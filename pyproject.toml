@@ -1,0 +1,37 @@
+[project]
+name = "vigia"
+version = "0.1.0"
+description = "Caja negra para agentes de IA: graba lo que hacen, rebobina y frena lo irreversible."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+vigia = "vigia.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs the Linux dev VM (Docker, Btrfs, eBPF)"]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+# Fixed-argument subprocess calls (btrfs, docker) are expected in this project.
+ignore = ["S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]

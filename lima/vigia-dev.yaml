@@ -1,0 +1,56 @@
+# Vigía dev VM: Fedora with Docker, Btrfs and uv.
+# Create and start it with `make vm-up`, which mounts only the project folder (writable).
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/fedora-44
+
+cpus: 6
+memory: "8GiB"
+disk: "50GiB"
+
+# Set by `make vm-up`: the VM only sees the project folder, never the whole home directory.
+mounts: []
+
+# Docker manages its own containerd, so Lima's is not needed.
+containerd:
+  system: false
+  user: false
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    rpm -q btrfs-progs make jq git >/dev/null || dnf install -y btrfs-progs make jq git
+    if ! command -v docker >/dev/null 2>&1; then
+      curl -fsSL https://get.docker.com | sh || dnf install -y moby-engine docker-compose
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+      curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+    fi
+# Give the Lima user ownership of the Docker socket, so `docker` works without sudo.
+- mode: yq
+  path: /etc/systemd/system/docker.socket.d/override.conf
+  format: ini
+  expression: .Socket.SocketUser="{{.User}}"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    systemctl daemon-reload
+    systemctl enable --now docker.socket docker.service
+
+probes:
+- script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! timeout 300s bash -c "until command -v docker >/dev/null 2>&1 && command -v uv >/dev/null 2>&1; do sleep 3; done"; then
+      echo >&2 "docker or uv is not installed yet"
+      exit 1
+    fi
+    if ! timeout 60s bash -c "until docker info >/dev/null 2>&1; do sleep 3; done"; then
+      echo >&2 "docker is not usable by the Lima user yet"
+      exit 1
+    fi
+  hint: See "/var/log/cloud-init-output.log" in the guest
