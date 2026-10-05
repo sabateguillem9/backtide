@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Secretos
+.env
+.env.*
+!.env.example
+
+# Datos locales de Vigía (caja negra, instantáneas, volúmenes)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.img
+
+# Claude Code: ajustes personales
+.claude/settings.local.json
+
+# Sistema
+.DS_Store
