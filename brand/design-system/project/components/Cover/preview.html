@@ -1,0 +1,46 @@
+<!-- @dsCard height=288 -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>backtide</title>
+<style>
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--paper); color: var(--ink); font-family: var(--font-sans); overflow: hidden; }
+  .cover { position: relative; height: 288px; overflow: hidden; }
+  .art { position: absolute; top: 0; left: 480px; width: 480px; height: 288px; overflow: hidden; }
+  .art svg { display: block; width: 480px; height: 288px; }
+  .slab { fill: var(--ink); }
+  .quiet { fill: var(--ink-muted); }
+  .hops { fill: none; stroke: var(--ink); stroke-width: var(--stroke-tide); stroke-linecap: round; stroke-linejoin: round; }
+  .tide { fill: none; stroke: var(--paper); stroke-width: var(--stroke-tide); stroke-linecap: round; stroke-linejoin: round; }
+  .dot { fill: var(--paper); }
+  .words { position: absolute; left: var(--space-6); bottom: var(--space-6); max-width: 440px; }
+  .name { margin: 0; font-size: 88px; line-height: .92; font-weight: 500; letter-spacing: -0.045em; color: var(--ink); }
+  .tag { margin: var(--space-3) 0 0 4px; font-size: 14px; line-height: 20px; color: var(--ink-muted); }
+</style>
+</head>
+<body>
+<div class="cover">
+<div class="art" aria-hidden="true">
+<svg viewBox="0 0 480 288" width="480" height="288">
+<!--
+  blocks      ink slab 352 wide bleeding off the top and bottom edges (the brand is ink on paper: the one big field) · ink-muted 48x64 once (the quiet second voice) · paper as ground; about 40% of 960x288
+  arrangement one tall ink slab on the right with a single small ink-muted satellite low on the ground, bottoms clear of the edge by space-6
+  pattern     the literal motif, the tide: the dot hops (|sin|) on paper in ink, and as it enters the slab the hops become the wave (sin) cut out in paper, ending in the paper dot; chosen because the README says the brand is "one idea drawn with one shape: the dot"
+  scales      line stroke-tide; satellite sides space-12 x space-16; offsets space-6; the dot radius-dot; wave period 112 = space-24 + space-4
+-->
+<rect class="slab" x="128" y="-8" width="352" height="304"/>
+<rect class="quiet" x="24" y="200" width="48" height="64"/>
+<path class="hops" d="M16,160.0L18,157.2L20,154.4L22,151.6L24,149.0L26,146.5L28,144.2L30,142.1L32,140.2L34,138.6L36,137.2L38,136.1L40,135.3L42,134.9L44,134.7L46,134.9L48,135.3L50,136.1L52,137.2L54,138.6L56,140.2L58,142.1L60,144.2L62,146.5L64,149.0L66,151.6L68,154.4L70,157.2L72,160.0L74,157.2L76,154.4L78,151.6L80,149.0L82,146.5L84,144.2L86,142.2L88,140.7L90,139.8L92,139.4L94,139.7L96,140.5L98,141.9L100,143.7L102,145.9L104,148.4L106,151.1L108,153.9L110,156.5L112,159.0L114,161.1L116,162.8L118,163.9L120,164.5L122,164.4L124,163.6L126,162.1L128,160.0"/>
+<path class="tide" d="M128,160.0L130,155.5L132,151.0L134,146.3L136,141.7L138,137.2L140,132.9L142,128.9L144,125.2L146,122.0L148,119.2L150,117.0L152,115.3L154,114.3L156,114.0L158,114.3L160,115.2L162,116.6L164,118.6L166,121.1L168,124.0L170,127.5L172,131.3L174,135.5L176,140.0L178,144.8L180,149.8L182,154.8L184,160.0L186,165.2L188,170.2L190,175.2L192,180.0L194,184.5L196,188.7L198,192.5L200,196.0L202,198.9L204,201.4L206,203.4L208,204.8L210,205.7L212,206.0L214,205.7L216,204.8L218,203.4L220,201.4L222,198.9L224,196.0L226,192.5L228,188.7L230,184.5L232,180.0L234,175.2L236,170.2L238,165.2L240,160.0L242,154.8L244,149.8L246,144.8L248,140.0L250,135.5L252,131.3L254,127.5L256,124.0L258,121.1L260,118.6L262,116.6L264,115.2L266,114.3L268,114.0L270,114.3L272,115.2L274,116.6L276,118.6L278,121.1L280,124.0L282,127.5L284,131.3L286,135.5L288,140.0L290,144.8L292,149.8L294,154.8L296,160.0L298,165.2L300,170.2L302,175.2L304,180.0L306,184.5L308,188.7L310,192.5L312,196.0L314,198.9L316,201.4L318,203.4L320,204.8L322,205.7L324,206.0L326,205.7L328,204.8L330,203.4L332,201.4L334,198.9L336,196.0L338,192.5L340,188.7L342,184.5L344,180.0L346,175.2L348,170.2L350,165.2L352,160.0L354,154.8L356,149.8L358,144.8L360,140.0L362,135.5L364,131.3L366,127.5L368,124.0L370,121.1L372,118.6L374,116.6L376,115.2L378,114.3L380,114.0L382,114.3L384,115.2L386,116.6L388,118.6L390,121.1L392,124.0L394,127.5L396,131.3L398,135.5L400,140.0L402,144.8L404,149.8L406,154.8L408,160.0L410,165.2L412,170.2L414,175.2L416,180.0L418,184.5L420,188.7L422,192.5L424,196.0L426,198.9L428,201.4L430,203.4L432,204.8L434,205.7L436,206.0L438,205.7L440,204.8"/>
+<circle class="dot" cx="440" cy="204.8" r="8"/>
+</svg>
+</div>
+<div class="words">
+<h1 class="name">backtide</h1>
+<p class="tag">The flight recorder and the rewind button for your AI agents.</p>
+</div>
+</div>
+</body>
+</html>

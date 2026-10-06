@@ -1,0 +1,12 @@
+<!-- @dsCard group="Forms" height=190 -->
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"></head>
+<body>
+<div id="root" class="bt-stage"></div>
+<script>
+  var B = window.Backtide, h = React.createElement;
+  ReactDOM.createRoot(document.getElementById('root')).render(h(B.EmailCapture, { onSubmit: function (email, setStatus) { setStatus({ text: 'Almost there: check your inbox to confirm your email.' }); } }));
+</script>
+</body>
+</html>

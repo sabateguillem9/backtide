@@ -1,0 +1,12 @@
+<!-- @dsCard group="Brand" height=200 -->
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"></head>
+<body>
+<div id="root" class="bt-stage"></div>
+<script>
+  var B = window.Backtide, h = React.createElement;
+  ReactDOM.createRoot(document.getElementById('root')).render(h(React.Fragment, null, h(B.Wordmark, { size: 96 }), h('div', { style: { background: 'var(--ink)', padding: '16px 24px' } }, h(B.Wordmark, { size: 40, tone: 'paper' }))));
+</script>
+</body>
+</html>
