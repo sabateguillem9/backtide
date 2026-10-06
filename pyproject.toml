@@ -15,6 +15,8 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import vigia from source: on macOS the .venv gets the "hidden" flag and Python skips hidden .pth files.
+pythonpath = ["."]
 markers = ["integration: needs the Linux dev VM (Docker, Btrfs, eBPF)"]
 addopts = "-m 'not integration'"
 
