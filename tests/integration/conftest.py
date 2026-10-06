@@ -17,18 +17,26 @@ from before the mount until after the unmount. The kernel drops it when the owne
 - one whose lock is free (or missing) was left by a killed run (``kill -9``): it stays until
   the VM reboots, and the next run fails and prints the command to remove it,
   ``sudo umount <mount point>``.
+
+``running_agent`` (T03a) starts the real OpenClaw image in its jail on that btrfs, with docker
+and no sudo at all. It pulls the pinned image the first time (about 1.3 GB, by digest). Test
+containers and networks carry the pid of the pytest process that made them, so a later run
+removes those of a killed run (whose pytest is gone) and leaves a live run's alone. Such a
+container may still hold a stale btrfs inside its own mount namespace: removing it, and the
+``sudo umount`` above, release the loop device.
 """
 
 import fcntl
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +44,8 @@ from uuid import uuid4
 
 import pytest
 
+from vigia.jail import IMAGE, AgentJail, AgentJailConfig, JailError
+from vigia.jail import docker as jail_docker
 from vigia.snapshots.store import SnapshotStore
 
 GIB = 1024**3
@@ -84,6 +94,170 @@ def store(btrfs_volume: Path, clock: Callable[[], datetime]) -> SnapshotStore:
     snapshot_store = SnapshotStore(root, clock=clock)
     snapshot_store.init()
     return snapshot_store
+
+
+IMAGE_PULL_TIMEOUT = 1800.0  # the first pull of the pinned image is about 1.3 GB
+# Test agents are named <prefix><pytest pid>-<random>: see _remove_stale_test_agents.
+TEST_CONTAINER_PREFIX = "vigia-test-agent-"
+TEST_NETWORK_PREFIX = "vigia-test-net-"
+
+
+@dataclass(frozen=True)
+class RunningAgent:
+    """The real OpenClaw in its jail, as the T03a tests see it.
+
+    ``workspace`` is ``<root>/workspace/agente`` on the host: the container's /workspace.
+    ``store`` is the SnapshotStore whose workspace contains it. ``exec`` runs inside the
+    container as the agent's user; ``quiesce`` is AgentJail.quiesce (stop, then start)."""
+
+    jail: AgentJail
+    store: SnapshotStore
+
+    @property
+    def name(self) -> str:
+        return self.jail.config.name
+
+    @property
+    def workspace(self) -> Path:
+        return self.jail.config.agent_dir
+
+    def exec(
+        self, argv: list[str], *, check: bool = False, timeout: float = 60
+    ) -> subprocess.CompletedProcess[str]:
+        return self.jail.exec(argv, check=check, timeout=timeout)
+
+    def quiesce(self) -> AbstractContextManager[None]:
+        return self.jail.quiesce()
+
+
+@pytest.fixture(scope="module")
+def running_agent(
+    btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[RunningAgent]:
+    """OpenClaw from the pinned image, running in its jail and ready (/healthz answers).
+
+    One per test module: its own snapshot store on the shared btrfs (real clock), its own
+    config folder outside that volume, and its own container and network, with unique names.
+    Leftovers of killed runs are removed first. Removed afterwards, also when setup fails
+    halfway.
+
+    The agent runs as the Lima user, who also owns the store, Vigía's side and the Docker
+    socket: without root, the agent's folders can only belong to that user. A concession of
+    these tests (``allow_shared_ids``), never of production: there Vigía runs as root and the
+    agent has ids of its own (docs/13)."""
+    _require_agent_image()
+    _remove_stale_test_agents()
+    root = btrfs_volume / f"agent-{uuid4().hex}"
+    root.mkdir(mode=0o700)
+    agent_store = SnapshotStore(root)
+    agent_store.init()
+    name, network = _agent_names(os.getpid())
+    config = AgentJailConfig(
+        workspace=agent_store.workspace,
+        config_dir=tmp_path_factory.mktemp("agent-config"),
+        gateway_token=secrets.token_urlsafe(32),
+        name=name,
+        network=network,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        allow_shared_ids=True,
+        memory="2g",
+        cpus="2",
+    )
+    jail = AgentJail(config)
+    try:
+        jail.ensure_network()
+        jail.prepare_workspace()
+        jail.write_config()
+        jail.create()
+        jail.start()
+        jail.wait_ready()
+        yield RunningAgent(jail=jail, store=agent_store)
+    finally:
+        _remove_agent(jail)
+
+
+def _require_agent_image() -> None:
+    """Pull the pinned OpenClaw image if the VM does not have it yet (by digest, so the
+    registry cannot hand over anything else)."""
+    if jail_docker.run(["image", "inspect", IMAGE], check=False).returncode == 0:
+        return
+    jail_docker.run(["pull", "--quiet", IMAGE], timeout=IMAGE_PULL_TIMEOUT)
+
+
+class AgentLeftovers:
+    """How test agents are named, and the cleanup of a killed run's leftovers."""
+
+    @staticmethod
+    def names(pid: int) -> tuple[str, str]:
+        return _agent_names(pid)
+
+    @staticmethod
+    def remove_stale() -> list[str]:
+        return _remove_stale_test_agents()
+
+
+@pytest.fixture
+def agent_leftovers() -> AgentLeftovers:
+    """For the test of the cleanup itself (test_jail.py)."""
+    return AgentLeftovers()
+
+
+def _agent_names(pid: int) -> tuple[str, str]:
+    """Container and network names for a test agent made by the pytest process ``pid``."""
+    suffix = f"{pid}-{uuid4().hex[:12]}"
+    return f"{TEST_CONTAINER_PREFIX}{suffix}", f"{TEST_NETWORK_PREFIX}{suffix}"
+
+
+def _remove_stale_test_agents() -> list[str]:
+    """Remove the test containers, then the test networks, whose pytest process is gone (a
+    run killed with kill -9 or a second Ctrl-C), and return their names. A live run's are
+    left alone, such as another `make it` at the same time."""
+    containers = _docker_lines(["ps", "--all", "--format", "{{.Names}}"])
+    networks = _docker_lines(["network", "ls", "--format", "{{.Name}}"])
+    stale_containers = [n for n in containers if _is_stale_test_name(n, TEST_CONTAINER_PREFIX)]
+    stale_networks = [n for n in networks if _is_stale_test_name(n, TEST_NETWORK_PREFIX)]
+    for name in stale_containers:
+        jail_docker.run(["rm", "--force", name])  # a missing container is not an error
+    for name in stale_networks:
+        result = jail_docker.run(["network", "rm", name], check=False)
+        if result.returncode != 0 and "not found" not in result.stderr:
+            raise JailError(f"cannot remove the stale test network {name}: {result.stderr}")
+    return stale_containers + stale_networks
+
+
+def _docker_lines(args: list[str]) -> list[str]:
+    return jail_docker.run(args).stdout.split()
+
+
+def _is_stale_test_name(name: str, prefix: str) -> bool:
+    if not name.startswith(prefix):
+        return False
+    pid, _, _ = name.removeprefix(prefix).partition("-")
+    if not pid.isdigit():
+        return True  # named before names carried a pid: left by a run killed back then
+    return not _is_pytest_alive(int(pid))
+
+
+def _is_pytest_alive(pid: int) -> bool:
+    """True if ``pid`` is a running pytest. Another process that reused the pid is not."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return b"pytest" in cmdline
+
+
+def _remove_agent(jail: AgentJail) -> None:
+    """Remove the container, then its network. Both are attempted; a failure is raised."""
+    errors: list[JailError] = []
+    for step in (jail.remove, jail.remove_network):
+        try:
+            step()
+        except JailError as error:
+            errors.append(error)
+    if errors:
+        raise errors[0]
 
 
 @contextmanager
@@ -157,7 +331,10 @@ def _fail_on_stale_mounts(*, session_dir: Path) -> None:
     stale = [m for m in candidates if _is_stale(m)]
     if stale:
         commands = "\n".join(shlex.join(["sudo", "umount", str(m.mount_point)]) for m in stale)
-        pytest.fail(f"a killed test run left btrfs mounted; remove it with:\n{commands}")
+        pytest.fail(
+            f"a killed test run left btrfs mounted; remove it with:\n{commands}\n"
+            "(a test agent that run left behind is removed by the next jail test module)"
+        )
 
 
 def _is_stale(mount: Mount) -> bool:

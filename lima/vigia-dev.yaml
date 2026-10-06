@@ -34,12 +34,22 @@ provision:
   path: /etc/systemd/system/docker.socket.d/override.conf
   format: ini
   expression: .Socket.SocketUser="{{.User}}"
+# SELinux for containers (Docker CE leaves it off): the agent runs as container_t instead of
+# spc_t (unconfined), and the :z mounts are labelled container_file_t. See docs/13.
+- mode: yq
+  path: /etc/docker/daemon.json
+  format: json
+  expression: .["selinux-enabled"] = true
 - mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
     systemctl daemon-reload
     systemctl enable --now docker.socket docker.service
+    # dockerd reads daemon.json only when it starts: restart it if SELinux is still off.
+    if ! docker info --format '{{json .SecurityOptions}}' | grep -q selinux; then
+      systemctl restart docker.service
+    fi
 
 probes:
 - script: |
