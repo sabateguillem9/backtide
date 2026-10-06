@@ -1,29 +1,72 @@
 {
   "v": 3,
   "layout": "files",
-  "createdOnFiles": { "v": 1, "at": "2026-10-06T17:25:03Z" },
+  "createdOnFiles": {
+    "v": 1,
+    "at": "2026-10-06T17:25:03Z"
+  },
   "title": "backtide",
   "namespace": "Backtide",
   "libraries": [
-    { "name": "react", "version": "18" },
-    { "name": "react-dom", "version": "18" }
+    {
+      "name": "react",
+      "version": "18"
+    },
+    {
+      "name": "react-dom",
+      "version": "18"
+    }
   ],
   "sections": {},
-  "groups": ["Logos"],
+  "groups": [
+    "Logos"
+  ],
   "assetGroups": {
     "Logos": {
       "name": "Logos",
       "tile": "l",
-      "order": ["backtide-wordmark.svg", "backtide-wordmark-white.svg", "backtide-mark.svg", "backtide-mark-white.svg"],
+      "order": [
+        "backtide-wordmark.svg",
+        "backtide-wordmark-white.svg",
+        "backtide-mark.svg",
+        "backtide-mark-white.svg"
+      ],
       "files": {
-        "backtide-wordmark.svg": { "name": "backtide-wordmark.svg", "blob": "3e597984ba0fe24fb02822d59cff821f", "size": 4468, "type": "image/svg+xml" },
-        "backtide-wordmark-white.svg": { "name": "backtide-wordmark-white.svg", "blob": "447be42eb1fe8a34c97cb7c1ce209aa5", "size": 4468, "type": "image/svg+xml" },
-        "backtide-mark.svg": { "name": "backtide-mark.svg", "blob": "e3645c3be9536d76f88e664675ae7e03", "size": 153, "type": "image/svg+xml" },
-        "backtide-mark-white.svg": { "name": "backtide-mark-white.svg", "blob": "ede954997426aa41737c46145ba91b3e", "size": 153, "type": "image/svg+xml" }
+        "backtide-wordmark.svg": {
+          "name": "backtide-wordmark.svg",
+          "blob": "3e597984ba0fe24fb02822d59cff821f",
+          "size": 4468,
+          "type": "image/svg+xml"
+        },
+        "backtide-wordmark-white.svg": {
+          "name": "backtide-wordmark-white.svg",
+          "blob": "447be42eb1fe8a34c97cb7c1ce209aa5",
+          "size": 4468,
+          "type": "image/svg+xml"
+        },
+        "backtide-mark.svg": {
+          "name": "backtide-mark.svg",
+          "blob": "e3645c3be9536d76f88e664675ae7e03",
+          "size": 153,
+          "type": "image/svg+xml"
+        },
+        "backtide-mark-white.svg": {
+          "name": "backtide-mark-white.svg",
+          "blob": "ede954997426aa41737c46145ba91b3e",
+          "size": 153,
+          "type": "image/svg+xml"
+        }
       }
     }
   },
   "blobs": {},
-  "docs": { "sections": [] },
-  "lastChange": { "by": "Guillem Sabaté", "via": "Claude Code", "at": "2026-10-06T17:25:03Z", "note": "First version, built from the landing page (site/) and the brand guide (docs/14-marca.md)." }
+  "docs": {
+    "sections": []
+  },
+  "lastChange": {
+    "by": "Guillem Sabaté",
+    "via": "Claude Code",
+    "at": "2026-10-06T18:06:38Z",
+    "note": "The tide calms instead of turning and rewinding. New Status component for where each part stands; Tide gets `calm`, Message gets `status`."
+  }
 }

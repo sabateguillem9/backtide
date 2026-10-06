@@ -6,7 +6,7 @@
 <div id="root" class="bt-stage"></div>
 <script>
   var B = window.Backtide, h = React.createElement;
-  ReactDOM.createRoot(document.getElementById('root')).render(h(B.Message, { title: 'Rewind anything.' }, 'The whole workspace, back to any moment.'));
+  ReactDOM.createRoot(document.getElementById('root')).render(h(B.Message, { title: 'Rewind anything.', status: h(B.Status, { state: 'built' }, 'Btrfs snapshots, swapped atomically.') }, 'The whole workspace, back to any moment.'));
 </script>
 </body>
 </html>

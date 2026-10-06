@@ -6,7 +6,7 @@
 <div id="root" class="bt-stage"></div>
 <script>
   var B = window.Backtide, h = React.createElement;
-  ReactDOM.createRoot(document.getElementById('root')).render(h(React.Fragment, null, h(B.Tide, { id: 'a', width: 520, height: 120 }), h(B.Tide, { id: 'b', width: 120, height: 220, orientation: 'vertical', hops: false, periods: 2 })));
+  ReactDOM.createRoot(document.getElementById('root')).render(h(React.Fragment, null, h(B.Tide, { id: 'a', width: 520, height: 120 }), h(B.Tide, { id: 'b', width: 520, height: 120, hops: false, calm: true, label: 'The tide calms' })));
 </script>
 </body>
 </html>

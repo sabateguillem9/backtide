@@ -19,19 +19,35 @@ export interface TideProps {
   amplitude?: number;
   /** Start with fading hops (|sin|) that become the wave. Default true. */
   hops?: boolean;
-  /** 'vertical' draws the rewind: the wave above, the dot at the bottom. */
+  /** Flatten the last stretch into a still line: the rewind, everything back to calm. Default false. */
+  calm?: boolean;
+  /** 'vertical' fits tall, narrow spaces: the wave above, the dot at the bottom. */
   orientation?: 'horizontal' | 'vertical';
   dot?: boolean; stroke?: number; tone?: Tone; label?: string; id?: string; className?: string;
 }
 export declare function Tide(props: TideProps): React.ReactElement;
 
 /** A headline with the one line that explains it. */
-export interface MessageProps { title: React.ReactNode; children?: React.ReactNode; align?: 'center' | 'start'; className?: string }
+export interface MessageProps {
+  title: React.ReactNode; children?: React.ReactNode; align?: 'center' | 'start';
+  /** A Status line under the message, e.g. on a crest of the tide. */
+  status?: React.ReactNode; className?: string;
+}
 export declare function Message(props: MessageProps): React.ReactElement;
 
 /** One sentence alone on screen. */
 export interface StatementProps { children: React.ReactNode; className?: string }
 export declare function Statement(props: StatementProps): React.ReactElement;
+
+/** Where a part of the product stands. `built` only when it has passing tests. */
+export interface StatusProps {
+  state: 'built' | 'progress' | 'next';
+  /** Replaces the state's words ("Built and tested", "In progress", "Next"), e.g. in Spanish. */
+  label?: string;
+  /** How it is solved, in one short sentence. */
+  children?: React.ReactNode; className?: string;
+}
+export declare function Status(props: StatusProps): React.ReactElement;
 
 /** The dot as a button: a 44px ink circle with an arrow. `label` is required for screen readers. */
 export interface DotButtonProps { label: string; type?: 'button' | 'submit'; onClick?: React.MouseEventHandler<HTMLButtonElement>; disabled?: boolean; className?: string }
@@ -75,7 +91,7 @@ export declare function Document(props: DocumentProps): React.ReactElement;
 declare global {
   interface Window {
     Backtide: {
-      Wordmark: typeof Wordmark; Mark: typeof Mark; Tide: typeof Tide; Message: typeof Message; Statement: typeof Statement;
+      Wordmark: typeof Wordmark; Mark: typeof Mark; Tide: typeof Tide; Message: typeof Message; Statement: typeof Statement; Status: typeof Status;
       DotButton: typeof DotButton; TextField: typeof TextField; EmailCapture: typeof EmailCapture; LegalFooter: typeof LegalFooter; Document: typeof Document;
     };
   }

@@ -15,6 +15,12 @@ body { margin: 0; font-family: var(--font-sans); background: var(--paper); color
 .bt-message-text { margin: 0; font-size: 17px; line-height: 1.45; color: var(--ink-muted); }
 @media (max-width: 480px) { .bt-message-title { font-size: 21px; } .bt-message-text { font-size: 15px; } }
 
+.bt-status { margin: 0; font-size: 13px; line-height: 1.45; letter-spacing: 0.02em; color: var(--ink-muted); text-wrap: balance; }
+.bt-message .bt-status { margin-top: 6px; }
+.bt-status-dot { display: inline-block; box-sizing: border-box; width: 7px; height: 7px; margin-right: var(--space-2); border-radius: var(--radius-dot); background: var(--ink); vertical-align: 1px; }
+.bt-status-progress .bt-status-dot { background: transparent; border: 1.5px solid var(--ink); }
+.bt-status-next .bt-status-dot { background: transparent; border: 1.5px solid var(--ink-muted); }
+
 .bt-statement { margin: 0; font-size: 36px; line-height: 1.15; font-weight: 500; letter-spacing: -0.02em; text-wrap: balance; }
 
 .bt-dot-button {

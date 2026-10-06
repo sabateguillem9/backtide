@@ -1,4 +1,4 @@
-backtide is the flight recorder and the rewind button for AI agents. The brand is one idea drawn with one shape: **the dot**. A dot is a moment of the agent; its hops are the agent's activity; the line it leaves is the record; the wave is the tide, which is also time; the tide turning vertical and running back into the dot is the rewind. Everything below follows from that.
+backtide is the flight recorder and the rewind button for AI agents. The brand is one idea drawn with one shape: **the dot**. A dot is a moment of the agent; its hops are the agent's activity; the line it leaves is the record; the wave is the tide, which is also time; the tide calming back into a still line is the rewind: everything as it was. Everything below follows from that.
 
 ## Content fundamentals
 
@@ -10,6 +10,7 @@ backtide is the flight recorder and the rewind button for AI agents. The brand i
   - "Rewind anything." / "The whole workspace, back to any moment."
   - "Even the rewind." / "Changed your mind? Undo it."
   - "A black box it can't erase." / "Every action, chained and signed. Tampering shows."
+- Show where each part of the product stands with a `Status` line: "Built and tested", "In progress" or "Next", then how it is solved in one sentence ("Btrfs snapshots, swapped atomically."). Say "Built and tested" only when it has tests that pass.
 - Name buttons by what happens ("Join the waitlist"); report results plainly ("Almost there: check your inbox to confirm your email.").
 - No emoji, no icons as decoration.
 
@@ -39,7 +40,7 @@ backtide is the flight recorder and the rewind button for AI agents. The brand i
 
 ### Motion
 - Scroll leads; never hijack it beyond the intro. On the landing page the first scroll (or a tap on the dot of the i) plays the intro on its own for 1.8 s, until the first wave; after that the animation follows the scroll.
-- The physics is the message: the dot hops (|sin|), the hops become the tide (sin), the tide turns vertical and runs back into the dot (the rewind), and the line is reborn as the email field with the dot as its button.
+- The physics is the message: the dot hops (|sin|), the hops become the tide (sin), and at the end the tide calms: the waves flatten into a still line that settles exactly on the email field's hairline, and the dot becomes its button. That calm is the rewind. Nothing runs backwards or spins.
 - Ease with sine in-out for travel and cubic out for arrivals. No springs, no overshoot, nothing that blinks.
 - Always respect `prefers-reduced-motion`: show the same words and the same form, still. Without JavaScript the page must read the same.
 

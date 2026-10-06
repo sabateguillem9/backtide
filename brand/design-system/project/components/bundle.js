@@ -1,4 +1,4 @@
-/* @ds-bundle: {"format":4,"namespace":"Backtide","components":[{"name":"Wordmark"},{"name":"Mark"},{"name":"Tide"},{"name":"Message"},{"name":"Statement"},{"name":"DotButton"},{"name":"TextField"},{"name":"EmailCapture"},{"name":"LegalFooter"},{"name":"Document"}]} */
+/* @ds-bundle: {"format":4,"namespace":"Backtide","components":[{"name":"Wordmark"},{"name":"Mark"},{"name":"Tide"},{"name":"Message"},{"name":"Statement"},{"name":"Status"},{"name":"DotButton"},{"name":"TextField"},{"name":"EmailCapture"},{"name":"LegalFooter"},{"name":"Document"}]} */
 (function () {
   var React = window.React;
   var h = React.createElement;
@@ -31,6 +31,7 @@
   }
 
   // The tide: hops (|sin|) that grow into a wave (sin), drawn by a dot at its head.
+  // `calm` flattens the last stretch into a still line: the rewind, everything back to calm.
   function smooth(t) { t = Math.min(1, Math.max(0, t)); return t * t * (3 - 2 * t); }
   function Tide(props) {
     var width = props.width || 480;
@@ -38,6 +39,7 @@
     var periods = props.periods || 2.25;
     var amplitude = props.amplitude == null ? 0.38 : props.amplitude;
     var hops = props.hops !== false;
+    var calm = !!props.calm;
     var vertical = props.orientation === "vertical";
     var showDot = props.dot !== false;
     var stroke = props.stroke || 2;
@@ -54,7 +56,8 @@
       var s = (inner * i) / 160;
       var sinv = Math.sin(k * s);
       var w = hops ? smooth((s - hopEnd * 0.6) / (hopEnd * 0.5)) : 1;
-      var g = (1 - w) * 0.6 * Math.abs(sinv) + w * sinv;
+      var still = calm ? 1 - smooth((s - inner * 0.55) / (inner * 0.4)) : 1;
+      var g = still * ((1 - w) * 0.6 * Math.abs(sinv) + w * sinv);
       var along = pad + s;
       var off = base - A * g;
       points.push(vertical ? [off, along] : [along, off]);
@@ -82,12 +85,23 @@
   function Message(props) {
     return h("div", { className: cx("bt-message", props.align === "start" && "bt-message-start", props.className) },
       h("h2", { className: "bt-message-title" }, props.title),
-      props.children ? h("p", { className: "bt-message-text" }, props.children) : null);
+      props.children ? h("p", { className: "bt-message-text" }, props.children) : null,
+      props.status || null);
   }
 
   // One sentence alone on screen.
   function Statement(props) {
     return h("p", { className: cx("bt-statement", props.className) }, props.children);
+  }
+
+  // Where a part of the product stands: a dot for the state, then how it is solved.
+  var STATES = { built: "Built and tested", progress: "In progress", next: "Next" };
+  function Status(props) {
+    var state = STATES[props.state] ? props.state : "next";
+    return h("p", { className: cx("bt-status", "bt-status-" + state, props.className) },
+      h("span", { className: "bt-status-dot", "aria-hidden": "true" }),
+      props.label || STATES[state],
+      props.children ? h(React.Fragment, null, " · ", props.children) : null);
   }
 
   var arrow = h("svg", { viewBox: "0 0 16 16", width: 16, height: 16, fill: "none", stroke: "currentColor", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true" },
@@ -176,6 +190,6 @@
       props.footer || null);
   }
 
-  var api = { Wordmark: Wordmark, Mark: Mark, Tide: Tide, Message: Message, Statement: Statement, DotButton: DotButton, TextField: TextField, EmailCapture: EmailCapture, LegalFooter: LegalFooter, Document: Document };
+  var api = { Wordmark: Wordmark, Mark: Mark, Tide: Tide, Message: Message, Statement: Statement, Status: Status, DotButton: DotButton, TextField: TextField, EmailCapture: EmailCapture, LegalFooter: LegalFooter, Document: Document };
   window.Backtide = Object.assign(window.Backtide || {}, api);
 })();
