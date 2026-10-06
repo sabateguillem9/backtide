@@ -14,3 +14,8 @@ def test_version_flag_prints_version(capsys: pytest.CaptureFixture[str]) -> None
 def test_without_arguments_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert main([]) == 0
     assert "usage: vigia" in capsys.readouterr().out
+
+
+def test_help_lists_the_verificar_command(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main([]) == 0
+    assert "verificar" in capsys.readouterr().out
