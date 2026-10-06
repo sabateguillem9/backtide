@@ -15,6 +15,7 @@ from vigia.snapshots.model import (
     utc_now,
 )
 from vigia.snapshots.retention import select_expired
+from vigia.snapshots.store import SnapshotStore
 
 __all__ = [
     "PruneIncomplete",
@@ -25,6 +26,7 @@ __all__ = [
     "SnapshotBusy",
     "SnapshotError",
     "SnapshotNoSpace",
+    "SnapshotStore",
     "select_expired",
     "utc_now",
 ]

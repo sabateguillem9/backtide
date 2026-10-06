@@ -27,12 +27,16 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+
+from vigia.snapshots.store import SnapshotStore
 
 GIB = 1024**3
 MOUNT_OPTIONS = "loop,noatime,nosuid,nodev,user_subvol_rm_allowed"
@@ -69,6 +73,17 @@ def tiny_btrfs_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     /tmp (tmpfs) stays sparse and the VM's RAM is not used up."""
     with _mounted_btrfs(tmp_path_factory.mktemp("tiny-btrfs"), GIB) as mnt:
         yield mnt
+
+
+@pytest.fixture
+def store(btrfs_volume: Path, clock: Callable[[], datetime]) -> SnapshotStore:
+    """An initialised snapshot store in this test's own 0700 directory of the shared btrfs,
+    reading the fake clock (tests/conftest.py)."""
+    root = btrfs_volume / uuid4().hex
+    root.mkdir(mode=0o700)
+    snapshot_store = SnapshotStore(root, clock=clock)
+    snapshot_store.init()
+    return snapshot_store
 
 
 @contextmanager
