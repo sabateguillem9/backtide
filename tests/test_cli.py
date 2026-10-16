@@ -16,6 +16,7 @@ from vigia.service.control import (
     ControlOutcomeUnknown,
     ControlUnavailable,
 )
+from vigia.service.notice import rewind_notice
 from vigia.service.rewind import RewindOutcome, RewindStatus
 from vigia.service.runner import ServiceLocked, ServiceRunning, take_lock
 from vigia.snapshots import Snapshot, SnapshotError
@@ -180,6 +181,10 @@ def test_the_notice_says_what_is_undone_what_is_not_and_when(
     assert "puede reenviar algún mensaje que estuviera en cola" in text
     assert "Se guarda un punto para deshacer el rebobinado" in text
     assert "el agente se queda parado" in text  # what happens when there is no service
+    # The same text as Telegram and the web (vigia/service/notice.py), channels included.
+    for paragraph in rewind_notice(TARGET.taken_at, now=NOW, tz=timezone(timedelta(hours=2))):
+        assert " ".join(paragraph.split()) in text
+    assert "WhatsApp y Signal no se pueden usar en esta versión" in text
 
 
 def test_nothing_is_asked_with_si_and_the_question_comes_before_anything_is_done(

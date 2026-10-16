@@ -22,6 +22,17 @@ CHANNELS = ("telegram",)
 SAFE_DM_POLICIES = ("allowlist", "disabled")
 SAFE_EXEC_MODES = ("full", "deny")
 SAFE_GATEWAY_AUTH = ("token", "password")
+# OpenClaw's lines of the rewind notice (docs/19, section 7; vigia/service/notice.py puts them
+# between the generic part and the undo point). Plain Spanish, the same for every config:
+# channels that check_rewindable refuses are said to be unavailable, not hidden.
+REWIND_NOTICE_LINES = (
+    "Telegram: los mensajes que Telegram ya le entregó al agente no le vuelven a llegar. Si "
+    "algo de esa conversación importa, díselo de nuevo.",
+    "WhatsApp y Signal no se pueden usar en esta versión: sus sesiones no aguantan volver atrás "
+    "y habría que vincularlas de nuevo.",
+    "El correo (IMAP) tampoco se puede usar todavía: tras rebobinar, el agente volvería a leer "
+    "el correo llegado desde esa hora.",
+)
 _NUMERIC_ID = re.compile(r"(?:(?:telegram|tg):)?[0-9]+")
 _WILDCARD = re.compile(r"(?:(?:telegram|tg):)?\s*\*\s*")
 

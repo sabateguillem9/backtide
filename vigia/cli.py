@@ -7,7 +7,7 @@ import sys
 import textwrap
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 
 from vigia import __version__
@@ -22,6 +22,7 @@ from vigia.service.control import (
     ControlUnavailable,
     ask_rewind,
 )
+from vigia.service.notice import ago, rewind_notice
 from vigia.service.offline import rewind_without_service
 from vigia.service.runner import ServiceLocked, ServiceRunning, serve, take_lock
 from vigia.service.seguir import seguir
@@ -38,16 +39,7 @@ NOT_VERIFIED = "NO VERIFICADA: trátala como no íntegra"
 MAX_LISTED_PROBLEMS = 50
 DEFAULT_CONFIG = Path("/etc/vigia/vigia.toml")
 DEFAULT_LISTED_SNAPSHOTS = 30  # docs/19, decision 21
-# The notice of `vigia rebobinar` (docs/19, section 7): what a rewind undoes and what it cannot.
-# Telegram (T09) and the web (T12) show the same text.
-REWIND_NOTICE = (
-    "Vas a volver a las {hora} ({hace}). Se deshace: los archivos de trabajo del agente y lo que "
-    "recuerda (memoria y conversaciones) desde esa hora. No se deshace: lo que el agente ya ha "
-    "enviado fuera (mensajes, correos, publicaciones, cambios en servicios); lo que ya salió de "
-    "la máquina no vuelve. Después, el agente no recordará nada posterior a esa hora aunque tus "
-    "chats sí lo muestren, y puede reenviar algún mensaje que estuviera en cola en ese momento. "
-    "Se guarda un punto para deshacer el rebobinado."
-)
+# Only `vigia rebobinar` says this: the rest of the notice is vigia/service/notice.py.
 REWIND_NOTICE_WITHOUT_SERVICE = (
     "Si no hay un servicio de Vigía en marcha (`vigia vigilar`), el rebobinado se hace aquí y el "
     "agente se queda parado: arráncalo después con `vigia vigilar`."
@@ -296,13 +288,8 @@ def _resume(args: argparse.Namespace) -> int:
 
 
 def _rewind_notice(target: Snapshot, *, now: datetime, tz: tzinfo) -> str:
-    text = REWIND_NOTICE.format(
-        hora=target.taken_at.astimezone(tz).strftime("%H:%M:%S del %Y-%m-%d"),
-        hace=_age(now - target.taken_at),
-    )
-    return "\n\n".join(
-        textwrap.fill(paragraph, width=88) for paragraph in (text, REWIND_NOTICE_WITHOUT_SERVICE)
-    )
+    paragraphs = (*rewind_notice(target.taken_at, now=now, tz=tz), REWIND_NOTICE_WITHOUT_SERVICE)
+    return "\n\n".join(textwrap.fill(paragraph, width=88) for paragraph in paragraphs)
 
 
 def _confirm() -> bool | None:
@@ -457,7 +444,7 @@ def _snapshot_lines(
             snap.id,
             snap.taken_at.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S"),
             _printable(REASON_NAMES.get(snap.reason, snap.reason)),
-            _age(now - snap.taken_at),
+            ago(now - snap.taken_at),
         )
         for snap in shown
     ]
@@ -473,19 +460,6 @@ def _snapshot_lines(
     if hidden > 0:
         lines.append(f"… y {hidden} más (usa --todas para verlas todas)")
     return lines
-
-
-def _age(elapsed: timedelta) -> str:
-    seconds = elapsed.total_seconds()
-    if seconds < -5:
-        return "en el futuro (¿reloj mal?)"
-    if seconds < 60:
-        return "hace unos segundos"
-    if seconds < 3600:
-        return f"hace {int(seconds // 60)} min"
-    if seconds < 48 * 3600:
-        return f"hace {int(seconds // 3600)} h"
-    return f"hace {int(seconds // 86400)} días"
 
 
 def _now() -> datetime:

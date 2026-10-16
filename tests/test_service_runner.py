@@ -14,9 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from vigia.blackbox import BlackBox, BlackBoxError
+from vigia.blackbox import BlackBox, BlackBoxError, load_key
 from vigia.jail import AgentJail, JailError
-from vigia.notify import AlertQueue, LogNotifier
+from vigia.jail.openclaw import RewindProblem, UnrewindableConfig
+from vigia.notify import Alert, AlertLevel, AlertQueue, LogNotifier
 from vigia.sensors.files import FileWatcher
 from vigia.service.config import Secret, ServiceConfig
 from vigia.service.guardian import Guardian
@@ -617,3 +618,82 @@ def test_a_checkpoint_without_the_key_is_refused_and_creates_nothing(
     with pytest.raises(BlackBoxError, match="clave"):
         open_black_box(config)
     assert not config.blackbox_key.exists()
+
+
+# --- a config a rewind would break: the notice reaches the user through the notifier ----------
+
+
+class UnrewindableJail(StubJail):
+    """A jail whose OpenClaw config check_rewindable refuses (what write_config raises)."""
+
+    def __init__(self, config: ServiceConfig) -> None:
+        super().__init__(running=False)
+        self.config = config.jail_config()
+        self.error = UnrewindableConfig(
+            [RewindProblem("channels.whatsapp", "its session cannot be rewound")]
+        )
+
+    def ensure_network(self) -> None:
+        self.calls.append("ensure_network")
+
+    def prepare_workspace(self) -> None:
+        self.calls.append("prepare_workspace")
+
+    def write_config(self) -> None:
+        self.calls.append("write_config")
+        raise self.error
+
+
+class QuietStore:
+    """The part of SnapshotStore the boot uses before the jail: nothing to recover."""
+
+    def init(self) -> None:
+        pass
+
+    def recover(self) -> list[object]:
+        return []
+
+    def workspace_id(self) -> int:
+        return 256
+
+
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.sent: list[Alert] = []
+
+    def send(self, alert: Alert) -> None:
+        self.sent.append(alert)
+
+
+def test_an_unrewindable_config_is_recorded_and_its_notice_is_delivered(
+    config: ServiceConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole way of `vigia vigilar`: the guardian records why it did not start, the alert
+    queue hands the Spanish notice to the notifier before serve() returns, and the error
+    reaches the caller. (Reading the workspace's counters needs btrfs: skipped here.)"""
+    monkeypatch.setattr(Guardian, "_note_downtime", lambda self: None)
+    jail = UnrewindableJail(config)
+    notifier = RecordingNotifier()
+    with pytest.raises(UnrewindableConfig) as raised:
+        serve(
+            config,
+            jail=jail,  # type: ignore[arg-type]
+            notifier=notifier,
+            store=QuietStore(),  # type: ignore[arg-type]
+            handle_signals=False,
+        )
+    assert raised.value is jail.error  # `vigia vigilar` prints its notice too
+    assert "create" not in jail.calls and "start" not in jail.calls
+    (alert,) = [sent for sent in notifier.sent if sent.body == jail.error.notice]
+    assert alert.level is AlertLevel.ERROR
+    assert "channels.whatsapp" in alert.body
+    box = BlackBox(config.blackbox_db, key=load_key(config.blackbox_key))
+    box.open()
+    try:
+        (failed,) = [event for event in box.events() if event.action == "service_start_failed"]
+    finally:
+        box.close()
+    assert alert.event_seq == failed.seq
+    assert failed.details["reason"] == "unrewindable_config"
+    assert failed.details["problems"] == ["channels.whatsapp"]
+    take_lock(config.lock_file).close()  # and the lock is free again
