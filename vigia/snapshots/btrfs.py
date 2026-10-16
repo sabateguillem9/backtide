@@ -3,14 +3,24 @@
 - Every command runs with a fixed argv, never through a shell, with ``LC_ALL=C`` (so error
   messages are stable) and a timeout. Nothing here calls sudo: commands run with whatever
   privileges the process has.
+- Privileges: only set_qgroup_limit needs CAP_SYS_ADMIN (the kernel refuses
+  BTRFS_IOC_QGROUP_LIMIT otherwise, and btrfs reports "Operation not permitted"). Everything
+  else works for the unprivileged owner of the subvolumes on a volume mounted with
+  ``user_subvol_rm_allowed``. Code that runs unprivileged, like the VM tests, does not call
+  set_qgroup_limit: it gets a setter built on qgroup_limit_args injected instead.
+- Quotas are simple quotas (squota), enabled when the volume is formatted. Usage and limits
+  are read from /sys/fs/btrfs without privileges (``btrfs qgroup show`` needs root), and the
+  filesystem's UUID comes from the unprivileged BTRFS_IOC_FS_INFO ioctl.
+- Never runs ``btrfs qgroup destroy`` or ``clear-stale``: on kernels before 7.1, freeing an
+  extent whose owner qgroup is gone aborts the transaction and the volume turns read-only.
 - Paths must be absolute (otherwise ValueError), so a path can never be read as an option.
 - The CLI follows a symlink in the last component (``property`` opens the path, ``subvolume
   delete`` calls realpath and deletes the target). So the functions that read or change a
   subvolume refuse a symlink there, and delete_subvolume refuses anything but a subvolume root.
   The check and the command are two steps: this stops bugs and tampering done beforehand, not
   someone renaming entries concurrently in a directory they can write to.
-- Never parses ``subvolume list`` or ``subvolume show``: they need root and have no JSON
-  output in btrfs-progs 6.19.
+- Never parses ``subvolume list``, ``subvolume show`` or ``qgroup show``: they need root and
+  have no JSON output in btrfs-progs 6.19 (``qgroup show`` has, but still needs root).
 - When a command fails or times out, the operation may or may not have happened. Callers
   check the postcondition they need (the store does).
 - The store calls these as ``btrfs.<fn>``, so unit tests can monkeypatch them or
@@ -20,6 +30,7 @@
 
 import ctypes
 import errno
+import fcntl
 import functools
 import logging
 import os
@@ -27,11 +38,13 @@ import re
 import shlex
 import stat
 import subprocess
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Literal, NoReturn
 
 from vigia.snapshots.model import SnapshotError, SnapshotNoSpace
 
@@ -42,10 +55,24 @@ SUBVOLUME_ROOT_INO = 256  # the root directory of every btrfs subvolume has this
 RENAME_NOREPLACE = 1
 RENAME_EXCHANGE = 2
 
+SYSFS_BTRFS = Path("/sys/fs/btrfs")
+# _IOR(0x94, 31, struct btrfs_ioctl_fs_info_args): 1024 bytes, the fsid at bytes 16..32.
+BTRFS_IOC_FS_INFO = 0x8400941F
+_FS_INFO_SIZE = 1024
+_FS_INFO_FSID = slice(16, 32)
+# limit_flags bits (BTRFS_QGROUP_LIMIT_MAX_*): which of max_referenced/max_exclusive apply.
+QGROUP_LIMIT_MAX_RFER = 1
+QGROUP_LIMIT_MAX_EXCL = 2
+_U64_MAX = 2**64 - 1  # `qgroup limit none` sends this value, so it is never a valid limit
+
+type QuotaMode = Literal["squota", "qgroup"]
+
 _NO_SPACE_STDERR = {"No space left on device": errno.ENOSPC, "Disk quota exceeded": errno.EDQUOT}
 _NO_SPACE_ERRNOS = frozenset(_NO_SPACE_STDERR.values())
 _ROOT_ID_RE = re.compile(r"([1-9][0-9]*)\n", re.ASCII)
+_U64_RE = re.compile(r"(0|[1-9][0-9]*)\n", re.ASCII)
 _READONLY_OUTPUT = {"ro=true\n": True, "ro=false\n": False}
+_QUOTA_MODES: dict[str, QuotaMode] = {"squota\n": "squota", "qgroup\n": "qgroup"}
 
 # File descriptors every btrfs child inherits (see children_hold).
 _held_fds: ContextVar[tuple[int, ...]] = ContextVar("_held_fds", default=())
@@ -204,6 +231,156 @@ def is_subvolume(path: Path) -> bool:
     except OSError as e:
         raise SnapshotError(f"cannot stat {path}: {e}", errno=e.errno) from e
     return stat.S_ISDIR(st.st_mode) and st.st_ino == SUBVOLUME_ROOT_INO
+
+
+@dataclass(frozen=True)
+class QgroupUsage:
+    """A subvolume's level-0 qgroup, as /sys/fs/btrfs shows it. Bytes, except limit_flags.
+
+    Under simple quotas ``referenced == exclusive``: data and fs-tree blocks the subvolume
+    allocated and that are still on disk. Each value is read separately, so they may come
+    from slightly different moments."""
+
+    referenced: int
+    exclusive: int
+    limit_flags: int
+    max_referenced: int
+    max_exclusive: int
+
+    @property
+    def limit(self) -> int | None:
+        """The referenced limit (the one qgroup_limit_args sets), or None if there is none."""
+        return self.max_referenced if self.limit_flags & QGROUP_LIMIT_MAX_RFER else None
+
+    @property
+    def exclusive_limit(self) -> int | None:
+        """The exclusive limit (``qgroup limit -e``), or None. Vigía never sets one, but it
+        caps writes just the same, so "no cap" means both limits are None."""
+        return self.max_exclusive if self.limit_flags & QGROUP_LIMIT_MAX_EXCL else None
+
+
+def qgroup_limit_args(path: Path, limit: int | None) -> tuple[str, ...]:
+    """The argv after ``btrfs`` that sets (or, with None, lifts) the referenced limit of the
+    subvolume at ``path``. Pure: no I/O, so a caller with other privileges can run it.
+
+    The two-argument form, ``qgroup limit <bytes>|none <path>``: btrfs-progs checks that
+    ``path`` is a subvolume root and limits that subvolume's own qgroup (0/<its id>)."""
+    path = _absolute(path)
+    token = "none" if limit is None else str(_valid_limit(limit))
+    return ("qgroup", "limit", token, str(path))
+
+
+def set_qgroup_limit(path: Path, limit: int | None) -> None:
+    """Set (or, with None, lift) the referenced limit of the subvolume at ``path``.
+
+    Needs CAP_SYS_ADMIN. Refuses a symlink, whose target btrfs would limit, and anything that
+    is not a subvolume root, before running anything."""
+    args = qgroup_limit_args(path, limit)  # validates first: no I/O on bad input
+    path = _absolute(path)
+    _refuse_symlink(path)
+    if not is_subvolume(path):
+        raise SnapshotError(
+            f"refusing to limit {path}: not a subvolume root (missing, a plain directory or a file)"
+        )
+    run(*args)
+
+
+def fsid(path: Path) -> str:
+    """The UUID of the btrfs that holds the directory ``path``: the name of its directory in
+    /sys/fs/btrfs. Unprivileged (BTRFS_IOC_FS_INFO has no capability check). Refuses a
+    symlink."""
+    path = _absolute(path)
+    _refuse_symlink(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise SnapshotError(f"cannot open {path}: {e}", errno=e.errno) from e
+    info = bytearray(_FS_INFO_SIZE)
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_FS_INFO, info)
+    except OSError as e:
+        raise SnapshotError(f"BTRFS_IOC_FS_INFO on {path} failed: {e}", errno=e.errno) from e
+    finally:
+        os.close(fd)
+    return str(uuid.UUID(bytes=bytes(info[_FS_INFO_FSID])))
+
+
+def quota_mode(path: Path, *, sysfs: Path = SYSFS_BTRFS) -> QuotaMode | None:
+    """``"squota"`` (simple quotas), ``"qgroup"`` (full qgroups) or None (quotas off) for the
+    btrfs that holds ``path``. Unprivileged."""
+    path = _absolute(path)
+    qgroups = _fs_dir(path, sysfs) / "qgroups"
+    if not _exists(qgroups):  # the kernel removes qgroups/ when quotas are disabled
+        return None
+    text = _read_sysfs(qgroups / "mode")
+    if text not in _QUOTA_MODES:
+        raise SnapshotError(f"unexpected content in {qgroups / 'mode'}: {text!r}")
+    return _QUOTA_MODES[text]
+
+
+def qgroup_usage(path: Path, *, sysfs: Path = SYSFS_BTRFS) -> QgroupUsage:
+    """Usage and limits of the qgroup of the subvolume at ``path``. Unprivileged.
+
+    Refuses anything that is not a subvolume root: a plain directory would report the qgroup of
+    the subvolume that contains it. SnapshotError if quotas are off (no qgroup directory) or a
+    value is not a decimal u64."""
+    path = _absolute(path)
+    if not is_subvolume(path):
+        raise SnapshotError(
+            f"cannot read the qgroup of {path}: not a subvolume root "
+            "(missing, a plain directory, a file or a symlink)"
+        )
+    qgroup = _fs_dir(path, sysfs) / "qgroups" / f"0_{subvolume_id(path)}"
+    if not _exists(qgroup):
+        raise SnapshotError(f"{qgroup} is missing: are quotas enabled on {path}?")
+    return QgroupUsage(
+        referenced=_read_u64(qgroup / "referenced"),
+        exclusive=_read_u64(qgroup / "exclusive"),
+        limit_flags=_read_u64(qgroup / "limit_flags"),
+        max_referenced=_read_u64(qgroup / "max_referenced"),
+        max_exclusive=_read_u64(qgroup / "max_exclusive"),
+    )
+
+
+def _valid_limit(limit: object) -> int:
+    # bool is an int subclass: True would silently become a 1-byte cap.
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 0 < limit < _U64_MAX:
+        raise ValueError(f"a qgroup limit must be an int of bytes in [1, 2**64 - 2], got {limit!r}")
+    return limit
+
+
+def _fs_dir(path: Path, sysfs: Path) -> Path:
+    """/sys/fs/btrfs/<fsid> of the btrfs that holds ``path``. It always exists for a mounted
+    btrfs, so a missing one means sysfs is not what this code expects."""
+    directory = sysfs / fsid(path)
+    if not _exists(directory):
+        raise SnapshotError(f"{directory} is missing: is sysfs mounted?")
+    return directory
+
+
+def _exists(path: Path) -> bool:
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise SnapshotError(f"cannot stat {path}: {e}", errno=e.errno) from e
+    return True
+
+
+def _read_sysfs(path: Path) -> str:
+    try:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError as e:
+        raise SnapshotError(f"cannot read {path}: {e}", errno=e.errno) from e
+
+
+def _read_u64(path: Path) -> int:
+    text = _read_sysfs(path)
+    match = _U64_RE.fullmatch(text)
+    if match is None or int(match.group(1)) > _U64_MAX:
+        raise SnapshotError(f"unexpected content in {path}: {text!r}")
+    return int(match.group(1))
 
 
 def renameat2(dir_fd: int, old: str, new: str, flags: int) -> None:

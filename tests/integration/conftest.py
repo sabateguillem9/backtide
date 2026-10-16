@@ -1,10 +1,19 @@
 """A real, throwaway Btrfs for the VM integration tests, mounted from a sparse file.
 
-Everything runs as the unprivileged Lima user except exactly three ``sudo -n`` commands:
-``mount -o loop,...,user_subvol_rm_allowed``, ``chown`` and ``umount`` (plus ``sudo -n true``,
-which only checks that sudo works without a password). Every path comes from
-``tmp_path_factory`` (never from the environment), and before unmounting the fixture checks
-in /proc/self/mountinfo that the mount point is the btrfs loop mount of its own image.
+Everything runs as the unprivileged Lima user except exactly four ``sudo -n`` commands:
+``mount -o loop,...,user_subvol_rm_allowed``, ``chown``, ``umount`` and, only on a
+``quota_volume``, ``btrfs qgroup limit <bytes>|none <path>`` (plus ``sudo -n true``, which only
+checks that sudo works without a password). Every path comes from ``tmp_path_factory`` (never
+from the environment), and before unmounting the fixture checks in /proc/self/mountinfo that
+the mount point is the btrfs loop mount of its own image. ``qgroup limit`` is checked in the
+one function that runs it (_sudo_btrfs, whoever calls it): exactly that argv and nothing else,
+the loop mount of a test image, and a canonical path (no symlink anywhere) that is a
+subvolume root strictly inside that mount, on that same btrfs. test_quota_volume.py tests
+each refusal.
+
+Simple quotas are enabled by the unprivileged ``mkfs.btrfs -O squota`` on the image, so
+``btrfs quota enable --simple`` is never needed. The tests never run ``btrfs qgroup destroy``
+or ``clear-stale``: on kernel 6.19 a missing owner qgroup aborts the transaction.
 
 The fixtures are lazy: importing this file (the Mac imports it for ``make test``) never runs
 sudo or btrfs. They refuse to run anywhere but the vigia-dev Lima VM (checked by hostname), so
@@ -46,6 +55,7 @@ import pytest
 
 from vigia.jail import IMAGE, AgentJail, AgentJailConfig, JailError
 from vigia.jail import docker as jail_docker
+from vigia.snapshots import SnapshotError, btrfs
 from vigia.snapshots.store import SnapshotStore
 
 GIB = 1024**3
@@ -53,8 +63,10 @@ MOUNT_OPTIONS = "loop,noatime,nosuid,nodev,user_subvol_rm_allowed"
 COMMAND_TIMEOUT = 60.0
 VM_HOSTNAME = "lima-vigia-dev"  # Lima names the guest lima-<instance>; see VM in the Makefile
 OWNER_LOCK = "owner.lock"
+VOLUME_IMAGE = "volume.img"  # the sparse file behind each test btrfs, next to its mount point
 SUDO_HINT = "integration tests need passwordless sudo in the VM to mount a loop btrfs"
 _OCTAL_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
+_DECIMAL_RE = re.compile(r"[1-9][0-9]{0,19}", re.ASCII)  # up to 2**64 - 1: 20 digits
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,61 @@ def tiny_btrfs_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     /tmp (tmpfs) stays sparse and the VM's RAM is not used up."""
     with _mounted_btrfs(tmp_path_factory.mktemp("tiny-btrfs"), GIB) as mnt:
         yield mnt
+
+
+@dataclass(frozen=True)
+class QuotaVolume:
+    """A fresh btrfs with simple quotas (see ``quota_volume``). ``image_file`` is the file
+    behind it, readable by the test user (``btrfs inspect-internal dump-tree`` reads it)."""
+
+    mnt: Path
+    image_file: Path
+
+    def set_limit(self, path: Path, limit: int | None) -> None:
+        """Set (or, with None, lift) the referenced limit of the subvolume at ``path``.
+
+        Runs ``sudo -n btrfs qgroup limit <bytes>|none <path>``: the production argv
+        (btrfs.qgroup_limit_args) with only the sudo prefix. Only on a canonical path that is a
+        subvolume root strictly inside ``mnt``, on this same btrfs; anything else is refused
+        before sudo runs. Raises SnapshotError, or SnapshotNoSpace for ENOSPC/EDQUOT, like
+        btrfs.set_qgroup_limit, so it can be injected wherever that one is expected."""
+        args = btrfs.qgroup_limit_args(path, limit)  # ValueError for a relative path or limit
+        _sudo_btrfs(self.mnt, args)
+
+
+@pytest.fixture
+def quota_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[QuotaVolume]:
+    """A fresh 1 GiB btrfs per test, formatted with simple quotas (``mkfs.btrfs -O squota``,
+    without sudo), and the one privileged quota command bound to it (``set_limit``).
+
+    Fill it like ``tiny_btrfs_volume``. Every subvolume gets its qgroup 0/<id> without limit;
+    usage and limits are read without privileges with btrfs.qgroup_usage.
+
+    The quota spike writes real data and metadata, so the image (on the VM's tmpfs, in RAM) is
+    deleted once it is unmounted, instead of waiting for pytest's retention."""
+    base = tmp_path_factory.mktemp("quota-btrfs").resolve()
+    image_file = base / VOLUME_IMAGE
+    with _mounted_btrfs(base, GIB, squota=True) as mnt:
+        mode = btrfs.quota_mode(mnt)
+        if mode != "squota":
+            pytest.fail(f"mkfs.btrfs -O squota gave quota mode {mode!r} on {mnt}, not 'squota'")
+        yield QuotaVolume(mnt, image_file)
+    image_file.unlink()  # only reached after a checked, successful unmount
+
+
+@pytest.fixture
+def sudo_btrfs() -> Callable[[Path, tuple[str, ...]], None]:
+    """The one privileged quota command behind QuotaVolume.set_limit, for the tests of its own
+    guard (test_quota_volume.py). Every other test goes through set_limit."""
+    return _sudo_btrfs
+
+
+@pytest.fixture(scope="session")
+def agent_image() -> str:
+    """The pinned OpenClaw image, pulled if the VM does not have it yet, for tests that start a
+    throwaway container of their own instead of ``running_agent``."""
+    _require_agent_image()
+    return IMAGE
 
 
 @pytest.fixture
@@ -261,20 +328,22 @@ def _remove_agent(jail: AgentJail) -> None:
 
 
 @contextmanager
-def _mounted_btrfs(base: Path, size: int) -> Iterator[Path]:
+def _mounted_btrfs(base: Path, size: int, *, squota: bool = False) -> Iterator[Path]:
     """Format a sparse ``size``-byte image in ``base`` and mount it at ``base/mnt``.
 
     ``base`` must come from ``tmp_path_factory.mktemp``, so its parent is this session's
-    pytest base directory."""
+    pytest base directory. ``squota`` formats it with simple quotas enabled (mkfs runs on the
+    image file, so it needs no privileges)."""
     base = base.resolve()  # mountinfo and the loop device report resolved paths
     _require_dev_vm_user_with_sudo()
-    img, mnt = base / "volume.img", base / "mnt"
+    img, mnt = base / VOLUME_IMAGE, base / "mnt"
     with _owner_lock(base):  # taken before the mount exists, released after it is gone
         _fail_on_stale_mounts(session_dir=base.parent)
         mnt.mkdir()
         with open(img, "xb") as image:  # x: never reuse or overwrite an existing file
             image.truncate(size)
-        _run([_require_binary("mkfs.btrfs"), "-q", "-L", "vigia-test", str(img)])
+        features = ["-O", "squota"] if squota else []
+        _run([_require_binary("mkfs.btrfs"), "-q", "-L", "vigia-test", *features, str(img)])
         _sudo("mount", "-o", MOUNT_OPTIONS, str(img), str(mnt))
         try:
             _sudo("chown", f"{os.getuid()}:{os.getgid()}", str(mnt))
@@ -413,8 +482,98 @@ def _require_binary(name: str) -> str:
 
 
 def _sudo(*args: str) -> None:
-    """The only privileged commands: mount, chown and umount (see the module docstring)."""
+    """mount, chown and umount: with _sudo_btrfs, the only privileged commands (see the
+    module docstring)."""
     _run(["sudo", "-n", *args])
+
+
+def _require_qgroup_limit_args(args: tuple[str, ...]) -> Path:
+    """Refuse (SnapshotError) anything but exactly ``("qgroup", "limit", <bytes>|"none",
+    <absolute path>)``, character for character as btrfs.qgroup_limit_args builds it: no other
+    subcommand (never ``destroy`` or ``clear-stale``), no options, no qgroup ids and no
+    spelling of a number or a path that the round trip changes. Returns the path."""
+    if (
+        not isinstance(args, tuple)
+        or len(args) != 4
+        or not all(isinstance(arg, str) for arg in args)
+        or args[:2] != ("qgroup", "limit")
+    ):
+        raise SnapshotError(f"refusing sudo btrfs {args!r}: only 'qgroup limit' is allowed")
+    value, path = args[2], Path(args[3])
+    if value != "none" and not _DECIMAL_RE.fullmatch(value):
+        raise SnapshotError(f"refusing sudo btrfs {args!r}: the limit must be bytes or 'none'")
+    limit = None if value == "none" else int(value)
+    try:
+        expected = btrfs.qgroup_limit_args(path, limit)
+    except ValueError as e:
+        raise SnapshotError(f"refusing sudo btrfs {args!r}: {e}") from e
+    if args != expected:
+        raise SnapshotError(f"refusing sudo btrfs {args!r}: not the form {expected!r}")
+    return path
+
+
+def _require_test_mount(mnt: Path) -> None:
+    """Refuse (SnapshotError) unless ``mnt`` is the mount point of a test btrfs: canonical,
+    under a pytest-of-* directory, and the btrfs loop mount of the image next to it (the
+    check _unmount makes before its sudo)."""
+    mnt = Path(mnt)
+    mount = _mount_at(mnt) if Path(os.path.realpath(mnt)) == mnt else None
+    if (
+        mount is None
+        or mount.fs_type != "btrfs"
+        or not any(part.startswith("pytest-of-") for part in mnt.parts)
+        or _loop_backing_file(mount.source) != mnt.parent / VOLUME_IMAGE
+    ):
+        raise SnapshotError(f"refusing sudo on {mnt}: not the mount point of a test btrfs")
+
+
+def _require_own_subvolume(mnt: Path, path: Path) -> None:
+    """Refuse (SnapshotError) unless ``path`` is canonical (absolute, no symlink, ``.`` or
+    ``..`` anywhere), a subvolume root, strictly inside ``mnt`` (never the top-level subvolume
+    0/5) and on the same btrfs as ``mnt``. Called right before sudo runs on ``path``."""
+    path = Path(path)
+    real = Path(os.path.realpath(path))
+    if real != path:
+        raise SnapshotError(f"refusing sudo on {path}: not canonical (it resolves to {real})")
+    if real == mnt or not real.is_relative_to(mnt):
+        raise SnapshotError(f"refusing sudo on {path}: not strictly inside the test mount {mnt}")
+    if not btrfs.is_subvolume(path):  # also False for a symlink or a missing path
+        raise SnapshotError(f"refusing sudo on {path}: not a subvolume root")
+    if btrfs.fsid(path) != btrfs.fsid(mnt):
+        raise SnapshotError(f"refusing sudo on {path}: not on the btrfs mounted at {mnt}")
+
+
+def _sudo_btrfs(mnt: Path, args: tuple[str, ...]) -> None:
+    """``sudo -n btrfs qgroup limit <bytes>|none <path>``, and nothing else, on a subvolume of
+    the test btrfs mounted at ``mnt``. Everything is checked here, before sudo runs, whoever
+    the caller: the exact argv (_require_qgroup_limit_args), the mount (_require_test_mount)
+    and the path (_require_own_subvolume); a refusal is a SnapshotError.
+
+    Runs with btrfs.run's conventions (fixed argv, LC_ALL=C, timeout) and its error mapping:
+    SnapshotError, or SnapshotNoSpace for ENOSPC/EDQUOT."""
+    path = _require_qgroup_limit_args(args)
+    _require_test_mount(mnt)
+    _require_own_subvolume(mnt, path)
+    argv = ["sudo", "-n", "btrfs", *args]
+    command = shlex.join(argv)
+    try:
+        result = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=COMMAND_TIMEOUT,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.TimeoutExpired as e:
+        raise SnapshotError(f"{command} timed out after {COMMAND_TIMEOUT} s") from e
+    except OSError as e:
+        raise SnapshotError(f"cannot run {command}: {e}", errno=e.errno) from e
+    if result.returncode != 0:
+        btrfs._raise_failure(command, result.returncode, result.stderr.strip())
 
 
 def _run(argv: list[str]) -> None:

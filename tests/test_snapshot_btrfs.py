@@ -2,11 +2,13 @@
 
 import ctypes
 import errno
+import fcntl
 import logging
 import os
 import stat
 import subprocess
 import sys
+import uuid
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ import pytest
 from vigia.snapshots import SnapshotError, SnapshotNoSpace, btrfs
 
 linux_only = pytest.mark.skipif(sys.platform != "linux", reason="needs glibc renameat2")
+MIB = 1024**2
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,18 @@ def delete(base: Path, name: str) -> list[str]:
             [("inspect-internal", "rootid", "@ws")],
             id="rootid",
         ),
+        pytest.param(
+            lambda d: btrfs.set_qgroup_limit(d / "subvol", 256 * MIB),
+            [],
+            [("qgroup", "limit", "268435456", "@subvol")],
+            id="qgroup-limit",
+        ),
+        pytest.param(
+            lambda d: btrfs.set_qgroup_limit(d / "subvol", None),
+            [],
+            [("qgroup", "limit", "none", "@subvol")],
+            id="qgroup-limit-none",
+        ),
     ],
 )
 def test_exact_argv(
@@ -259,6 +274,12 @@ def test_missing_btrfs_binary_raises_snapshot_error(recorder: Recorder) -> None:
         pytest.param(lambda: btrfs.subvolume_id(Path("ws")), id="rootid"),
         pytest.param(lambda: btrfs.is_subvolume(Path("ws")), id="is-subvolume"),
         pytest.param(lambda: btrfs.run("subvolume", "create", Path("ws")), id="run"),
+        pytest.param(lambda: btrfs.qgroup_limit_args(Path("ws"), MIB), id="qgroup-limit-args"),
+        pytest.param(lambda: btrfs.set_qgroup_limit(Path("ws"), MIB), id="qgroup-limit"),
+        pytest.param(lambda: btrfs.set_qgroup_limit(Path("ws"), None), id="qgroup-limit-none"),
+        pytest.param(lambda: btrfs.fsid(Path("ws")), id="fsid"),
+        pytest.param(lambda: btrfs.quota_mode(Path("ws")), id="quota-mode"),
+        pytest.param(lambda: btrfs.qgroup_usage(Path("ws")), id="qgroup-usage"),
     ],
 )
 def test_relative_paths_raise_value_error_before_any_subprocess(
@@ -821,3 +842,403 @@ def test_renameat2_noreplace_moves_to_a_new_name(tmp_path: Path, dir_fd: int) ->
     btrfs.renameat2(dir_fd, "a", "sub/.incoming-a", btrfs.RENAME_NOREPLACE)
     assert not (tmp_path / "a").exists()
     assert (tmp_path / "sub" / ".incoming-a" / "marker-a").exists()
+
+
+# --- quotas: qgroup limit --------------------------------------------------------------------
+
+U64_MAX = 2**64 - 1  # what `btrfs qgroup limit none` sends: never a valid limit
+
+
+@pytest.mark.parametrize(
+    ("limit", "token"),
+    [
+        (1, "1"),
+        (256 * MIB, "268435456"),
+        (U64_MAX - 1, "18446744073709551614"),
+        (None, "none"),
+    ],
+)
+def test_qgroup_limit_args_is_the_two_argument_form(limit: int | None, token: str) -> None:
+    assert btrfs.qgroup_limit_args(Path("/vol/ws"), limit) == ("qgroup", "limit", token, "/vol/ws")
+
+
+def test_qgroup_limit_args_never_touches_the_filesystem(recorder: Recorder) -> None:
+    # Pure: the path does not exist, and nothing is run or checked.
+    assert btrfs.qgroup_limit_args(Path("/nowhere/ws"), MIB)[-1] == "/nowhere/ws"
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize(
+    "limit",
+    [True, False, 0, -1, -MIB, 1.0, 1.5, "100", "none", b"1", U64_MAX, U64_MAX + 1],
+    ids=repr,
+)
+def test_qgroup_limit_args_rejects_anything_but_a_positive_int(limit: object) -> None:
+    with pytest.raises(ValueError, match="limit"):
+        btrfs.qgroup_limit_args(Path("/vol/ws"), limit)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("limit", [True, 0, -1, 1.5, U64_MAX])
+def test_set_qgroup_limit_rejects_a_bad_limit_before_any_subprocess(
+    recorder: Recorder, snap: Path, limit: object
+) -> None:
+    with pytest.raises(ValueError, match="limit"):
+        btrfs.set_qgroup_limit(snap, limit)  # type: ignore[arg-type]
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda p: p.mkdir(), id="plain-directory"),
+        pytest.param(lambda p: p.touch(), id="file"),
+        pytest.param(lambda p: None, id="missing"),
+        pytest.param(lambda p: p.symlink_to(p.parent / "real-dir"), id="symlink-to-directory"),
+        pytest.param(lambda p: p.symlink_to(p.parent / "nowhere"), id="dangling-symlink"),
+    ],
+)
+@pytest.mark.parametrize("limit", [MIB, None])
+def test_set_qgroup_limit_refuses_anything_but_a_subvolume_root_before_any_subprocess(
+    recorder: Recorder, tmp_path: Path, make: Callable[[Path], None], limit: int | None
+) -> None:
+    (tmp_path / "real-dir").mkdir()
+    make(tmp_path / "ws")
+    with pytest.raises(SnapshotError, match="refusing"):
+        btrfs.set_qgroup_limit(tmp_path / "ws", limit)
+    assert recorder.calls == []
+
+
+def test_set_qgroup_limit_refuses_a_symlink_to_a_subvolume_root(
+    recorder: Recorder, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # btrfs would follow it and limit (or uncap) the target instead.
+    fake_lstat(monkeypatch, tmp_path / "workspace", SUBVOLUME_ROOT)
+    (tmp_path / "workspace").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "workspace")
+    with pytest.raises(SnapshotError, match="symlink") as info:
+        btrfs.set_qgroup_limit(tmp_path / "link", None)
+    assert info.value.errno == errno.ELOOP
+    assert recorder.calls == []
+
+
+def test_set_qgroup_limit_without_cap_sys_admin_is_a_snapshot_error(
+    recorder: Recorder, snap: Path
+) -> None:
+    recorder.then(
+        Reply(
+            stderr="ERROR: unable to limit requested quota group: Operation not permitted\n",
+            returncode=1,
+        )
+    )
+    with pytest.raises(SnapshotError, match="Operation not permitted") as info:
+        btrfs.set_qgroup_limit(snap, MIB)
+    assert not isinstance(info.value, SnapshotNoSpace)
+    assert f"btrfs qgroup limit 1048576 {snap}" in str(info.value)
+
+
+def test_set_qgroup_limit_with_quotas_off_is_a_snapshot_error(
+    recorder: Recorder, snap: Path
+) -> None:
+    recorder.then(
+        Reply(
+            stderr="ERROR: unable to limit requested quota group: quota not enabled\n", returncode=1
+        )
+    )
+    with pytest.raises(SnapshotError, match="quota not enabled") as info:
+        btrfs.set_qgroup_limit(snap, None)
+    assert not isinstance(info.value, SnapshotNoSpace)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "code"),
+    [("No space left on device", errno.ENOSPC), ("Disk quota exceeded", errno.EDQUOT)],
+)
+def test_set_qgroup_limit_out_of_space_is_snapshot_no_space(
+    recorder: Recorder, snap: Path, stderr: str, code: int
+) -> None:
+    recorder.then(
+        Reply(stderr=f"ERROR: unable to limit requested quota group: {stderr}\n", returncode=1)
+    )
+    with pytest.raises(SnapshotNoSpace) as info:
+        btrfs.set_qgroup_limit(snap, MIB)
+    assert info.value.errno == code
+
+
+def test_set_qgroup_limit_follows_the_run_conventions(recorder: Recorder, snap: Path) -> None:
+    with btrfs.children_hold(7):
+        btrfs.set_qgroup_limit(snap, MIB)
+    (call,) = recorder.calls
+    assert call.kwargs["timeout"] == btrfs.DEFAULT_TIMEOUT
+    assert call.kwargs["pass_fds"] == (7,)
+    env = call.kwargs["env"]
+    assert isinstance(env, dict)
+    assert env["LC_ALL"] == "C"
+
+
+# --- quotas: fsid ----------------------------------------------------------------------------
+
+FSID = "6f8c00f2-c2dd-4f3f-a7f1-89ab816842a5"
+
+
+class FakeIoctl:
+    """Stands in for fcntl.ioctl: answers BTRFS_IOC_FS_INFO with FSID at bytes 16..32, or
+    raises ``error``. Records the fd, request and buffer size of every call."""
+
+    def __init__(self, error: OSError | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[int, int, int]] = []
+
+    def __call__(self, fd: int, request: int, arg: bytearray, mutate: bool = True) -> int:
+        self.calls.append((fd, request, len(arg)))
+        if self.error is not None:
+            raise self.error
+        arg[16:32] = uuid.UUID(FSID).bytes
+        arg[0:8] = (1).to_bytes(8, "little")  # max_id: anything outside the fsid is ignored
+        return 0
+
+
+def use_fake_ioctl(monkeypatch: pytest.MonkeyPatch, error: OSError | None = None) -> FakeIoctl:
+    fake = FakeIoctl(error)
+    monkeypatch.setattr(fcntl, "ioctl", fake)
+    return fake
+
+
+def test_fsid_reads_the_uuid_from_fs_info(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    fake = use_fake_ioctl(monkeypatch)
+    assert btrfs.fsid(tmp_path) == FSID
+    ((fd, request, size),) = fake.calls
+    assert request == btrfs.BTRFS_IOC_FS_INFO == 0x8400941F
+    assert size == 1024  # sizeof(struct btrfs_ioctl_fs_info_args)
+    with pytest.raises(OSError) as closed:
+        os.fstat(fd)
+    assert closed.value.errno == errno.EBADF
+
+
+def test_fsid_failure_is_a_snapshot_error_and_closes_the_fd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = use_fake_ioctl(monkeypatch, OSError(errno.ENOTTY, "Inappropriate ioctl for device"))
+    with pytest.raises(SnapshotError, match="FS_INFO") as info:
+        btrfs.fsid(tmp_path)
+    assert info.value.errno == errno.ENOTTY
+    ((fd, _, _),) = fake.calls
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda p: p.symlink_to(p.parent / "real-dir"), id="symlink"),
+        pytest.param(lambda p: None, id="missing"),
+        pytest.param(lambda p: p.touch(), id="file"),
+    ],
+)
+def test_fsid_refuses_symlinks_and_anything_but_a_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, make: Callable[[Path], None]
+) -> None:
+    fake = use_fake_ioctl(monkeypatch)
+    (tmp_path / "real-dir").mkdir()
+    make(tmp_path / "x")
+    with pytest.raises(SnapshotError):
+        btrfs.fsid(tmp_path / "x")
+    assert fake.calls == []
+
+
+# --- quotas: sysfs readers -------------------------------------------------------------------
+
+QGROUP_FILES = ("referenced", "exclusive", "limit_flags", "max_referenced", "max_exclusive")
+
+
+@pytest.fixture
+def sysfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fake /sys/fs/btrfs with this filesystem's directory; fsid() returns FSID."""
+    root = tmp_path / "sys-fs-btrfs"
+    (root / FSID).mkdir(parents=True)
+    monkeypatch.setattr(btrfs, "fsid", lambda path: FSID)
+    return root
+
+
+def write_mode(sysfs: Path, text: str) -> None:
+    (sysfs / FSID / "qgroups").mkdir(exist_ok=True)
+    (sysfs / FSID / "qgroups" / "mode").write_text(text)
+
+
+def write_qgroup(sysfs: Path, name: str, **values: str) -> Path:
+    """``qgroups/<name>/`` with every file: ``values`` overrides the defaults (decimal + \\n)."""
+    directory = sysfs / FSID / "qgroups" / name
+    directory.mkdir(parents=True)
+    defaults = dict.fromkeys(QGROUP_FILES, "0\n")
+    for file, text in (defaults | values).items():
+        (directory / file).write_text(text)
+    return directory
+
+
+def test_sysfs_root_is_the_kernel_one_by_default() -> None:
+    assert Path("/sys/fs/btrfs") == btrfs.SYSFS_BTRFS
+
+
+@pytest.mark.parametrize(("text", "mode"), [("squota\n", "squota"), ("qgroup\n", "qgroup")])
+def test_quota_mode_reads_sysfs(sysfs: Path, tmp_path: Path, text: str, mode: str) -> None:
+    write_mode(sysfs, text)
+    assert btrfs.quota_mode(tmp_path, sysfs=sysfs) == mode
+
+
+def test_quota_mode_is_none_when_quotas_are_off(sysfs: Path, tmp_path: Path) -> None:
+    # The kernel removes qgroups/ when quotas are disabled.
+    assert btrfs.quota_mode(tmp_path, sysfs=sysfs) is None
+
+
+def test_quota_mode_without_the_filesystem_directory_is_an_error(
+    sysfs: Path, tmp_path: Path
+) -> None:
+    (sysfs / FSID).rmdir()
+    with pytest.raises(SnapshotError, match=FSID):
+        btrfs.quota_mode(tmp_path, sysfs=sysfs)
+
+
+def test_quota_mode_without_the_mode_file_is_an_error(sysfs: Path, tmp_path: Path) -> None:
+    (sysfs / FSID / "qgroups").mkdir()
+    with pytest.raises(SnapshotError, match="mode"):
+        btrfs.quota_mode(tmp_path, sysfs=sysfs)
+
+
+@pytest.mark.parametrize(
+    "text", ["", "\n", "squota", "SQUOTA\n", " squota\n", "squota\n\n", "disabled\n", "simple\n"]
+)
+def test_quota_mode_rejects_anything_else(sysfs: Path, tmp_path: Path, text: str) -> None:
+    write_mode(sysfs, text)
+    with pytest.raises(SnapshotError, match="unexpected"):
+        btrfs.quota_mode(tmp_path, sysfs=sysfs)
+
+
+@pytest.fixture
+def subvol(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """``tmp_path/ws``, which lstat reports as a subvolume root. Nothing is created."""
+    target = tmp_path / "ws"
+    fake_lstat(monkeypatch, target, SUBVOLUME_ROOT)
+    return target
+
+
+def test_qgroup_usage_reads_the_level_0_qgroup_of_the_subvolume(
+    recorder: Recorder, sysfs: Path, subvol: Path
+) -> None:
+    write_qgroup(
+        sysfs,
+        "0_258",
+        referenced="16384\n",
+        exclusive="16384\n",
+        limit_flags="1\n",
+        max_referenced="268435456\n",
+    )
+    write_qgroup(sysfs, "0_257", referenced="999\n")  # another subvolume's qgroup
+    recorder.then(Reply("258\n"))
+    usage = btrfs.qgroup_usage(subvol, sysfs=sysfs)
+    assert usage == btrfs.QgroupUsage(
+        referenced=16384,
+        exclusive=16384,
+        limit_flags=1,
+        max_referenced=268435456,
+        max_exclusive=0,
+    )
+    assert recorder.argvs == [["btrfs", "inspect-internal", "rootid", str(subvol)]]
+
+
+def test_qgroup_usage_accepts_the_largest_u64(
+    recorder: Recorder, sysfs: Path, subvol: Path
+) -> None:
+    write_qgroup(sysfs, "0_258", max_exclusive=f"{U64_MAX}\n")
+    recorder.then(Reply("258\n"))
+    assert btrfs.qgroup_usage(subvol, sysfs=sysfs).max_exclusive == U64_MAX
+
+
+def test_qgroup_usage_without_the_qgroup_directory_is_an_error(
+    recorder: Recorder, sysfs: Path, subvol: Path
+) -> None:
+    write_mode(sysfs, "squota\n")
+    recorder.then(Reply("258\n"))
+    with pytest.raises(SnapshotError, match="0_258"):
+        btrfs.qgroup_usage(subvol, sysfs=sysfs)
+
+
+@pytest.mark.parametrize("missing", QGROUP_FILES)
+def test_qgroup_usage_with_a_file_missing_is_an_error(
+    recorder: Recorder, sysfs: Path, subvol: Path, missing: str
+) -> None:
+    (write_qgroup(sysfs, "0_258") / missing).unlink()
+    recorder.then(Reply("258\n"))
+    with pytest.raises(SnapshotError, match=missing):
+        btrfs.qgroup_usage(subvol, sysfs=sysfs)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "\n",
+        "1",
+        "-1\n",
+        "+1\n",
+        "01\n",
+        "1 \n",
+        " 1\n",
+        "1\n\n",
+        "1\r\n",
+        "0x10\n",
+        "1.0\n",
+        "1_000\n",
+        "１\n",  # fullwidth digit
+        f"{U64_MAX + 1}\n",
+    ],
+)
+@pytest.mark.parametrize("file", QGROUP_FILES)
+def test_qgroup_usage_rejects_anything_but_a_decimal_u64(
+    recorder: Recorder, sysfs: Path, subvol: Path, file: str, text: str
+) -> None:
+    write_qgroup(sysfs, "0_258", **{file: text})
+    recorder.then(Reply("258\n"))
+    with pytest.raises(SnapshotError, match="unexpected"):
+        btrfs.qgroup_usage(subvol, sysfs=sysfs)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda p: p.mkdir(), id="plain-directory"),
+        pytest.param(lambda p: None, id="missing"),
+        pytest.param(lambda p: p.symlink_to(p.parent / "real-dir"), id="symlink"),
+    ],
+)
+def test_qgroup_usage_refuses_anything_but_a_subvolume_root(
+    recorder: Recorder, sysfs: Path, tmp_path: Path, make: Callable[[Path], None]
+) -> None:
+    # A plain directory would report the qgroup of the subvolume that contains it.
+    (tmp_path / "real-dir").mkdir()
+    make(tmp_path / "x")
+    with pytest.raises(SnapshotError, match="not a subvolume root"):
+        btrfs.qgroup_usage(tmp_path / "x", sysfs=sysfs)
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize(
+    ("flags", "limit", "exclusive_limit"),
+    [
+        (0, None, None),
+        (btrfs.QGROUP_LIMIT_MAX_RFER, 300, None),
+        (btrfs.QGROUP_LIMIT_MAX_EXCL, None, 700),
+        (btrfs.QGROUP_LIMIT_MAX_RFER | btrfs.QGROUP_LIMIT_MAX_EXCL, 300, 700),
+        (4 | 8, None, None),  # the compression flags (-c) are no limit
+    ],
+)
+def test_qgroup_usage_limits_only_count_with_their_flag(
+    flags: int, limit: int | None, exclusive_limit: int | None
+) -> None:
+    usage = btrfs.QgroupUsage(
+        referenced=0, exclusive=0, limit_flags=flags, max_referenced=300, max_exclusive=700
+    )
+    assert usage.limit == limit
+    assert usage.exclusive_limit == exclusive_limit
+
+
+def test_qgroup_limit_flags_match_the_kernel() -> None:
+    assert (btrfs.QGROUP_LIMIT_MAX_RFER, btrfs.QGROUP_LIMIT_MAX_EXCL) == (1, 2)
