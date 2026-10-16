@@ -63,6 +63,8 @@ demo-parar: ## Demo: stop everything, unmount and delete the demo volume
 
 demo-web: ## Demo: the web of the running demo, in the VM (open the link on the Mac; docs/demo.md)
 	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
+	@if lsof -nP -iTCP:$(DEMO_WEB_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
 	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) vigia web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT)'
 
 web-demo: ## Web demo on the Mac, no VM: made-up black box + `vigia web`; Ctrl-C stops (docs/demo.md)
