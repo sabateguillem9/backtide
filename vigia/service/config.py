@@ -200,6 +200,7 @@ class ServiceConfig:
             raise ConfigError(f"{path} is not valid TOML: {error}") from error
         _reject_unknown(data)
         state_dir = _path(data, "state_dir")
+        _require_private_state_dir(state_dir)
         volume = _path(data, "volume")
         agent = data.get("agent", {})
         if not isinstance(agent, dict):
@@ -216,6 +217,28 @@ class ServiceConfig:
             gateway_token=Secret(token.strip()),
             agent=agent,
             **optional,
+        )
+
+
+def _require_private_state_dir(path: Path) -> None:
+    """Vigía's state (the lock, the black box's key, the token) lives here: only we may write
+    in it, or someone else could swap those files for their own."""
+    try:
+        info = os.stat(path)
+    except OSError as error:
+        raise ConfigError(
+            f"cannot read state_dir {path}: {os.strerror(error.errno or 0)}"
+        ) from None
+    mode = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISDIR(info.st_mode):
+        raise ConfigError(f"state_dir {path} is not a directory")
+    if info.st_uid != os.geteuid():
+        raise ConfigError(
+            f"state_dir {path} is owned by uid {info.st_uid}, not {os.geteuid()} ({mode:04o})"
+        )
+    if mode & 0o022:
+        raise ConfigError(
+            f"state_dir {path} is writable by group or others (mode {mode:04o}): chmod 700 it"
         )
 
 

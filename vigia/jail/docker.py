@@ -68,6 +68,10 @@ def run(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env={**os.environ, "LC_ALL": "C", **(env or {})},
+            # Its own session: a Ctrl-C in the terminal goes to the foreground process group and
+            # must reach Vigía (which stops the agent in an orderly way), not the `docker stop`
+            # it is waiting for. A timeout still kills the child: process.kill() is by pid.
+            start_new_session=True,
         )
     except OSError as e:  # FileNotFoundError when the docker CLI is not installed
         raise JailError(f"cannot run {command}: {e}") from e

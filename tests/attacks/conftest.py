@@ -46,6 +46,7 @@ _vm = _load_vm_fixtures()
 btrfs_volume = _vm.btrfs_volume
 quota_volume = _vm.quota_volume
 running_agent = _vm.running_agent
+real_service = _vm.real_service
 start_quota_agent = _vm.start_quota_agent
 
 

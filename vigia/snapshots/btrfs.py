@@ -116,6 +116,9 @@ def run(*args: str | Path, timeout: float = DEFAULT_TIMEOUT) -> str:
             timeout=timeout,
             env={**os.environ, "LC_ALL": "C"},
             pass_fds=_held_fds.get(),
+            # Its own session: a Ctrl-C in the terminal reaches Vigía only, never a btrfs in the
+            # middle of a snapshot or a swap. A timeout still kills the child (by pid).
+            start_new_session=True,
         )
     except subprocess.TimeoutExpired as e:
         raise SnapshotError(f"{command} timed out after {timeout} s") from e

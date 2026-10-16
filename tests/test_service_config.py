@@ -10,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from vigia.jail import AgentJailConfig
-from vigia.service.config import ConfigError, Secret, ServiceConfig
+from vigia.service.config import (
+    ConfigError,
+    Secret,
+    ServiceConfig,
+    _require_private_state_dir,
+)
 
 TOKEN = "T0kenForTestsOnly_" + "a1B2c3D4e5F6g7H8i9J0" * 2  # 38 URL-safe characters
 OTHER_TOKEN = "Another0Token_" + "Z9y8X7w6V5u4T3s2R1q0" * 2
@@ -412,3 +417,38 @@ def test_dotdot_is_refused_in_the_agent_config_dir_in_code(tmp_path: Path) -> No
             gateway_token=Secret(TOKEN),
             agent={"config_dir": tmp_path / "x" / ".." / "y"},
         )
+
+
+# --- the state folder must be Vigía's alone ----------------------------------------------------
+
+
+def test_a_state_dir_others_can_write_is_refused(layout: Path) -> None:
+    """Whoever can write there can swap the lock, the key or the token for their own."""
+    (layout / "state").chmod(0o770)
+    with pytest.raises(ConfigError, match="state_dir .* writable by group or others"):
+        ServiceConfig.from_file(write_toml(layout))
+    (layout / "state").chmod(0o707)
+    with pytest.raises(ConfigError, match="state_dir .* writable by group or others"):
+        ServiceConfig.from_file(write_toml(layout))
+
+
+def test_a_state_dir_readable_by_others_but_not_writable_is_accepted(layout: Path) -> None:
+    (layout / "state").chmod(0o755)
+    ServiceConfig.from_file(write_toml(layout))
+
+
+def test_a_state_dir_of_another_user_is_refused(
+    layout: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)
+    with pytest.raises(ConfigError, match="state_dir .* owned by uid"):
+        _require_private_state_dir(layout / "state")  # from_file reads the TOML first
+
+
+def test_a_state_dir_that_is_a_file_or_missing_is_refused(layout: Path) -> None:
+    path = write_toml(layout)
+    (layout / "state" / "gateway.token").unlink()
+    (layout / "state").rmdir()
+    with pytest.raises(ConfigError, match="cannot read state_dir"):
+        ServiceConfig.from_file(path)

@@ -49,6 +49,7 @@ from typing import Any, Protocol
 import vigia
 from vigia.blackbox import BlackBox, BlackBoxError, Event, redact
 from vigia.jail import AgentJail, JailError
+from vigia.jail.openclaw import UnrewindableConfig
 from vigia.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProblem
 from vigia.service.clock import clock_synced as kernel_clock_synced
 from vigia.service.config import ServiceConfig
@@ -237,14 +238,26 @@ class Guardian:
             try:
                 self._boot()
             except BaseException as error:
-                self._record(
-                    "system",
-                    "service_start_failed",
-                    details={"error": _short(error)},
-                    risk=2,
-                )
+                self._boot_failed(error)
                 self._abort_boot(error)
                 raise
+
+    def _boot_failed(self, error: BaseException) -> None:
+        """Record why the boot failed and, for a config a rewind would break, say so in the
+        user's language: the alert carries the error's own Spanish notice (paths of the config,
+        never values), and the caller prints it again when it exits."""
+        details: dict[str, Any] = {"error": _short(error)}
+        if isinstance(error, UnrewindableConfig):
+            details["reason"] = "unrewindable_config"
+            details["problems"] = [problem.path for problem in error.problems]
+        event = self._record("system", "service_start_failed", details=details, risk=2)
+        if isinstance(error, UnrewindableConfig):
+            self._alert(
+                AlertLevel.ERROR,
+                "La configuración del agente no se puede rebobinar",
+                error.notice,
+                event,
+            )
 
     def _open_black_box(self) -> None:
         """Open the black box AND write ``service_start``: no recording, no watching. If either
@@ -887,36 +900,8 @@ class Guardian:
         return None
 
     def _halt(self, *, kill_first: bool = False) -> JailError | None:
-        """Make sure the agent is not running; None once Docker confirms it, else the first
-        error. Decided by Docker's own state, never by ours: a frozen container still reports
-        Running, and ``docker stop`` would wake it to run its SIGTERM handler, so a paused one
-        is killed. If the attempt fails (or does not take), kill and then ``rm --force``."""
-        try:
-            kill = kill_first or self._jail.is_paused()
-        except JailError:
-            kill = True  # cannot tell: assume the worst
-        attempts = [
-            self._jail.kill if kill else self._jail.stop,
-            self._jail.kill,
-            self._jail.remove,
-        ]
-        first_error: JailError | None = None
-        tried: list[Callable[[], None]] = []
-        for attempt in attempts:
-            if attempt in tried:
-                continue
-            tried.append(attempt)
-            try:
-                attempt()
-            except JailError as error:
-                first_error = first_error or error
-                continue
-            try:
-                if not self._jail.is_running():
-                    return None
-            except JailError as error:
-                first_error = first_error or error
-        return first_error or JailError("the agent is still running after stop, kill and remove")
+        """Make sure the agent is not running (see ``halt_agent``)."""
+        return halt_agent(self._jail, kill_first=kill_first)
 
     def flush_logs(self, timeout: float = 5.0) -> bool:
         """Wait until the log messages bridged so far are in the black box (for tests, and for
@@ -1051,6 +1036,37 @@ class Guardian:
         )
 
 
+def halt_agent(jail: AgentJail, *, kill_first: bool = False) -> JailError | None:
+    """Make sure the agent is not running; None once Docker confirms it, else the first
+    error. Decided by Docker's own state, never by ours: a frozen container still reports
+    Running, and ``docker stop`` would wake it to run its SIGTERM handler, so a paused one
+    is killed. If the attempt fails (or does not take), kill and then ``rm --force``.
+
+    Also used by the runner when the service cannot even open its black box."""
+    try:
+        kill = kill_first or jail.is_paused()
+    except JailError:
+        kill = True  # cannot tell: assume the worst
+    attempts = [jail.kill if kill else jail.stop, jail.kill, jail.remove]
+    first_error: JailError | None = None
+    tried: list[Callable[[], None]] = []
+    for attempt in attempts:
+        if attempt in tried:
+            continue
+        tried.append(attempt)
+        try:
+            attempt()
+        except JailError as error:
+            first_error = first_error or error
+            continue
+        try:
+            if not jail.is_running():
+                return None
+        except JailError as error:
+            first_error = first_error or error
+    return first_error or JailError("the agent is still running after stop, kill and remove")
+
+
 def _prune_details(deleted: Sequence[Snapshot], failed: Sequence[Snapshot]) -> dict[str, Any]:
     return {
         "deleted_count": len(deleted),
@@ -1074,4 +1090,12 @@ def _excerpt(error: BaseException) -> str:
     return str(redact(str(error)))[:ALERT_EXCERPT_CHARS]
 
 
-__all__ = ["AgentState", "CycleResult", "FileWatcher", "Guardian", "SpaceGate", "Violation"]
+__all__ = [
+    "AgentState",
+    "CycleResult",
+    "FileWatcher",
+    "Guardian",
+    "SpaceGate",
+    "Violation",
+    "halt_agent",
+]

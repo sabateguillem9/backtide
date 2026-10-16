@@ -19,6 +19,7 @@ import pytest
 
 from vigia.blackbox import BlackBox, BlackBoxError, Event, create_key
 from vigia.jail import JailError
+from vigia.jail.openclaw import RewindProblem, UnrewindableConfig
 from vigia.notify import Alert, AlertLevel
 from vigia.service.config import Secret, ServiceConfig
 from vigia.service.guardian import AgentState, FileWatcher, Guardian
@@ -195,6 +196,7 @@ class FakeJail:
         self.ready_error: JailError | None = None
         self.stop_error: JailError | None = None
         self.setup_error: JailError | None = None
+        self.config_error: Exception | None = None
         self.pause_error: Exception | None = None
         self.kill_error: JailError | None = None
         self.remove_error: JailError | None = None
@@ -209,6 +211,8 @@ class FakeJail:
 
     def write_config(self) -> None:
         self.log.append("jail.write_config")
+        if self.config_error is not None:
+            raise self.config_error
 
     def create(self) -> None:
         self.log.append("jail.create")
@@ -562,6 +566,64 @@ def test_a_failing_boot_step_is_recorded_and_raised(world: World) -> None:
     assert "network is unsafe" in failed.details["error"]
     assert "jail.start" not in world.log
     assert world.guardian.agent_state is AgentState.STOPPED
+
+
+def unrewindable() -> UnrewindableConfig:
+    return UnrewindableConfig(
+        [
+            RewindProblem("channels.whatsapp", "its session cannot be rewound"),
+            RewindProblem("channels.telegram.dmPolicy", "open to anyone after a rewind"),
+        ]
+    )
+
+
+def test_an_unrewindable_config_stops_the_boot_with_its_notice(world: World) -> None:
+    error = unrewindable()
+    world.jail.config_error = error
+    with pytest.raises(UnrewindableConfig) as raised:
+        world.guardian.start()
+    assert raised.value is error  # the caller prints error.notice
+    assert "jail.create" not in world.log
+    assert "jail.start" not in world.log
+    assert world.guardian.agent_state is AgentState.STOPPED
+    failed = world.only("service_start_failed")
+    assert failed.risk == 2
+    assert failed.details["reason"] == "unrewindable_config"
+    assert failed.details["problems"] == ["channels.whatsapp", "channels.telegram.dmPolicy"]
+
+
+def test_an_unrewindable_config_alerts_with_the_spanish_notice_after_recording(
+    world: World,
+) -> None:
+    error = unrewindable()
+    world.jail.config_error = error
+    with pytest.raises(UnrewindableConfig):
+        world.guardian.start()
+    (alert,) = world.alerts.titled("configuración")
+    assert alert.level is AlertLevel.ERROR
+    assert alert.body == error.notice
+    assert alert.event_seq == world.only("service_start_failed").seq
+    assert not world.jail.running
+
+
+def test_an_unrewindable_config_with_an_agent_found_running_leaves_nothing_running(
+    world: World,
+) -> None:
+    world.jail.running = True  # the service died before: the agent is stopped first anyway
+    world.jail.config_error = unrewindable()
+    with pytest.raises(UnrewindableConfig):
+        world.guardian.start()
+    assert not world.jail.running
+    assert world.only("agent_stop").details == {"reason": "unsupervised"}
+
+
+def test_stopping_after_an_unrewindable_config_is_quiet(world: World) -> None:
+    world.jail.config_error = unrewindable()
+    with pytest.raises(UnrewindableConfig):
+        world.guardian.start()
+    before = world.actions()
+    world.guardian.stop()  # what Guardian.run does in its finally
+    assert world.actions() == before
 
 
 def test_recovered_leftovers_are_recorded(world: World) -> None:

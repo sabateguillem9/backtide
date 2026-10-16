@@ -266,8 +266,7 @@ name = "Escrituras que inotify no ve o atribuye mal"
 story = "mmap sin cerrar, enlace duro a un archivo de otra carpeta, fallocate y xattr."
 inspired_by = "Esquivar al vigilante"
 invariants = [7]
-status = "pending"
-task = "T04a"
+status = "ready"
 [scenario.expect]
 stopped = "no"
 recorded = "yes"

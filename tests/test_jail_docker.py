@@ -2,6 +2,7 @@
 a small Python script, so the real process handling (pipes, timeout, output bound) runs."""
 
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -22,7 +23,8 @@ FAKE_CLI = """
 import json, os, sys, time
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, "record.json"), "w") as record:
-    json.dump({"argv": sys.argv[1:], "env": dict(os.environ), "stdin": sys.stdin.read()}, record)
+    json.dump({"argv": sys.argv[1:], "env": dict(os.environ), "stdin": sys.stdin.read(),
+               "pgid": os.getpgrp(), "sid": os.getsid(0)}, record)
 with open(os.path.join(here, "behaviour.json")) as f:
     behaviour = json.load(f)
 time.sleep(behaviour.get("sleep", 0))
@@ -68,6 +70,15 @@ def test_runs_docker_with_a_fixed_argv(fake_cli: FakeCli) -> None:
     assert record["env"]["LC_ALL"] == "C"
     assert record["stdin"] == ""  # closed
     assert result.stdout == "out\n" and result.returncode == 0
+
+
+def test_the_cli_runs_in_a_process_group_of_its_own(fake_cli: FakeCli) -> None:
+    """Ctrl-C in the terminal goes to the foreground process group: it must reach Vigía, which
+    stops the agent in an orderly way, and not kill the `docker stop` it is waiting for."""
+    docker.run(["stop", "agent"])
+    record = fake_cli.record()
+    assert record["pgid"] != os.getpgrp()
+    assert record["sid"] != os.getsid(0)
 
 
 def test_the_real_program_is_docker() -> None:

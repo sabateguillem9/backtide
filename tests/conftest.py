@@ -9,6 +9,16 @@ from pathlib import Path
 import pytest
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--idle-seconds",
+        type=int,
+        default=250,
+        help="how long tests/integration/test_idle.py leaves the real OpenClaw idle "
+        "(250 s by default; the 10-minute measurement of docs/19 uses 600)",
+    )
+
+
 class FakeClock:
     """A controllable clock. Each read returns the current instant and then moves
     1 µs forward, so two takes or restores never get the same snapshot id."""

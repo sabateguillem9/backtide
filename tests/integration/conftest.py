@@ -55,6 +55,7 @@ from uuid import uuid4
 
 import pytest
 
+from tests.integration.service_kit import Service, make_service
 from vigia.jail import IMAGE, AgentJail, AgentJailConfig, JailError
 from vigia.jail import docker as jail_docker
 from vigia.snapshots import SnapshotError, btrfs
@@ -163,6 +164,58 @@ def store(btrfs_volume: Path, clock: Callable[[], datetime]) -> SnapshotStore:
     snapshot_store = SnapshotStore(root, clock=clock)
     snapshot_store.init()
     return snapshot_store
+
+
+@pytest.fixture(scope="module")
+def real_service(btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Service]:
+    """`vigia vigilar` running as a process, with the real OpenClaw in its jail and ready, one per
+    test module (T04b-2). A 3 s cycle instead of 120 s. Stopped, and the agent and its network
+    removed, when the module ends, also when the start fails."""
+    service = _new_service(btrfs_volume, tmp_path_factory)
+    try:
+        service.start()
+        service.wait_ready()
+        yield service
+    finally:
+        service.shutdown()
+
+
+@pytest.fixture
+def make_real_service(
+    btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Callable[..., Service]]:
+    """A factory of services that are not started (the test starts, stops and kills them): same
+    as ``real_service`` but one per call, each on its own folder of the btrfs. Whatever was made
+    is shut down when the test ends."""
+    made: list[Service] = []
+
+    def make(**kwargs: float) -> Service:
+        service = _new_service(btrfs_volume, tmp_path_factory, **kwargs)
+        made.append(service)
+        return service
+
+    try:
+        yield make
+    finally:
+        errors: list[Exception] = []
+        for service in reversed(made):
+            try:
+                service.shutdown()
+            except Exception as error:  # noqa: BLE001 - every service is shut down
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
+
+def _new_service(
+    btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory, **kwargs: float
+) -> Service:
+    _require_agent_image()
+    _remove_stale_test_agents()
+    root = btrfs_volume / f"service-{uuid4().hex}"
+    root.mkdir(mode=0o700)
+    state_dir = tmp_path_factory.mktemp("service-state")
+    return make_service(root, state_dir, _agent_names(os.getpid()), **kwargs)
 
 
 IMAGE_PULL_TIMEOUT = 1800.0  # the first pull of the pinned image is about 1.3 GB

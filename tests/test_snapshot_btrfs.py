@@ -211,6 +211,25 @@ def test_run_uses_a_fixed_argv_list_c_locale_and_a_timeout(
     assert call.kwargs["pass_fds"] == ()
 
 
+def test_run_starts_btrfs_in_a_session_of_its_own(recorder: Recorder) -> None:
+    """A Ctrl-C in the terminal must reach Vigía only, not a `btrfs subvolume snapshot` in the
+    middle of its work. A timeout still kills the child: subprocess.run kills its pid."""
+    btrfs.run("filesystem", "sync", Path("/vol"))
+    assert recorder.calls[0].kwargs["start_new_session"] is True
+
+
+def test_a_real_btrfs_child_is_outside_our_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "bin" / "btrfs"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\nps -o pgid= -p $$\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}:{os.environ['PATH']}")
+    child_group = int(btrfs.run("version").strip())
+    assert child_group != os.getpgrp()
+
+
 def test_run_passes_a_custom_timeout_and_returns_stdout(recorder: Recorder) -> None:
     recorder.then(Reply("Label: none\n", stderr="WARNING: ignored on success\n"))
     assert btrfs.run("filesystem", "show", timeout=5.0) == "Label: none\n"

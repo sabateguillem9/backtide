@@ -1,0 +1,315 @@
+"""The real service: the lock, the real parts and the loop that `vigia vigilar` runs.
+
+Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
+
+- ``take_lock``: one owner of the agent at a time. ``vigia.lock`` is held with ``flock`` for the
+  whole life of the service, so ``vigia rebobinar`` (T04c-2) can tell "no service" from "a
+  service" by trying the same lock without blocking. The kernel drops it when the process dies,
+  also with SIGKILL, so a killed service never leaves a lock behind.
+- ``open_black_box``: the key is made on the very first start and never again. A database (or
+  its checkpoint, -wal or -shm) without its key is an error, not a reason to start a new chain.
+  If the black box cannot be used, an agent left running by a killed service is stopped before
+  the error goes up: no recording, no watching.
+- ``build_guardian``: the real store, jail, file watcher and black box in one ``Guardian``. Every
+  part can be handed in, which is how the VM tests run the real thing without root.
+- ``run_guardian``: SIGTERM, SIGINT and SIGHUP stop the service (and so the agent), never kill
+  it half way, and a second signal while it stops is ignored: a stop of the agent takes up to
+  ``stop_timeout`` s. The handler only writes a byte to a pipe: ``Event.set`` takes a lock, and
+  a handler runs on the very thread that may be holding it.
+"""
+
+import errno
+import fcntl
+import logging
+import os
+import signal
+import stat
+import threading
+from collections.abc import Callable
+from pathlib import Path
+from types import FrameType, TracebackType
+from typing import Protocol
+
+from vigia.blackbox import BlackBox, BlackBoxError, create_key, load_key
+from vigia.jail import AgentJail, JailError
+from vigia.notify import AlertQueue, LogNotifier, Notifier
+from vigia.sensors.files import FileWatcher, WatcherConfig
+from vigia.service.config import ServiceConfig
+from vigia.service.guardian import Guardian, halt_agent
+from vigia.snapshots import SnapshotStore
+
+logger = logging.getLogger(__name__)
+
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+LOCK_ATTEMPTS = 5
+_HANDLER = Callable[[int, FrameType | None], None]
+
+
+class ServiceLocked(RuntimeError):  # noqa: N818 - reads better than ServiceLockedError
+    """The lock is taken (another service owns the agent) or cannot be used. The message is
+    for the user, in Spanish."""
+
+
+class ServiceLock:
+    """``vigia.lock`` held with ``flock``. Close it (or leave the ``with``) to release it."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+
+    def fileno(self) -> int:
+        if self._fd is None:
+            raise ValueError("the lock is released")
+        return self._fd
+
+    def close(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            os.close(fd)  # closing drops the flock
+
+    def __enter__(self) -> "ServiceLock":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+def take_lock(path: Path) -> ServiceLock:
+    """Take the service lock at ``path`` or raise ServiceLocked. Does not block.
+
+    The file is checked like the rest of the state: a regular file of ours with no other name
+    (a hard link would let someone hold the same lock from elsewhere), made private if it was
+    not. After the ``flock``, the file we hold must still be the one the path names: if someone
+    replaced it in between, the lock is on an inode nobody else will ever open by name and a
+    second service would own the agent too. Then we try again."""
+    for _ in range(LOCK_ATTEMPTS):
+        fd = _open_lock_file(path)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise ServiceLocked(
+                "Ya hay un `vigia vigilar` en marcha: solo uno puede vigilar al agente "
+                f"(cerrojo {path})."
+            ) from None
+        except OSError as error:
+            os.close(fd)
+            raise ServiceLocked(
+                f"No se puede tomar el cerrojo {path}: {os.strerror(error.errno or 0)}"
+            ) from None
+        if _still_the_file_at(fd, path):
+            return ServiceLock(fd)
+        os.close(fd)  # replaced while we took it: take the new one
+    raise ServiceLocked(f"El cerrojo {path} cambia mientras se toma: alguien lo está reemplazando.")
+
+
+def _open_lock_file(path: Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as error:
+        if error.errno == errno.ELOOP:  # the last component is a symlink
+            raise ServiceLocked(f"El cerrojo {path} es un enlace simbólico: no se usa.") from None
+        raise ServiceLocked(
+            f"No se puede abrir el cerrojo {path}: {os.strerror(error.errno or 0)}"
+        ) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ServiceLocked(f"El cerrojo {path} no es un archivo normal: no se usa.")
+        if info.st_uid != os.geteuid():
+            raise ServiceLocked(
+                f"El cerrojo {path} es del usuario {info.st_uid} y no del que ejecuta Vigía: "
+                "no se usa."
+            )
+        if info.st_nlink != 1:
+            raise ServiceLocked(
+                f"El cerrojo {path} tiene {info.st_nlink} nombres (enlaces duros): no se usa."
+            )
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _still_the_file_at(fd: int, path: Path) -> bool:
+    held = os.fstat(fd)
+    try:
+        named = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+
+def open_black_box(config: ServiceConfig) -> BlackBox:
+    """The black box of ``config``, not yet opened (the Guardian opens it and writes
+    ``service_start``). Creates the key on the very first start; raises BlackBoxError if any
+    part of a black box (database, checkpoint, -wal, -shm) exists without it, or the key file
+    is not private. Nothing is created in those cases."""
+    key_path = config.blackbox_key
+    if os.path.lexists(key_path):
+        key = load_key(key_path)
+    else:
+        db = config.blackbox_db
+        parts = [
+            db,
+            config.blackbox_checkpoint,
+            db.with_name(db.name + "-wal"),
+            db.with_name(db.name + "-shm"),
+        ]
+        found = [part for part in parts if os.path.lexists(part)]
+        if found:
+            raise BlackBoxError(
+                f"Existe la caja negra ({', '.join(part.name for part in found)}) pero falta su "
+                f"clave {key_path}: no se crea una clave nueva para una cadena que ya existe."
+            )
+        key = create_key(key_path)
+    return BlackBox(config.blackbox_db, key, checkpoint_path=config.blackbox_checkpoint)
+
+
+def build_guardian(
+    config: ServiceConfig,
+    *,
+    jail: AgentJail | None = None,
+    notifier: Notifier | None = None,
+    watcher_config: WatcherConfig | None = None,
+) -> tuple[Guardian, AlertQueue, BlackBox]:
+    """The Guardian with the real store, jail, file watcher and black box, the alert queue it
+    reports to (not started) and the black box (not opened). ``space`` stays unset until the
+    pause by space arrives (T04d-2)."""
+    jail = jail if jail is not None else AgentJail(config.jail_config())
+    try:
+        box = open_black_box(config)
+    except BlackBoxError as error:
+        _stop_unrecorded_agent(jail, error)
+        raise
+    store = SnapshotStore(config.volume, workspace_limit=config.workspace_limit)
+    watcher = FileWatcher(
+        jail.config.agent_dir, box, workspace_id=store.workspace_id, config=watcher_config
+    )
+    alerts = AlertQueue(notifier if notifier is not None else LogNotifier())
+    guardian = Guardian(
+        config, store=store, jail=jail, blackbox=box, watcher=watcher, alerts=alerts
+    )
+    return guardian, alerts, box
+
+
+def _stop_unrecorded_agent(jail: AgentJail, error: BlackBoxError) -> None:
+    """The black box cannot be used, so the Guardian (which would do this) does not exist yet.
+    An agent that a killed service left running is running unrecorded: stop it. Raises a
+    JailError, caused by ``error``, if it cannot be stopped; else adds a note to ``error``."""
+    try:
+        running = jail.is_running()
+    except JailError:
+        running = True  # cannot tell: halt_agent confirms
+    if not running:
+        return
+    logger.error("cannot use the black box, so the agent that was running is stopped: %s", error)
+    stop_error = halt_agent(jail)
+    if stop_error is not None:
+        raise JailError(
+            f"EL AGENTE SIGUE EN MARCHA sin vigilancia: la caja negra no se puede usar ({error}) "
+            f"y no se ha podido parar: {stop_error}"
+        ) from error
+    error.add_note("Se ha parado al agente que estaba en marcha: sin grabar no hay vigilancia.")
+
+
+class _Runnable(Protocol):
+    def run(self, stop: threading.Event) -> None: ...
+
+
+class _Closable(Protocol):
+    def close(self) -> object: ...
+
+
+class _Startable(_Closable, Protocol):
+    def start(self) -> None: ...
+
+
+def run_guardian(
+    guardian: _Runnable,
+    alerts: _Startable,
+    box: _Closable,
+    *,
+    stop: threading.Event | None = None,
+    handle_signals: bool = True,
+) -> None:
+    """Run ``guardian`` until ``stop`` is set, SIGTERM, SIGINT or SIGHUP arrives, or it fails.
+
+    The alerts are delivering before the guardian starts and are flushed after it ends, so the
+    alert about a failed start is not lost. The guardian's own ``run`` stops the agent and
+    records ``service_stop``; the black box is closed last. Raises what the guardian raises.
+    Signal handlers only work in the main thread."""
+    stop = stop if stop is not None else threading.Event()
+    wake = _StopPipe(stop) if handle_signals else None
+    previous: dict[int, object] = {}
+    if wake is not None:
+        for number in _STOP_SIGNALS:
+            previous[number] = signal.signal(number, wake.on_signal)
+    alerts.start()
+    try:
+        guardian.run(stop)
+    finally:
+        try:
+            alerts.close()
+            box.close()
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)  # type: ignore[arg-type]
+            if wake is not None:
+                wake.close()
+
+
+class _StopPipe:
+    """Turns a signal into ``stop.set()`` without the handler touching a lock: the handler
+    writes one byte to a pipe and a thread of ours reads it and sets the event. Again while
+    stopping: the event is already set, so another byte changes nothing."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        self._stop = stop
+        self._read, self._write = os.pipe()
+        os.set_blocking(self._write, False)  # a handler must never block
+        self._thread = threading.Thread(target=self._run, name="vigia-signals", daemon=True)
+        self._thread.start()
+
+    def on_signal(self, number: int, frame: FrameType | None) -> None:
+        try:
+            os.write(self._write, b"x")
+        except BlockingIOError:
+            pass  # the pipe is full of earlier signals: the stop is already on its way
+
+    def _run(self) -> None:
+        while os.read(self._read, 64):
+            self._stop.set()
+
+    def close(self) -> None:
+        """After the handlers are gone: closing the write end ends the thread."""
+        os.close(self._write)
+        self._thread.join(5)
+        os.close(self._read)
+
+
+def serve(
+    config: ServiceConfig,
+    *,
+    jail: AgentJail | None = None,
+    notifier: Notifier | None = None,
+    watcher_config: WatcherConfig | None = None,
+    stop: threading.Event | None = None,
+    handle_signals: bool = True,
+) -> None:
+    """What `vigia vigilar` does: take the lock, build the real service and run it until it is
+    told to stop. Raises ServiceLocked, BlackBoxError, ConfigError-like errors from the parts,
+    ``UnrewindableConfig`` (the caller shows its ``notice``) or, if the agent could not be
+    stopped, the JailError that says it keeps running."""
+    with take_lock(config.lock_file):
+        guardian, alerts, box = build_guardian(
+            config, jail=jail, notifier=notifier, watcher_config=watcher_config
+        )
+        run_guardian(guardian, alerts, box, stop=stop, handle_signals=handle_signals)
