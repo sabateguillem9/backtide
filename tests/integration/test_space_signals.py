@@ -19,6 +19,7 @@ Everything runs as the unprivileged Lima user; the only privileged command is
 
 import errno
 import os
+import shutil
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -55,6 +56,11 @@ REWIND_RESERVE = 13 * MIB  # what the EXCHANGE and the snapshot reserve (docs/16
 SMALL_FILES = 20_000  # about 45 MiB of metadata
 SMALL_FILE = b"x" * 2000  # inline: stored in the metadata tree
 FRESH = signals.Health(check_age=0.0)  # a reading taken just now, with the agent running
+# The most a worst-case run writes into its image on the VM's tmpfs (measured 662 MiB, reported
+# as image_bytes_on_disk by ``room_for_the_image``), plus a margin. With less free the loop
+# device cannot write, btrfs aborts its transaction and every call fails with EIO: not a flaw
+# of P1.
+IMAGE_ROOM = 900 * MIB
 SMALL_FILE_COST = 3000  # bytes of metadata one 2,000-byte file takes, about
 
 
@@ -273,7 +279,9 @@ def test_a_volume_with_quotas_off_has_no_usage_and_p5(btrfs_volume: Path, tmp_pa
     workspace = make_subvolume(root / "workspace")
     found = signals.sample(root, workspace, tmp_path)
     assert (found.usage, found.errors) == (None, ())
-    assert conditions(found) == ["P5"]
+    # P1 and P2 depend on how much of the SHARED volume the tests before this one have allocated
+    # (the metadata-full tests leave it nearly full), so only what is about the workspace counts.
+    assert [c for c in conditions(found) if c in ("P3", "P4", "P5")] == ["P5"]
 
 
 # P4: a signal that cannot be read
@@ -372,10 +380,34 @@ def consume_metadata_down_to(volume, workspace: Path, target: int) -> signals.Sa
                 os.close(fd)
 
 
+@pytest.fixture
+def room_for_the_image(quota_volume, record_property: Callable[[str, object], None]):
+    """The worst-case test writes real data and hundreds of MiB of real metadata into its image,
+    and the image lives in the VM's tmpfs (/tmp), which every integration run also fills with
+    the images pytest keeps from its last three sessions (the shared 2 GiB volume alone leaves
+    ~1 GiB). With the tmpfs full the loop device fails to write, btrfs aborts its transaction
+    and every call answers EIO: that looks like P1 failing and has nothing to do with it. So
+    check the room first and say what is wrong, instead of proving nothing."""
+    image = quota_volume.image_file
+    free = shutil.disk_usage(image.parent).free
+    if free < IMAGE_ROOM:
+        pytest.fail(
+            f"only {mib(free)} free in {image.parent}, this test needs {mib(IMAGE_ROOM)}: the "
+            "VM's tmpfs is full of the images of earlier pytest sessions. Delete the old "
+            "pytest-N folders of the pytest base directory (not the current one) and run it again."
+        )
+    yield
+    report(record_property, "image_bytes_on_disk", mib(image.stat().st_blocks * 512))
+
+
 @pytest.mark.parametrize("tight", [False, True], ids=["new-volume", "just-above-P1"])
 @pytest.mark.parametrize("cap", [16 * MIB, CAP], ids=mib)
 def test_the_worst_the_agent_does_stays_inside_what_p1_leaves_and_the_rewind_works(
-    quota_volume, cap: int, tight: bool, record_property: Callable[[str, object], None]
+    quota_volume,
+    room_for_the_image,
+    cap: int,
+    tight: bool,
+    record_property: Callable[[str, object], None],
 ) -> None:
     """P1 - R is the metadata the agent may spend before it is frozen. Measured here, with caps
     of 16 MiB (a data chunk is 7 times the cap, so what dominates is the number of chunks that

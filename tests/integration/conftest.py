@@ -85,9 +85,13 @@ class Mount:
 def btrfs_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     """A 2 GiB btrfs, owned by the test user, shared by the whole session.
 
-    Above 1 GiB, so mkfs never picks mixed mode. Tests make their own directory inside it."""
-    with _mounted_btrfs(tmp_path_factory.mktemp("btrfs"), 2 * GIB) as mnt:
+    Above 1 GiB, so mkfs never picks mixed mode. Tests make their own directory inside it.
+    The image is deleted once unmounted, like ``quota_volume``'s: pytest keeps the last three
+    sessions, and their images would fill the VM's /tmp (tmpfs) and turn writes into EIO."""
+    base = tmp_path_factory.mktemp("btrfs").resolve()
+    with _mounted_btrfs(base, 2 * GIB) as mnt:
         yield mnt
+    (base / VOLUME_IMAGE).unlink()  # only reached after a checked, successful unmount
 
 
 @pytest.fixture
@@ -95,9 +99,12 @@ def tiny_btrfs_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     """A fresh 1 GiB btrfs per test, only for the disk-full tests.
 
     Fill it with os.posix_fallocate: preallocated extents are never written, so the image on
-    /tmp (tmpfs) stays sparse and the VM's RAM is not used up."""
-    with _mounted_btrfs(tmp_path_factory.mktemp("tiny-btrfs"), GIB) as mnt:
+    /tmp (tmpfs) stays sparse and the VM's RAM is not used up. The image is deleted once
+    unmounted (see ``btrfs_volume``)."""
+    base = tmp_path_factory.mktemp("tiny-btrfs").resolve()
+    with _mounted_btrfs(base, GIB) as mnt:
         yield mnt
+    (base / VOLUME_IMAGE).unlink()  # only reached after a checked, successful unmount
 
 
 @dataclass(frozen=True)
