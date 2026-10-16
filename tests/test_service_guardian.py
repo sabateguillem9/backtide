@@ -255,6 +255,7 @@ class FakeJail:
         self.setup_error: JailError | None = None
         self.config_error: Exception | None = None
         self.pause_error: Exception | None = None
+        self.unpause_error: Exception | None = None
         self.kill_error: JailError | None = None
         self.remove_error: JailError | None = None
         self.stops_anyway = False  # a stop or kill that fails (a timeout) but did stop it
@@ -316,6 +317,12 @@ class FakeJail:
         if self.pause_error is not None:
             raise self.pause_error
         self.paused = True
+
+    def unpause(self) -> None:
+        self.log.append("jail.unpause")
+        if self.unpause_error is not None:
+            raise self.unpause_error
+        self.paused = False
 
     def is_paused(self) -> bool:
         return self.running and self.paused
@@ -2306,24 +2313,27 @@ def test_without_the_space_thread_unreadable_signals_do_not_start(rewinding: Wor
 P1 = Violation("P1", "metadatos: quedan 100 MiB, mínimo 341 MiB", "space")
 
 
-def test_the_space_thread_can_freeze_an_agent_that_is_being_stopped(rewinding: World) -> None:
-    """During `docker stop` the agent runs its SIGTERM handler: a condition must freeze it then
-    too (state STOPPING), not only when it is RUNNING."""
+def test_the_space_thread_kills_an_agent_that_is_being_stopped(rewinding: World) -> None:
+    """During `docker stop` the agent runs its SIGTERM handler: a condition must stop it then
+    too (state STOPPING). Frozen, `docker stop` would wake it again, so it is killed (T04d-2,
+    review: a freeze in the middle of a stop is undone by the stop)."""
     guardian = rewinding.guardian
     states: list[AgentState] = []
 
-    def freeze_now() -> None:
+    def condition_now() -> None:
         states.append(guardian.agent_state)
         rewinding.violations.append(P1)
-        guardian._pause([P1], freeze=True)  # noqa: SLF001 - what the space thread (T04d-2) calls
+        guardian._pause([P1], freeze=True)  # noqa: SLF001 - what the space thread calls
 
-    rewinding.jail.on_stop = freeze_now
+    rewinding.jail.on_stop = condition_now
     outcome = guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
     assert states == [AgentState.STOPPING]
-    assert rewinding.log.index("jail.pause") < rewinding.log.index(
+    assert "jail.pause" not in rewinding.log
+    assert rewinding.log.index("jail.kill") < rewinding.log.index(
         f"store.swap({rewinding.volume.listed[0].id})"
     )
-    assert rewinding.events("space_pause")[0].details["frozen"] is True
+    pause = rewinding.events("space_pause")[0]
+    assert pause.details["killed"] is True and pause.risk == 2
     assert not outcome.agent_started  # still red afterwards: it stays stopped, pause open
     assert guardian.pause_reasons == {"space"}
     assert not rewinding.jail.running

@@ -37,7 +37,8 @@ from vigia.notify import AlertQueue, LogNotifier, Notifier
 from vigia.sensors.files import FileWatcher, WatcherConfig
 from vigia.service.config import ServiceConfig
 from vigia.service.control import ControlServer
-from vigia.service.guardian import ControlHook, Guardian, halt_agent
+from vigia.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
+from vigia.service.pause import Holder, make_space_gate, read_holders
 from vigia.snapshots import SnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -187,23 +188,49 @@ def build_guardian(
     jail: AgentJail | None = None,
     notifier: Notifier | None = None,
     watcher_config: WatcherConfig | None = None,
+    store: SnapshotStore | None = None,
+    space: SpaceGate | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
-    reports to (not started) and the black box (not opened). ``space`` stays unset until the
-    pause by space arrives (T04d-2)."""
+    reports to (not started) and the black box (not opened).
+
+    With a ``workspace_limit``, the pause by space is on (T04d-2): the real gate
+    (``make_space_gate``) and the reader of what holds the space. Without one there is no cap
+    to measure against and the pause is off, which is logged. ``store`` and ``space`` replace
+    the real ones (the VM tests: a cap set through their one sudo command, and a gate that does
+    not count the VM's tmpfs against P6)."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
         box = open_black_box(config)
     except BlackBoxError as error:
         _stop_unrecorded_agent(jail, error)
         raise
-    store = SnapshotStore(config.volume, workspace_limit=config.workspace_limit)
+    if store is None:
+        store = SnapshotStore(config.volume, workspace_limit=config.workspace_limit)
+    if space is None:
+        space = make_space_gate(config, store)
+    if space is None:
+        logger.warning(
+            "no workspace_limit is configured: the agent is not paused for lack of space"
+        )
     watcher = FileWatcher(
         jail.config.agent_dir, box, workspace_id=store.workspace_id, config=watcher_config
     )
     alerts = AlertQueue(notifier if notifier is not None else LogNotifier())
+    holders_of = store
+
+    def holders() -> list[Holder]:
+        return read_holders(holders_of)
+
     guardian = Guardian(
-        config, store=store, jail=jail, blackbox=box, watcher=watcher, alerts=alerts
+        config,
+        store=store,
+        jail=jail,
+        blackbox=box,
+        watcher=watcher,
+        alerts=alerts,
+        space=space,
+        holders=holders,
     )
     return guardian, alerts, box
 
@@ -316,16 +343,24 @@ def serve(
     watcher_config: WatcherConfig | None = None,
     stop: threading.Event | None = None,
     handle_signals: bool = True,
+    store: SnapshotStore | None = None,
+    space: SpaceGate | None = None,
 ) -> None:
     """What `vigia vigilar` does: take the lock, build the real service and run it until it is
-    told to stop, with the control socket of ``vigia rebobinar`` open while it runs. Raises
+    told to stop, with the control socket of ``vigia rebobinar`` and ``vigia seguir`` open while
+    it runs (``store`` and ``space``: see ``build_guardian``). Raises
     ServiceLocked, ControlError (the socket cannot be opened; the agent is stopped then),
     BlackBoxError, ConfigError-like errors from the parts, ``UnrewindableConfig`` (the caller
     shows its ``notice``) or, if the agent could not be stopped, the JailError that says it
     keeps running."""
     with take_lock(config.lock_file):
         guardian, alerts, box = build_guardian(
-            config, jail=jail, notifier=notifier, watcher_config=watcher_config
+            config,
+            jail=jail,
+            notifier=notifier,
+            watcher_config=watcher_config,
+            store=store,
+            space=space,
         )
         control = ControlServer(guardian, config.control_socket)
         run_guardian(

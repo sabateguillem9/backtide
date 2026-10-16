@@ -153,7 +153,7 @@ def test_build_guardian_wires_the_real_parts(config: ServiceConfig) -> None:
     assert guardian._store.root == config.volume  # noqa: SLF001
     assert isinstance(guardian._jail, AgentJail)  # noqa: SLF001
     assert isinstance(guardian._watcher, FileWatcher)  # noqa: SLF001
-    assert guardian._space is None  # noqa: SLF001 - the pause comes with T04d-2
+    assert guardian._space is None  # noqa: SLF001 - no cap configured: nothing to measure
 
 
 def test_the_watcher_watches_the_agents_own_folder_and_nothing_else(config: ServiceConfig) -> None:
@@ -174,6 +174,33 @@ def test_the_store_gets_the_workspace_limit_of_the_config(tmp_path: Path) -> Non
     )
     guardian, _, _ = build_guardian(limited)
     assert guardian._store._workspace_limit == 123456  # noqa: SLF001
+
+
+def test_with_a_cap_the_pause_by_space_is_wired(tmp_path: Path) -> None:
+    """T04d-2: the real gate and the reader of what holds the space."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    limited = ServiceConfig(
+        state_dir=state, volume=tmp_path / "vol", gateway_token=Secret(TOKEN), workspace_limit=64
+    )
+    guardian, _, _ = build_guardian(limited)
+    assert callable(guardian._space)  # noqa: SLF001
+    assert callable(guardian._holders)  # noqa: SLF001
+
+
+def test_build_guardian_takes_a_store_and_a_gate_the_tests_can_adjust(
+    config: ServiceConfig,
+) -> None:
+    """The VM tests need a store whose cap is set through their one sudo command, and a gate
+    that does not count the VM's small tmpfs against P6."""
+    store = SnapshotStore(config.volume)
+
+    def gate() -> list[object]:
+        return []
+
+    guardian, _, _ = build_guardian(config, store=store, space=gate)
+    assert guardian._store is store  # noqa: SLF001
+    assert guardian._space is gate  # noqa: SLF001
 
 
 def test_build_guardian_takes_a_jail_the_tests_can_adjust(config: ServiceConfig) -> None:

@@ -68,6 +68,10 @@ class Service:
     jail: AgentJail
     store: SnapshotStore
     log_path: Path
+    # The launcher of `vigia vigilar` and what it gets after the config (test_space_pause.py
+    # runs one that sets the cap through the test's sudo command).
+    main: str = "tests.integration.service_main"
+    main_args: tuple[str, ...] = ()
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     _box: BlackBox | None = field(default=None, repr=False)
 
@@ -83,7 +87,7 @@ class Service:
         log = open(self.log_path, "ab")  # noqa: SIM115 - closed by the child's end
         try:
             return subprocess.Popen(
-                [sys.executable, "-m", "tests.integration.service_main", str(self.config_path)],
+                [sys.executable, "-m", self.main, str(self.config_path), *self.main_args],
                 cwd=REPO,
                 env={**os.environ, "PYTHONPATH": str(REPO), "PYTHONUNBUFFERED": "1"},
                 stdin=subprocess.DEVNULL,
@@ -446,6 +450,7 @@ def make_service(
     names: tuple[str, str],
     *,
     cycle_interval: float = CYCLE,
+    workspace_limit: int | None = None,
 ) -> Service:
     """Write the config and token of a service for the btrfs folder ``root`` (nothing runs
     yet). ``names`` are the container and network names, from the fixtures' cleanup scheme."""
@@ -460,7 +465,8 @@ def make_service(
         f'state_dir = "{state_dir}"\n'
         f'volume = "{root}"\n'
         f"cycle_interval = {cycle_interval}\n"
-        "[agent]\n"
+        + (f"workspace_limit = {workspace_limit}\n" if workspace_limit is not None else "")
+        + "[agent]\n"
         f'name = "{container}"\n'
         f'network = "{network}"\n'
         f"uid = {os.getuid()}\n"

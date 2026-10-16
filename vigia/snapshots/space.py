@@ -425,19 +425,25 @@ def evaluate(
                     minimum,
                 )
             )
-    if (
-        health.blackbox_failures >= cfg.blackbox_failures
-        and health.blackbox_failing_for > cfg.blackbox_failing_for
-    ):
-        found.append(
-            Condition(
-                "P7",
-                "blackbox",
-                f"the black box failed {health.blackbox_failures} times in a row, for "
-                f"{health.blackbox_failing_for:.0f} s: nothing is being recorded",
-            )
-        )
+    p7 = blackbox_condition(health.blackbox_failures, health.blackbox_failing_for, cfg)
+    if p7 is not None:
+        found.append(p7)
     return found
+
+
+def blackbox_condition(
+    failures: int, failing_for: float, cfg: SpaceConfig = DEFAULT_CONFIG
+) -> Condition | None:
+    """P7 alone: the black box failed ``failures`` appends in a row, for ``failing_for``
+    seconds. The guardian checks it with every space check, from its own counters. Pure."""
+    if failures >= cfg.blackbox_failures and failing_for > cfg.blackbox_failing_for:
+        return Condition(
+            "P7",
+            "blackbox",
+            f"the black box failed {failures} times in a row, for {failing_for:.0f} s: "
+            "nothing is being recorded",
+        )
+    return None
 
 
 def evaluate_sample(

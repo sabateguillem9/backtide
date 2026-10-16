@@ -24,6 +24,7 @@ from vigia.service.control import (
 )
 from vigia.service.offline import rewind_without_service
 from vigia.service.runner import ServiceLocked, ServiceRunning, serve, take_lock
+from vigia.service.seguir import seguir
 from vigia.snapshots import Snapshot, SnapshotError, SnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,17 @@ def build_parser() -> argparse.ArgumentParser:
     rewind.add_argument("snapshot", metavar="instantánea", help="identificador de la instantánea")
     rewind.add_argument("--si", action="store_true", help="no pedir confirmación")
     rewind.set_defaults(handler=_rewind)
+
+    resume = commands.add_parser(
+        "seguir",
+        help="reanuda al agente tras una pausa por falta de espacio",
+        description="Reanuda al agente que Vigía pausó por falta de espacio (o por no poder "
+        "grabar). Se lo pide al servicio en marcha, que se niega mientras siga faltando "
+        "espacio. Sale con 0 si el agente sigue (o no había pausa), 1 si no se reanudó, 2 si "
+        "hay un error de uso y 3 si no se sabe o se reanudó con un problema.",
+    )
+    _add_config(resume)
+    resume.set_defaults(handler=_resume)
     _add_web(commands)
     return parser
 
@@ -271,6 +283,16 @@ def _rewind(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     with lock:
         return _rewind_in_process(config, target)
+
+
+def _resume(args: argparse.Namespace) -> int:
+    """`vigia seguir`: everything but reading the config is in vigia/service/seguir.py."""
+    try:
+        config = ServiceConfig.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    return seguir(config)
 
 
 def _rewind_notice(target: Snapshot, *, now: datetime, tz: tzinfo) -> str:

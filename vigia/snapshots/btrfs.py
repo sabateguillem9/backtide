@@ -80,6 +80,7 @@ _NO_SPACE_STDERR = {"No space left on device": errno.ENOSPC, "Disk quota exceede
 _NO_SPACE_ERRNOS = frozenset(_NO_SPACE_STDERR.values())
 _ROOT_ID_RE = re.compile(r"([1-9][0-9]*)\n", re.ASCII)
 _U64_RE = re.compile(r"(0|[1-9][0-9]*)\n", re.ASCII)
+_LEVEL0_QGROUP_RE = re.compile(r"0_([1-9][0-9]*)", re.ASCII)  # a subvolume's qgroup in /sys
 _READONLY_OUTPUT = {"ro=true\n": True, "ro=false\n": False}
 _QUOTA_MODES: dict[str, QuotaMode] = {"squota\n": "squota", "qgroup\n": "qgroup"}
 
@@ -433,6 +434,34 @@ def qgroup_usage(path: Path, *, sysfs: Path = SYSFS_BTRFS) -> QgroupUsage:
         max_referenced=_read_u64(qgroup / "max_referenced"),
         max_exclusive=_read_u64(qgroup / "max_exclusive"),
     )
+
+
+def level0_qgroups(path: Path, *, sysfs: Path = SYSFS_BTRFS) -> dict[int, QgroupUsage]:
+    """Every level-0 qgroup (one per subvolume, ``0/<id>``) of the btrfs that holds ``path``,
+    by subvolume id. Unprivileged. Empty when quotas are off. Under simple quotas a deleted
+    subvolume keeps its qgroup while snapshots still share what it wrote: that is how the
+    pause by space names the old workspaces that still hold room (T04d-2)."""
+    qgroups = _fs_dir(_absolute(path), sysfs) / "qgroups"
+    if not _exists(qgroups):
+        return {}
+    try:
+        names = os.listdir(qgroups)
+    except OSError as e:
+        raise SnapshotError(f"cannot list {qgroups}: {e}", errno=e.errno) from e
+    found: dict[int, QgroupUsage] = {}
+    for name in names:
+        match = _LEVEL0_QGROUP_RE.fullmatch(name)
+        if match is None:
+            continue
+        qgroup = qgroups / name
+        found[int(match.group(1))] = QgroupUsage(
+            referenced=_read_u64(qgroup / "referenced"),
+            exclusive=_read_u64(qgroup / "exclusive"),
+            limit_flags=_read_u64(qgroup / "limit_flags"),
+            max_referenced=_read_u64(qgroup / "max_referenced"),
+            max_exclusive=_read_u64(qgroup / "max_exclusive"),
+        )
+    return found
 
 
 def _valid_limit(limit: object) -> int:

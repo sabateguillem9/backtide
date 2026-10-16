@@ -1434,3 +1434,31 @@ def test_sync_filesystem_relative_path_is_a_value_error(recorder: Recorder) -> N
     with pytest.raises(ValueError, match="absolute"):
         btrfs.sync_filesystem(Path("mnt"))
     assert recorder.calls == []
+
+
+# --- quotas: every level-0 qgroup (T04d-2: what holds the space) -------------------------------
+
+
+def test_level0_qgroups_reads_every_subvolume_qgroup_and_nothing_else(
+    sysfs: Path, tmp_path: Path
+) -> None:
+    write_mode(sysfs, "squota\n")
+    write_qgroup(sysfs, "0_258", referenced="100\n", exclusive="100\n")
+    write_qgroup(sysfs, "0_300", referenced="7\n", exclusive="7\n")
+    write_qgroup(sysfs, "1_100", referenced="999\n")  # a higher level: not a subvolume
+    (sysfs / FSID / "qgroups" / "0_bad").mkdir()  # not a qgroup name: ignored
+    (sysfs / FSID / "qgroups" / "enabled").write_text("1\n")
+    found = btrfs.level0_qgroups(tmp_path, sysfs=sysfs)
+    assert sorted(found) == [258, 300]
+    assert (found[258].exclusive, found[300].referenced) == (100, 7)
+
+
+def test_level0_qgroups_without_quotas_is_empty(sysfs: Path, tmp_path: Path) -> None:
+    assert btrfs.level0_qgroups(tmp_path, sysfs=sysfs) == {}
+
+
+def test_level0_qgroups_with_a_bad_value_is_an_error(sysfs: Path, tmp_path: Path) -> None:
+    write_mode(sysfs, "squota\n")
+    write_qgroup(sysfs, "0_258", exclusive="-1\n")
+    with pytest.raises(SnapshotError, match="unexpected"):
+        btrfs.level0_qgroups(tmp_path, sysfs=sysfs)

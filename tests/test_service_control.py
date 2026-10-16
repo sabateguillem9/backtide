@@ -31,9 +31,11 @@ from vigia.service.control import (
     ControlOutcomeUnknown,
     ControlServer,
     ControlUnavailable,
+    ask_resume,
     ask_rewind,
     peer_credentials,
 )
+from vigia.service.pause import ResumeOutcome, ResumeStatus
 from vigia.service.rewind import RewindOutcome, RewindStatus
 from vigia.snapshots import Snapshot
 
@@ -70,6 +72,10 @@ class FakeGuardian:
         self.error: Exception | None = None
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
+        self.resumes: list[str] = []
+        self.resume_outcome = ResumeOutcome(
+            ResumeStatus.RESUMED, "El agente sigue donde estaba.", "running"
+        )
 
     def rewind(self, snapshot_id: str, *, requested_by: str) -> RewindOutcome:
         self.calls.append((snapshot_id, requested_by))
@@ -79,6 +85,12 @@ class FakeGuardian:
         if self.error is not None:
             raise self.error
         return self.outcome
+
+    def resume(self, *, requested_by: str) -> ResumeOutcome:
+        self.resumes.append(requested_by)
+        if self.error is not None:
+            raise self.error
+        return self.resume_outcome
 
 
 @pytest.fixture
@@ -315,7 +327,8 @@ def test_a_peer_whose_credentials_cannot_be_read_is_refused(
         (b'{"cmd": "format-the-disk"}\n', "desconocida"),
         (b'{"cmd": 7}\n', "desconocida"),
         (b"{}\n", "desconocida"),
-        (b'{"cmd": "resume"}\n', "desconocida"),  # arrives with T04d-2
+        (b'{"cmd": "resume", "now": true}\n', "nada más"),
+        (b'{"cmd": "pause"}\n', "desconocida"),
         (b'{"cmd": "rewind"}\n', "nada más"),
         (rewind_request(extra="x"), "nada más"),
         (b'{"snapshot_id": "%b"}\n' % SNAPSHOT.encode(), "desconocida"),
@@ -786,3 +799,85 @@ def test_if_the_serving_thread_dies_the_listener_is_closed_so_clients_fail_fast(
         finally:
             server.close()
     assert any(r.exc_info for r in caplog.records)
+
+
+# --- `vigia seguir` through the socket (T04d-2) ------------------------------------------------
+
+
+def test_a_resume_goes_to_the_guardian_and_its_outcome_comes_back(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    server = make_server()
+    reply = ask_resume(server.path, peer=me)
+    assert guardian.resumes == [f"cli (uid {ME}, pid 4242)"]
+    assert guardian.calls == []
+    assert reply == {
+        "ok": True,
+        "outcome": "resumed",
+        "message": "El agente sigue donde estaba.",
+        "agent_state": "running",
+    }
+
+
+@pytest.mark.parametrize("status", list(ResumeStatus))
+def test_every_resume_status_travels_with_ok_only_when_the_agent_may_run(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian, status: ResumeStatus
+) -> None:
+    guardian.resume_outcome = ResumeOutcome(status, "m", "frozen")
+    reply = ask_resume(make_server().path, peer=me)
+    assert reply["outcome"] == str(status)
+    assert reply["ok"] is (status in (ResumeStatus.RESUMED, ResumeStatus.NOT_PAUSED))
+    assert OUTCOME_EXIT_CODES[str(status)] == ResumeOutcome(status, "m").exit_code
+
+
+def test_another_uid_cannot_resume(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    reply = talk(make_server(peer=somebody_else), b'{"cmd": "resume"}\n')
+    assert reply["outcome"] == "refused"
+    assert guardian.resumes == []
+
+
+def test_a_guardian_that_raises_on_resume_is_a_problem_without_its_text(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    guardian.error = RuntimeError("secret sk-ant-api03-" + "x" * 40)
+    reply = ask_resume(make_server().path, peer=me)
+    assert reply["outcome"] == "problem" and reply["ok"] is False
+    assert "sk-ant" not in reply["message"]
+
+
+def test_the_resume_message_is_redacted(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    guardian.resume_outcome = ResumeOutcome(
+        ResumeStatus.STILL_RED, "token sk-ant-api03-" + "y" * 40, "frozen"
+    )
+    reply = ask_resume(make_server().path, peer=me)
+    assert "sk-ant-api03-yyyy" not in reply["message"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        b"not json",
+        b'{"ok": true, "outcome": "done", "message": "m"}',  # a rewind's outcome
+        b'{"ok": "yes", "outcome": "resumed", "message": "m"}',
+        b'{"ok": true, "outcome": "resumed", "message": 5}',
+    ],
+)
+def test_a_resume_reply_that_makes_no_sense_is_unknown(folder: Path, answer: bytes) -> None:
+    thread = raw_server(folder, answer)
+    with pytest.raises(ControlOutcomeUnknown, match="No se sabe si"):
+        ask_resume(folder / "control.sock", wait=0, peer=me)
+    thread.join(5)
+
+
+def test_a_resume_reply_keeps_only_what_the_cli_uses(folder: Path) -> None:
+    thread = raw_server(
+        folder,
+        b'{"ok": true, "outcome": "resumed", "message": "m", "agent_state": "running", "x": 1}\n',
+    )
+    reply = ask_resume(folder / "control.sock", wait=0, peer=me)
+    thread.join(5)
+    assert set(reply) == {"ok", "outcome", "message", "agent_state"}

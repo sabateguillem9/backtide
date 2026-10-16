@@ -325,3 +325,42 @@ def test_instantaneas_does_not_need_the_service(
 def test_a_snapshot_reason_has_a_spanish_name_for_every_known_reason() -> None:
     for reason in Reason:
         assert cli.REASON_NAMES[str(reason)]
+
+
+# --- seguir (T04d-2) ---------------------------------------------------------------------------
+
+
+def test_seguir_is_in_the_help(capsys: pytest.CaptureFixture[str]) -> None:
+    assert "seguir" in run(capsys)[1]
+
+
+def test_seguir_hands_the_config_to_the_command_and_returns_its_code(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen = []
+
+    def fake(config: object) -> int:
+        seen.append(config)
+        return 3
+
+    monkeypatch.setattr(cli, "seguir", fake)
+    code, _, _ = run(capsys, "seguir", "--config", config_file)
+    assert code == 3
+    (config,) = seen
+    assert config.state_dir == config_file.parent / "state"  # type: ignore[attr-defined]
+
+
+def test_seguir_with_a_bad_config_is_a_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _, err = run(capsys, "seguir", "--config", tmp_path / "missing.toml")
+    assert code == 2
+    assert "configuración no válida" in err
+
+
+def test_seguir_without_a_service_says_so(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _, err = run(capsys, "seguir", "--config", config_file)
+    assert code == 1
+    assert "vigia vigilar" in err

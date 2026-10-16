@@ -1,4 +1,5 @@
-"""The control socket: how `vigia rebobinar` asks a running service to rewind.
+"""The control socket: how `vigia rebobinar` asks a running service to rewind, and how
+`vigia seguir` asks it to resume after a pause by space (T04d-2).
 
 Design: docs/19-diseno-t04.md, sections 4 ("El socket de control") and "La CLI".
 
@@ -15,9 +16,10 @@ The server (inside the service):
   another uid gets a refusal before a byte of its request is read. Fails closed: if the
   credentials cannot be read, the connection is refused.
 - One JSON object per connection, on one line, at most 4 KiB, and 5 s to send it (a total
-  deadline, not per read: a client that sends a byte every 4 s does not get more time). Anything
-  else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is not a
-  snapshot id) is refused WITHOUT calling the Guardian.
+  deadline, not per read: a client that sends a byte every 4 s does not get more time):
+  ``{"cmd": "rewind", "snapshot_id": ...}`` or ``{"cmd": "resume"}``, with exactly those keys.
+  Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
+  not a snapshot id) is refused WITHOUT calling the Guardian.
 - One thread per connection (``socketserver``), at most ``MAX_CONNECTIONS`` at a time, so a
   client that connects and says nothing blocks nobody. A rewind runs on its connection's thread;
   if the client goes away the rewind still finishes (it is the person's safety action), and the
@@ -25,10 +27,10 @@ The server (inside the service):
 - The reply never carries the agent's text: it is ``RewindOutcome.message`` (which the Guardian
   keeps free of it) after ``redact``.
 
-The client (``ask_rewind``): checks that the path is a real socket of ours before connecting (a
-symbolic link is refused: it could lead to somebody else's server), checks with ``SO_PEERCRED``
-that the server runs as our user before sending anything, retries while the service is starting,
-and treats whatever comes back as data.
+The client (``ask_rewind``, ``ask_resume``): checks that the path is a real socket of ours
+before connecting (a symbolic link is refused: it could lead to somebody else's server), checks
+with ``SO_PEERCRED`` that the server runs as our user before sending anything, retries while the
+service is starting, and treats whatever comes back as data.
 """
 
 import errno
@@ -46,6 +48,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from vigia.blackbox import redact
+from vigia.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from vigia.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from vigia.snapshots import Snapshot
 
@@ -66,12 +69,16 @@ _CREDENTIALS = struct.Struct("iII")  # struct ucred: pid, uid, gid
 # What "outcome" can say. The rewind statuses, and "refused" for a request that was not served.
 REFUSED = "refused"
 OUTCOMES = frozenset({*(str(status) for status in RewindStatus), REFUSED})
-# The exit code of `vigia rebobinar` for each outcome (docs/19, "La CLI"): a refused request did
-# nothing and was malformed or not allowed, which is a usage error like an invalid id.
+RESUME_OUTCOMES = frozenset({*(str(status) for status in ResumeStatus), REFUSED})
+# The exit code of `vigia rebobinar` and `vigia seguir` for each outcome (docs/19, "La CLI"): a
+# refused request did nothing and was malformed or not allowed, which is a usage error like an
+# invalid id. The two commands share "failed" (1) and "problem" (3).
 OUTCOME_EXIT_CODES = {
+    **{str(status): code for status, code in RESUME_EXIT_CODES.items()},
     **{str(status): code for status, code in EXIT_CODES.items()},
     REFUSED: EXIT_CODES[RewindStatus.INVALID],
 }
+_RESUME_OK = frozenset({ResumeStatus.RESUMED, ResumeStatus.NOT_PAUSED})
 
 
 class ControlError(Exception):
@@ -91,6 +98,8 @@ class RewindService(Protocol):
     """What the server needs from the Guardian."""
 
     def rewind(self, snapshot_id: str, *, requested_by: str) -> RewindOutcome: ...
+
+    def resume(self, *, requested_by: str) -> ResumeOutcome: ...
 
 
 PeerCredentials = Callable[[socket.socket], tuple[int, int, int]]
@@ -269,8 +278,28 @@ class ControlServer:
         command = request.get("cmd")
         if command == "rewind":
             return self._rewind(request, pid, uid)
-        # "resume" arrives with the pause by space (T04d-2).
+        if command == "resume":
+            return self._resume(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
+
+    def _resume(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una petición de seguir lleva `cmd` y nada más.")
+        try:
+            outcome = self._guardian.resume(requested_by=f"cli (uid {uid}, pid {pid})")
+        except Exception:  # the Guardian should not raise; if it does, say so without its text
+            logger.exception("resuming raised instead of answering")
+            outcome = ResumeOutcome(
+                ResumeStatus.PROBLEM,
+                "Ha fallado algo inesperado al reanudar. Mira el estado del agente y la caja "
+                "negra antes de repetirlo.",
+            )
+        return {
+            "ok": outcome.status in _RESUME_OK,
+            "outcome": str(outcome.status),
+            "message": redact(outcome.message),
+            "agent_state": outcome.agent_state,
+        }
 
     def _rewind(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         if set(request) != {"cmd", "snapshot_id"}:
@@ -511,10 +540,81 @@ def ask_rewind(
     path is not a socket of ours, the server is not our user, or the reply makes no sense.
     Waits for the reply as long as ``reply_timeout``: a rewind takes seconds, and a client that
     gives up early would leave the person guessing whether it happened."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "rewind", "snapshot_id": snapshot_id},
+        what="el rebobinado",
+        wait=wait,
+        reply_timeout=reply_timeout,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    return _checked_reply(raw)
+
+
+def ask_resume(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    reply_timeout: float = CLIENT_REPLY_TIMEOUT,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Ask the service at ``path`` to resume after a pause by space (`vigia seguir`) and return
+    its reply, checked like ``ask_rewind``'s: ``ok`` (the agent may run), ``outcome`` (a
+    ``ResumeStatus`` or "refused"), ``message`` and ``agent_state``. Same retries and errors."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "resume"},
+        what="la reanudación",
+        wait=wait,
+        reply_timeout=reply_timeout,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    try:
+        reply = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        reply = None
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in RESUME_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si el agente se ha "
+            "reanudado: mira la caja negra."
+        )
+    state = reply.get("agent_state")
+    return {
+        "ok": reply["ok"],
+        "outcome": reply["outcome"],
+        "message": reply["message"],
+        "agent_state": state if isinstance(state, str) else "",
+    }
+
+
+def _ask(
+    path: Path,
+    request: dict[str, Any],
+    *,
+    what: str,
+    wait: float,
+    reply_timeout: float,
+    peer: PeerCredentials,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> bytes:
+    """One conversation: connect (retrying while nobody answers), send ``request``, read the
+    whole reply. ``what`` names the request in the messages ("el rebobinado")."""
     deadline = monotonic() + wait
     while True:
         try:
-            sock = _connect(Path(path), peer)
+            sock = _connect(path, peer)
         except ControlUnavailable:
             if monotonic() >= deadline:
                 raise
@@ -522,24 +622,23 @@ def ask_rewind(
             continue
         break
     with sock:
-        request = json.dumps({"cmd": "rewind", "snapshot_id": snapshot_id}).encode() + b"\n"
+        data = json.dumps(request).encode() + b"\n"
         try:
             sock.settimeout(REPLY_TIMEOUT)
-            sock.sendall(request)
+            sock.sendall(data)
             sock.shutdown(socket.SHUT_WR)
             sock.settimeout(reply_timeout)
-            raw = _read_all(sock)
+            return _read_all(sock)
         except TimeoutError:
             raise ControlOutcomeUnknown(
-                "El servicio no ha contestado a tiempo. El rebobinado puede seguir en marcha: "
-                "mira `vigia instantaneas` y la caja negra antes de repetirlo."
+                f"El servicio no ha contestado a tiempo. {what.capitalize()} puede seguir en "
+                "marcha: mira `vigia instantaneas` y la caja negra antes de repetirlo."
             ) from None
         except OSError as error:
             raise ControlOutcomeUnknown(
                 f"Se ha perdido la conexión con el servicio ({error.strerror or error}). "
-                "No se sabe si el rebobinado se hizo: mira `vigia instantaneas`."
+                f"No se sabe si {what} se hizo: mira `vigia instantaneas`."
             ) from None
-    return _checked_reply(raw)
 
 
 def _connect(path: Path, peer: PeerCredentials) -> socket.socket:

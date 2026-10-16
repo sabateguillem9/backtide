@@ -67,6 +67,8 @@ CONFIG_FILE_MODE = 0o640
 _TMP_CONFIG = f".{CONFIG_FILE}.tmp"
 _NO_SUCH_CONTAINER = "No such container"
 _NOT_RUNNING = "is not running"
+_NOT_PAUSED = "is not paused"
+PAUSE_TIMEOUT = 10.0  # seconds for docker pause / unpause, which take milliseconds
 _NETWORK_NOT_FOUND = "not found"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -192,6 +194,26 @@ class AgentJail:
         stderr = docker.sanitize(result.stderr.strip())
         raise JailError(
             f"docker kill {self.config.name} failed: {stderr}",
+            returncode=result.returncode,
+            stderr=stderr,
+        )
+
+    def pause(self) -> None:
+        """Freeze every process of the container (``docker pause``, the cgroup freezer): they
+        keep their memory and connections and run nothing until ``unpause``. Takes a few
+        milliseconds, so a CLI that hangs is cut after ``PAUSE_TIMEOUT``. Any failure raises
+        JailError, also a container that is missing or not running: the caller decides what
+        an agent that could not be frozen means (the Guardian kills it)."""
+        docker.run(["pause", self.config.name], timeout=PAUSE_TIMEOUT)
+
+    def unpause(self) -> None:
+        """Thaw a frozen container. One that is not frozen is not an error."""
+        result = docker.run(["unpause", self.config.name], check=False, timeout=PAUSE_TIMEOUT)
+        if result.returncode == 0 or _NOT_PAUSED in result.stderr:
+            return
+        stderr = docker.sanitize(result.stderr.strip())
+        raise JailError(
+            f"docker unpause {self.config.name} failed: {stderr}",
             returncode=result.returncode,
             stderr=stderr,
         )

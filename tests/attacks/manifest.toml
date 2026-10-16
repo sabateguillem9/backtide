@@ -487,9 +487,8 @@ rebobina. También a mitad de un rebobinado: mientras `docker stop` espera a su 
 SIGTERM y mientras `wait_ready` espera a que esté listo, el agente ejecuta código y tiene que \
 congelarse igual (y un agente congelado se mata, nunca se despierta)."""
 inspired_by = "Agente que llena el disco"
-invariants = [2]
-status = "pending"
-task = "T04d-2"
+invariants = [2, 7]
+status = "ready"
 [scenario.expect]
 stopped = "yes"
 recorded = "yes"

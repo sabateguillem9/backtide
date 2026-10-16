@@ -545,6 +545,51 @@ def test_kill_failing_for_another_reason_raises(jail: AgentJail, fake_docker: Fa
         jail.kill()
 
 
+# pause and unpause (T04d-2)
+
+
+def test_pause_freezes_the_container_with_a_short_timeout(
+    jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    """Freezing takes milliseconds: a docker CLI that hangs must not hold the freeze for two
+    minutes, the Guardian kills the agent instead."""
+    jail.pause()
+    (call,) = fake_docker.calls
+    assert call.args == ["pause", jail.config.name]
+    assert call.timeout <= 15
+
+
+@pytest.mark.parametrize("reply", [DAEMON_DOWN, NO_CONTAINER, Reply(error="timed out")])
+def test_pause_that_fails_raises(jail: AgentJail, fake_docker: FakeDocker, reply: Reply) -> None:
+    """Every failure of a freeze is an error, also a missing container: the caller decides."""
+    fake_docker.reply("pause", reply)
+    with pytest.raises(JailError):
+        jail.pause()
+
+
+def test_unpause_thaws_the_container(jail: AgentJail, fake_docker: FakeDocker) -> None:
+    jail.unpause()
+    assert fake_docker.commands() == [["unpause", jail.config.name]]
+
+
+def test_unpause_of_a_container_that_is_not_frozen_is_not_an_error(
+    jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    fake_docker.reply(
+        "unpause",
+        Reply(stderr="Error response from daemon: container x is not paused\n", returncode=1),
+    )
+    jail.unpause()
+
+
+def test_unpause_failing_for_another_reason_raises(
+    jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    fake_docker.reply("unpause", DAEMON_DOWN)
+    with pytest.raises(JailError, match="docker unpause"):
+        jail.unpause()
+
+
 def test_exec_runs_as_the_agent(jail: AgentJail, fake_docker: FakeDocker) -> None:
     jail.exec(["id", "-u"], check=True, timeout=5)
     (call,) = fake_docker.calls

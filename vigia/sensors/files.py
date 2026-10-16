@@ -1023,8 +1023,10 @@ class FileWatcher:
             return self._unwatched.total
 
     def blackbox_health(self) -> BlackBoxHealth:
-        with self._emit_lock:
-            return BlackBoxHealth(self._failures, self._failing_since, self._lost)
+        """Read without ``_emit_lock``, which is held while a whole batch is written: the space
+        thread asks every second and must never wait for an avalanche of events (a late check
+        is P4). Three plain reads; a value one batch old is fine for P7."""
+        return BlackBoxHealth(self._failures, self._failing_since, self._lost)
 
     def arm(self, current: str | None = None) -> bool:
         """Put the watches on the agent's folder, before the agent starts. ``current`` is the
