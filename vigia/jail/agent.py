@@ -42,6 +42,7 @@ from vigia.jail.config import (
     token_env,
 )
 from vigia.jail.docker import JailError
+from vigia.jail.openclaw import check_rewindable
 from vigia.jail.verify import container_problems
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,11 @@ class AgentJail:
 
         The folder holds only openclaw.json (anything else there is refused, so nothing of
         Vigía is ever mounted by mistake). Folder 0750 and file 0640, owned by Vigía, group the
-        agent's gid: the agent can read them, and the mount is read-only anyway."""
+        agent's gid: the agent can read them, and the mount is read-only anyway. Raises
+        ``UnrewindableConfig`` (a ValueError, before touching the disk) when the config has
+        authorization that a rewind would revive (docs/20, section 8)."""
+        config = openclaw_config(self.config)
+        check_rewindable(config)  # an unsafe config is never written (UnrewindableConfig)
         path = self.config.config_dir
         try:
             os.mkdir(path, CONFIG_DIR_MODE)
@@ -144,7 +149,7 @@ class AgentJail:
         dir_fd = _open_dir(path)
         try:
             self._check_config_dir(dir_fd, path)
-            content = json.dumps(openclaw_config(self.config), indent=2) + "\n"
+            content = json.dumps(config, indent=2) + "\n"
             self._replace_config(dir_fd, content.encode())
         finally:
             os.close(dir_fd)

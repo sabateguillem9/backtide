@@ -281,7 +281,8 @@ def network_create_argv(config: AgentJailConfig) -> list[str]:
 def openclaw_config(config: AgentJailConfig) -> dict[str, Any]:
     """OpenClaw's openclaw.json: the hardened baseline of docs/12, with no secrets in it.
 
-    Validated against the pinned image with ``openclaw config validate`` (a VM test)."""
+    Validated against the pinned image with ``openclaw config validate`` (a VM test), and it
+    passes ``openclaw.check_rewindable`` (AgentJail.write_config enforces it)."""
     del config  # the same for every agent today
     return {
         "gateway": {
@@ -289,7 +290,11 @@ def openclaw_config(config: AgentJailConfig) -> dict[str, Any]:
             "bind": "loopback",
             "port": GATEWAY_PORT,
             "auth": {"mode": "token"},  # the token comes from OPENCLAW_GATEWAY_TOKEN
+            # On by default: the gateway would try SSH towards private peers (docs/20, rule 8).
+            "nodes": {"pairing": {"sshVerify": False}},
         },
+        # Active by default: its /pair codes would come back after a rewind (docs/20, rule 8).
+        "plugins": {"entries": {"device-pair": {"enabled": False}}},
         "update": {"checkOnStart": False, "auto": {"enabled": False}},
         "models": {"catalogRefresh": {"enabled": False}},
         "cron": {"enabled": False},

@@ -35,8 +35,10 @@ from vigia.jail.config import (
     SECCOMP_PROFILE,
     TOKEN_ENV,
     docker_create_argv,
+    openclaw_config,
     token_env,
 )
+from vigia.jail.openclaw import check_rewindable
 from vigia.jail.seccomp import BLOCKED_ERRNO
 from vigia.jail.verify import container_problems
 from vigia.snapshots import Reason, btrfs
@@ -142,6 +144,32 @@ def test_config_validates_and_is_read_only(running_agent) -> None:
     overwrite = sh(running_agent, f"echo '{{}}' > {CONTAINER_CONFIG_DIR}/openclaw.json")
     assert overwrite.returncode != 0
     assert "Read-only file system" in overwrite.stderr
+
+
+def _validate_copy(agent, config: dict) -> subprocess.CompletedProcess[str]:
+    """``openclaw config validate`` on a copy of ``config`` in /tmp (OPENCLAW_CONFIG_PATH)."""
+    copy = "/tmp/openclaw-rewindable.json"
+    text = json.dumps(config)
+    assert "'" not in text  # it goes inside sh -c '...'
+    written = sh(agent, f"printf %s '{text}' > {copy}")
+    assert written.returncode == 0, written.stderr
+    validate = f"OPENCLAW_CONFIG_PATH={copy} node openclaw.mjs config validate"
+    return sh(agent, f"{validate}; rc=$?; rm -f {copy}; exit $rc")
+
+
+def test_openclaw_accepts_the_config_that_check_rewindable_accepts(running_agent) -> None:
+    """The baseline plus docs/20's minimal safe Telegram config validate in the real OpenClaw.
+
+    Run against a copy: the mounted config stays untouched."""
+    config = openclaw_config(running_agent.jail.config)
+    telegram = {"dmPolicy": "allowlist", "allowFrom": ["123456789"], "groupPolicy": "disabled"}
+    config["channels"] = {"telegram": telegram}
+    check_rewindable(config)
+    validated = _validate_copy(running_agent, config)
+    assert validated.returncode == 0, validated.stdout + validated.stderr
+    # The copy is what gets validated: a bad value fails the same way.
+    bad = config | {"channels": {"telegram": telegram | {"dmPolicy": "not-a-policy"}}}
+    assert _validate_copy(running_agent, bad).returncode != 0
 
 
 # What the container is

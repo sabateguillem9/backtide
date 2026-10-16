@@ -25,6 +25,7 @@ from vigia.jail.config import (
     token_env,
 )
 from vigia.jail.docker import JailError
+from vigia.jail.openclaw import UnrewindableConfig
 
 TOKEN = "u" * 43
 STARTED_AT = "2026-10-06T16:44:06.49679418Z"
@@ -341,6 +342,21 @@ def test_write_config_cleans_up_an_interrupted_write(jail: AgentJail) -> None:
     (jail.config.config_dir / ".openclaw.json.tmp").write_text("half")
     jail.write_config()
     assert sorted(p.name for p in jail.config.config_dir.iterdir()) == ["openclaw.json"]
+
+
+def test_write_config_never_writes_an_unrewindable_config(
+    jail: AgentJail, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unsafe = openclaw_config(jail.config) | {"channels": {"telegram": {"dmPolicy": "pairing"}}}
+    monkeypatch.setattr(agent_module, "openclaw_config", lambda _config: unsafe)
+    with pytest.raises(UnrewindableConfig, match="channels.telegram.dmPolicy"):
+        jail.write_config()
+    assert not jail.config.config_dir.exists()  # refused before touching the disk
+    jail.config.config_dir.mkdir()  # and an old config is left as it was
+    jail.config.config_file.write_text("old")
+    with pytest.raises(UnrewindableConfig):
+        jail.write_config()
+    assert jail.config.config_file.read_text() == "old"
 
 
 def test_write_config_refuses_anything_else_in_the_folder(jail: AgentJail) -> None:

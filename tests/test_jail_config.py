@@ -245,7 +245,14 @@ def test_network_is_internal_and_isolated_from_the_host(cfg: AgentJailConfig) ->
 
 def test_openclaw_config_is_the_hardened_baseline(cfg: AgentJailConfig) -> None:
     assert openclaw_config(cfg) == {
-        "gateway": {"mode": "local", "bind": "loopback", "port": 18789, "auth": {"mode": "token"}},
+        "gateway": {
+            "mode": "local",
+            "bind": "loopback",
+            "port": 18789,
+            "auth": {"mode": "token"},
+            "nodes": {"pairing": {"sshVerify": False}},
+        },
+        "plugins": {"entries": {"device-pair": {"enabled": False}}},
         "update": {"checkOnStart": False, "auto": {"enabled": False}},
         "models": {"catalogRefresh": {"enabled": False}},
         "cron": {"enabled": False},
