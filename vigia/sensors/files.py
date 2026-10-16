@@ -270,8 +270,10 @@ class WatchTree:
             depth, current = depth + 1, entry[0]
         return None
 
-    def height(self, wd: int) -> int:
-        """How many levels of watched directories hang below ``wd`` (0 if none)."""
+    def height(self, wd: int, limit: int | None = None) -> int:
+        """How many levels of watched directories hang below ``wd`` (0 if none). With a
+        ``limit``, it stops at the first level beyond it (and returns that level): the
+        caller only needs to know that it does not fit."""
         best = 0
         stack = [(wd, 0)]
         for _ in range(len(self._parent) + 1):  # never more nodes than the tree has
@@ -279,8 +281,20 @@ class WatchTree:
                 break
             current, level = stack.pop()
             best = max(best, level)
+            if limit is not None and best > limit:
+                return best
             stack.extend((kid, level + 1) for kid in self._kids.get(current, {}).values())
         return best
+
+    def touch_subtree(self, wd: int) -> None:
+        """Stamp ``wd`` and everything below it with the current generation."""
+        stack = [wd]
+        for _ in range(len(self._parent) + 1):
+            if not stack:
+                break
+            current = stack.pop()
+            self.touch(current)
+            stack.extend(self._kids.get(current, {}).values())
 
     def is_below(self, wd: int, ancestor: int) -> bool:
         """Whether ``wd`` is ``ancestor`` or hangs somewhere below it."""
@@ -817,11 +831,12 @@ class _Job:
 
 @dataclass(frozen=True)
 class _Ref:
-    """A directory for the walk to arm and list: the entry ``name`` of the watch ``parent``."""
+    """A directory for the walk to arm and list: the entry ``name`` of the watch ``parent``.
+    Its depth is not kept: it is taken from the model when it is armed, because an ancestor
+    may move while it waits."""
 
     parent: int
     name: bytes
-    depth: int
 
 
 class _Stale(Exception):  # noqa: N818 - a signal inside the walk, not an error to report
@@ -931,7 +946,7 @@ class FileWatcher:
         self._rescan_sid: str | None = None  # the oldest snapshot current at a request
         self._rescan_sid_unknown = False
         self._rescanning = False
-        self._late_raced: list[str] = []
+        self._rescan_walk_sid: str | None = None  # the snapshot of the rescan that is running
         self._last_rescan: float | None = None
         self._gen = 0  # one per armed period: a thread of an older one touches nothing
         self._orphans: set[int] = set()  # periods whose reader was left running
@@ -1221,7 +1236,7 @@ class FileWatcher:
             self._rescan_wanted = self._rescan_emit = self._rescan_sid_unknown = False
             self._rescan_sid = None
             self._rescanning = False
-            self._late_raced = []
+            self._rescan_walk_sid = None
             self._refusals.clear()
             self._anomaly = None
             self._disarming = False
@@ -1577,14 +1592,22 @@ class FileWatcher:
         """The same watch in a new place, if the whole subtree still fits the depth cap.
         If not (an agent moving chains into each other's leaves to build endless paths), the
         subtree loses its watches and is walked again from its new place, which applies the
-        cap and records what does not fit."""
+        cap and records what does not fit.
+
+        During a rescan, the walk may already have listed the old parent and find nothing
+        under the old name: the moved subtree is stamped as found (its watches are not
+        dropped as vanished at the end) and walked again from its new place."""
         depth = self._tree.depth(parent)
+        room = self._cfg.max_depth - depth - 1 if depth is not None else -1
         if (
-            depth is not None
+            room >= 0
             and not self._tree.is_below(parent, wd)
-            and depth + 1 + self._tree.height(wd) <= self._cfg.max_depth
+            and self._tree.height(wd, limit=room) <= room
         ):
             self._tree.add(wd, parent, name)
+            if self._rescanning:
+                self._tree.touch_subtree(wd)
+                self._queue_dir(parent, name, self._rescan_walk_sid, now)
             return
         for gone in self._tree.remove_subtree(wd):
             try:
@@ -1693,6 +1716,10 @@ class FileWatcher:
                 self._run_job(job, stop, gen)
             except Exception:  # noqa: BLE001 - the scanner must not die quietly
                 logger.exception("the file watcher failed scanning")
+                with self._cond:
+                    if self._gen == gen:  # what that walk did not reach: the rescan will
+                        self._stats.errors += 1
+                        self._want_rescan(job.snapshot_id, emit=job.emit)
             finally:
                 with self._cond:
                     self._busy = False
@@ -1702,10 +1729,10 @@ class FileWatcher:
         if job.kind == "dir":
             assert job.parent is not None  # noqa: S101 - dir jobs always have one
             with self._lock:
-                depth = self._tree.depth(job.parent) if self._gen == gen else None
-            if depth is None:
+                watched = self._gen == gen and job.parent in self._tree
+            if not watched:
                 return  # the parent is no longer watched: its own events said where it went
-            start = deque([_Ref(job.parent, job.name, depth + 1)])
+            start = deque([_Ref(job.parent, job.name)])
             self._walk(start, job.emit, job.snapshot_id, stop, None, gen)
             return
         if job.kind == "rescan":
@@ -1754,7 +1781,7 @@ class FileWatcher:
             root = self._tree.root
             if root is not None:
                 self._tree.touch(root)
-            self._rescanning, self._late_raced = True, []
+            self._rescanning, self._rescan_walk_sid = True, snapshot_id
         walked = False
         try:
             if root is not None:
@@ -1776,10 +1803,7 @@ class FileWatcher:
                                 ino.rm_watch(wd)
                             except OSError as exc:
                                 logger.debug("rm_watch(%d) of a vanished directory: %s", wd, exc)
-                    for path in self._late_raced:  # raced by a job while this walk ran
-                        fresh.add(path, "raced")
                     self._unwatched = fresh
-                self._late_raced = []
 
     def _walk_from_root(
         self,
@@ -1797,7 +1821,7 @@ class FileWatcher:
             self._note_unwatched(".", "raced", ledger, snapshot_id, gen)
             return
         try:  # the root is always known: what it holds is not reported as new
-            children = self._list(fd, root, b"", 0, False, snapshot_id, ledger, gen)
+            children = self._list(fd, root, b"", False, snapshot_id, ledger, gen)
         finally:
             os.close(fd)
         self._walk(deque(children), emit, snapshot_id, stop, ledger, gen)
@@ -1885,13 +1909,12 @@ class FileWatcher:
         room: int,
     ) -> list[_Ref]:
         """Open, arm and list the directory ``ref``; return its subdirectories."""
-        with self._lock:
-            base = self._tree.path(ref.parent) if self._gen == gen else None
-        if base is None:
+        place = self._place(ref, gen)
+        if place is None:
             return []  # the parent stopped being watched meanwhile
-        rel = base + b"/" + ref.name if base else ref.name
+        rel, depth = place
         path = os.fsdecode(rel)
-        if ref.depth > self._cfg.max_depth:
+        if depth > self._cfg.max_depth:  # checked again, under the lock, when arming
             self._note_unwatched(path, "depth", ledger, snapshot_id, gen)
             return []
         opened = self._open_child(parent_fd, ref.name)
@@ -1901,16 +1924,28 @@ class FileWatcher:
             self._note_unwatched(path, opened, ledger, snapshot_id, gen)
             return []
         try:
-            armed = self._arm_dir(ref, opened, path, ledger, gen)
+            armed = self._arm_dir(ref, opened, parent_fd, ledger, gen)
             if armed is None:
                 return []
-            wd, known = armed
+            wd, known, rel = armed
             new = emit and not known
             if new:  # a directory nobody told us about: it is new too
-                self._add_scanned([(path, True)], snapshot_id, gen)
-            return self._list(opened, wd, rel, ref.depth, new, snapshot_id, ledger, gen, room)
+                self._add_scanned([(os.fsdecode(rel), True)], snapshot_id, gen)
+            return self._list(opened, wd, rel, new, snapshot_id, ledger, gen, room)
         finally:
             os.close(opened)
+
+    def _place(self, ref: _Ref, gen: int) -> tuple[bytes, int] | None:
+        """Where ``ref`` is NOW (its path and depth, from the model), or None if its parent is
+        no longer watched. Under _lock or not: it takes it."""
+        with self._lock:
+            if self._gen != gen:
+                return None
+            base = self._tree.path(ref.parent)
+            depth = self._tree.depth(ref.parent)
+        if base is None or depth is None:
+            return None
+        return (base + b"/" + ref.name if base else ref.name), depth + 1
 
     def _open_child(self, parent_fd: int, name: bytes) -> int | str | None:
         """Open the subdirectory ``name`` of ``parent_fd`` (no symlink, no mount crossing).
@@ -1941,7 +1976,6 @@ class FileWatcher:
         fd: int,
         wd: int,
         rel: bytes,
-        depth: int,
         report: bool,
         snapshot_id: str | None,
         ledger: _Unwatched | None,
@@ -1965,7 +1999,7 @@ class FileWatcher:
                     child = rel + b"/" + name if rel else name
                     if is_dir:
                         if len(subdirs) < limit:
-                            subdirs.append(_Ref(wd, name, depth + 1))
+                            subdirs.append(_Ref(wd, name))
                         else:
                             self._note_unwatched(
                                 os.fsdecode(child), "watch_limit", ledger, snapshot_id, gen
@@ -2009,8 +2043,6 @@ class FileWatcher:
                 return
             (ledger if ledger is not None else self._unwatched).add(path, reason)
             if reason in ("raced", "unlisted"):
-                if ledger is None and self._rescanning and len(self._late_raced) < _UNWATCHED_KEPT:
-                    self._late_raced.append(path)
                 self._want_rescan(snapshot_id, emit=True)
 
     def _log_refused(self, what: str, code: int | None) -> None:
@@ -2026,17 +2058,30 @@ class FileWatcher:
             )
 
     def _arm_dir(
-        self, ref: _Ref, fd: int, path: str, ledger: _Unwatched | None, gen: int
-    ) -> tuple[int, bool] | None:
+        self, ref: _Ref, fd: int, parent_fd: int, ledger: _Unwatched | None, gen: int
+    ) -> tuple[int, bool, bytes] | None:
         """Watch the directory open as ``fd``, the entry ``ref.name`` of the watch
-        ``ref.parent``. Returns None if it could not be watched, else its wd and whether it
-        already was (so its contents are not reported as new)."""
+        ``ref.parent``. Returns None if it could not be watched, else its wd, whether it
+        already was (so its contents are not reported as new) and its path now.
+
+        Everything is decided under the lock, against the model as it is now: the depth (an
+        ancestor may have moved since the walk queued it) and the name (the directory may have
+        been moved away between the open and the watch: a watch hung under a name it no
+        longer has would log, at the agent's will, its writes under a false path)."""
         info = os.fstat(fd)
         with self._lock:
             ino = self._ino
-            if ino is None or self._gen != gen or ref.parent not in self._tree:
+            if ino is None or self._gen != gen:
                 return None
+            place = self._place(ref, gen)
+            if place is None:
+                return None
+            rel, depth = place
+            path = os.fsdecode(rel)
             book = ledger if ledger is not None else self._unwatched
+            if depth > self._cfg.max_depth:
+                book.add(path, "depth")
+                return None
             new = self._tree.child(ref.parent, ref.name) is None
             if new and len(self._tree) + 1 >= self._max_watches:
                 book.add(path, "watch_limit")
@@ -2050,9 +2095,23 @@ class FileWatcher:
                 book.add(path, "watch_limit" if limit else "refused")
                 return None
             known = wd in self._tree
+            try:
+                now = os.stat(ref.name, dir_fd=parent_fd, follow_symlinks=False)
+                still_there = (now.st_dev, now.st_ino) == (info.st_dev, info.st_ino)
+            except OSError:
+                still_there = False
+            if not still_there:
+                # Moved away (or swapped) since it was opened: the reader saw that event,
+                # and where it went is told by the events of its new place, if watched.
+                if not known:
+                    try:
+                        ino.rm_watch(wd)
+                    except OSError as exc:
+                        logger.debug("rm_watch(%d) of a directory moved away: %s", wd, exc)
+                return None
             self._tree.add(wd, ref.parent, ref.name, (info.st_dev, info.st_ino))
             book.discard(path)
-            return wd, known
+            return wd, known, rel
 
     # -- the dumper and the black box --------------------------------------------------
 

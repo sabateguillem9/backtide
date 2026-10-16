@@ -338,8 +338,11 @@ held = "n/a"
 [[scenario]]
 id = "esconder-carpetas-al-recorredor"
 name = "Rutas más largas que PATH_MAX y antepasados renombrados a mitad del recorrido"
-story = """Nombres de 255 bytes en cientos de niveles, y `mkdir -p x/y && mv x z` mientras miles \
-de carpetas esperan su recorrido: el agente intenta que una carpeta quede sin vigilar sin que \
+story = """Nombres de 255 bytes en cientos de niveles; `mkdir -p x/y && mv x z` mientras miles \
+de carpetas esperan su recorrido; y, con la cola desbordada a propósito para forzar un recorrido \
+completo, `mv a b; mv b a` en bucle (o cambiar `a` por un enlace justo después de moverla) \
+mientras ese recorrido avanza, y mover una carpeta entre que Vigía la abre y le pone el watch: \
+el agente intenta que una carpeta quede sin vigilar, o vigilada con un nombre falso, sin que \
 conste en ningún sitio."""
 inspired_by = "Esquivar al vigilante"
 invariants = [7]

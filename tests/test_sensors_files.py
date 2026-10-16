@@ -1955,3 +1955,129 @@ class TestDisarmOrder:
         monkeypatch.setattr(files_module.os, "close", spying)
         rig.watcher.close()
         assert seen == [True]
+
+
+class TestReReview:
+    """The second security review of T04a: races between the walk and the reader."""
+
+    def config(self, **kwargs: Any) -> WatcherConfig:
+        return WatcherConfig(dump_interval=None, max_watches=100, rescan_cooldown=30, **kwargs)
+
+    def test_a_rename_during_a_rescan_keeps_the_watches_of_what_it_moved(
+        self, make_rig: Callable[..., Rig]
+    ) -> None:
+        """Item 1: the rescan lists the root, the agent runs ``mv a b`` and the walk finds no
+        ``a``. Without care the end of the rescan drops the watches of b/sub, b/sub/deep."""
+        active: list[bool] = []
+        hooked: list[bool] = []
+
+        def moving(fd: int, rel: bytes, flags: int) -> int:
+            if active and rel == b"a" and not hooked:
+                hooked.append(True)
+                (rig.agent_dir / "a").rename(rig.agent_dir / "b")
+                root = rig.ino.wd_of(rig.agent_dir)
+                rig.ino.push(
+                    RawEvent(root, IN_MOVED_FROM | IN_ISDIR, 41, b"a"),
+                    RawEvent(root, IN_MOVED_TO | IN_ISDIR, 41, b"b"),
+                )
+                assert rig.watcher.drain()
+            return inotify.open_beneath(fd, rel, flags)
+
+        rig = make_rig(self.config(), arm=False, opener=moving)
+        (rig.agent_dir / "a" / "sub" / "deep").mkdir(parents=True)
+        assert rig.watcher.arm(S1)
+        active.append(True)
+        rig.deliver(RawEvent(-1, IN_Q_OVERFLOW, 0, b""))
+        rig.settle()
+        assert hooked
+        moved = rig.agent_dir / "b"
+        assert rig.ino.is_watching(moved / "sub") and rig.ino.is_watching(moved / "sub" / "deep")
+        rig.deliver(RawEvent(rig.ino.wd_of(moved / "sub" / "deep"), IN_CREATE, 0, b"f"))
+        rig.settle()
+        assert "b/sub/deep/f" in rig.by_target()
+        assert not [r for r in rig.files("create") if r.details.get("scan")]  # known: not new
+
+    def test_a_directory_moved_away_between_its_open_and_its_watch_keeps_no_false_name(
+        self, make_rig: Callable[..., Rig], tmp_path: Path
+    ) -> None:
+        """Item 2: opened as work/x, moved out before the watch: it must not stay as work/x."""
+        elsewhere = tmp_path / "elsewhere"
+        hooked: list[bool] = []
+
+        def moving(fd: int, rel: bytes, flags: int) -> int:
+            opened = inotify.open_beneath(fd, rel, flags)
+            if rel == b"x" and not hooked:
+                hooked.append(True)
+                (rig.agent_dir / "work" / "x").rename(elsewhere)
+                rig.ino.push(rig.event("work", IN_MOVED_FROM | IN_ISDIR, "x", cookie=42))
+                assert rig.watcher.drain()
+            return opened
+
+        rig = make_rig(self.config(), opener=moving)
+        (rig.agent_dir / "work" / "x").mkdir()
+        rig.deliver(rig.event("work", IN_CREATE | IN_ISDIR, "x"))
+        rig.settle()
+        assert hooked
+        assert not rig.ino.is_watching(elsewhere)
+        assert rig.watcher.watch_count() == 3
+
+    def test_a_pending_directory_gets_the_depth_of_where_its_parent_is_now(
+        self, make_rig: Callable[..., Rig]
+    ) -> None:
+        """Item 3: p moves one level deeper while the walk is about to arm p/q/r."""
+        hooked: list[bool] = []
+
+        def moving(fd: int, rel: bytes, flags: int) -> int:
+            if rel == b"r" and not hooked:
+                hooked.append(True)
+                (rig.agent_dir / "p").rename(rig.agent_dir / "d1" / "p")
+                rig.ino.push(
+                    rig.event(".", IN_MOVED_FROM | IN_ISDIR, "p", cookie=43),
+                    rig.event("d1", IN_MOVED_TO | IN_ISDIR, "p", cookie=43),
+                )
+                assert rig.watcher.drain()
+            return inotify.open_beneath(fd, rel, flags)
+
+        rig = make_rig(self.config(max_depth=3), arm=False, opener=moving)
+        (rig.agent_dir / "p" / "q" / "r").mkdir(parents=True)
+        (rig.agent_dir / "d1").mkdir()
+        assert rig.watcher.arm(S1)
+        assert hooked
+        assert not rig.ino.is_watching(rig.agent_dir / "d1" / "p" / "q" / "r")  # depth 4
+        assert rig.ino.is_watching(rig.agent_dir / "d1" / "p" / "q")
+        assert rig.watcher.report_unwatched()
+        dropped = rig.files("dropped")[-1]
+        assert dropped.details["reasons"] == {"depth": 1}
+        assert dropped.details["sample"] == ["d1/p/q/r"]  # where it is, not where it was
+
+    def test_the_height_of_a_moved_subtree_stops_at_the_limit(self) -> None:
+        """Item 4: no walk of the whole subtree under the lock to learn it is too deep."""
+        tree = WatchTree()
+        tree.add(1, None, b"")
+        for wd in range(2, 3002):
+            tree.add(wd, wd - 1, b"d")
+        assert tree.height(1, limit=5) == 6  # over the limit: it stops there
+        assert tree.height(1) == 3000
+        assert tree.height(2995, limit=10) == 6
+
+    def test_a_directory_job_that_fails_asks_for_a_rescan(
+        self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Item 5: a bug in one walk loses its directories only until the rescan."""
+        rig = make_rig(self.config())
+        real = rig.watcher._scan_child
+        failed: list[bool] = []
+
+        def flaky(ref: Any, *args: Any) -> Any:
+            if ref.name == b"boom" and not failed:
+                failed.append(True)
+                raise RuntimeError("a bug")
+            return real(ref, *args)
+
+        monkeypatch.setattr(rig.watcher, "_scan_child", flaky)
+        (rig.agent_dir / "work" / "boom").mkdir()
+        rig.deliver(rig.event("work", IN_CREATE | IN_ISDIR, "boom"))
+        eventually(lambda: rig.watcher.stats().rescans == 1)
+        rig.settle()
+        assert failed and rig.watcher.stats().errors == 1
+        assert rig.ino.is_watching(rig.agent_dir / "work" / "boom")
