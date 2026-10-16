@@ -65,6 +65,7 @@ CONFIG_DIR_MODE = 0o750  # group: the agent's gid, so it can read its config and
 CONFIG_FILE_MODE = 0o640
 _TMP_CONFIG = f".{CONFIG_FILE}.tmp"
 _NO_SUCH_CONTAINER = "No such container"
+_NOT_RUNNING = "is not running"
 _NETWORK_NOT_FOUND = "not found"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -170,6 +171,23 @@ class AgentJail:
         timeout = self.config.stop_timeout
         docker.run(["stop", "--time", str(timeout), self.config.name], timeout=timeout + 60)
 
+    def kill(self) -> None:
+        """SIGKILL the container, at once: it runs nothing more. A frozen container must be
+        killed, not stopped: ``docker stop`` wakes it up to deliver SIGTERM, and the agent runs
+        code again for up to ``stop_timeout`` seconds. A missing or already stopped container
+        is not an error."""
+        result = docker.run(["kill", self.config.name], check=False)
+        if result.returncode == 0:
+            return
+        if _NO_SUCH_CONTAINER in result.stderr or _NOT_RUNNING in result.stderr:
+            return
+        stderr = docker.sanitize(result.stderr.strip())
+        raise JailError(
+            f"docker kill {self.config.name} failed: {stderr}",
+            returncode=result.returncode,
+            stderr=stderr,
+        )
+
     def remove(self) -> None:
         """Remove the container, running or not. A missing container is not an error."""
         docker.run(["rm", "--force", self.config.name])
@@ -180,6 +198,12 @@ class AgentJail:
     def is_running(self) -> bool:
         state = self._state()
         return state is not None and state.get("Running") is True
+
+    def is_paused(self) -> bool:
+        """Whether the container is frozen (``docker pause``). Read from Docker, never from
+        memory: a frozen container still reports ``Running`` as true."""
+        state = self._state()
+        return state is not None and state.get("Paused") is True
 
     def wait_ready(self, timeout: float | None = None) -> None:
         """Wait until this run of the Gateway has logged ``[gateway] ready`` and /healthz

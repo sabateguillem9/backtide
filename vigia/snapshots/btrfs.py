@@ -26,6 +26,8 @@
 - The store calls these as ``btrfs.<fn>``, so unit tests can monkeypatch them or
   ``subprocess.run``.
 - libc's ``renameat2`` is loaded on first use, so importing this module works on macOS.
+- ``subvolume_info`` (BTRFS_IOC_GET_SUBVOL_INFO) and ``sync_filesystem`` need no privileges: the
+  service reads the workspace's change counters every cycle without being root (docs/19).
 """
 
 import ctypes
@@ -38,13 +40,13 @@ import re
 import shlex
 import stat
 import subprocess
-import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NoReturn
+from uuid import UUID
 
 from vigia.snapshots.model import SnapshotError, SnapshotNoSpace
 
@@ -64,6 +66,13 @@ _FS_INFO_FSID = slice(16, 32)
 QGROUP_LIMIT_MAX_RFER = 1
 QGROUP_LIMIT_MAX_EXCL = 2
 _U64_MAX = 2**64 - 1  # `qgroup limit none` sends this value, so it is never a valid limit
+# _IOR(0x94, 60, struct btrfs_ioctl_get_subvol_info_args): 504 bytes. Offsets of the fields read.
+BTRFS_IOC_GET_SUBVOL_INFO = 0x81F8943C
+_SUBVOL_INFO_SIZE = 504
+_SUBVOL_NAME = slice(8, 8 + 256)  # BTRFS_VOL_NAME_MAX + 1
+_SUBVOL_UUID = slice(296, 312)
+_SUBVOL_PARENT_UUID = slice(312, 328)
+_ROOT_SUBVOL_RDONLY = 1  # bit 0 of the flags
 
 type QuotaMode = Literal["squota", "qgroup"]
 
@@ -302,7 +311,88 @@ def fsid(path: Path) -> str:
         raise SnapshotError(f"BTRFS_IOC_FS_INFO on {path} failed: {e}", errno=e.errno) from e
     finally:
         os.close(fd)
-    return str(uuid.UUID(bytes=bytes(info[_FS_INFO_FSID])))
+    return str(UUID(bytes=bytes(info[_FS_INFO_FSID])))
+
+
+@dataclass(frozen=True)
+class SubvolumeInfo:
+    """What BTRFS_IOC_GET_SUBVOL_INFO says about a subvolume (the fields Vigía uses).
+
+    ``ctransid`` moves at once with any change to the subvolume (create, write, chmod, mmap,
+    delete) and not with a read; ``generation`` only moves when the transaction commits. A
+    snapshot copies the ``ctransid`` of its origin, and its ``parent_uuid`` is the origin's
+    ``uuid`` (None for a subvolume that is not a snapshot). ``otransid`` is the transaction
+    that created the subvolume."""
+
+    treeid: int  # the subvolume ID, the same number as subvolume_id()
+    name: str
+    generation: int
+    flags: int
+    uuid: UUID
+    parent_uuid: UUID | None
+    ctransid: int
+    otransid: int
+
+    @property
+    def readonly(self) -> bool:
+        return bool(self.flags & _ROOT_SUBVOL_RDONLY)
+
+
+def parse_subvolume_info(buffer: bytes) -> SubvolumeInfo:
+    """Decode the ioctl's 504-byte answer (little endian, as on every Linux Vigía runs on)."""
+    if len(buffer) != _SUBVOL_INFO_SIZE:
+        raise SnapshotError(
+            f"BTRFS_IOC_GET_SUBVOL_INFO answered {len(buffer)} bytes, expected {_SUBVOL_INFO_SIZE}"
+        )
+
+    def u64(offset: int) -> int:
+        return int.from_bytes(buffer[offset : offset + 8], "little")
+
+    parent = UUID(bytes=bytes(buffer[_SUBVOL_PARENT_UUID]))
+    return SubvolumeInfo(
+        treeid=u64(0),
+        name=bytes(buffer[_SUBVOL_NAME]).split(b"\0", 1)[0].decode("utf-8", errors="replace"),
+        generation=u64(280),
+        flags=u64(288),
+        uuid=UUID(bytes=bytes(buffer[_SUBVOL_UUID])),
+        parent_uuid=parent if parent.int else None,
+        ctransid=u64(344),
+        otransid=u64(352),
+    )
+
+
+def subvolume_info(path: Path) -> SubvolumeInfo:
+    """The change counters and lineage of the subvolume at ``path``. Unprivileged, and cheap
+    (about 6 µs): the service calls it for the workspace and every snapshot each cycle.
+
+    Refuses anything that is not a subvolume root (the ioctl would answer for the subvolume
+    that CONTAINS a plain directory) and a symlink."""
+    path = _absolute(path)
+    if not is_subvolume(path):
+        raise SnapshotError(
+            f"cannot read the subvolume info of {path}: not a subvolume root "
+            "(missing, a plain directory, a file or a symlink)"
+        )
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise SnapshotError(f"cannot open {path}: {e}", errno=e.errno) from e
+    info = bytearray(_SUBVOL_INFO_SIZE)
+    try:
+        fcntl.ioctl(fd, BTRFS_IOC_GET_SUBVOL_INFO, info)
+    except OSError as e:
+        raise SnapshotError(
+            f"BTRFS_IOC_GET_SUBVOL_INFO on {path} failed: {e}", errno=e.errno
+        ) from e
+    finally:
+        os.close(fd)
+    return parse_subvolume_info(bytes(info))
+
+
+def sync_filesystem(path: Path) -> None:
+    """``btrfs filesystem sync``: commit the transaction of the btrfs that holds ``path``, so
+    ``generation`` and qgroup usage catch up. Unprivileged."""
+    run("filesystem", "sync", _absolute(path))
 
 
 def quota_mode(path: Path, *, sysfs: Path = SYSFS_BTRFS) -> QuotaMode | None:

@@ -1242,3 +1242,176 @@ def test_qgroup_usage_limits_only_count_with_their_flag(
 
 def test_qgroup_limit_flags_match_the_kernel() -> None:
     assert (btrfs.QGROUP_LIMIT_MAX_RFER, btrfs.QGROUP_LIMIT_MAX_EXCL) == (1, 2)
+
+
+# --- GET_SUBVOL_INFO and sync ------------------------------------------------------------------
+
+SUBVOL_UUID = uuid.UUID("11111111-2222-3333-4444-555555555555")
+PARENT_UUID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+
+def subvol_info_buffer(
+    *,
+    treeid: int = 258,
+    name: bytes = b"workspace",
+    generation: int = 700,
+    flags: int = 0,
+    own_uuid: uuid.UUID = SUBVOL_UUID,
+    parent_uuid: uuid.UUID | None = PARENT_UUID,
+    ctransid: int = 650,
+    otransid: int = 123,
+) -> bytes:
+    """A 504-byte btrfs_ioctl_get_subvol_info_args, packed by hand at the documented offsets."""
+    buffer = bytearray(504)
+    buffer[0:8] = treeid.to_bytes(8, "little")
+    buffer[8 : 8 + len(name)] = name
+    buffer[264:272] = (5).to_bytes(8, "little")  # parent_id: not read
+    buffer[280:288] = generation.to_bytes(8, "little")
+    buffer[288:296] = flags.to_bytes(8, "little")
+    buffer[296:312] = own_uuid.bytes
+    buffer[312:328] = (parent_uuid or uuid.UUID(int=0)).bytes
+    buffer[328:344] = b"\xee" * 16  # received_uuid: not read
+    buffer[344:352] = ctransid.to_bytes(8, "little")
+    buffer[352:360] = otransid.to_bytes(8, "little")
+    return bytes(buffer)
+
+
+class FakeSubvolIoctl:
+    """Stands in for fcntl.ioctl: fills the buffer with ``answer``, or raises ``error``."""
+
+    def __init__(self, answer: bytes | None = None, error: OSError | None = None) -> None:
+        self.answer = subvol_info_buffer() if answer is None else answer
+        self.error = error
+        self.calls: list[tuple[int, int, int]] = []
+
+    def __call__(self, fd: int, request: int, arg: bytearray, mutate: bool = True) -> int:
+        self.calls.append((fd, request, len(arg)))
+        if self.error is not None:
+            raise self.error
+        arg[:] = self.answer
+        return 0
+
+
+@pytest.fixture
+def subvol_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A real directory that lstat reports as a subvolume root (so os.open works on it)."""
+    target = tmp_path / "ws"
+    target.mkdir()
+    fake_lstat(monkeypatch, target, SUBVOLUME_ROOT)
+    return target
+
+
+def test_subvolume_info_decodes_the_fields_at_their_offsets(
+    monkeypatch: pytest.MonkeyPatch, subvol_dir: Path
+) -> None:
+    fake = FakeSubvolIoctl()
+    monkeypatch.setattr(fcntl, "ioctl", fake)
+    info = btrfs.subvolume_info(subvol_dir)
+    assert info == btrfs.SubvolumeInfo(
+        treeid=258,
+        name="workspace",
+        generation=700,
+        flags=0,
+        uuid=SUBVOL_UUID,
+        parent_uuid=PARENT_UUID,
+        ctransid=650,
+        otransid=123,
+    )
+    assert not info.readonly
+    ((fd, request, size),) = fake.calls
+    assert request == btrfs.BTRFS_IOC_GET_SUBVOL_INFO == 0x81F8943C
+    assert size == 504
+    with pytest.raises(OSError) as closed:
+        os.fstat(fd)
+    assert closed.value.errno == errno.EBADF
+
+
+def test_subvolume_info_without_a_parent_is_none_and_flags_say_read_only(
+    monkeypatch: pytest.MonkeyPatch, subvol_dir: Path
+) -> None:
+    answer = subvol_info_buffer(parent_uuid=None, flags=1 | 4)
+    monkeypatch.setattr(fcntl, "ioctl", FakeSubvolIoctl(answer))
+    info = btrfs.subvolume_info(subvol_dir)
+    assert info.parent_uuid is None
+    assert info.readonly
+
+
+def test_subvolume_info_reads_full_width_counters() -> None:
+    big = 2**64 - 1
+    info = btrfs.parse_subvolume_info(subvol_info_buffer(ctransid=big, generation=2**40))
+    assert info.ctransid == big
+    assert info.generation == 2**40
+
+
+def test_subvolume_info_name_stops_at_the_nul_and_survives_bad_utf8() -> None:
+    info = btrfs.parse_subvolume_info(subvol_info_buffer(name=b"snap\x00junk\xff"))
+    assert info.name == "snap"
+    assert btrfs.parse_subvolume_info(subvol_info_buffer(name=b"a\xffb")).name == "a�b"
+
+
+@pytest.mark.parametrize("size", [0, 503, 505, 1024])
+def test_parse_subvolume_info_rejects_a_wrong_size(size: int) -> None:
+    with pytest.raises(SnapshotError, match="expected 504"):
+        btrfs.parse_subvolume_info(b"\0" * size)
+
+
+def test_subvolume_info_failure_is_a_snapshot_error_and_closes_the_fd(
+    monkeypatch: pytest.MonkeyPatch, subvol_dir: Path
+) -> None:
+    fake = FakeSubvolIoctl(error=OSError(errno.ENOTTY, "Inappropriate ioctl for device"))
+    monkeypatch.setattr(fcntl, "ioctl", fake)
+    with pytest.raises(SnapshotError, match="GET_SUBVOL_INFO") as raised:
+        btrfs.subvolume_info(subvol_dir)
+    assert raised.value.errno == errno.ENOTTY
+    ((fd, _, _),) = fake.calls
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda p: p.symlink_to(p.parent / "real-dir"), id="symlink"),
+        pytest.param(lambda p: None, id="missing"),
+        pytest.param(lambda p: p.touch(), id="file"),
+        pytest.param(lambda p: p.mkdir(), id="plain-directory"),
+    ],
+)
+def test_subvolume_info_refuses_anything_but_a_subvolume_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, make: Callable[[Path], None]
+) -> None:
+    # A plain directory would make the ioctl answer for the subvolume that contains it.
+    fake = FakeSubvolIoctl()
+    monkeypatch.setattr(fcntl, "ioctl", fake)
+    (tmp_path / "real-dir").mkdir()
+    make(tmp_path / "x")
+    with pytest.raises(SnapshotError, match="not a subvolume root"):
+        btrfs.subvolume_info(tmp_path / "x")
+    assert fake.calls == []
+
+
+def test_subvolume_info_relative_path_is_a_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSubvolIoctl()
+    monkeypatch.setattr(fcntl, "ioctl", fake)
+    with pytest.raises(ValueError, match="absolute"):
+        btrfs.subvolume_info(Path("ws"))
+    assert fake.calls == []
+
+
+def test_sync_filesystem_runs_filesystem_sync(recorder: Recorder, tmp_path: Path) -> None:
+    btrfs.sync_filesystem(tmp_path)
+    assert recorder.argvs == [["btrfs", "filesystem", "sync", str(tmp_path)]]
+
+
+def test_sync_filesystem_failure_is_a_snapshot_error(recorder: Recorder, tmp_path: Path) -> None:
+    recorder.then(DENIED)
+    with pytest.raises(SnapshotError, match="Permission denied"):
+        btrfs.sync_filesystem(tmp_path)
+
+
+def test_sync_filesystem_relative_path_is_a_value_error(recorder: Recorder) -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        btrfs.sync_filesystem(Path("mnt"))
+    assert recorder.calls == []

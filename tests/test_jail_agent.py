@@ -484,6 +484,51 @@ def test_running_and_existing(jail: AgentJail, fake_docker: FakeDocker) -> None:
         jail.is_running()
 
 
+def test_is_paused_reads_the_real_state_of_the_container(
+    jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    # A frozen container still has Running = true: only Paused tells the two apart.
+    fake_docker.reply("container", "inspect", Reply(json.dumps({"Running": True, "Paused": True})))
+    assert jail.is_running() and jail.is_paused()
+    fake_docker.reply("container", "inspect", Reply(json.dumps({"Running": True, "Paused": False})))
+    assert not jail.is_paused()
+    fake_docker.reply("container", "inspect", state(running=False))  # no Paused key at all
+    assert not jail.is_paused()
+    fake_docker.reply("container", "inspect", NO_CONTAINER)
+    assert not jail.is_paused()
+    fake_docker.reply("container", "inspect", DAEMON_DOWN)
+    with pytest.raises(JailError, match="cannot inspect container"):
+        jail.is_paused()
+
+
+def test_kill_sends_sigkill_without_waiting_for_a_graceful_stop(
+    jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    jail.kill()
+    assert fake_docker.commands() == [["kill", jail.config.name]]
+    assert not any(command[0] == "stop" for command in fake_docker.commands())
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Error response from daemon: No such container: x",
+        "Error response from daemon: Cannot kill container: x: container x is not running",
+    ],
+)
+def test_kill_of_a_missing_or_stopped_container_is_not_an_error(
+    jail: AgentJail, fake_docker: FakeDocker, stderr: str
+) -> None:
+    fake_docker.reply("kill", Reply(stderr=stderr + "\n", returncode=1))
+    jail.kill()
+
+
+def test_kill_failing_for_another_reason_raises(jail: AgentJail, fake_docker: FakeDocker) -> None:
+    fake_docker.reply("kill", DAEMON_DOWN)
+    with pytest.raises(JailError, match="docker kill"):
+        jail.kill()
+
+
 def test_exec_runs_as_the_agent(jail: AgentJail, fake_docker: FakeDocker) -> None:
     jail.exec(["id", "-u"], check=True, timeout=5)
     (call,) = fake_docker.calls
