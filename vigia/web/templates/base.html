@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="{{ lang }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="robots" content="noindex">
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0,"refreshOnHistoryMiss":true}'>
+{% block head %}{% endblock %}
+<title>{% block title %}{{ t('app.name') }}{% endblock %} · {{ t('app.name') }}</title>
+<link rel="icon" href="{{ base }}/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="{{ base }}/static/web.css">
+<script src="{{ base }}/static/vendor/htmx.min.js" defer></script>
+<script src="{{ base }}/static/vendor/htmx-sse.js" defer></script>
+<script src="{{ base }}/static/web.js" defer></script>
+</head>
+<body>
+<div class="page">
+<header class="top">
+  <div class="brand">
+    <a class="home" href="{{ base }}/ahora">{{ t('app.name') }}</a>
+    <span class="run" title="{{ t('run.label') }}">{{ run_name }}</span>
+  </div>
+  {% if active %}
+  <nav aria-label="{{ t('nav.label') }}">
+    <a href="{{ base }}/ahora"{% if active == 'now' %} aria-current="page"{% endif %}>{{ t('nav.now') }}</a>
+    <a href="{{ base }}/historia"{% if active == 'history' %} aria-current="page"{% endif %}>{{ t('nav.history') }}</a>
+    <a href="{{ base }}/instantaneas"{% if active == 'snapshots' %} aria-current="page"{% endif %}>{{ t('nav.snapshots') }}</a>
+  </nav>
+  {% endif %}
+</header>
+{% block main %}{% endblock %}
+<footer class="foot">
+  <span>{{ t('app.local') }}</span>
+  <span class="langs" role="group" aria-label="{{ t('lang.label') }}">
+    {% for code in languages %}
+    <a href="{{ switch(code) }}" lang="{{ code }}"{% if code == lang %} aria-current="true"{% endif %}>{{ code | upper }}</a>
+    {% endfor %}
+  </span>
+</footer>
+</div>
+</body>
+</html>

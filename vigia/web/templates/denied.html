@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ t('auth.title') }}{% endblock %}
+{% block main %}
+<main class="watch">
+  <h1>{{ t('auth.title') }}</h1>
+  <p class="lede">{{ t('auth.bad') if bad_link else t('auth.body') }}</p>
+</main>
+{% endblock %}

@@ -1,0 +1,17 @@
+<div class="line you">
+  <span class="when">{{ t('chat.you') }}</span>
+  <span class="dot dot-you" aria-hidden="true"></span>
+  <span class="said">{{ vis(question, 200) }}</span>
+</div>
+<div class="line answer">
+  <span class="when"></span>
+  <span class="dot dot-0" aria-hidden="true"></span>
+  <span class="said">
+    {% if unreadable %}
+    <span class="para">{{ t('box.unreadable') }}</span>
+    {% else %}
+    {% for text in reply.lines %}<span class="para">{{ text }}</span>{% endfor %}
+    {% if reply.risky %}<ul class="risky">{% for text in reply.risky %}<li>{{ text }}</li>{% endfor %}</ul>{% endif %}
+    {% endif %}
+  </span>
+</div>

@@ -9,8 +9,13 @@ UV_VM = UV_PROJECT_ENVIRONMENT="$$HOME/.venvs/vigia" uv run --locked
 # The recordable demo (docs/demo.md): scripts/demo/demo.py, inside the VM.
 DEMO_VM = $(UV_VM) python -m scripts.demo.demo
 
+# The web of the demo (docs/demo.md): in the VM, on the config that `make demo` writes. A port
+# apart from the Mac's own `make web-demo`, so both can be open at once (Lima forwards the VM's).
+DEMO_WEB_CONFIG = $$HOME/vigia-demo-run/vigia.toml
+DEMO_WEB_PORT = 8766
+
 .PHONY: help test lint fmt it ataques demo demo-crear demo-archivos demo-borrar demo-instantaneas \
-	demo-rebobinar demo-parar vm-up vm-shell vm-down vm-delete
+	demo-rebobinar demo-parar demo-web web-demo vm-up vm-shell vm-down vm-delete
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -55,6 +60,19 @@ demo-rebobinar: ## Demo: rewind (ID=<snapshot>, default the one demo-crear left;
 
 demo-parar: ## Demo: stop everything, unmount and delete the demo volume
 	$(VM_SH) '$(DEMO_VM) parar'
+
+demo-web: ## Demo: the web of the running demo, in the VM (open the link on the Mac; docs/demo.md)
+	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
+	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) vigia web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT)'
+
+web-demo: ## Web demo on the Mac, no VM: made-up black box + `vigia web`; Ctrl-C stops (docs/demo.md)
+	@dir=$$(mktemp -d "$${TMPDIR:-/tmp}/vigia-web-demo.XXXXXX") || exit 1; \
+	seeder=; trap 'kill $$seeder 2>/dev/null; rm -rf "$$dir"' EXIT INT TERM; \
+	uv run python scripts/web-demo/seed.py "$$dir" --live >/dev/null & seeder=$$!; \
+	n=0; while [ ! -e "$$dir/.ready" ]; do \
+	  n=$$((n+1)); if [ $$n -gt 240 ]; then echo "The demo data did not appear" >&2; exit 1; fi; \
+	  sleep 0.5; done; \
+	uv run vigia web --config "$$dir/vigia.toml"
 
 vm-up: ## Create (first time) and start the dev VM
 	@status=$$(limactl list --format '{{.Status}}' $(VM) 2>/dev/null); \

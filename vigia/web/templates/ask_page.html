@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ t('now.title') }}{% endblock %}
+{% block main %}
+<main class="watch">
+  <h1>{{ t('now.title') }}</h1>
+  <div class="feed">{% include "ask.html" %}</div>
+  <p class="note"><a href="{{ base }}/ahora">{{ t('nav.now') }}</a></p>
+</main>
+{% endblock %}

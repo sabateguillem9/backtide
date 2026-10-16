@@ -120,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     rewind.add_argument("snapshot", metavar="instantánea", help="identificador de la instantánea")
     rewind.add_argument("--si", action="store_true", help="no pedir confirmación")
     rewind.set_defaults(handler=_rewind)
+    _add_web(commands)
     return parser
 
 
@@ -505,6 +506,67 @@ def _printable(text: str) -> str:
     attacker chose (tables, triggers, paths), and escape sequences in them could rewrite
     what the terminal shows, for example turn MANIPULADO into a fake OK."""
     return "".join(char if char.isprintable() else repr(char)[1:-1] for char in text)
+
+
+# -- `vigia web` (T12) -----------------------------------------------------------------------
+
+
+def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    web = commands.add_parser(
+        "web",
+        help="abre el puesto de vigilancia en este ordenador (solo lectura)",
+        description="Sirve la web de Vigía en 127.0.0.1 (solo este ordenador): lo que hace el "
+        "agente en directo, la historia con filtros y las instantáneas. Solo lee la base de la "
+        "caja negra (sin su clave ni el token) y se puede lanzar como un usuario sin privilegios "
+        "con permiso de lectura sobre ella. Imprime un enlace de un solo uso, nuevo en cada "
+        "ejecución, y el nombre de la ejecución; ábrelo en el navegador (no abre nada por sí "
+        "mismo). Ctrl-C la para. Sale con 0 si paró bien, 1 si no pudo arrancar y 2 si la "
+        "configuración no sirve.",
+    )
+    _add_config(web)
+    web.add_argument(
+        "--puerto",
+        "--port",
+        dest="port",
+        type=int,
+        default=None,
+        help="puerto en 127.0.0.1 (por defecto 8765; 0 elige uno libre)",
+    )
+    web.set_defaults(handler=_web)
+
+
+def _web(args: argparse.Namespace) -> int:
+    from vigia.web.paths import WebPaths
+    from vigia.web.server import DEFAULT_PORT, run_web
+
+    port = DEFAULT_PORT if args.port is None else args.port
+    if not 0 <= port <= 65535:
+        _error(f"el puerto debe estar entre 0 y 65535, no {port}")
+        return EXIT_ERROR
+    try:
+        # Only the two paths the web needs: never the gateway token, never the black box's key.
+        paths = WebPaths.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+
+    def announce(url: str, run_name: str) -> None:
+        print(f"Puesto de vigilancia listo, solo en este ordenador:\n\n  {url}\n", flush=True)
+        print(
+            f"Nombre de esta ejecución: {run_name}\n"
+            "Debe ser el mismo que sale en la cabecera de la página: si no, no es esta.\n"
+            "El enlace vale una sola vez (después la página usa una cookie de este navegador). "
+            "Ctrl-C la para.",
+            flush=True,
+        )
+
+    try:
+        run_web(paths, port, announce)
+    except OSError as error:
+        _error(f"no se puede abrir el puerto {port} en 127.0.0.1: {error.strerror or error}")
+        return EXIT_FAILED
+    print("Puesto de vigilancia parado.")
+    return EXIT_OK
 
 
 if __name__ == "__main__":

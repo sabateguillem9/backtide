@@ -1,0 +1,5 @@
+<div class="line{% if line.mark %} mark{% endif %}" id="l-{{ line.id }}"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <time class="when" datetime="{{ line.ts }}" title="{{ stamp(line.ts) }}">{{ clock(line.ts) }}</time>
+  <span class="dot dot-{{ line.risk }}" role="img" aria-label="{{ t('risk.' ~ line.risk) }}"></span>
+  <span class="said">{{ tell(line) }}</span>
+</div>

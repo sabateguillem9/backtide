@@ -1,0 +1,10 @@
+{% if filters.bad_time %}<p class="note">{{ t('hist.badtime') }}</p>{% endif %}
+{% if unreadable %}
+<p class="note">{{ t('box.unreadable') }}</p>
+{% elif not events %}
+<p class="note">{{ t('hist.none') }}</p>
+{% else %}
+<div class="events">
+{% include "history_rows.html" %}
+</div>
+{% endif %}

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ t('hist.title') }}{% endblock %}
+{% block main %}
+<main class="history">
+  <h1>{{ t('hist.title') }}</h1>
+  <p class="lede">{{ t('hist.lede') }}</p>
+  <form class="filters" action="{{ base }}/historia" method="get" hx-get="{{ base }}/historia" hx-target="#results" hx-push-url="true" hx-trigger="change, submit">
+    <label>{{ t('hist.source') }}
+      <select name="origen">
+        <option value="">{{ t('hist.any') }}</option>
+        {% for s in sources %}<option value="{{ s }}"{% if filters.source == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>{{ t('hist.action') }}
+      <input name="accion" type="text" maxlength="64" autocomplete="off" value="{{ filters.action or '' }}">
+    </label>
+    <label>{{ t('hist.risk') }}
+      <select name="riesgo">
+        <option value="">{{ t('hist.any') }}</option>
+        <option value="1"{% if filters.min_risk == 1 %} selected{% endif %}>{{ t('hist.risk1') }}</option>
+        <option value="2"{% if filters.min_risk == 2 %} selected{% endif %}>{{ t('hist.risk2') }}</option>
+        <option value="3"{% if filters.min_risk == 3 %} selected{% endif %}>{{ t('hist.risk3') }}</option>
+      </select>
+    </label>
+    <label>{{ t('hist.range') }}
+      <select name="rango">
+        <option value="">{{ t('hist.range.all') }}</option>
+        {% for r in ranges %}<option value="{{ r }}"{% if filters.rng == r %} selected{% endif %}>{{ t('hist.range.' ~ r) }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>{{ t('hist.from') }}
+      <input name="desde" type="datetime-local" value="{{ filters.since_text }}">
+    </label>
+    <label>{{ t('hist.to') }}
+      <input name="hasta" type="datetime-local" value="{{ filters.until_text }}">
+    </label>
+    <button class="dot-button" type="submit" aria-label="{{ t('hist.apply') }}">{% include "arrow.html" %}</button>
+  </form>
+  <section id="results">
+    {% include "history_results.html" %}
+  </section>
+</main>
+{% endblock %}

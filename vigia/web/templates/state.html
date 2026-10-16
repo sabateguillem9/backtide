@@ -1,0 +1,6 @@
+<p class="agent">
+  <span class="muted">{{ t('agent.label') }}</span>
+  <span class="status-dot st-{{ state }}" aria-hidden="true"></span>
+  <strong>{{ t('state.' ~ state) }}</strong>
+</p>
+<p class="note">{% if state_time %}{{ t('state.note', time=state_time) }}{% else %}{{ t('state.none') }}{% endif %}</p>

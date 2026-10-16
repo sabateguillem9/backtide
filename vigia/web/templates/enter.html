@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block head %}<meta http-equiv="refresh" content="0;url={{ target }}">{% endblock %}
+{% block title %}{{ t('enter.title') }}{% endblock %}
+{% block main %}
+<main class="watch">
+  <h1>{{ t('enter.title') }}</h1>
+  <p class="lede">{{ t('enter.body') }}</p>
+  <p class="note"><a href="{{ target }}">{{ t('enter.link') }}</a></p>
+</main>
+{% endblock %}

@@ -1,0 +1,18 @@
+<details class="event{% if e.source.value == 'snapshot' and e.action == 'take' %} mark{% endif %}" id="e-{{ e.seq }}">
+  <summary class="line">
+    <time class="when" datetime="{{ e.ts }}">{{ stamp(e.ts) }}</time>
+    <span class="dot dot-{{ e.risk }}" role="img" aria-label="{{ t('risk.' ~ e.risk) }}"></span>
+    <span class="said">{{ tell(e) }}</span>
+    <span class="tag">{{ e.source.value }}/{{ vis(e.action, 64) }}</span>
+  </summary>
+  <dl class="facts">
+    <dt>{{ t('hist.field.seq') }}</dt><dd>{{ e.seq }}</dd>
+    <dt>{{ t('hist.field.ts') }}</dt><dd>{{ e.ts }}</dd>
+    <dt>{{ t('hist.field.what') }}</dt><dd>{{ e.source.value }} / {{ vis(e.action, 64) }}</dd>
+    <dt>{{ t('hist.field.target') }}</dt><dd>{{ vis(e.target, 600) }}</dd>
+    <dt>{{ t('hist.field.risk') }}</dt><dd>{{ e.risk }} · {{ t('risk.' ~ e.risk) }}</dd>
+    {% if e.snapshot_id %}<dt>{{ t('hist.field.snapshot') }}</dt><dd>{{ vis(e.snapshot_id, 80) }}</dd>{% endif %}
+    <dt>{{ t('hist.field.hash') }}</dt><dd class="hash">{{ e.hash[:16] }}</dd>
+    <dt>{{ t('hist.field.details') }}</dt><dd><pre>{{ vis(details_json(e), 6000, keep_newlines=True) }}</pre></dd>
+  </dl>
+</details>

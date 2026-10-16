@@ -1,0 +1,6 @@
+{% for e in events %}
+{% include "event_row.html" %}
+{% endfor %}
+{% if older %}
+<a class="more" href="{{ older }}" hx-get="{{ older }}" hx-target="this" hx-swap="outerHTML" hx-push-url="false">{{ t('hist.more') }}</a>
+{% endif %}

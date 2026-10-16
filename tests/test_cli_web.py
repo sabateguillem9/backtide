@@ -1,0 +1,160 @@
+"""`vigia web`: arguments, messages in Spanish, exit codes, and the real server it starts. The web
+needs no secret: these tests run with no gateway token and no key file at all."""
+
+import threading
+import time
+from pathlib import Path
+
+import httpx2 as httpx
+import pytest
+
+import vigia.web.server as server_module
+from tests.webkit import KEY
+from vigia.blackbox import BlackBox
+from vigia.cli import main
+from vigia.web.paths import WebPaths
+
+
+@pytest.fixture
+def config_file(tmp_path: Path) -> Path:
+    """A configuration and a black box, and NOTHING else: no gateway.token, no blackbox.key."""
+    state = tmp_path / "state"
+    state.mkdir()
+    path = tmp_path / "vigia.toml"
+    path.write_text(f'state_dir = "{state}"\nvolume = "{tmp_path / "vol"}"\n')
+    path.chmod(0o644)
+    return path
+
+
+@pytest.fixture
+def recorded(config_file: Path) -> BlackBox:
+    """What the service would have left: a black box with a few events."""
+    state = config_file.parent / "state"
+    box = BlackBox(state / "blackbox.db", KEY, checkpoint_path=state / "blackbox.checkpoint")
+    box.append("system", "agent_start", "")
+    box.append("file", "create", "notas.md", details={"type": "file"})
+    return box
+
+
+def run(capsys, *args):
+    code = main([str(arg) for arg in args])
+    out, err = capsys.readouterr()
+    return code, out, err
+
+
+def test_web_is_in_the_help(capsys) -> None:
+    _, out, _ = run(capsys)
+    assert "web" in out
+
+
+def test_a_bad_port_is_a_usage_error(capsys, config_file: Path) -> None:
+    for port in ("-1", "70000"):
+        code, _, err = run(capsys, "web", "--config", config_file, "--puerto", port)
+        assert code == 2 and "puerto" in err
+
+
+def test_a_bad_config_is_exit_2(capsys, tmp_path: Path) -> None:
+    code, _, err = run(capsys, "web", "--config", tmp_path / "missing.toml")
+    assert code == 2 and "configuración no válida" in err
+
+
+def test_it_never_asks_for_the_key_or_the_token(
+    capsys, config_file: Path, recorded: BlackBox, monkeypatch
+) -> None:
+    """The service's secrets are not the web's business: it must start without them, and it
+    must not even try to read them."""
+    import vigia.blackbox.keys as keys
+    import vigia.service.config as service_config
+
+    monkeypatch.setattr(keys, "load_key", lambda *a, **k: pytest.fail("the web read the key"))
+    monkeypatch.setattr(
+        service_config.ServiceConfig,
+        "from_file",
+        classmethod(lambda *a, **k: pytest.fail("the web read the whole configuration")),
+    )
+    monkeypatch.setattr(server_module, "run_web", lambda paths, port, announce: None)
+    assert run(capsys, "web", "--config", config_file)[0] == 0
+
+
+def test_it_prints_the_link_once_and_the_name_of_the_run_and_opens_nothing(
+    capsys, config_file: Path, recorded: BlackBox, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake(paths: WebPaths, port: int, announce) -> None:
+        seen.update(paths=paths, port=port)
+        announce("http://127.0.0.1:8765/s/abc/?t=SECRET", "marea-faro-nube")
+
+    monkeypatch.setattr(server_module, "run_web", fake)
+    code, out, _ = run(capsys, "web", "--config", config_file)
+    assert code == 0
+    assert out.count("http://127.0.0.1:8765/s/abc/?t=SECRET") == 1
+    assert "solo en este ordenador" in out and "Ctrl-C" in out
+    assert "Nombre de esta ejecución: marea-faro-nube" in out and "una sola vez" in out
+    assert seen["port"] == 8765 and isinstance(seen["paths"], WebPaths)
+
+
+@pytest.mark.parametrize("flag", ["--puerto", "--port"])
+def test_the_port_can_be_chosen(capsys, config_file: Path, monkeypatch, flag: str) -> None:
+    ports = []
+    monkeypatch.setattr(server_module, "run_web", lambda paths, port, announce: ports.append(port))
+    assert run(capsys, "web", "--config", config_file, flag, "9123")[0] == 0
+    assert ports == [9123]
+
+
+def test_a_port_in_use_is_exit_1_with_a_sentence(capsys, config_file: Path, recorded) -> None:
+    taken = server_module.bind(0)
+    try:
+        port = taken.getsockname()[1]
+        code, _, err = run(capsys, "web", "--config", config_file, "--puerto", str(port))
+    finally:
+        taken.close()
+    assert code == 1 and f"no se puede abrir el puerto {port} en 127.0.0.1" in err
+    assert "Traceback" not in err
+
+
+def test_the_real_web_of_a_real_config(config_file: Path, recorded: BlackBox, monkeypatch) -> None:
+    """`run_web` for real, with no key and no token on disk: the link it announces works once,
+    the black box of the config is on the page, and the snapshots page falls back to the box
+    because the volume is missing."""
+    servers = []
+    real_make = server_module.make_server
+
+    def capture(app):
+        servers.append(real_make(app))
+        return servers[-1]
+
+    monkeypatch.setattr(server_module, "make_server", capture)
+    announced: list[tuple[str, str]] = []
+    paths = WebPaths.from_file(config_file)
+    thread = threading.Thread(
+        target=server_module.run_web,
+        args=(paths, 0, lambda url, name: announced.append((url, name))),
+        daemon=True,
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not (announced and servers and servers[0].started):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    try:
+        link, name = announced[0]
+        assert link.startswith("http://127.0.0.1:") and "/s/" in link and "/?t=" in link
+        base, _, token = link.partition("/?t=")
+        with httpx.Client(base_url=base) as browser:
+            assert browser.get("/ahora").status_code == 401
+            enter = browser.get(f"/ahora?t={token}")  # the page that sets the cookie...
+            assert enter.status_code == 200 and "refresh" in enter.text
+            page = browser.get("/ahora")  # ...and the next navigation, which carries it
+            assert page.status_code == 200 and "notas.md" in page.text and name in page.text
+            fresh = httpx.get(f"{base}/ahora?t={token}")  # the link is dead for anyone else
+            assert fresh.status_code == 401
+            snaps = browser.get("/instantaneas")
+            assert snaps.status_code == 200
+            assert (
+                "No se puede leer el volumen" in snaps.text or "No hay instantáneas" in snaps.text
+            )
+    finally:
+        servers[0].should_exit = True
+        thread.join(10)
+    assert not thread.is_alive()

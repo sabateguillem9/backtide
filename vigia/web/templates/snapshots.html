@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}{{ t('snaps.title') }}{% endblock %}
+{% block main %}
+<main class="snapshots">
+  <h1>{{ t('snaps.title') }}</h1>
+  <p class="lede">{{ t('snaps.lede') }}</p>
+  {% if error %}<p class="note">{{ t('snaps.unreadable') }} {{ t('snaps.fallback') }}</p>{% endif %}
+  {% if not rows %}
+  <p class="note">{{ t('snaps.empty') }}</p>
+  {% else %}
+  <ol class="snaplist">
+    {% for snap in rows %}
+    <li class="snaprow">
+      <div class="snapinfo">
+        <span class="sid">{{ vis(snap.id, 80) }}</span>
+        <span class="snapmeta">
+          <time datetime="{{ snap.taken_at.isoformat() }}">{{ stamp(snap.taken_at) }}</time>
+          · {{ t('reason.' ~ snap.reason) if t.has('reason.' ~ snap.reason) else vis(snap.reason, 40) }}
+          · {{ age(snap.taken_at) }}
+        </span>
+      </div>
+      <span class="rewind">
+        <small>{{ t('snaps.rewind.soon') }}</small>
+        <button class="dot-button" type="button" disabled aria-label="{{ t('snaps.rewind') }}: {{ t('snaps.rewind.soon') }}">{% include "arrow.html" %}</button>
+      </span>
+    </li>
+    {% endfor %}
+  </ol>
+  {% if hidden %}
+  <p class="note">{{ t('snaps.more', n=rows | length) }} <a href="{{ base }}/instantaneas?todas=1">+{{ hidden }}</a></p>
+  {% endif %}
+  {% endif %}
+</main>
+{% endblock %}

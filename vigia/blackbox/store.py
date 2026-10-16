@@ -168,22 +168,27 @@ class BlackBox:
     them, and never one inside the snapshot volume.
 
     With ``readonly=True`` the database must exist and is never written: not created,
-    not switched to WAL, not initialized. Use it to verify; append() then raises."""
+    not switched to WAL, not initialized. Use it to verify; append() then raises. With
+    ``key=None`` (read-only only) it cannot verify either: it just lists events, and holds no
+    secret, which is what a viewer such as the web should do."""
 
     def __init__(
         self,
         path: str | os.PathLike[str],
-        key: bytes,
+        key: bytes | None,
         *,
         checkpoint_path: str | os.PathLike[str] | None = None,
         clock: Callable[[], datetime] = utc_now,
         readonly: bool = False,
     ) -> None:
-        if not isinstance(key, bytes) or len(key) != KEY_SIZE:
+        if key is None:
+            if not readonly:
+                raise ValueError("only a read-only black box may go without its key")
+        elif not isinstance(key, bytes) or len(key) != KEY_SIZE:
             raise ValueError(f"key must be exactly {KEY_SIZE} bytes")
         self._path = Path(path)
-        self._key = key
-        self._key_id = compute_key_id(key)
+        self._key = key  # None: a reader that lists events (the web) and can verify nothing
+        self._key_id = compute_key_id(key) if key is not None else None
         self._checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
         self._clock = clock
         self._readonly = readonly
@@ -249,13 +254,20 @@ class BlackBox:
         self,
         *,
         since_seq: int | None = None,
+        before_seq: int | None = None,
         source: Source | str | None = None,
         action: str | None = None,
+        min_risk: int | None = None,
+        since_ts: datetime | None = None,
+        until_ts: datetime | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[Event]:
         """Events in ``seq`` order (``newest_first``: the reverse): those with seq >
-        ``since_seq``, from ``source``, with ``action``, at most ``limit``. With
+        ``since_seq`` and seq < ``before_seq``, from ``source``, with ``action``, risk of at
+        least ``min_risk``, recorded from ``since_ts`` (inclusive) until ``until_ts``
+        (exclusive; both aware datetimes), at most ``limit``. The web's history page pages
+        with ``before_seq`` and filters with the rest. With
         ``newest_first`` and ``limit``, the newest ones: so the startup reconciliation reads
         the last rewind without walking the whole black box. Does not check hashes (that is
         verify()); a row that cannot even be parsed raises BlackBoxError."""
@@ -266,6 +278,26 @@ class BlackBox:
                 raise ValueError(f"since_seq must be an int >= 0, got {since_seq!r}")
             clauses.append("seq > ?")
             params.append(since_seq)
+        if before_seq is not None:
+            if not _is_int(before_seq) or before_seq < 1:
+                raise ValueError(f"before_seq must be an int >= 1, got {before_seq!r}")
+            clauses.append("seq < ?")
+            params.append(before_seq)
+        if min_risk is not None:
+            if not _is_int(min_risk) or not 0 <= min_risk <= 3:
+                raise ValueError(f"min_risk must be an int from 0 to 3, got {min_risk!r}")
+            clauses.append("risk >= ?")
+            params.append(min_risk)
+        for column_op, moment_name, moment in (
+            (">=", "since_ts", since_ts),
+            ("<", "until_ts", until_ts),
+        ):
+            if moment is None:
+                continue
+            if not isinstance(moment, datetime) or moment.utcoffset() is None:
+                raise ValueError(f"{moment_name} must be an aware datetime, got {moment!r}")
+            clauses.append(f"ts {column_op} ?")  # fixed-width UTC text: it sorts like time
+            params.append(_format_ts(moment))
         if source is not None:
             clauses.append("source = ?")
             params.append(_parse_source(source).value)
@@ -305,6 +337,8 @@ class BlackBox:
         a Problem in the report (see ProblemKind for what each kind means). Raises
         BlackBoxError only when the database or the checkpoint cannot be read at all
         (I/O error, busy, not a database): then nothing was verified."""
+        if self._key is None:
+            raise BlackBoxError("this black box was opened without its key: it cannot verify")
         findings = _Findings()
         count, head = 0, None
         with self._lock:
