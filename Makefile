@@ -27,8 +27,9 @@ it: ## Integration tests inside the VM (only some: make it IT=tests/integration/
 	@case "$(IT)" in *"'"*) echo "IT cannot contain single quotes: it goes inside sh -c '...'" >&2; exit 2;; esac
 	$(VM_SH) '$(UV_VM) pytest -m integration $(IT)'
 
-ataques: ## Attack suite inside the VM (created in T05)
-	@echo "The attack suite is created in T05."
+ataques: ## Evil-agent battery inside the VM (only some: make ataques ATK="-k nested"; no ' in ATK)
+	@case "$(ATK)" in *"'"*) echo "ATK cannot contain single quotes: it goes inside sh -c '...'" >&2; exit 2;; esac
+	$(VM_SH) '$(UV_VM) pytest -m ataques -q --tb=short tests/attacks $(ATK)'
 
 vm-up: ## Create (first time) and start the dev VM
 	@status=$$(limactl list --format '{{.Status}}' $(VM) 2>/dev/null); \

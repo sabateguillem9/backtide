@@ -17,8 +17,12 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 # Import vigia from source: on macOS the .venv gets the "hidden" flag and Python skips hidden .pth files.
 pythonpath = ["."]
-markers = ["integration: needs the Linux dev VM (Docker, Btrfs, eBPF)"]
-addopts = "-m 'not integration'"
+markers = [
+    "integration: needs the Linux dev VM (Docker, Btrfs, eBPF)",
+    "ataques: evil-agent scenario of tests/attacks, VM only (run with `make ataques`)",
+]
+# Attacks are never part of `make test` (Mac) or `make it` (-m integration); only `make ataques`.
+addopts = "-m 'not integration and not ataques'"
 
 [tool.ruff]
 line-length = 100
