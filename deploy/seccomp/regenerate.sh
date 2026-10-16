@@ -6,7 +6,7 @@
 #
 # docker-default.json is Docker's own default profile for the Docker version below, copied
 # from the moby repository (it is vendored there from github.com/moby/profiles). agent.json
-# is that profile plus the Btrfs ioctl block of vigia/jail/seccomp.py, and nothing else:
+# is that profile plus the Btrfs ioctl and copy_file_range blocks of vigia/jail/seccomp.py, and nothing else:
 # `git diff --no-index docker-default.json agent.json` shows exactly what we change.
 #
 # To move to a new Docker version: update DOCKER_VERSION, run with --fetch, check the new
@@ -36,4 +36,4 @@ fi
 
 cd "$root"
 uv run python -m vigia.jail.seccomp "$default" "$here/agent.json"
-echo "wrote $here/agent.json (Docker $DOCKER_VERSION default + Btrfs ioctl block)"
+echo "wrote $here/agent.json (Docker $DOCKER_VERSION default + Btrfs ioctl and copy_file_range blocks)"

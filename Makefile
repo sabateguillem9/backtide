@@ -23,8 +23,9 @@ fmt: ## Auto-fix lint issues and format
 	uv run ruff check --fix .
 	uv run ruff format .
 
-it: ## Integration tests inside the VM
-	$(VM_SH) '$(UV_VM) pytest -m integration'
+it: ## Integration tests inside the VM (only some: make it IT=tests/integration/test_x.py; no ' in IT)
+	@case "$(IT)" in *"'"*) echo "IT cannot contain single quotes: it goes inside sh -c '...'" >&2; exit 2;; esac
+	$(VM_SH) '$(UV_VM) pytest -m integration $(IT)'
 
 ataques: ## Attack suite inside the VM (created in T05)
 	@echo "The attack suite is created in T05."

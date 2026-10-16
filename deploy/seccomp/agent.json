@@ -86,7 +86,6 @@
 				"close",
 				"close_range",
 				"connect",
-				"copy_file_range",
 				"creat",
 				"dup",
 				"dup2",
@@ -1005,6 +1004,14 @@
 			],
 			"comment": "ioctl: Btrfs, FICLONE and FIDEDUPERANGE (type 0x94)",
 			"errnoRet": 95
+		},
+		{
+			"names": [
+				"copy_file_range"
+			],
+			"action": "SCMP_ACT_ERRNO",
+			"errnoRet": 18,
+			"comment": "copy_file_range: reflinks on Btrfs, uncharged by the space cap; EXDEV makes callers copy by reading and writing"
 		}
 	]
 }

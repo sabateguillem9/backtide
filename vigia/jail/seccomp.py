@@ -1,9 +1,14 @@
-"""The agent's seccomp profile: Docker's default plus a block on the Btrfs ioctls (type 0x94).
+"""The agent's seccomp profile: Docker's default plus two blocks.
 
-Why: an unprivileged owner can create Btrfs subvolumes with an ioctl, and a nested subvolume
-inside the workspace breaks snapshots and rewinds (docs/10, "Notas para tareas posteriores").
-FICLONE, FICLONERANGE and FIDEDUPERANGE share the 0x94 type, so they are blocked too; callers
-like ``cp --reflink=auto``, libuv and OpenClaw's plugin loader fall back to a plain copy.
+1. The Btrfs ioctls (type 0x94). An unprivileged owner can create Btrfs subvolumes with an
+   ioctl, and a nested subvolume inside the workspace breaks snapshots and rewinds (docs/10,
+   "Notas para tareas posteriores"). FICLONE, FICLONERANGE and FIDEDUPERANGE share the 0x94
+   type, so they are blocked too.
+2. ``copy_file_range``. On Btrfs it makes a reflink, like FICLONE, but it is a syscall, not an
+   ioctl, so block 1 does not stop it: after FICLONE fails, ``cp``, libuv and Node use it and
+   still reflink (T03b-1, docs/16 A11). A reflink is not charged to the workspace's space cap,
+   and its metadata is charged to nobody. It fails with EXDEV, what it returns across
+   filesystems, so every caller copies by reading and writing instead.
 
 How, and why not the obvious way: Docker's default profile allows ``ioctl`` with no condition.
 libseccomp drops a conditional rule for a syscall that already has an unconditional one (and
@@ -17,6 +22,9 @@ unconditional list and replaced by rules that never overlap:
 
 Exactly one rule matches any request, so the order libseccomp evaluates them in cannot change
 the result. The upper 32 bits of the request are masked out, as the kernel ignores them too.
+
+``copy_file_range`` gets the same treatment, for the same libseccomp reason: it leaves the
+unconditional list and gets one unconditional ERRNO rule, the only rule naming it.
 
 Regenerate ``deploy/seccomp/agent.json`` with ``deploy/seccomp/regenerate.sh``.
 """
@@ -39,6 +47,10 @@ IOCTL_TYPE_MASK = 0xFF << IOCTL_TYPE_SHIFT
 # VM: cp --reflink=auto and libuv's copyfile). A Linux number, written out: Python's errno
 # module gives the HOST's value, and on macOS EOPNOTSUPP is 102 (ENETRESET on Linux).
 BLOCKED_ERRNO = 95
+COPY_FILE_RANGE = "copy_file_range"
+# EXDEV, "Invalid cross-device link": copy_file_range's answer for files on different
+# filesystems, after which coreutils, libuv and Node copy by hand. Linux number, written out.
+COPY_FILE_RANGE_ERRNO = 18
 ALLOW = "SCMP_ACT_ALLOW"
 ERRNO = "SCMP_ACT_ERRNO"
 MASKED_EQ = "SCMP_CMP_MASKED_EQ"
@@ -52,17 +64,32 @@ class SeccompProfileError(ValueError):
 
 
 def agent_profile(docker_default: Profile) -> Profile:
-    """Return Docker's default profile with the Btrfs ioctls blocked. Never changes the input.
+    """Return Docker's default profile with the Btrfs ioctls and copy_file_range blocked.
+    Never changes the input.
 
-    Raises SeccompProfileError if ``ioctl`` is not allowed exactly once and unconditionally,
-    which is what Docker's default has done for years: a new shape needs a human to look."""
+    Raises SeccompProfileError if ``ioctl`` or ``copy_file_range`` is not allowed exactly once
+    and unconditionally, which is what Docker's default has done for years: a new shape needs
+    a human to look."""
     profile = copy.deepcopy(docker_default)
     syscalls = profile.get("syscalls")
     if not isinstance(syscalls, list):
         raise SeccompProfileError("the profile has no 'syscalls' list")
-    _remove_unconditional_ioctl(syscalls)
+    _remove_unconditional(syscalls, IOCTL)
+    _remove_unconditional(syscalls, COPY_FILE_RANGE)
     syscalls.extend(ioctl_rules())
+    syscalls.append(copy_file_range_rule())
     return profile
+
+
+def copy_file_range_rule() -> Rule:
+    """The one rule naming copy_file_range: fail with EXDEV (see the module docstring)."""
+    return {
+        "names": [COPY_FILE_RANGE],
+        "action": ERRNO,
+        "errnoRet": COPY_FILE_RANGE_ERRNO,
+        "comment": "copy_file_range: reflinks on Btrfs, uncharged by the space cap; "
+        "EXDEV makes callers copy by reading and writing",
+    }
 
 
 def ioctl_rules() -> list[Rule]:
@@ -110,6 +137,25 @@ def evaluate_ioctl(profile: Profile, request: int) -> tuple[str, int | None]:
     return profile["defaultAction"], profile.get("defaultErrnoRet")
 
 
+def evaluate_syscall(profile: Profile, name: str) -> tuple[str, int | None]:
+    """What ``profile`` does with a syscall that has no argument rules: (action, errno or
+    None). Only unconditional rules are understood. Raises SeccompProfileError when two of
+    them name it with different outcomes, as libseccomp would then keep only one."""
+    outcomes = set()
+    for rule in profile["syscalls"]:
+        if name not in rule["names"] or rule.get("includes") or rule.get("excludes"):
+            continue
+        if rule.get("args"):
+            raise SeccompProfileError(f"evaluate_syscall does not understand args on {name}")
+        errno_ret = rule.get("errnoRet") if rule["action"] == ERRNO else None
+        outcomes.add((rule["action"], errno_ret))
+    if len(outcomes) > 1:
+        raise SeccompProfileError(f"overlapping rules for {name}: {outcomes}")
+    if outcomes:
+        return outcomes.pop()
+    return profile["defaultAction"], profile.get("defaultErrnoRet")
+
+
 def render(profile: Profile) -> str:
     """Serialise like Docker's own default.json: tab indents and a final newline."""
     return json.dumps(profile, indent="\t") + "\n"
@@ -125,18 +171,20 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _remove_unconditional_ioctl(syscalls: list[Rule]) -> None:
-    holders = [rule for rule in syscalls if IOCTL in rule.get("names", [])]
+def _remove_unconditional(syscalls: list[Rule], syscall: str) -> None:
+    holders = [rule for rule in syscalls if syscall in rule.get("names", [])]
     if len(holders) != 1:
-        raise SeccompProfileError(f"expected exactly one rule naming ioctl, found {len(holders)}")
+        raise SeccompProfileError(
+            f"expected exactly one rule naming {syscall}, found {len(holders)}"
+        )
     rule = holders[0]
     conditions = {key: rule.get(key) for key in ("args", "includes", "excludes") if rule.get(key)}
     if rule.get("action") != ALLOW or conditions:
         raise SeccompProfileError(
-            f"expected ioctl to be allowed unconditionally, found {rule.get('action')} "
+            f"expected {syscall} to be allowed unconditionally, found {rule.get('action')} "
             f"with {conditions}"
         )
-    rule["names"] = [name for name in rule["names"] if name != IOCTL]
+    rule["names"] = [name for name in rule["names"] if name != syscall]
 
 
 def _ioctl_rule(

@@ -21,6 +21,11 @@ Layout (docs/10-diseno-t01-instantaneas.md)::
 - There is no journal: the names on disk are the state. recover() only keeps data or finishes
   deletes that had already started.
 - Snapshots are crash-consistent, not application-consistent.
+- Space cap (T03b, docs/16): on a volume formatted with simple quotas, the workspace can carry
+  a qgroup limit. A limit belongs to the subvolume, not the path, so the store moves it by
+  hand: restore() caps the staging copy before quiesce (copying the current workspace's
+  limit) and fails closed if it cannot, and a former workspace is uncapped before any ro flip
+  on it, because at its cap that flip fails with EDQUOT.
 """
 
 import errno
@@ -70,6 +75,9 @@ NO_SPACE_HINT = (
     "agent's own files fill the volume that is almost nothing, so grow it"
 )
 _NESTED_SUBVOLUME_STDERR = "Directory not empty"  # what btrfs says when a nested one blocks it
+_NO_SPACE_TEXTS = ("Disk quota exceeded", "No space left on device")
+
+type SetLimit = Callable[[Path, int | None], None]
 
 
 class SnapshotStore:
@@ -82,17 +90,36 @@ class SnapshotStore:
         *,
         clock: Callable[[], datetime] = utc_now,
         lock_timeout: float = 30.0,
+        workspace_limit: int | None = None,
+        set_limit: SetLimit | None = None,
     ) -> None:
-        """No disk access. ``root`` must be absolute (ValueError otherwise)."""
+        """No disk access. ``root`` must be absolute (ValueError otherwise).
+
+        ``workspace_limit`` (bytes) is the cap init() gives the workspace; it needs a volume
+        formatted with simple quotas. Without it, restore() still copies whatever cap the
+        current workspace has, so the cap follows the workspace and not this process's config.
+        ``set_limit`` sets or clears (None) a subvolume's limit and needs CAP_SYS_ADMIN; it
+        defaults to btrfs.set_qgroup_limit (Vigía runs as root). The VM tests inject the same
+        command behind ``sudo -n``. Anything it raises becomes a SnapshotError."""
         root = Path(root)
         if not root.is_absolute():
             raise ValueError(f"the snapshot root must be an absolute path, got {str(root)!r}")
+        if workspace_limit is not None and (
+            isinstance(workspace_limit, bool)
+            or not isinstance(workspace_limit, int)
+            or workspace_limit <= 0
+        ):
+            raise ValueError(
+                f"workspace_limit must be a positive number of bytes, got {workspace_limit!r}"
+            )
         self.root = root
         self.workspace = root / WORKSPACE
         self.snapshots_dir = root / SNAPSHOTS
         self._staging = root / STAGING
         self._clock = clock
         self._lock_timeout = lock_timeout
+        self._workspace_limit = workspace_limit
+        self._set_limit = set_limit
 
     # Public API
 
@@ -100,9 +127,14 @@ class SnapshotStore:
         """Create ``snapshots/`` and an empty workspace subvolume where missing. Idempotent.
 
         Refuses to create an empty workspace when snapshots exist: restoring one recreates it.
-        A read-only workspace is only logged, so the agent cannot stop the guardian starting."""
+        A read-only workspace is only logged, so the agent cannot stop the guardian starting.
+        With ``workspace_limit``, the volume must use simple quotas (checked before anything is
+        created) and the workspace gets that cap, new or existing: a changed config takes
+        effect at the next start."""
         with self._lock() as root_fd:
             self._check_private_dir(self.root)
+            if self._workspace_limit is not None:
+                self._require_simple_quotas()
             if not os.path.lexists(self.snapshots_dir):
                 _mkdir_private(root_fd, SNAPSHOTS)
             self._check_layout(require_workspace=False)
@@ -111,14 +143,17 @@ class SnapshotStore:
                     logger.warning(
                         "%s is read-only; take() and restore() still work", self.workspace
                     )
-                return
-            existing = self._list()
-            if existing:
-                raise SnapshotError(
-                    f"{self.workspace} is missing but {len(existing)} snapshots exist; refusing "
-                    f"to create an empty workspace: restore({existing[-1].id!r}) recreates it"
-                )
-            btrfs.create_subvolume(self.workspace)
+            else:
+                existing = self._list()
+                if existing:
+                    raise SnapshotError(
+                        f"{self.workspace} is missing but {len(existing)} snapshots exist; "
+                        "refusing to create an empty workspace: "
+                        f"restore({existing[-1].id!r}) recreates it"
+                    )
+                btrfs.create_subvolume(self.workspace)
+            if self._workspace_limit is not None:
+                self._apply_cap(self.workspace, self._workspace_limit)
 
     def take(self, reason: Reason) -> Snapshot:
         """Take a read-only snapshot of the workspace, durable on return.
@@ -166,6 +201,9 @@ class SnapshotStore:
           or workspace unchanged.
         - If the recovery that runs first published leftovers and restore then fails, the error
           carries a note naming them.
+
+        ``quiesce`` must STOP the agent, not pause it: a paused (frozen) container keeps the old
+        workspace mounted, and after the swap that is the uncapped undo point.
 
         Afterwards, fds, cwd and inotify watches that pointed into the old workspace point at
         ``snapshots/<undo.id>``: re-open by path. Undo is ``restore(result.undo.id, ...)``."""
@@ -232,6 +270,14 @@ class SnapshotStore:
     def workspace_id(self) -> int:
         """The btrfs subvolume ID of the workspace. Changes exactly when a restore swaps it."""
         return btrfs.subvolume_id(self.workspace)
+
+    def workspace_usage(self) -> btrfs.QgroupUsage | None:
+        """The workspace's qgroup (usage and cap), or None on a volume without quotas. Takes
+        no lock and needs no root. ``referenced`` only moves when a transaction commits, and
+        it can pass the cap: deletes after a snapshot are not checked (docs/16, A13)."""
+        if btrfs.quota_mode(self.root) is None:
+            return None
+        return btrfs.qgroup_usage(self.workspace)
 
     # Lock and layout
 
@@ -350,7 +396,11 @@ class SnapshotStore:
     ) -> Snapshot | None:
         self._check_target(target, source)
         workspace_existed = os.path.lexists(self.workspace)
-        self._stage(source)
+        try:
+            cap = self._cap_for_new_workspace(workspace_existed)
+        except SnapshotError as error:
+            raise _failed_before_swap(error) from error
+        self._stage(source, cap)
         return self._swap_quiesced(root_fd, target, workspace_existed, quiesce)
 
     def _check_target(self, target: Snapshot, source: Path) -> None:
@@ -362,13 +412,21 @@ class SnapshotStore:
                 "the volume was full): refusing to restore it; inspect it or delete it"
             )
 
-    def _stage(self, source: Path) -> None:
-        """Make the writable copy of the target, before the agent is stopped."""
+    def _stage(self, source: Path, cap: int | None) -> None:
+        """Make the writable copy of the target, before the agent is stopped, and give it the
+        cap: the agent never starts on an uncapped workspace. Fails closed."""
         try:
             btrfs.snapshot(source, self._staging, readonly=False)
         except SnapshotError as error:
             if error.errno != errno.EEXIST:  # EEXIST: that staging is not ours to delete
                 self._discard_staging(error)
+            raise _failed_before_swap(error) from error
+        if cap is None:
+            return
+        try:
+            self._apply_cap(self._staging, cap)
+        except SnapshotError as error:
+            self._discard_staging(error)
             raise _failed_before_swap(error) from error
 
     def _swap_quiesced(
@@ -453,8 +511,10 @@ class SnapshotStore:
         """Publish the subvolume at ``<root>/<src_rel>`` as the read-only snapshot ``snap``.
 
         A read-only subvolume cannot move to another directory (EROFS), so it moves while
-        writable and is sealed inside snapshots/. A crash leaves ``.incoming-<id>`` (R2)."""
+        writable and is sealed inside snapshots/. A crash leaves ``.incoming-<id>`` (R2). A
+        former workspace loses its cap first: at its cap, every ro flip fails with EDQUOT."""
         src = self.root / src_rel
+        self._uncap(src)
         if btrfs.is_readonly(src):
             btrfs.set_readonly(src, False)
         btrfs.renameat2(root_fd, src_rel, _incoming_rel(snap), btrfs.RENAME_NOREPLACE)
@@ -482,6 +542,7 @@ class SnapshotStore:
     def _delete_in_place_locked(self, snap: Snapshot, *, commit: bool) -> None:
         path = self.root / _snapshot_rel(snap)
         try:
+            self._uncap(path)  # deleting clears ro first, and at its cap that fails
             _delete_subvolume(snap, path, commit=commit)
         except SnapshotError as error:
             _reseal(path, error)
@@ -491,6 +552,7 @@ class SnapshotStore:
         """Delete ``.trash-<id>``. If that fails, seal it and rename it back to ``<id>``, so it
         is listed again and read-only."""
         try:
+            self._uncap(self.root / _trash_rel(snap))
             _delete_subvolume(snap, self.root / _trash_rel(snap), commit=commit)
         except SnapshotError as error:
             _reseal(self.root / _trash_rel(snap), error)
@@ -551,6 +613,7 @@ class SnapshotStore:
                 f"cannot publish {self.root / _incoming_rel(snap)}: {snap.id} already exists; "
                 "leaving both for a human"
             )
+        self._uncap(self.root / _incoming_rel(snap))
         self._seal_locked(root_fd, snap)
 
     def _recover_staging_locked(self, root_fd: int) -> Snapshot:
@@ -564,6 +627,84 @@ class SnapshotStore:
         snap = Snapshot(self._clock(), Reason.RECOVERED)
         self._publish_locked(root_fd, STAGING, snap)
         return snap
+
+    # Quotas (T03b, docs/16)
+
+    def _require_simple_quotas(self) -> None:
+        mode = btrfs.quota_mode(self.root)
+        if mode != "squota":
+            raise SnapshotError(
+                f"a workspace limit needs a volume formatted with simple quotas "
+                f"(mkfs.btrfs -O squota); the quota mode of {self.root} is {mode or 'off'}"
+            )
+
+    def _cap_for_new_workspace(self, workspace_existed: bool) -> int | None:
+        """The cap the next workspace gets: the current workspace's, else the configured one.
+        None on a volume without quotas (unless a cap is configured: then it fails closed)."""
+        if btrfs.quota_mode(self.root) is None:
+            if self._workspace_limit is not None:
+                self._require_simple_quotas()  # raises: never hand the agent an uncapped one
+            return None
+        if workspace_existed:
+            usage = btrfs.qgroup_usage(self.workspace)
+            if usage.exclusive_limit is not None:
+                # Vigía never sets one and cannot clear it, so the old workspace could never be
+                # uncapped and sealed: refuse now, with nothing changed, not after the swap.
+                raise SnapshotError(
+                    f"{self.workspace} has an exclusive quota limit, which Vigía never sets: "
+                    f"clear it by hand with `btrfs qgroup limit -e none {self.workspace}`"
+                )
+            if usage.limit is not None:
+                return usage.limit
+        if self._workspace_limit is None:
+            logger.error(
+                "%s uses simple quotas but no cap is configured and the workspace has none: "
+                "the rewound workspace has no space cap",
+                self.root,
+            )
+        return self._workspace_limit
+
+    def _uncap(self, path: Path) -> None:
+        """Remove any cap from a subvolume that is no longer the workspace. No-op without
+        quotas or without a cap."""
+        if btrfs.quota_mode(self.root) is None:
+            return
+        usage = btrfs.qgroup_usage(path)
+        if usage.limit is not None or usage.exclusive_limit is not None:
+            self._apply_cap(path, None)
+
+    def _apply_cap(self, path: Path, limit: int | None) -> None:
+        """Give ``path`` exactly this referenced limit (None: no cap) and read it back. The
+        setter runs only when the value differs, and the bits are what count (docs/16: mkfs
+        leaves garbage in the limit fields of 0/5)."""
+        if _cap_of(btrfs.qgroup_usage(path)) == (limit, None):
+            return
+        self._call_set_limit(path, limit)
+        after = _cap_of(btrfs.qgroup_usage(path))
+        if after == (limit, None):
+            return
+        message = f"the quota limit of {path} reads back as {after} after setting it to {limit}"
+        if after[1] is not None:
+            message += (
+                "; it has an exclusive limit, which Vigía never sets: clear it by hand with "
+                f"`btrfs qgroup limit -e none {path}`"
+            )
+        raise SnapshotError(message)
+
+    def _call_set_limit(self, path: Path, limit: int | None) -> None:
+        setter = self._set_limit or btrfs.set_qgroup_limit  # looked up now, so tests can patch
+        try:
+            setter(path, limit)
+        except SnapshotError:
+            raise
+        except Exception as error:  # an injected setter still honours the error contract
+            kind = (
+                SnapshotNoSpace if any(t in str(error) for t in _NO_SPACE_TEXTS) else SnapshotError
+            )
+            raise kind(
+                f"cannot set the quota limit of {path} to {limit}: {error}",
+                errno=getattr(error, "errno", None),
+            ) from error
 
     # Warnings
 
@@ -699,6 +840,11 @@ def _failure_outcome(target: Snapshot, error: BaseException) -> str:
 
 def _ids(snapshots: list[Snapshot]) -> str:
     return ", ".join(snap.id for snap in snapshots)
+
+
+def _cap_of(usage: btrfs.QgroupUsage) -> tuple[int | None, int | None]:
+    """(referenced limit, exclusive limit), each None when its bit is not set."""
+    return usage.limit, usage.exclusive_limit
 
 
 def _failed_before_swap(error: SnapshotError) -> SnapshotError:

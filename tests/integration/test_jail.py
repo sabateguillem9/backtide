@@ -351,6 +351,9 @@ def test_environment_has_no_keys(running_agent) -> None:
 
 
 def test_cannot_create_subvolumes_but_copies_fall_back(running_agent) -> None:
+    """``cp --reflink=always`` fails, and ``cp --reflink=auto`` ends well as a plain copy:
+    FICLONE is blocked (0x94) and so is copy_file_range, which answers EXDEV (T03b-2;
+    test_quota_assumptions.py checks that no copier shares blocks)."""
     work = f"{CONTAINER_WORKSPACE}/work/subvolume-probe-{uuid4().hex[:8]}"
     running_agent.exec(["mkdir", work], check=True)
     try:

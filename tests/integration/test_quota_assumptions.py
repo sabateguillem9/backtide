@@ -1328,28 +1328,44 @@ def test_docker_relabel_at_start_fails_past_the_cap_only_for_files_labeled_other
 
 # A11 in the jail. Last: it starts the real agent (module-scoped running_agent).
 
+COPIERS = ("read_write", "cp", "cp_reflink_auto", "node_copyfile", "node_copyfile_ficlone")
 
-def test_copy_file_range_in_the_jail_makes_reflinks(
-    running_agent, record_property: Callable[[str, object], None]
-) -> None:
-    """copy_file_range(2) is a syscall, not a 0x94 ioctl, so the T03a seccomp rule lets it
-    through, and on btrfs it clones. T03b-2 blocks it (founder decision, 2026-10-06); this
-    test then has to show the fallback instead."""
+
+def probe_copiers(agent) -> tuple[dict, dict[str, bool]]:
+    """Run CLONE_PROBE in ``agent``'s container (a 1 MiB source and one copy by each copier)
+    and return its results and, for each copy, whether it shares the source's extents (FIEMAP,
+    from the host). Fails the test unless every copy is byte for byte the source. A
+    copy_file_range that failed made no copy and is left out. Used by test_quota.py too."""
     name = f"clone-probe-{uuid4().hex[:8]}"
     inside = f"{CONTAINER_WORKSPACE}/work/{name}"
-    host = running_agent.workspace / "work" / name
-    running_agent.exec(["mkdir", inside], check=True)
+    host = agent.workspace / "work" / name
+    agent.exec(["mkdir", inside], check=True)
     try:
-        result = running_agent.exec(["python3", "-c", CLONE_PROBE, inside], check=True)
-        probe = json.loads(result.stdout)
-        shared = {
-            copy: shares_extents(host / f"{copy}.bin", host / "src.bin")
-            for copy in probe
-            if (host / f"{copy}.bin").exists()
-        }
+        probe = json.loads(agent.exec(["python3", "-c", CLONE_PROBE, inside], check=True).stdout)
+        source = (host / "src.bin").read_bytes()
+        # A copy_file_range that failed leaves the empty file it opened: not a copy.
+        copies = [copy for copy in probe if copy != "copy_file_range" or probe[copy] >= 0]
+        for copy in copies:
+            assert (host / f"{copy}.bin").read_bytes() == source, f"{copy} is not a copy"
+        shared = {copy: shares_extents(host / f"{copy}.bin", host / "src.bin") for copy in copies}
     finally:
-        running_agent.exec(["rm", "-rf", inside], check=True)
+        agent.exec(["rm", "-rf", inside], check=True)
+    return probe, shared
+
+
+def test_copy_file_range_in_the_jail_fails_with_exdev_and_every_copier_copies_for_real(
+    running_agent, record_property: Callable[[str, object], None]
+) -> None:
+    """copy_file_range(2) is a syscall, not a 0x94 ioctl, so the T03a seccomp rule let it
+    through and on btrfs it cloned (A11). Since T03b-2 the profile answers it with EXDEV, what
+    it returns across filesystems, and cp, libuv and Node copy by reading and writing: the
+    five copiers of A11 end well, byte for byte, and none shares a block with the original
+    (a reflink is not charged to the workspace cap)."""
+    probe, shared = probe_copiers(running_agent)
     report(record_property, "clones_in_the_jail", f"results {probe}; reflinked {shared}")
-    assert shared["read_write"] is False  # the FIEMAP check tells a copy from a clone
-    assert probe["copy_file_range"] == MIB
-    assert shared["copy_file_range"] is True
+    assert probe["copy_file_range"] == -errno.EXDEV
+    assert probe["read_write"] == 0
+    for copier in COPIERS[1:]:
+        assert probe[copier] == [0, ""], (copier, probe[copier])
+    assert set(shared) == set(COPIERS)  # every copier, and not the failed copy_file_range
+    assert not any(shared.values()), f"a copy shares blocks with its original: {shared}"

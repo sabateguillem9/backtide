@@ -40,7 +40,8 @@ CONTAINER_HOME = CONTAINER_WORKSPACE / "home"
 CONTAINER_STATE = CONTAINER_WORKSPACE / "state"
 CONTAINER_WORK = CONTAINER_WORKSPACE / "work"
 
-# deploy/seccomp/agent.json: Docker's default profile plus the Btrfs ioctl block.
+# deploy/seccomp/agent.json: Docker's default profile plus the Btrfs ioctl and copy_file_range
+# blocks.
 SECCOMP_PROFILE = Path(__file__).resolve().parents[2] / "deploy" / "seccomp" / "agent.json"
 
 # The agent's own uid and gid. Not 1000 (the image's `node`, and the first person's account on

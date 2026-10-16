@@ -28,7 +28,9 @@ from before the mount until after the unmount. The kernel drops it when the owne
   ``sudo umount <mount point>``.
 
 ``running_agent`` (T03a) starts the real OpenClaw image in its jail on that btrfs, with docker
-and no sudo at all. It pulls the pinned image the first time (about 1.3 GB, by digest). Test
+and no sudo at all. It pulls the pinned image the first time (about 1.3 GB, by digest).
+``start_quota_agent`` (T03b-2) starts the same agent on a ``quota_volume`` with its workspace
+capped; the cap is the only sudo it needs, through ``QuotaVolume.set_limit``. Test
 containers and networks carry the pid of the pytest process that made them, so a later run
 removes those of a killed run (whose pytest is gone) and leaves a live run's alone. Such a
 container may still hold a stale btrfs inside its own mount namespace: removing it, and the
@@ -45,7 +47,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -218,10 +220,47 @@ def running_agent(
     root.mkdir(mode=0o700)
     agent_store = SnapshotStore(root)
     agent_store.init()
+    with _jailed_agent(agent_store, tmp_path_factory.mktemp("agent-config")) as agent:
+        yield agent
+
+
+@pytest.fixture
+def start_quota_agent(
+    quota_volume: QuotaVolume, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Callable[[int | None], RunningAgent]]:
+    """A factory for the real OpenClaw in its jail on this test's own ``quota_volume`` (T03b-2).
+
+    ``start_quota_agent(workspace_limit)`` makes a snapshot store whose workspace is capped at
+    ``workspace_limit`` bytes (None: no cap, the negative control), with ``quota_volume.set_limit``
+    as its only privileged command, and starts the agent on it like ``running_agent`` does
+    (same ids, memory and cleanup). Call it once per test. Whatever it started is removed when
+    the test ends, also when the start fails halfway."""
+    _require_agent_image()
+    _remove_stale_test_agents()
+    with ExitStack() as stack:
+
+        def start(workspace_limit: int | None) -> RunningAgent:
+            root = quota_volume.mnt / f"agent-{uuid4().hex}"
+            root.mkdir(mode=0o700)
+            agent_store = SnapshotStore(
+                root, workspace_limit=workspace_limit, set_limit=quota_volume.set_limit
+            )
+            agent_store.init()
+            config_dir = tmp_path_factory.mktemp("agent-config")
+            return stack.enter_context(_jailed_agent(agent_store, config_dir))
+
+        yield start
+
+
+@contextmanager
+def _jailed_agent(agent_store: SnapshotStore, config_dir: Path) -> Iterator[RunningAgent]:
+    """Set up, create and start the agent's jail on ``agent_store``'s workspace, wait until it
+    is ready and yield it. The container and its network are removed on the way out, also when
+    any step of the setup fails."""
     name, network = _agent_names(os.getpid())
     config = AgentJailConfig(
         workspace=agent_store.workspace,
-        config_dir=tmp_path_factory.mktemp("agent-config"),
+        config_dir=config_dir,
         gateway_token=secrets.token_urlsafe(32),
         name=name,
         network=network,

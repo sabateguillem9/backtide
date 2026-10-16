@@ -1,4 +1,5 @@
-"""Unit tests for the agent's seccomp profile: Docker's default plus the Btrfs ioctl block.
+"""Unit tests for the agent's seccomp profile: Docker's default plus the Btrfs ioctl block and
+the copy_file_range block.
 
 The VM test (tests/integration/test_jail.py) proves the kernel enforces it; these prove the
 profile shipped in deploy/seccomp is exactly what the generator makes, and that its ioctl rules
@@ -17,10 +18,12 @@ from vigia.jail import seccomp
 from vigia.jail.seccomp import (
     ALLOW,
     BLOCKED_ERRNO,
+    COPY_FILE_RANGE_ERRNO,
     ERRNO,
     SeccompProfileError,
     agent_profile,
     evaluate_ioctl,
+    evaluate_syscall,
     render,
 )
 
@@ -30,6 +33,7 @@ AGENT = SECCOMP_DIR / "agent.json"
 REGENERATE = SECCOMP_DIR / "regenerate.sh"
 LINUX_EOPNOTSUPP = 95
 LINUX_EPERM = 1
+LINUX_EXDEV = 18
 
 BLOCKED = {
     "BTRFS_IOC_SUBVOL_CREATE": 0x5000940E,
@@ -81,12 +85,13 @@ def test_config_points_at_the_shipped_profile() -> None:
     assert jail_config.SECCOMP_PROFILE == AGENT
 
 
-def test_only_ioctl_changes(docker_default: dict, shipped: dict) -> None:
+def test_only_ioctl_and_copy_file_range_change(docker_default: dict, shipped: dict) -> None:
     original = copy.deepcopy(docker_default)
     original["syscalls"][0]["names"].remove("ioctl")
+    original["syscalls"][0]["names"].remove("copy_file_range")
     assert shipped["syscalls"][: len(original["syscalls"])] == original["syscalls"]
     added = shipped["syscalls"][len(original["syscalls"]) :]
-    assert added == seccomp.ioctl_rules()
+    assert added == [*seccomp.ioctl_rules(), seccomp.copy_file_range_rule()]
     assert {k: v for k, v in shipped.items() if k != "syscalls"} == {
         k: v for k, v in docker_default.items() if k != "syscalls"
     }
@@ -97,7 +102,40 @@ def test_ioctl_is_never_allowed_unconditionally(shipped: dict) -> None:
     assert unconditional == []
 
 
+def test_copy_file_range_is_never_allowed(shipped: dict) -> None:
+    allowing = [
+        r for r in shipped["syscalls"] if "copy_file_range" in r["names"] and r["action"] == ALLOW
+    ]
+    assert allowing == []
+
+
 # The rules
+
+
+def test_copy_file_range_fails_with_linux_exdev(shipped: dict) -> None:
+    """On Btrfs it makes reflinks, which the space cap does not charge (docs/16, A11). EXDEV
+    is what it returns across filesystems, so cp, libuv and Node copy by reading and writing."""
+    assert COPY_FILE_RANGE_ERRNO == LINUX_EXDEV
+    assert evaluate_syscall(shipped, "copy_file_range") == (ERRNO, LINUX_EXDEV)
+
+
+def test_other_syscalls_keep_dockers_action(docker_default: dict, shipped: dict) -> None:
+    for name in ("read", "sendfile", "splice", "openat"):
+        assert (
+            evaluate_syscall(shipped, name)
+            == evaluate_syscall(docker_default, name)
+            == (
+                ALLOW,
+                None,
+            )
+        )
+
+
+def test_the_naive_copy_file_range_rule_would_overlap(docker_default: dict) -> None:
+    naive = copy.deepcopy(docker_default)
+    naive["syscalls"].append(seccomp.copy_file_range_rule())
+    with pytest.raises(SeccompProfileError, match="overlapping"):
+        evaluate_syscall(naive, "copy_file_range")
 
 
 def test_blocked_errno_is_linux_eopnotsupp() -> None:
@@ -181,6 +219,10 @@ def _profile_with_ioctl_rules(*rules: dict) -> dict:
         (
             _profile_with_ioctl_rules({"names": ["ioctl"], "action": "SCMP_ACT_LOG"}),
             "unconditionally",
+        ),
+        (
+            _profile_with_ioctl_rules({"names": ["ioctl", "read"], "action": ALLOW}),
+            "copy_file_range, found 0",
         ),
     ],
 )

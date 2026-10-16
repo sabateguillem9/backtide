@@ -45,6 +45,9 @@ FAKED = (
     "subvolume_id",
     "is_subvolume",
     "renameat2",
+    "quota_mode",
+    "qgroup_usage",
+    "set_qgroup_limit",
 )
 FLAG_NAMES = {btrfs.RENAME_EXCHANGE: "EXCHANGE", btrfs.RENAME_NOREPLACE: "NOREPLACE"}
 OLD = Snapshot(datetime(2026, 10, 1, 12, 0, tzinfo=UTC), Reason.PERIODIC)
@@ -71,13 +74,23 @@ class Fault:
 class FakeBtrfs:
     """The btrfs functions, on plain directories. Paths in the log are relative to the root;
     renameat2 logs its flag by name. ``fail()`` makes the next matching call raise, either
-    before it takes effect or, with ``after_effect``, after (an ambiguous CLI failure)."""
+    before it takes effect or, with ``after_effect``, after (an ambiguous CLI failure).
+
+    Quotas (T03b) behave as the spike measured them (docs/16): a limit belongs to the subvolume
+    ID, so it follows renames and stays with the old workspace after an EXCHANGE; a snapshot is
+    born without one; and flipping ro on a capped subvolume listed in ``full`` fails with
+    EDQUOT (A7). With ``quota`` None (quotas off) quota_mode is not logged, so the exact call
+    sequences of the T01 tests stay as they were."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self.log: list[Call] = []
         self.ids: dict[Path, int] = {}  # tracked subvolumes and their subvolume IDs
         self.readonly: set[Path] = set()
+        self.quota: str | None = None  # quota mode: None (off), "squota" or "qgroup"
+        self.limits: dict[int, int] = {}  # subvolume ID -> referenced limit
+        self.exclusive_limits: dict[int, int] = {}  # subvolume ID -> exclusive limit
+        self.full: set[int] = set()  # subvolume IDs at or past their cap
         self._faults: list[Fault] = []
         self._next_id = 256
 
@@ -128,6 +141,10 @@ class FakeBtrfs:
     def set_readonly(self, path: Path, value: bool) -> None:
         fault = self._record("set_readonly", self._rel(path), value)
         self._require_subvolume(path)
+        if self._is_capped(path) and self.ids[path] in self.full:  # the flip reserves 16 KiB
+            raise SnapshotNoSpace(
+                f"ERROR: failed to set flags for {path}: Disk quota exceeded", errno=errno.EDQUOT
+            )
         if value:
             self.readonly.add(path)
         else:
@@ -137,6 +154,9 @@ class FakeBtrfs:
     def delete_subvolume(self, path: Path, *, commit: bool = False) -> None:
         fault = self._record("delete_subvolume", self._rel(path), commit)
         self._require_subvolume(path)
+        if path in self.readonly and self._is_capped(path) and self.ids[path] in self.full:
+            # the real one clears ro first, and that flip is quota-checked (A7)
+            raise SnapshotNoSpace(f"ERROR: cannot clear ro on {path}: Disk quota exceeded")
         shutil.rmtree(path)
         del self.ids[path]
         self.readonly.discard(path)
@@ -177,7 +197,44 @@ class FakeBtrfs:
     def sync(self) -> None:
         self.log.append(("sync",))
 
+    def quota_mode(self, path: Path, *, sysfs: Path = btrfs.SYSFS_BTRFS) -> str | None:
+        if self.quota is not None:
+            _raise(self._record("quota_mode", self._rel(path)))
+        return self.quota
+
+    def qgroup_usage(self, path: Path, *, sysfs: Path = btrfs.SYSFS_BTRFS) -> btrfs.QgroupUsage:
+        fault = self._record("qgroup_usage", self._rel(path))
+        self._require_subvolume(path)
+        _raise(fault)
+        sid = self.ids[path]
+        flags = (btrfs.QGROUP_LIMIT_MAX_RFER if sid in self.limits else 0) | (
+            btrfs.QGROUP_LIMIT_MAX_EXCL if sid in self.exclusive_limits else 0
+        )
+        return btrfs.QgroupUsage(
+            referenced=16384,
+            exclusive=16384,
+            limit_flags=flags,
+            max_referenced=self.limits.get(sid, 0),
+            max_exclusive=self.exclusive_limits.get(sid, 0),
+        )
+
+    def set_qgroup_limit(self, path: Path, limit: int | None) -> None:
+        fault = self._record("set_qgroup_limit", self._rel(path), limit)
+        self._require_subvolume(path)
+        if limit is None:
+            self.limits.pop(self.ids[path], None)
+        else:
+            self.limits[self.ids[path]] = limit
+        _raise(fault)
+
+    def limit_of(self, path: Path) -> int | None:
+        """The referenced limit of the subvolume at ``path``, for asserts. Not logged."""
+        return self.limits.get(self.ids[path])
+
     # Helpers
+
+    def _is_capped(self, path: Path) -> bool:
+        return self.ids[path] in self.limits or self.ids[path] in self.exclusive_limits
 
     def _record(self, name: str, *args: object) -> Fault | None:
         self.log.append((name, *args))
@@ -1473,3 +1530,318 @@ def test_workspace_id_changes_exactly_when_a_restore_swaps(store: SnapshotStore)
     store.restore(target.id, quiesce=contextlib.nullcontext)
 
     assert store.workspace_id() != first
+
+
+# Quotas (T03b-2): the cap follows the workspace (docs/16)
+
+CAP = 192 * 1024**2
+
+
+@pytest.fixture
+def capped(root: Path, fake: FakeBtrfs, clock: Clock) -> SnapshotStore:
+    """An initialised store on a simple-quota volume, its workspace capped at CAP and holding
+    marker 'v0'. The log starts empty."""
+    fake.quota = "squota"
+    store = SnapshotStore(root, clock=clock, lock_timeout=1.0, workspace_limit=CAP)
+    store.init()
+    write_marker(store.workspace, "v0")
+    fake.log.clear()
+    return store
+
+
+def only_the_copy(path: str, limit: int | None) -> bool:
+    return path == "workspace.restore" and limit is not None
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "1"])
+def test_workspace_limit_must_be_a_positive_int(tmp_path: Path, bad: object) -> None:
+    with pytest.raises(ValueError, match="workspace_limit"):
+        SnapshotStore(tmp_path / "missing", workspace_limit=bad)  # type: ignore[arg-type]
+
+    assert not (tmp_path / "missing").exists()
+
+
+def test_without_quotas_nothing_about_quotas_is_read_or_set(
+    store: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    target = take(store, "v1")
+    store.restore(target.id, quiesce=contextlib.nullcontext)
+    store.delete(target.id)
+
+    assert store.workspace_usage() is None
+    assert fake.calls("qgroup_usage") == [] and fake.calls("set_qgroup_limit") == []
+
+
+@pytest.mark.parametrize("mode", [None, "qgroup"])
+def test_a_limit_needs_simple_quotas_before_anything_is_created(
+    root: Path, fake: FakeBtrfs, clock: Clock, mode: str | None
+) -> None:
+    fake.quota = mode
+    store = SnapshotStore(root, clock=clock, workspace_limit=CAP)
+
+    with pytest.raises(SnapshotError, match="simple quotas"):
+        store.init()
+
+    assert sorted(os.listdir(root)) == [".lock"]
+
+
+def test_init_caps_a_new_workspace_and_reads_it_back(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    assert fake.limit_of(capped.workspace) == CAP
+    usage = capped.workspace_usage()
+    assert usage is not None and usage.limit == CAP and usage.exclusive_limit is None
+
+
+def test_init_sets_the_cap_only_when_it_differs(
+    root: Path, fake: FakeBtrfs, clock: Clock, capped: SnapshotStore
+) -> None:
+    capped.init()
+    assert fake.calls("set_qgroup_limit") == []
+
+    SnapshotStore(root, clock=clock, workspace_limit=2 * CAP).init()
+
+    assert fake.calls("set_qgroup_limit") == [("set_qgroup_limit", "workspace", 2 * CAP)]
+    assert fake.limit_of(capped.workspace) == 2 * CAP
+
+
+def test_restore_caps_the_copy_before_quiesce_and_uncaps_the_old_one_before_sealing(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    target = take(capped, "v1")
+    old_id = capped.workspace_id()
+    fake.log.clear()
+
+    result = capped.restore(target.id, quiesce=Quiesce(fake.log))
+
+    undo = result.undo
+    assert undo is not None
+    at = fake.log.index
+    cap_copy = at(("set_qgroup_limit", "workspace.restore", CAP))
+    exchange = at(("renameat2", "workspace.restore", "workspace", "EXCHANGE"))
+    uncap_old = at(("set_qgroup_limit", "workspace.restore", None))
+    assert at(("snapshot", f"snapshots/{target.id}", "workspace.restore", False)) < cap_copy
+    assert fake.log[cap_copy + 1] == ("qgroup_usage", "workspace.restore")  # read back
+    assert cap_copy < at(("quiesce", "enter")) < exchange < uncap_old
+    assert fake.log[uncap_old + 1] == ("qgroup_usage", "workspace.restore")
+    assert uncap_old < at(("set_readonly", f"snapshots/.incoming-{undo.id}", True))
+    assert fake.limit_of(capped.workspace) == CAP
+    undo_path = capped.snapshots_dir / undo.id
+    assert fake.ids[undo_path] == old_id and fake.limit_of(undo_path) is None
+
+
+def test_the_cap_follows_the_workspace_even_without_a_configured_limit(
+    root: Path, fake: FakeBtrfs, clock: Clock, capped: SnapshotStore
+) -> None:
+    target = take(capped, "v1")
+    plain = SnapshotStore(root, clock=clock)  # e.g. a CLI process built without the config
+
+    result = plain.restore(target.id, quiesce=contextlib.nullcontext)
+
+    assert fake.limit_of(capped.workspace) == CAP
+    assert result.undo is not None
+    assert fake.limit_of(capped.snapshots_dir / result.undo.id) is None
+    plain.restore(result.undo.id, quiesce=contextlib.nullcontext)  # undo
+    assert fake.limit_of(capped.workspace) == CAP and marker(capped.workspace) == "v1"
+
+
+def test_a_recreated_workspace_gets_the_configured_cap(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    target = take(capped, "v1")
+    fake.delete_subvolume(capped.workspace)
+
+    capped.restore(target.id, quiesce=contextlib.nullcontext)
+
+    assert fake.limit_of(capped.workspace) == CAP
+
+
+def test_with_quotas_but_no_cap_anywhere_nothing_is_set(
+    root: Path, fake: FakeBtrfs, clock: Clock
+) -> None:
+    fake.quota = "squota"
+    store = SnapshotStore(root, clock=clock)
+    store.init()
+    target = store.take(Reason.PERIODIC)
+
+    store.restore(target.id, quiesce=contextlib.nullcontext)
+
+    assert fake.calls("set_qgroup_limit") == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SnapshotError("ERROR: Operation not permitted"),
+        SnapshotNoSpace("ERROR: No space left on device", errno=errno.ENOSPC),
+    ],
+)
+def test_a_cap_that_cannot_be_set_stops_the_rewind_before_the_agent_stops(
+    capped: SnapshotStore, fake: FakeBtrfs, error: SnapshotError
+) -> None:
+    target = take(capped, "v1")
+    write_marker(capped.workspace, "v2")
+    before = capped.workspace_id()
+    fake.fail("set_qgroup_limit", error, match=only_the_copy)
+
+    with pytest.raises(SnapshotError, match="workspace unchanged") as excinfo:
+        capped.restore(target.id, quiesce=Quiesce(fake.log))
+
+    assert type(excinfo.value) is type(error)
+    assert fake.calls("quiesce") == []
+    assert capped.workspace_id() == before and marker(capped.workspace) == "v2"
+    assert fake.limit_of(capped.workspace) == CAP
+    assert not os.path.lexists(capped.root / "workspace.restore")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [("sudo: a password is required", SnapshotError), ("Disk quota exceeded", SnapshotNoSpace)],
+)
+def test_an_injected_setter_that_raises_anything_keeps_the_error_contract(
+    root: Path,
+    fake: FakeBtrfs,
+    clock: Clock,
+    capped: SnapshotStore,
+    message: str,
+    expected: type[SnapshotError],
+) -> None:
+    target = take(capped, "v1")
+
+    def setter(path: Path, limit: int | None) -> None:
+        raise RuntimeError(message)  # what a sudo wrapper in a test fixture might raise
+
+    store = SnapshotStore(root, clock=clock, workspace_limit=CAP, set_limit=setter)
+
+    with pytest.raises(SnapshotError, match="workspace unchanged") as excinfo:
+        store.restore(target.id, quiesce=Quiesce(fake.log))
+
+    assert type(excinfo.value) is expected
+    assert fake.calls("quiesce") == []
+    assert not os.path.lexists(capped.root / "workspace.restore")
+
+
+def test_a_cap_that_does_not_read_back_is_refused(
+    root: Path, fake: FakeBtrfs, clock: Clock, capped: SnapshotStore
+) -> None:
+    target = take(capped, "v1")
+    store = SnapshotStore(
+        root, clock=clock, workspace_limit=CAP, set_limit=lambda path, limit: None
+    )
+
+    with pytest.raises(SnapshotError, match="reads back"):
+        store.restore(target.id, quiesce=Quiesce(fake.log))
+
+    assert fake.calls("quiesce") == []
+    assert not os.path.lexists(capped.root / "workspace.restore")
+
+
+def test_an_old_workspace_at_its_cap_is_uncapped_before_it_is_sealed(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    target = take(capped, "v1")
+    fake.full.add(capped.workspace_id())  # filled, then deleted after a snapshot (A13)
+
+    result = capped.restore(target.id, quiesce=contextlib.nullcontext)
+
+    assert result.undo is not None
+    undo_path = capped.snapshots_dir / result.undo.id
+    assert undo_path in fake.readonly and fake.limit_of(undo_path) is None
+    capped.delete(result.undo.id)
+    assert not os.path.lexists(undo_path)
+
+
+def test_an_uncap_failure_after_the_swap_is_restore_incomplete_and_recover_publishes(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    target = take(capped, "v1")
+    write_marker(capped.workspace, "v2")
+    fake.full.add(capped.workspace_id())
+    fake.fail(
+        "set_qgroup_limit",
+        SnapshotError("ERROR: Operation not permitted"),
+        match=lambda path, limit: path == "workspace.restore" and limit is None,
+    )
+
+    with pytest.raises(RestoreIncomplete):
+        capped.restore(target.id, quiesce=contextlib.nullcontext)
+
+    assert marker(capped.workspace) == "v1" and fake.limit_of(capped.workspace) == CAP
+    assert marker(capped.root / "workspace.restore") == "v2"
+    published = capped.recover()
+    assert [snap.reason for snap in published] == [Reason.RECOVERED]
+    path = capped.snapshots_dir / published[0].id
+    assert marker(path) == "v2" and path in fake.readonly and fake.limit_of(path) is None
+
+
+def test_recovery_uncaps_a_capped_incoming_leftover_before_sealing_it(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    path = fake.add_subvolume(capped.snapshots_dir / f".incoming-{OLD.id}", marker="old")
+    fake.limits[fake.ids[path]] = CAP
+    fake.full.add(fake.ids[path])
+
+    assert capped.recover() == [OLD]
+
+    sealed = capped.snapshots_dir / OLD.id
+    assert sealed in fake.readonly and fake.limit_of(sealed) is None
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_a_capped_snapshot_at_its_cap_can_still_be_deleted(
+    capped: SnapshotStore, fake: FakeBtrfs, in_place: bool
+) -> None:
+    snap = take(capped, "v1")
+    path = capped.snapshots_dir / snap.id
+    fake.limits[fake.ids[path]] = CAP  # e.g. published by a Vigía older than T03b-2
+    fake.full.add(fake.ids[path])
+    if in_place:  # full metadata: the tombstone rename fails and it is deleted where it is
+        fake.fail("renameat2", SnapshotNoSpace("renameat2 failed", errno=errno.ENOSPC))
+
+    capped.delete(snap.id)
+
+    assert not os.path.lexists(path) and capped.snapshots() == []
+
+
+def test_an_exclusive_limit_left_by_hand_stops_the_rewind_before_anything_changes(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    """After the swap it could never be cleared, and every later restore() would stop in
+    recovery: so it is refused first, with the workspace unchanged and nothing left behind."""
+    target = take(capped, "v1")
+    before = capped.workspace_id()
+    fake.exclusive_limits[before] = CAP  # `qgroup limit -e`, by hand
+
+    with pytest.raises(SnapshotError, match="workspace unchanged.*exclusive quota limit"):
+        capped.restore(target.id, quiesce=Quiesce(fake.log))
+
+    assert fake.calls("quiesce") == [] and capped.workspace_id() == before
+    assert not os.path.lexists(capped.root / "workspace.restore")
+    capped.recover()  # nothing for recovery to trip over
+
+
+def test_a_rewind_without_any_cap_on_a_quota_volume_is_logged_as_an_error(
+    root: Path, fake: FakeBtrfs, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake.quota = "squota"
+    store = SnapshotStore(root, clock=clock)
+    store.init()
+    target = store.take(Reason.PERIODIC)
+
+    with caplog.at_level(logging.ERROR):
+        store.restore(target.id, quiesce=contextlib.nullcontext)
+
+    assert "no space cap" in caplog.text
+
+
+def test_a_configured_limit_on_a_volume_without_quotas_fails_closed(
+    capped: SnapshotStore, fake: FakeBtrfs
+) -> None:
+    target = take(capped, "v1")
+    fake.quota = None  # e.g. the volume was re-created without -O squota
+    fake.log.clear()
+
+    with pytest.raises(SnapshotError, match="simple quotas"):
+        capped.restore(target.id, quiesce=Quiesce(fake.log))
+
+    assert fake.calls("snapshot") == [] and fake.calls("quiesce") == []
