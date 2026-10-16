@@ -2050,15 +2050,14 @@ class TestReReview:
         assert dropped.details["reasons"] == {"depth": 1}
         assert dropped.details["sample"] == ["d1/p/q/r"]  # where it is, not where it was
 
-    def test_the_height_of_a_moved_subtree_stops_at_the_limit(self) -> None:
+    def test_the_cut_of_a_moved_subtree_stops_at_the_limit(self) -> None:
         """Item 4: no walk of the whole subtree under the lock to learn it is too deep."""
         tree = WatchTree()
         tree.add(1, None, b"")
         for wd in range(2, 3002):
             tree.add(wd, wd - 1, b"d")
-        assert tree.height(1, limit=5) == 6  # over the limit: it stops there
-        assert tree.height(1) == 3000
-        assert tree.height(2995, limit=10) == 6
+        assert tree.beyond(1, 5) == [7]  # only as deep as the cut: it stops there
+        assert tree.beyond(2995, 10) == []  # 6 levels below it: nothing to cut
 
     def test_a_directory_job_that_fails_asks_for_a_rescan(
         self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
@@ -2081,3 +2080,331 @@ class TestReReview:
         rig.settle()
         assert failed and rig.watcher.stats().errors == 1
         assert rig.ino.is_watching(rig.agent_dir / "work" / "boom")
+
+
+class BtrfsListings:
+    """Btrfs fixes the end of a directory listing when the directory is OPENED: a name made
+    after the open is never listed through that descriptor, however late it is read. This
+    models it on the Mac: each directory the watcher opens remembers the names it had then,
+    and ``scandir`` of that descriptor lists only those."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._names: dict[int, set[str]] = {}
+        self._scandir = os.scandir
+        monkeypatch.setattr(files_module.os, "scandir", self.scandir)
+
+    def opener(self, fd: int, rel: bytes, flags: int) -> int:
+        opened = inotify.open_beneath(fd, rel, flags)
+        self._names.pop(opened, None)  # a number reused: not the description it was
+        if flags & os.O_DIRECTORY:
+            try:
+                self._names[opened] = set(os.listdir(opened))
+            except OSError:
+                pass  # not listable: scandir will say so itself
+        return opened
+
+    def scandir(self, target: Any = ".") -> Any:
+        real = self._scandir(target)
+        if isinstance(target, int) and target in self._names:
+            return _FrozenListing(real, self._names[target])
+        return real
+
+
+class _FrozenListing:
+    def __init__(self, real: Any, names: set[str]) -> None:
+        self._real, self._names = real, names
+
+    def __enter__(self) -> "_FrozenListing":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._real.close()
+
+    def __iter__(self) -> Iterator[Any]:
+        return (entry for entry in self._real if entry.name in self._names)
+
+
+class HookedInotify(FakeInotify):
+    """Runs ``before_watch[inode]`` once, just before the first watch on that directory: what
+    the agent does in the instant between the watcher opening a folder and watching it (no
+    event can tell it: the watch is not there yet)."""
+
+    def __init__(
+        self, log: list[str], *, before_watch: dict[int, Callable[[], object]], **kw: Any
+    ) -> None:
+        super().__init__(log, **kw)
+        self.before_watch = before_watch
+
+    def add_watch(self, dir_fd: int, mask: int) -> int:
+        hook = self.before_watch.pop(os.fstat(dir_fd).st_ino, None)
+        if hook is not None:
+            hook()
+        return super().add_watch(dir_fd, mask)
+
+
+class TestListingAfterTheWatch:
+    """A folder is listed through a descriptor opened AFTER its watch: what was made between
+    the open and the watch is in that listing, and what comes later is in the events.
+    Before, the listing used the descriptor of before the watch and btrfs lost those names
+    with no record and no ``dropped`` (docs/19: nothing is lost in silence)."""
+
+    def config(self) -> WatcherConfig:
+        return WatcherConfig(dump_interval=None, max_watches=100, rescan_cooldown=30)
+
+    def rig(
+        self,
+        make_rig: Callable[..., Rig],
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        arm: bool = True,
+        opener: OpenBeneath | None = None,
+    ) -> tuple[Rig, dict[int, Callable[[], object]]]:
+        listings = BtrfsListings(monkeypatch)
+        hooks: dict[int, Callable[[], object]] = {}
+        rig = make_rig(
+            self.config(),
+            arm=arm,
+            opener=opener or listings.opener,
+            ino_cls=HookedInotify,
+            before_watch=hooks,
+        )
+        return rig, hooks
+
+    def test_a_name_made_between_the_open_and_the_watch_of_a_new_folder_is_reported(
+        self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rig, hooks = self.rig(make_rig, monkeypatch)
+        new = rig.agent_dir / "work" / "new"
+        new.mkdir()
+
+        def agent() -> None:
+            (new / "early.txt").write_text("x")
+            (new / "sub").mkdir()
+
+        hooks[new.stat().st_ino] = agent
+        rig.deliver(rig.event("work", IN_CREATE | IN_ISDIR, "new"))
+        rig.settle()
+        assert not hooks  # the window was hit
+        records = rig.by_target()
+        assert records["work/new/early.txt"].action == "create"
+        assert records["work/new/early.txt"].details["scan"] is True
+        assert records["work/new/sub"].action == "create"
+        assert rig.ino.is_watching(new / "sub")
+        assert rig.watcher.unwatched_count() == 0 and not rig.files("dropped")
+
+    def test_a_folder_made_between_the_open_and_the_watch_while_arming_is_watched(
+        self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The initial walk (and the one after a rewind) has the same window below the root."""
+        rig, hooks = self.rig(make_rig, monkeypatch, arm=False)
+        work = rig.agent_dir / "work"
+        hooks[work.stat().st_ino] = lambda: (work / "late").mkdir()
+        assert rig.watcher.arm(S1)
+        assert not hooks
+        assert rig.ino.is_watching(work / "late")
+        assert rig.watcher.unwatched_count() == 0
+
+    @pytest.mark.parametrize("trouble", ["swapped", "no_descriptors"])
+    def test_a_new_folder_that_cannot_be_reopened_as_itself_is_raced_until_the_rescan(
+        self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch, trouble: str
+    ) -> None:
+        """If the second open is not the folder that is watched, or fails, nothing is listed
+        from it: the watch is given back and the folder is ``raced``, so the rescan arms it as
+        new and reports what it holds."""
+        new_inode: list[int] = []
+        fooled: list[bool] = []
+
+        def tricky(fd: int, rel: bytes, flags: int) -> int:
+            if rel == b"." and not fooled and os.fstat(fd).st_ino in new_inode:
+                fooled.append(True)
+                if trouble == "no_descriptors":
+                    raise OSError(errno.EMFILE, "Too many open files")
+                return os.open(rig.agent_dir / "home", os.O_RDONLY | os.O_DIRECTORY)
+            return inotify.open_beneath(fd, rel, flags)
+
+        rig, _ = self.rig(make_rig, monkeypatch, opener=tricky)
+        new = rig.agent_dir / "work" / "new"
+        new.mkdir()
+        (new / "inside.txt").write_text("x")
+        new_inode.append(new.stat().st_ino)
+        with rig.watcher._cond:
+            rig.watcher._last_rescan = rig.mono.now  # in the cooldown: no rescan right away
+        rig.deliver(rig.event("work", IN_CREATE | IN_ISDIR, "new"))
+        assert rig.watcher.wait_idle(5)
+        assert fooled
+        assert not rig.ino.is_watching(new)  # its watch was given back
+        assert rig.watcher.report_unwatched()
+        assert rig.files("dropped")[-1].details["reasons"] == {"raced": 1}
+        rig.mono.now += 31
+        eventually(lambda: rig.watcher.stats().rescans == 1)
+        rig.settle()
+        assert rig.ino.is_watching(new)
+        assert rig.by_target()["work/new/inside.txt"].details["scan"] is True
+        assert rig.watcher.unwatched_count() == 0
+
+    def test_a_folder_that_could_not_be_listed_again_in_a_rescan_keeps_its_watch(
+        self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Already watched: it is ``unlisted`` (as when its listing fails), never given back."""
+        active: list[bool] = []
+
+        def failing(fd: int, rel: bytes, flags: int) -> int:
+            if active and rel == b"." and os.fstat(fd).st_ino == work_inode:
+                active.clear()
+                raise OSError(errno.EMFILE, "Too many open files")
+            return inotify.open_beneath(fd, rel, flags)
+
+        rig, _ = self.rig(make_rig, monkeypatch, opener=failing)
+        work = rig.agent_dir / "work"
+        work_inode = work.stat().st_ino
+        before = len(os.listdir("/dev/fd"))
+        active.append(True)
+        rig.deliver(RawEvent(-1, IN_Q_OVERFLOW, 0, b""))
+        eventually(lambda: rig.watcher.stats().rescans == 1)
+        rig.settle()
+        assert not active and rig.ino.is_watching(work)
+        assert rig.watcher.report_unwatched()
+        assert rig.files("dropped")[-1].details["reasons"] == {"unlisted": 1}
+        assert not rig.files("create")  # nothing reported as new from a known folder
+        assert len(os.listdir("/dev/fd")) == before  # no descriptor left behind
+
+    def test_a_new_folder_armed_first_by_a_quiet_rescan_still_reports_what_it_holds(
+        self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rescan after a freed watch does not report what it finds (``emit=False``). If it
+        arms a folder the agent has just made before that folder's own job runs, the job finds
+        it already watched: what it holds must be reported all the same."""
+        rig, _ = self.rig(make_rig, monkeypatch)
+        new = rig.agent_dir / "work" / "new"
+        (new / "deeper").mkdir(parents=True)
+        (new / "secret.txt").write_text("x")
+        (new / "deeper" / "more.txt").write_text("y")
+        with rig.watcher._cond:
+            rig.watcher._want_rescan(None, emit=False, unknown=True)
+        eventually(lambda: rig.watcher.stats().rescans == 1)
+        assert rig.watcher.wait_idle(5)
+        assert rig.ino.is_watching(new / "deeper")  # armed by the quiet rescan
+        rig.deliver(rig.event("work", IN_CREATE | IN_ISDIR, "new"))  # the reader was behind
+        rig.settle()
+        records = rig.by_target()
+        assert records["work/new/secret.txt"].details["scan"] is True
+        assert records["work/new/deeper/more.txt"].details["scan"] is True
+        assert records["work/new"].action == "create"
+
+
+class TestMovesKeepWhatFits:
+    """A subtree moved too deep loses only the watches beyond the cap: the rest is never blind
+    (a re-walk of the whole subtree left it without events and without a ``dropped``)."""
+
+    def test_the_part_that_fits_keeps_its_watches_and_its_events(
+        self, make_rig: Callable[..., Rig]
+    ) -> None:
+        rig = make_rig(
+            arm=False, config=WatcherConfig(dump_interval=None, max_depth=4, max_watches=100)
+        )
+        (rig.agent_dir / "a" / "b" / "c").mkdir(parents=True)
+        (rig.agent_dir / "d" / "e").mkdir(parents=True)
+        assert rig.watcher.arm(S1)
+        wd_a, wd_b = rig.ino.wd_of(rig.agent_dir / "a"), rig.ino.wd_of(rig.agent_dir / "a" / "b")
+        wd_c = rig.ino.wd_of(rig.agent_dir / "a" / "b" / "c")
+        root, e = rig.ino.wd_of(rig.agent_dir), rig.ino.wd_of(rig.agent_dir / "d" / "e")
+        (rig.agent_dir / "a").rename(rig.agent_dir / "d" / "e" / "a")
+        rig.deliver(
+            RawEvent(root, IN_MOVED_FROM | IN_ISDIR, 33, b"a"),
+            RawEvent(e, IN_MOVED_TO | IN_ISDIR, 33, b"a"),
+            RawEvent(wd_b, IN_CREATE, 0, b"right_after.txt"),  # no gap: b kept its watch
+        )
+        rig.settle()
+        assert wd_a not in rig.ino.removed and wd_b not in rig.ino.removed
+        assert wd_c in rig.ino.removed  # depth 5
+        assert "d/e/a/b/right_after.txt" in rig.by_target()
+        assert rig.watcher.report_unwatched()
+        dropped = rig.files("dropped")[-1]
+        assert dropped.details["reasons"] == {"depth": 1}
+        assert dropped.details["sample"] == ["d/e/a/b/c"]
+
+    def test_the_cut_is_exactly_one_level_beyond_the_room(self) -> None:
+        tree = WatchTree()
+        tree.add(1, None, b"")
+        tree.add(2, 1, b"a")
+        tree.add(3, 2, b"b")
+        tree.add(4, 2, b"c")
+        tree.add(5, 3, b"d")
+        assert tree.beyond(2, -1) == [2]
+        assert sorted(tree.beyond(2, 0)) == [3, 4]
+        assert tree.beyond(2, 1) == [5]
+        assert tree.beyond(2, 2) == []
+
+    def test_a_move_of_a_watch_that_left_the_model_is_walked_as_new_with_its_identity(
+        self, make_rig: Callable[..., Rig]
+    ) -> None:
+        """MOVED_FROM, then the watch is dropped (IN_IGNORED), then MOVED_TO: the old wd is not
+        put back without the identity that checks every reopen of it."""
+        rig = make_rig()
+        work = rig.agent_dir / "work"
+        wd_work, root = rig.ino.wd_of(work), rig.ino.wd_of(rig.agent_dir)
+        work.rename(rig.agent_dir / "z")
+        rig.deliver(
+            RawEvent(root, IN_MOVED_FROM | IN_ISDIR, 34, b"work"),
+            RawEvent(wd_work, IN_IGNORED, 0, b""),
+        )
+        rig.deliver(RawEvent(root, IN_MOVED_TO | IN_ISDIR, 34, b"z"))
+        rig.settle()
+        z = rig.agent_dir / "z"
+        wd_z = rig.ino.wd_of(z)
+        assert rig.watcher._tree.ident(wd_z) == (z.stat().st_dev, z.stat().st_ino)
+        assert rig.watcher._tree.path(wd_z) == b"z"
+
+    def test_a_subtree_moved_too_deep_and_back_gets_the_cut_part_watched_again(
+        self, make_rig: Callable[..., Rig]
+    ) -> None:
+        rig = make_rig(
+            arm=False, config=WatcherConfig(dump_interval=None, max_depth=4, max_watches=100)
+        )
+        (rig.agent_dir / "a" / "b" / "c").mkdir(parents=True)
+        (rig.agent_dir / "d" / "e").mkdir(parents=True)
+        assert rig.watcher.arm(S1)
+        root, e = rig.ino.wd_of(rig.agent_dir), rig.ino.wd_of(rig.agent_dir / "d" / "e")
+        (rig.agent_dir / "a").rename(rig.agent_dir / "d" / "e" / "a")
+        rig.deliver(
+            RawEvent(root, IN_MOVED_FROM | IN_ISDIR, 35, b"a"),
+            RawEvent(e, IN_MOVED_TO | IN_ISDIR, 35, b"a"),
+        )
+        rig.settle()
+        assert rig.watcher.unwatched_count() == 1  # c, cut at the cap
+        (rig.agent_dir / "d" / "e" / "a").rename(rig.agent_dir / "a")
+        (rig.agent_dir / "a" / "b" / "c" / "meanwhile.txt").write_text("x")
+        rig.deliver(
+            RawEvent(e, IN_MOVED_FROM | IN_ISDIR, 36, b"a"),
+            RawEvent(root, IN_MOVED_TO | IN_ISDIR, 36, b"a"),
+        )
+        rig.settle()
+        assert rig.ino.is_watching(rig.agent_dir / "a" / "b" / "c")
+        assert rig.by_target()["a/b/c/meanwhile.txt"].details["scan"] is True
+
+    def test_a_move_the_model_cannot_place_is_raced_and_asks_for_a_full_walk(
+        self, make_rig: Callable[..., Rig]
+    ) -> None:
+        """The model says the new parent is inside the moved folder (it lags behind renames
+        still queued): the subtree is started over, said, and a rescan puts it right."""
+        rig = make_rig(
+            WatcherConfig(dump_interval=None, max_watches=100, rescan_cooldown=30), arm=False
+        )
+        (rig.agent_dir / "work" / "inner").mkdir()
+        assert rig.watcher.arm(S1)
+        root = rig.ino.wd_of(rig.agent_dir)
+        inner = rig.ino.wd_of(rig.agent_dir / "work" / "inner")
+        with rig.watcher._cond:
+            rig.watcher._last_rescan = rig.mono.now  # in the cooldown: no rescan right away
+        rig.deliver(
+            RawEvent(root, IN_MOVED_FROM | IN_ISDIR, 37, b"work"),
+            RawEvent(inner, IN_MOVED_TO | IN_ISDIR, 37, b"work"),
+        )
+        assert rig.watcher.wait_idle(5)
+        assert rig.watcher.report_unwatched()
+        assert rig.files("dropped")[-1].details["reasons"] == {"raced": 1}
+        rig.mono.now += 31
+        eventually(lambda: rig.watcher.stats().rescans == 1)
+        rig.settle()
+        assert rig.ino.is_watching(rig.agent_dir / "work" / "inner")
+        assert rig.watcher.unwatched_count() == 0

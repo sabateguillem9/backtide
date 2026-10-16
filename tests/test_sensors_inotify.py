@@ -4,6 +4,7 @@ The real inotify (watches, queue, overflow) is Linux-only and is tested in the V
 (tests/integration/test_file_watcher.py)."""
 
 import errno
+import fcntl
 import os
 import struct
 import sys
@@ -146,6 +147,18 @@ class TestOpenBeneath:
                 assert os.fstat(fd).st_ino == os.fstat(root).st_ino
             finally:
                 os.close(fd)
+
+    def test_dot_is_a_new_open_file_description_not_a_dup(self, root: int) -> None:
+        """Btrfs fixes a directory listing when the directory is opened: the watcher reopens
+        ``.`` after putting its watch, to list what came since. A dup would share the old open
+        file description (and its old listing); status flags tell them apart."""
+        fcntl.fcntl(root, fcntl.F_SETFL, fcntl.fcntl(root, fcntl.F_GETFL) | os.O_NONBLOCK)
+        fd = inotify.open_beneath(root, b".", self.flags | os.O_DIRECTORY)
+        try:
+            assert not fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK
+            assert os.fstat(fd).st_ino == os.fstat(root).st_ino
+        finally:
+            os.close(fd)
 
     def test_a_symlink_in_the_last_component_is_refused(self, root: int) -> None:
         with pytest.raises(OSError):  # ELOOP (or ENOTDIR with O_DIRECTORY)

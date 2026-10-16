@@ -213,8 +213,9 @@ def open_beneath(root_fd: int, rel: bytes, flags: int) -> int:
     descriptor, never following a symlink or leaving the directory: an absolute path, any
     ``..``, a symlink in ANY component and a mount crossing are refused (OSError).
 
-    ``.`` (or empty) is the directory itself. Raises ValueError for a path with a NUL. The
-    length of ``rel`` does not matter: it is opened in pieces below PATH_MAX."""
+    ``.`` (or empty) is the directory itself, opened again: a new open file description,
+    never a dup of ``root_fd``. Raises ValueError for a path with a NUL. The length of ``rel``
+    does not matter: it is opened in pieces below PATH_MAX."""
     rel = _check_relative(rel)
     flags |= os.O_CLOEXEC
     if sys.platform == "linux" and _openat2_usable():
@@ -312,7 +313,10 @@ def _open_walking(root_fd: int, rel: bytes, flags: int) -> int:
     if b".." in parts:
         raise OSError(errno.EXDEV, "'..' refused", rel)
     if not parts:
-        return os.dup(root_fd)
+        # A NEW open of the directory itself, never a dup: a dup shares the old open file
+        # description, and btrfs fixes a directory's listing when it is opened (the watcher
+        # reopens ``.`` after its watch to list what came since).
+        return os.open(".", flags | os.O_NOFOLLOW, dir_fd=root_fd)
     device = os.fstat(root_fd).st_dev
     current = root_fd
     try:
