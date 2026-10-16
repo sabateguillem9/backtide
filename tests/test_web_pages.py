@@ -342,7 +342,7 @@ def test_snapshots_list_newest_first_with_a_disabled_rewind(tmp_path: Path) -> N
     ids = re.findall(r'<span class="sid">([^<]+)</span>', html)
     assert ids == sorted((s.id for s in snaps), reverse=True)
     assert html.count('<button class="dot-button" type="button" disabled') == 4
-    assert html.count("llega con T04c-2") >= 4
+    assert html.count("muy pronto") >= 4
     assert "periódica" in html and "manual" in html
     assert "hace 2 min" in text_of(html)
     assert "<form" not in html, "nothing here can rewind yet"
@@ -362,7 +362,7 @@ def test_snapshots_in_english(tmp_path: Path) -> None:
     now = datetime(2026, 10, 16, 10, 0, tzinfo=UTC)
     web = new_client(tmp_path, snapshots=lambda: snapshots(1, now))
     text = text_of(web.get("/instantaneas", headers={"accept-language": "en"}).text)
-    assert "arrives with T04c-2" in text and "periodic" in text and "2 min ago" in text
+    assert "coming soon" in text and "periodic" in text and "2 min ago" in text
 
 
 def test_an_unreadable_volume_falls_back_to_what_the_black_box_says(
@@ -377,15 +377,17 @@ def test_an_unreadable_volume_falls_back_to_what_the_black_box_says(
         raise SnapshotError("no btrfs here <b>")
 
     html = new_client(tmp_path, snapshots=failing).get("/instantaneas").text
-    assert "No se puede leer el volumen de instantáneas desde aquí" in html
+    assert "Lista sacada de la caja negra." in html, "a calm word on where the list comes from"
+    assert "No se puede leer" not in html, "the box could be read: nothing is wrong to show"
     assert "no btrfs here" not in html, "the cause goes to the log, not onto the page"
-    assert "Esto es lo que dice la caja negra." in html
     assert re.findall(r'<span class="sid">([^<]+)</span>', html) == ids[::-1]
 
 
 def test_no_volume_and_no_box_is_an_empty_list_not_an_error(tmp_path: Path) -> None:
     response = new_client(tmp_path).get("/instantaneas")
     assert response.status_code == 200 and "No hay instantáneas todavía." in response.text
+    assert "No se puede leer el volumen de instantáneas desde aquí" in response.text
+    assert "No se puede leer la caja negra" in response.text
 
 
 def test_a_reason_this_version_does_not_know_is_shown_escaped(tmp_path: Path) -> None:
@@ -452,6 +454,26 @@ def test_extreme_dates_are_clamped_to_1970_9000(web: TestClient) -> None:
     assert 'name="desde" type="datetime-local" value="1970-01-01T00:00"' in html
     assert 'name="hasta" type="datetime-local" value="9000-12-31T23:59"' in html
     assert len(re.findall(r'id="e-\d+"', html)) == 35  # everything is in that range
+
+
+@pytest.mark.parametrize("before", ["%C2%B2", "%D9%A3", "%EF%BC%91"])  # ², Arabic 3, fullwidth 1
+def test_a_non_ascii_digit_page_position_is_ignored_not_a_500(web: TestClient, before: str) -> None:
+    response = web.get(f"/historia?antes={before}")
+    assert response.status_code == 200
+    assert len(re.findall(r'id="e-\d+"', response.text)) == 35
+
+
+@pytest.mark.parametrize("action", ["%20", "%20%20%20", "%09", "%C2%A0"])
+def test_a_blank_action_filter_is_ignored_not_a_500(web: TestClient, action: str) -> None:
+    response = web.get(f"/historia?accion={action}")
+    assert response.status_code == 200
+    assert len(re.findall(r'id="e-\d+"', response.text)) == 35
+
+
+def test_an_action_filter_is_stripped(web: TestClient) -> None:
+    html = web.get("/historia?accion=%20delete%20").text
+    seqs = re.findall(r'id="e-\d+"', html)
+    assert len(seqs) == 30  # the 30 deletions of the fixture
 
 
 def test_a_hostile_dropped_reason_does_not_take_the_page_down(tmp_path: Path) -> None:

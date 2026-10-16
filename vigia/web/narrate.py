@@ -75,6 +75,7 @@ class Line:
     mark: bool = False  # a snapshot: drawn as a mark on the line, not as a sentence
     count: int = 1
     what: str = ""  # "source/action", for the plain line shown if this one cannot be told
+    first_ts: str = ""  # when the first event of a folded line happened
 
 
 # -- words -------------------------------------------------------------------------------------
@@ -139,6 +140,7 @@ def line_for(event: Event) -> Line:
         params=params,
         mark=mark,
         what=f"{event.source.value}/{event.action}",
+        first_ts=event.ts,
     )
 
 
@@ -263,7 +265,16 @@ class _Group:
         self.dirs = 0
         self.files = 0
         self.sample = Name(tail(event.target, PATH_CHARS))
-        self.line = Line(event.seq, event.seq, event.ts, 0, "", {})
+        self.line = Line(
+            event.seq,
+            event.seq,
+            event.ts,
+            0,
+            "",
+            {},
+            what=f"file/{event.action}",
+            first_ts=event.ts,
+        )
         self.count = 0
         self.add(event, when)
 

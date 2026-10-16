@@ -1,8 +1,20 @@
-<svg class="tide" viewBox="0 0 {{ tide.width | int }} 28" role="img" aria-label="{{ t('tide.label', n=tide.total) }}">
-  <line class="tide-line" x1="{{ tide.left }}" y1="14" x2="{{ tide.right }}" y2="14"/>
+<div class="tide-window"><div class="tide-inner">
+<svg class="tide" viewBox="0 0 {{ tide.width | int }} {{ tide.height | int }}" role="img" aria-label="{{ t('tide.label', n=tide.total) if tide.hours == 24 else t('tide.label.hours', h=tide.hours, n=tide.total) }}">
+  <defs>
+    <linearGradient id="tide-fade" gradientUnits="userSpaceOnUse" x1="{{ tide.left }}" y1="0" x2="{{ tide.fade_to }}" y2="0">
+      <stop offset="0" stop-color="currentColor" stop-opacity="0"/>
+      <stop offset="1" stop-color="currentColor" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+  <path class="tide-line" d="{{ tide.path }}" stroke="url(#tide-fade)"/>
+  <g class="tide-swell"><path class="tide-line" d="{{ tide.swell }}" stroke="currentColor"/></g>
   {% for mark in tide.marks %}
-  <circle class="tide-mark" cx="{{ mark.x }}" cy="14" r="3.5"><title>{{ mark.ts }}</title></circle>
+  <circle class="tide-mark" cx="{{ mark.x }}" cy="{{ mark.y }}" r="3.5" data-at="{{ mark.at }}"><title>{{ mark.ts }}</title></circle>
   {% endfor %}
-  <circle class="tide-head" cx="{{ tide.right }}" cy="14" r="6"/>
 </svg>
-<p class="tide-scale"><span>{{ t('tide.from') }}</span><span>{{ t('tide.now') }}</span></p>
+</div></div>
+<p class="tide-scale">
+  <span>{{ t('tide.from') if tide.hours == 24 else (t('age.hour', n=tide.hours) if tide.hours < 48 else t('age.day', n=tide.hours // 24)) }}</span>
+  <span class="tide-count"><span class="num" data-count="events">{{ tide.events }}</span>{% if tide.more %}+{% endif %} {{ t('tide.events.one' if tide.events == 1 else 'tide.events.other') }} · <span class="num" data-count="snaps">{{ tide.total }}</span> {{ t('tide.snaps.one' if tide.total == 1 else 'tide.snaps.other') }}</span>
+  <span>{{ t('tide.now') }}</span>
+</p>

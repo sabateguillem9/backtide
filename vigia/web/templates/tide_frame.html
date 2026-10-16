@@ -1,0 +1,6 @@
+<div class="tide-frame is-intro" data-tide>
+  <div class="tide-wrap" id="tide"{% if live %} sse-swap="tide"{% endif %}>{% include "tide.html" %}</div>
+  <svg class="tide-now" viewBox="0 0 {{ tide.width | int }} {{ tide.height | int }}" aria-hidden="true">
+    <g class="tide-pos"><g class="tide-hop"><circle class="tide-head" cx="{{ tide.right }}" cy="{{ tide.base }}" r="6"/></g></g>
+  </svg>
+</div>

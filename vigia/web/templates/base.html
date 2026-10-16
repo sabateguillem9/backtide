@@ -14,7 +14,7 @@
 <script src="{{ base }}/static/vendor/htmx-sse.js" defer></script>
 <script src="{{ base }}/static/web.js" defer></script>
 </head>
-<body>
+<body data-age-now="{{ t.raw('age.now') }}" data-age-sec="{{ t.raw('age.sec') }}" data-age-min="{{ t.raw('age.min') }}" data-age-hour="{{ t.raw('age.hour') }}" data-age-day="{{ t.raw('age.day') }}">
 <div class="page">
 <header class="top">
   <div class="brand">
@@ -23,9 +23,9 @@
   </div>
   {% if active %}
   <nav aria-label="{{ t('nav.label') }}">
-    <a href="{{ base }}/ahora"{% if active == 'now' %} aria-current="page"{% endif %}>{{ t('nav.now') }}</a>
-    <a href="{{ base }}/historia"{% if active == 'history' %} aria-current="page"{% endif %}>{{ t('nav.history') }}</a>
-    <a href="{{ base }}/instantaneas"{% if active == 'snapshots' %} aria-current="page"{% endif %}>{{ t('nav.snapshots') }}</a>
+    {% for key, path, label in (('now', '/ahora', 'nav.now'), ('history', '/historia', 'nav.history'), ('snapshots', '/instantaneas', 'nav.snapshots'), ('ask', '/ahora/preguntar', 'nav.ask')) %}
+    <a href="{{ base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}{% if active == key %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
+    {% endfor %}
   </nav>
   {% endif %}
 </header>

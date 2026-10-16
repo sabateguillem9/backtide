@@ -36,6 +36,7 @@
     </label>
     <button class="dot-button" type="submit" aria-label="{{ t('hist.apply') }}">{% include "arrow.html" %}</button>
   </form>
+  {% if filters.after is not none %}<p class="note">{{ t('hist.burst') }} <a href="{{ base }}/historia">{{ t('hist.all') }}</a></p>{% endif %}
   <section id="results">
     {% include "history_results.html" %}
   </section>

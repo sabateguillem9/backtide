@@ -67,14 +67,14 @@ demo-web: ## Demo: the web of the running demo, in the VM (open the link on the 
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
 	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) vigia web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT)'
 
-web-demo: ## Web demo on the Mac, no VM: made-up black box + `vigia web`; Ctrl-C stops (docs/demo.md)
+web-demo: ## Web demo on the Mac, no VM: made-up black box and snapshots + the web; Ctrl-C stops (docs/demo.md)
 	@dir=$$(mktemp -d "$${TMPDIR:-/tmp}/vigia-web-demo.XXXXXX") || exit 1; \
 	seeder=; trap 'kill $$seeder 2>/dev/null; rm -rf "$$dir"' EXIT INT TERM; \
 	uv run python scripts/web-demo/seed.py "$$dir" --live >/dev/null & seeder=$$!; \
 	n=0; while [ ! -e "$$dir/.ready" ]; do \
 	  n=$$((n+1)); if [ $$n -gt 240 ]; then echo "The demo data did not appear" >&2; exit 1; fi; \
 	  sleep 0.5; done; \
-	uv run vigia web --config "$$dir/vigia.toml"
+	uv run python scripts/web-demo/serve.py "$$dir/vigia.toml"
 
 vm-up: ## Create (first time) and start the dev VM
 	@status=$$(limactl list --format '{{.Status}}' $(VM) 2>/dev/null); \

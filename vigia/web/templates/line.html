@@ -1,5 +1,10 @@
+{% set span = burst(line) %}
 <div class="line{% if line.mark %} mark{% endif %}" id="l-{{ line.id }}"{% if oob %} hx-swap-oob="true"{% endif %}>
   <time class="when" datetime="{{ line.ts }}" title="{{ stamp(line.ts) }}">{{ clock(line.ts) }}</time>
   <span class="dot dot-{{ line.risk }}" role="img" aria-label="{{ t('risk.' ~ line.risk) }}"></span>
+  {% if span %}
+  <div class="said"><details class="burst"><summary>{{ tell(line) }}</summary><p class="burst-more">{{ t('burst.span', from_=span.from_, to=span.to) }} <a href="{{ span.href }}">{{ t('burst.open') }}</a></p></details></div>
+  {% else %}
   <span class="said">{{ tell(line) }}</span>
+  {% endif %}
 </div>

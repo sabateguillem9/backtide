@@ -3,9 +3,13 @@
 Who runs it: NOT root, and not as the service. The web reads one file, ``blackbox.db`` (plus its
 ``-wal`` and ``-shm``), and the volume's snapshot list: no key, no gateway token, no socket. Give
 an ordinary user read access to the state directory and those files (for example a ``vigia``
-group with ``chmod g+rx`` on the directory and ``g+r`` on the database, which the service creates
-0600 today) and run ``vigia web`` as that user. Reading a WAL database needs the ``-shm`` file
-too; if the volume cannot be listed, the snapshots page falls back to the black box's own
+group with ``chmod g+rx`` on the directory and ``g+r`` on ``blackbox.db``, ``blackbox.db-wal``
+and ``blackbox.db-shm``, which the service creates 0600 today) and run ``vigia web`` as that user.
+NEVER give the group ``w`` on any of them, not even on ``-shm``: a writable ``-shm`` lets a
+lower-privileged reader corrupt the WAL index, and with it the black box. With a read-only
+``-shm``, SQLite 3.22 or newer reads while the service holds the database open; without the
+service running, the page says the box cannot be read (``BoxUnavailable``), which is correct. If
+the volume cannot be listed, the snapshots page falls back to the black box's own
 ``snapshot/take`` events.
 
 T12b: the data should come through the control socket instead, so the web needs no file at all,
@@ -74,16 +78,20 @@ def run_web(
     paths: WebPaths,
     port: int,
     announce: Callable[[str, str], None],
+    *,
+    snapshots: Callable[[], list[Snapshot]] | None = None,
 ) -> None:
     """Serve the web of ``paths`` on 127.0.0.1:``port`` until the process is stopped.
     ``announce`` gets the link with the token (printed once, never logged) and the name of
-    this run, to compare with the one on the page."""
+    this run, to compare with the one on the page. ``snapshots`` lists the snapshots; it is
+    the volume's own list (``SnapshotStore``) unless given, which only the Mac's demo does
+    (scripts/web-demo/serve.py: there is no btrfs there)."""
     sock = bind(port)
     real_port = sock.getsockname()[1]
     token, prefix, run_name = make_token(), make_prefix(), make_run_name()
     reader = BoxReader(paths.blackbox_db)
 
-    def snapshots() -> list[Snapshot]:
+    def from_volume() -> list[Snapshot]:
         return SnapshotStore(paths.volume).snapshots()
 
     app = create_app(
@@ -92,7 +100,7 @@ def run_web(
         token=token,
         prefix=prefix,
         run_name=run_name,
-        snapshots=snapshots,
+        snapshots=snapshots or from_volume,
     )
     server = make_server(app)
     announce(web_url(real_port, prefix, token), run_name)

@@ -2,9 +2,11 @@
 
 Usage: python scripts/web-demo/seed.py <folder> [--live]
 
-Writes into <folder>: ``vigia.toml``, ``state/`` (a black box written by the real BlackBox) and a
-``.ready`` file when the first story is in. The story is about the last hour: an agent creates
-notes, a report and a spreadsheet, Vigía takes snapshots, the agent deletes a whole project (a
+Writes into <folder>: ``vigia.toml``, ``state/`` (a black box written by the real BlackBox),
+``volume/snapshots/`` (one empty folder per snapshot, which serve.py lists: no btrfs on a Mac)
+and a ``.ready`` file when the first story is in. Before the last hour there is a day of work
+with quiet stretches, so the tide has a shape. The last hour: an agent creates notes, a report
+and a spreadsheet, Vigía takes snapshots, the agent deletes a whole project (a
 burst of 120 files), the person rewinds, and the agent carries on. With ``--live`` it then keeps
 adding events like an agent at work (some edits, now and then a burst of deletions, a snapshot
 every half minute) until it is stopped, so the "Ahora" page has something to show.
@@ -28,10 +30,16 @@ SNAPSHOT_EVERY = 15  # live events between two snapshots
 class Story:
     """Appends events with a clock that starts an hour ago and catches up with now."""
 
-    def __init__(self, box: BlackBox, clock: "Clock") -> None:
+    def __init__(self, box: BlackBox, clock: "Clock", volume: Path | None = None) -> None:
         self.box = box
         self.clock = clock
         self.last_snapshot: str | None = None
+        self.volume = volume  # where serve.py finds the snapshot list (one empty folder each)
+
+    def keep(self, snapshot_id: str) -> None:
+        """Leave the snapshot where serve.py lists it (a plain folder: no btrfs on a Mac)."""
+        if self.volume is not None:
+            (self.volume / "snapshots" / snapshot_id).mkdir(parents=True, exist_ok=True)
 
     def at(self, seconds: float) -> None:
         self.clock.advance(seconds)
@@ -52,6 +60,7 @@ class Story:
             snapshot_id=snapshot_id,
         )
         self.last_snapshot = snapshot_id
+        self.keep(snapshot_id)
         return snapshot_id
 
     def system(self, action: str, **details: object) -> None:
@@ -69,12 +78,38 @@ class Clock:
     def now(self) -> datetime:
         return self._now
 
+    def jump_to(self, moment: datetime) -> None:
+        """Forward to ``moment`` (never backwards)."""
+        self._now = max(self._now, moment)
+
     def advance(self, seconds: float) -> None:
         self._now += timedelta(seconds=seconds)
 
     def sync(self) -> None:
         """Follow the real time (never backwards: the black box wants non-decreasing times)."""
         self._now = max(self._now, datetime.now(UTC))
+
+
+def earlier_day(story: Story) -> None:
+    """The day before the last hour, so the tide has a shape: three work sessions with quiet
+    stretches between them, and snapshots every half hour while the agent works."""
+    rng = random.Random(3)  # noqa: S311 - demo data, not a secret
+    story.system("service_start", version="0.1.0")
+    story.at(2)
+    story.system("agent_start")
+    sessions = ((1.5, 4.0, 6), (8.0, 9.5, 12), (13.5, 18.5, 4))  # (from h, to h, events per step)
+    files = ("notas.md", "plan.md", "datos-ventas.csv", "informe-trimestral.md", "ideas.txt")
+    step = 300.0  # five minutes
+    begin = story.clock.now()
+    for i in range(int(22 * 3600 / step)):
+        hour = i * step / 3600
+        busy = next((n for start, end, n in sessions if start <= hour < end), 0)
+        if i % (6 if busy else 24) == 0:
+            story.snapshot()
+        for _ in range(rng.randint(0, busy * 2) if busy else 0):
+            story.at(rng.uniform(1, step / (busy * 2 + 1)))
+            story.file("modify", f"work/{rng.choice(files)}", writes=rng.randint(1, 4))
+        story.clock.jump_to(begin + timedelta(seconds=step * (i + 1)))
 
 
 def first_story(story: Story) -> str:
@@ -130,7 +165,10 @@ def first_story(story: Story) -> str:
     )
     story.at(1)
     story.system("agent_stop", reason="rewind")
-    story.at(4)
+    story.at(2)
+    # the rewind keeps the workspace it replaces, so it can be undone ("antes de rebobinar")
+    story.keep(f"{story.clock.now():%Y%m%dT%H%M%S.%f}Z-pre_restore")
+    story.at(2)
     story.box.append(
         "snapshot",
         "rewind_done",
@@ -185,16 +223,17 @@ def main(argv: list[str]) -> int:
     config.chmod(0o600)
     if not (state / "blackbox.key").exists():
         create_key(state / "blackbox.key")
-    story_start = datetime.now(UTC) - timedelta(minutes=58)
-    clock = Clock(story_start)
+    clock = Clock(datetime.now(UTC) - timedelta(hours=23, minutes=30))
     box = BlackBox(
         state / "blackbox.db",
         load_key(state / "blackbox.key"),
         checkpoint_path=state / "blackbox.checkpoint",
         clock=clock,
     )
-    story = Story(box, clock)
+    story = Story(box, clock, folder / "volume")
     if box.head() is None:
+        earlier_day(story)
+        clock.jump_to(datetime.now(UTC) - timedelta(minutes=58))
         first_story(story)
         # The story ran on a fast-forwarded clock: from here on, wait until it is "now" again.
         wait = (clock.now() - datetime.now(UTC)).total_seconds()

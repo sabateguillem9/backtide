@@ -1,8 +1,9 @@
 """The web of Vigía: a lookout post on 127.0.0.1, read-only.
 
-Three pages: "Ahora" (a live conversation of what the agent does, over Server-Sent Events),
-"Historia" (the filtered timeline) and "Instantáneas" (the list; the rewind button is disabled
-until the web gets the control socket). The security reasoning is in ``vigia.web.security``.
+Four pages: "Ahora" (a live conversation of what the agent does, over Server-Sent Events),
+"Historia" (the filtered timeline), "Instantáneas" (the list; the rewind button is disabled
+until the web gets the control socket) and "Preguntar" (the question box on a page of its own).
+The security reasoning is in ``vigia.web.security``.
 
 Everything here reads the black box through ``BoxReader`` (read-only, without its key); nothing
 writes, and the only method the app answers is GET.
@@ -11,6 +12,9 @@ writes, and the only method the app answers is GET.
 import asyncio
 import json
 import logging
+import math
+import threading
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -53,6 +57,7 @@ SHOWN_LINES = 60
 PAGE_SIZE = 50
 STREAM_BATCH = 500
 TIDE_REFRESH = 60.0
+ACTIVITY_EVENTS = 5000  # how many of the day's events shape the tide (and are counted)
 KEEPALIVE = 15.0
 LISTED_SNAPSHOTS = 30
 SNAPSHOT_FALLBACK = 200
@@ -106,6 +111,9 @@ def create_app(
         lstrip_blocks=True,
     )
     app = FastAPI(
+        # "/ahora/" must not answer "307 to /ahora?t=...": the redirect drops the prefix and copies
+        # an unspent token into another address. A path with a trailing slash is simply a 404.
+        redirect_slashes=False,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -190,13 +198,34 @@ def create_app(
             moment = fmt.parse_ts(when) if isinstance(when, str) else when
             return fmt.stamp(moment, zone)
 
+        def burst(line: Line) -> dict[str, str] | None:
+            """A folded line's span and the history of its events, or None for a single one."""
+            if line.count < 2 or line.mark or not line.first_ts or "/" not in line.what:
+                return None
+            first, last = fmt.parse_ts(line.first_ts), fmt.parse_ts(line.ts)
+            source = line.what.partition("/")[0]
+            # By seq, not by action or by time: a burst may have absorbed file/summary rows
+            # (another action), and local minutes are ambiguous when the clock changes (DST).
+            # Nothing else happens inside the range: any other event closes a burst.
+            query = urlencode(
+                [("origen", source), ("tras", str(line.id - 1)), ("antes", str(line.last_seq + 1))]
+            )
+            return {
+                "from_": fmt.clock(first, zone),
+                "to": fmt.clock(last, zone),
+                "href": f"{base}/historia?{query}",
+            }
+
         return {
             "t": t,
             "tell": tell,
+            "burst": burst,
             "vis": visible,
             "clock": lambda ts: fmt.clock(fmt.parse_ts(ts), zone),
             "stamp": stamp,
+            "parse_ts": fmt.parse_ts,
             "age": lambda moment: fmt.age(t, now - moment),
+            "day_time": lambda moment: fmt.day_time(t, moment, now, zone),
             "details_json": _details_json,
             "say": lambda key, **params: sentence(t, key, params, zone),
             "name": Name,
@@ -244,18 +273,47 @@ def create_app(
         when = fmt.clock(status.since, zone) if status.since else None
         return {"state": status.state, "state_time": when}
 
-    def _tide_view(now: datetime) -> Any:
+    def _tide_view(
+        now: datetime, window: timedelta = WINDOW, marked: Sequence[Snapshot] | None = None
+    ) -> Any:
+        """The tide of ``window`` before ``now``. One read, by primary key only (the newest
+        ``ACTIVITY_EVENTS`` + 1 events, whatever the box's size: ``ts`` has no index, so asking
+        for "since" would walk the whole table in a quiet window, under the reader's lock).
+        The marks are ``marked`` if given, else the volume's snapshots, else the ``take``
+        events among the rows read."""
         try:
-            takes = reader.events(
-                source=Source.SNAPSHOT,
-                action="take",
-                since_ts=now - WINDOW,
-                newest_first=True,
-                limit=300,
-            )
+            rows = reader.events(newest_first=True, limit=ACTIVITY_EVENTS + 1)
         except BoxUnavailable:
-            takes = []
-        return build_tide(list(reversed(takes)), now)
+            rows = []
+        start = now - window
+        inside = [e for e in rows[:ACTIVITY_EVENTS] if fmt.parse_ts(e.ts) >= start]
+        more = len(rows) > ACTIVITY_EVENTS and fmt.parse_ts(rows[ACTIVITY_EVENTS].ts) >= start
+        activity = [fmt.parse_ts(e.ts) for e in inside]
+        if marked is None and snapshots is not None:
+            try:
+                marked = [s for s in snapshots() if s.taken_at >= start]
+            except (SnapshotError, OSError):
+                marked = None  # the page about snapshots says so; here the box's word will do
+        takes = [e for e in inside if e.source is Source.SNAPSHOT and e.action == "take"]
+        return build_tide(
+            list(reversed(takes)), now, activity, more=more, window=window, snapshots=marked
+        )
+
+    tide_cache: dict[str, Any] = {"at": float("-inf"), "tide": None}
+    tide_lock = threading.Lock()
+
+    def _day_tide(*, fresh: bool = False) -> Any:
+        """The day's tide of "Ahora", built at most once per ``TIDE_REFRESH`` for every page and
+        stream (``fresh`` after a new snapshot: its mark must not wait a minute)."""
+        moment = time.monotonic()
+        with tide_lock:
+            cached = tide_cache["tide"]
+            if not fresh and cached is not None and moment - tide_cache["at"] < TIDE_REFRESH:
+                return cached
+        tide = _tide_view(clock())
+        with tide_lock:
+            tide_cache["at"], tide_cache["tide"] = moment, tide
+        return tide
 
     # -- pages -----------------------------------------------------------------------------
 
@@ -266,14 +324,15 @@ def create_app(
     @app.get("/ahora", dependencies=protected)
     def now_page(request: Request) -> Response:
         t = Translator(_language(request)[0])
-        now = clock()
         unreadable = False
         lines: list[Line] = []
         head = 0
+        last_ts = None
         try:
             recent = list(reversed(_recent(reader, PRIME_EVENTS)))
             lines = Narrator().feed(recent)[-SHOWN_LINES:]
             head = recent[-1].seq if recent else 0
+            last_ts = recent[-1].ts if recent else None
         except BoxUnavailable:
             unreadable = True
         return _page(
@@ -283,8 +342,9 @@ def create_app(
             t=t,
             lines=lines,
             head=head,
+            last_ts=last_ts,
             unreadable=unreadable,
-            tide=_tide_view(now),
+            tide=_day_tide(),
             **_status_view(t),
         )
 
@@ -296,10 +356,11 @@ def create_app(
             unreadable = False
         except BoxUnavailable:
             reply, unreadable = None, True
+        partial = request.headers.get("hx-request") == "true"
         return _page(
-            "ask.html" if request.headers.get("hx-request") == "true" else "ask_page.html",
+            "ask.html" if partial else "ask_page.html",
             request,
-            active="",
+            active="ask",
             t=t,
             question=q[:MAX_QUESTION],
             reply=reply,
@@ -376,6 +437,7 @@ def create_app(
                 error = str(failure)
         else:
             error = "no volume configured"
+        box_unreadable = False
         if error is not None:
             from_box = True
             try:
@@ -386,7 +448,7 @@ def create_app(
                     limit=SNAPSHOT_FALLBACK,
                 )
             except BoxUnavailable:
-                takes = []
+                takes, box_unreadable = [], True
             rows = [s for e in takes if e.snapshot_id and (s := Snapshot.parse(e.snapshot_id))][
                 ::-1
             ]
@@ -401,7 +463,9 @@ def create_app(
             hidden=len(newest_first) - len(shown),
             error=error,
             from_box=from_box,
+            box_unreadable=box_unreadable,
             now=now,
+            tide=_tide_view(now, _snapshot_window(shown, now), shown),
         )
 
     # -- the stream ------------------------------------------------------------------------
@@ -414,6 +478,7 @@ def create_app(
         seq = start
         failing = False
         last_sent = last_tide = loop.time()
+        fresh_tide = False
         try:
             if start == 0:  # the page saw nothing: begin near the end, not at the beginning
                 seq = max(0, await asyncio.to_thread(reader.head_seq) - SHOWN_LINES)
@@ -451,11 +516,12 @@ def create_app(
                 if any(e.source is Source.SYSTEM and e.action in STATE_ACTIONS for e in batch):
                     yield _sse("state", await asyncio.to_thread(_render_state, t), None)
                 if any(e.source is Source.SNAPSHOT and e.action == "take" for e in batch):
-                    last_tide = float("-inf")
+                    last_tide, fresh_tide = float("-inf"), True
                 last_sent = now_t
             if now_t - last_tide >= TIDE_REFRESH:
                 last_tide = now_t
-                yield _sse("tide", await asyncio.to_thread(_render_tide, t), None)
+                yield _sse("tide", await asyncio.to_thread(_render_tide, t, fresh_tide), None)
+                fresh_tide = False
                 last_sent = now_t
             if now_t - last_sent >= keepalive:
                 last_sent = now_t
@@ -465,8 +531,8 @@ def create_app(
     def _render_state(t: Translator) -> str:
         return env.get_template("state.html").render(t=t, **_status_view(t))
 
-    def _render_tide(t: Translator) -> str:
-        return env.get_template("tide.html").render(t=t, tide=_tide_view(clock()))
+    def _render_tide(t: Translator, fresh: bool = False) -> str:
+        return env.get_template("tide.html").render(t=t, tide=_day_tide(fresh=fresh))
 
     return Guard(app, port=port, prefix=prefix)
 
@@ -479,6 +545,16 @@ def _recent(reader: BoxReader, count: int, up_to: int | None = None) -> list[Eve
     if up_to is not None:
         return reader.events(before_seq=up_to + 1, newest_first=True, limit=count)
     return reader.events(newest_first=True, limit=count)
+
+
+def _snapshot_window(shown: Sequence[Snapshot], now: datetime) -> timedelta:
+    """The snapshots page draws the tide back to its oldest listed snapshot (whole hours, from
+    one hour to thirty days), so every row has its mark and a preview shows how far it goes."""
+    if not shown:
+        return WINDOW
+    oldest = now - min(s.taken_at for s in shown)
+    hours = math.ceil(max(oldest, timedelta(0)) / timedelta(hours=1) + 0.25)
+    return timedelta(hours=min(max(hours, 1), 30 * 24))
 
 
 def _details_json(event: Event) -> str:
@@ -507,6 +583,7 @@ class Filters:
     since: datetime | None = None
     until: datetime | None = None
     before: int | None = None
+    after: int | None = None
     rng: str | None = None
     since_text: str = ""
     until_text: str = ""
@@ -521,6 +598,7 @@ class Filters:
             "since_ts": self.since,
             "until_ts": self.until,
             "before_seq": self.before,
+            "since_seq": self.after,
         }
         return {k: v for k, v in wanted.items() if v is not None}
 
@@ -533,6 +611,7 @@ class Filters:
             ("rango", self.rng or ""),
             ("desde", self.since_text),
             ("hasta", self.until_text),
+            ("tras", str(self.after) if self.after is not None else ""),
         ]
         return [(k, v) for k, v in pairs if v]
 
@@ -544,15 +623,18 @@ def parse_filters(params: Any, now: datetime, tz: tzinfo) -> Filters:
     source = params.get("origen")
     if source in {s.value for s in Source}:
         filters.source = source
-    action = params.get("accion", "")
-    if action and len(action) <= MAX_ACTION_CHARS and action.isprintable():
+    action = params.get("accion", "").strip()
+    if _valid_action(action):
         filters.action = action
     risk = params.get("riesgo", "")
     if risk in {"1", "2", "3"}:
         filters.min_risk = int(risk)
     before = params.get("antes", "")
-    if before.isdigit() and 1 <= int(before) < 2**62:
+    if before.isascii() and before.isdigit() and 1 <= int(before) < 2**62:
         filters.before = int(before)
+    after = params.get("tras", "")
+    if after.isascii() and after.isdigit() and int(after) < 2**62:
+        filters.after = int(after)  # only events after this seq (a burst's link from "Ahora")
     rng = params.get("rango", "")
     if rng in RANGES:
         filters.rng = rng
@@ -572,6 +654,18 @@ def parse_filters(params: Any, now: datetime, tz: tzinfo) -> Filters:
             filters.until_text = moment.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
             filters.until = moment
     return filters
+
+
+def _valid_action(text: str) -> bool:
+    """An action the black box accepts as a filter (it raises on any other): not blank, at most
+    64 characters, printable and encodable. Anything else is an ignored filter, never a 500."""
+    if not text or len(text) > MAX_ACTION_CHARS or not text.isprintable():
+        return False
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 MIN_YEAR, MAX_YEAR = 1970, 9000  # the black box began after the first and ends before the second

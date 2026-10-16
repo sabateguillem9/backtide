@@ -209,6 +209,17 @@ def test_a_strange_path_with_the_link_is_a_404_and_never_a_redirect_to_another_s
     assert "location" not in response.headers and "set-cookie" not in response.headers
 
 
+@pytest.mark.parametrize("path", ["/ahora/", "/historia/", "/instantaneas/", "/ahora/preguntar/"])
+def test_a_trailing_slash_is_never_a_redirect_that_carries_the_token(
+    tmp_path: Path, path: str
+) -> None:
+    web = TestClient(new_app(tmp_path), base_url=BASE)
+    response = web.get(f"{BASE}{path}?t={TOKEN}", follow_redirects=False)
+    assert response.status_code not in {301, 302, 303, 307, 308}
+    assert "location" not in response.headers
+    assert TOKEN not in response.text
+
+
 def test_the_refresh_target_always_stays_under_the_prefix(tmp_path: Path) -> None:
     for url in (
         f"{BASE}/?t={TOKEN}",

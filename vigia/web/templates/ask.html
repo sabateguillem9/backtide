@@ -1,8 +1,10 @@
+{% if question %}
 <div class="line you">
   <span class="when">{{ t('chat.you') }}</span>
   <span class="dot dot-you" aria-hidden="true"></span>
   <span class="said">{{ vis(question, 200) }}</span>
 </div>
+{% endif %}
 <div class="line answer">
   <span class="when"></span>
   <span class="dot dot-0" aria-hidden="true"></span>

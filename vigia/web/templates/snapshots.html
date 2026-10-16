@@ -4,20 +4,24 @@
 <main class="snapshots">
   <h1>{{ t('snaps.title') }}</h1>
   <p class="lede">{{ t('snaps.lede') }}</p>
-  {% if error %}<p class="note">{{ t('snaps.unreadable') }} {{ t('snaps.fallback') }}</p>{% endif %}
+  {% set live = false %}
+  {% include "tide_frame.html" %}
+  <p class="note preview-hint" hidden>{{ t('snaps.preview') }}</p>
+  {% if error and box_unreadable %}<p class="note">{{ t('snaps.unreadable') }} {{ t('box.unreadable') }}</p>{% elif error %}<p class="note source">{{ t('snaps.from_box') }}</p>{% endif %}
   {% if not rows %}
   <p class="note">{{ t('snaps.empty') }}</p>
   {% else %}
   <ol class="snaplist">
     {% for snap in rows %}
-    <li class="snaprow">
+    <li class="snaprow" data-rewind-to="{{ snap.taken_at.isoformat() }}">
       <div class="snapinfo">
-        <span class="sid">{{ vis(snap.id, 80) }}</span>
+        <time class="snaptitle" datetime="{{ snap.taken_at.isoformat() }}" title="{{ stamp(snap.taken_at) }}">{{ day_time(snap.taken_at) }}</time>
         <span class="snapmeta">
-          <time datetime="{{ snap.taken_at.isoformat() }}">{{ stamp(snap.taken_at) }}</time>
-          · {{ t('reason.' ~ snap.reason) if t.has('reason.' ~ snap.reason) else vis(snap.reason, 40) }}
-          · {{ age(snap.taken_at) }}
+          {{ t('reason.' ~ snap.reason) if t.has('reason.' ~ snap.reason) else vis(snap.reason, 40) }}
+          · <time class="ago" datetime="{{ snap.taken_at.isoformat() }}" data-ago>{{ age(snap.taken_at) }}</time>
         </span>
+        <span class="visually-hidden">{{ t('snaps.id.label') }}:</span>
+        <span class="sid">{{ vis(snap.id, 80) }}</span>
       </div>
       <span class="rewind">
         <small>{{ t('snaps.rewind.soon') }}</small>

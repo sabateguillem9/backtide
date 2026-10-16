@@ -1,9 +1,16 @@
 {% extends "base.html" %}
-{% block title %}{{ t('now.title') }}{% endblock %}
+{% block title %}{{ t('ask.title') }}{% endblock %}
 {% block main %}
-<main class="watch">
-  <h1>{{ t('now.title') }}</h1>
-  <div class="feed">{% include "ask.html" %}</div>
-  <p class="note"><a href="{{ base }}/ahora">{{ t('nav.now') }}</a></p>
+<main class="watch asking">
+  <h1>{{ t('ask.title') }}</h1>
+  <p class="lede">{{ t('ask.lede') }}</p>
+  <p class="suggest">
+    <span class="muted">{{ t('ask.try') }}</span>
+    {% for key in ('ask.q.hour', 'ask.q.state', 'ask.q.today') %}
+    <a href="{{ base }}/ahora/preguntar?{{ {'q': t(key)} | urlencode }}" hx-get="{{ base }}/ahora/preguntar?{{ {'q': t(key)} | urlencode }}" hx-target="#feed" hx-swap="beforeend" hx-push-url="false">{{ t(key) }}</a>
+    {% endfor %}
+  </p>
+  <div class="feed" id="feed" role="log" aria-live="polite">{% include "ask.html" %}</div>
+  {% include "ask_form.html" %}
 </main>
 {% endblock %}
