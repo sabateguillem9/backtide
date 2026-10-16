@@ -22,7 +22,7 @@ from vigia.jail.config import (
     container_env,
     memory_bytes,
     nano_cpus,
-    tmpfs_options,
+    tmpfs_mounts,
     volume_binds,
 )
 
@@ -98,7 +98,7 @@ def _host_problems(
     expected = {
         "CapDrop": ["ALL"],
         "ReadonlyRootfs": True,
-        "Tmpfs": {"/tmp": tmpfs_options(config)},  # noqa: S108 - inside the container
+        "Tmpfs": tmpfs_mounts(config),  # /tmp and the /sys masks, exactly
         "RestartPolicy.Name": "no",
         "Memory": memory,
         "MemorySwap": memory,

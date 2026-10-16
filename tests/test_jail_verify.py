@@ -39,6 +39,8 @@ JAIL_ENV = [
     f"OPENCLAW_GATEWAY_TOKEN={TOKEN}",
 ]
 
+MASK_OPTIONS = "ro,nosuid,nodev,noexec,size=4k,mode=0555"  # the /sys masks, as docker keeps them
+
 GOOD: dict[str, Any] = {
     "Config": {
         "Image": IMAGE,
@@ -76,7 +78,11 @@ GOOD: dict[str, Any] = {
         "ReadonlyRootfs": True,
         "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
         "SecurityOpt": ["no-new-privileges=true", f"seccomp={json.dumps(PROFILE)}"],
-        "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=256m"},
+        "Tmpfs": {
+            "/tmp": "rw,nosuid,nodev,size=256m",
+            "/sys/fs/btrfs": MASK_OPTIONS,
+            "/sys/devices/virtual/block": MASK_OPTIONS,
+        },
         "UTSMode": "",
         "UsernsMode": "",
         "VolumeDriver": "",
@@ -177,6 +183,38 @@ def test_the_order_of_lists_docker_keeps_does_not_matter(cfg: AgentJailConfig) -
         ("HostConfig.Mounts", [{"Type": "bind", "Source": "/", "Target": "/host"}], "Mounts"),
         ("HostConfig.VolumesFrom", ["vigia"], "VolumesFrom"),
         ("HostConfig.Tmpfs", {"/tmp": "rw,exec,size=256m"}, "Tmpfs"),
+        # A container from before the /sys masks (or one that lost one) shows the agent the host
+        (
+            "HostConfig.Tmpfs",
+            {"/tmp": "rw,nosuid,nodev,size=256m", "/sys/devices/virtual/block": MASK_OPTIONS},
+            "Tmpfs",
+        ),
+        (
+            "HostConfig.Tmpfs",
+            {"/tmp": "rw,nosuid,nodev,size=256m", "/sys/fs/btrfs": MASK_OPTIONS},
+            "Tmpfs",
+        ),
+        ("HostConfig.Tmpfs", {"/tmp": "rw,nosuid,nodev,size=256m"}, "Tmpfs"),
+        ("HostConfig.Tmpfs", None, "Tmpfs"),
+        (  # writable, or bigger, is not a mask
+            "HostConfig.Tmpfs",
+            {
+                "/tmp": "rw,nosuid,nodev,size=256m",
+                "/sys/fs/btrfs": "rw,nosuid,nodev,noexec,size=4k,mode=0555",
+                "/sys/devices/virtual/block": MASK_OPTIONS,
+            },
+            "Tmpfs",
+        ),
+        (  # an extra tmpfs
+            "HostConfig.Tmpfs",
+            {
+                "/tmp": "rw,nosuid,nodev,size=256m",
+                "/sys/fs/btrfs": MASK_OPTIONS,
+                "/sys/devices/virtual/block": MASK_OPTIONS,
+                "/var/run": "rw",
+            },
+            "Tmpfs",
+        ),
         ("HostConfig.PidMode", "host", "PidMode"),
         ("HostConfig.IpcMode", "host", "IpcMode"),
         ("HostConfig.IpcMode", "container:vigia", "IpcMode"),
@@ -239,7 +277,7 @@ def test_the_config_decides_the_expected_values(cfg: AgentJailConfig) -> None:
     host["Memory"] = host["MemorySwap"] = 512 * 1024**2
     host["NanoCpus"] = 500_000_000
     host["PidsLimit"] = 64
-    host["Tmpfs"] = {"/tmp": "rw,nosuid,nodev,size=64m"}
+    host["Tmpfs"] = {**host["Tmpfs"], "/tmp": "rw,nosuid,nodev,size=64m"}
     assert problems(other, info) == []
 
 

@@ -7,6 +7,7 @@ Mac unit tests check every security option of the container.
   By default the agent runs as a uid and gid of its own (61000), meant to be nobody else's.
 - The root filesystem is read-only. The agent writes only to ``/workspace`` (its folder in the
   snapshotted volume) and to a small ``/tmp`` tmpfs; OpenClaw's config is mounted read-only.
+  ``/sys/fs/btrfs`` and ``/sys/devices/virtual/block`` are covered with empty read-only tmpfs.
 - The network is ``--internal`` with an isolated gateway: no route out and no address of the
   host on the bridge. No ports are published and no host entries are added.
 - No API key ever reaches the container. The Gateway token reaches it through the docker
@@ -39,6 +40,13 @@ CONTAINER_CONFIG_DIR = PurePosixPath("/config")
 CONTAINER_HOME = CONTAINER_WORKSPACE / "home"
 CONTAINER_STATE = CONTAINER_WORKSPACE / "state"
 CONTAINER_WORK = CONTAINER_WORKSPACE / "work"
+
+# Docker mounts /sys read-only in the container, and it shows the host's. These two directories
+# are covered with an empty read-only tmpfs (docs/19, section 5):
+# - /sys/fs/btrfs shows the agent its own space usage and when a snapshot is made (the qgroups);
+# - /sys/devices/virtual/block/loopN/loop/backing_file is the host path of the volume's image.
+SYS_MASKS = (PurePosixPath("/sys/fs/btrfs"), PurePosixPath("/sys/devices/virtual/block"))
+SYS_MASK_OPTIONS = "ro,nosuid,nodev,noexec,size=4k,mode=0555"
 
 # deploy/seccomp/agent.json: Docker's default profile plus the Btrfs ioctl and copy_file_range
 # blocks.
@@ -197,6 +205,17 @@ def tmpfs_options(config: AgentJailConfig) -> str:
     return f"rw,nosuid,nodev,size={config.tmp_size}"
 
 
+def tmpfs_mounts(config: AgentJailConfig) -> dict[str, str]:
+    """Every tmpfs of the container, mount point to options: /tmp and the /sys masks.
+
+    --tmpfs (not --mount type=tmpfs, which docker keeps in HostConfig.Mounts, and verify.py
+    requires that empty) lands in HostConfig.Tmpfs with this exact text. docker_create_argv and
+    verify.py both read it from here. A bind of an empty folder would also hide the directory,
+    but would show a path of the host in the mount table."""
+    tmp = "/tmp"  # noqa: S108 - inside the container
+    return {tmp: tmpfs_options(config), **{str(mask): SYS_MASK_OPTIONS for mask in SYS_MASKS}}
+
+
 def memory_bytes(size: str) -> int:
     """What docker makes of a size such as ``2g``: binary units."""
     units = {"k": 1024, "m": 1024**2, "g": 1024**3}
@@ -213,7 +232,6 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
 
     Run it with token_env(config) in the CLI's environment: ``-e OPENCLAW_GATEWAY_TOKEN``
     without a value makes the CLI copy it from there."""
-    tmpfs = f"/tmp:{tmpfs_options(config)}"  # noqa: S108 - inside the container
     argv = [
         "create",
         "--name", config.name,
@@ -223,7 +241,6 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
         "--security-opt", NO_NEW_PRIVILEGES,
         "--security-opt", f"seccomp={config.seccomp_profile}",
         "--read-only",
-        "--tmpfs", tmpfs,
         "--network", config.network,
         "--restart", "no",
         "--memory", config.memory,
@@ -235,6 +252,8 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
     ]  # fmt: skip
     for name, value in LOG_OPTIONS.items():
         argv += ["--log-opt", f"{name}={value}"]
+    for target, options in tmpfs_mounts(config).items():
+        argv += ["--tmpfs", f"{target}:{options}"]
     for bind in volume_binds(config):
         argv += ["--volume", bind]
     for name, value in container_env(config):

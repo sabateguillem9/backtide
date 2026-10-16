@@ -10,10 +10,13 @@ import pytest
 
 from vigia.jail import config as jail_config
 from vigia.jail.config import (
+    SYS_MASK_OPTIONS,
+    SYS_MASKS,
     AgentJailConfig,
     docker_create_argv,
     network_create_argv,
     openclaw_config,
+    tmpfs_mounts,
     token_env,
 )
 
@@ -21,6 +24,11 @@ TOKEN = "t" * 43  # the length of secrets.token_urlsafe(32)
 WORKSPACE = Path("/srv/vigia/volume/workspace")
 CONFIG_DIR = Path("/srv/vigia/agent-config")
 SECRET_WORDS = ("KEY", "SECRET", "PASSWORD")
+# The tmpfs mounts of the design: /tmp, and the two /sys directories hidden from the agent.
+SYS_MASK_ARGS = [
+    "/sys/fs/btrfs:ro,nosuid,nodev,noexec,size=4k,mode=0555",
+    "/sys/devices/virtual/block:ro,nosuid,nodev,noexec,size=4k,mode=0555",
+]
 # Options that would open a hole in the jail. None may ever appear in the argv.
 FORBIDDEN_OPTIONS = {
     "-p",
@@ -64,7 +72,7 @@ def test_create_argv_has_every_option_of_the_design(cfg: AgentJailConfig) -> Non
         "--user": ["61000:61000"],  # the agent's own ids: no host account, not Vigía's
         "--cap-drop": ["ALL"],
         "--security-opt": ["no-new-privileges=true", f"seccomp={jail_config.SECCOMP_PROFILE}"],
-        "--tmpfs": ["/tmp:rw,nosuid,nodev,size=256m"],
+        "--tmpfs": ["/tmp:rw,nosuid,nodev,size=256m", *SYS_MASK_ARGS],
         "--network": ["vigia-agente-net"],
         "--restart": ["no"],
         "--memory": ["2g"],
@@ -85,6 +93,32 @@ def test_create_argv_mounts_only_the_agent_folder_and_the_config(cfg: AgentJailC
         f"{CONFIG_DIR}:/config:ro,z",
     ]
     assert "-v" not in argv and "--mount" not in argv
+
+
+def test_create_argv_hides_the_btrfs_sysfs_and_the_loop_backing_file(
+    cfg: AgentJailConfig,
+) -> None:
+    """/sys/fs/btrfs shows the agent its own usage and when snapshots are made; the loop
+    device's backing_file is the host path of the volume's image (docs/19, section 5)."""
+    argv = docker_create_argv(cfg)
+    assert [str(mask) for mask in SYS_MASKS] == ["/sys/fs/btrfs", "/sys/devices/virtual/block"]
+    mounts = [arg for arg in option_values(argv, "--tmpfs") if arg.startswith("/sys/")]
+    assert mounts == SYS_MASK_ARGS
+    # Read-only and nothing in them: 4 KiB, no suid, no devices, no exec.
+    assert SYS_MASK_OPTIONS == "ro,nosuid,nodev,noexec,size=4k,mode=0555"
+    # --tmpfs lands in HostConfig.Tmpfs, which verify.py checks; --mount would land in
+    # HostConfig.Mounts, which must stay empty.
+    assert "--mount" not in argv and "-v" not in argv
+
+
+def test_tmpfs_mounts_is_the_one_source_of_every_tmpfs(cfg: AgentJailConfig) -> None:
+    assert tmpfs_mounts(cfg) == {
+        "/tmp": "rw,nosuid,nodev,size=256m",
+        "/sys/fs/btrfs": SYS_MASK_OPTIONS,
+        "/sys/devices/virtual/block": SYS_MASK_OPTIONS,
+    }
+    mounts = [f"{target}:{options}" for target, options in tmpfs_mounts(cfg).items()]
+    assert option_values(docker_create_argv(cfg), "--tmpfs") == mounts
 
 
 def test_create_argv_ends_with_the_pinned_image_and_the_gateway(cfg: AgentJailConfig) -> None:
@@ -160,7 +194,8 @@ def test_create_argv_follows_the_config(cfg: AgentJailConfig) -> None:
     assert option_values(argv, "--memory") == ["512m"]
     assert option_values(argv, "--pids-limit") == ["64"]
     assert option_values(argv, "--cpus") == ["0.5"]
-    assert option_values(argv, "--tmpfs") == ["/tmp:rw,nosuid,nodev,size=64m"]
+    # tmp_size only sizes /tmp: the /sys masks stay 4 KiB whatever the config says.
+    assert option_values(argv, "--tmpfs") == ["/tmp:rw,nosuid,nodev,size=64m", *SYS_MASK_ARGS]
     assert "seccomp=/etc/vigia/agent.json" in option_values(argv, "--security-opt")
     assert option_values(argv, "--stop-timeout") == ["5"]
 

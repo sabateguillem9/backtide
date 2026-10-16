@@ -26,6 +26,7 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -46,8 +47,14 @@ from test_quota_assumptions import (
     usage,
 )
 
-from vigia.jail import JailError
-from vigia.jail.config import CONTAINER_WORKSPACE, HEALTH_URL
+from vigia.jail import JailError, docker
+from vigia.jail.config import (
+    CONTAINER_WORKSPACE,
+    HEALTH_URL,
+    SYS_MASKS,
+    docker_create_argv,
+    token_env,
+)
 from vigia.snapshots import Reason, RestoreIncomplete, RestoreResult, SnapshotNoSpace, btrfs
 from vigia.snapshots.store import SnapshotStore
 
@@ -209,6 +216,13 @@ def qgroup_limit_ioctl():
         os.close(fd)
 
 
+def read(path):
+    def action():
+        with open(path) as f:
+            f.read()
+    return action
+
+
 def write(path, value):
     def action():
         with open(path, "w") as f:
@@ -217,12 +231,19 @@ def write(path, value):
 
 
 fs = "/sys/fs/btrfs/" + fsid
-with open(fs + "/qgroups/0_" + subvolume_id + "/max_referenced") as f:
-    results["max_referenced_seen"] = int(f.read())  # the path attacked below is the right one
+# Since T04d-1 the jail covers /sys/fs/btrfs with an empty read-only tmpfs: the agent cannot
+# even read its cap, and the files that could lift it do not exist for it.
+attempt("max_referenced_read", read(fs + "/qgroups/0_" + subvolume_id + "/max_referenced"))
+try:
+    with open(fs + "/qgroups/0_" + subvolume_id + "/max_referenced") as f:
+        results["max_referenced_seen"] = int(f.read())
+except OSError:
+    results["max_referenced_seen"] = None
 attempt("qgroup_limit_ioctl", qgroup_limit_ioctl)
 attempt("quota_override", write(fs + "/quota_override", "1"))
 attempt("max_referenced", write(fs + "/qgroups/0_" + subvolume_id + "/max_referenced", str(NONE)))
 attempt("limit_flags", write(fs + "/qgroups/0_" + subvolume_id + "/limit_flags", "0"))
+attempt("create_in_the_mask", write("/sys/fs/btrfs/vigia-probe", "1"))
 print(json.dumps(results))
 """
 
@@ -488,12 +509,40 @@ def test_without_a_cap_a_metadata_full_volume_cannot_be_rewound(
 # The evil agent (invariant 7)
 
 
+def run_without_the_sys_masks(agent, agent_leftovers, command: list[str]) -> str:
+    """Run ``command`` in a one-off container that is the agent's jail minus the two /sys
+    masks: same image, user, capabilities, seccomp profile, read-only root and mounts, but its
+    own entrypoint. It shows what is left once the first layer is gone. The container is named
+    like a test agent, so a later run removes it if this one is killed."""
+    config = agent.jail.config
+    name, _ = agent_leftovers.names(os.getpid())
+    masks = tuple(f"{mask}:" for mask in SYS_MASKS)
+    argv = docker_create_argv(replace(config, name=name))
+    kept: list[str] = []
+    skip = False
+    for index, arg in enumerate(argv):
+        if skip:
+            skip = False
+        elif arg == "--tmpfs" and argv[index + 1].startswith(masks):
+            skip = True
+        else:
+            kept.append(arg)
+    assert len(kept) == len(argv) - 4, "expected to drop exactly the two /sys masks"
+    kept[0:1] = ["run", "--rm"]
+    entrypoint = kept.index("--entrypoint")
+    kept[entrypoint + 1] = command[0]  # create has --entrypoint tini <image> <gateway command>
+    image = kept.index(config.image)
+    run = [*kept[: image + 1], *command[1:]]
+    return docker.run(run, env=token_env(config), timeout=120).stdout
+
+
 def test_the_agent_cannot_lift_its_cap_or_dodge_it_with_reflinks(
-    start_quota_agent, record_property: Callable[[str, object], None]
+    start_quota_agent, agent_leftovers, record_property: Callable[[str, object], None]
 ) -> None:
     """From inside the jail: the BTRFS_IOC_QGROUP_LIMIT ioctl fails with EOPNOTSUPP (95, the
     seccomp block of the 0x94 ioctls: the agent has no CAP_SYS_ADMIN either), the sysfs files
-    that could lift the cap are not writable, and the cap reads the same afterwards.
+    that could lift the cap are hidden (/sys/fs/btrfs is an empty read-only tmpfs for the agent:
+    nothing to read, nothing to write, nothing to create) and the cap reads the same afterwards.
     copy_file_range returns EXDEV (18) and every copier falls back to a real copy that shares
     no block with its original, so a reflink cannot hide data from the cap (docs/16, A11)."""
     agent = start_quota_agent(TEST_CAP)
@@ -503,15 +552,36 @@ def test_the_agent_cannot_lift_its_cap_or_dodge_it_with_reflinks(
     lifting = json.loads(
         agent.exec(["python3", "-c", LIFT_THE_CAP_SCRIPT, fsid, subvolume], check=True).stdout
     )
+    unmasked = json.loads(
+        run_without_the_sys_masks(
+            agent, agent_leftovers, ["python3", "-c", LIFT_THE_CAP_SCRIPT, fsid, subvolume]
+        )
+    )
     probe, shared = probe_copiers(agent)
 
-    report(record_property, "evil_agent_cap", f"lifting the cap: {lifting}; copiers: {probe}")
+    report(
+        record_property,
+        "evil_agent_cap",
+        f"lifting the cap: {lifting}; without the /sys masks: {unmasked}; copiers: {probe}",
+    )
     assert lifting["qgroup_limit_ioctl"] == 95  # blocked by seccomp
-    assert lifting["max_referenced_seen"] == TEST_CAP, lifting
+    # First layer, since T04d-1: the agent cannot even see the qgroups.
+    assert lifting["max_referenced_seen"] is None
     assert all(
-        lifting[attempt] == errno.EROFS
-        for attempt in ("quota_override", "max_referenced", "limit_flags")
+        lifting[attempt] == errno.ENOENT
+        for attempt in ("max_referenced_read", "quota_override", "max_referenced", "limit_flags")
     ), lifting
+    assert lifting["create_in_the_mask"] == errno.EROFS, lifting
+    # Second layer, proven with a container that has no masks (the jail minus the two tmpfs):
+    # the agent reads its real cap, and still cannot write any file that would lift it (sysfs is
+    # read-only for it) nor use the ioctl (seccomp).
+    assert unmasked["max_referenced_seen"] == TEST_CAP, unmasked
+    assert unmasked["max_referenced_read"] == 0, unmasked
+    assert unmasked["qgroup_limit_ioctl"] == 95, unmasked
+    assert all(
+        unmasked[attempt] == errno.EROFS
+        for attempt in ("quota_override", "max_referenced", "limit_flags")
+    ), unmasked
     assert cap_of(store.workspace) == (TEST_CAP, None)
     assert store.workspace_id() == int(subvolume)
     assert probe["copy_file_range"] == -errno.EXDEV

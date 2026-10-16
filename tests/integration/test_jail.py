@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -38,7 +39,7 @@ from vigia.jail.config import (
 )
 from vigia.jail.seccomp import BLOCKED_ERRNO
 from vigia.jail.verify import container_problems
-from vigia.snapshots import Reason
+from vigia.snapshots import Reason, btrfs
 
 pytestmark = pytest.mark.integration
 
@@ -247,18 +248,20 @@ def test_no_docker_socket(running_agent) -> None:
     assert [s for s in sockets if "docker" in s or "containerd" in s] == []
 
 
-def test_only_the_workspace_the_config_and_tmp_are_added(running_agent) -> None:
-    """Besides Docker's standard mounts, only /workspace, /config (read-only) and /tmp."""
+def test_only_the_workspace_the_config_tmp_and_the_sys_masks_are_added(running_agent) -> None:
+    """Besides Docker's standard mounts, only /workspace, /config (read-only), /tmp and the two
+    empty read-only tmpfs that hide /sys/fs/btrfs and /sys/devices/virtual/block."""
     jail = running_agent.jail.config
     mounts = _mountinfo(running_agent.exec(["cat", "/proc/self/mountinfo"], check=True).stdout)
     masks = [m for m in mounts if _is_docker_mask(m["point"])]
     others = [m for m in mounts if not _is_docker_mask(m["point"])]
-    ours = {str(CONTAINER_WORKSPACE), str(CONTAINER_CONFIG_DIR), "/tmp"}
+    sys_masks = {"/sys/fs/btrfs", "/sys/devices/virtual/block"}  # spelled out: not from config
+    ours = {str(CONTAINER_WORKSPACE), str(CONTAINER_CONFIG_DIR), "/tmp", *sys_masks}
     assert sorted(m["point"] for m in others) == sorted(DOCKER_STANDARD_MOUNTS | ours)
     # Docker hides parts of /proc and /sys: read-only, or its own /dev/null bound over them.
     assert [m for m in masks if m["options"][0] != "ro" and m["root"] != "/null"] == []
     by_point = {m["point"]: m for m in others}
-    for read_only in ("/", "/sys", str(CONTAINER_CONFIG_DIR), *DOCKER_ETC_FILES):
+    for read_only in ("/", "/sys", str(CONTAINER_CONFIG_DIR), *DOCKER_ETC_FILES, *sys_masks):
         assert by_point[read_only]["options"][0] == "ro", read_only
     writable = {m["point"] for m in others if m["options"][0] == "rw"}
     assert writable == CONTAINER_WRITABLE | {str(CONTAINER_WORKSPACE), "/tmp"}
@@ -267,6 +270,74 @@ def test_only_the_workspace_the_config_and_tmp_are_added(running_agent) -> None:
     tmp = by_point["/tmp"]
     assert tmp["fs"] == "tmpfs" and tmp["root"] == "/"  # a fresh tmpfs, not a host folder
     assert {"rw", "nosuid", "nodev"} <= set(tmp["options"])
+    for mask in sys_masks:  # also fresh tmpfs: no host path shows in the mount table
+        assert by_point[mask]["fs"] == "tmpfs" and by_point[mask]["root"] == "/", mask
+        assert {"ro", "nosuid", "nodev", "noexec"} <= set(by_point[mask]["options"]), mask
+
+
+# What the agent could read about its own volume in /sys. Prints four sections separated by
+# "---": the entries of /sys/fs/btrfs and of /sys/devices/virtual/block, then the host path of
+# every loop device's image reached through /sys/block, then through find.
+SYSFS_PROBE = r"""
+ls -A /sys/fs/btrfs 2>&1
+echo ---
+ls -A /sys/devices/virtual/block 2>&1
+echo ---
+cat /sys/block/loop*/loop/backing_file 2>/dev/null
+echo ---
+find -L /sys/block /sys/class/block /sys/dev/block -maxdepth 4 -name backing_file \
+  -exec cat {} + 2>/dev/null
+exit 0
+"""
+
+
+def _sysfs_probe(output: str) -> list[list[str]]:
+    sections = output.split("---\n")
+    assert len(sections) == 4, output
+    return [section.split() for section in sections]
+
+
+def test_the_agent_cannot_see_the_btrfs_sysfs_or_where_the_volume_image_lives(
+    running_agent,
+) -> None:
+    """/sys/fs/btrfs (the volume's usage, its qgroups, when snapshots appear) and
+    ``backing_file`` (the host path of the image) are hidden; the same probe in a container
+    without the masks sees both, so this test goes red if a mask is ever removed."""
+    host_images = sorted(
+        {
+            text
+            for path in Path("/sys/block").glob("loop*/loop/backing_file")
+            if (text := path.read_text().strip()).endswith("/volume.img")
+        }
+    )
+    fsid = btrfs.fsid(running_agent.store.root)
+    # The precondition: the VM shows both things to a container that has no masks.
+    assert host_images and (Path("/sys/fs/btrfs") / fsid).is_dir()
+
+    image = running_agent.jail.config.image
+    control = docker.run(
+        ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL"]
+        + ["--entrypoint", "sh", image, "-c", SYSFS_PROBE],
+        timeout=120,
+    )
+    seen_btrfs, seen_block, seen_by_block, seen_by_find = _sysfs_probe(control.stdout)
+    assert fsid in seen_btrfs
+    assert any(name.startswith("loop") for name in seen_block)
+    assert set(host_images) <= set(seen_by_block) and set(host_images) <= set(seen_by_find)
+
+    hidden = running_agent.exec(["sh", "-c", SYSFS_PROBE], check=True)
+    assert _sysfs_probe(hidden.stdout) == [[], [], [], []]
+    for path in ("/sys/fs/btrfs", "/sys/devices/virtual/block"):
+        assert running_agent.exec(["touch", f"{path}/probe"]).returncode != 0, path
+    assert "Read-only file system" in running_agent.exec(["touch", "/sys/fs/btrfs/x"]).stderr
+    for name in sorted({Path(p).name for p in Path("/sys/block").glob("loop*")}):
+        reached = [
+            f"/sys/block/{name}/loop/backing_file",
+            f"/sys/class/block/{name}/loop/backing_file",
+            f"/sys/devices/virtual/block/{name}/loop/backing_file",
+        ]
+        for path in reached:
+            assert running_agent.exec(["test", "-e", path]).returncode == 1, path
 
 
 def test_vigia_files_are_invisible(running_agent) -> None:
