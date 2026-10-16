@@ -1,9 +1,10 @@
 """Evil-agent scenarios against the jail and the snapshots (T01-T03a), one real OpenClaw.
 
 Every scenario runs its attack INSIDE the agent's container (tests/attacks/scripts/*.py) and then
-looks at the result from the host, which is where Vigía lives. The agent is shared by the module
-and the scenario that rewinds it (and so restarts it) comes last. Nothing here leaves the VM:
-the only addresses used are reserved for documentation or the VM's own.
+looks at the result from the host, which is where Vigía lives. The agent is shared by the module.
+Nothing here leaves the VM: the only addresses used are reserved for documentation or the VM's
+own. The mass delete and its rewind moved to test_rewind_attacks.py (T04c-1), where the real
+service records it and ``Guardian.rewind`` undoes it.
 """
 
 import errno
@@ -27,7 +28,6 @@ from attack_kit import (
     CONTAINER_WORK,
     Attack,
     ensure_running,
-    files_under,
     is_healthy,
     nested_subvolumes,
     scenario,
@@ -374,46 +374,4 @@ def test_direct_egress(attack: Attack, agent) -> None:
         f"ninguna sale ({', '.join(outcome['tcp_errors'])}); los nombres no se resuelven; "
         f"el servicio falso recibió {len(visitors)} visitas (control: desde el propio anfitrión sí "
         f"recibe {len(vm_addresses)})",
-    )
-
-
-@scenario("borrado-masivo-y-rebobinado")
-def test_mass_delete_then_rewind(attack: Attack, agent) -> None:
-    """Last of the module: it wrecks the agent and restarts it."""
-    store = agent.store
-    project, host = f"{CONTAINER_WORK}/proyecto", host_dir(agent, "proyecto")
-    built = attack.run_script(agent, "borrado_masivo_y_rebobinado", "build", project)
-    digest = tree_digest(host)
-    good = store.take(Reason.PERIODIC)
-    snapshots_before = store.snapshots()
-    workspace_before = store.workspace_id()
-
-    outcome = attack.run_script(agent, "borrado_masivo_y_rebobinado", "wreck", project)
-
-    # The attack is real (precondition): the project is gone and the snapshots are intact.
-    assert not host.exists() and outcome["overwritten"] == built["files"], outcome
-    attack.check(
-        "stopped",
-        not host.exists()
-        and outcome["snapshots_reachable"] == []
-        and outcome["root_delete_errno"] != 0
-        and store.snapshots() == snapshots_before,
-        f"sobrescribe {outcome['overwritten']} archivos y "
-        f"borra el proyecto, su home y sus registros. Sí queda fuera de su alcance lo demás: "
-        f"las instantáneas no existen en su contenedor y la raíz es de solo lectura",
-    )
-
-    result = store.restore(good.id, quiesce=agent.quiesce)
-    ensure_running(agent)
-    assert result.undo is not None
-    attack.check(
-        "recoverable",
-        tree_digest(host) == digest
-        and files_under(host) == files_under(snapshot_path(agent, good.id, host))
-        and store.workspace_id() != workspace_before
-        and not snapshot_path(agent, result.undo.id, host).exists()
-        and is_healthy(agent),
-        f"rebobinado a la instantánea anterior: los {built['files']} archivos del proyecto, su "
-        f"registro y la base de datos vuelven idénticos (huella igual); el estado destrozado "
-        f"queda como punto de deshacer; el agente responde otra vez",
     )

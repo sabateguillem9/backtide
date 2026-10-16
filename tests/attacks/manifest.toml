@@ -155,7 +155,7 @@ invariants = [1]
 status = "ready"
 [scenario.expect]
 stopped = "no"
-recorded = "pending:T04a"
+recorded = "yes"
 risk = "pending:T08"
 recoverable = "yes"
 held = "n/a"
@@ -408,8 +408,7 @@ name = "Matar el servicio de Vigía"
 story = "El servicio muere con el agente en marcha: al volver no puede seguir sin vigilancia."
 inspired_by = "Quitar al vigilante"
 invariants = [7]
-status = "pending"
-task = "T04b-2"
+status = "ready"
 [scenario.expect]
 stopped = "yes"
 recorded = "yes"
@@ -423,8 +422,7 @@ name = "Matar un rebobinado a medias"
 story = "Se mata el proceso de rebobinar justo antes y justo después del intercambio."
 inspired_by = "Cortes de luz y fallos a mitad"
 invariants = [7]
-status = "pending"
-task = "T04c-1"
+status = "ready"
 [scenario.expect]
 stopped = "n/a"
 recorded = "yes"
@@ -465,7 +463,10 @@ held = "n/a"
 [[scenario]]
 id = "pausar-por-espacio"
 name = "Pausa por falta de espacio, y pausar y rebobinar"
-story = "El espacio libre baja del mínimo: el agente se congela de verdad y avisa; luego se rebobina."
+story = """El espacio libre baja del mínimo: el agente se congela de verdad y avisa; luego se \
+rebobina. También a mitad de un rebobinado: mientras `docker stop` espera a su manejador de \
+SIGTERM y mientras `wait_ready` espera a que esté listo, el agente ejecuta código y tiene que \
+congelarse igual (y un agente congelado se mata, nunca se despierta)."""
 inspired_by = "Agente que llena el disco"
 invariants = [2]
 status = "pending"

@@ -611,14 +611,25 @@ def test_wait_ready_times_out(jail: AgentJail, fake_docker: FakeDocker, clock: l
 # quiesce
 
 
+def stopping() -> tuple[Reply, ...]:
+    """What `docker inspect` says around a stop: running on entry, still running (not frozen)
+    right before the stop, stopped after it, and running again once started."""
+    return state(), state(), state(running=False), state()
+
+
 def test_quiesce_stops_then_starts_and_waits(
     ready_jail: AgentJail, fake_docker: FakeDocker, clock: list[float]
 ) -> None:
-    fake_docker.reply("container", "inspect", state())
+    fake_docker.reply("container", "inspect", *stopping())
     fake_docker.reply("logs", READY_LOGS)
     fake_docker.reply("exec", HEALTHY)
     with ready_jail.quiesce():
-        assert [c[0] for c in fake_docker.commands()] == ["container", "stop"]
+        assert [c[0] for c in fake_docker.commands()] == [
+            "container",
+            "container",
+            "stop",
+            "container",
+        ]
     lifecycle = [c[0] for c in fake_docker.commands() if c[0] in {"stop", "start", "exec"}]
     assert lifecycle == ["stop", "start", "exec"]
 
@@ -626,7 +637,7 @@ def test_quiesce_stops_then_starts_and_waits(
 def test_quiesce_starts_the_agent_even_if_the_body_fails(
     ready_jail: AgentJail, fake_docker: FakeDocker, clock: list[float]
 ) -> None:
-    fake_docker.reply("container", "inspect", state())
+    fake_docker.reply("container", "inspect", *stopping())
     fake_docker.reply("logs", READY_LOGS)
     fake_docker.reply("exec", HEALTHY)
     with pytest.raises(RuntimeError, match="swap failed"), ready_jail.quiesce():
@@ -646,7 +657,7 @@ def test_quiesce_leaves_a_stopped_agent_stopped(
 def test_quiesce_reports_a_failed_restart(
     ready_jail: AgentJail, fake_docker: FakeDocker, clock: list[float]
 ) -> None:
-    fake_docker.reply("container", "inspect", state())
+    fake_docker.reply("container", "inspect", *stopping())
     fake_docker.reply("start", DAEMON_DOWN)
     with pytest.raises(JailError, match="start failed"), ready_jail.quiesce():
         pass
@@ -672,7 +683,7 @@ def test_quiesce_starts_the_agent_again_if_it_stopped_despite_the_error(
 ) -> None:
     """The CLI timed out, but the daemon did stop the container: restore will not run, so the
     agent goes back to how it was (running), and the error still propagates."""
-    fake_docker.reply("container", "inspect", state(), state(running=False), state())
+    fake_docker.reply("container", "inspect", *stopping())
     fake_docker.reply("stop", Reply(error="docker stop timed out after 90 s"))
     fake_docker.reply("logs", READY_LOGS)
     fake_docker.reply("exec", HEALTHY)
@@ -687,12 +698,128 @@ def test_quiesce_starts_the_agent_again_if_it_stopped_despite_the_error(
 def test_quiesce_notes_a_failed_restart_after_a_failed_stop(
     ready_jail: AgentJail, fake_docker: FakeDocker, clock: list[float]
 ) -> None:
-    fake_docker.reply("container", "inspect", state(), state(running=False))
+    fake_docker.reply("container", "inspect", state(), state(), state(running=False))
     fake_docker.reply("stop", Reply(error="docker stop timed out after 90 s"))
     fake_docker.reply("start", DAEMON_DOWN)
     with pytest.raises(JailError, match="stop timed out") as error, ready_jail.quiesce():
         pass
     assert any("failed stop failed too" in note for note in error.value.__notes__)
+
+
+# quiesce with a frozen agent, and start_if (T04c-1)
+
+
+def paused_state() -> Reply:
+    return Reply(json.dumps({"Running": True, "Paused": True, "StartedAt": STARTED_AT}))
+
+
+def test_quiesce_kills_a_frozen_agent_and_leaves_it_stopped(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    """`docker stop` would wake a frozen agent to run its SIGTERM handler for up to 30 s: it is
+    killed, and someone froze it on purpose, so it is not started again by default."""
+    fake_docker.reply("container", "inspect", paused_state(), state(running=False))
+    with ready_jail.quiesce():
+        assert [c[0] for c in fake_docker.commands()] == ["container", "kill", "container"]
+    lifecycle = [c[0] for c in fake_docker.commands() if c[0] in {"stop", "kill", "start"}]
+    assert lifecycle == ["kill"]
+
+
+def test_quiesce_kills_an_agent_frozen_right_before_the_stop(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    """The space thread may freeze the agent at any moment (it never waits for agent_lock):
+    the state is read again right before stopping, and a frozen agent is killed instead."""
+    fake_docker.reply("container", "inspect", state(), paused_state(), state(running=False))
+    with ready_jail.quiesce(start_if=lambda error: False):
+        pass
+    lifecycle = [c[0] for c in fake_docker.commands() if c[0] in {"stop", "kill", "start"}]
+    assert lifecycle == ["kill"]
+
+
+def test_quiesce_never_enters_while_the_agent_still_runs(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    """`docker stop` returned but Docker still says running: the swap must not happen under
+    a running agent (it would keep the old workspace mounted)."""
+    fake_docker.reply("container", "inspect", state())  # running, always
+    entered = False
+    with (
+        pytest.raises(JailError, match="still running"),
+        ready_jail.quiesce(start_if=lambda error: False),
+    ):
+        entered = True
+    assert not entered
+
+
+def test_wait_ready_fails_at_once_when_the_agent_is_frozen(
+    jail: AgentJail, fake_docker: FakeDocker, clock: list[float]
+) -> None:
+    fake_docker.reply("container", "inspect", paused_state())
+    fake_docker.reply("logs", READY_LOGS)
+    fake_docker.reply("exec", HEALTHY)
+    with pytest.raises(JailError, match="frozen"):
+        jail.wait_ready()
+    assert clock[0] == 0  # no polling: a frozen agent will not get ready
+    assert not [c for c in fake_docker.commands() if c[0] == "exec"]
+
+
+def test_quiesce_start_if_decides_whether_to_start_and_sees_the_error(
+    ready_jail: AgentJail, fake_docker: FakeDocker, clock: list[float]
+) -> None:
+    fake_docker.reply("container", "inspect", *stopping())
+    fake_docker.reply("logs", READY_LOGS)
+    fake_docker.reply("exec", HEALTHY)
+    seen: list[BaseException | None] = []
+
+    def refuse(error: BaseException | None) -> bool:
+        seen.append(error)
+        return False
+
+    with (
+        pytest.raises(RuntimeError, match="no space") as raised,
+        ready_jail.quiesce(start_if=refuse),
+    ):
+        raise RuntimeError("no space")
+    assert seen == [raised.value]
+    assert ["start", ready_jail.config.name] not in fake_docker.commands()
+
+    fake_docker.calls.clear()
+    fake_docker.reply("container", "inspect", *stopping())
+    with ready_jail.quiesce(start_if=lambda error: seen.append(error) or True):
+        pass
+    assert seen[-1] is None
+    lifecycle = [c[0] for c in fake_docker.commands() if c[0] in {"stop", "start", "exec"}]
+    assert lifecycle == ["stop", "start", "exec"]  # started and waited until ready
+
+
+def test_quiesce_start_if_can_start_an_agent_that_was_stopped_or_frozen(
+    ready_jail: AgentJail, fake_docker: FakeDocker, clock: list[float]
+) -> None:
+    """With start_if, the caller (the Guardian) decides: a rewind of an agent frozen for lack
+    of space starts it again when everything is green."""
+    fake_docker.reply("container", "inspect", paused_state(), state(running=False), state())
+    fake_docker.reply("logs", READY_LOGS)
+    fake_docker.reply("exec", HEALTHY)
+    with ready_jail.quiesce(start_if=lambda error: True):
+        pass
+    lifecycle = [c[0] for c in fake_docker.commands() if c[0] in {"stop", "kill", "start"}]
+    assert lifecycle == ["kill", "start"]
+
+
+def test_quiesce_start_if_also_decides_after_a_failed_stop(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    fake_docker.reply("container", "inspect", state(), state(running=False))
+    fake_docker.reply("stop", Reply(error="docker stop timed out after 90 s"))
+    seen: list[BaseException | None] = []
+    with (
+        pytest.raises(JailError, match="timed out"),
+        ready_jail.quiesce(start_if=lambda error: seen.append(error) or False),
+    ):
+        pass
+    assert len(seen) == 1 and isinstance(seen[0], JailError)
+    assert ["start", ready_jail.config.name] not in fake_docker.commands()
 
 
 # The agent never shares Vigía's ids (finding: the agent ran as the test user)

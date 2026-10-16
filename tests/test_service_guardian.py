@@ -8,8 +8,10 @@ like the fake's.
 """
 
 import logging
+import os
 import threading
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -22,10 +24,13 @@ from vigia.jail import JailError
 from vigia.jail.openclaw import RewindProblem, UnrewindableConfig
 from vigia.notify import Alert, AlertLevel
 from vigia.service.config import Secret, ServiceConfig
-from vigia.service.guardian import AgentState, FileWatcher, Guardian
+from vigia.service.guardian import AgentState, CycleResult, FileWatcher, Guardian
+from vigia.service.rewind import RewindStatus
 from vigia.snapshots import (
     PruneIncomplete,
     Reason,
+    RestoreIncomplete,
+    RestoreResult,
     Snapshot,
     SnapshotBusy,
     SnapshotError,
@@ -70,11 +75,18 @@ class FakeVolume:
         self.take_error: Exception | None = None
         self.recover_error: Exception | None = None
         self.recovered: list[Snapshot] = []
+        self.leftover: SubvolumeInfo | None = None  # an old workspace no snapshot was made of
         self.prune_error: Exception | None = None
         self.pruned: list[Snapshot] = []
         self.workspace_id_error: Exception | None = None
         self.sync_error: Exception | None = None
         self.hide_info_of: set[str] = set()
+        # restore(): what goes wrong, and where
+        self.restore_error_before: Exception | None = None  # before quiesce (staging, recovery)
+        self.swap_error: Exception | None = None  # the swap itself, inside quiesce
+        self.incomplete_cause: Exception | None = None  # swapped, undo point not published
+        self.during_swap: Callable[[], None] | None = None  # runs inside quiesce, before the swap
+        self.workspace_id_error_after_restore: Exception | None = None
 
     def _uuid(self) -> UUID:
         self._next_uuid += 1
@@ -86,11 +98,15 @@ class FakeVolume:
         self.workspace_info = _with(self.workspace_info, ctransid=self.workspace_info.ctransid + 1)
         self.dirty = True
 
-    def rewind_to(self, target: Snapshot) -> Snapshot:
-        """What a restore leaves: the old workspace published as pre_restore, a new workspace
+    def rewind_to(self, target: Snapshot, *, publish: bool = True) -> Snapshot:
+        """What a restore leaves: the old workspace published as pre_restore (a renamed
+        subvolume keeps its id, so the undo point has the old workspace's id), a new workspace
         copied from the target (so it has the target's ctransid)."""
         undo = Snapshot(self._clock(), Reason.PRE_RESTORE)
-        self._publish(undo, self.workspace_info)
+        if publish:
+            self._publish(undo, self.workspace_info, treeid=self.workspace_info.treeid)
+        else:
+            self.leftover = self.workspace_info  # recover() publishes it later
         self.txn += 1
         self.workspace_info = SubvolumeInfo(
             treeid=self.workspace_info.treeid + 1,
@@ -117,10 +133,16 @@ class FakeVolume:
         self._publish(snapshot, self.workspace_info, otransid=self.txn)
         return snapshot
 
-    def _publish(self, snapshot: Snapshot, origin: SubvolumeInfo, otransid: int = 0) -> None:
+    def _publish(
+        self,
+        snapshot: Snapshot,
+        origin: SubvolumeInfo,
+        otransid: int = 0,
+        treeid: int | None = None,
+    ) -> None:
         self.listed.append(snapshot)
         self.infos[snapshot.id] = SubvolumeInfo(
-            treeid=1000 + len(self.listed),
+            treeid=treeid if treeid is not None else 1000 + len(self.listed),
             name=snapshot.id,
             generation=origin.generation if not otransid else otransid,
             flags=1,
@@ -139,6 +161,11 @@ class FakeVolume:
         self.log.append("store.recover")
         if self.recover_error is not None:
             raise self.recover_error
+        if self.leftover is not None:  # R3: the old workspace left at the staging name
+            origin, self.leftover = self.leftover, None
+            snapshot = Snapshot(self._clock(), Reason.RECOVERED)
+            self._publish(snapshot, origin, treeid=origin.treeid)
+            self.recovered = [*self.recovered, snapshot]
         return self.recovered
 
     def snapshots(self) -> list[Snapshot]:
@@ -160,6 +187,36 @@ class FakeVolume:
         if self.workspace_id_error is not None:
             raise self.workspace_id_error
         return self.workspace_info.treeid
+
+    def restore(self, snapshot_id: str, *, quiesce: Callable[[], object]) -> RestoreResult:
+        """SnapshotStore.restore's contract: errors before quiesce leave everything as it was;
+        quiesce is entered around the swap and always exited, with restore's own error."""
+        self.log.append("store.restore")
+        target = Snapshot.parse(snapshot_id)
+        if target is None or target not in self.listed:
+            raise SnapshotError(f"no such snapshot: {snapshot_id}")
+        if self.restore_error_before is not None:
+            raise self.restore_error_before
+        quiesced = quiesce()
+        quiesced.__enter__()  # type: ignore[attr-defined]
+        try:
+            if self.during_swap is not None:
+                self.during_swap()
+            if self.swap_error is not None:
+                raise self.swap_error
+            undo = self.rewind_to(target, publish=self.incomplete_cause is None)
+            self.log.append(f"store.swap({target.id})")
+            if self.incomplete_cause is not None:
+                raise RestoreIncomplete(target, self.root / "workspace.restore") from (
+                    self.incomplete_cause
+                )
+            if self.workspace_id_error_after_restore is not None:
+                self.workspace_id_error = self.workspace_id_error_after_restore
+        except BaseException as error:
+            quiesced.__exit__(type(error), error, error.__traceback__)  # type: ignore[attr-defined]
+            raise
+        quiesced.__exit__(None, None, None)  # type: ignore[attr-defined]
+        return RestoreResult(target=target, undo=undo)
 
     # The btrfs functions the Guardian is given
 
@@ -200,6 +257,9 @@ class FakeJail:
         self.pause_error: Exception | None = None
         self.kill_error: JailError | None = None
         self.remove_error: JailError | None = None
+        self.stops_anyway = False  # a stop or kill that fails (a timeout) but did stop it
+        self.on_stop: Callable[[], None] | None = None  # runs in the middle of `docker stop`
+        self.on_wait_ready: Callable[[], None] | None = None  # ... and of `wait_ready`
 
     def ensure_network(self) -> None:
         self.log.append("jail.ensure_network")
@@ -232,12 +292,21 @@ class FakeJail:
 
     def wait_ready(self) -> None:
         self.log.append("jail.wait_ready")
+        if self.on_wait_ready is not None:
+            self.on_wait_ready()
         if self.ready_error is not None:
             raise self.ready_error
+        if self.paused:
+            raise JailError("the agent is frozen: it cannot get ready")
 
     def stop(self) -> None:
         self.log.append("jail.stop")
+        if self.on_stop is not None:
+            self.on_stop()
         if self.stop_error is not None:
+            if self.stops_anyway:
+                self.running = False
+                self.paused = False
             raise self.stop_error
         self.running = False
         self.paused = False
@@ -254,9 +323,41 @@ class FakeJail:
     def kill(self) -> None:
         self.log.append("jail.kill")
         if self.kill_error is not None:
+            if self.stops_anyway:
+                self.running = False
+                self.paused = False
             raise self.kill_error
         self.running = False
         self.paused = False
+
+    @contextmanager
+    def quiesce(
+        self, start_if: Callable[[BaseException | None], bool] | None = None
+    ) -> Iterator[None]:
+        """AgentJail.quiesce's contract: a frozen agent is killed, a running one stopped; on
+        the way out ``start_if`` (given the body's exception) decides whether it starts."""
+        was_running, was_paused = self.running, self.paused
+        if was_running:
+            try:
+                self.kill() if was_paused else self.stop()
+                if self.running:
+                    raise JailError("still running after being stopped")
+            except JailError as error:
+                if not self.running and start_if is not None and start_if(error):
+                    self.start()
+                    self.wait_ready()
+                raise
+        body_error: BaseException | None = None
+        try:
+            yield
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            start = (was_running and not was_paused) if start_if is None else start_if(body_error)
+            if start:
+                self.start()
+                self.wait_ready()
 
     def remove(self) -> None:
         self.log.append("jail.remove")
@@ -285,6 +386,8 @@ class FakeWatcher:
         self.barrier_error_before: Exception | None = None  # the watcher breaks before take()
         self.barrier_error_after: Exception | None = None  # ... or after it
         self.step_error: Exception | None = None  # rearm / report_unwatched / close
+        self.suspend_error: Exception | None = None  # suspended() never raises, but if it did
+        self.resume_error: Exception | None = None
 
     def arm(self, current: str | None = None) -> bool:
         self.log.append(f"watcher.arm({current})")
@@ -321,6 +424,19 @@ class FakeWatcher:
         if self.step_error is not None:
             raise self.step_error
 
+    @contextmanager
+    def suspended(self, new_current: str | None = None) -> Iterator[None]:
+        self.log.append("watcher.suspend")
+        if self.suspend_error is not None:
+            raise self.suspend_error
+        try:
+            yield
+        finally:
+            self.log.append(f"watcher.rearm({new_current})")
+            self.current = new_current
+            if self.resume_error is not None:
+                raise self.resume_error
+
 
 class Alerts:
     def __init__(self) -> None:
@@ -355,8 +471,8 @@ class FlakyBox:
     def head(self) -> tuple[int, str] | None:
         return self._box.head()
 
-    def events(self) -> list[Event]:
-        return self._box.events()
+    def events(self, **filters: object) -> list[Event]:
+        return self._box.events(**filters)  # type: ignore[arg-type]
 
     def close(self) -> None:
         self._box.close()
@@ -416,6 +532,7 @@ def world(tmp_path: Path, clock: Callable[[], datetime]) -> Iterator[World]:
     alerts = Alerts()
     key = create_key(tmp_path / "bb.key")
     box = FlakyBox(BlackBox(tmp_path / "bb.db", key, checkpoint_path=tmp_path / "bb.checkpoint"))
+    (tmp_path / "state").mkdir(mode=0o700)
     config = ServiceConfig(
         state_dir=tmp_path / "state",
         volume=tmp_path / "vol",
@@ -1645,3 +1762,804 @@ def test_a_barrier_that_never_calls_take_still_gets_its_snapshot(running: World)
     assert result.snapshot is not None
     assert result.snapshot != running.volume.listed[0]
     assert running.only("watcher_failed")
+
+
+# --- rewind (T04c-1, docs/19 section 4) -------------------------------------------------------
+
+
+def pending_intent(world: World) -> object:
+    from vigia.service.rewind import read_pending  # noqa: PLC0415 - only the rewind tests
+
+    return read_pending(world.config.pending_file)
+
+
+@pytest.fixture
+def rewinding(running: World) -> World:
+    """A running service with a change snapshotted after the startup snapshot: rewinding to the
+    startup one undoes it."""
+    running.volume.write()
+    running.guardian.cycle()
+    running.log.clear()
+    return running
+
+
+def test_an_invalid_id_does_nothing_at_all(running: World) -> None:
+    before = running.actions()
+    with running.guardian.agent_lock:  # not even the lock is asked for
+        outcome = running.guardian.rewind("../../etc", requested_by="cli")
+    assert outcome.status is RewindStatus.INVALID
+    assert outcome.exit_code == 2
+    assert running.actions() == before
+    assert running.log == []
+    assert not running.config.pending_file.exists()
+
+
+def test_a_rewind_of_a_running_agent_in_the_documented_order(rewinding: World) -> None:
+    target = rewinding.volume.listed[0]
+    seen_intent: list[object] = []
+    rewinding.volume.during_swap = lambda: seen_intent.append(pending_intent(rewinding))
+
+    outcome = rewinding.guardian.rewind(target.id, requested_by="cli")
+
+    assert rewinding.log == [
+        "store.restore",
+        "jail.stop",  # the agent stops first, while the watcher still describes what it writes
+        "watcher.suspend",
+        f"store.swap({target.id})",
+        f"watcher.rearm({target.id})",  # the watcher is armed again before the agent starts
+        "btrfs.sync",
+        "space.evaluate",  # and the agent only starts with the space green
+        "jail.start",
+        "jail.wait_ready",
+    ]
+    assert outcome.status is RewindStatus.DONE and outcome.exit_code == 0
+    assert outcome.agent_started
+    assert rewinding.guardian.agent_state is AgentState.RUNNING
+    assert rewinding.actions()[-4:] == [
+        "snapshot/rewind_requested",
+        "system/agent_stop",
+        "system/agent_start",
+        "snapshot/rewind_done",
+    ]
+    requested = rewinding.only("rewind_requested")
+    assert requested.details["from_workspace_id"] == 258
+    assert requested.details["requested_by"] == "cli"
+    assert requested.snapshot_id == target.id
+    # The intent was on disk, with what reconciling needs, before anything changed.
+    (intent,) = seen_intent
+    assert intent.request_id == requested.details["request_id"]  # type: ignore[attr-defined]
+    assert intent.from_workspace_id == 258  # type: ignore[attr-defined]
+    assert intent.target == target.id  # type: ignore[attr-defined]
+    assert not rewinding.config.pending_file.exists()  # and is gone afterwards
+
+    done = rewinding.only("rewind_done")
+    undo = rewinding.volume.snapshots()[-1]
+    assert undo.reason == Reason.PRE_RESTORE
+    assert done.snapshot_id == target.id
+    assert done.details["request_id"] == requested.details["request_id"]
+    assert done.details["undo"] == undo.id == outcome.undo
+    assert done.details["workspace_id"] == 259
+    assert done.details["from_workspace_id"] == 258
+    assert done.details["workspace_uuid"] == str(rewinding.volume.workspace_info.uuid)
+    assert done.details["agent_started"] is True
+    assert "error" not in done.details and "problems" not in done.details
+    assert [e.details["reason"] for e in rewinding.events("agent_stop")][-1] == "rewind"
+    assert rewinding.alerts.titled("ebobina") == []  # nothing went wrong: nothing to alert
+
+
+def test_a_stopped_agent_stays_stopped_after_a_rewind(rewinding: World) -> None:
+    rewinding.jail.stop()  # stopped on purpose (no pause reason): not the rewind's to start
+    rewinding.guardian._set_state(AgentState.STOPPED)  # noqa: SLF001
+    rewinding.log.clear()
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.DONE
+    assert not outcome.agent_started
+    assert "jail.start" not in rewinding.log and "space.evaluate" not in rewinding.log
+    assert not rewinding.jail.running
+    assert rewinding.only("rewind_done").details["agent_started"] is False
+
+
+def test_the_outcome_is_decided_by_the_workspace_id_not_by_the_exception(rewinding: World) -> None:
+    """A watcher that raises while rearming and an agent that cannot start, both AFTER the
+    swap: still a rewind (rewind_done, exit code 3), never a failed one."""
+    rewinding.watcher.resume_error = RuntimeError("rearm broke")
+    rewinding.jail.ready_error = JailError("not ready: the agent log says token=abc")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+
+    assert outcome.status is RewindStatus.PROBLEM and outcome.exit_code == 3
+    assert outcome.rewound and not outcome.agent_started
+    assert not rewinding.events("rewind_failed")
+    done = rewinding.only("rewind_done")
+    assert done.details["agent_started"] is False
+    assert set(done.details["problems"]) == {"agent", "watcher"}
+    assert "not ready" in done.details["error"]
+    assert done.risk == 2
+    failed_start = rewinding.events("agent_start_failed")[-1]
+    assert failed_start.seq < done.seq
+    assert rewinding.only("watcher_failed").details["step"] == "rearm"
+    assert not rewinding.jail.running  # the half-started agent was stopped again
+    assert rewinding.guardian.agent_state is AgentState.STOPPED
+    (alert,) = rewinding.alerts.titled("Rebobinado con problemas")
+    assert alert.event_seq == done.seq
+    assert "token=abc" not in alert.body  # Docker's text never reaches an alert
+
+
+def test_a_failure_before_the_swap_leaves_everything_as_it_was(rewinding: World) -> None:
+    rewinding.volume.restore_error_before = SnapshotError("staging failed")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED and outcome.exit_code == 1
+    assert rewinding.log == ["store.restore"]  # the agent was never touched
+    assert rewinding.jail.running
+    failed = rewinding.only("rewind_failed")
+    assert failed.details["no_space"] is False
+    assert failed.details["request_id"] == rewinding.only("rewind_requested").details["request_id"]
+    assert failed.risk == 2
+    assert rewinding.alerts.titled("No se ha rebobinado")
+    assert not rewinding.config.pending_file.exists()
+
+
+def test_a_failed_swap_starts_the_agent_again_on_the_old_workspace(rewinding: World) -> None:
+    rewinding.volume.swap_error = SnapshotError("rename failed")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED
+    assert outcome.agent_started
+    assert rewinding.jail.running
+    assert rewinding.guardian.agent_state is AgentState.RUNNING
+    assert rewinding.log.index("jail.stop") < rewinding.log.index("jail.start")
+    assert rewinding.only("rewind_failed")
+
+
+@pytest.mark.parametrize("where", ["before_quiesce", "in_the_swap"])
+def test_no_space_kills_the_agent_and_opens_the_pause(rewinding: World, where: str) -> None:
+    """Before quiesce (the recovery or the staging copy), the agent is still running: it is
+    killed, and that is recorded. In the swap, it is already stopped and start_if refuses to
+    start it: nothing is killed, and nothing says it was. Either way the pause stays open."""
+    error = SnapshotNoSpace("restore stopped before the swap: no space")
+    if where == "before_quiesce":
+        rewinding.volume.restore_error_before = error
+    else:
+        rewinding.volume.swap_error = error
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+
+    assert outcome.status is RewindStatus.FAILED
+    assert "jail.start" not in rewinding.log and "space.evaluate" not in rewinding.log
+    assert not rewinding.jail.running
+    assert rewinding.guardian.agent_state is AgentState.STOPPED
+    assert rewinding.guardian.pause_reasons == {"rewind_no_space"}
+    pause = rewinding.only("space_pause")
+    assert pause.details["reason"] == "rewind_no_space"
+    request_id = rewinding.only("rewind_requested").details["request_id"]
+    stops = [
+        e.details for e in rewinding.events("agent_stop") if e.details["reason"] != "service_stop"
+    ]
+    (alert,) = rewinding.alerts.titled("No hay espacio para rebobinar")
+    if where == "before_quiesce":
+        assert "jail.kill" in rewinding.log
+        assert pause.details["killed"] is True
+        assert stops == [{"reason": "rewind_no_space", "request_id": request_id}]
+        assert "se ha parado" in alert.body
+    else:
+        assert pause.details["killed"] is False
+        assert stops == [{"reason": "rewind", "request_id": request_id}]  # quiesce stopped it
+        assert "ya estaba parado" in alert.body
+    assert rewinding.only("rewind_failed").details["no_space"] is True
+
+
+def test_a_rewind_without_space_for_the_undo_point_is_done_but_incomplete(
+    rewinding: World,
+) -> None:
+    rewinding.volume.incomplete_cause = SnapshotNoSpace("no space to publish")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.PROBLEM and outcome.exit_code == 3
+    assert outcome.undo is None
+    done = rewinding.only("rewind_done")
+    assert done.details["incomplete"] is True
+    assert done.details["leftover"] == "workspace.restore"
+    assert "jail.start" not in rewinding.log  # start_if refused: a space error
+    assert rewinding.guardian.pause_reasons == {"rewind_no_space"}
+
+
+def freeze_for_space(world: World) -> None:
+    world.violations.append(Violation("P3", "el uso pasa del tope", "space"))
+    world.volume.write()
+    world.guardian.cycle()
+    assert world.guardian.agent_state is AgentState.FROZEN
+    world.log.clear()
+
+
+def test_rewinding_an_agent_frozen_for_space_starts_it_when_all_is_green(running: World) -> None:
+    freeze_for_space(running)
+    running.violations.clear()  # the rewind gives a new cap: green again
+    outcome = running.guardian.rewind(running.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.DONE and outcome.agent_started
+    assert running.log[1] == "jail.kill"  # frozen: killed, never woken by docker stop
+    assert "jail.stop" not in running.log
+    assert running.guardian.pause_reasons == frozenset()
+    resume = running.only("space_resume")
+    assert resume.details["by"] == "rewind"
+    assert resume.details["reasons"] == ["space"]
+    assert running.guardian.agent_state is AgentState.RUNNING
+
+
+def test_rewinding_an_agent_frozen_for_space_leaves_it_stopped_if_still_red(
+    running: World,
+) -> None:
+    freeze_for_space(running)
+    outcome = running.guardian.rewind(running.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.PROBLEM and not outcome.agent_started
+    assert "jail.start" not in running.log
+    assert not running.jail.running
+    assert running.guardian.agent_state is AgentState.STOPPED
+    assert running.guardian.pause_reasons == {"space"}  # the pause stays open
+    assert not running.events("space_resume")
+    assert len(running.events("space_pause")) == 2  # the cycle's and the rewind's
+    assert running.only("rewind_done").details["problems"] == ["agent"]
+
+
+def test_an_agent_paused_for_another_reason_stays_stopped(running: World) -> None:
+    freeze_for_space(running)
+    with running.guardian.freeze_lock:
+        running.guardian._pause_reasons.add("user")  # noqa: SLF001 - T09's pause does not exist yet
+    running.violations.clear()
+    outcome = running.guardian.rewind(running.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.DONE  # it was not supposed to run
+    assert not outcome.agent_started
+    assert "space.evaluate" not in running.log
+    assert running.guardian.pause_reasons == {"space", "user"}
+
+
+def test_start_if_fails_closed_when_deciding_breaks(rewinding: World) -> None:
+    """A bug while deciding whether to start (here the space reading blows up): the agent
+    stays stopped, the rewind says why, and the error is logged, never swallowed."""
+    world = capped_world(rewinding, usage_limit=64 * 1024**2)
+
+    def broken(root: Path, workspace: Path, state_dir: Path) -> object:
+        raise KeyError("a bug in the space reading")
+
+    world.guardian._sample = broken  # type: ignore[assignment]  # noqa: SLF001
+    outcome = world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.PROBLEM
+    assert not outcome.agent_started and not world.jail.running
+    assert set(world.only("rewind_done").details["problems"]) == {"agent", "start_check"}
+    world.guardian.flush_logs()
+    assert any(
+        "cannot decide whether to start" in e.details["message"] for e in world.events("log")
+    )
+
+
+def test_a_failing_black_box_does_not_stop_the_rewind(rewinding: World) -> None:
+    from vigia.blackbox import BlackBoxError  # noqa: PLC0415
+
+    rewinding.box.append_error = BlackBoxError("disk full")
+    seen_intent: list[object] = []
+    rewinding.volume.during_swap = lambda: seen_intent.append(pending_intent(rewinding))
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.rewound and outcome.status is RewindStatus.PROBLEM  # exit code 3
+    assert outcome.agent_started
+    assert seen_intent and seen_intent[0] is not None  # the intent is what reconciles it
+    assert rewinding.alerts.titled("caja negra")
+    # rewind_done could not be written: the intent stays, so the rewind is reconciled later
+    # (and an older request can never be judged by today's workspace id).
+    assert rewinding.config.pending_file.exists()
+
+    rewinding.box.append_error = None
+    rewinding.guardian.stop()
+    rewinding.guardian.start()
+    (done,) = rewinding.events("rewind_done")
+    assert done.details["reconciled"] is True
+    assert done.details["basis"] == "pending"
+    assert not rewinding.config.pending_file.exists()
+
+
+def test_the_watcher_cannot_stop_a_rewind_on_entry_either(rewinding: World) -> None:
+    rewinding.watcher.suspend_error = RuntimeError("suspend broke")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.PROBLEM
+    assert outcome.agent_started
+    assert rewinding.only("watcher_failed").details["step"] == "suspend"
+
+
+def test_a_workspace_that_cannot_be_read_first_is_not_rewound(rewinding: World) -> None:
+    rewinding.volume.workspace_id_error = SnapshotError("workspace is missing")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED
+    assert rewinding.log == []
+    assert rewinding.only("rewind_failed").details["stage"] == "workspace_id"
+    assert not rewinding.config.pending_file.exists()
+
+
+def test_a_workspace_that_cannot_be_read_afterwards_keeps_the_intent(rewinding: World) -> None:
+    rewinding.volume.workspace_id_error_after_restore = SnapshotError("cannot read")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.UNKNOWN and outcome.exit_code == 3
+    assert rewinding.config.pending_file.exists()  # the next start reconciles it
+    assert not rewinding.events("rewind_done") and not rewinding.events("rewind_failed")
+    assert rewinding.alerts.titled("No se sabe si se ha rebobinado")
+
+
+def test_the_cycle_is_skipped_while_a_rewind_holds_the_agent(rewinding: World) -> None:
+    """Interleaved with a rewind whose workspace id changes half way, the cycle must not read
+    the old id and rearm the watcher a second time (nor wait on the volume lock)."""
+    results: list[CycleResult] = []
+
+    def cycle_meanwhile() -> None:
+        thread = threading.Thread(target=lambda: results.append(rewinding.guardian.cycle()))
+        thread.start()
+        thread.join(5)
+
+    rewinding.volume.during_swap = cycle_meanwhile
+    rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    (result,) = results
+    assert result.skipped and not result.changed
+    assert not any(entry.startswith("watcher.rearm_if_moved") for entry in rewinding.log)
+    assert rewinding.log.count(f"watcher.rearm({rewinding.volume.listed[0].id})") == 1
+
+
+def test_a_rewind_waits_for_a_cycle_and_a_cycle_does_not_wait_for_a_rewind(
+    rewinding: World,
+) -> None:
+    with rewinding.guardian.agent_lock:
+        assert rewinding.guardian.cycle().skipped
+    assert not rewinding.guardian.cycle().skipped
+
+
+def test_an_undo_point_can_be_rewound_to_in_turn(rewinding: World) -> None:
+    first = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert first.undo is not None
+    second = rewinding.guardian.rewind(first.undo, requested_by="cli")
+    assert second.status is RewindStatus.DONE
+    assert len(rewinding.events("rewind_done")) == 2
+
+
+# --- reconcile at startup ----------------------------------------------------------------------
+
+
+def interrupted_rewind(
+    world: World, *, swapped: bool, with_event: bool = True, request_id: str = "a" * 32
+) -> str:
+    """What a rewind killed half way leaves: its intent on disk, its request in the black box
+    (unless ``with_event`` is False) and, if ``swapped``, a rewound workspace."""
+    from vigia.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
+
+    target = world.volume.snapshot_quietly()
+    world.volume.write()
+    from_workspace = world.volume.workspace_info.treeid
+    write_pending(
+        world.config.pending_file, PendingRewind(request_id, target.id, from_workspace, "cli")
+    )
+    if with_event:
+        world.box._box.open()  # noqa: SLF001 - the service that died wrote it
+        world.box._box.append(  # noqa: SLF001
+            "snapshot",
+            "rewind_requested",
+            target.id,
+            details={
+                "request_id": request_id,
+                "target": target.id,
+                "requested_by": "cli",
+                "from_workspace_id": from_workspace,
+            },
+            snapshot_id=target.id,
+        )
+    if swapped:
+        world.volume.rewind_to(target)
+    return target.id
+
+
+@pytest.mark.parametrize("with_event", [True, False])
+def test_a_rewind_killed_after_the_swap_is_reconciled_as_done(
+    world: World, with_event: bool
+) -> None:
+    target = interrupted_rewind(world, swapped=True, with_event=with_event)
+    undo = world.volume.snapshots()[-1]
+    world.guardian.start()
+    done = world.only("rewind_done")
+    assert done.details["reconciled"] is True
+    assert done.details["request_id"] == "a" * 32
+    assert done.details["undo"] == undo.id
+    assert done.details["from_workspace_id"] == 258
+    assert done.snapshot_id == target
+    assert not world.events("rewind_failed")
+    assert not world.config.pending_file.exists()
+    assert world.alerts.titled("Un rebobinado se interrumpió")
+    # Reconciled before anything starts.
+    assert world.actions().index("snapshot/rewind_done") < world.actions().index(
+        "system/agent_start"
+    )
+
+
+def test_a_rewind_killed_before_the_swap_is_reconciled_as_failed(world: World) -> None:
+    interrupted_rewind(world, swapped=False)
+    world.guardian.start()
+    failed = world.only("rewind_failed")
+    assert failed.details["reconciled"] is True
+    assert failed.details["request_id"] == "a" * 32
+    assert not world.events("rewind_done")
+    assert not world.config.pending_file.exists()
+
+
+def test_a_request_without_its_intent_is_reconciled_from_the_black_box(world: World) -> None:
+    interrupted_rewind(world, swapped=True)
+    world.config.pending_file.unlink()
+    world.guardian.start()
+    assert world.only("rewind_done").details["reconciled"] is True
+
+
+def test_nothing_pending_records_nothing(world: World) -> None:
+    world.guardian.start()
+    assert not world.events("rewind_done") and not world.events("rewind_failed")
+
+
+def test_a_settled_rewind_is_not_reconciled_twice(rewinding: World) -> None:
+    rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    rewinding.guardian.stop()
+    rewinding.guardian.start()
+    assert len(rewinding.events("rewind_done")) == 1
+
+
+def test_an_intent_whose_rewind_was_settled_is_only_removed(rewinding: World) -> None:
+    """The rewind ended, but removing its intent failed: the next start finds it settled."""
+    from vigia.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
+
+    rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    done = rewinding.only("rewind_done")
+    write_pending(
+        rewinding.config.pending_file,
+        PendingRewind(done.details["request_id"], done.details["target"], 258, "cli"),
+    )
+    rewinding.guardian.stop()
+    rewinding.guardian.start()
+    assert len(rewinding.events("rewind_done")) == 1
+    assert not rewinding.events("rewind_failed")
+    assert not rewinding.config.pending_file.exists()
+
+
+def test_an_unreadable_intent_is_logged_and_removed(world: World) -> None:
+    world.config.pending_file.write_text("garbage")
+    world.guardian.start()
+    world.guardian.flush_logs()
+    assert any("cannot be read" in e.details["message"] for e in world.events("log"))
+    assert not world.config.pending_file.exists()
+    assert world.guardian.agent_state is AgentState.RUNNING
+
+
+def test_an_earlier_interrupted_rewind_is_settled_before_a_new_one(world: World) -> None:
+    world.guardian.start()
+    interrupted_rewind(world, swapped=False)
+    world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    failed = world.only("rewind_failed")
+    assert failed.details["reconciled"] is True
+    assert failed.seq < world.events("rewind_requested")[-1].seq
+    assert world.events("rewind_done")
+
+
+# --- the start after a rewind, before the space thread exists (T04d-2) -------------------------
+
+
+def capped_world(world: World, usage_limit: int | None, errors: tuple[str, ...] = ()) -> World:
+    from dataclasses import replace  # noqa: PLC0415
+
+    from vigia.snapshots import space  # noqa: PLC0415
+    from vigia.snapshots.btrfs import QGROUP_LIMIT_MAX_RFER, QgroupUsage  # noqa: PLC0415
+
+    limit = 64 * 1024**2
+    usage = None
+    if usage_limit is not None or not errors:
+        usage = QgroupUsage(
+            referenced=1024**2,
+            exclusive=1024**2,
+            limit_flags=QGROUP_LIMIT_MAX_RFER if usage_limit is not None else 0,
+            max_referenced=usage_limit or 0,
+            max_exclusive=0,
+        )
+    gib = 1024**3
+    volume = space.VolumeSpace(
+        device_total=100 * gib,
+        unallocated=90 * gib,
+        data=space.Allocation(4 * gib, 4 * gib, gib),
+        metadata=space.Allocation(gib, 2 * gib, 0),
+    )
+    host = space.HostSpace(total=500 * gib, free=400 * gib)
+    reading = space.Sample(space=volume, usage=usage, host=host, errors=errors)
+    reads: list[tuple[Path, Path, Path]] = []
+
+    def sample(root: Path, workspace: Path, state_dir: Path) -> space.Sample:
+        reads.append((root, workspace, state_dir))
+        return reading
+
+    world.guardian._config = replace(world.config, workspace_limit=limit)  # noqa: SLF001
+    world.guardian._space = None  # noqa: SLF001
+    world.guardian._sample = sample  # noqa: SLF001
+    world.reads = reads  # type: ignore[attr-defined]
+    return world
+
+
+def test_without_the_space_thread_only_the_cap_decides_the_start(rewinding: World) -> None:
+    world = capped_world(rewinding, usage_limit=64 * 1024**2)
+    outcome = world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    assert outcome.agent_started
+    assert world.reads == [(world.volume.root, world.volume.workspace, world.config.state_dir)]  # type: ignore[attr-defined]
+    assert world.log.index("btrfs.sync") < world.log.index("jail.start")
+
+
+@pytest.mark.parametrize("usage_limit", [None, 32 * 1024**2])
+def test_without_the_space_thread_a_workspace_without_its_cap_does_not_start(
+    rewinding: World, usage_limit: int | None
+) -> None:
+    world = capped_world(rewinding, usage_limit=usage_limit)
+    outcome = world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    assert not outcome.agent_started
+    assert world.events("space_pause")[-1].details["conditions"] == ["P5"]
+    assert world.guardian.pause_reasons == {"space"}
+
+
+def test_without_the_space_thread_unreadable_signals_do_not_start(rewinding: World) -> None:
+    world = capped_world(rewinding, usage_limit=None, errors=("workspace quota: EIO",))
+    outcome = world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    assert not outcome.agent_started
+    assert set(world.events("space_pause")[-1].details["conditions"]) == {"P4", "P5"}
+
+
+# --- review of T04c-1: freezing during a rewind, what the outcome may say, failed stops -------
+
+
+P1 = Violation("P1", "metadatos: quedan 100 MiB, mínimo 341 MiB", "space")
+
+
+def test_the_space_thread_can_freeze_an_agent_that_is_being_stopped(rewinding: World) -> None:
+    """During `docker stop` the agent runs its SIGTERM handler: a condition must freeze it then
+    too (state STOPPING), not only when it is RUNNING."""
+    guardian = rewinding.guardian
+    states: list[AgentState] = []
+
+    def freeze_now() -> None:
+        states.append(guardian.agent_state)
+        rewinding.violations.append(P1)
+        guardian._pause([P1], freeze=True)  # noqa: SLF001 - what the space thread (T04d-2) calls
+
+    rewinding.jail.on_stop = freeze_now
+    outcome = guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert states == [AgentState.STOPPING]
+    assert rewinding.log.index("jail.pause") < rewinding.log.index(
+        f"store.swap({rewinding.volume.listed[0].id})"
+    )
+    assert rewinding.events("space_pause")[0].details["frozen"] is True
+    assert not outcome.agent_started  # still red afterwards: it stays stopped, pause open
+    assert guardian.pause_reasons == {"space"}
+    assert not rewinding.jail.running
+
+
+def test_the_space_thread_can_freeze_an_agent_that_is_starting(rewinding: World) -> None:
+    """During wait_ready the agent runs code too (state STARTING): it is frozen, wait_ready
+    fails at once, and the frozen agent is killed, never woken."""
+    guardian = rewinding.guardian
+    states: list[AgentState] = []
+
+    def freeze_now() -> None:
+        states.append(guardian.agent_state)
+        guardian._pause([P1], freeze=True)  # noqa: SLF001
+
+    rewinding.jail.on_wait_ready = freeze_now
+    outcome = guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert states == [AgentState.STARTING]
+    assert outcome.status is RewindStatus.PROBLEM and not outcome.agent_started
+    pause, kill = rewinding.log.index("jail.pause"), len(rewinding.log) - 1
+    assert (
+        rewinding.log[pause:].count("jail.kill") == 1 and "jail.stop" not in rewinding.log[pause:]
+    )
+    assert kill >= pause
+    assert not rewinding.jail.running
+    assert guardian.agent_state is AgentState.STOPPED
+    assert guardian.pause_reasons == {"space"}
+
+
+def test_the_outcome_never_carries_the_agents_text(rewinding: World) -> None:
+    """outcome.error and outcome.message go to the CLI, Telegram and the web: Docker's errors
+    (which quote the agent's logs) never go there, only their type and the event to read;
+    anything else is redacted."""
+    rewinding.jail.ready_error = JailError("not ready; the agent printed token=abc")
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    done = rewinding.only("rewind_done")
+    assert "token=abc" not in (outcome.error or "") + outcome.message
+    assert outcome.error is not None
+    assert "JailError" in outcome.error and f"#{done.seq}" in outcome.error
+
+    rewinding.jail.ready_error = None
+    rewinding.volume.swap_error = SnapshotError("rename failed for token=abc")
+    failed = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert failed.status is RewindStatus.FAILED
+    assert "token=abc" not in (failed.error or "") + failed.message
+    assert "rename failed" in (failed.error or "")
+
+
+@pytest.mark.parametrize("when", ["never_started", "stopped"])
+def test_a_rewind_needs_a_running_service(world: World, when: str) -> None:
+    """Without a booted service there is no black box to record in (never started) or no
+    watcher to rearm (stopped): the rewind is refused and nothing is touched."""
+    if when == "stopped":
+        world.guardian.start()
+        world.guardian.stop()
+    world.log.clear()
+    before = world.actions() if when == "stopped" else []
+    target = world.volume.snapshot_quietly()
+    outcome = world.guardian.rewind(target.id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED and outcome.exit_code == 1
+    assert "Vigía" in outcome.message
+    assert world.log == []
+    if when == "stopped":
+        assert world.actions() == before
+    assert not world.config.pending_file.exists()
+
+
+def test_a_failed_stop_that_did_stop_restarts_the_agent_as_it_was_and_says_so(
+    rewinding: World,
+) -> None:
+    """`docker stop` timed out, but the daemon stopped it: restore does not run, the agent is
+    started again as it was, and the black box says it was started."""
+    rewinding.jail.stop_error = JailError("docker stop timed out after 90 s")
+    rewinding.jail.stops_anyway = True
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED
+    assert outcome.agent_started
+    assert rewinding.jail.running
+    assert rewinding.guardian.agent_state is AgentState.RUNNING
+    starts = [e.details for e in rewinding.events("agent_start") if e.details.get("request_id")]
+    assert [d["reason"] for d in starts] == ["rewind"]
+    assert not rewinding.events("space_resume")
+    assert rewinding.only("rewind_failed").details["agent_started"] is True
+
+
+def test_a_failed_stop_never_closes_a_pause(running: World) -> None:
+    """A frozen agent whose kill failed but which stopped anyway: its pause stays open, it is
+    not started, and nothing says the pause was closed."""
+    freeze_for_space(running)
+    running.violations.clear()
+    running.jail.kill_error = JailError("docker kill failed")
+    running.jail.stops_anyway = True
+    outcome = running.guardian.rewind(running.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED and not outcome.agent_started
+    assert "jail.start" not in running.log
+    assert running.guardian.pause_reasons == {"space"}
+    assert not running.events("space_resume")
+    assert running.guardian.agent_state is AgentState.STOPPED
+
+
+def test_a_frozen_agent_whose_kill_failed_is_still_frozen(running: World) -> None:
+    freeze_for_space(running)
+    running.jail.kill_error = JailError("docker kill failed")
+    outcome = running.guardian.rewind(running.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED
+    assert running.jail.running and running.jail.paused
+    assert running.guardian.agent_state is AgentState.FROZEN  # never "running"
+    assert running.only("agent_stop_failed").details["still_running"] is True
+
+
+def test_a_failed_swap_never_closes_a_pause_for_lack_of_space(rewinding: World) -> None:
+    """An earlier rewind failed for lack of space (pause rewind_no_space). This one fails too,
+    for another reason (EIO): the workspace did not change, so nothing was freed, the pause
+    stays and the agent is not started on the old workspace."""
+    rewinding.volume.restore_error_before = SnapshotNoSpace("no space")
+    rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert rewinding.guardian.pause_reasons == {"rewind_no_space"}
+    rewinding.volume.restore_error_before = None
+    rewinding.volume.swap_error = SnapshotError("EIO")
+    rewinding.log.clear()
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED and not outcome.agent_started
+    assert "jail.start" not in rewinding.log
+    assert rewinding.guardian.pause_reasons == {"rewind_no_space"}
+    assert not rewinding.events("space_resume")
+
+
+def test_a_rewind_after_one_without_space_closes_its_pause_when_it_works(rewinding: World) -> None:
+    rewinding.volume.restore_error_before = SnapshotNoSpace("no space")
+    rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    rewinding.volume.restore_error_before = None  # the person freed some space
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.DONE and outcome.agent_started
+    assert rewinding.guardian.pause_reasons == frozenset()
+    assert rewinding.only("space_resume").details["reasons"] == ["rewind_no_space"]
+
+
+def test_a_reconciliation_that_cannot_be_recorded_keeps_the_intent(world: World) -> None:
+    from vigia.blackbox import BlackBoxError  # noqa: PLC0415
+
+    interrupted_rewind(world, swapped=True)
+    world.guardian.start()
+    assert world.only("rewind_done").details["basis"] == "pending"
+    world.guardian.stop()
+
+    interrupted_rewind(world, swapped=False, request_id="c" * 32)
+    world.box._box.open()  # noqa: SLF001
+    original = world.box.append
+
+    def failing_for_rewinds(source: str, action: str, *args: object, **kwargs: object) -> Event:
+        if action.startswith("rewind_"):
+            raise BlackBoxError("disk full")
+        return original(source, action, *args, **kwargs)
+
+    world.box.append = failing_for_rewinds  # type: ignore[method-assign]
+    world.guardian.start()
+    assert world.config.pending_file.exists()  # not recorded: not settled
+    world.guardian.stop()
+
+
+def test_a_reconciliation_from_the_black_box_alone_says_so(world: World) -> None:
+    interrupted_rewind(world, swapped=False)
+    world.config.pending_file.unlink()
+    world.guardian.start()
+    assert world.only("rewind_failed").details["basis"] == "blackbox"
+
+
+def test_a_rewind_killed_between_the_swap_and_the_undo_point_is_reconciled(
+    world: World,
+) -> None:
+    """Killed after the swap but before the old workspace was published: the next start's
+    recover() publishes it (as "recovered"), and the reconciliation finds it as the undo point
+    by its subvolume id."""
+    from vigia.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
+
+    target = world.volume.snapshot_quietly()
+    world.volume.write()
+    write_pending(world.config.pending_file, PendingRewind("b" * 32, target.id, 258, "cli"))
+    world.volume.rewind_to(target, publish=False)
+    world.guardian.start()
+    (recovered,) = world.events("recovered")
+    done = world.only("rewind_done")
+    assert done.details["undo"] == recovered.snapshot_id
+    assert done.details["reconciled"] is True
+    assert world.actions().index("snapshot/recovered") < world.actions().index(
+        "snapshot/rewind_done"
+    )
+
+
+def test_a_real_jail_whose_stop_fails_in_the_middle_of_a_rewind(
+    rewinding: World, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The real AgentJail.quiesce (Docker faked): `docker stop` times out and the container is
+    still running. restore never swaps, the agent was never stopped, and the black box says
+    the stop failed with the agent still running."""
+    from vigia.jail import agent as agent_module  # noqa: PLC0415
+    from vigia.jail import docker  # noqa: PLC0415
+    from vigia.jail.agent import AgentJail  # noqa: PLC0415
+    from vigia.jail.config import AgentJailConfig  # noqa: PLC0415
+
+    replies = iter([{"Running": True, "Paused": False}] * 50)
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        import json  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+
+        calls.append(list(args))
+        if args[0] == "stop":
+            raise JailError("docker stop timed out after 90 s")
+        if args[:2] == ["container", "inspect"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps(next(replies)), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(docker, "run", fake_run)
+    monkeypatch.setattr(agent_module, "container_problems", lambda *a, **k: [])
+    workspace = tmp_path / "jail-root" / "workspace"
+    workspace.mkdir(parents=True)
+    jail = AgentJail(
+        AgentJailConfig(
+            workspace=workspace,
+            config_dir=tmp_path / "jail-config",
+            gateway_token="u" * 43,
+            name="agent-under-test",
+            network="net-under-test",
+            uid=os.getuid(),
+            gid=os.getgid(),
+            allow_shared_ids=True,
+        )
+    )
+    rewinding.guardian._jail = jail  # type: ignore[assignment]  # noqa: SLF001
+    outcome = rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
+    assert outcome.status is RewindStatus.FAILED
+    assert "token" not in (outcome.error or "")
+    assert not any(entry.startswith("store.swap") for entry in rewinding.log)
+    assert [c[0] for c in calls if c[0] in {"stop", "kill", "start"}] == ["stop"]
+    failed = rewinding.only("agent_stop_failed")
+    assert failed.details["reason"] == "rewind" and failed.details["still_running"] is True
+    assert rewinding.guardian.agent_state is AgentState.RUNNING

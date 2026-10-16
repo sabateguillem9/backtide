@@ -16,8 +16,10 @@ import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -27,6 +29,8 @@ from vigia.blackbox import BlackBox, BlackBoxError, Event, load_key
 from vigia.jail import AgentJail
 from vigia.jail import docker as jail_docker
 from vigia.service.config import Secret, ServiceConfig
+from vigia.service.guardian import Guardian
+from vigia.service.runner import build_guardian, run_guardian, take_lock
 from vigia.snapshots import Snapshot, SnapshotStore, btrfs
 
 REPO = Path(__file__).resolve().parents[2]
@@ -88,6 +92,16 @@ class Service:
             )
         finally:
             log.close()  # the child has its own copy
+
+    def wait_agent_start(self, before: int, timeout: float = STARTUP_TIMEOUT) -> None:
+        """Wait until there are more than ``before`` ``agent_start`` events and the agent runs:
+        for a Guardian that is not this object's process (``guardian_in_process``)."""
+        wait_until(
+            lambda: len(self.events("agent_start")) > before and self.jail.is_running(),
+            timeout,
+            "the agent to be started",
+            context=self.diagnosis,
+        )
 
     def wait_ready(self, timeout: float = STARTUP_TIMEOUT) -> None:
         """Wait until the agent is running AND recorded as started by this process."""
@@ -261,6 +275,147 @@ class Service:
 
     def workspace_ctransid(self) -> int:
         return btrfs.subvolume_info(self.store.workspace).ctransid
+
+
+@contextmanager
+def guardian_in_process(service: Service) -> Iterator[Guardian]:
+    """The real service of ``service`` (same lock, same parts from ``build_guardian``, same
+    ``run_guardian``), but run by this test process in a thread instead of as `vigia vigilar`:
+    until the control socket exists (T04c-2) that is the only way to call ``Guardian.rewind``
+    while it runs. Yields once the agent is started and watched; stops it like a SIGTERM
+    would (the agent stops and ``service_stop`` is recorded) when the block ends."""
+    lock = take_lock(service.config.lock_file)
+    try:
+        guardian, alerts, box = build_guardian(service.config, jail=service.jail)
+        stop = threading.Event()
+        failures: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                run_guardian(guardian, alerts, box, stop=stop, handle_signals=False)
+            except BaseException as error:  # noqa: BLE001 - handed to the test below
+                failures.append(error)
+
+        before = len(service.events("agent_start"))
+        thread = threading.Thread(target=run, name="test-guardian", daemon=True)
+        thread.start()
+        try:
+            wait_until(
+                lambda: (
+                    failures
+                    or not thread.is_alive()
+                    or (len(service.events("agent_start")) > before and service.jail.is_running())
+                ),
+                STARTUP_TIMEOUT,
+                "the in-process service to start the agent",
+                context=service.diagnosis,
+            )
+            if failures:
+                raise failures[0]
+            yield guardian
+        finally:
+            stop.set()
+            thread.join(STOP_TIMEOUT)
+            if thread.is_alive():
+                pytest.fail(f"the in-process service did not stop\n{service.diagnosis()}")
+        if failures:
+            raise failures[0]
+    finally:
+        lock.close()
+
+
+REWIND_KILL_TIMEOUT = STARTUP_TIMEOUT + STOP_TIMEOUT
+
+
+def kill_a_rewind(service: Service, target: str, when: str) -> subprocess.CompletedProcess[str]:
+    """Run the real service in another process (tests/integration/rewind_main.py), rewind to
+    ``target`` and SIGKILL that process from inside the rewind: ``when`` is "before" (the agent
+    is stopped, the swap has not happened) or "after" (swapped, undo point published, nothing
+    rearmed or started). The service of ``service`` must not be running. Returns the dead
+    process (its return code is -SIGKILL)."""
+    assert service.process is None or service.process.poll() is not None, "stop it first"
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tests.integration.rewind_main",
+            str(service.config_path),
+            target,
+            when,
+        ],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": str(REPO), "PYTHONUNBUFFERED": "1"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=REWIND_KILL_TIMEOUT,
+        check=False,
+    )
+
+
+def snapshot_holds(service: Service, snapshot_id: str | None, files: dict[str, str]) -> bool:
+    """Whether ``snapshot_id`` has each of ``files`` (paths inside the agent's folder) with
+    exactly that text."""
+    if snapshot_id is None:
+        return False
+    base = service.store.snapshots_dir / snapshot_id / "agente"
+    try:
+        return all((base / name).read_text() == text for name, text in files.items())
+    except OSError:
+        return False
+
+
+def workspace_holds(service: Service, files: dict[str, str]) -> bool:
+    base = service.store.workspace / "agente"
+    try:
+        return all((base / name).read_text() == text for name, text in files.items())
+    except OSError:
+        return False
+
+
+def exec_in_agent(service: Service, script: str) -> str:
+    """``sh -c script`` inside the agent, as the agent; it must succeed. Returns its stdout."""
+    result = service.jail.exec(["sh", "-c", script], timeout=60)
+    assert result.returncode == 0, (script, result.stdout, result.stderr)
+    return result.stdout
+
+
+def write_in_agent(service: Service, files: dict[str, str]) -> None:
+    """Write ``files`` (paths inside the agent's folder) from inside the agent, through the real
+    bind mount. The texts must not contain a single quote."""
+    for name, text in files.items():
+        path = f"/workspace/{name}"
+        exec_in_agent(
+            service, f"mkdir -p \"$(dirname '{path}')\" && printf '%s' '{text}' > '{path}'"
+        )
+
+
+MARKER = "work/marker.txt"
+REWIND_WITHIN = CYCLE + 30  # a cycle, the sync, the snapshot and a loaded VM
+
+
+def interrupted_rewind(service: Service, when: str) -> tuple[str, int]:
+    """Start ``service`` (`vigia vigilar`), get a snapshot with ``marker = v1``, change it to
+    v2, stop the service, and then rewind to the v1 snapshot in a process that is SIGKILLed
+    ``when`` ("before"/"after" the swap): see ``kill_a_rewind``. Returns the target and the
+    workspace id from before. The service is left stopped."""
+    service.start()
+    service.wait_ready()
+    write_in_agent(service, {MARKER: "v1\n"})
+    wait_until(
+        lambda: snapshot_holds(service, service.snapshots()[-1].id, {MARKER: "v1\n"}),
+        REWIND_WITHIN,
+        "a snapshot with v1",
+        context=service.diagnosis,
+    )
+    target = service.snapshots()[-1].id
+    write_in_agent(service, {MARKER: "v2\n"})
+    assert service.stop() == 0
+    workspace_before = service.store.workspace_id()
+    dead = kill_a_rewind(service, target, when)
+    assert dead.returncode == -signal.SIGKILL, (dead.returncode, dead.stdout, dead.stderr[-3000:])
+    assert "rewinding" in dead.stdout
+    return target, workspace_before
 
 
 def make_service(

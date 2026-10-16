@@ -350,8 +350,14 @@ def test_head_is_the_last_seq_and_hash(box: BlackBox) -> None:
 
 @pytest.fixture
 def mixed(box: BlackBox) -> BlackBox:
-    for source in ("file", "net", "file", "exec", "file"):
-        box.append(source, "act", "/t")
+    for source, action in (
+        ("file", "act"),
+        ("net", "act"),
+        ("file", "delete"),
+        ("exec", "act"),
+        ("file", "act"),
+    ):
+        box.append(source, action, "/t")
     return box
 
 
@@ -368,6 +374,14 @@ def mixed(box: BlackBox) -> BlackBox:
         ({"limit": 2}, [1, 2]),
         ({"limit": 100}, [1, 2, 3, 4, 5]),
         ({"since_seq": 1, "source": "file", "limit": 1}, [3]),
+        ({"action": "act"}, [1, 2, 4, 5]),
+        ({"action": "delete"}, [3]),
+        ({"action": "nothing"}, []),
+        ({"source": "file", "action": "act"}, [1, 5]),
+        ({"newest_first": True}, [5, 4, 3, 2, 1]),
+        ({"newest_first": True, "limit": 2}, [5, 4]),
+        ({"source": "file", "action": "act", "newest_first": True, "limit": 1}, [5]),
+        ({"since_seq": 2, "newest_first": True}, [5, 4, 3]),
     ],
 )
 def test_events_filters(mixed: BlackBox, kwargs: dict, seqs: list[int]) -> None:
@@ -384,6 +398,9 @@ def test_events_filters(mixed: BlackBox, kwargs: dict, seqs: list[int]) -> None:
         {"limit": -1},
         {"limit": True},
         {"source": "bogus"},
+        {"action": ""},
+        {"action": 3},
+        {"newest_first": 1},
     ],
 )
 def test_events_rejects_invalid_filters(box: BlackBox, kwargs: dict) -> None:

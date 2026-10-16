@@ -9,6 +9,9 @@ A scenario test looks like this::
         attack.check("stopped", outcome["created"] == [], "no subvolume was created")
         attack.check("recoverable", ..., "the snapshot holds the file")
 
+Run one scenario by its manifest id (or part of it): `make ataques ATK="-k rebobinado-matado"`
+(conftest.py adds the id to the test's keywords; the function names are English).
+
 ``check`` ties a test to a dimension of its manifest entry: a dimension that is final and not
 "n/a" must be checked (else the battery fails), and one that is ``pending:Txx`` must not (it
 is reported as pending). So a task that builds a pending piece has to flip the manifest and

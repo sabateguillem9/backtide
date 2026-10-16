@@ -23,7 +23,7 @@ import os
 import stat
 import subprocess
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -69,6 +69,9 @@ _NO_SUCH_CONTAINER = "No such container"
 _NOT_RUNNING = "is not running"
 _NETWORK_NOT_FOUND = "not found"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+# Whether quiesce starts the agent on exit, given the exception of its body (or None).
+type StartIf = Callable[[BaseException | None], bool]
 
 
 class AgentJail:
@@ -214,7 +217,8 @@ class AgentJail:
         """Wait until this run of the Gateway has logged ``[gateway] ready`` and /healthz
         answers from inside the container. Raises JailError, with the last log lines, if the
         container stops or ``timeout`` (default: the config's) passes first, and also if the
-        probe or the logs print more than their bound (the agent is not to be trusted then)."""
+        probe or the logs print more than their bound (the agent is not to be trusted then).
+        A frozen container fails at once."""
         timeout = self.config.ready_timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
         while True:
@@ -226,6 +230,10 @@ class AgentJail:
                     f"the agent stopped before it was ready (exit code "
                     f"{state.get('ExitCode')}): {self.log_tail()}"
                 )
+            if state.get("Paused") is True:
+                # Frozen (the pause by space, maybe in the middle of a start): it will not get
+                # ready, and waiting would only hold agent_lock for nothing.
+                raise JailError(f"the agent {self.config.name} is frozen: it cannot get ready")
             if self._logged_ready(str(state.get("StartedAt", ""))) and self._healthy():
                 return
             if time.monotonic() >= deadline:
@@ -233,35 +241,61 @@ class AgentJail:
             time.sleep(POLL_INTERVAL)
 
     @contextmanager
-    def quiesce(self) -> Iterator[None]:
+    def quiesce(self, start_if: StartIf | None = None) -> Iterator[None]:
         """Stop the agent on entry and start it again on exit, waiting until it is ready.
 
-        The ``quiesce`` that SnapshotStore.restore() takes. On exit the agent is started even
-        if the body raised (the workspace is then unchanged or rewound, and both are fine to
-        run on). If stopping fails the body never runs, and the agent is started again if it
-        stopped anyway (a CLI timeout does not cancel the daemon's stop). An agent that was not
-        running on entry is left stopped: someone (T04's low-space pause, for example) stopped
-        it on purpose."""
-        was_running = self.is_running()
+        The ``quiesce`` that SnapshotStore.restore() takes. A frozen agent (``docker pause``)
+        is killed, never stopped: ``docker stop`` would wake it to run its SIGTERM handler for
+        up to ``stop_timeout`` seconds. If stopping fails the body never runs, and the agent is
+        started again if it stopped anyway (a CLI timeout does not cancel the daemon's stop).
+
+        Whether it starts on exit: without ``start_if``, if it was running and not frozen on
+        entry, even if the body raised (the workspace is then unchanged or rewound, and both
+        are fine to run on); an agent that was stopped or frozen was put so on purpose and is
+        left stopped. With ``start_if``, that function decides, called with the body's
+        exception (or None, or the failed stop's JailError): the Guardian's rewind passes one
+        that looks at the error and the space (docs/19, section 4)."""
+        state = self._state() or {}
+        was_running = state.get("Running") is True
+        was_paused = was_running and state.get("Paused") is True
         if was_running:
             try:
-                self.stop()
+                # Read again right before stopping: the space thread freezes without waiting
+                # for anyone, and `docker stop` would wake a frozen agent.
+                if was_paused or self.is_paused():
+                    self.kill()
+                else:
+                    self.stop()
+                if self.is_running():
+                    raise JailError(
+                        f"container {self.config.name} is still running after being stopped: "
+                        "refusing to swap its workspace under it"
+                    )
             except JailError as error:
-                self._restart_after_failed_stop(error)
+                self._restart_after_failed_stop(error, start_if, was_paused)
                 raise
+        body_error: BaseException | None = None
         try:
             yield
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            if was_running:
+            start = (was_running and not was_paused) if start_if is None else start_if(body_error)
+            if start:
                 self.start()
                 self.wait_ready()
 
-    def _restart_after_failed_stop(self, error: JailError) -> None:
+    def _restart_after_failed_stop(
+        self, error: JailError, start_if: StartIf | None, was_paused: bool
+    ) -> None:
         """quiesce could not stop the agent, so its body never runs. The daemon may have
-        stopped it anyway: then start it again, as it was. A failure to do so is added to
-        ``error`` as a note (the caller raises ``error``)."""
+        stopped it anyway: then start it again, as it was (or as ``start_if`` says). A failure
+        to do so is added to ``error`` as a note (the caller raises ``error``)."""
         try:
-            if not self.is_running():
+            if self.is_running():
+                return
+            if (not was_paused) if start_if is None else start_if(error):
                 self.start()
                 self.wait_ready()
         except JailError as restart_error:

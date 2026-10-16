@@ -47,6 +47,7 @@ btrfs_volume = _vm.btrfs_volume
 quota_volume = _vm.quota_volume
 running_agent = _vm.running_agent
 real_service = _vm.real_service
+make_real_service = _vm.make_real_service
 start_quota_agent = _vm.start_quota_agent
 
 
@@ -57,6 +58,16 @@ _REPORTS: pytest.StashKey[dict[str, pytest.TestReport]] = pytest.StashKey()
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "scenario(id): the manifest scenario this test runs")
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Make each scenario selectable by its manifest id, which is Spanish while the test names
+    are English: `make ataques ATK="-k rebobinado-matado"` (or any part of an id, such as
+    `-k rebobin`) runs the tests of the scenarios whose id contains it."""
+    for item in items:
+        marker = item.get_closest_marker("scenario")
+        if marker is not None:
+            item.extra_keyword_matches.add(marker.args[0])
 
 
 @pytest.hookimpl(wrapper=True)

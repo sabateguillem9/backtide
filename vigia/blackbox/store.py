@@ -250,11 +250,15 @@ class BlackBox:
         *,
         since_seq: int | None = None,
         source: Source | str | None = None,
+        action: str | None = None,
         limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[Event]:
-        """Events in ``seq`` order: those with seq > ``since_seq``, from ``source``, at most
-        ``limit``. Does not check hashes (that is verify()); a row that cannot even be
-        parsed raises BlackBoxError."""
+        """Events in ``seq`` order (``newest_first``: the reverse): those with seq >
+        ``since_seq``, from ``source``, with ``action``, at most ``limit``. With
+        ``newest_first`` and ``limit``, the newest ones: so the startup reconciliation reads
+        the last rewind without walking the whole black box. Does not check hashes (that is
+        verify()); a row that cannot even be parsed raises BlackBoxError."""
         clauses: list[str] = []
         params: list[Any] = []
         if since_seq is not None:
@@ -265,10 +269,17 @@ class BlackBox:
         if source is not None:
             clauses.append("source = ?")
             params.append(_parse_source(source).value)
+        if action is not None:
+            if not _valid_action(action):
+                raise ValueError(f"action must be a non-empty str, got {action!r}")
+            clauses.append("action = ?")
+            params.append(action)
+        if not isinstance(newest_first, bool):
+            raise ValueError(f"newest_first must be a bool, got {newest_first!r}")
         sql = _SELECT_EVENTS
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY seq"
+        sql += " ORDER BY seq DESC" if newest_first else " ORDER BY seq"
         if limit is not None:
             if not _is_int(limit) or limit < 1:
                 raise ValueError(f"limit must be an int >= 1, got {limit!r}")
