@@ -2563,3 +2563,68 @@ def test_a_real_jail_whose_stop_fails_in_the_middle_of_a_rewind(
     failed = rewinding.only("agent_stop_failed")
     assert failed.details["reason"] == "rewind" and failed.details["still_running"] is True
     assert rewinding.guardian.agent_state is AgentState.RUNNING
+
+
+# --- the control socket as ``run()`` drives it (T04c-2) ----------------------------------------
+
+
+class FakeControl:
+    """The control socket as the Guardian sees it: start and close, on the shared call log."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+        self.start_error: Exception | None = None
+
+    def start(self) -> None:
+        self.log.append("control.start")
+        if self.start_error is not None:
+            raise self.start_error
+
+    def close(self) -> None:
+        self.log.append("control.close")
+
+
+def test_run_opens_the_control_socket_after_the_agent_is_up_and_closes_it_before_stopping(
+    world: World,
+) -> None:
+    stop = threading.Event()
+    stop.set()  # one start, no cycle, one stop
+    world.guardian.run(stop, control=FakeControl(world.log))  # type: ignore[arg-type]
+    assert index(world.log, "jail.wait_ready") < index(world.log, "control.start")
+    assert index(world.log, "control.start") < index(world.log, "control.close")
+    assert index(world.log, "control.close") < index(world.log, "jail.stop")
+    assert not world.jail.running
+
+
+def test_a_control_socket_that_cannot_start_stops_the_service_and_the_agent(
+    world: World,
+) -> None:
+    """Without the socket, `vigia rebobinar` would find the lock taken and nobody to ask."""
+    control = FakeControl(world.log)
+    control.start_error = RuntimeError("cannot bind")
+    with pytest.raises(RuntimeError, match="cannot bind"):
+        world.guardian.run(threading.Event(), control=control)  # type: ignore[arg-type]
+    assert "control.close" in world.log
+    assert not world.jail.running
+    assert world.actions()[-1] == "system/service_stop"
+
+
+def test_a_control_socket_that_fails_to_close_still_stops_the_agent(world: World) -> None:
+    class BrokenClose(FakeControl):
+        def close(self) -> None:
+            raise RuntimeError("cannot close")
+
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(RuntimeError, match="cannot close"):
+        world.guardian.run(stop, control=BrokenClose(world.log))  # type: ignore[arg-type]
+    assert not world.jail.running
+    assert world.actions()[-1] == "system/service_stop"
+
+
+def test_run_without_a_control_socket_is_what_it_was(world: World) -> None:
+    stop = threading.Event()
+    stop.set()
+    world.guardian.run(stop)
+    assert "control.start" not in world.log
+    assert not world.jail.running

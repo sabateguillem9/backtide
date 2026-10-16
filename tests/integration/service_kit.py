@@ -353,6 +353,28 @@ def kill_a_rewind(service: Service, target: str, when: str) -> subprocess.Comple
     )
 
 
+CLI_TIMEOUT = 300.0
+
+
+def run_cli(
+    service: Service, command: str, *args: str, timeout: float = CLI_TIMEOUT
+) -> subprocess.CompletedProcess[str]:
+    """The real `vigia <command> --config <the service's> <args>` as a process of its own
+    (tests/integration/cli_main.py), with no terminal: `rebobinar` needs ``--si``. Returns the
+    finished process; the tests read its exit code and what it printed."""
+    return subprocess.run(
+        [sys.executable, "-m", "tests.integration.cli_main", command, "--config",
+         str(service.config_path), *args],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": str(REPO), "PYTHONUNBUFFERED": "1"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )  # fmt: skip
+
+
 def snapshot_holds(service: Service, snapshot_id: str | None, files: dict[str, str]) -> bool:
     """Whether ``snapshot_id`` has each of ``files`` (paths inside the agent's folder) with
     exactly that text."""

@@ -29,8 +29,13 @@ says something changed, and stops it. Design: docs/19-diseno-t04.md, section 3.
   (never by the type of an exception), and starts the agent afterwards only if it should run and
   the space is green. A rewind killed half way is reconciled at the next start.
 
-Not here yet: the space thread, ``vigia seguir`` and the pause thresholds (T04d), growth (T04e),
-the control socket (T04c-2). ``space`` is the seam T04d plugs into: a function that returns
+- **The control socket** (T04c-2, ``control.py``): ``run()`` starts it once the service is up and
+  closes it before stopping, so a rewind in flight finishes and is answered. Without a service,
+  ``vigia rebobinar`` opens the Guardian just to rewind (``open_for_rewind``, with a
+  ``NullWatcher``): the agent is never started.
+
+Not here yet: the space thread, ``vigia seguir`` and the pause thresholds (T04d), growth (T04e).
+``space`` is the seam T04d plugs into: a function that returns
 the conditions that forbid the agent to run, evaluated after a ``btrfs filesystem sync`` before
 every snapshot and every agent start. The Guardian only reacts to what it says by not
 snapshotting and by freezing (``jail.pause()``, added in T04d; if it fails, the agent is killed).
@@ -118,6 +123,18 @@ class AgentState(StrEnum):
 # The states in which the agent may run code, so a space condition must freeze it: also while
 # `docker stop` waits for its SIGTERM handler and while `wait_ready` waits for it (a rewind).
 _CAN_RUN_CODE = frozenset({AgentState.RUNNING, AgentState.STARTING, AgentState.STOPPING})
+
+
+class ControlHook(Protocol):
+    """The control socket as ``run()`` sees it (``vigia.service.control.ControlServer``)."""
+
+    def start(self) -> None:
+        """Start answering. Raises if it cannot (the service then stops)."""
+        ...
+
+    def close(self) -> None:
+        """Stop accepting and wait for the requests in flight."""
+        ...
 
 
 class FileWatcher(Protocol):
@@ -928,6 +945,46 @@ class Guardian:
             )
         return False
 
+    # Rewind without a service (T04c-2: `vigia rebobinar` when no `vigia vigilar` runs)
+
+    def open_for_rewind(self) -> None:
+        """Make ``rewind()`` usable without a service: open the black box (so the rewind has
+        somewhere to record), write ``system/cli_start`` and bridge the log into it. Nothing
+        else boots: no snapshot, no watcher armed, no agent started. ``want_running`` is
+        "no" for the state of a fresh Guardian (stopped, no pause), so the agent is never started
+        by this rewind, and one found running unsupervised is stopped by the rewind itself.
+
+        The caller holds ``vigia.lock`` (there is no service) and uses a ``NullWatcher``. Raises
+        BlackBoxError, with nothing touched, if the black box cannot be used: no recording, no
+        rewinding. Call ``close_after_rewind`` when done."""
+        with self.agent_lock:
+            self._stopped = False
+            self._wound_down = False
+            try:
+                self._box.open()
+                self._box.append("system", "cli_start", "", details={"version": vigia.__version__})
+            except BlackBoxError as error:
+                self._wound_down = True
+                logger.error("cannot use the black box, so nothing is rewound: %s", error)
+                raise
+            self._serving = True
+            self._bridge = LogBridge(self._on_log)
+            self._bridge.start()
+            logging.getLogger(_BRIDGED_LOGGERS).addHandler(self._bridge)
+
+    def close_after_rewind(self) -> None:
+        """The end of ``open_for_rewind``: record ``system/cli_stop``, detach the bridge (which
+        drains the bridged log into the black box). Never touches the agent. Idempotent."""
+        with self.agent_lock:
+            if not self._serving:
+                return
+            self._serving = False
+            self._wound_down = True
+            self._stopped = True
+            self._record("system", "cli_stop", details={"agent_state": str(self.agent_state)})
+            logging.getLogger(_BRIDGED_LOGGERS).removeHandler(self._bridge)
+            self._bridge.close()
+
     # Rewind (docs/19, section 4)
 
     def rewind(self, snapshot_id: str, *, requested_by: str) -> RewindOutcome:
@@ -1688,11 +1745,18 @@ class Guardian:
         a caller that wants to read the box right after something was logged)."""
         return self._bridge.flush(timeout)
 
-    def run(self, stop: threading.Event) -> None:
+    def run(self, stop: threading.Event, *, control: ControlHook | None = None) -> None:
         """Start, run a cycle every ``cycle_interval`` seconds until ``stop`` is set, and stop.
-        The caller sets ``stop`` from its signal handlers."""
+        The caller sets ``stop`` from its signal handlers.
+
+        ``control`` (the socket of ``vigia rebobinar``) starts once the service is up and is
+        closed BEFORE the stop: no new request after that, and a rewind in flight finishes and
+        is answered. If it cannot start, the service stops (and so does the agent): without it
+        a `vigia rebobinar` would find the lock taken and nobody to ask."""
         try:
             self.start()
+            if control is not None:
+                control.start()
             while not stop.wait(self._config.cycle_interval):
                 try:
                     self.cycle()
@@ -1700,7 +1764,11 @@ class Guardian:
                     logger.exception("the cycle crashed")
                     self._cycle_problem("crash", error)
         finally:
-            self.stop()
+            try:
+                if control is not None:
+                    control.close()
+            finally:
+                self.stop()
 
     # Records, alerts and watcher guards
 

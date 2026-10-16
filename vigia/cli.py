@@ -2,16 +2,28 @@
 
 import argparse
 import logging
+import signal
 import sys
+import textwrap
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from vigia import __version__
-from vigia.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, load_key
+from vigia.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, load_key, redact
 from vigia.jail import JailError
 from vigia.jail.openclaw import UnrewindableConfig
 from vigia.service.config import ConfigError, ServiceConfig
-from vigia.service.runner import ServiceLocked, serve
+from vigia.service.control import (
+    OUTCOME_EXIT_CODES,
+    ControlError,
+    ControlOutcomeUnknown,
+    ControlUnavailable,
+    ask_rewind,
+)
+from vigia.service.offline import rewind_without_service
+from vigia.service.runner import ServiceLocked, ServiceRunning, serve, take_lock
 from vigia.snapshots import Snapshot, SnapshotError, SnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -20,10 +32,26 @@ EXIT_OK = 0
 EXIT_TAMPERED = 1  # verificar: the black box is not intact
 EXIT_FAILED = 1  # vigilar: the service could not run, or could not stop the agent
 EXIT_ERROR = 2  # usage errors (argparse also exits with 2) and unreadable inputs
+EXIT_PROBLEM = 3  # rebobinar: rewound, but something went wrong afterwards (or cannot tell)
 NOT_VERIFIED = "NO VERIFICADA: trátala como no íntegra"
 MAX_LISTED_PROBLEMS = 50
 DEFAULT_CONFIG = Path("/etc/vigia/vigia.toml")
 DEFAULT_LISTED_SNAPSHOTS = 30  # docs/19, decision 21
+# The notice of `vigia rebobinar` (docs/19, section 7): what a rewind undoes and what it cannot.
+# Telegram (T09) and the web (T12) show the same text.
+REWIND_NOTICE = (
+    "Vas a volver a las {hora} ({hace}). Se deshace: los archivos de trabajo del agente y lo que "
+    "recuerda (memoria y conversaciones) desde esa hora. No se deshace: lo que el agente ya ha "
+    "enviado fuera (mensajes, correos, publicaciones, cambios en servicios); lo que ya salió de "
+    "la máquina no vuelve. Después, el agente no recordará nada posterior a esa hora aunque tus "
+    "chats sí lo muestren, y puede reenviar algún mensaje que estuviera en cola en ese momento. "
+    "Se guarda un punto para deshacer el rebobinado."
+)
+REWIND_NOTICE_WITHOUT_SERVICE = (
+    "Si no hay un servicio de Vigía en marcha (`vigia vigilar`), el rebobinado se hace aquí y el "
+    "agente se queda parado: arráncalo después con `vigia vigilar`."
+)
+YES_ANSWERS = frozenset({"s", "si", "sí"})
 REASON_NAMES = {
     "periodic": "periódica",
     "manual": "manual",
@@ -75,6 +103,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"todas, no solo las {DEFAULT_LISTED_SNAPSHOTS} más nuevas",
     )
     listing.set_defaults(handler=_list_snapshots)
+
+    rewind = commands.add_parser(
+        "rebobinar",
+        help="vuelve el espacio de trabajo del agente a una instantánea",
+        description="Vuelve el espacio de trabajo del agente a una instantánea: copia el "
+        "identificador de la primera columna de `vigia instantaneas`. Enseña qué se deshace y "
+        "qué no, y pide confirmación (`--si` la da por hecha; sin terminal es obligatorio). "
+        "Con un servicio en marcha se lo pide a él por el socket de control y el agente "
+        "vuelve a arrancar; sin servicio rebobina en este proceso y el agente se queda "
+        "parado. Se guarda un punto para deshacer, que se muestra al terminar. Sale con 0 si "
+        "se rebobinó, 1 si no se hizo y el espacio de trabajo no cambió, 2 si hay un error de "
+        "uso o de lectura y 3 si se rebobinó pero con un problema (o no se sabe).",
+    )
+    _add_config(rewind)
+    rewind.add_argument("snapshot", metavar="instantánea", help="identificador de la instantánea")
+    rewind.add_argument("--si", action="store_true", help="no pedir confirmación")
+    rewind.set_defaults(handler=_rewind)
     return parser
 
 
@@ -138,6 +183,9 @@ def _watch(args: argparse.Namespace) -> int:
     except ServiceLocked as error:
         _error(str(error))
         return EXIT_FAILED
+    except ControlError as error:  # the guardian stopped (and the agent with it) before this
+        _error(f"no se puede abrir el socket de control, así que Vigía se ha parado: {error}")
+        return EXIT_FAILED
     except BlackBoxError as error:
         _error(f"no se puede usar la caja negra, así que Vigía no vigila: {error}")
         for note in getattr(error, "__notes__", []):
@@ -177,6 +225,199 @@ def _list_snapshots(args: argparse.Namespace) -> int:
     ):
         print(line)
     return EXIT_OK
+
+
+def _rewind(args: argparse.Namespace) -> int:
+    """`vigia rebobinar`: the notice, the confirmation, and then the rewind through the running
+    service (the lock is taken: its socket) or, if there is none, in this process. Never both:
+    with the lock taken by somebody else this process does not touch the agent."""
+    target = Snapshot.parse(args.snapshot)
+    if target is None:
+        _error(
+            "eso no es el identificador de una instantánea: cópialo de la primera columna de "
+            "`vigia instantaneas`"
+        )
+        return EXIT_ERROR
+    try:
+        config = ServiceConfig.from_file(args.config)
+        known = SnapshotStore(config.volume).snapshots()
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    except SnapshotError as error:
+        _error(f"no se pueden leer las instantáneas: {error}")
+        return EXIT_ERROR
+    if target not in known:
+        _error(f"no existe la instantánea {target.id}: mira `vigia instantaneas`")
+        return EXIT_ERROR
+
+    print(_rewind_notice(target, now=_now(), tz=_local_tz()))
+    if not args.si:
+        confirmed = _confirm()
+        if confirmed is None:
+            _error("sin terminal no se puede preguntar: usa --si para confirmar")
+            return EXIT_ERROR
+        if not confirmed:
+            print("No se ha hecho nada.")
+            return EXIT_FAILED
+
+    try:
+        lock = take_lock(config.lock_file)
+    except ServiceRunning:
+        return _rewind_through_service(config, target)
+    except ServiceLocked as error:  # the lock file itself is unusable: not "a service"
+        _error(str(error))
+        return EXIT_ERROR
+    with lock:
+        return _rewind_in_process(config, target)
+
+
+def _rewind_notice(target: Snapshot, *, now: datetime, tz: tzinfo) -> str:
+    text = REWIND_NOTICE.format(
+        hora=target.taken_at.astimezone(tz).strftime("%H:%M:%S del %Y-%m-%d"),
+        hace=_age(now - target.taken_at),
+    )
+    return "\n\n".join(
+        textwrap.fill(paragraph, width=88) for paragraph in (text, REWIND_NOTICE_WITHOUT_SERVICE)
+    )
+
+
+def _confirm() -> bool | None:
+    """Ask `¿Rebobinar? [s/N]`: True for yes, False for anything else, None without a terminal."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        answer = input("¿Rebobinar? [s/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer.strip().lower() in YES_ANSWERS
+
+
+def _rewind_through_service(config: ServiceConfig, target: Snapshot) -> int:
+    print("Hay un servicio de Vigía en marcha: se lo pido por el socket de control.")
+    try:
+        reply = ask_rewind(config.control_socket, target.id)
+    except ControlUnavailable:
+        _error(
+            "hay un servicio de Vigía que tiene el cerrojo, pero no contesta en el socket de "
+            "control: está arrancando o se ha quedado a medias. No se ha tocado nada; inténtalo "
+            "de nuevo en un momento."
+        )
+        return EXIT_FAILED
+    except ControlOutcomeUnknown as error:  # the request went out: it may have been done
+        _error(str(error))
+        return EXIT_PROBLEM
+    except ControlError as error:  # nothing was sent
+        _error(str(error))
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        _error(
+            "interrumpido. Si el servicio ya había recibido la petición, sigue con el "
+            "rebobinado y no se sabe si terminó: mira `vigia instantaneas`."
+        )
+        return EXIT_PROBLEM
+    outcome: str = reply["outcome"]
+    return _report_rewind(
+        outcome,
+        reply["message"],
+        reply["undo"],
+        agent_line=(
+            "El agente está en marcha otra vez."
+            if reply["agent_started"]
+            else "El agente no se ha arrancado."
+        ),
+    )
+
+
+def _rewind_in_process(config: ServiceConfig, target: Snapshot) -> int:
+    print("No hay un servicio en marcha: rebobino aquí y el agente se queda parado.")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_SafeFormatter("%(levelname)s %(name)s: %(message)s"))
+    package_logger = logging.getLogger("vigia")
+    previous_level = package_logger.level
+    package_logger.addHandler(handler)
+    package_logger.setLevel(logging.WARNING)
+    try:
+        with _shielded_from_stop_signals():
+            outcome = rewind_without_service(config, target.id)
+    except BlackBoxError as error:
+        _error(
+            f"no se puede usar la caja negra, así que no se rebobina (sin grabar no hay "
+            f"vigilancia): {error}"
+        )
+        for note in getattr(error, "__notes__", []):
+            _error(note)
+        return EXIT_FAILED
+    except JailError as error:  # the black box was unusable and the agent could not be stopped
+        _error(f"EL AGENTE SIGUE EN MARCHA y Vigía no ha podido pararlo: {error}")
+        return EXIT_FAILED
+    except Exception as error:  # nothing on this path is swallowed: logged with its trace
+        logger.exception("vigia rebobinar failed")
+        _error(
+            f"error inesperado, no se sabe si se rebobinó: {type(error).__name__}: {error}. "
+            "Mira `vigia instantaneas`; el próximo `vigia vigilar` lo concilia."
+        )
+        return EXIT_PROBLEM
+    finally:
+        package_logger.removeHandler(handler)
+        package_logger.setLevel(previous_level)
+    return _report_rewind(
+        str(outcome.status),
+        outcome.message,
+        outcome.undo,
+        agent_line="El agente queda parado: arráncalo con `vigia vigilar`.",
+    )
+
+
+def _report_rewind(outcome: str, message: str, undo: str | None, *, agent_line: str) -> int:
+    """Print what the rewind did and return the exit code. Everything here may come from the
+    service or the agent's world: it is redacted and its control characters escaped."""
+    code = OUTCOME_EXIT_CODES[outcome]
+    text = _printable(redact(message))
+    if code == EXIT_OK:
+        print(text)
+    elif outcome in ("problem", "unknown"):
+        print(f"AVISO: {text}", file=sys.stderr)
+    else:
+        _error(text)
+    if outcome in ("done", "problem"):
+        if undo is not None and Snapshot.parse(undo) is not None:
+            print(f"Para deshacer: vigia rebobinar {undo}")
+        elif undo is not None:
+            _error("el servicio ha dado un punto para deshacer que no es válido: no se muestra")
+        else:
+            print("No se ha podido guardar un punto para deshacer.", file=sys.stderr)
+        print(agent_line)
+    return code
+
+
+@contextmanager
+def _shielded_from_stop_signals() -> Iterator[None]:
+    """Ctrl-C, SIGTERM and SIGHUP are ignored while this process rewinds on its own: a rewind
+    cut in the middle would leave the agent stopped and the workspace half swapped. (A service
+    is shielded by being another process; SIGKILL still can, and the next start reconciles it.)
+    Only the main thread can change handlers: elsewhere nothing is shielded."""
+    numbers = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    try:
+        previous = {number: signal.signal(number, signal.SIG_IGN) for number in numbers}
+    except ValueError:
+        yield
+        return
+    print("Rebobinando: Ctrl-C se ignora hasta terminar, para no dejarlo a medias.", flush=True)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+class _SafeFormatter(logging.Formatter):
+    """Log lines for the person's terminal: redacted, and with control characters escaped. A
+    log message can quote what the agent wrote (a Docker error, a path)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _printable(redact(super().format(record)))
 
 
 def _snapshot_lines(
@@ -234,7 +475,7 @@ def _local_tz() -> tzinfo:
 
 
 def _error(message: str) -> None:
-    print(f"ERROR: {_printable(message)}", file=sys.stderr)
+    print(f"ERROR: {_printable(redact(message))}", file=sys.stderr)
 
 
 def _print_report(report: VerifyReport) -> None:

@@ -22,6 +22,7 @@ from vigia.service.config import Secret, ServiceConfig
 from vigia.service.guardian import Guardian
 from vigia.service.runner import (
     ServiceLocked,
+    ServiceRunning,
     build_guardian,
     open_black_box,
     run_guardian,
@@ -49,6 +50,22 @@ def test_the_lock_is_taken_and_a_second_owner_is_refused(config: ServiceConfig) 
             take_lock(config.lock_file)
     with take_lock(config.lock_file):  # released when the first owner is done
         pass
+
+
+def test_a_lock_held_by_a_live_process_is_told_apart_from_an_unusable_lock_file(
+    config: ServiceConfig, tmp_path: Path
+) -> None:
+    """`vigia rebobinar` asks the service over the socket only when the lock is HELD
+    (ServiceRunning); a lock file it cannot use is an error, not a service."""
+    with take_lock(config.lock_file):
+        with pytest.raises(ServiceRunning):
+            take_lock(config.lock_file)
+    other = tmp_path / "other-state"
+    other.mkdir(mode=0o700)
+    (other / "vigia.lock").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(ServiceLocked) as raised:
+        take_lock(other / "vigia.lock")
+    assert not isinstance(raised.value, ServiceRunning)
 
 
 def test_the_lock_file_is_private(config: ServiceConfig) -> None:
@@ -229,6 +246,56 @@ def test_the_alerts_are_running_before_the_guardian_and_everything_is_closed_aft
         "alerts.close",
         "box.close",
     ]
+
+
+def test_the_control_socket_is_handed_to_the_guardian() -> None:
+    calls: list[str] = []
+    received: list[object] = []
+
+    class ControlledGuardian(FakeGuardian):
+        def run(self, stop: threading.Event, **options: object) -> None:  # type: ignore[override]
+            received.append(options.get("control"))
+            super().run(stop)
+
+    guardian = ControlledGuardian(calls)
+    guardian.on_run = lambda stop: None
+    control = object()
+    run(calls, guardian, handle_signals=False, control=control)
+    assert received == [control]
+
+
+def test_without_a_control_socket_the_guardian_is_run_as_before() -> None:
+    calls: list[str] = []
+    received: list[object] = []
+
+    class ControlledGuardian(FakeGuardian):
+        def run(self, stop: threading.Event, **options: object) -> None:  # type: ignore[override]
+            received.append(options)
+            super().run(stop)
+
+    guardian = ControlledGuardian(calls)
+    guardian.on_run = lambda stop: None
+    run(calls, guardian, handle_signals=False)
+    assert received == [{}]
+
+
+def test_serve_opens_the_control_socket_for_the_whole_life_of_the_service(
+    config: ServiceConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """serve() builds the real ControlServer on ``config.control_socket`` and gives it to the
+    guardian, which starts it once the agent is up (the guardian is a fake here)."""
+    import vigia.service.runner as runner  # noqa: PLC0415
+
+    seen: list[object] = []
+
+    def fake_run(guardian: object, alerts: object, box: object, **kwargs: object) -> None:
+        seen.append(kwargs.get("control"))
+
+    monkeypatch.setattr(runner, "run_guardian", fake_run)
+    serve(config, jail=AgentJail(config.jail_config()), handle_signals=False)
+    (control,) = seen
+    assert isinstance(control, runner.ControlServer)
+    assert control.path == config.control_socket == config.state_dir / "control.sock"
 
 
 def test_a_guardian_that_fails_still_closes_the_alerts_and_the_box() -> None:

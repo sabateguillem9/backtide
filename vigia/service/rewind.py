@@ -50,7 +50,7 @@ class RewindStatus(StrEnum):
     UNKNOWN = "unknown"  # the workspace id cannot be read: the next start reconciles it
 
 
-_EXIT_CODES = {
+EXIT_CODES = {
     RewindStatus.DONE: 0,
     RewindStatus.FAILED: 1,
     RewindStatus.INVALID: 2,
@@ -81,7 +81,7 @@ class RewindOutcome:
     def exit_code(self) -> int:
         """0 rewound; 1 not done, workspace unchanged; 2 invalid id; 3 rewound with a problem
         (or cannot tell)."""
-        return _EXIT_CODES[self.status]
+        return EXIT_CODES[self.status]
 
 
 def is_space_error(error: BaseException | None) -> bool:
@@ -174,6 +174,7 @@ def remove_pending(path: Path) -> None:
 
 
 __all__ = [
+    "EXIT_CODES",
     "PendingError",
     "PendingRewind",
     "RewindOutcome",

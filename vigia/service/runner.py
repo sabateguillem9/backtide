@@ -3,9 +3,10 @@
 Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
 
 - ``take_lock``: one owner of the agent at a time. ``vigia.lock`` is held with ``flock`` for the
-  whole life of the service, so ``vigia rebobinar`` (T04c-2) can tell "no service" from "a
-  service" by trying the same lock without blocking. The kernel drops it when the process dies,
-  also with SIGKILL, so a killed service never leaves a lock behind.
+  whole life of the service, so ``vigia rebobinar`` can tell "no service" (it takes the lock and
+  rewinds in its own process) from "a service" (``ServiceRunning``: it asks over the control
+  socket, ``control.py``) by trying the same lock without blocking. The kernel drops it when
+  the process dies, also with SIGKILL, so a killed service never leaves a lock behind.
 - ``open_black_box``: the key is made on the very first start and never again. A database (or
   its checkpoint, -wal or -shm) without its key is an error, not a reason to start a new chain.
   If the black box cannot be used, an agent left running by a killed service is stopped before
@@ -35,7 +36,8 @@ from vigia.jail import AgentJail, JailError
 from vigia.notify import AlertQueue, LogNotifier, Notifier
 from vigia.sensors.files import FileWatcher, WatcherConfig
 from vigia.service.config import ServiceConfig
-from vigia.service.guardian import Guardian, halt_agent
+from vigia.service.control import ControlServer
+from vigia.service.guardian import ControlHook, Guardian, halt_agent
 from vigia.snapshots import SnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,12 @@ _HANDLER = Callable[[int, FrameType | None], None]
 class ServiceLocked(RuntimeError):  # noqa: N818 - reads better than ServiceLockedError
     """The lock is taken (another service owns the agent) or cannot be used. The message is
     for the user, in Spanish."""
+
+
+class ServiceRunning(ServiceLocked):
+    """The lock is held by a live process: there is a service (or a rewind without one) that
+    owns the agent. ``vigia rebobinar`` asks it over the control socket instead of rewinding
+    in its own process."""
 
 
 class ServiceLock:
@@ -92,7 +100,7 @@ def take_lock(path: Path) -> ServiceLock:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
-            raise ServiceLocked(
+            raise ServiceRunning(
                 "Ya hay un `vigia vigilar` en marcha: solo uno puede vigilar al agente "
                 f"(cerrojo {path})."
             ) from None
@@ -221,7 +229,7 @@ def _stop_unrecorded_agent(jail: AgentJail, error: BlackBoxError) -> None:
 
 
 class _Runnable(Protocol):
-    def run(self, stop: threading.Event) -> None: ...
+    def run(self, stop: threading.Event, **options: ControlHook) -> None: ...
 
 
 class _Closable(Protocol):
@@ -239,13 +247,15 @@ def run_guardian(
     *,
     stop: threading.Event | None = None,
     handle_signals: bool = True,
+    control: ControlHook | None = None,
 ) -> None:
     """Run ``guardian`` until ``stop`` is set, SIGTERM, SIGINT or SIGHUP arrives, or it fails.
 
     The alerts are delivering before the guardian starts and are flushed after it ends, so the
     alert about a failed start is not lost. The guardian's own ``run`` stops the agent and
     records ``service_stop``; the black box is closed last. Raises what the guardian raises.
-    Signal handlers only work in the main thread."""
+    ``control`` is the control socket (``ControlServer``): the guardian starts it once the
+    service is up and closes it before stopping. Signal handlers only work in the main thread."""
     stop = stop if stop is not None else threading.Event()
     wake = _StopPipe(stop) if handle_signals else None
     previous: dict[int, object] = {}
@@ -254,7 +264,10 @@ def run_guardian(
             previous[number] = signal.signal(number, wake.on_signal)
     alerts.start()
     try:
-        guardian.run(stop)
+        if control is None:
+            guardian.run(stop)
+        else:
+            guardian.run(stop, control=control)
     finally:
         try:
             alerts.close()
@@ -305,11 +318,16 @@ def serve(
     handle_signals: bool = True,
 ) -> None:
     """What `vigia vigilar` does: take the lock, build the real service and run it until it is
-    told to stop. Raises ServiceLocked, BlackBoxError, ConfigError-like errors from the parts,
-    ``UnrewindableConfig`` (the caller shows its ``notice``) or, if the agent could not be
-    stopped, the JailError that says it keeps running."""
+    told to stop, with the control socket of ``vigia rebobinar`` open while it runs. Raises
+    ServiceLocked, ControlError (the socket cannot be opened; the agent is stopped then),
+    BlackBoxError, ConfigError-like errors from the parts, ``UnrewindableConfig`` (the caller
+    shows its ``notice``) or, if the agent could not be stopped, the JailError that says it
+    keeps running."""
     with take_lock(config.lock_file):
         guardian, alerts, box = build_guardian(
             config, jail=jail, notifier=notifier, watcher_config=watcher_config
         )
-        run_guardian(guardian, alerts, box, stop=stop, handle_signals=handle_signals)
+        control = ControlServer(guardian, config.control_socket)
+        run_guardian(
+            guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control
+        )
