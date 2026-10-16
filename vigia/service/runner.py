@@ -246,7 +246,7 @@ def _stop_unrecorded_agent(jail: AgentJail, error: BlackBoxError) -> None:
     if not running:
         return
     logger.error("cannot use the black box, so the agent that was running is stopped: %s", error)
-    stop_error = halt_agent(jail)
+    stop_error = halt_agent(jail, kill_first=True)  # unwatched: no `docker stop` grace period
     if stop_error is not None:
         raise JailError(
             f"EL AGENTE SIGUE EN MARCHA sin vigilancia: la caja negra no se puede usar ({error}) "

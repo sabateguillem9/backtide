@@ -485,7 +485,7 @@ def test_an_unusable_key_stops_the_agent_a_killed_service_left_running(
     with pytest.raises(BlackBoxError) as raised:
         build_guardian(config, jail=jail)  # type: ignore[arg-type]
     assert not jail.running
-    assert jail.calls == ["stop"]
+    assert jail.calls == ["kill"]  # nobody watches it: killed, not given 30 s to stop
     assert any("parado" in note for note in raised.value.__notes__)
 
 
@@ -507,7 +507,7 @@ def test_an_unusable_key_and_an_agent_that_will_not_stop_says_the_agent_keeps_ru
     with pytest.raises(JailError, match="SIGUE EN MARCHA") as raised:
         build_guardian(config, jail=jail)  # type: ignore[arg-type]
     assert isinstance(raised.value.__cause__, BlackBoxError)  # and the key's problem with it
-    assert jail.calls == ["stop", "kill", "remove"]
+    assert jail.calls == ["kill", "remove"]
 
 
 def test_an_unusable_key_in_serve_releases_the_lock_after_stopping_the_agent(

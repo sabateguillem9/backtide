@@ -34,6 +34,7 @@ CAP = 64 * MIB
     [
         (ResumeStatus.RESUMED, 0),
         (ResumeStatus.NOT_PAUSED, 0),
+        (ResumeStatus.STOPPED, 1),
         (ResumeStatus.STILL_RED, 1),
         (ResumeStatus.STILL_PAUSED, 1),
         (ResumeStatus.FAILED, 1),

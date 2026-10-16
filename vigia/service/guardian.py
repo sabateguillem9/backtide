@@ -444,7 +444,7 @@ class Guardian:
             running = True  # cannot tell: try to stop it
         if not running:
             return
-        stop_error = self._halt()
+        stop_error = self._halt(kill_first=True)  # unwatched and unrecorded: no grace period
         if stop_error is not None:
             error.add_note(f"stopping the running agent also failed: {stop_error}")
             logger.error("cannot stop the agent while the black box is down: %s", stop_error)
@@ -500,7 +500,9 @@ class Guardian:
         if not self._jail.is_running():
             return
         self._mark_stopping()
-        error = self._halt()
+        # Killed, not stopped: nobody has watched it, and `docker stop` would give it up to
+        # `stop_timeout` more seconds of running without a watcher.
+        error = self._halt(kill_first=True)
         if error is not None:
             self._set_state(AgentState.RUNNING)
             event = self._record(
@@ -1339,6 +1341,15 @@ class Guardian:
         with self.freeze_lock:
             reasons = set(self._pause_reasons)
         if not reasons & SPACE_REASONS:
+            if not reasons and self._stopped_with_no_pause():
+                return ResumeOutcome(
+                    ResumeStatus.STOPPED,
+                    "El agente está parado, pero no por falta de espacio: no hay ninguna pausa "
+                    "que cerrar y `vigia seguir` no lo arranca. Mira por qué se paró en la "
+                    "caja negra (eventos `agent_stop` y `agent_start_failed`) y reinicia "
+                    "`vigia vigilar`: al arrancar, el servicio lo pone en marcha vigilado.",
+                    str(self.agent_state),
+                )
             return ResumeOutcome(
                 ResumeStatus.NOT_PAUSED,
                 "El agente no está pausado por falta de espacio: no hay nada que reanudar.",
@@ -1412,6 +1423,15 @@ class Guardian:
             str(self.agent_state),
         )
 
+    def _stopped_with_no_pause(self) -> bool:
+        """Docker says the agent is not running while no pause is open (Docker's word, as in
+        ``_wake_agent``; if it cannot be read, "nothing to resume" stands)."""
+        try:
+            return not self._jail.is_running()
+        except JailError as error:
+            logger.warning("cannot tell whether the agent runs to answer `seguir`: %s", error)
+            return False
+
     def _wake_agent(self) -> str:
         """Thaw a frozen agent, or start a stopped one. Docker's state decides, never ours.
         A frozen agent that cannot be thawed is killed and started again. Returns what was
@@ -1452,7 +1472,7 @@ class Guardian:
             # Running while we had it stopped: nobody armed the watcher for it. Stop it and
             # start it the watched way.
             self._mark_stopping()
-            if self._halt() is not None:
+            if self._halt(kill_first=True) is not None:  # unwatched: no `docker stop` grace
                 self._set_state(AgentState.RUNNING)
                 return "running"
             self._set_state(AgentState.STOPPED)
@@ -1701,6 +1721,11 @@ class Guardian:
             state, reasons = self._agent_state, set(self._pause_reasons)
         if reasons:
             return reasons <= SPACE_REASONS
+        if state is AgentState.FROZEN:
+            # No reason is open: the space thread froze it to confirm a condition (nothing is
+            # confirmed yet), and it goes back to what it was if the alarm is false. A rewind
+            # that left it stopped here would leave it stopped with nothing written down.
+            return self._thaw_to is AgentState.RUNNING
         return state is AgentState.RUNNING
 
     @contextmanager

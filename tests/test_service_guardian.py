@@ -630,8 +630,10 @@ def test_the_service_start_event_carries_the_version(world: World) -> None:
 def test_an_agent_found_running_is_stopped_first_and_the_gap_is_recorded(world: World) -> None:
     world.jail.running = True
     world.guardian.start()
-    assert world.log[0] == "jail.stop"
-    assert index(world.log, "jail.stop") < index(world.log, "store.init")
+    # Killed, not stopped: `docker stop` would give it up to 30 s more of unwatched running.
+    assert world.log[0] == "jail.kill"
+    assert "jail.stop" not in world.log
+    assert index(world.log, "jail.kill") < index(world.log, "store.init")
     unsupervised = world.only("agent_stop")
     assert unsupervised.details == {"reason": "unsupervised"}
     assert unsupervised.risk == 2
@@ -667,7 +669,7 @@ def test_without_a_black_box_a_running_agent_is_stopped(world: World) -> None:
     world.box.open_error = BlackBoxError("disk full")
     with pytest.raises(BlackBoxError):
         world.guardian.start()
-    assert world.log == ["jail.stop"]
+    assert world.log == ["jail.kill"]  # nobody watches it: no SIGTERM grace period
     assert not world.jail.running
 
 
@@ -679,7 +681,7 @@ def test_without_a_black_box_and_an_agent_that_will_not_stop_the_error_says_both
     world.box.open_error = BlackBoxError("disk full")
     with pytest.raises(BlackBoxError) as raised:
         world.guardian.start()
-    assert any("docker stop failed" in note for note in raised.value.__notes__)
+    assert any("docker kill failed" in note for note in raised.value.__notes__)
 
 
 def test_a_failing_boot_step_is_recorded_and_raised(world: World) -> None:
@@ -1535,7 +1537,7 @@ def test_a_black_box_that_cannot_be_written_stops_an_agent_found_running(world: 
     world.box.append_error = BlackBoxError("disk full")
     with pytest.raises(BlackBoxError):
         world.guardian.start()
-    assert world.log == ["jail.stop"]
+    assert world.log == ["jail.kill"]
     assert not world.jail.running
 
 

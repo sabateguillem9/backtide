@@ -11,8 +11,9 @@ jail and the real black box, and the same events; the differences from a service
   ``vigia vigilar`` arms the watcher on the new workspace at boot (and records, as it does after
   any downtime, that nobody was watching).
 - The agent is never started: a fresh Guardian is "stopped, no pause", so ``want_running`` is
-  false. An agent found running unsupervised (a killed service left it) is stopped by the rewind
-  itself and stays stopped, with the usual ``agent_stop {reason: rewind}``.
+  false. An agent found running unsupervised (a killed service left it) is frozen first and then
+  killed by the rewind itself (never ``docker stop``: that gives it seconds of unwatched running)
+  and stays stopped, with the usual ``agent_stop {reason: rewind}``.
 - No snapshot is taken, no cycle runs. The person starts the service again when they want the
   agent back (`vigia vigilar`).
 
@@ -26,7 +27,7 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 from vigia.blackbox import BlackBoxError
-from vigia.jail import AgentJail
+from vigia.jail import AgentJail, JailError
 from vigia.notify import AlertQueue, LogNotifier, Notifier
 from vigia.service.config import ServiceConfig
 from vigia.service.guardian import Guardian
@@ -58,6 +59,31 @@ class NullWatcher:
 
     def close(self) -> None:
         return None
+
+
+def _freeze_unwatched_agent(jail: AgentJail) -> bool:
+    """An agent found running with no service has run unwatched. Freeze it at once (a few
+    milliseconds) so that the rewind kills it, as it does a frozen one, instead of giving it
+    `docker stop`'s grace period (up to ``stop_timeout`` seconds of running with no watcher).
+    True if it was frozen here. A failure is logged and the rewind stops it the usual way."""
+    try:
+        if not jail.is_running() or jail.is_paused():
+            return False
+        jail.pause()
+    except JailError as error:
+        logger.warning("cannot freeze the unwatched agent before the rewind: %s", error)
+        return False
+    return True
+
+
+def _thaw_if_left_frozen(jail: AgentJail) -> None:
+    """The rewind ended and the agent we froze is still there (it was refused or failed before
+    stopping it): it goes back to how it was found."""
+    try:
+        if jail.is_running() and jail.is_paused():
+            jail.unpause()
+    except JailError as error:
+        logger.error("cannot thaw the agent that was frozen for the rewind: %s", error)
 
 
 @contextmanager
@@ -107,6 +133,7 @@ def rewind_without_service(
         except BlackBoxError as error:
             _stop_unrecorded_agent(jail, error)
             raise
+        frozen = _freeze_unwatched_agent(jail)
         try:
             return guardian.rewind(snapshot_id, requested_by=requested_by)
         except Exception:
@@ -114,6 +141,8 @@ def rewind_without_service(
             logger.exception("the rewind to %s failed unexpectedly", snapshot_id)
             raise
         finally:
+            if frozen:
+                _thaw_if_left_frozen(jail)
             guardian.close_after_rewind()
     finally:
         try:

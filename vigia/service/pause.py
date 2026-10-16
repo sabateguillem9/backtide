@@ -42,6 +42,7 @@ REASON_NAMES = {
 class ResumeStatus(StrEnum):
     RESUMED = "resumed"  # the pause by space is closed and the agent runs again
     NOT_PAUSED = "not_paused"  # there was no pause by space to close
+    STOPPED = "stopped"  # no pause to close, but the agent is stopped: nothing here starts it
     STILL_RED = "still_red"  # a condition still stands: nothing changed
     STILL_PAUSED = "still_paused"  # the space pause is closed, another reason keeps it paused
     FAILED = "failed"  # no service to resume anything
@@ -51,6 +52,7 @@ class ResumeStatus(StrEnum):
 RESUME_EXIT_CODES = {
     ResumeStatus.RESUMED: 0,
     ResumeStatus.NOT_PAUSED: 0,
+    ResumeStatus.STOPPED: 1,
     ResumeStatus.STILL_RED: 1,
     ResumeStatus.STILL_PAUSED: 1,
     ResumeStatus.FAILED: 1,

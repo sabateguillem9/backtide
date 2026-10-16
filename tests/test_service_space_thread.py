@@ -514,6 +514,63 @@ def test_a_rewind_of_a_frozen_agent_never_leaves_a_frozen_container(frozen: Worl
     assert frozen.jail.running and not frozen.jail.paused
 
 
+def test_a_rewind_during_a_freeze_to_confirm_starts_the_agent_again(live: World) -> None:
+    """The space thread froze the agent to confirm a condition (no reason is open yet) and a
+    rewind comes in: the agent was running, so it runs after the rewind. It is not left stopped
+    with nothing written down, where `vigia seguir` would say there is nothing to resume."""
+    epoch = live.guardian._freeze_to_confirm()  # noqa: SLF001 - the space thread, mid-confirmation
+    assert isinstance(epoch, int) and live.guardian.pause_reasons == frozenset()
+    script(live, [])
+    outcome = live.guardian.rewind(live.volume.listed[0].id, requested_by="cli")
+    assert outcome.rewound and outcome.agent_started
+    assert live.jail.running and not live.jail.paused
+    assert live.guardian.agent_state is AgentState.RUNNING
+    live.log.clear()
+    live.guardian._thaw_after_false_alarm(epoch)  # noqa: SLF001 - the freeze is no longer ours
+    assert "jail.unpause" not in live.log
+    assert live.guardian.agent_state is AgentState.RUNNING
+
+
+def test_a_rewind_during_a_freeze_to_confirm_with_red_space_leaves_a_pause_to_close(
+    live: World,
+) -> None:
+    live.guardian._freeze_to_confirm()  # noqa: SLF001
+    script(live, [P1])
+    outcome = live.guardian.rewind(live.volume.listed[0].id, requested_by="cli")
+    assert outcome.rewound and not outcome.agent_started
+    assert not live.jail.running
+    assert live.guardian.pause_reasons == {"space"}  # the reason is written down
+    script(live, [])
+    assert live.guardian.resume(requested_by="cli").status is ResumeStatus.RESUMED
+    assert live.jail.running
+
+
+def test_a_rewind_of_a_freeze_that_was_not_a_confirmation_is_unchanged(live: World) -> None:
+    """A frozen agent that is not mid-confirmation (a stopped agent, here) is not started."""
+    live.guardian._set_state(AgentState.STOPPED)  # noqa: SLF001
+    live.jail.running = False
+    outcome = live.guardian.rewind(live.volume.listed[0].id, requested_by="cli")
+    assert outcome.rewound and not outcome.agent_started
+    assert not live.jail.running
+
+
+def test_resume_of_an_agent_stopped_with_no_pause_says_what_to_do(live: World) -> None:
+    """Nothing is paused by space and the agent is stopped: `vigia seguir` does not say "nothing
+    to resume" as if all were well; it says the agent is stopped and how to get it back."""
+    live.guardian._set_state(AgentState.STOPPED)  # noqa: SLF001
+    live.jail.running = False
+    outcome = live.guardian.resume(requested_by="cli")
+    assert outcome.status is ResumeStatus.STOPPED
+    assert outcome.exit_code == 1
+    assert "parado" in outcome.message and "vigia vigilar" in outcome.message
+    assert "jail.start" not in live.log  # it is not started behind anybody's back
+
+
+def test_resume_of_a_running_agent_with_no_pause_still_has_nothing_to_resume(live: World) -> None:
+    outcome = live.guardian.resume(requested_by="cli")
+    assert outcome.status is ResumeStatus.NOT_PAUSED and outcome.exit_code == 0
+
+
 # --- the threads in run() ----------------------------------------------------------------------
 
 
@@ -610,7 +667,8 @@ def test_an_agent_found_running_while_stopped_is_restarted_watched_on_resume(
     script(live, [])
     outcome = live.guardian.resume(requested_by="cli")
     assert outcome.status is ResumeStatus.RESUMED
-    assert live.log.index("jail.stop") < live.log.index("jail.start")
+    assert live.log.index("jail.kill") < live.log.index("jail.start")
+    assert "jail.stop" not in live.log  # unwatched: no 30 s of SIGTERM grace
     assert live.only("space_resume").details["agent"] == "started"
 
 

@@ -123,7 +123,9 @@ def test_an_agent_found_running_is_stopped_by_the_rewind_and_left_stopped(rig: R
     outcome = rig.rewind()
     assert outcome.status is RewindStatus.DONE  # type: ignore[attr-defined]
     assert not rig.jail.running
-    assert "jail.stop" in rig.log and "jail.start" not in rig.log
+    # Nobody watches it, so it is frozen and killed, never given `docker stop`'s 30 s.
+    assert rig.log.index("jail.pause") < rig.log.index("jail.kill")
+    assert "jail.stop" not in rig.log and "jail.start" not in rig.log
     (stop,) = [e for e in rig.events() if e.action == "agent_stop"]
     assert stop.details["reason"] == "rewind"
     done = next(e for e in rig.events() if e.action == "rewind_done")
@@ -148,6 +150,7 @@ def test_a_black_box_that_cannot_be_used_means_nothing_is_rewound_and_an_unrecor
         rig.rewind()
     assert "store.restore" not in rig.log
     assert not rig.jail.running  # as the service does: with nothing to record it, it must not run
+    assert rig.log == ["jail.kill"]
     assert any("parado" in note for note in raised.value.__notes__)
 
 
