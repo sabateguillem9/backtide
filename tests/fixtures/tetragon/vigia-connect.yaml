@@ -1,0 +1,26 @@
+# The connect policy of docs/23, section 4: every connect() to an IPv4 or IPv6 address made
+# outside the host's network namespace. Loopback is filtered by the reader, not here (sockaddr
+# cannot be matched by address). Checked in the VM by test_sensor_assumptions.py (P7);
+# T07-2 moves it to its final place next to the sensor's code.
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "vigia-connect"
+spec:
+  kprobes:
+  - call: "security_socket_connect"
+    syscall: false
+    args:
+    - index: 0
+      type: "socket"  # struct socket *, not struct sock * (Tetragon warns with "sock")
+    - index: 1
+      type: "sockaddr"
+    selectors:
+    - matchArgs:
+      - index: 1
+        operator: "Family"
+        values: ["AF_INET", "AF_INET6"]
+      matchNamespaces:
+      - namespace: Net
+        operator: NotIn
+        values: ["host_ns"]
