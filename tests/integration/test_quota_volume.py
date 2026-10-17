@@ -1,10 +1,14 @@
-"""The guard around the one sudo command of ``quota_volume`` (conftest.py), checked in the VM.
+"""The guards around the two sudo btrfs commands of conftest.py, checked in the VM.
 
 QuotaVolume.set_limit runs ``sudo -n btrfs qgroup limit <bytes>|none <path>`` through
 _sudo_btrfs, which checks the argv, the mount and the path itself, before sudo runs. Each test
 caps a real subvolume first (the positive control, a real sudo), then forbids every
 subprocess: a guard that let something through fails the test instead of running sudo on it.
 Afterwards the cap must be unchanged.
+
+The second one is ``sudo -n btrfs filesystem resize max <mnt>`` (_sudo_btrfs_resize, approved by
+the founder on 2026-10-17 for test_grow.py): it refuses, before sudo runs, any path that is not
+a mount point this process mounted itself.
 """
 
 import subprocess
@@ -199,3 +203,36 @@ def test_sudo_btrfs_runs_only_on_the_mount_point_of_a_test_btrfs(
     assert btrfs.qgroup_usage(workspace).limit == CAP
     sudo_btrfs(mnt, args)  # the same argv on the right mount runs
     assert btrfs.qgroup_usage(workspace).limit is None
+
+
+# _sudo_btrfs_resize: only `filesystem resize max`, only on a mount this process mounted
+
+
+def test_sudo_btrfs_resize_runs_only_on_a_mount_this_test_made(
+    quota_volume: QuotaVolume,
+    workspace: Path,
+    sudo_btrfs_resize: Callable[[Path], None],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mnt = quota_volume.mnt
+    (mnt.parent / "mntlink").symlink_to(mnt)
+    outside = tmp_path / "not-a-mount"
+    outside.mkdir()
+
+    with no_subprocess(monkeypatch):
+        for refused in (
+            Path("/"),
+            outside,
+            mnt.parent,
+            mnt / "workspace",
+            workspace,
+            mnt.parent / "mntlink",
+            mnt / ".." / mnt.name,
+            Path("mnt"),
+            str(mnt),
+        ):
+            with pytest.raises(SnapshotError, match="refusing sudo btrfs resize"):
+                sudo_btrfs_resize(refused)  # type: ignore[arg-type]
+
+    sudo_btrfs_resize(mnt)  # the same call on the right mount runs (a no-op: already max)

@@ -1,15 +1,18 @@
 """A real, throwaway Btrfs for the VM integration tests, mounted from a sparse file.
 
-Everything runs as the unprivileged Lima user except exactly four ``sudo -n`` commands:
-``mount -o loop,...,user_subvol_rm_allowed``, ``chown``, ``umount`` and, only on a
-``quota_volume``, ``btrfs qgroup limit <bytes>|none <path>`` (plus ``sudo -n true``, which only
-checks that sudo works without a password). Every path comes from ``tmp_path_factory`` (never
-from the environment), and before unmounting the fixture checks in /proc/self/mountinfo that
-the mount point is the btrfs loop mount of its own image. ``qgroup limit`` is checked in the
-one function that runs it (_sudo_btrfs, whoever calls it): exactly that argv and nothing else,
-the loop mount of a test image, and a canonical path (no symlink anywhere) that is a
-subvolume root strictly inside that mount, on that same btrfs. test_quota_volume.py tests
-each refusal.
+Everything runs as the unprivileged Lima user except exactly five ``sudo -n`` commands:
+``mount -o loop,...,user_subvol_rm_allowed``, ``chown``, ``umount``, only on a
+``quota_volume``, ``btrfs qgroup limit <bytes>|none <path>`` and, only in test_grow.py (approved
+by the founder on 2026-10-17, docs/19), ``btrfs filesystem resize max <mount point>`` (plus
+``sudo -n true``, which only checks that sudo works without a password). Every path comes from
+``tmp_path_factory`` (never from the environment), and before unmounting the fixture checks in
+/proc/self/mountinfo that the mount point is the btrfs loop mount of its own image.
+``qgroup limit`` is checked in the one function that runs it (_sudo_btrfs, whoever calls it):
+exactly that argv and nothing else, the loop mount of a test image, and a canonical path (no
+symlink anywhere) that is a subvolume root strictly inside that mount, on that same btrfs.
+``resize max`` is checked in the one function that runs it (_sudo_btrfs_resize): exactly
+that argv, on a mount point that this process mounted itself (_TEST_MOUNTS) and that
+_require_test_mount accepts. test_quota_volume.py tests each refusal.
 
 Simple quotas are enabled by the unprivileged ``mkfs.btrfs -O squota`` on the image, so
 ``btrfs quota enable --simple`` is never needed. The tests never run ``btrfs qgroup destroy``
@@ -58,7 +61,7 @@ import pytest
 from tests.integration.service_kit import Service, make_service
 from vigia.jail import IMAGE, AgentJail, AgentJailConfig, JailError
 from vigia.jail import docker as jail_docker
-from vigia.snapshots import SnapshotError, btrfs
+from vigia.snapshots import SnapshotError, btrfs, grow
 from vigia.snapshots.store import SnapshotStore
 
 GIB = 1024**3
@@ -66,6 +69,11 @@ MOUNT_OPTIONS = "loop,noatime,nosuid,nodev,user_subvol_rm_allowed"
 COMMAND_TIMEOUT = 60.0
 VM_HOSTNAME = "lima-vigia-dev"  # Lima names the guest lima-<instance>; see VM in the Makefile
 OWNER_LOCK = "owner.lock"
+# The mount points this process mounted itself (see _mounted_btrfs): the only ones that
+# ``resize max`` may run on. Module state: pytest loads this file as ``conftest`` while a test
+# that imports it gets ``tests.integration.conftest``, a second copy with its own set, so only
+# the fixtures of this file (small_btrfs_volume, quota_volume...) may mount.
+_TEST_MOUNTS: set[Path] = set()
 VOLUME_IMAGE = "volume.img"  # the sparse file behind each test btrfs, next to its mount point
 SUDO_HINT = "integration tests need passwordless sudo in the VM to mount a loop btrfs"
 _OCTAL_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
@@ -103,6 +111,18 @@ def tiny_btrfs_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     unmounted (see ``btrfs_volume``)."""
     base = tmp_path_factory.mktemp("tiny-btrfs").resolve()
     with _mounted_btrfs(base, GIB) as mnt:
+        yield mnt
+    (base / VOLUME_IMAGE).unlink()  # only reached after a checked, successful unmount
+
+
+@pytest.fixture
+def small_btrfs_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """A fresh btrfs per test for test_grow.py: a 1.25 GiB image formatted at 1 GiB
+    (``mkfs.btrfs -b 1G``), so the loop device already sees the whole file and one
+    ``sudo_btrfs_resize`` grows it. The only mount ``sudo_btrfs_resize`` accepts is one made by
+    a fixture of this file. The image is deleted once unmounted (see ``btrfs_volume``)."""
+    base = tmp_path_factory.mktemp("grow-btrfs").resolve()
+    with _mounted_btrfs(base, GIB + 256 * 1024**2, fs_size=GIB) as mnt:
         yield mnt
     (base / VOLUME_IMAGE).unlink()  # only reached after a checked, successful unmount
 
@@ -152,6 +172,14 @@ def sudo_btrfs() -> Callable[[Path, tuple[str, ...]], None]:
     """The one privileged quota command behind QuotaVolume.set_limit, for the tests of its own
     guard (test_quota_volume.py). Every other test goes through set_limit."""
     return _sudo_btrfs
+
+
+@pytest.fixture
+def sudo_btrfs_resize() -> Callable[[Path], None]:
+    """The one privileged resize command of test_grow.py (``_sudo_btrfs_resize``): ``sudo -n
+    btrfs filesystem resize max <mnt>`` on a mount this process mounted itself. Refuses anything
+    else before sudo runs; test_quota_volume.py tests each refusal."""
+    return _sudo_btrfs_resize
 
 
 @pytest.fixture(scope="session")
@@ -450,11 +478,15 @@ def _mounted_btrfs(
             features += ["-b", str(fs_size)]
         _run([_require_binary("mkfs.btrfs"), "-q", "-L", "vigia-test", *features, str(img)])
         _sudo("mount", "-o", MOUNT_OPTIONS, str(img), str(mnt))
+        _TEST_MOUNTS.add(mnt)
         try:
             _sudo("chown", f"{os.getuid()}:{os.getgid()}", str(mnt))
             yield mnt
         finally:
-            _unmount(img, mnt)
+            try:
+                _unmount(img, mnt)
+            finally:
+                _TEST_MOUNTS.discard(mnt)
 
 
 def _require_dev_vm_user_with_sudo() -> None:
@@ -659,6 +691,30 @@ def _sudo_btrfs(mnt: Path, args: tuple[str, ...]) -> None:
     path = _require_qgroup_limit_args(args)
     _require_test_mount(mnt)
     _require_own_subvolume(mnt, path)
+    _run_sudo_btrfs(args)
+
+
+def _sudo_btrfs_resize(mnt: Path) -> None:
+    """``sudo -n btrfs filesystem resize max <mnt>``, and nothing else (the founder approved
+    exactly this rule on 2026-10-17, docs/19). ``mnt`` must be a mount point that this process
+    mounted itself in _mounted_btrfs (_TEST_MOUNTS) and the mount point of a test btrfs
+    (_require_test_mount: canonical, under pytest-of-*, the loop mount of the image next to
+    it); anything else is a SnapshotError before sudo runs. The argv is the production one
+    (grow.resize_argv) with only the sudo prefix."""
+    if not isinstance(mnt, Path) or not mnt.is_absolute():
+        raise SnapshotError(f"refusing sudo btrfs resize on {mnt!r}: not an absolute path")
+    if mnt not in _TEST_MOUNTS:
+        raise SnapshotError(f"refusing sudo btrfs resize on {mnt}: not a mount this test made")
+    _require_test_mount(mnt)
+    args = grow.resize_argv(mnt)[1:]
+    if args != ("filesystem", "resize", "max", str(mnt)):
+        raise SnapshotError(f"refusing sudo btrfs {args!r}: not 'filesystem resize max <mount>'")
+    _run_sudo_btrfs(args)
+
+
+def _run_sudo_btrfs(args: tuple[str, ...]) -> None:
+    """Run ``sudo -n btrfs <args>`` (already checked by the caller) with btrfs.run's
+    conventions and its error mapping."""
     argv = ["sudo", "-n", "btrfs", *args]
     command = shlex.join(argv)
     try:

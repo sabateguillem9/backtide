@@ -2,15 +2,14 @@
 volume grown once and within its limit, and the retry that works. docs/19, section 6, and the
 criterion "Crecimiento de emergencia" of T04 in docs/backlog.md.
 
-SKIPPED until the founder approves its one new sudo (docs/19, "Bloqueado por el founder"):
+Its one new sudo, approved by the founder on 2026-10-17 (docs/19, "Bloqueado por el
+founder"), is
 
     sudo -n btrfs filesystem resize max <mount point of this test's own btrfs>
 
-run only after ``_require_test_mount`` (the check ``_unmount`` makes before its sudo: a
-canonical path under pytest-of-*, the btrfs loop mount of the image next to it). Set
-``VIGIA_IT_GROW_SUDO=1`` to run it; ``make it`` does not pass the Mac's environment into the
-VM, so from ``make vm-shell``: ``VIGIA_IT_GROW_SUDO=1 UV_PROJECT_ENVIRONMENT=$HOME/.venvs/vigia
-uv run --locked pytest -m integration tests/integration/test_grow.py``.
+and it lives in conftest.py (``_sudo_btrfs_resize``, next to ``_sudo_btrfs``): it runs only on
+a mount this process mounted itself and only after ``_require_test_mount`` (a canonical path
+under pytest-of-*, the btrfs loop mount of the image next to it). ``make it`` runs this file.
 
 Nothing else is privileged: the btrfs is formatted with ``mkfs.btrfs -b 1G`` on a 1.25 GiB
 image, so the loop device already sees the whole file and ``losetup --set-capacity`` is never
@@ -24,19 +23,12 @@ watcher (``NullWatcher``) and the host's free space (the VM's /tmp is a small tm
 margin rule has its unit tests).
 """
 
-import os
-import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tests.integration.conftest import (
-    COMMAND_TIMEOUT,
-    VOLUME_IMAGE,
-    _mounted_btrfs,
-    _require_test_mount,
-)
+from tests.integration.conftest import VOLUME_IMAGE
 from tests.integration.test_snapshots import fill_data, fill_metadata
 from tests.test_service_guardian import TOKEN, Alerts, FakeJail
 from vigia.blackbox import BlackBox, create_key
@@ -45,33 +37,23 @@ from vigia.service.guardian import Guardian
 from vigia.service.offline import NullWatcher
 from vigia.service.rewind import RewindStatus
 from vigia.snapshots import Reason, SnapshotError, SnapshotStore
-from vigia.snapshots.grow import GrowLimits, SystemProbe, VolumeGrower, resize_argv
+from vigia.snapshots.grow import GrowLimits, SystemProbe, VolumeGrower
 from vigia.snapshots.space import GIB, MIB, HostSpace
 
-SUDO_ENV = "VIGIA_IT_GROW_SUDO"
 IMAGE_SIZE = GIB + 256 * MIB  # measured: the loop sees 1,280 MiB and btrfs uses 1,024
 FS_SIZE = GIB
 CEILING = 3 * GIB // 2
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        os.environ.get(SUDO_ENV) != "1",
-        reason=(
-            "needs one sudo the founder has not approved yet: `sudo -n btrfs filesystem resize "
-            f"max <test mount>` (docs/19, 'Bloqueado por el founder'); set {SUDO_ENV}=1 once "
-            "it is"
-        ),
-    ),
-]
+pytestmark = pytest.mark.integration
 
 
 class VmSteps:
     """The privileged steps of this test: the file is the test user's, the loop step must not
     be needed, and the resize is the one sudo above."""
 
-    def __init__(self, mnt: Path) -> None:
+    def __init__(self, mnt: Path, sudo_resize: Callable[[Path], None]) -> None:
         self.mnt = mnt
+        self.sudo_resize = sudo_resize
         self.calls: list[str] = []
 
     def grow_file(self, image: Path, size: int) -> None:
@@ -86,13 +68,7 @@ class VmSteps:
         self.calls.append("resize")
         if mount != self.mnt:
             raise SnapshotError(f"refusing to resize {mount}: not this test's mount {self.mnt}")
-        _require_test_mount(mount)
-        argv = ["sudo", "-n", *resize_argv(mount)]
-        result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=COMMAND_TIMEOUT, check=False
-        )
-        if result.returncode != 0:
-            raise SnapshotError(f"{argv} failed: {result.stderr.strip()}")
+        self.sudo_resize(mount)  # checks the mount itself, then runs the one sudo
 
 
 class RoomyHost(SystemProbe):
@@ -102,18 +78,10 @@ class RoomyHost(SystemProbe):
         return HostSpace(total=100 * GIB, free=50 * GIB)
 
 
-@pytest.fixture
-def small_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
-    base = tmp_path_factory.mktemp("grow-btrfs").resolve()
-    with _mounted_btrfs(base, IMAGE_SIZE, fs_size=FS_SIZE) as mnt:
-        yield mnt
-    (base / VOLUME_IMAGE).unlink()  # only reached after a checked, successful unmount
-
-
 def test_a_rewind_without_space_grows_the_volume_once_and_the_retry_works(
-    small_volume: Path, tmp_path: Path
+    small_btrfs_volume: Path, tmp_path: Path, sudo_btrfs_resize: Callable[[Path], None]
 ) -> None:
-    mnt = small_volume
+    mnt = small_btrfs_volume
     image = mnt.parent / VOLUME_IMAGE
     probe = RoomyHost()
     assert probe.fs_bytes(mnt) == FS_SIZE
@@ -138,7 +106,7 @@ def test_a_rewind_without_space_grows_the_volume_once_and_the_retry_works(
         volume_image=image,
         max_volume_bytes=CEILING,
     )
-    steps = VmSteps(mnt)
+    steps = VmSteps(mnt, sudo_btrfs_resize)
     box = BlackBox(
         config.blackbox_db,
         create_key(config.blackbox_key),

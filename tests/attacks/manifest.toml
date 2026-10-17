@@ -520,11 +520,11 @@ story = "Varios rebobinados apilados más un borrado masivo: solo lo cubre el cr
 inspired_by = "Agotar el disco para impedir la recuperación"
 invariants = [2]
 status = "pending"
-task = "T04e-1"
+task = "T13"
 [scenario.expect]
 stopped = "contained"
 recorded = "yes"
-risk = "pending:T04e-1"
+risk = "pending:T13"
 recoverable = "yes"
 held = "n/a"
 
