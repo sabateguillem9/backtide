@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from vigia.service.config import ConfigError
-from vigia.service.telegram_config import TelegramSettings, load_telegram, telegram_file
+from backtide.service.config import ConfigError
+from backtide.service.telegram_config import TelegramSettings, load_telegram, telegram_file
 
 TOKEN = "123456789:" + "Zx9_-" * 7  # the shape of a BotFather token; not a real one
 SECRET_PART = TOKEN.split(":")[1]

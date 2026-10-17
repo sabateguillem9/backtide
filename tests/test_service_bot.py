@@ -1,4 +1,4 @@
-"""What the Telegram bot makes the service do (T09, ``vigia.service.bot``): the Guardian for
+"""What the Telegram bot makes the service do (T09, ``backtide.service.bot``): the Guardian for
 pausing and resuming, the control socket for rewinding (``via: "telegram"``), the snapshot to
 offer for an alert, and the hooks that run the bot next to the control socket."""
 
@@ -10,13 +10,13 @@ from typing import Any
 
 import pytest
 
-from vigia.blackbox import BlackBox, BlackBoxError, create_key
-from vigia.service.bot import GuardianActions, Hooks, TelegramParts, telegram_parts
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.control import ControlOutcomeUnknown, ControlUnavailable
-from vigia.service.pause import PauseOutcome, PauseStatus, ResumeOutcome, ResumeStatus
-from vigia.service.telegram_config import TelegramSettings
-from vigia.snapshots import Snapshot
+from backtide.blackbox import BlackBox, BlackBoxError, create_key
+from backtide.service.bot import GuardianActions, Hooks, TelegramParts, telegram_parts
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.control import ControlOutcomeUnknown, ControlUnavailable
+from backtide.service.pause import PauseOutcome, PauseStatus, ResumeOutcome, ResumeStatus
+from backtide.service.telegram_config import TelegramSettings
+from backtide.snapshots import Snapshot
 
 TOKEN = "123456789:" + "Q" * 35
 
@@ -68,7 +68,7 @@ def snap(moment: datetime, reason: str = "periodic") -> Snapshot:
     return Snapshot(moment.astimezone(UTC), reason)
 
 
-def test_before_bind_every_action_says_vigia_is_starting(tmp_path: Path) -> None:
+def test_before_bind_every_action_says_backtide_is_starting(tmp_path: Path) -> None:
     actions = GuardianActions(tmp_path / "control.sock")
     assert "arrancando" in actions.pause()
     assert actions.pause_mark() is None

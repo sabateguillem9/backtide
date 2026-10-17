@@ -14,8 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import FakeClock, call_unblocking_fifo
-from vigia.blackbox import (
+from backtide.blackbox import (
     GENESIS,
     REDACTED,
     BlackBox,
@@ -25,15 +24,16 @@ from vigia.blackbox import (
     canonical,
     compute_hash,
 )
-from vigia.blackbox.chain import canonical_json
-from vigia.blackbox.checkpoint import (
+from backtide.blackbox.chain import canonical_json
+from backtide.blackbox.checkpoint import (
     CheckpointError,
     checkpoint_lock,
     read_checkpoint,
     write_checkpoint,
 )
-from vigia.blackbox.redact import MAX_TEXT_BYTES
-from vigia.blackbox.store import TRIGGERS
+from backtide.blackbox.redact import MAX_TEXT_BYTES
+from backtide.blackbox.store import TRIGGERS
+from tests.conftest import FakeClock, call_unblocking_fifo
 
 KEY = bytes(range(32))
 OTHER_KEY = bytes(range(1, 33))
@@ -105,7 +105,7 @@ def test_events_survive_reopening(db: Path, checkpoint: Path, clock: FakeClock) 
     with BlackBox(db, KEY, checkpoint_path=checkpoint, clock=clock) as box:
         assert box.events() == [first, second]
         assert box.head() == (2, second.hash)
-        assert box.append(Source.SYSTEM, "start", "vigia").prev_hash == second.hash
+        assert box.append(Source.SYSTEM, "start", "backtide").prev_hash == second.hash
         assert box.verify().ok
 
 
@@ -520,7 +520,7 @@ def test_a_failed_checkpoint_write_keeps_the_old_one_and_says_the_event_was_reco
     def broken_replace(src: object, dst: object) -> None:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr("vigia.blackbox.checkpoint.os.replace", broken_replace)
+    monkeypatch.setattr("backtide.blackbox.checkpoint.os.replace", broken_replace)
     with pytest.raises(BlackBoxError, match="3 WAS recorded"):
         box.append(Source.FILE, "write", "/w")
     assert checkpoint.read_bytes() == before
@@ -799,7 +799,7 @@ def test_append_refuses_a_head_whose_hash_is_not_text(db: Path) -> None:
             fresh.append(Source.FILE, "write", "/w")
 
 
-# -- read-only, as `vigia verificar` opens it
+# -- read-only, as `backtide verificar` opens it
 
 
 def test_a_read_only_box_reads_but_never_writes(box: BlackBox, db: Path, checkpoint: Path) -> None:
@@ -876,7 +876,7 @@ def test_verify_raises_when_the_database_cannot_be_read(
     def broken(conn: sqlite3.Connection) -> set[str]:
         raise error
 
-    monkeypatch.setattr("vigia.blackbox.store._table_names", broken)
+    monkeypatch.setattr("backtide.blackbox.store._table_names", broken)
     with pytest.raises(BlackBoxError, match="cannot read the black box"):
         box.verify()
 
@@ -890,7 +890,7 @@ def test_a_corrupt_database_is_reported_not_raised(
     def broken(conn: sqlite3.Connection) -> set[str]:
         raise error
 
-    monkeypatch.setattr("vigia.blackbox.store._table_names", broken)
+    monkeypatch.setattr("backtide.blackbox.store._table_names", broken)
     assert _kinds(box.verify().problems) == [ProblemKind.SCHEMA]
 
 

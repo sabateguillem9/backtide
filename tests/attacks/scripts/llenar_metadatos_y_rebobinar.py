@@ -4,7 +4,7 @@ Runs INSIDE the jail, as the agent's user (python3 -c). Usage: <script> <directo
 Prints one JSON object on its last line.
 
 Files of 2000 bytes live inside the metadata tree, and a created empty file costs metadata
-too. With the metadata full, every rename in the volume fails, so Vigía could not rewind.
+too. With the metadata full, every rename in the volume fails, so backtide could not rewind.
 The workspace cap (a Btrfs simple quota) is what must stop this first.
 """
 

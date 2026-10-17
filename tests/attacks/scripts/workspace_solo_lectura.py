@@ -4,7 +4,7 @@ Runs INSIDE the jail, as the agent's user (python3 -c). Usage: <script> <directo
 workspace to lock>, which must already hold a marker.txt. Prints one JSON object on its last
 line.
 
-Vigía rewinds by swapping the whole workspace subvolume, so it does not depend on anything the
+backtide rewinds by swapping the whole workspace subvolume, so it does not depend on anything the
 agent can set on its files. The agent has two ways to try: the Btrfs "read-only" flag of the
 subvolume (an ioctl of type 0x94, which seccomp answers with EOPNOTSUPP, 95) and the generic
 route (remount read-only, the immutable attribute), which needs capabilities it does not have.

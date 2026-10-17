@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import KEY_SIZE, BlackBoxError, create_key, load_key
 from tests.conftest import call_unblocking_fifo
-from vigia.blackbox import KEY_SIZE, BlackBoxError, create_key, load_key
 
 
 def test_create_key_writes_32_random_bytes_readable_only_by_the_owner(tmp_path: Path) -> None:

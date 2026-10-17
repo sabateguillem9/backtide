@@ -1,19 +1,19 @@
-"""The Mac's web demo: `vigia web` over the made-up state of seed.py, with its snapshot list.
+"""The Mac's web demo: `backtide web` over the made-up state of seed.py, with its snapshot list.
 
-Usage: python scripts/web-demo/serve.py <folder>/vigia.toml [port]
+Usage: python scripts/web-demo/serve.py <folder>/backtide.toml [port]
 
 The real web lists the snapshots of the btrfs volume (``SnapshotStore``), which a Mac does not
 have: there the page would fall back to the black box. seed.py also leaves one empty folder per
 snapshot in ``<volume>/snapshots/``; this lists those by name, so the snapshots page looks like
-the real one. Demo only: ``vigia web`` itself never takes this path.
+the real one. Demo only: ``backtide web`` itself never takes this path.
 """
 
 import sys
 from pathlib import Path
 
-from vigia.snapshots import Snapshot
-from vigia.web.paths import WebPaths
-from vigia.web.server import DEFAULT_PORT, run_web
+from backtide.snapshots import Snapshot
+from backtide.web.paths import WebPaths
+from backtide.web.server import DEFAULT_PORT, run_web
 
 
 def main(argv: list[str]) -> int:

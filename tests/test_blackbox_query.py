@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import BlackBox
 from tests.conftest import FakeClock
-from vigia.blackbox import BlackBox
 
 KEY = bytes(range(32))
 

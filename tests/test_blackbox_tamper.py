@@ -32,8 +32,8 @@ from typing import Any, Protocol
 
 import pytest
 
-from vigia.blackbox.model import BlackBoxError, Source, VerifyReport
-from vigia.blackbox.store import BlackBox
+from backtide.blackbox.model import BlackBoxError, Source, VerifyReport
+from backtide.blackbox.store import BlackBox
 
 KEY = bytes(range(32))
 ATTACKER_KEY = bytes(range(100, 132))
@@ -129,7 +129,7 @@ def _make_box(
 
 
 def _verify(box: Box, key: bytes = KEY) -> VerifyReport:
-    """Open the box afresh, as ``vigia verificar`` does, and verify it."""
+    """Open the box afresh, as ``backtide verificar`` does, and verify it."""
     with BlackBox(box.db, key, checkpoint_path=box.checkpoint) as bb:
         return bb.verify()
 

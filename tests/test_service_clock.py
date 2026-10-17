@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from vigia.service import clock
+from backtide.service import clock
 
 
 @pytest.mark.parametrize(

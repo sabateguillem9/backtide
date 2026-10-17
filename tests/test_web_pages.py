@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from backtide.snapshots import Reason, Snapshot, SnapshotError
 from tests.conftest import FakeClock
 from tests.webkit import PREFIX_PATH, ROOT, START, new_box, new_client
-from vigia.snapshots import Reason, Snapshot, SnapshotError
 
 HOSTILE = '"><img src=x onerror=alert(1)>‮txt.exe'
 
@@ -50,12 +50,12 @@ def web(tmp_path: Path, clock: FakeClock) -> TestClient:
 def test_now_tells_what_happened_as_a_conversation(web: TestClient) -> None:
     html = web.get("/ahora").text
     text = text_of(html)
-    assert "Vigía ha empezado a vigilar" in text
+    assert "backtide ha empezado a vigilar" in text
     assert "El agente ha arrancado" in text
     assert "Ha creado notas.md" in text
     assert "Ha borrado 30 archivos, entre ellos work/f0.txt" in text
     assert "Instantánea guardada" in text
-    assert html.index("Vigía ha empezado") < html.index("Ha borrado 30")  # oldest first
+    assert html.index("backtide ha empezado") < html.index("Ha borrado 30")  # oldest first
 
 
 def test_the_agent_state_is_at_the_top(web: TestClient) -> None:
@@ -406,7 +406,7 @@ def test_the_language_follows_the_browser_and_the_switch_remembers_it(web: TestC
     switched = web.get("/ahora?lang=en")
     assert '<html lang="en">' in switched.text
     cookie = switched.headers["set-cookie"]
-    assert "vigia_lang=en" in cookie and "HttpOnly" in cookie and "SameSite=strict" in cookie
+    assert "backtide_lang=en" in cookie and "HttpOnly" in cookie and "SameSite=strict" in cookie
     assert '<html lang="en">' in web.get("/historia").text  # remembered
     assert '<html lang="es">' in web.get("/historia?lang=es").text
 
@@ -514,7 +514,7 @@ def test_a_hostile_dropped_reason_does_not_stop_the_stream(tmp_path: Path) -> No
 def test_one_line_that_cannot_be_told_does_not_take_the_page_down(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:
-    from vigia.web import narrate
+    from backtide.web import narrate
 
     box = new_box(tmp_path)
     box.append("file", "create", "fine.txt")
@@ -535,7 +535,7 @@ def test_one_line_that_cannot_be_told_does_not_take_the_page_down(
     assert any("cannot tell" in r.message for r in caplog.records)
 
 
-def test_names_are_visibly_the_agents_not_vigias(web: TestClient) -> None:
+def test_names_are_visibly_the_agents_not_backtides(web: TestClient) -> None:
     css = web.get("/static/web.css").text
     name_rule = re.search(r"\.name \{([^}]*)\}", css)
     assert name_rule
@@ -548,11 +548,11 @@ def test_names_are_visibly_the_agents_not_vigias(web: TestClient) -> None:
         assert rule and "overflow: clip" in rule.group(1), selector
 
 
-def test_a_name_that_imitates_vigia_is_a_quoted_name_span(tmp_path: Path) -> None:
+def test_a_name_that_imitates_backtide_is_a_quoted_name_span(tmp_path: Path) -> None:
     box = new_box(tmp_path)
-    box.append("file", "create", "Vigía: todo en orden")
+    box.append("file", "create", "backtide: todo en orden")
     html = new_client(tmp_path).get("/ahora").text
-    assert 'Ha creado <span class="name">Vigía: todo en orden</span>' in html
+    assert 'Ha creado <span class="name">backtide: todo en orden</span>' in html
 
 
 def test_a_tower_of_marks_in_a_name_is_one_marker(tmp_path: Path) -> None:

@@ -1,5 +1,5 @@
-"""`vigia web`: arguments, messages in Spanish, exit codes, and the real server it starts. The web
-needs no secret: these tests run with no gateway token and no key file at all."""
+"""`backtide web`: arguments, messages in Spanish, exit codes, and the real server it starts. The
+web needs no secret: these tests run with no gateway token and no key file at all."""
 
 import threading
 import time
@@ -8,11 +8,11 @@ from pathlib import Path
 import httpx2 as httpx
 import pytest
 
-import vigia.web.server as server_module
+import backtide.web.server as server_module
+from backtide.blackbox import BlackBox
+from backtide.cli import main
+from backtide.web.paths import WebPaths
 from tests.webkit import KEY
-from vigia.blackbox import BlackBox
-from vigia.cli import main
-from vigia.web.paths import WebPaths
 
 
 @pytest.fixture
@@ -20,7 +20,7 @@ def config_file(tmp_path: Path) -> Path:
     """A configuration and a black box, and NOTHING else: no gateway.token, no blackbox.key."""
     state = tmp_path / "state"
     state.mkdir()
-    path = tmp_path / "vigia.toml"
+    path = tmp_path / "backtide.toml"
     path.write_text(f'state_dir = "{state}"\nvolume = "{tmp_path / "vol"}"\n')
     path.chmod(0o644)
     return path
@@ -63,8 +63,8 @@ def test_it_never_asks_for_the_key_or_the_token(
 ) -> None:
     """The service's secrets are not the web's business: it must start without them, and it
     must not even try to read them."""
-    import vigia.blackbox.keys as keys
-    import vigia.service.config as service_config
+    import backtide.blackbox.keys as keys
+    import backtide.service.config as service_config
 
     monkeypatch.setattr(keys, "load_key", lambda *a, **k: pytest.fail("the web read the key"))
     monkeypatch.setattr(
@@ -116,7 +116,7 @@ def test_with_the_flag_it_may_rewind_once_the_service_runs(
 def test_a_web_of_another_user_says_it_cannot_rewind(
     capsys, config_file: Path, recorded: BlackBox, monkeypatch
 ) -> None:
-    from vigia.web import rewind as web_rewind
+    from backtide.web import rewind as web_rewind
 
     monkeypatch.setattr(
         web_rewind.ControlRewinder,
@@ -127,7 +127,7 @@ def test_a_web_of_another_user_says_it_cannot_rewind(
         server_module, "run_web", lambda paths, port, announce, **_: announce("http://x", "a-b-c")
     )
     out = run(capsys, "web", "--config", config_file, "--rebobinar")[1]
-    assert "Rebobinar desde la web: no" in out and "vigia rebobinar" in out
+    assert "Rebobinar desde la web: no" in out and "backtide rebobinar" in out
 
 
 @pytest.mark.parametrize("flag", ["--puerto", "--port"])
@@ -204,7 +204,7 @@ def test_a_web_run_as_root_needs_the_flag_and_says_so(
 ) -> None:
     """T12b: a root web has every privilege of root. Without --rebobinar it does not start (to
     watch, run it as a reader); with it, it starts and says so."""
-    import vigia.cli as cli_module
+    import backtide.cli as cli_module
 
     started = []
     monkeypatch.setattr(cli_module, "_effective_uid", lambda: euid)

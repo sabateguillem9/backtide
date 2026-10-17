@@ -1,7 +1,7 @@
-"""Evil-agent scenarios against the service itself, with `vigia vigilar` as a process and the
+"""Evil-agent scenarios against the service itself, with `backtide vigilar` as a process and the
 real OpenClaw:
 
-- ``matar-el-servicio`` (T04b-2): kill Vigía and hope the agent goes on unwatched.
+- ``matar-el-servicio`` (T04b-2): kill backtide and hope the agent goes on unwatched.
 - ``socket-de-control`` (T04c-2): reach the control socket from the jail; send it garbage.
 
 The same behaviour has its integration test (tests/integration/test_service.py); this is its
@@ -18,8 +18,8 @@ from pathlib import Path
 from attack_kit import CONTAINER_WORK, Attack, scenario
 from risk_kit import summary
 
+from backtide.service.control import ask_rewind
 from tests.integration.service_kit import Service
-from vigia.service.control import ask_rewind
 
 
 @scenario("matar-el-servicio")
@@ -50,8 +50,8 @@ def test_killing_the_service(attack: Attack, make_real_service: Callable[..., Se
         and 0 <= stop_at < armed_at < start_at
         and service.jail.is_running(),
         "con el servicio muerto el agente siguió en marcha (el límite que cierra T13 con "
-        "Restart=always), pero el siguiente `vigia vigilar` lo para lo primero, arma el vigilante "
-        "y solo entonces lo arranca, vigilado",
+        "Restart=always), pero el siguiente `backtide vigilar` lo para lo primero, arma el "
+        "vigilante y solo entonces lo arranca, vigilado",
     )
     report = service.box.verify()
     risk = unsupervised[0].risk if unsupervised else None
@@ -75,7 +75,7 @@ def test_killing_the_service(attack: Attack, make_real_service: Callable[..., Se
 def test_reaching_the_control_socket(
     attack: Attack, make_real_service: Callable[..., Service]
 ) -> None:
-    """The socket that `vigia rebobinar` uses is Vigía's: the agent cannot reach it (it is not
+    """The socket that `backtide rebobinar` uses is backtide's: the agent cannot reach it (it is not
     in its jail), and what a client of the right user can send that is wrong moves nothing."""
     service = make_real_service()
     service.start()

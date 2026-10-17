@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from vigia.jail import AgentJailConfig
-from vigia.service.config import (
+from backtide.jail import AgentJailConfig
+from backtide.service.config import (
     ConfigError,
     Secret,
     ServiceConfig,
@@ -37,7 +37,7 @@ def write_token(path: Path, text: str, mode: int = 0o600) -> None:
 
 
 def write_toml(layout: Path, extra: str = "", mode: int = 0o600) -> Path:
-    path = layout / "vigia.toml"
+    path = layout / "backtide.toml"
     path.write_text(f'state_dir = "{layout / "state"}"\nvolume = "{layout / "volume"}"\n{extra}')
     path.chmod(mode)
     return path
@@ -102,7 +102,7 @@ def test_the_state_layout_is_the_one_in_the_design(layout: Path) -> None:
     assert config.blackbox_checkpoint == state / "blackbox.checkpoint"
     assert config.gateway_token_file == state / "gateway.token"
     assert config.agent_config_dir == state / "openclaw"
-    assert config.lock_file == state / "vigia.lock"
+    assert config.lock_file == state / "backtide.lock"
     assert config.pending_file == state / "rewind.pending"
     assert config.control_socket == state / "control.sock"
 
@@ -175,7 +175,7 @@ def test_a_token_in_the_toml_is_rejected_without_quoting_it(layout: Path) -> Non
 
 
 def test_a_syntax_error_in_the_toml_does_not_quote_the_file(layout: Path) -> None:
-    path = layout / "vigia.toml"
+    path = layout / "backtide.toml"
     path.write_text(f'state_dir = "{layout}"\nvolume = = "{OTHER_TOKEN}"\n')
     path.chmod(0o600)
     with pytest.raises(ConfigError) as raised:
@@ -266,8 +266,8 @@ def test_a_config_file_readable_by_others_is_fine(layout: Path) -> None:
 
 
 def test_a_missing_config_file_is_a_config_error(layout: Path) -> None:
-    with pytest.raises(ConfigError, match="vigia.toml"):
-        ServiceConfig.from_file(layout / "vigia.toml")
+    with pytest.raises(ConfigError, match="backtide.toml"):
+        ServiceConfig.from_file(layout / "backtide.toml")
 
 
 # --- validation --------------------------------------------------------------------------------
@@ -307,7 +307,7 @@ def test_invalid_values_are_refused(layout: Path, extra: str, match: str) -> Non
 
 
 def test_missing_required_keys_are_named(layout: Path) -> None:
-    path = layout / "vigia.toml"
+    path = layout / "backtide.toml"
     path.write_text(f'state_dir = "{layout / "state"}"\n')
     path.chmod(0o600)
     with pytest.raises(ConfigError, match="volume"):
@@ -317,7 +317,7 @@ def test_missing_required_keys_are_named(layout: Path) -> None:
 @pytest.mark.parametrize("key", ["state_dir", "volume"])
 def test_relative_paths_are_refused(layout: Path, key: str) -> None:
     other = "volume" if key == "state_dir" else "state_dir"
-    path = layout / "vigia.toml"
+    path = layout / "backtide.toml"
     directory = {"state_dir": layout / "state", "volume": layout / "volume"}
     path.write_text(f'{key} = "relative/dir"\n{other} = "{directory[other]}"\n')
     path.chmod(0o600)
@@ -336,7 +336,7 @@ def test_relative_paths_are_refused(layout: Path, key: str) -> None:
 def test_state_and_volume_must_not_contain_each_other(
     tmp_path: Path, state: str, volume: str
 ) -> None:
-    # The agent can write the volume: Vigía's black box must never live inside it.
+    # The agent can write the volume: backtide's black box must never live inside it.
     with pytest.raises(ConfigError, match="contain each other"):
         ServiceConfig(
             state_dir=tmp_path / state, volume=tmp_path / volume, gateway_token=Secret(TOKEN)
@@ -388,7 +388,7 @@ def test_the_token_must_be_a_secret(tmp_path: Path) -> None:
 def test_dot_components_are_refused_in_the_toml(layout: Path, key: str, bad: str) -> None:
     other = "volume" if key == "state_dir" else "state_dir"
     directory = {"state_dir": layout / "state", "volume": layout / "volume"}
-    path = layout / "vigia.toml"
+    path = layout / "backtide.toml"
     path.write_text(f'{key} = "{bad.format(base=layout)}"\n{other} = "{directory[other]}"\n')
     path.chmod(0o600)
     with pytest.raises(ConfigError, match=r"'\.\.' or '\.'"):
@@ -419,7 +419,7 @@ def test_dotdot_is_refused_in_the_agent_config_dir_in_code(tmp_path: Path) -> No
         )
 
 
-# --- the state folder must be Vigía's alone ----------------------------------------------------
+# --- the state folder must be backtide's alone ----------------------------------------------------
 
 
 def test_a_state_dir_others_can_write_is_refused(layout: Path) -> None:

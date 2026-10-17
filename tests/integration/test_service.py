@@ -1,6 +1,6 @@
-"""T04b-2 in the VM: the service owns the agent. Parar Vigía para al agente.
+"""T04b-2 in the VM: the service owns the agent. Parar backtide para al agente.
 
-docs/19-diseno-t04.md, "Los procesos" and "Parar". `vigia vigilar` runs as a process against the
+docs/19-diseno-t04.md, "Los procesos" and "Parar". `backtide vigilar` runs as a process against the
 real OpenClaw in its jail:
 
 - stopping the service (SIGTERM, Ctrl-C) stops the agent, and the black box says so;
@@ -15,8 +15,8 @@ from collections.abc import Callable
 
 import pytest
 
+from backtide.service.runner import ServiceLocked, take_lock
 from tests.integration.service_kit import Service
-from vigia.service.runner import ServiceLocked, take_lock
 
 pytestmark = pytest.mark.integration
 
@@ -37,7 +37,7 @@ def test_stopping_the_service_stops_the_agent(
     assert service.stop(number) == 0
 
     assert not service.jail.is_running()  # and not merely paused: it is stopped
-    assert "Vigía parado" in service.log_text()
+    assert "backtide parado" in service.log_text()
     stops = service.events("agent_stop")
     assert [e.details["reason"] for e in stops] == ["service_stop"]  # no "unsupervised": first run
     assert service.events("service_stop")[0].details == {"agent_stopped": True}
@@ -71,7 +71,7 @@ def test_a_killed_service_leaves_the_agent_and_the_next_one_stops_it_and_says_so
     # A second service cannot take the agent away from the first one.
     intruder = service.launch()
     assert intruder.wait(60) == 1
-    assert "Ya hay un `vigia vigilar` en marcha" in service.log_text()
+    assert "Ya hay un `backtide vigilar` en marcha" in service.log_text()
     assert service.jail.is_running()
     with pytest.raises(ServiceLocked):
         take_lock(service.config.lock_file)

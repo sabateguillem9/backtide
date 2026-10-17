@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from backtide.web.security import CSP, make_token, token_matches
 from tests.webkit import (
     BASE,
     PORT,
@@ -22,7 +23,6 @@ from tests.webkit import (
     new_box,
     new_client,
 )
-from vigia.web.security import CSP, make_token, token_matches
 
 PAGES = ["/", "/ahora", "/historia", "/instantaneas", "/ahora/preguntar?q=ayuda"]
 
@@ -110,13 +110,13 @@ def test_a_wrong_token_in_the_link_or_cookie_is_refused(tmp_path: Path, wrong: s
     web = anonymous(tmp_path)
     response = web.get("/ahora", params={"t": wrong}, follow_redirects=False)
     assert response.status_code == 401 and "set-cookie" not in response.headers
-    web.cookies.set("vigia_web", wrong, domain="127.0.0.1", path=PREFIX_PATH)
+    web.cookies.set("backtide_web", wrong, domain="127.0.0.1", path=PREFIX_PATH)
     assert web.get("/ahora").status_code == 401
 
 
 def test_the_link_token_is_not_a_session_and_is_not_accepted_as_a_cookie(tmp_path: Path) -> None:
     web = anonymous(tmp_path)
-    web.cookies.set("vigia_web", TOKEN, domain="127.0.0.1", path=PREFIX_PATH)
+    web.cookies.set("backtide_web", TOKEN, domain="127.0.0.1", path=PREFIX_PATH)
     assert web.get("/ahora").status_code == 401
 
 
@@ -135,7 +135,7 @@ def test_the_link_answers_a_page_with_the_cookie_and_a_refresh_under_the_prefix(
     assert TOKEN not in first.text and SESSION not in first.text
     cookie = first.headers["set-cookie"]
     # the value is a session secret, not the link's token, and the cookie hangs from the prefix
-    assert cookie.startswith(f"vigia_web={SESSION}") and TOKEN not in cookie
+    assert cookie.startswith(f"backtide_web={SESSION}") and TOKEN not in cookie
     assert "HttpOnly" in cookie and "SameSite=strict" in cookie
     assert f"Path={PREFIX_PATH}" in cookie and "Path=/;" not in cookie
     assert "Max-Age" not in cookie and "expires" not in cookie.lower()  # a session cookie
@@ -176,7 +176,7 @@ def test_the_link_works_once(tmp_path: Path) -> None:
 def test_two_requests_with_the_link_at_once_only_one_wins() -> None:
     import threading
 
-    from vigia.web.security import Access
+    from backtide.web.security import Access
 
     access = Access(TOKEN)
     results: list[str | None] = []
@@ -409,7 +409,7 @@ def test_nothing_answers_outside_the_prefix(client: TestClient, path: str) -> No
     response = client.get(ROOT + path)
     assert response.status_code == 404
     assert response.text == "Not found"
-    assert "vigia" not in response.text.lower() and "backtide" not in response.text.lower()
+    assert "backtide" not in response.text.lower()
 
 
 def test_the_prefix_is_matched_whole(client: TestClient) -> None:
@@ -424,19 +424,19 @@ def test_the_cookie_is_scoped_to_the_prefix_so_another_port_never_gets_it(
     web = anonymous(tmp_path)
     web.get(f"/ahora?t={TOKEN}")
     jar = web.cookies.jar
-    (cookie,) = [c for c in jar if c.name == "vigia_web"]
+    (cookie,) = [c for c in jar if c.name == "backtide_web"]
     assert cookie.path == PREFIX_PATH and cookie.value == SESSION
     # a request to the same host, another path (another service of 127.0.0.1): not sent
     elsewhere = urllib.request.Request(f"http://127.0.0.1:{PORT + 1}/")  # noqa: S310
     jar.add_cookie_header(elsewhere)
-    assert "vigia_web" not in (elsewhere.get_header("Cookie") or "")
+    assert "backtide_web" not in (elsewhere.get_header("Cookie") or "")
     ours = urllib.request.Request(f"{BASE}/ahora")  # noqa: S310
     jar.add_cookie_header(ours)
-    assert "vigia_web" in (ours.get_header("Cookie") or "")
+    assert "backtide_web" in (ours.get_header("Cookie") or "")
 
 
 def test_two_runs_have_different_prefixes_tokens_and_names() -> None:
-    from vigia.web.security import make_prefix, make_run_name
+    from backtide.web.security import make_prefix, make_run_name
 
     assert len({make_prefix() for _ in range(20)}) == 20
     assert len(make_prefix()) >= 22  # 128 bits
@@ -445,7 +445,7 @@ def test_two_runs_have_different_prefixes_tokens_and_names() -> None:
 
 
 def test_an_app_without_arguments_picks_its_own_random_prefix_and_name(tmp_path: Path) -> None:
-    from vigia.web import BoxReader, create_app
+    from backtide.web import BoxReader, create_app
 
     one = create_app(reader=BoxReader(tmp_path / "x.db"), port=PORT)
     two = create_app(reader=BoxReader(tmp_path / "x.db"), port=PORT)
@@ -503,7 +503,7 @@ def test_even_a_crash_carries_the_security_headers(tmp_path: Path) -> None:
 
     app = new_app(tmp_path, snapshots=explode)
     web = TestClient(app, base_url=BASE, raise_server_exceptions=False)
-    web.cookies.set("vigia_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
+    web.cookies.set("backtide_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
     response = web.get("/instantaneas")
     assert response.status_code == 500
     assert response.headers["content-security-policy"] == CSP
@@ -512,7 +512,7 @@ def test_even_a_crash_carries_the_security_headers(tmp_path: Path) -> None:
 
 
 def test_the_guard_is_the_outermost_layer(tmp_path: Path) -> None:
-    from vigia.web.security import Guard
+    from backtide.web.security import Guard
 
     app = new_app(tmp_path)
     assert isinstance(app, Guard)
@@ -526,15 +526,19 @@ def test_fastapi_telemetry_is_off(tmp_path: Path) -> None:
 
 
 def test_a_stale_cookie_of_the_same_name_does_not_lock_us_out(tmp_path: Path) -> None:
-    """Cookies ignore ports: an old ``vigia_web`` (another run, another version) on 127.0.0.1 can
+    """Cookies ignore ports: an old ``backtide_web`` (another run, another version) on 127.0.0.1 can
     be sent together with ours, in any order. Ours must be found among them."""
     web = anonymous(tmp_path)
     for header in (
-        f"vigia_web=stale; vigia_web={SESSION}",
-        f"vigia_web={SESSION}; vigia_web=stale",
-        f"a=b; vigia_web=stale; vigia_lang=es; vigia_web={SESSION}",
-        f'vigia_web="{SESSION}"',
+        f"backtide_web=stale; backtide_web={SESSION}",
+        f"backtide_web={SESSION}; backtide_web=stale",
+        f"a=b; backtide_web=stale; backtide_lang=es; backtide_web={SESSION}",
+        f'backtide_web="{SESSION}"',
     ):
         assert web.get("/ahora", headers={"cookie": header}).status_code == 200, header
-    for header in ("vigia_web=stale; other=x", f"x_vigia_web={SESSION}", f"vigia_web2={SESSION}"):
+    for header in (
+        "backtide_web=stale; other=x",
+        f"x_backtide_web={SESSION}",
+        f"backtide_web2={SESSION}",
+    ):
         assert web.get("/ahora", headers={"cookie": header}).status_code == 401, header

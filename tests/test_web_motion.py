@@ -11,13 +11,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from backtide.snapshots import Reason, Snapshot
+from backtide.web.security import CSP
+from backtide.web.tide import BASE, PAD, WIDTH, build_tide
 from tests.conftest import FakeClock
 from tests.webkit import PREFIX_PATH, START, new_box, new_client
-from vigia.snapshots import Reason, Snapshot
-from vigia.web.security import CSP
-from vigia.web.tide import BASE, PAD, WIDTH, build_tide
 
-STATIC = Path(__file__).resolve().parent.parent / "vigia" / "web" / "static"
+STATIC = Path(__file__).resolve().parent.parent / "backtide" / "web" / "static"
 TEMPLATES = STATIC.parent / "templates"
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 
@@ -277,8 +277,8 @@ def test_a_bad_lower_bound_is_ignored(web: TestClient, after: str) -> None:
 def test_the_tide_reads_a_bounded_number_of_rows_whatever_the_box_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from vigia.web import app as web_app
-    from vigia.web.reader import BoxReader
+    from backtide.web import app as web_app
+    from backtide.web.reader import BoxReader
 
     monkeypatch.setattr(web_app, "ACTIVITY_EVENTS", 40)
     clock = FakeClock(START - timedelta(days=3))
@@ -309,7 +309,9 @@ def test_the_tide_reads_a_bounded_number_of_rows_whatever_the_box_size(
     from fastapi.testclient import TestClient as Client
 
     client = Client(app, base_url="http://127.0.0.1:8765/s/pref0123456789abcdefghijkl")
-    client.cookies.set("vigia_web", "s", domain="127.0.0.1", path="/s/pref0123456789abcdefghijkl")
+    client.cookies.set(
+        "backtide_web", "s", domain="127.0.0.1", path="/s/pref0123456789abcdefghijkl"
+    )
     for path in ("/instantaneas", "/ahora", "/ahora"):
         calls.clear()
         assert client.get(path).status_code == 200
@@ -391,8 +393,8 @@ def test_snapshots_have_human_titles_and_a_small_id(tmp_path: Path) -> None:
 def test_days_follow_the_persons_time_zone() -> None:
     from zoneinfo import ZoneInfo
 
-    from vigia.web import format as fmt
-    from vigia.web.i18n import Translator
+    from backtide.web import format as fmt
+    from backtide.web.i18n import Translator
 
     madrid = ZoneInfo("Europe/Madrid")
     now = datetime(2026, 10, 16, 22, 30, tzinfo=UTC)  # already the 17th in Madrid

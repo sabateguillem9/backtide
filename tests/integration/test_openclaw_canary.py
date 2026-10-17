@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from backtide.jail.config import AGENT_DIR
+from backtide.snapshots import Reason
 from tests.integration.openclaw_canary import USER_VERSION, read_openclaw_db
-from vigia.jail.config import AGENT_DIR
-from vigia.snapshots import Reason
 
 pytestmark = pytest.mark.integration
 
@@ -24,6 +24,6 @@ def test_the_snapshot_holds_the_sqlite_docs_20_was_written_against(
     print(sorted(reading.tables), reading.user_version, reading.authorizations)  # noqa: T201
     assert reading.user_version == USER_VERSION
     assert reading.missing_tables == []
-    # With the config Vigía writes, nobody is authorized in the SQLite.
+    # With the config backtide writes, nobody is authorized in the SQLite.
     assert reading.authorized_rows == {}
     assert reading.pairing_entries == ()

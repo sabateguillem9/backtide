@@ -1,6 +1,6 @@
-"""Evil-agent scenarios that try to trick the file watcher (T04a), with `vigia vigilar` as a
+"""Evil-agent scenarios that try to trick the file watcher (T04a), with `backtide vigilar` as a
 process and the real OpenClaw: the attack runs INSIDE the agent's jail, and the test reads
-what Vigía did from the host (the black box, the snapshots, the service's log and the
+what backtide did from the host (the black box, the snapshots, the service's log and the
 kernel's list of what it watches, /proc/<pid>/fdinfo).
 
 - ``nombres-hostiles``: names that carry secrets, escape sequences or forged log lines.
@@ -37,10 +37,10 @@ from watcher_kit import (
     watches_outside,
 )
 
+from backtide.blackbox import Event
+from backtide.sensors.files import WatcherConfig
+from backtide.sensors.inotify import Inotify, InotifyError
 from tests.integration.service_kit import CYCLE, Service, run_cli, wait_until
-from vigia.blackbox import Event
-from vigia.sensors.files import WatcherConfig
-from vigia.sensors.inotify import Inotify, InotifyError
 
 DEFAULTS = WatcherConfig()  # the limits of the real service: the tests do not lower any
 FLOOD_SCRIPT = "inundar_la_cola_sin_parar"
@@ -347,8 +347,8 @@ def test_exhausting_inotify_instances(
             and after
             and watches_outside(service, after) == []
             and not (service.store.workspace / "agente" / "work" / "exhaust").exists(),
-            f"`vigia rebobinar {baseline.id}` con las instancias gastadas funciona: el agente se "
-            "para (y las devuelve), el vigilante cierra la suya y arma otra en el espacio nuevo "
+            f"`backtide rebobinar {baseline.id}` con las instancias gastadas funciona: el agente "
+            "se para (y las devuelve), el vigilante cierra la suya y arma otra en el espacio nuevo "
             f"({len(after)} watches, system/watcher_armed grabado) y sigue grabando",
         )
     finally:
@@ -482,9 +482,9 @@ def test_flooding_the_queue_without_a_pause(
         and watches
         and watches_outside(service, watches) == []
         and service.jail.is_running(),
-        f"`vigia rebobinar {target}` con la inundación en marcha termina bien: el agente se para, "
-        f"el vigilante arma de nuevo el espacio nuevo ({len(watches)} watches, todos en él), no "
-        "hay ningún system/watcher_failed y el siguiente archivo del agente tiene su registro",
+        f"`backtide rebobinar {target}` con la inundación en marcha termina bien: el agente se "
+        f"para, el vigilante arma de nuevo el espacio nuevo ({len(watches)} watches, todos en él), "
+        "no hay ningún system/watcher_failed y el siguiente archivo del agente tiene su registro",
     )
     assert service.stop() == 0
     assert service.box.verify().ok

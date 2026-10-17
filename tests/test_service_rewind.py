@@ -2,7 +2,7 @@
 
 ``rewind.pending`` is the intent of a rewind in progress, written (and fsynced) before anything
 changes, so a fresh Guardian can reconcile a rewind that was killed half way (docs/19, section
-4). It lives in Vigía's own state folder: never in the volume, never seen by the agent.
+4). It lives in backtide's own state folder: never in the volume, never seen by the agent.
 """
 
 import os
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from vigia.service.rewind import (
+from backtide.service.rewind import (
     PendingError,
     PendingRewind,
     RewindOutcome,
@@ -21,7 +21,7 @@ from vigia.service.rewind import (
     remove_pending,
     write_pending,
 )
-from vigia.snapshots import RestoreIncomplete, Snapshot, SnapshotError, SnapshotNoSpace
+from backtide.snapshots import RestoreIncomplete, Snapshot, SnapshotError, SnapshotNoSpace
 
 TARGET = "20261005T080000.000000Z-periodic"
 

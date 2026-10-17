@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from vigia.jail import config as jail_config
-from vigia.jail.config import (
+from backtide.jail import config as jail_config
+from backtide.jail.config import (
     SYS_MASK_OPTIONS,
     SYS_MASKS,
     AgentJailConfig,
@@ -21,8 +21,8 @@ from vigia.jail.config import (
 )
 
 TOKEN = "t" * 43  # the length of secrets.token_urlsafe(32)
-WORKSPACE = Path("/srv/vigia/volume/workspace")
-CONFIG_DIR = Path("/srv/vigia/agent-config")
+WORKSPACE = Path("/srv/backtide/volume/workspace")
+CONFIG_DIR = Path("/srv/backtide/agent-config")
 SECRET_WORDS = ("KEY", "SECRET", "PASSWORD")
 # The tmpfs mounts of the design: /tmp, and the two /sys directories hidden from the agent.
 SYS_MASK_ARGS = [
@@ -67,13 +67,13 @@ def test_create_argv_has_every_option_of_the_design(cfg: AgentJailConfig) -> Non
     argv = docker_create_argv(cfg)
     assert argv[0] == "create"
     expected = {
-        "--name": ["vigia-agente"],
+        "--name": ["backtide-agente"],
         "--hostname": ["agente"],
-        "--user": ["61000:61000"],  # the agent's own ids: no host account, not Vigía's
+        "--user": ["61000:61000"],  # the agent's own ids: no host account, not backtide's
         "--cap-drop": ["ALL"],
         "--security-opt": ["no-new-privileges=true", f"seccomp={jail_config.SECCOMP_PROFILE}"],
         "--tmpfs": ["/tmp:rw,nosuid,nodev,size=256m", *SYS_MASK_ARGS],
-        "--network": ["vigia-agente-net"],
+        "--network": ["backtide-agente-net"],
         "--restart": ["no"],
         "--memory": ["2g"],
         "--memory-swap": ["2g"],
@@ -183,7 +183,7 @@ def test_create_argv_follows_the_config(cfg: AgentJailConfig) -> None:
         pids_limit=64,
         cpus="0.5",
         tmp_size="64m",
-        seccomp_profile=Path("/etc/vigia/agent.json"),
+        seccomp_profile=Path("/etc/backtide/agent.json"),
         stop_timeout=5,
     )
     argv = docker_create_argv(custom)
@@ -196,7 +196,7 @@ def test_create_argv_follows_the_config(cfg: AgentJailConfig) -> None:
     assert option_values(argv, "--cpus") == ["0.5"]
     # tmp_size only sizes /tmp: the /sys masks stay 4 KiB whatever the config says.
     assert option_values(argv, "--tmpfs") == ["/tmp:rw,nosuid,nodev,size=64m", *SYS_MASK_ARGS]
-    assert "seccomp=/etc/vigia/agent.json" in option_values(argv, "--security-opt")
+    assert "seccomp=/etc/backtide/agent.json" in option_values(argv, "--security-opt")
     assert option_values(argv, "--stop-timeout") == ["5"]
 
 
@@ -348,8 +348,8 @@ def test_valid_custom_config_is_accepted() -> None:
         workspace=WORKSPACE,
         config_dir=CONFIG_DIR,
         gateway_token="A-b_9" * 8,
-        name="vigia-test-agent-0123abcd",
-        network="vigia-test-net-0123abcd",
+        name="backtide-test-agent-0123abcd",
+        network="backtide-test-net-0123abcd",
         uid=501,
         gid=1000,
         cpus="1.5",

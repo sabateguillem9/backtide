@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-from vigia.snapshots import grow
-from vigia.snapshots.grow import (
+from backtide.snapshots import grow
+from backtide.snapshots.grow import (
     NOT_CONFIGURED,
     GrowError,
     GrowLimits,
@@ -23,10 +23,10 @@ from vigia.snapshots.grow import (
     SystemProbe,
     VolumeGrower,
 )
-from vigia.snapshots.space import GIB, MIB, HostSpace
+from backtide.snapshots.space import GIB, MIB, HostSpace
 
-IMAGE = Path("/var/lib/vigia/volume.img")
-MOUNT = Path("/srv/vigia")
+IMAGE = Path("/var/lib/backtide/volume.img")
+MOUNT = Path("/srv/backtide")
 VOLUME = MOUNT / "vol"
 
 
@@ -406,7 +406,7 @@ def test_the_grower_never_sees_the_snapshots() -> None:
     }
     assert imported <= {
         "os", "re", "stat", "collections.abc", "dataclasses", "enum", "pathlib", "typing",
-        "vigia.snapshots", "vigia.snapshots.model", "vigia.snapshots.space",
+        "backtide.snapshots", "backtide.snapshots.model", "backtide.snapshots.space",
     }  # fmt: skip
     names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} | {
         node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
@@ -453,22 +453,22 @@ def _mountinfo(tmp_path: Path, *lines: str) -> Path:
 
 
 ROOT_LINE = "22 1 252:2 / / rw,relatime shared:1 - ext4 /dev/vda2 rw"
-LOOP_LINE = "95 22 0:55 / /srv/vigia rw,noatime shared:50 - btrfs /dev/loop3 rw,space_cache=v2"
+LOOP_LINE = "95 22 0:55 / /srv/backtide rw,noatime shared:50 - btrfs /dev/loop3 rw,space_cache=v2"
 
 
 def test_the_probe_finds_the_mount_that_holds_the_volume(tmp_path: Path) -> None:
     probe = SystemProbe(mountinfo=_mountinfo(tmp_path, ROOT_LINE, LOOP_LINE))
-    found = probe.mount_of(Path("/srv/vigia/vol"))
-    assert found == MountedOn(Path("/srv/vigia"), "btrfs", "/dev/loop3")
+    found = probe.mount_of(Path("/srv/backtide/vol"))
+    assert found == MountedOn(Path("/srv/backtide"), "btrfs", "/dev/loop3")
     assert grow.loop_name(found.source) == "loop3"
     assert probe.mount_of(Path("/srv/other")).source == "/dev/vda2"
 
 
 def test_the_probe_takes_the_mount_on_top_and_unescapes(tmp_path: Path) -> None:
-    over = "96 22 0:56 / /srv/vigia rw shared:51 - tmpfs tmpfs rw"
+    over = "96 22 0:56 / /srv/backtide rw shared:51 - tmpfs tmpfs rw"
     spaced = r"97 22 0:57 / /srv/with\040space rw - btrfs /dev/loop4 rw"
     probe = SystemProbe(mountinfo=_mountinfo(tmp_path, ROOT_LINE, LOOP_LINE, over, spaced))
-    assert probe.mount_of(Path("/srv/vigia/vol")).fs_type == "tmpfs"
+    assert probe.mount_of(Path("/srv/backtide/vol")).fs_type == "tmpfs"
     assert probe.mount_of(Path("/srv/with space/x")).source == "/dev/loop4"
 
 

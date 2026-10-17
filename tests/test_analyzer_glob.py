@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from vigia.analyzer.glob import MAX_GLOB_CHARS, MAX_STARS, Glob
+from backtide.analyzer.glob import MAX_GLOB_CHARS, MAX_STARS, Glob
 
 
 def matches(pattern: str, text: str) -> bool:

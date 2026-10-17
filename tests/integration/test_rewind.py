@@ -12,7 +12,7 @@ docs/19-diseno-t04.md, section 4, and the criterion of T04 in docs/backlog.md:
 
 There is no control socket yet (T04c-2), so the first test runs the real service's parts in
 this process (``guardian_in_process``) to call ``Guardian.rewind``; the killed rewinds run it in
-a process of their own (rewind_main.py) and the reconciliation is `vigia vigilar` itself.
+a process of their own (rewind_main.py) and the reconciliation is `backtide vigilar` itself.
 """
 
 import time
@@ -22,6 +22,9 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import Event
+from backtide.service.rewind import RewindStatus, read_pending
+from backtide.snapshots import Snapshot
 from tests.integration.service_kit import (
     CYCLE,
     Service,
@@ -33,9 +36,6 @@ from tests.integration.service_kit import (
     write_in_agent,
 )
 from tests.integration.service_kit import exec_in_agent as exec_ok
-from vigia.blackbox import Event
-from vigia.service.rewind import RewindStatus, read_pending
-from vigia.snapshots import Snapshot
 
 pytestmark = pytest.mark.integration
 
@@ -238,7 +238,8 @@ def test_a_rewind_killed_after_the_swap_is_reconciled_as_done(
 
 
 def test_the_intent_lives_outside_the_volume(make_real_service: Callable[..., Service]) -> None:
-    """Invariant 1: rewind.pending is Vigía's, in its state folder, never in the agent's volume."""
+    """Invariant 1: rewind.pending is backtide's, in its state folder, never in the agent's
+    volume."""
     service = make_real_service()
     pending = service.config.pending_file
     assert pending.parent == service.config.state_dir

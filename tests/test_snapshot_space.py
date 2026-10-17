@@ -1,4 +1,4 @@
-"""Unit tests for vigia/snapshots/space.py: the space signals and the pause conditions P1-P7.
+"""Unit tests for backtide/snapshots/space.py: the space signals and the pause conditions P1-P7.
 
 ``evaluate`` is pure, so the table tests feed it the numbers measured in the VM (docs/16 and
 docs/19): a new 1 GiB volume, the metadata full, the buffered-write trap of A14b, a workspace
@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from vigia.snapshots import btrfs, space
-from vigia.snapshots.model import SnapshotError
-from vigia.snapshots.space import (
+from backtide.snapshots import btrfs, space
+from backtide.snapshots.model import SnapshotError
+from backtide.snapshots.space import (
     DEFAULT_CONFIG,
     GIB,
     MIB,
@@ -28,7 +28,7 @@ from vigia.snapshots.space import (
     host_threshold,
     metadata_threshold,
 )
-from vigia.snapshots.space import evaluate as raw_evaluate
+from backtide.snapshots.space import evaluate as raw_evaluate
 
 FSID = "8c9bd68d-0b2f-4d38-a2e2-6c2d3a5f1b77"
 PLENTY = HostSpace(total=500 * GIB, free=400 * GIB)

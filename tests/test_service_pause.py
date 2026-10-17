@@ -1,4 +1,4 @@
-"""The pieces of the pause by space that live outside the Guardian (vigia/service/pause.py):
+"""The pieces of the pause by space that live outside the Guardian (backtide/service/pause.py):
 what resuming answers, what the alert says holds the space, the real space gate and the
 threads that tick. Pure or with fakes; the Guardian's side is in test_service_space_thread.py.
 """
@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.pause import (
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.pause import (
     Holder,
     ResumeOutcome,
     ResumeStatus,
@@ -19,8 +19,8 @@ from vigia.service.pause import (
     holders_text,
     make_space_gate,
 )
-from vigia.snapshots import btrfs, space
-from vigia.snapshots.space import GIB, MIB, Allocation, Condition, HostSpace, Sample, VolumeSpace
+from backtide.snapshots import btrfs, space
+from backtide.snapshots.space import GIB, MIB, Allocation, Condition, HostSpace, Sample, VolumeSpace
 
 TOKEN = "T0kenForTestsOnly_" + "a1B2c3D4e5F6g7H8i9J0" * 2
 CAP = 64 * MIB
@@ -228,7 +228,7 @@ def test_a_step_that_raises_is_logged_and_the_ticker_goes_on(
         ran.set()
 
     ticker = Ticker("test-ticker", 0.01, step)
-    with caplog.at_level("ERROR", logger="vigia.service.pause"):
+    with caplog.at_level("ERROR", logger="backtide.service.pause"):
         ticker.start()
         assert ran.wait(5)
         ticker.close()

@@ -1,7 +1,7 @@
 """Evil-agent scenarios against the black box (T02), from the host and without the agent.
 
 The attacker here has what the agent would have after escaping the jail: write access to the
-black box's files on the host. It never has the key. `vigia verificar` (the real command) has to
+black box's files on the host. It never has the key. `backtide verificar` (the real command) has to
 notice every manipulation. A second scenario checks that secrets never reach those files at all.
 Nothing needs the agent's container, so these run fast, but they still refuse to run outside the
 VM like every attack.
@@ -21,8 +21,8 @@ from pathlib import Path
 import pytest
 from attack_kit import Attack, scenario
 
-from vigia.blackbox import BlackBox, BlackBoxError, Source, create_key
-from vigia.blackbox.chain import canonical, compute_hash
+from backtide.blackbox import BlackBox, BlackBoxError, Source, create_key
+from backtide.blackbox.chain import canonical, compute_hash
 
 REPO = Path(__file__).resolve().parents[2]
 SNAPSHOT = "20261016T101500.000000Z-periodic"
@@ -189,12 +189,12 @@ ATTACKS: dict[str, tuple[Callable[[Box], None], int]] = {
 
 
 def verify(box: Box) -> subprocess.CompletedProcess[str]:
-    """`vigia verificar`, exactly as a person would run it."""
+    """`backtide verificar`, exactly as a person would run it."""
     return subprocess.run(
         [
             sys.executable,
             "-m",
-            "vigia.cli",
+            "backtide.cli",
             "verificar",
             "--db",
             str(box.db),
@@ -247,7 +247,7 @@ def test_tampering_with_the_black_box(attack: Attack, tmp_path_factory: pytest.T
     attack.check(
         "recorded",
         all(detected),
-        "la caja intacta sale con 0 y cada manipulación se detecta con `vigia verificar`: "
+        "la caja intacta sale con 0 y cada manipulación se detecta con `backtide verificar`: "
         + "; ".join(findings),
     )
 

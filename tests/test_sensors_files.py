@@ -17,11 +17,10 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import FakeClock
-from vigia.blackbox import BlackBox
-from vigia.sensors import files as files_module
-from vigia.sensors import inotify
-from vigia.sensors.files import (
+from backtide.blackbox import BlackBox
+from backtide.sensors import files as files_module
+from backtide.sensors import inotify
+from backtide.sensors.files import (
     SENTINEL_MASK,
     WATCH_MASK,
     Coalescer,
@@ -32,7 +31,7 @@ from vigia.sensors.files import (
     WatcherConfig,
     WatchTree,
 )
-from vigia.sensors.inotify import (
+from backtide.sensors.inotify import (
     IN_ATTRIB,
     IN_CLOSE_WRITE,
     IN_CREATE,
@@ -49,7 +48,8 @@ from vigia.sensors.inotify import (
     OpenBeneath,
     RawEvent,
 )
-from vigia.snapshots import Snapshot
+from backtide.snapshots import Snapshot
+from tests.conftest import FakeClock
 
 T0 = datetime(2026, 10, 16, 9, 0, tzinfo=UTC)
 S1 = "20261016T085900.000000Z-periodic"
@@ -1031,7 +1031,7 @@ class TestBarrier:
     def test_a_delete_that_arrives_while_the_snapshot_is_taken_points_to_the_one_before(
         self, make_rig: Callable[..., Rig]
     ) -> None:
-        """The agent deletes at t0, Vigía takes S2 at t0+e, the reader sees the event after: the
+        """The agent deletes at t0, backtide takes S2 at t0+e, the reader sees the event after: the
         record must say S1 (S2 no longer has the file)."""
         rig = make_rig()
         (rig.agent_dir / "work" / "old.txt").unlink()
@@ -1124,7 +1124,7 @@ class TestRateLimits:
         rig = make_rig(
             self.config(bucket_rate=1000, bucket_burst=1000, daily_budget=4, summary_interval=10)
         )
-        with caplog.at_level("WARNING", logger="vigia.sensors.files"):
+        with caplog.at_level("WARNING", logger="backtide.sensors.files"):
             self.create_files(rig, 10, "a")
             rig.settle()
             self.create_files(rig, 10, "b")
@@ -1182,7 +1182,7 @@ class TestOverflow:
         newer = rig.agent_dir / "work" / "made_during_the_overflow"
         newer.mkdir()
         (newer / "inside").write_text("x")
-        with caplog.at_level("WARNING", logger="vigia.sensors.files"):
+        with caplog.at_level("WARNING", logger="backtide.sensors.files"):
             rig.deliver(RawEvent(-1, IN_Q_OVERFLOW, 0, b""))
             rig.settle()
         (dropped,) = rig.files("dropped")
@@ -1294,7 +1294,7 @@ class TestBounds:
             real(path, **kwargs)
 
         monkeypatch.setattr(rig.watcher._coalescer, "created", flaky)
-        with caplog.at_level("ERROR", logger="vigia.sensors.files"):
+        with caplog.at_level("ERROR", logger="backtide.sensors.files"):
             rig.deliver(rig.event("work", IN_CREATE, "bad"), rig.event("work", IN_CREATE, "good"))
         rig.settle()
         assert "work/good" in rig.by_target()
@@ -1309,7 +1309,7 @@ class TestBlackBoxFailures:
         for i in range(4):
             (rig.agent_dir / "work" / f"n{i}").write_text("x")
         rig.box.fail = True
-        with caplog.at_level("ERROR", logger="vigia.sensors.files"):
+        with caplog.at_level("ERROR", logger="backtide.sensors.files"):
             rig.deliver(*[rig.event("work", IN_CREATE, f"n{i}") for i in range(4)])
             rig.watcher.flush()
         assert rig.files() == []
@@ -1552,7 +1552,7 @@ class TestLifecycle:
         rig = make_rig(WatcherConfig(dump_interval=0.02, max_watches=100))
         rig.watcher.close()
         names = {t.name for t in threading.enumerate()}
-        assert not {n for n in names if n.startswith("vigia-watch")}
+        assert not {n for n in names if n.startswith("backtide-watch")}
 
 
 # -- the security review of T04a: each finding with the test that failed without its fix -----
@@ -1654,7 +1654,7 @@ class TestWalkerRaces:
 
         rig = make_rig(self.config(), arm=False, opener=refusing)
         (rig.agent_dir / "work" / hostile).mkdir()
-        with caplog.at_level("DEBUG", logger="vigia.sensors"):
+        with caplog.at_level("DEBUG", logger="backtide.sensors"):
             assert rig.watcher.arm(S1)
         assert rig.watcher.unwatched_count() == 1
         assert rig.watcher.report_unwatched()

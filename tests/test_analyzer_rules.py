@@ -2,9 +2,9 @@
 
 import pytest
 
-from vigia.analyzer import RulesError, default_rules, parse_rules
-from vigia.analyzer.model import MAX_RULES
-from vigia.analyzer.rules import MAX_RULES_BYTES
+from backtide.analyzer import RulesError, default_rules, parse_rules
+from backtide.analyzer.model import MAX_RULES
+from backtide.analyzer.rules import MAX_RULES_BYTES
 
 GOOD = """
 [[rule]]

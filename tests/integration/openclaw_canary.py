@@ -1,6 +1,6 @@
 """The canary on OpenClaw's SQLite (docs/19, section 7, point 6; docs/20, section 9).
 
-What Vigía promises about channels and rewinds rests on how OpenClaw 2026.9.8 keeps its state:
+What backtide promises about channels and rewinds rests on how OpenClaw 2026.9.8 keeps its state:
 who may talk to the agent comes only from openclaw.json (read-only), and what its global SQLite
 holds a rewind brings back. The canary reads that SQLite in a SNAPSHOT (never the live one) and
 says two things:
@@ -9,13 +9,13 @@ says two things:
   if a new OpenClaw breaks it, docs/19 section 7 and docs/20 have to be read again;
 - which rows in it would authorize someone (``authorizations``): a sender approved in the DM
   pairing store, a pending pairing code, "allow always" exec entries, standing grants, paired
-  devices. With the config Vigía writes none of them may authorize anything, but rows there
+  devices. With the config backtide writes none of them may authorize anything, but rows there
   are exactly what an agent that tries to authorize itself leaves behind.
 
 Only for the tests: it runs as the test's user on a COPY of the database and its WAL (a
 snapshot is read-only, and ``immutable=1`` would ignore what is committed in the WAL but not yet
-checkpointed, which on a young database is everything). Vigía itself never opens a SQLite of the
-agent (docs/19, section 7: "nunca Vigía como root abriendo una SQLite del agente").
+checkpointed, which on a young database is everything). backtide itself never opens a SQLite of the
+agent (docs/19, section 7: "nunca backtide como root abriendo una SQLite del agente").
 """
 
 import shutil

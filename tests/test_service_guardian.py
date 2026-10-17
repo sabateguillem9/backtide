@@ -19,14 +19,14 @@ from uuid import UUID
 
 import pytest
 
-from vigia.blackbox import BlackBox, BlackBoxError, Event, create_key
-from vigia.jail import JailError
-from vigia.jail.openclaw import RewindProblem, UnrewindableConfig
-from vigia.notify import Alert, AlertLevel
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.guardian import AgentState, CycleResult, FileWatcher, Guardian
-from vigia.service.rewind import RewindStatus
-from vigia.snapshots import (
+from backtide.blackbox import BlackBox, BlackBoxError, Event, create_key
+from backtide.jail import JailError
+from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
+from backtide.notify import Alert, AlertLevel
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.guardian import AgentState, CycleResult, FileWatcher, Guardian
+from backtide.service.rewind import RewindStatus
+from backtide.snapshots import (
     PruneIncomplete,
     Reason,
     RestoreIncomplete,
@@ -36,7 +36,7 @@ from vigia.snapshots import (
     SnapshotError,
     SnapshotNoSpace,
 )
-from vigia.snapshots.btrfs import SubvolumeInfo
+from backtide.snapshots.btrfs import SubvolumeInfo
 
 TOKEN = "T0kenForTestsOnly_" + "a1B2c3D4e5F6g7H8i9J0" * 2
 
@@ -524,10 +524,10 @@ class World:
 @pytest.fixture(autouse=True)
 def no_leftover_bridge() -> Iterator[None]:
     yield
-    vigia_logger = logging.getLogger("vigia")
-    for handler in list(vigia_logger.handlers):
+    backtide_logger = logging.getLogger("backtide")
+    for handler in list(backtide_logger.handlers):
         if type(handler).__name__ == "LogBridge":
-            vigia_logger.removeHandler(handler)
+            backtide_logger.removeHandler(handler)
 
 
 @pytest.fixture
@@ -1305,26 +1305,28 @@ def test_a_black_box_that_fails_mid_cycle_is_logged_alerted_and_does_not_stop_th
 
 
 def test_a_store_warning_becomes_an_event_and_an_alert(running: World) -> None:
-    logging.getLogger("vigia.snapshots.store").warning("%s is low on space: %d%% free", "/vol", 4)
+    logging.getLogger("backtide.snapshots.store").warning(
+        "%s is low on space: %d%% free", "/vol", 4
+    )
     assert running.guardian.flush_logs()
     event = running.only("log")
-    assert (event.source, event.risk, event.target) == ("system", 1, "vigia.snapshots.store")
+    assert (event.source, event.risk, event.target) == ("system", 1, "backtide.snapshots.store")
     assert event.details["template"] == "%s is low on space: %d%% free"
     assert event.details["message"] == "/vol is low on space: 4% free"
-    (alert,) = running.alerts.titled("vigia.snapshots.store")
+    (alert,) = running.alerts.titled("backtide.snapshots.store")
     assert alert.event_seq == event.seq
     assert alert.level is AlertLevel.WARNING
 
 
 def test_an_error_has_risk_two_and_error_level(running: World) -> None:
-    logging.getLogger("vigia.snapshots.store").error("the clock is behind")
+    logging.getLogger("backtide.snapshots.store").error("the clock is behind")
     assert running.guardian.flush_logs()
     assert running.only("log").risk == 2
     assert running.alerts.sent[-1].level is AlertLevel.ERROR
 
 
 def test_a_flood_of_one_template_is_one_event_a_minute(running: World) -> None:
-    store_logger = logging.getLogger("vigia.snapshots.store")
+    store_logger = logging.getLogger("backtide.snapshots.store")
     for name in ("a", "b", "c"):
         store_logger.warning("unexpected entry %s: leaving it untouched", name)
     assert running.guardian.flush_logs()
@@ -1333,14 +1335,14 @@ def test_a_flood_of_one_template_is_one_event_a_minute(running: World) -> None:
 
 def test_a_failing_black_box_does_not_make_the_bridge_loop(running: World) -> None:
     running.box.append_error = BlackBoxError("disk full")
-    logging.getLogger("vigia.snapshots.store").warning("something")  # must return
+    logging.getLogger("backtide.snapshots.store").warning("something")  # must return
     assert running.guardian.flush_logs()
-    assert running.alerts.titled("vigia.snapshots.store")  # the user still hears about it
+    assert running.alerts.titled("backtide.snapshots.store")  # the user still hears about it
 
 
 def test_the_bridge_is_removed_when_the_service_stops(running: World) -> None:
     running.guardian.stop()
-    logging.getLogger("vigia.snapshots.store").warning("after the stop")
+    logging.getLogger("backtide.snapshots.store").warning("after the stop")
     assert [e.details["message"] for e in running.events("log")] == []
 
 
@@ -1348,7 +1350,7 @@ def test_the_bridge_is_not_installed_when_the_boot_fails(world: World) -> None:
     world.jail.setup_error = JailError("boom")
     with pytest.raises(JailError):
         world.guardian.start()
-    logging.getLogger("vigia.snapshots.store").warning("after a failed boot")
+    logging.getLogger("backtide.snapshots.store").warning("after a failed boot")
     assert world.events("log") == []
 
 
@@ -1435,7 +1437,7 @@ def test_a_boot_that_fails_after_the_agent_started_does_not_leave_it_running(
     assert world.log[-2:] == ["jail.stop", "watcher.close"]
     assert world.only("agent_stop").details == {"reason": "boot_failed"}
     assert world.only("service_start_failed")
-    logging.getLogger("vigia.snapshots.store").warning("after the failed boot")
+    logging.getLogger("backtide.snapshots.store").warning("after the failed boot")
     assert world.events("log") == []  # the bridge is gone
     world.log.clear()
     world.guardian.stop()  # nothing left to do
@@ -1697,7 +1699,7 @@ def test_every_alert_goes_through_redact(running: World) -> None:
 def test_a_secret_in_a_logged_warning_is_redacted_in_the_alert_and_the_event(
     running: World,
 ) -> None:
-    logging.getLogger("vigia.snapshots.store").warning("unexpected entry %s", SECRET)
+    logging.getLogger("backtide.snapshots.store").warning("unexpected entry %s", SECRET)
     assert running.guardian.flush_logs()
     assert all(SECRET not in alert.body for alert in running.alerts.sent)
     assert SECRET not in str(running.only("log").details)
@@ -1777,7 +1779,7 @@ def test_a_barrier_that_never_calls_take_still_gets_its_snapshot(running: World)
 
 
 def pending_intent(world: World) -> object:
-    from vigia.service.rewind import read_pending  # noqa: PLC0415 - only the rewind tests
+    from backtide.service.rewind import read_pending  # noqa: PLC0415 - only the rewind tests
 
     return read_pending(world.config.pending_file)
 
@@ -2037,7 +2039,7 @@ def test_start_if_fails_closed_when_deciding_breaks(rewinding: World) -> None:
 
 
 def test_a_failing_black_box_does_not_stop_the_rewind(rewinding: World) -> None:
-    from vigia.blackbox import BlackBoxError  # noqa: PLC0415
+    from backtide.blackbox import BlackBoxError  # noqa: PLC0415
 
     rewinding.box.append_error = BlackBoxError("disk full")
     seen_intent: list[object] = []
@@ -2128,7 +2130,7 @@ def interrupted_rewind(
 ) -> str:
     """What a rewind killed half way leaves: its intent on disk, its request in the black box
     (unless ``with_event`` is False) and, if ``swapped``, a rewound workspace."""
-    from vigia.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
+    from backtide.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
 
     target = world.volume.snapshot_quietly()
     world.volume.write()
@@ -2208,7 +2210,7 @@ def test_a_settled_rewind_is_not_reconciled_twice(rewinding: World) -> None:
 
 def test_an_intent_whose_rewind_was_settled_is_only_removed(rewinding: World) -> None:
     """The rewind ended, but removing its intent failed: the next start finds it settled."""
-    from vigia.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
+    from backtide.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
 
     rewinding.guardian.rewind(rewinding.volume.listed[0].id, requested_by="cli")
     done = rewinding.only("rewind_done")
@@ -2248,8 +2250,8 @@ def test_an_earlier_interrupted_rewind_is_settled_before_a_new_one(world: World)
 def capped_world(world: World, usage_limit: int | None, errors: tuple[str, ...] = ()) -> World:
     from dataclasses import replace  # noqa: PLC0415
 
-    from vigia.snapshots import space  # noqa: PLC0415
-    from vigia.snapshots.btrfs import QGROUP_LIMIT_MAX_RFER, QgroupUsage  # noqa: PLC0415
+    from backtide.snapshots import space  # noqa: PLC0415
+    from backtide.snapshots.btrfs import QGROUP_LIMIT_MAX_RFER, QgroupUsage  # noqa: PLC0415
 
     limit = 64 * 1024**2
     usage = None
@@ -2396,7 +2398,7 @@ def test_a_rewind_needs_a_running_service(world: World, when: str) -> None:
     target = world.volume.snapshot_quietly()
     outcome = world.guardian.rewind(target.id, requested_by="cli")
     assert outcome.status is RewindStatus.FAILED and outcome.exit_code == 1
-    assert "Vigía" in outcome.message
+    assert "backtide" in outcome.message
     assert world.log == []
     if when == "stopped":
         assert world.actions() == before
@@ -2474,7 +2476,7 @@ def test_a_rewind_after_one_without_space_closes_its_pause_when_it_works(rewindi
 
 
 def test_a_reconciliation_that_cannot_be_recorded_keeps_the_intent(world: World) -> None:
-    from vigia.blackbox import BlackBoxError  # noqa: PLC0415
+    from backtide.blackbox import BlackBoxError  # noqa: PLC0415
 
     interrupted_rewind(world, swapped=True)
     world.guardian.start()
@@ -2509,7 +2511,7 @@ def test_a_rewind_killed_between_the_swap_and_the_undo_point_is_reconciled(
     """Killed after the swap but before the old workspace was published: the next start's
     recover() publishes it (as "recovered"), and the reconciliation finds it as the undo point
     by its subvolume id."""
-    from vigia.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
+    from backtide.service.rewind import PendingRewind, write_pending  # noqa: PLC0415
 
     target = world.volume.snapshot_quietly()
     world.volume.write()
@@ -2531,10 +2533,10 @@ def test_a_real_jail_whose_stop_fails_in_the_middle_of_a_rewind(
     """The real AgentJail.quiesce (Docker faked): `docker stop` times out and the container is
     still running. restore never swaps, the agent was never stopped, and the black box says
     the stop failed with the agent still running."""
-    from vigia.jail import agent as agent_module  # noqa: PLC0415
-    from vigia.jail import docker  # noqa: PLC0415
-    from vigia.jail.agent import AgentJail  # noqa: PLC0415
-    from vigia.jail.config import AgentJailConfig  # noqa: PLC0415
+    from backtide.jail import agent as agent_module  # noqa: PLC0415
+    from backtide.jail import docker  # noqa: PLC0415
+    from backtide.jail.agent import AgentJail  # noqa: PLC0415
+    from backtide.jail.config import AgentJailConfig  # noqa: PLC0415
 
     replies = iter([{"Running": True, "Paused": False}] * 50)
     calls: list[list[str]] = []
@@ -2611,7 +2613,7 @@ def test_run_opens_the_control_socket_after_the_agent_is_up_and_closes_it_before
 def test_a_control_socket_that_cannot_start_stops_the_service_and_the_agent(
     world: World,
 ) -> None:
-    """Without the socket, `vigia rebobinar` would find the lock taken and nobody to ask."""
+    """Without the socket, `backtide rebobinar` would find the lock taken and nobody to ask."""
     control = FakeControl(world.log)
     control.start_error = RuntimeError("cannot bind")
     with pytest.raises(RuntimeError, match="cannot bind"):

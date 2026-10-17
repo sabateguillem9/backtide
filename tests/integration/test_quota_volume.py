@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import pytest
 
-from vigia.snapshots import SnapshotError, btrfs
+from backtide.snapshots import SnapshotError, btrfs
 
 pytestmark = pytest.mark.integration
 

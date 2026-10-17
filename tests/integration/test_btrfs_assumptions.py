@@ -4,7 +4,7 @@ Each test pins one behaviour of the kernel or btrfs-progs that the snapshot stor
 (docs/10, "Plan B" table). They stay as regression tests for kernel and btrfs-progs upgrades.
 
 Everything runs as the unprivileged Lima user on a loop btrfs mounted with
-user_subvol_rm_allowed (see conftest.py), through the same vigia.snapshots.btrfs functions
+user_subvol_rm_allowed (see conftest.py), through the same backtide.snapshots.btrfs functions
 the store uses.
 """
 
@@ -19,7 +19,7 @@ from uuid import uuid4
 
 import pytest
 
-from vigia.snapshots import SnapshotError, SnapshotNoSpace, btrfs
+from backtide.snapshots import SnapshotError, SnapshotNoSpace, btrfs
 
 pytestmark = pytest.mark.integration
 

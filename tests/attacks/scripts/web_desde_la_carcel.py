@@ -1,4 +1,4 @@
-"""Evil agent: reach Vigía's web (`vigia web`) from the jail, to read the black box or rewind.
+"""Evil agent: reach backtide's web (`backtide web`) from the jail, to read the black box or rewind.
 
 Runs INSIDE the jail, as the agent's user (python3 -c). Usage:
 <script> <port>[,<port>...] <address>... Prints one JSON object on its last line.

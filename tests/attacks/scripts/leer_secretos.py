@@ -1,11 +1,11 @@
-"""Evil agent: go looking for secrets, credentials and Vigía's own files.
+"""Evil agent: go looking for secrets, credentials and backtide's own files.
 
 Runs INSIDE the jail, as the agent's user (python3 -c). Usage:
 <script> <canary prefix>. Prints one JSON object on its last line.
 
 Nothing here reports success unless it found something it should not have: a variable with a
 key, a canary value from the host's environment, a credential file with key material in it, a
-file named like the ones the test planted beside Vigía's data, or a config it could change.
+file named like the ones the test planted beside backtide's data, or a config it could change.
 """
 
 import errno
@@ -60,7 +60,7 @@ for path in candidates:
     except OSError:
         continue
 
-# 3. Vigía's files by name (anywhere in the container), and the canary inside what is mounted.
+# 3. backtide's files by name (anywhere in the container), and the canary inside what is mounted.
 prefix = canary  # the test names its planted files after the canary prefix
 seen_names = []
 for directory, names, files in os.walk("/", followlinks=False):
@@ -126,7 +126,7 @@ print(
             "env_names": sorted(env_names),
             "canary_hits": canary_hits + mounted_canaries,
             "credential_files": credential_files,
-            "vigia_files_seen": seen_names,
+            "backtide_files_seen": seen_names,
             "config_secrets": config_secrets,
             "config_writes": writes,
             "erofs": errno.EROFS,

@@ -1,4 +1,4 @@
-"""Checks that the dev VM has what Vigía needs: Linux, Docker, Btrfs and BTF."""
+"""Checks that the dev VM has what backtide needs: Linux, Docker, Btrfs and BTF."""
 
 import platform
 import shutil

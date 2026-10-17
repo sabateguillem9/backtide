@@ -1,6 +1,6 @@
 """The manifest of the evil-agent battery (manifest.toml), loaded and validated. Pure: no VM.
 
-Every scenario says what Vigía is expected to do in five dimensions (``DIMENSIONS``). A
+Every scenario says what backtide is expected to do in five dimensions (``DIMENSIONS``). A
 dimension is either a final value or ``pending:Txx``: it will exist when that task is built,
 and until then it is reported as pending, never as passed.
 """

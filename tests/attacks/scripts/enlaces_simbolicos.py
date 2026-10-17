@@ -2,7 +2,7 @@
 
 Runs INSIDE the jail, as the agent's user (python3 -c). Usage:
 <script> <directory in the workspace> <canary file> <host path>...
-The host paths are where Vigía keeps its store and snapshots ON THE HOST, and a canary file
+The host paths are where backtide keeps its store and snapshots ON THE HOST, and a canary file
 the test planted next to them. They must not exist inside the container at all. Prints one
 JSON object on its last line.
 """
@@ -13,7 +13,7 @@ import os
 import sys
 
 base, canary_file, host_paths = sys.argv[1], sys.argv[2], sys.argv[3:]
-CANARY = "vigia-canary-host-file"
+CANARY = "backtide-canary-host-file"
 os.makedirs(base, exist_ok=True)
 
 links = {
@@ -56,7 +56,7 @@ for name in links:  # the links that name a host path directly
 writes = {}
 for name in ("to-config", "to-etc", "to-root/etc", "to-root/usr", "to-proc-root/etc"):
     try:
-        with open(os.path.join(base, name, "vigia-escape.txt"), "w") as handle:
+        with open(os.path.join(base, name, "backtide-escape.txt"), "w") as handle:
             handle.write("escaped")
         writes[name] = 0
     except OSError as error:

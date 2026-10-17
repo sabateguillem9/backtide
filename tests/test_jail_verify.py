@@ -1,4 +1,4 @@
-"""Unit tests for vigia/jail/verify.py: is an existing container exactly the jail?
+"""Unit tests for backtide/jail/verify.py: is an existing container exactly the jail?
 
 GOOD is what ``docker container inspect`` reported in the VM (Docker 29.8.2) for a container
 made by docker_create_argv, reduced to the fields that matter. The VM test
@@ -14,12 +14,12 @@ from typing import Any
 
 import pytest
 
-from vigia.jail.config import IMAGE, AgentJailConfig
-from vigia.jail.verify import container_problems
+from backtide.jail.config import IMAGE, AgentJailConfig
+from backtide.jail.verify import container_problems
 
 TOKEN = "t" * 43
-WORKSPACE = Path("/srv/vigia/volume/workspace")
-CONFIG_DIR = Path("/srv/vigia/agent-config")
+WORKSPACE = Path("/srv/backtide/volume/workspace")
+CONFIG_DIR = Path("/srv/backtide/agent-config")
 PROFILE = {"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [{"names": ["read"]}]}
 IMAGE_ENV = ["PATH=/usr/local/bin:/usr/bin:/bin", "NODE_ENV=production"]
 JAIL_ENV = [
@@ -68,7 +68,7 @@ GOOD: dict[str, Any] = {
         "Memory": 2147483648,
         "MemorySwap": 2147483648,
         "NanoCpus": 2000000000,
-        "NetworkMode": "vigia-agente-net",
+        "NetworkMode": "backtide-agente-net",
         "OomKillDisable": False,
         "PidMode": "",
         "PidsLimit": 512,
@@ -88,7 +88,7 @@ GOOD: dict[str, Any] = {
         "VolumeDriver": "",
         "VolumesFrom": None,
     },
-    "NetworkSettings": {"Networks": {"vigia-agente-net": {"IPAddress": ""}}},
+    "NetworkSettings": {"Networks": {"backtide-agente-net": {"IPAddress": ""}}},
 }
 
 
@@ -181,7 +181,7 @@ def test_the_order_of_lists_docker_keeps_does_not_matter(cfg: AgentJailConfig) -
             "mounts",
         ),
         ("HostConfig.Mounts", [{"Type": "bind", "Source": "/", "Target": "/host"}], "Mounts"),
-        ("HostConfig.VolumesFrom", ["vigia"], "VolumesFrom"),
+        ("HostConfig.VolumesFrom", ["backtide"], "VolumesFrom"),
         ("HostConfig.Tmpfs", {"/tmp": "rw,exec,size=256m"}, "Tmpfs"),
         # A container from before the /sys masks (or one that lost one) shows the agent the host
         (
@@ -217,7 +217,7 @@ def test_the_order_of_lists_docker_keeps_does_not_matter(cfg: AgentJailConfig) -
         ),
         ("HostConfig.PidMode", "host", "PidMode"),
         ("HostConfig.IpcMode", "host", "IpcMode"),
-        ("HostConfig.IpcMode", "container:vigia", "IpcMode"),
+        ("HostConfig.IpcMode", "container:backtide", "IpcMode"),
         ("HostConfig.UTSMode", "host", "UTSMode"),
         ("HostConfig.UsernsMode", "host", "UsernsMode"),
         ("HostConfig.CgroupnsMode", "host", "CgroupnsMode"),
@@ -225,11 +225,11 @@ def test_the_order_of_lists_docker_keeps_does_not_matter(cfg: AgentJailConfig) -
         # The network
         ("HostConfig.NetworkMode", "host", "networks"),
         ("HostConfig.NetworkMode", "bridge", "networks"),
-        ("NetworkSettings.Networks", {"vigia-agente-net": {}, "bridge": {}}, "networks"),
+        ("NetworkSettings.Networks", {"backtide-agente-net": {}, "bridge": {}}, "networks"),
         ("HostConfig.PortBindings", {"18789/tcp": [{"HostPort": "18789"}]}, "PortBindings"),
         ("HostConfig.PublishAllPorts", True, "PublishAllPorts"),
         ("HostConfig.ExtraHosts", ["host.docker.internal:host-gateway"], "ExtraHosts"),
-        ("HostConfig.Links", ["/vigia:/agente/vigia"], "Links"),
+        ("HostConfig.Links", ["/backtide:/agente/backtide"], "Links"),
         # Limits
         ("HostConfig.RestartPolicy", {"Name": "always"}, "RestartPolicy"),
         ("HostConfig.Memory", 0, "Memory"),

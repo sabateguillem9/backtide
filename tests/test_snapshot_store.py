@@ -23,8 +23,8 @@ from typing import Protocol
 
 import pytest
 
-import vigia.snapshots.store as store_module
-from vigia.snapshots import (
+import backtide.snapshots.store as store_module
+from backtide.snapshots import (
     PruneIncomplete,
     Reason,
     RestoreIncomplete,
@@ -1793,7 +1793,7 @@ def test_a_capped_snapshot_at_its_cap_can_still_be_deleted(
 ) -> None:
     snap = take(capped, "v1")
     path = capped.snapshots_dir / snap.id
-    fake.limits[fake.ids[path]] = CAP  # e.g. published by a Vigía older than T03b-2
+    fake.limits[fake.ids[path]] = CAP  # e.g. published by a backtide older than T03b-2
     fake.full.add(fake.ids[path])
     if in_place:  # full metadata: the tombstone rename fails and it is deleted where it is
         fake.fail("renameat2", SnapshotNoSpace("renameat2 failed", errno=errno.ENOSPC))

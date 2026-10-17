@@ -9,7 +9,7 @@ The lab (``lab``, one per module) is made of throwaway containers on two network
 ``--internal`` with isolated gateways: nothing in it can reach the internet, the VM or the Mac
 (invariant 8), even if a check fails.
 
-    agent net:  client (the agent's role, --dns = fake-dns) . fake-dns . proxy ("vigia-proxy")
+    agent net:  client (the agent's role, --dns = fake-dns) . fake-dns . proxy ("backtide-proxy")
     egress net: proxy . fake-internet (every *.fake.test name is an alias of it)
 
 - ``proxy``: the pinned mitmproxy image as uid 61001, no capabilities, read-only root, started
@@ -22,8 +22,8 @@ The lab (``lab``, one per module) is made of throwaway containers on two network
 P9 adds the real OpenClaw from the pinned image. Every key is a fake one made here; nothing
 ever talks to a real model provider.
 
-Containers and networks are named like conftest.py's test agents (``vigia-test-agent-<pid>-``
-and ``vigia-test-net-<pid>-``), so the cleanup of a killed run's leftovers covers them too.
+Containers and networks are named like conftest.py's test agents (``backtide-test-agent-<pid>-``
+and ``backtide-test-net-<pid>-``), so the cleanup of a killed run's leftovers covers them too.
 """
 
 import json
@@ -44,9 +44,9 @@ from uuid import uuid4
 
 import pytest
 
-from vigia.jail import IMAGE, AgentJail, AgentJailConfig
-from vigia.jail import docker as jail_docker
-from vigia.jail.config import docker_create_argv, openclaw_config, token_env
+from backtide.jail import IMAGE, AgentJail, AgentJailConfig
+from backtide.jail import docker as jail_docker
+from backtide.jail.config import docker_create_argv, openclaw_config, token_env
 
 pytestmark = pytest.mark.integration
 
@@ -59,13 +59,13 @@ ARM64_MANIFEST = "sha256:62d266a86ee95187217866c0e35487837498daa3aa1cdce37d256f0
 AMD64_MANIFEST = "sha256:68afa70d7b6ac9d269b88f88534f9ffceb363b4ce31703a78702341fba82e831"
 
 PROXY_UID = 61001
-CLIENT_UID = 61000  # the agent's own ids (vigia/jail/config.py)
+CLIENT_UID = 61000  # the agent's own ids (backtide/jail/config.py)
 FAKE_UID = 61002
-PROXY_ALIAS = "vigia-proxy"
+PROXY_ALIAS = "backtide-proxy"
 PROXY_PORT = 8080
 PROXY = f"{PROXY_ALIAS}:{PROXY_PORT}"
-CONTAINER_PREFIX = "vigia-test-agent-"  # conftest.TEST_CONTAINER_PREFIX
-NETWORK_PREFIX = "vigia-test-net-"  # conftest.TEST_NETWORK_PREFIX
+CONTAINER_PREFIX = "backtide-test-agent-"  # conftest.TEST_CONTAINER_PREFIX
+NETWORK_PREFIX = "backtide-test-net-"  # conftest.TEST_NETWORK_PREFIX
 
 FIXTURES = Path(__file__).parent / "proxy_fixtures"
 SCRIPTS = ("proxy_main.py", "fake_internet.py", "fake_dns.py", "client.py")
@@ -87,7 +87,7 @@ FAKE_HOSTS = (
     "p8-sni.fake.test",
     "model.fake.test",
 )
-AGENT_CA_NAME = "Vigia agent CA t06-1"
+AGENT_CA_NAME = "backtide agent CA t06-1"
 INTERNET_CA_NAME = "T06 test internet CA"
 
 PULL_TIMEOUT = 900.0
@@ -185,7 +185,7 @@ def openssl(*args: str) -> None:
 
 
 def make_ca(folder: Path, name: str, bits: int, days: int) -> tuple[Path, Path]:
-    """A CA as Vigía will make it (docs/21, section 3): the VM's openssl, a fixed config."""
+    """A CA as backtide will make it (docs/21, section 3): the VM's openssl, a fixed config."""
     config = folder / f"{bits}-ca.cnf"
     config.write_text(
         "[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\nprompt = no\n"
@@ -262,7 +262,7 @@ def proxy_argv(lab_root: Path, name: str, agent_net: str, egress_net: str, *, al
         # Without it mitmproxy's own log (addon errors) stays in stdout's buffer (P7).
         "--env", "PYTHONUNBUFFERED=1",
         "--volume", f"{confdir}:/ca:ro,z",
-        "--volume", f"{lab_root / 'channel'}:/run/vigia:ro,z",
+        "--volume", f"{lab_root / 'channel'}:/run/backtide:ro,z",
         "--volume", f"{lab_root / 't06'}:/opt/t06:ro,z",
     ]  # fmt: skip
     for item in env:
@@ -507,7 +507,7 @@ def test_p2_dhparam_is_needed_in_a_read_only_confdir(
     lab: Lab, record_property: Callable[[str, object], None]
 ) -> None:
     """With only ``mitmproxy-ca.pem`` in a read-only /ca, mitmproxy tries to write
-    ``mitmproxy-dhparam.pem`` there and the proxy does not start (fails closed). So Vigía
+    ``mitmproxy-dhparam.pem`` there and the proxy does not start (fails closed). So backtide
     writes the dhparam next to the CA beforehand (RFC 7919 ffdhe3072, ``openssl genpkey``):
     the lab's proxy, which works, is made that way."""
     confdir = lab.root / "proxy-ca-only"
@@ -516,12 +516,12 @@ def test_p2_dhparam_is_needed_in_a_read_only_confdir(
     name = unique(CONTAINER_PREFIX)
     try:
         docker(*proxy_argv(lab.root, name, lab.agent_net, lab.egress_net,
-                           alias="vigia-proxy-ca-only", confdir=confdir))  # fmt: skip
+                           alias="backtide-proxy-ca-only", confdir=confdir))  # fmt: skip
         docker("start", name)
         try:
             wait_for_line(name, PROXY_READY, timeout=30)
             outcome = "starts"
-            result = run_client(lab, "https", "vigia-proxy-ca-only:8080", "plain.fake.test", "/")
+            result = run_client(lab, "https", "backtide-proxy-ca-only:8080", "plain.fake.test", "/")
             outcome += f"; a request through it: {result.get('status', result.get('error'))}"
         except AssertionError as error:
             outcome = f"does not start: {str(error)[-600:]}"
@@ -576,13 +576,13 @@ def serve_once(path: Path, seen: PeerSeen, ready: threading.Event) -> threading.
 
 def connect_from(lab: Lab, container: str, sock: Path) -> tuple[dict, PeerSeen]:
     """The host listens on ``sock`` (in the channel folder); ``container`` connects to it
-    through its read-only /run/vigia."""
+    through its read-only /run/backtide."""
     seen, ready = PeerSeen(), threading.Event()
     thread = serve_once(sock, seen, ready)
     try:
         assert ready.wait(10)
         result = run_client(
-            lab, "unix", f"/run/vigia/{sock.name}", "hello", container=container, timeout=40
+            lab, "unix", f"/run/backtide/{sock.name}", "hello", container=container, timeout=40
         )
         thread.join(40)
     finally:
@@ -618,7 +618,7 @@ def test_p3_selinux_refuses_container_t_a_host_socket(
     docker(
         *hardened(name, PROXY_UID), "--network", "none",
         "--security-opt", "label=disable",
-        "--volume", f"{lab.channel_dir}:/run/vigia:ro,z",
+        "--volume", f"{lab.channel_dir}:/run/backtide:ro,z",
         "--volume", f"{lab.t06_dir}:/opt/t06:ro,z",
         "--entrypoint", "sleep", MITMPROXY_IMAGE, "infinity",
     )  # fmt: skip
@@ -641,17 +641,17 @@ def test_p3_plan_b_the_host_connects_to_a_socket_of_the_proxy(
     its own folder (mounted read-write, ``:z``) and the host connects. The host opens the
     socket with O_PATH|O_NOFOLLOW, checks it is a socket of 61001 and connects through
     /proc/self/fd/N (no symlink can redirect it). SO_PEERCRED gives 61001 and a pid whose
-    cgroup names the proxy's container, which is what Vigía checks before sending anything."""
+    cgroup names the proxy's container, which is what backtide checks before sending anything."""
     folder = tmp_path / "proxy-channel"
     folder.mkdir()
     folder.chmod(0o777)  # production: 0700 61001 (the test user cannot chown to 61001)
     name = unique(CONTAINER_PREFIX)
     docker(
         *hardened(name, PROXY_UID), "--network", "none",
-        "--volume", f"{folder}:/run/vigia:rw,z",
+        "--volume", f"{folder}:/run/backtide:rw,z",
         "--volume", f"{lab.t06_dir}:/opt/t06:ro,z",
         "--entrypoint", "python3", MITMPROXY_IMAGE,
-        "/opt/t06/client.py", "listen", "/run/vigia/events.sock",
+        "/opt/t06/client.py", "listen", "/run/backtide/events.sock",
     )  # fmt: skip
     try:
         docker("start", name)
@@ -692,7 +692,7 @@ def test_p3_plan_b_the_host_connects_to_a_socket_of_the_proxy(
 def test_p4_one_create_puts_the_proxy_on_both_networks(
     lab: Lab, record_property: Callable[[str, object], None]
 ) -> None:
-    """``--network name=<agent>,alias=vigia-proxy --network <egress>`` in one docker create:
+    """``--network name=<agent>,alias=backtide-proxy --network <egress>`` in one docker create:
     the proxy is on both, and the alias exists only on the agent's network. Forwarding is off
     in the proxy only because its argv says so: a container inherits the VM's
     ``ip_forward=1`` (Docker turns it on in the VM)."""
@@ -722,7 +722,7 @@ def test_p4_one_create_puts_the_proxy_on_both_networks(
     assert "blocked" in direct and "ESCAPED" not in direct, direct
 
 
-# P5: the agent resolves vigia-proxy, and its DNS goes nowhere
+# P5: the agent resolves backtide-proxy, and its DNS goes nowhere
 
 
 def fake_dns_queries(lab: Lab) -> list[str]:
@@ -734,7 +734,7 @@ def test_p5_the_agent_resolves_the_proxy_and_nothing_else(
     lab: Lab, record_property: Callable[[str, object], None]
 ) -> None:
     """The agent as the jail makes it (no ``--dns``): Docker's embedded resolver answers
-    ``vigia-proxy`` and nothing else, the egress side's names included; the proxy answers no
+    ``backtide-proxy`` and nothing else, the egress side's names included; the proxy answers no
     DNS; and the fake resolver on the agent's network gets nothing."""
     resolv = docker("exec", lab.client, "cat", "/etc/resolv.conf").stdout
     ext = [line for line in resolv.splitlines() if "ExtServers" in line]
@@ -831,11 +831,11 @@ def test_p6_control_eager_connects_before_the_hook(lab: Lab) -> None:
     name = unique(CONTAINER_PREFIX)
     try:
         docker(*proxy_argv(lab.root, name, lab.agent_net, lab.egress_net,
-                           alias="vigia-proxy-eager", confdir=lab.proxy_ca_dir,
+                           alias="backtide-proxy-eager", confdir=lab.proxy_ca_dir,
                            env=("T06_STRATEGY=eager",)))  # fmt: skip
         docker("start", name)
         wait_for_line(name, PROXY_READY)
-        result = run_client(lab, "https", "vigia-proxy-eager:8080", "eager.fake.test", "/eager")
+        result = run_client(lab, "https", "backtide-proxy-eager:8080", "eager.fake.test", "/eager")
     finally:
         docker("rm", "--force", name, check=False)
     assert result["ok"] and result["status"] == 200, result
@@ -925,7 +925,7 @@ MODEL_HOST = "model.fake.test"
 FAKE_PROVIDER = "t06-fake"
 FAKE_MODEL = "fake-claude"
 REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"  # proxy_fixtures/fake_internet.py
-AGENT_CA_DIR = "/etc/vigia-ca"
+AGENT_CA_DIR = "/etc/backtide-ca"
 PROXY_URL = f"http://{PROXY}"
 # docs/21, sections 2 and 3: what T06-2 adds to the agent's _FIXED_ENV.
 PROXY_ENV = (
@@ -1012,7 +1012,7 @@ def openclaw_files(lab: Lab, tmp_path_factory: pytest.TempPathFactory) -> OpenCl
     jail = AgentJail(config)
     jail.prepare_workspace()
     jail.write_config()
-    fake_key = f"vigia-fake-anthropic-{secrets.token_hex(16)}"
+    fake_key = f"backtide-fake-anthropic-{secrets.token_hex(16)}"
     config.config_file.write_text(
         json.dumps(openclaw_test_config(openclaw_config(config), fake_key), indent=2)
     )
@@ -1021,8 +1021,8 @@ def openclaw_files(lab: Lab, tmp_path_factory: pytest.TempPathFactory) -> OpenCl
 
 @contextmanager
 def openclaw_container(files: OpenClawFiles, *, gateway: bool) -> Iterator[OpenClaw]:
-    """The real OpenClaw with the jail's own argv (vigia/jail/config.py) on the lab's agent
-    network, plus docs/21's variables and the agent CA in /etc/vigia-ca. With ``gateway`` it
+    """The real OpenClaw with the jail's own argv (backtide/jail/config.py) on the lab's agent
+    network, plus docs/21's variables and the agent CA in /etc/backtide-ca. With ``gateway`` it
     runs the Gateway, as the jail does; without, only ``sleep``, for embedded turns
     (``--local`` refuses to run next to a Gateway, and both at once do not fit in 2 GB)."""
     config = replace(files.config, name=unique(CONTAINER_PREFIX))

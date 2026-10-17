@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from backtide.web.reader import BoxReader, BoxUnavailable
+from backtide.web.state import FROZEN, STOPPED, UNKNOWN, WATCHED, read_status, status_from
+from backtide.web.tide import MAX_MARKS, WIDTH, build_tide
 from tests.conftest import FakeClock
 from tests.test_web_narrate import START, ev
 from tests.webkit import new_box
-from vigia.web.reader import BoxReader, BoxUnavailable
-from vigia.web.state import FROZEN, STOPPED, UNKNOWN, WATCHED, read_status, status_from
-from vigia.web.tide import MAX_MARKS, WIDTH, build_tide
 
 
 def system(seq: int, action: str, **details) -> object:
@@ -84,7 +84,7 @@ def test_reader_is_read_only(tmp_path: Path) -> None:
     reader = BoxReader(tmp_path / "blackbox.db")
     reader.events()
     assert reader._box is not None  # noqa: SLF001 - the point of the test
-    from vigia.blackbox import BlackBoxError
+    from backtide.blackbox import BlackBoxError
 
     with pytest.raises(BlackBoxError):
         reader._box.append("file", "create", "x")  # noqa: SLF001

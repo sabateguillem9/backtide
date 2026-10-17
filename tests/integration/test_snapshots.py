@@ -25,8 +25,8 @@ from uuid import uuid4
 
 import pytest
 
-import vigia.snapshots.store as store_module
-from vigia.snapshots import (
+import backtide.snapshots.store as store_module
+from backtide.snapshots import (
     Reason,
     RestoreIncomplete,
     RestoreResult,
@@ -36,11 +36,11 @@ from vigia.snapshots import (
     SnapshotNoSpace,
     btrfs,
 )
-from vigia.snapshots.store import SnapshotStore
+from backtide.snapshots.store import SnapshotStore
 
 pytestmark = pytest.mark.integration
 
-LOGGER = "vigia.snapshots"
+LOGGER = "backtide.snapshots"
 STAGING = "workspace.restore"
 CLEAN_ROOT = [".lock", "snapshots", "workspace"]  # sorted: nothing in progress, nothing stray
 NESTED_STUB_INO = 2  # the empty directory a nested subvolume leaves inside a snapshot

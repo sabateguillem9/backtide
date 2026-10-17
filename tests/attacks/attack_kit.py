@@ -35,7 +35,7 @@ from attack_report import Result
 CONTAINER_WORK = "/workspace/work"
 SCRIPT_TIMEOUT = 180.0
 # Fake secrets (see conftest.canary_environment): each value is "<prefix><its own name>".
-CANARY_PREFIX = "vigia-canary-"
+CANARY_PREFIX = "backtide-canary-"
 CANARY_VARIABLES = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -52,7 +52,7 @@ _SCENARIOS: dict[str, Scenario] | None = None
 
 
 class AttackError(Exception):
-    """The scenario test is wrong (not Vigía): it checked a dimension the manifest forbids."""
+    """The scenario test is wrong (not backtide): it checked a dimension the manifest forbids."""
 
 
 class Agent(Protocol):
@@ -179,7 +179,7 @@ def ensure_running(agent: Any) -> None:
 
 def is_healthy(agent: Any) -> bool:
     """True if OpenClaw's Gateway answers ok on /healthz inside the container."""
-    from vigia.jail.config import HEALTH_URL  # noqa: PLC0415 - only the VM scenarios need it
+    from backtide.jail.config import HEALTH_URL  # noqa: PLC0415 - only the VM scenarios need it
 
     try:
         answer = agent.exec(["curl", "--fail", "--silent", "--max-time", "5", HEALTH_URL])

@@ -92,7 +92,7 @@ def test_attack_tests_are_left_out_of_make_test_and_make_it() -> None:
 @pytest.mark.skipif(platform.node() == "lima-vigia-dev", reason="this is the VM itself")
 def test_the_vm_guard_refuses_to_run_an_attack_anywhere_else() -> None:
     """Invariant 8, on the Mac: the check every attack makes first fails here."""
-    guard = sys.modules["vigia_vm_fixtures"]._require_dev_vm_user_with_sudo
+    guard = sys.modules["backtide_vm_fixtures"]._require_dev_vm_user_with_sudo
     with pytest.raises(pytest.fail.Exception, match="only inside"):
         guard()
 

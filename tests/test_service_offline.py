@@ -1,4 +1,5 @@
-"""`vigia rebobinar` without a service (T04c-2): the real Guardian and black box, fake store/jail.
+"""`backtide rebobinar` without a service (T04c-2): the real Guardian and black box, fake
+store/jail.
 
 The fakes are those of test_service_guardian.py (a volume with Btrfs counters, a jail that logs
 its calls). What these tests pin down: the rewind is the real ``Guardian.rewind`` with its events,
@@ -14,15 +15,15 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import BlackBox, BlackBoxError, Event, load_key
+from backtide.jail import JailError
+from backtide.notify import Alert
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.guardian import Guardian
+from backtide.service.offline import NullWatcher, rewind_without_service
+from backtide.service.rewind import RewindStatus
+from backtide.snapshots import Reason, Snapshot, SnapshotError
 from tests.test_service_guardian import TOKEN, FakeJail, FakeVolume
-from vigia.blackbox import BlackBox, BlackBoxError, Event, load_key
-from vigia.jail import JailError
-from vigia.notify import Alert
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.guardian import Guardian
-from vigia.service.offline import NullWatcher, rewind_without_service
-from vigia.service.rewind import RewindStatus
-from vigia.snapshots import Reason, Snapshot, SnapshotError
 
 
 class Collector:
@@ -81,10 +82,10 @@ class Rig:
 @pytest.fixture
 def rig(tmp_path: Path, clock: Callable[[], datetime]) -> Iterator[Rig]:
     yield Rig(tmp_path, clock)
-    vigia_logger = logging.getLogger("vigia")
-    for handler in list(vigia_logger.handlers):
+    backtide_logger = logging.getLogger("backtide")
+    for handler in list(backtide_logger.handlers):
         if type(handler).__name__ == "LogBridge":
-            vigia_logger.removeHandler(handler)
+            backtide_logger.removeHandler(handler)
 
 
 def test_the_rewind_is_done_in_this_process_and_recorded(rig: Rig) -> None:
@@ -220,13 +221,15 @@ def test_an_invalid_id_does_nothing(rig: Rig) -> None:
 def test_the_log_is_bridged_into_the_black_box_during_the_rewind_and_then_detached(
     rig: Rig,
 ) -> None:
-    rig.volume.during_swap = lambda: logging.getLogger("vigia.snapshots.fake").warning(
+    rig.volume.during_swap = lambda: logging.getLogger("backtide.snapshots.fake").warning(
         "the swap took a while"
     )
     rig.rewind()
     logs = [e for e in rig.events() if e.source == "system" and e.action == "log"]
     assert any("swap took a while" in str(e.details) for e in logs)
-    assert not [h for h in logging.getLogger("vigia").handlers if type(h).__name__ == "LogBridge"]
+    assert not [
+        h for h in logging.getLogger("backtide").handlers if type(h).__name__ == "LogBridge"
+    ]
 
 
 def test_the_requester_is_recorded(rig: Rig) -> None:

@@ -7,7 +7,7 @@ from collections.abc import Iterator
 import pytest
 from telegram_fake import TOKEN, FakeBotApi
 
-from vigia.notify.telegram_api import BotApi, TelegramError, check_api_base
+from backtide.notify.telegram_api import BotApi, TelegramError, check_api_base
 
 
 @pytest.fixture

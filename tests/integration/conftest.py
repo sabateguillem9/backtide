@@ -58,11 +58,11 @@ from uuid import uuid4
 
 import pytest
 
+from backtide.jail import IMAGE, AgentJail, AgentJailConfig, JailError
+from backtide.jail import docker as jail_docker
+from backtide.snapshots import SnapshotError, btrfs, grow
+from backtide.snapshots.store import SnapshotStore
 from tests.integration.service_kit import Service, make_service
-from vigia.jail import IMAGE, AgentJail, AgentJailConfig, JailError
-from vigia.jail import docker as jail_docker
-from vigia.snapshots import SnapshotError, btrfs, grow
-from vigia.snapshots.store import SnapshotStore
 
 GIB = 1024**3
 MOUNT_OPTIONS = "loop,noatime,nosuid,nodev,user_subvol_rm_allowed"
@@ -203,8 +203,8 @@ def store(btrfs_volume: Path, clock: Callable[[], datetime]) -> SnapshotStore:
 
 @pytest.fixture(scope="module")
 def real_service(btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Service]:
-    """`vigia vigilar` running as a process, with the real OpenClaw in its jail and ready, one per
-    test module (T04b-2). A 3 s cycle instead of 120 s. Stopped, and the agent and its network
+    """`backtide vigilar` running as a process, with the real OpenClaw in its jail and ready, one
+    per test module (T04b-2). A 3 s cycle instead of 120 s. Stopped, and the agent and its network
     removed, when the module ends, also when the start fails."""
     service = _new_service(btrfs_volume, tmp_path_factory)
     try:
@@ -255,8 +255,8 @@ def _new_service(
 
 IMAGE_PULL_TIMEOUT = 1800.0  # the first pull of the pinned image is about 1.3 GB
 # Test agents are named <prefix><pytest pid>-<random>: see _remove_stale_test_agents.
-TEST_CONTAINER_PREFIX = "vigia-test-agent-"
-TEST_NETWORK_PREFIX = "vigia-test-net-"
+TEST_CONTAINER_PREFIX = "backtide-test-agent-"
+TEST_NETWORK_PREFIX = "backtide-test-net-"
 
 
 @dataclass(frozen=True)
@@ -298,9 +298,9 @@ def running_agent(
     Leftovers of killed runs are removed first. Removed afterwards, also when setup fails
     halfway.
 
-    The agent runs as the Lima user, who also owns the store, Vigía's side and the Docker
+    The agent runs as the Lima user, who also owns the store, backtide's side and the Docker
     socket: without root, the agent's folders can only belong to that user. A concession of
-    these tests (``allow_shared_ids``), never of production: there Vigía runs as root and the
+    these tests (``allow_shared_ids``), never of production: there backtide runs as root and the
     agent has ids of its own (docs/13)."""
     _require_agent_image()
     _remove_stale_test_agents()
@@ -476,7 +476,7 @@ def _mounted_btrfs(
         features = ["-O", "squota"] if squota else []
         if fs_size is not None:
             features += ["-b", str(fs_size)]
-        _run([_require_binary("mkfs.btrfs"), "-q", "-L", "vigia-test", *features, str(img)])
+        _run([_require_binary("mkfs.btrfs"), "-q", "-L", "backtide-test", *features, str(img)])
         _sudo("mount", "-o", MOUNT_OPTIONS, str(img), str(mnt))
         _TEST_MOUNTS.add(mnt)
         try:

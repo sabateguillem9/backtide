@@ -1,7 +1,7 @@
 """Evil-agent scenarios against the jail and the snapshots (T01-T03a), one real OpenClaw.
 
 Every scenario runs its attack INSIDE the agent's container (tests/attacks/scripts/*.py) and then
-looks at the result from the host, which is where Vigía lives. The agent is shared by the module.
+looks at the result from the host, which is where backtide lives. The agent is shared by the module.
 Nothing here leaves the VM: the only addresses used are reserved for documentation or the VM's
 own. The mass delete and its rewind moved to test_rewind_attacks.py (T04c-1), where the real
 service records it and ``Guardian.rewind`` undoes it.
@@ -35,14 +35,14 @@ from attack_kit import (
 )
 from attack_manifest import SCRIPTS_DIR
 
-from vigia.jail import AgentJail, AgentJailConfig
-from vigia.jail import docker as jail_docker
-from vigia.jail.config import SECCOMP_PROFILE
-from vigia.jail.seccomp import BLOCKED_ERRNO
-from vigia.snapshots import Reason, btrfs
-from vigia.snapshots.store import SnapshotStore
+from backtide.jail import AgentJail, AgentJailConfig
+from backtide.jail import docker as jail_docker
+from backtide.jail.config import SECCOMP_PROFILE
+from backtide.jail.seccomp import BLOCKED_ERRNO
+from backtide.snapshots import Reason, btrfs
+from backtide.snapshots.store import SnapshotStore
 
-HOST_CANARY_CONTENT = "vigia-canary-host-file"  # what enlaces_simbolicos.py looks for
+HOST_CANARY_CONTENT = "backtide-canary-host-file"  # what enlaces_simbolicos.py looks for
 NOT_EVEN_A_CHANCE = {errno.EPERM, errno.EACCES, errno.EROFS, errno.ENOENT, errno.EOPNOTSUPP}
 
 
@@ -57,7 +57,7 @@ def unconfined_agent(agent, canary_environment, tmp_path_factory) -> Iterator[ob
     seccomp profile: the control run. If the real attack works here and fails in the real jail,
     the profile is what stops it (and the test is not passing because the attack is broken).
     Removed afterwards, also when the start fails halfway."""
-    vm = sys.modules["vigia_vm_fixtures"]  # tests/integration/conftest.py, loaded by conftest.py
+    vm = sys.modules["backtide_vm_fixtures"]  # tests/integration/conftest.py, loaded by conftest.py
     root = agent.store.root.parent / f"control-{uuid4().hex}"
     root.mkdir(mode=0o700)
     store = SnapshotStore(root)
@@ -139,7 +139,7 @@ def test_read_only_workspace(attack: Attack, agent, unconfined_agent) -> None:
     marker = host / "marker.txt"
 
     # Second layer: even without the seccomp block, the flag cannot be set from the agent's
-    # folder. The ioctl only works on the ROOT of a subvolume, and that root is Vigía's.
+    # folder. The ioctl only works on the ROOT of a subvolume, and that root is backtide's.
     unconfined_agent.exec(
         ["sh", "-c", f"mkdir -p {base} && echo x > {base}/marker.txt"], check=True
     )
@@ -166,7 +166,8 @@ def test_read_only_workspace(attack: Attack, agent, unconfined_agent) -> None:
         f"{len(flag_attempts)} sitios, chattr +i y el remount fallan "
         f"(errno {attempts['immutable']} y {attempts['remount_ro']}); el subvolumen sigue "
         f"escribible desde el anfitrión. Segunda capa: sin el perfil seccomp, el mismo script "
-        f"también falla (EINVAL), porque su carpeta no es la raíz del subvolumen, que es de Vigía",
+        f"también falla (EINVAL), porque su carpeta no es la raíz del subvolumen, que es de "
+        "backtide",
     )
     # The attack that does work only locks the agent's own files (precondition, not a check).
     assert outcome["chmod_changed"] > 0 and not outcome["still_writes"], outcome
@@ -242,7 +243,7 @@ def test_symlinks_out_of_the_workspace(attack: Attack, agent) -> None:
 @scenario("leer-secretos")
 def test_reading_secrets(attack: Attack, agent) -> None:
     store = agent.store
-    # Files named like the canaries, where Vigía's data would be on the host.
+    # Files named like the canaries, where backtide's data would be on the host.
     planted = [store.root / f"{CANARY_PREFIX}blackbox-key", store.root.parent / f"{CANARY_PREFIX}x"]
     for path in planted:
         path.write_text(f"{CANARY_PREFIX}secret-material")
@@ -263,7 +264,7 @@ def test_reading_secrets(attack: Attack, agent) -> None:
         agent.exec(["rm", "-rf", home, f"{CONTAINER_WORK}/{CANARY_PREFIX}control.txt"], check=True)
         assert f"{home}/credentials" in control["credential_files"], control
         assert f"{CONTAINER_WORK}/{CANARY_PREFIX}control.txt" in control["canary_hits"], control
-        assert f"{CONTAINER_WORK}/{CANARY_PREFIX}control.txt" in control["vigia_files_seen"]
+        assert f"{CONTAINER_WORK}/{CANARY_PREFIX}control.txt" in control["backtide_files_seen"]
         outcome = attack.run_script(agent, "leer_secretos", CANARY_PREFIX, timeout=240)
     finally:
         for path in planted:
@@ -275,7 +276,7 @@ def test_reading_secrets(attack: Attack, agent) -> None:
         outcome["env_names"] == []
         and outcome["canary_hits"] == []
         and outcome["credential_files"] == []
-        and outcome["vigia_files_seen"] == []
+        and outcome["backtide_files_seen"] == []
         and outcome["config_secrets"] == []
         and config_frozen,
         "sin claves en su entorno ni en el de OpenClaw (solo el token del Gateway, aceptado), "

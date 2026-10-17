@@ -1,4 +1,4 @@
-"""The real service in the VM: `vigia vigilar` as a process, watching the real OpenClaw.
+"""The real service in the VM: `backtide vigilar` as a process, watching the real OpenClaw.
 
 Used by test_activity.py, test_service.py and test_idle.py (T04b-2). Nothing here is a fake:
 the service is the real command (tests/integration/service_main.py), the agent is the real
@@ -25,13 +25,13 @@ from pathlib import Path
 
 import pytest
 
-from vigia.blackbox import BlackBox, BlackBoxError, Event, load_key
-from vigia.jail import AgentJail
-from vigia.jail import docker as jail_docker
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.guardian import Guardian
-from vigia.service.runner import build_guardian, run_guardian, take_lock
-from vigia.snapshots import Snapshot, SnapshotStore, btrfs
+from backtide.blackbox import BlackBox, BlackBoxError, Event, load_key
+from backtide.jail import AgentJail
+from backtide.jail import docker as jail_docker
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.guardian import Guardian
+from backtide.service.runner import build_guardian, run_guardian, take_lock
+from backtide.snapshots import Snapshot, SnapshotStore, btrfs
 
 REPO = Path(__file__).resolve().parents[2]
 CYCLE = 3.0  # seconds between two cycles of a test service (the real one is 120)
@@ -58,7 +58,7 @@ def wait_until(
 
 @dataclass
 class Service:
-    """One `vigia vigilar` process and the folders it works on.
+    """One `backtide vigilar` process and the folders it works on.
 
     ``config`` is what it reads; ``jail`` and ``store`` are handles for the tests to look at the
     agent and the snapshots (they never start or stop anything on their own)."""
@@ -68,7 +68,7 @@ class Service:
     jail: AgentJail
     store: SnapshotStore
     log_path: Path
-    # The launcher of `vigia vigilar` and what it gets after the config (test_space_pause.py
+    # The launcher of `backtide vigilar` and what it gets after the config (test_space_pause.py
     # runs one that sets the cap through the test's sudo command).
     main: str = "tests.integration.service_main"
     main_args: tuple[str, ...] = ()
@@ -78,12 +78,12 @@ class Service:
     # Running it
 
     def start(self) -> None:
-        """Launch `vigia vigilar` (it is not necessarily ready: see ``wait_ready``)."""
+        """Launch `backtide vigilar` (it is not necessarily ready: see ``wait_ready``)."""
         assert self.process is None or self.process.poll() is not None, "already running"
         self.process = self.launch()
 
     def launch(self) -> subprocess.Popen[bytes]:
-        """Another `vigia vigilar` on the same config (to see it refused, or to start again)."""
+        """Another `backtide vigilar` on the same config (to see it refused, or to start again)."""
         log = open(self.log_path, "ab")  # noqa: SIM115 - closed by the child's end
         try:
             return subprocess.Popen(
@@ -284,7 +284,7 @@ class Service:
 @contextmanager
 def guardian_in_process(service: Service) -> Iterator[Guardian]:
     """The real service of ``service`` (same lock, same parts from ``build_guardian``, same
-    ``run_guardian``), but run by this test process in a thread instead of as `vigia vigilar`:
+    ``run_guardian``), but run by this test process in a thread instead of as `backtide vigilar`:
     until the control socket exists (T04c-2) that is the only way to call ``Guardian.rewind``
     while it runs. Yields once the agent is started and watched; stops it like a SIGTERM
     would (the agent stops and ``service_stop`` is recorded) when the block ends."""
@@ -363,7 +363,7 @@ CLI_TIMEOUT = 300.0
 def run_cli(
     service: Service, command: str, *args: str, timeout: float = CLI_TIMEOUT
 ) -> subprocess.CompletedProcess[str]:
-    """The real `vigia <command> --config <the service's> <args>` as a process of its own
+    """The real `backtide <command> --config <the service's> <args>` as a process of its own
     (tests/integration/cli_main.py), with no terminal: `rebobinar` needs ``--si``. Returns the
     finished process; the tests read its exit code and what it printed."""
     return subprocess.run(
@@ -421,7 +421,7 @@ REWIND_WITHIN = CYCLE + 30  # a cycle, the sync, the snapshot and a loaded VM
 
 
 def interrupted_rewind(service: Service, when: str) -> tuple[str, int]:
-    """Start ``service`` (`vigia vigilar`), get a snapshot with ``marker = v1``, change it to
+    """Start ``service`` (`backtide vigilar`), get a snapshot with ``marker = v1``, change it to
     v2, stop the service, and then rewind to the v1 snapshot in a process that is SIGKILLed
     ``when`` ("before"/"after" the swap): see ``kill_a_rewind``. Returns the target and the
     workspace id from before. The service is left stopped."""

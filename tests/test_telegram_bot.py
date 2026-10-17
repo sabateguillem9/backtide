@@ -14,16 +14,16 @@ from typing import Any
 import pytest
 from telegram_fake import OWNER, STRANGER, TOKEN, Call, FakeBotApi, buttons
 
-from vigia.notify import Alert, AlertLevel, AlertQueue
-from vigia.notify.buttons import ButtonBook, RateLimit
-from vigia.notify.telegram import (
+from backtide.notify import Alert, AlertLevel, AlertQueue
+from backtide.notify.buttons import ButtonBook, RateLimit
+from backtide.notify.telegram import (
     IGNORED_PER_MINUTE,
     TelegramBot,
     TelegramNotifier,
     alert_text,
     printable,
 )
-from vigia.notify.telegram_api import BotApi
+from backtide.notify.telegram_api import BotApi
 
 SNAPSHOT = "20261016T120000.000000Z-periodic"
 WAIT = 5.0
@@ -169,7 +169,7 @@ def test_pausar_is_not_held_up_by_a_long_order(rig: Rig) -> None:
 def test_seguir_and_estado_run_on_the_worker(rig: Rig) -> None:
     rig.fake.push_message("/seguir")
     rig.reply("donde estaba")
-    rig.fake.push_message("/estado@VigiaBot")
+    rig.fake.push_message("/estado@BacktideBot")
     rig.reply("Agente: en marcha")
     assert rig.actions.calls == ["resume", "status"]
 
@@ -277,7 +277,7 @@ def test_a_flood_of_strangers_is_recorded_a_few_times_a_minute(rig: Rig) -> None
 def test_a_stranger_warning_goes_to_the_log_once_an_hour(
     rig: Rig, caplog: pytest.LogCaptureFixture
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="vigia.telegram"):
+    with caplog.at_level(logging.WARNING, logger="backtide.telegram"):
         rig.fake.push_message("/seguir", chat_id=STRANGER)
         rig.fake.push_message("/seguir", chat_id=STRANGER)
         rig.settle()
@@ -493,7 +493,7 @@ def test_an_alert_quoting_the_agent_has_nothing_to_tap_and_no_secret() -> None:
 def test_a_conflict_says_another_program_reads_the_updates(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with FakeBotApi(max_poll=0.2) as fake, caplog.at_level(logging.ERROR, "vigia.telegram"):
+    with FakeBotApi(max_poll=0.2) as fake, caplog.at_level(logging.ERROR, "backtide.telegram"):
         fake.fail_with = 409
         bot = TelegramBot(BotApi(TOKEN, base=fake.base), OWNER, ButtonBook(), FakeActions())
         bot.start()

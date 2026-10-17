@@ -1,15 +1,15 @@
-"""The Vigía demo, recordable with one command each (docs/demo.md). Runs inside the Lima VM.
+"""The backtide demo, recordable with one command each (docs/demo.md). Runs inside the Lima VM.
 
-    python -m scripts.demo.demo up                 # volume + config + `vigia vigilar`, in front
+    python -m scripts.demo.demo up                 # volume + config + `backtide vigilar`, in front
     python -m scripts.demo.demo crear|archivos|borrar
     python -m scripts.demo.demo instantaneas
     python -m scripts.demo.demo rebobinar <id> [--si]
     python -m scripts.demo.demo parar              # stops everything, unmounts, deletes the demo
 
-Everything lives under ``~/vigia-demo-run`` (a folder with the ``.vigia-demo`` mark that this script
-writes; it never deletes one without it): a sparse Btrfs image formatted with simple quotas
+Everything lives under ``~/backtide-demo-run`` (a folder with the ``.backtide-demo`` mark that this
+script writes; it never deletes one without it): a sparse Btrfs image formatted with simple quotas
 (``mkfs.btrfs -O squota``, no privileges), mounted the way tests/integration/conftest.py mounts
-its throwaway volumes, and Vigía's state next to it. The only privileged commands are the ones
+its throwaway volumes, and backtide's state next to it. The only privileged commands are the ones
 that file already uses: ``sudo -n true`` (does sudo work without a password?), ``mount``,
 ``chown``, ``umount`` and ``btrfs qgroup limit <bytes>|none <path>``. Every one of them is
 checked here, right before it runs, against the demo's own paths.
@@ -17,9 +17,9 @@ checked here, right before it runs, against the demo's own paths.
 The concession. The VM user is not root, so the agent's ids are the user's, and ``AgentJail``
 refuses that unless ``allow_shared_ids`` says so; the workspace cap also needs a privileged
 ``qgroup limit``. A config file cannot set either (on purpose), so this entry point, like
-tests/integration/service_main.py and cli_main.py, hands the real `vigia` command a jail with
-``allow_shared_ids`` and a guarded ``sudo`` limit setter, then runs ``vigia.cli.main``
-unchanged. Nothing of this is in ``vigia/``: in production Vigía runs as root.
+tests/integration/service_main.py and cli_main.py, hands the real `backtide` command a jail with
+``allow_shared_ids`` and a guarded ``sudo`` limit setter, then runs ``backtide.cli.main``
+unchanged. Nothing of this is in ``backtide/``: in production backtide runs as root.
 """
 
 import argparse
@@ -41,12 +41,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import vigia.cli as cli
-from vigia.blackbox import BlackBox, BlackBoxError, Event, load_key
-from vigia.jail import IMAGE, AgentJail
-from vigia.service.config import ServiceConfig
-from vigia.service.offline import rewind_without_service
-from vigia.snapshots import SnapshotError, SnapshotStore, btrfs
+import backtide.cli as cli
+from backtide.blackbox import BlackBox, BlackBoxError, Event, load_key
+from backtide.jail import IMAGE, AgentJail
+from backtide.service.config import ServiceConfig
+from backtide.service.offline import rewind_without_service
+from backtide.snapshots import SnapshotError, SnapshotStore, btrfs
 
 MIB = 1024**2
 GIB = 1024**3
@@ -58,8 +58,8 @@ CYCLE_INTERVAL = 5  # seconds between two "did anything change?" checks (the rea
 COMMAND_TIMEOUT = 60.0
 STOP_TIMEOUT = 120.0
 PULL_TIMEOUT = 1800.0  # the first pull of the pinned OpenClaw image is about 1.3 GB
-CONTAINER = "vigia-demo-agent"
-NETWORK = "vigia-demo-net"
+CONTAINER = "backtide-demo-agent"
+NETWORK = "backtide-demo-net"
 PROCESS_MARK = b"scripts.demo.demo"  # what the service's /proc/<pid>/cmdline contains
 PROJECT = "/workspace/work/proyecto"  # inside the agent: the folder the demo creates and deletes
 SNAPSHOT_WAIT = 90.0  # a cycle, the sync and the snapshot, on a loaded VM
@@ -95,8 +95,9 @@ class Paths:
 
     @property
     def volume(self) -> Path:
-        """Vigía's snapshot store, a private folder inside the btrfs (the config's ``volume``)."""
-        return self.mnt / "vigia"
+        """backtide's snapshot store, a private folder inside the btrfs (the config's
+        ``volume``)."""
+        return self.mnt / "backtide"
 
     @property
     def state(self) -> Path:
@@ -104,13 +105,13 @@ class Paths:
 
     @property
     def config(self) -> Path:
-        return self.base / "vigia.toml"
+        return self.base / "backtide.toml"
 
     @property
     def mark(self) -> Path:
         """Written first: proof that this script made the folder, and the only thing that lets
         ``teardown`` delete it."""
-        return self.base / ".vigia-demo"
+        return self.base / ".backtide-demo"
 
     @property
     def before_file(self) -> Path:
@@ -127,7 +128,7 @@ class Paths:
         return self.base / "service.pid"
 
 
-PATHS = Paths(Path.home() / "vigia-demo-run")
+PATHS = Paths(Path.home() / "backtide-demo-run")
 
 
 # -- Mounts (the same checks as tests/integration/conftest.py) --------------------------------
@@ -266,11 +267,11 @@ def sudo_qgroup_limit(path: Path, limit: int | None) -> None:
         btrfs._raise_failure(command, result.returncode, result.stderr.strip())
 
 
-# -- The concession: the real `vigia` command, with what a non-root VM user needs --------------
+# -- The concession: the real `backtide` command, with what a non-root VM user needs --------------
 
 
 def serve_without_root(config: ServiceConfig, **options: Any) -> None:
-    from vigia.service import runner
+    from backtide.service import runner
 
     jail = AgentJail(replace(config.jail_config(), allow_shared_ids=True))
     runner.serve(config, jail=jail, **options)
@@ -284,8 +285,8 @@ def rewind_without_root(config: ServiceConfig, snapshot_id: str, **options: Any)
     return _production_rewind(config, snapshot_id, jail=jail, **options)
 
 
-def run_vigia(*argv: str) -> int:
-    """`vigia <argv>` as it is, in this process, with the concessions installed."""
+def run_backtide(*argv: str) -> int:
+    """`backtide <argv>` as it is, in this process, with the concessions installed."""
     cli.serve = serve_without_root  # type: ignore[attr-defined]
     cli.rewind_without_service = rewind_without_root  # type: ignore[attr-defined]
     btrfs.set_qgroup_limit = sudo_qgroup_limit  # type: ignore[assignment]  # looked up at call
@@ -343,7 +344,7 @@ def stop_service(paths: Paths) -> None:
     pid = service_pid(paths)
     if pid is None:
         return
-    print(f"Parando el servicio de Vigía (pid {pid}); para al agente con él...", flush=True)
+    print(f"Parando el servicio de backtide (pid {pid}); para al agente con él...", flush=True)
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + STOP_TIMEOUT
     while service_pid(paths) is not None:
@@ -399,7 +400,7 @@ def create_volume(paths: Paths) -> None:
     paths.mnt.mkdir(mode=0o700)
     with open(paths.image, "xb") as image:  # x: never reuse or overwrite an existing file
         image.truncate(IMAGE_SIZE)
-    run([mkfs, "-q", "-L", "vigia-demo", "-O", "squota", str(paths.image)])
+    run([mkfs, "-q", "-L", "backtide-demo", "-O", "squota", str(paths.image)])
     sudo("mount", "-o", MOUNT_OPTIONS, str(paths.image), str(paths.mnt))
     try:
         sudo("chown", f"{os.getuid()}:{os.getgid()}", str(paths.mnt))
@@ -454,7 +455,8 @@ def command_up(paths: Paths) -> int:
     create_volume(paths)
     print(
         f"Volumen de la demo listo en {paths.mnt} (Btrfs con cuotas, tope del agente: 192 MiB).\n"
-        "Arranco `vigia vigilar`: espera a ver el agente en marcha y las primeras instantáneas.\n"
+        "Arranco `backtide vigilar`: espera a ver el agente en marcha y las primeras "
+        "instantáneas.\n"
         "Para parar: Ctrl-C aquí. Para limpiarlo todo: `make demo-parar`.\n",
         flush=True,
     )
@@ -465,7 +467,7 @@ def command_up(paths: Paths) -> int:
     feed = threading.Thread(target=feed_black_box, args=(paths, stop), name="demo-feed")
     feed.start()
     try:
-        return run_vigia("vigilar", "--config", str(paths.config))
+        return run_backtide("vigilar", "--config", str(paths.config))
     finally:
         stop.set()
         feed.join(10)
@@ -526,7 +528,7 @@ def command_crear(paths: Paths) -> int:
     lines.append(f"ls -l {PROJECT}")
     print("El agente crea sus archivos de trabajo:")
     agent_exec(paths, "\n".join(lines))
-    print("Espero a que Vigía haga una instantánea que los tenga...", flush=True)
+    print("Espero a que backtide haga una instantánea que los tenga...", flush=True)
     paths.after_file.unlink(missing_ok=True)
     snapshot_id = wait_for_snapshot(paths, present=True)
     paths.before_file.write_text(snapshot_id + "\n")
@@ -545,7 +547,7 @@ def command_borrar(paths: Paths) -> int:
     print("El agente borra archivos (rm):")
     agent_exec(paths, f"cd {PROJECT} && rm -v {names} && ls -l .")
     before = saved_id(paths.before_file)
-    print("Espero a que Vigía haga una instantánea ya sin ellos...", flush=True)
+    print("Espero a que backtide haga una instantánea ya sin ellos...", flush=True)
     after = wait_for_snapshot(paths, present=False, newer_than=before)
     paths.after_file.write_text(after + "\n")
     print(f"Instantánea sin los archivos: {after}")
@@ -562,14 +564,14 @@ def saved_id(path: Path) -> str | None:
 
 
 def command_instantaneas(paths: Paths) -> int:
-    """`vigia instantaneas`, with a note on the lines `crear` and `borrar` found."""
+    """`backtide instantaneas`, with a note on the lines `crear` and `borrar` found."""
     notes = {
         saved_id(paths.before_file): "  <-- con los archivos",
         saved_id(paths.after_file): "  <-- sin los archivos (ya borrados)",
     }
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        code = run_vigia("instantaneas", "--config", str(paths.config))
+        code = run_backtide("instantaneas", "--config", str(paths.config))
     for line in out.getvalue().splitlines():
         print(line + next((note for key, note in notes.items() if key and key in line), ""))
     return code
@@ -584,7 +586,7 @@ def command_rebobinar(paths: Paths, snapshot: str | None, *, yes: bool) -> int:
     real_stdout = sys.stdout
     sys.stdout = _UndoHint(real_stdout)  # type: ignore[assignment]
     try:
-        return run_vigia(
+        return run_backtide(
             "rebobinar", "--config", str(paths.config), target, *(["--si"] if yes else [])
         )
     finally:
@@ -592,14 +594,14 @@ def command_rebobinar(paths: Paths, snapshot: str | None, *, yes: bool) -> int:
 
 
 class _UndoHint:
-    """Wraps stdout so `Para deshacer: vigia rebobinar <id>` reads as the demo's own command.
+    """Wraps stdout so `Para deshacer: backtide rebobinar <id>` reads as the demo's own command.
     Everything else, the question included, goes through as it is."""
 
     def __init__(self, stream: Any) -> None:
         self._stream = stream
 
     def write(self, text: str) -> int:
-        return self._stream.write(text.replace("vigia rebobinar ", "make demo-rebobinar ID="))
+        return self._stream.write(text.replace("backtide rebobinar ", "make demo-rebobinar ID="))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
@@ -611,7 +613,7 @@ class _UndoHint:
 def describe(event: Event) -> str | None:
     """One line for an event worth showing in front of a camera, or None: the agent's own
     files (OpenClaw writes its database all the time) are left out, only the demo's are shown."""
-    # Local time, like the table of `vigia instantaneas`.
+    # Local time, like the table of `backtide instantaneas`.
     when = datetime.fromisoformat(event.ts).astimezone().strftime("%H:%M:%S")
     target = str(event.target)
     source = event.source.value
@@ -662,7 +664,7 @@ def feed_black_box(paths: Paths, stop: threading.Event) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="demo", description="La demo de Vigía (docs/demo.md).")
+    parser = argparse.ArgumentParser(prog="demo", description="La demo de backtide (docs/demo.md).")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("up", help="prepara el volumen y arranca el servicio en primer plano")
     commands.add_parser("crear", help="el agente crea archivos de trabajo")

@@ -1,0 +1,353 @@
+# Reglas de riesgo por defecto de backtide (T08). Dan un nivel a cada evento antes de grabarlo:
+#
+#   0  normal (lo que ninguna regla toca)
+#   1  curioso: queda anotado, no molesta
+#   2  sospechoso: se ve en la web y en el historial con el filtro de riesgo
+#   3  peligroso: una instantánea de evidencia al momento y un aviso
+#
+# Si hay varias reglas que valen para un evento, gana la de nivel más alto. Cada evento graba en
+# `details.risk_rules` las reglas que lo tocaron, para saber por qué.
+#
+# Para cambiarlas: copia este archivo a `<state_dir>/rules.toml` (la carpeta de estado de backtide,
+# que el agente no ve) y edítalo. Si ese archivo existe, REEMPLAZA a este entero; si tiene un
+# error, el servicio no arranca y dice cuál. El formato está en backtide/analyzer/rules.py.
+#
+# No hay expresiones regulares a propósito: un agente elige los nombres de archivo y los
+# comandos que estas reglas leen, y una regex mal escrita podría colgar al vigilante. Los
+# patrones son globs: `*` es cualquier tramo (también `/`), `?` un carácter, `[a-z]` una clase.
+# Para varias formas de lo mismo, una lista de patrones: basta que valga uno. Un `*` literal se
+# escribe `[*]`.
+
+# ---------------------------------------------------------------------------------------------
+# Archivos (T04): el vigilante graba create, modify, delete, move, y `summary` cuando no cabe
+# todo. Borrar es lo que más cuesta deshacer a mano; con las instantáneas se deshace, pero la
+# persona tiene que enterarse. Ojo: `rm -rf node_modules` también salta (se afinará con uso real).
+# ---------------------------------------------------------------------------------------------
+
+[[rule]]
+id = "mass-delete"
+description = "Ha borrado 20 archivos o más en un minuto"
+risk = 2
+source = "file"
+action = "delete"
+where = [{ field = "transient", op = "exists", value = false }]
+burst = { count = 20, window = 60 }
+
+[[rule]]
+id = "mass-delete-severe"
+description = "Ha borrado 100 archivos o más en un minuto"
+risk = 3
+source = "file"
+action = "delete"
+where = [{ field = "transient", op = "exists", value = false }]
+burst = { count = 100, window = 60 }
+
+# Los borrados `transient` (el archivo se creó y se borró en la misma ventana de 2 s, como los
+# temporales con los que OpenClaw arranca: 68 de 77 borrados medidos en un arranque) no destruyen
+# nada que existiera antes, y no cuentan. Cuando son tantos que el vigilante los pliega en un
+# resumen, los borrados van en `counts.delete` (ahí los transitorios no se distinguen, y por eso
+# los umbrales de los resúmenes son más altos).
+[[rule]]
+id = "mass-delete-folded"
+description = "Ha borrado 100 archivos o más en un minuto (plegados en un resumen)"
+risk = 2
+source = "file"
+action = "summary"
+burst = { count = 100, window = 60, sum = "counts.delete" }
+
+[[rule]]
+id = "mass-delete-folded-severe"
+description = "Ha borrado 1.000 archivos o más en un minuto (plegados en un resumen)"
+risk = 3
+source = "file"
+action = "summary"
+burst = { count = 1000, window = 60, sum = "counts.delete" }
+
+[[rule]]
+id = "file-flood"
+description = "Más de 10.000 cambios de archivos plegados en un solo resumen"
+risk = 1
+source = "file"
+action = "summary"
+where = [{ field = "folded", op = "ge", value = 10000 }]
+
+# Sobrescribir o renombrar en masa (cifrar cada archivo en su sitio, ponerles `.locked`): no
+# borra nada a la vista, pero deja los originales irrecuperables sin una instantánea. Un
+# `npm install` modifica muchos archivos a la vez, por eso el umbral es alto. Solo los registros
+# sueltos: en un resumen, `counts.modify` también cuenta las carpetas que cambian cada vez que se
+# crea un archivo, y una avalancha de creaciones parecería una de sobrescrituras.
+[[rule]]
+id = "mass-modify"
+description = "Ha modificado 300 archivos o más en un minuto"
+risk = 2
+source = "file"
+action = "modify"
+where = [{ field = "type", op = "ne", value = "dir" }]
+burst = { count = 300, window = 60 }
+
+[[rule]]
+id = "mass-modify-severe"
+description = "Ha modificado 1.000 archivos o más en un minuto"
+risk = 3
+source = "file"
+action = "modify"
+where = [{ field = "type", op = "ne", value = "dir" }]
+burst = { count = 1000, window = 60 }
+
+[[rule]]
+id = "mass-move-folded"
+description = "Ha renombrado o movido 100 archivos o más en un minuto (plegados en un resumen)"
+risk = 2
+source = "file"
+action = "summary"
+burst = { count = 100, window = 60, sum = "counts.move" }
+
+[[rule]]
+id = "mass-move"
+description = "Ha renombrado o movido 100 archivos o más en un minuto"
+risk = 2
+source = "file"
+action = "move"
+burst = { count = 100, window = 60 }
+
+# Borrar despacio, para quedarse debajo de la línea del minuto: la misma cuenta en una hora.
+[[rule]]
+id = "slow-delete"
+description = "Ha borrado 500 archivos o más en una hora"
+risk = 2
+source = "file"
+action = "delete"
+where = [{ field = "transient", op = "exists", value = false }]
+burst = { count = 500, window = 3600 }
+
+[[rule]]
+id = "slow-delete-severe"
+description = "Ha borrado 2.000 archivos o más en una hora"
+risk = 3
+source = "file"
+action = "delete"
+where = [{ field = "transient", op = "exists", value = false }]
+burst = { count = 2000, window = 3600 }
+
+[[rule]]
+id = "slow-delete-folded-severe"
+description = "Ha borrado 2.000 archivos o más en una hora (plegados en resúmenes)"
+risk = 3
+source = "file"
+action = "summary"
+burst = { count = 2000, window = 3600, sum = "counts.delete" }
+
+# Claves y credenciales por el disco.
+[[rule]]
+id = "credentials-file"
+description = "Toca un archivo de claves o credenciales"
+risk = 2
+source = "file"
+action = ["create", "modify", "delete", "move"]
+target = [
+  ".ssh/*", "*/.ssh/*", ".aws/*", "*/.aws/*", ".gnupg/*", "*/.gnupg/*",
+  "*.pem", "*.p12", "*.pfx", "*.kdbx", "*id_rsa*", "*id_ed25519*", "*id_ecdsa*",
+  ".netrc", "*/.netrc", ".git-credentials", "*/.git-credentials",
+]
+
+[[rule]]
+id = "env-file"
+description = "Toca un archivo .env"
+risk = 1
+source = "file"
+action = ["create", "modify", "delete", "move"]
+target = ["*.env", "*.env.*"]
+
+# Nombres hechos para engañar a quien los lee: caracteres de control (saltos de línea, escapes de
+# terminal), de dirección de escritura, invisibles, o una pila de marcas combinantes.
+[[rule]]
+id = "hostile-name"
+description = "Un nombre de archivo con caracteres de control, invisibles o que cambian el sentido de la escritura"
+risk = 1
+source = "file"
+target = [
+  "*[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\u3164\ufeff\ufff9-\ufffb\U000e0000-\U000e007f]*",
+  "*[\u0300-\u036f][\u0300-\u036f][\u0300-\u036f][\u0300-\u036f]*",
+]
+
+# Un nombre que llevaba un secreto (una clave, un token): la caja negra lo tacha antes de que lo
+# vean las reglas, y lo que queda dice `[REDACTED]`. Un archivo llamado como su contraseña es, o
+# un descuido, o una forma de sacar algo en el nombre.
+[[rule]]
+id = "secret-in-name"
+description = "Un nombre de archivo llevaba un secreto (la caja negra lo ha tachado)"
+risk = 1
+source = "file"
+target = "*[[]REDACTED]*"
+
+# Enlaces que salen de su carpeta. El destino (`details.link`) se graba sin seguirlo.
+[[rule]]
+id = "symlink-absolute"
+description = "Crea un enlace simbólico a una ruta absoluta, fuera de su carpeta"
+risk = 2
+source = "file"
+action = ["create", "modify", "move"]
+where = [
+  { field = "type", op = "eq", value = "symlink" },
+  { field = "link", op = "glob", value = "/*" },
+]
+
+[[rule]]
+id = "symlink-far-up"
+description = "Crea un enlace simbólico que sube tres carpetas o más, hacia fuera de su carpeta"
+risk = 2
+source = "file"
+action = ["create", "modify", "move"]
+where = [
+  { field = "type", op = "eq", value = "symlink" },
+  { field = "link", op = "glob", value = "../../../*" },
+]
+
+[[rule]]
+id = "hardlink"
+description = "Un archivo con más de un nombre (enlace duro): se escribe por un nombre y se ve por otro"
+risk = 1
+source = "file"
+action = ["create", "modify", "move"]
+where = [
+  { field = "type", op = "eq", value = "file" },
+  { field = "nlink", op = "gt", value = 1 },
+]
+
+# ---------------------------------------------------------------------------------------------
+# Comandos (T07, Tetragon): `exec/exec` lleva en `target` la ruta del binario y en `details.argv`
+# los argumentos SIN el binario y ya tachados (docs/23). Una orden dentro de `sh -c "..."` sale
+# entera en el argv de la `sh`, así que hay una regla para el binario y otra para la shell.
+# PROVISIONAL: se ajustan con comandos reales cuando T07 esté hecha; mientras tanto solo se
+# prueban con eventos escritos a mano.
+# ---------------------------------------------------------------------------------------------
+
+[[rule]]
+id = "exec-wipe-rm"
+description = "Borra la raíz, /home o /root enteros (rm -rf /)"
+risk = 3
+source = "exec"
+action = "exec"
+target = "*/rm"
+where = [
+  { field = "argv", op = "glob", value = [
+    "-*[rR]* /", "-*[rR]* /[*]", "-*[rR]* /home", "-*[rR]* /home/", "-*[rR]* /root",
+    "-*[rR]* /root/", "*--no-preserve-root*", "-r -f /", "-f -r /",
+  ] },
+]
+
+[[rule]]
+id = "exec-wipe-dd"
+description = "Escribe sobre un disco entero (dd of=/dev/...)"
+risk = 3
+source = "exec"
+action = "exec"
+target = "*/dd"
+where = [
+  { field = "argv", op = "glob", value = [
+    "*of=/dev/[sv]d*", "*of=/dev/xvd*", "*of=/dev/nvme*", "*of=/dev/mmcblk*", "*of=/dev/dm-*",
+    "*of=/dev/mapper/*", "*of=/dev/loop*",
+  ] },
+]
+
+# Dentro de `sh -c "..."` los indicadores van seguidos (`rm -rf /`), sin comodín entre `rm` y la
+# ruta: con él, `rm -rf build && cd /` pasaría por borrar la raíz.
+[[rule]]
+id = "exec-wipe-shell"
+description = "Una orden de shell que borra la raíz o escribe sobre un disco"
+risk = 3
+source = "exec"
+action = "exec"
+target = ["*/sh", "*/bash", "*/dash", "*/zsh"]
+where = [
+  { field = "argv", op = "glob", value = [
+    "*rm -rf /", "*rm -rf /\"", "*rm -rf /'", "*rm -rf /[*]", "*rm -rf /[*]\"", "*rm -rf /[*]'",
+    "*rm -rf ~", "*rm -rf ~\"", "*rm -rf ~'", "*rm -fr /", "*rm -fr /\"", "*rm -fr /'",
+    "*rm -fr /[*]", "*rm -fr /[*]\"", "*rm -fr /[*]'", "*rm -fr ~", "*rm -fr ~\"", "*rm -fr ~'",
+    "*rm -Rf /", "*rm -Rf /\"", "*rm -Rf /'", "*rm -Rf /[*]", "*rm -Rf /[*]\"", "*rm -Rf /[*]'",
+    "*rm -Rf ~", "*rm -Rf ~\"", "*rm -Rf ~'", "*rm -fR /", "*rm -fR /\"", "*rm -fR /'",
+    "*rm -fR /[*]", "*rm -fR /[*]\"", "*rm -fR /[*]'", "*rm -fR ~", "*rm -fR ~\"", "*rm -fR ~'",
+    "*rm -r -f /", "*rm -r -f /\"", "*rm -r -f /'", "*rm -r -f /[*]", "*rm -r -f /[*]\"",
+    "*rm -r -f /[*]'", "*rm -r -f ~", "*rm -r -f ~\"", "*rm -r -f ~'", "*--no-preserve-root*",
+    "*dd *of=/dev/[sv]d*", "*dd *of=/dev/nvme*",
+  ] },
+]
+
+[[rule]]
+id = "exec-disk-tools"
+description = "Ejecuta una herramienta que formatea o destruye datos (mkfs, wipefs, shred)"
+risk = 2
+source = "exec"
+action = "exec"
+target = ["*/mkfs", "*/mkfs.*", "*/wipefs", "*/shred"]
+
+[[rule]]
+id = "exec-download-and-run"
+description = "Descarga algo y lo ejecuta sin mirarlo"
+risk = 2
+source = "exec"
+action = "exec"
+target = ["*/sh", "*/bash", "*/dash", "*/zsh"]
+where = [
+  { field = "argv", op = "glob", value = [
+    "*curl*| sh", "*curl*| sh *", "*curl*| sh\"", "*curl*|sh", "*curl*|sh *", "*curl*| sudo sh*",
+    "*curl*| bash", "*curl*| bash *", "*curl*| bash\"", "*curl*|bash", "*curl*|bash *",
+    "*curl*| sudo bash*", "*curl*| python", "*curl*| python *", "*curl*| python\"",
+    "*curl*|python", "*curl*|python *", "*curl*| sudo python*", "*curl*| python3",
+    "*curl*| python3 *", "*curl*| python3\"", "*curl*|python3", "*curl*|python3 *",
+    "*curl*| sudo python3*", "*wget*| sh", "*wget*| sh *", "*wget*| sh\"", "*wget*|sh",
+    "*wget*|sh *", "*wget*| sudo sh*", "*wget*| bash", "*wget*| bash *", "*wget*| bash\"",
+    "*wget*|bash", "*wget*|bash *", "*wget*| sudo bash*", "*wget*| python", "*wget*| python *",
+    "*wget*| python\"", "*wget*|python", "*wget*|python *", "*wget*| sudo python*",
+    "*wget*| python3", "*wget*| python3 *", "*wget*| python3\"", "*wget*|python3",
+    "*wget*|python3 *", "*wget*| sudo python3*",
+  ] },
+]
+
+[[rule]]
+id = "exec-privilege"
+description = "Pide más privilegios (sudo, su, doas)"
+risk = 2
+source = "exec"
+action = "exec"
+target = ["*/sudo", "*/su", "*/doas"]
+
+[[rule]]
+id = "exec-chmod-open"
+description = "Abre los permisos de un árbol entero (chmod -R 777)"
+risk = 2
+source = "exec"
+action = "exec"
+target = "*/chmod"
+where = [{ field = "argv", op = "glob", value = ["-R 777*", "-R 0777*", "-Rf 777*", "-fR 777*", "-R a+rwx*"] }]
+
+[[rule]]
+id = "exec-shell-chmod-open"
+description = "Una orden de shell que abre los permisos de un árbol entero (chmod -R 777)"
+risk = 2
+source = "exec"
+action = "exec"
+target = ["*/sh", "*/bash", "*/dash", "*/zsh"]
+where = [{ field = "argv", op = "glob", value = ["*chmod -R 777*", "*chmod -R 0777*"] }]
+
+# ---------------------------------------------------------------------------------------------
+# Red (T06, el proxy). PROVISIONAL: se escriben para `net/request` con `details.method`. El proxy
+# ya graba sus propios riesgos (rechazos, clave real) y T10 retiene lo destructivo antes de que
+# salga; estas reglas solo ponen nivel a lo que pasa.
+# ---------------------------------------------------------------------------------------------
+
+[[rule]]
+id = "net-delete"
+description = "Una petición DELETE hacia internet"
+risk = 2
+source = "net"
+action = "request"
+where = [{ field = "method", op = "eq", value = "DELETE" }]
+
+[[rule]]
+id = "net-flood"
+description = "200 peticiones o más a internet en un minuto"
+risk = 2
+source = "net"
+action = "request"
+burst = { count = 200, window = 60 }

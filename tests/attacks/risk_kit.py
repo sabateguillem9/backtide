@@ -8,9 +8,9 @@ of the run: the service's own start-up and shutdown events have a risk of their 
 from collections import Counter
 from collections.abc import Iterable
 
-from vigia.blackbox import Event
+from backtide.blackbox import Event
 
-RULES_KEY = "risk_rules"  # in ``details``: the rules that touched the event (vigia.analyzer)
+RULES_KEY = "risk_rules"  # in ``details``: the rules that touched the event (backtide.analyzer)
 
 
 def peak(events: Iterable[Event]) -> int:

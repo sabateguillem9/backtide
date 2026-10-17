@@ -10,8 +10,6 @@ It is meant to hold back what cannot be undone before it leaves your machine. Th
 
 > **Status: pre-alpha.** This is a working prototype, not a product. Do not rely on it to protect anything you cannot afford to lose. Read [What works today](#what-works-today) and [Security model](#security-model) first.
 
-The code, the command line and the Python package are still called `vigia` (the project's working name). The rename to `backtide` is planned before the first installer.
-
 ## Why
 
 Agents like [OpenClaw](https://github.com/openclaw/openclaw) run with broad access to files, shells, mail and the network. When one goes wrong, or is manipulated, it can delete data and then misreport what it did. A record kept by the agent is only as trustworthy as the agent.
@@ -26,11 +24,11 @@ Developed and tested against OpenClaw, on Linux with Docker and Btrfs.
 |---|---|
 | Snapshots of the agent's working folder (Btrfs, copy-on-write), with Time Machine-style retention | Works |
 | Rewind to any snapshot, and undo the rewind | Works |
-| Black box: an append-only SQLite log where each event carries the hash of the previous one, with secrets redacted before writing; `vigia verificar` detects edits and deletions | Works |
+| Black box: an append-only SQLite log where each event carries the hash of the previous one, with secrets redacted before writing; `backtide verificar` detects edits and deletions | Works |
 | The agent's cage: OpenClaw in a container with no root, no capabilities, a read-only root filesystem, an internal network with no way out, and a seccomp profile | Works |
 | Disk quota for the agent, so it cannot fill the volume; the quota follows the folder across rewinds | Works |
 | File watcher (inotify) that records file changes in the black box | Works |
-| Service (`vigia vigilar`): snapshots every 2 minutes while there is activity, freezes the agent when space runs low, `vigia seguir` to resume | Works |
+| Service (`backtide vigilar`): snapshots every 2 minutes while there is activity, freezes the agent when space runs low, `backtide seguir` to resume | Works |
 | Read-only web view of the black box and the snapshots, on `127.0.0.1` | Works |
 | Attack battery: scripted "evil agent" scenarios that run inside the VM | Partly; some scenarios are still pending |
 | Rewind from the web | In progress |
@@ -122,7 +120,7 @@ Linux
   backtide service     black box, snapshots, rules, web, Telegram bot.
 ```
 
-Python modules in `vigia/`:
+Python modules in `backtide/`:
 
 | Module | What it does |
 |---|---|
@@ -133,7 +131,7 @@ Python modules in `vigia/`:
 | `service` | The long-running service: snapshot cycle, rewind, pause, control socket |
 | `notify` | Alerts (log only for now) |
 | `web` | The read-only web view |
-| `cli` | The `vigia` command |
+| `cli` | The `backtide` command |
 
 Planned and not present yet: `gate` (the proxy and approvals) and `analyzer` (risk rules).
 

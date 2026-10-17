@@ -28,15 +28,15 @@ from typing import Any
 
 import pytest
 
+from backtide.blackbox import BlackBox, Event
+from backtide.sensors import inotify
+from backtide.sensors.files import FileWatcher, WatcherConfig
+from backtide.sensors.inotify import IN_CREATE, IN_ONLYDIR, Inotify
+from backtide.snapshots import Reason
+from backtide.snapshots.store import SnapshotStore
 from tests.test_sensors_inotify import TestOpenBeneath as _UnitOpenBeneath
 from tests.test_sensors_inotify import TestOpenBeneathHardening as _UnitHardening
 from tests.test_sensors_inotify import root  # noqa: F401 - the fixture of those cases
-from vigia.blackbox import BlackBox, Event
-from vigia.sensors import inotify
-from vigia.sensors.files import FileWatcher, WatcherConfig
-from vigia.sensors.inotify import IN_CREATE, IN_ONLYDIR, Inotify
-from vigia.snapshots import Reason
-from vigia.snapshots.store import SnapshotStore
 
 pytestmark = pytest.mark.integration
 

@@ -4,8 +4,8 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from vigia.jail import openclaw
-from vigia.service.notice import ago, rewind_notice
+from backtide.jail import openclaw
+from backtide.service.notice import ago, rewind_notice
 
 TAKEN = datetime(2026, 10, 16, 11, 50, tzinfo=UTC)
 NOW = TAKEN + timedelta(minutes=10)

@@ -9,7 +9,7 @@ only record say so in their docstring. Sections follow the checks A1-A14 of the 
 SELinux relabel at each start, came out of the review.
 
 Everything runs as the unprivileged Lima user on a fresh 1 GiB btrfs formatted with
-``mkfs.btrfs -O squota`` (``quota_volume`` in conftest.py), through the vigia.snapshots.btrfs
+``mkfs.btrfs -O squota`` (``quota_volume`` in conftest.py), through the backtide.snapshots.btrfs
 functions. The only privileged command is ``quota_volume.set_limit`` (``sudo -n btrfs qgroup
 limit``). No test runs ``btrfs qgroup destroy`` or ``clear-stale``.
 
@@ -35,9 +35,9 @@ from uuid import uuid4
 
 import pytest
 
-from vigia.jail import docker as jail_docker
-from vigia.jail.config import CONTAINER_WORKSPACE
-from vigia.snapshots import SnapshotError, SnapshotNoSpace, btrfs
+from backtide.jail import docker as jail_docker
+from backtide.jail.config import CONTAINER_WORKSPACE
+from backtide.snapshots import SnapshotError, SnapshotNoSpace, btrfs
 
 pytestmark = pytest.mark.integration
 

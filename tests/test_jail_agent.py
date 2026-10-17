@@ -14,18 +14,18 @@ from pathlib import Path
 
 import pytest
 
-from vigia.jail import agent as agent_module
-from vigia.jail import docker
-from vigia.jail.agent import AgentJail
-from vigia.jail.config import (
+from backtide.jail import agent as agent_module
+from backtide.jail import docker
+from backtide.jail.agent import AgentJail
+from backtide.jail.config import (
     AgentJailConfig,
     docker_create_argv,
     network_create_argv,
     openclaw_config,
     token_env,
 )
-from vigia.jail.docker import JailError
-from vigia.jail.openclaw import UnrewindableConfig
+from backtide.jail.docker import JailError
+from backtide.jail.openclaw import UnrewindableConfig
 
 TOKEN = "u" * 43
 STARTED_AT = "2026-10-06T16:44:06.49679418Z"
@@ -440,7 +440,7 @@ def test_start_stop_and_remove(ready_jail: AgentJail, fake_docker: FakeDocker) -
     assert stop.timeout > ready_jail.config.stop_timeout
 
 
-# start() only starts the jail it would create (finding: a container left by an older Vigía)
+# start() only starts the jail it would create (finding: a container left by an older backtide)
 
 
 def test_start_checks_the_container_against_the_config(
@@ -867,7 +867,7 @@ def test_quiesce_start_if_also_decides_after_a_failed_stop(
     assert ["start", ready_jail.config.name] not in fake_docker.commands()
 
 
-# The agent never shares Vigía's ids (finding: the agent ran as the test user)
+# The agent never shares backtide's ids (finding: the agent ran as the test user)
 
 
 @pytest.mark.parametrize("method", ["create", "start"])
@@ -879,7 +879,7 @@ def test_quiesce_start_if_also_decides_after_a_failed_stop(
         ({"gid": os.getgroups()[-1] if os.getgroups() else os.getgid()}, "gid"),
     ],
 )
-def test_create_and_start_refuse_ids_shared_with_vigia(
+def test_create_and_start_refuse_ids_shared_with_backtide(
     config: AgentJailConfig,
     fake_docker: FakeDocker,
     method: str,

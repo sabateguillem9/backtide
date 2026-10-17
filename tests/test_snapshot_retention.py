@@ -8,8 +8,8 @@ from itertools import pairwise
 
 import pytest
 
-from vigia.snapshots.model import Reason, Snapshot
-from vigia.snapshots.retention import (
+from backtide.snapshots.model import Reason, Snapshot
+from backtide.snapshots.retention import (
     DAILY_FOR,
     HOURLY_FOR,
     KEEP_ALL_FOR,

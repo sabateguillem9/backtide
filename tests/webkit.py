@@ -1,4 +1,4 @@
-"""Helpers shared by the tests of vigia.web: a black box written by the real BlackBox, and the
+"""Helpers shared by the tests of backtide.web: a black box written by the real BlackBox, and the
 app on top of it, reached with Host 127.0.0.1:PORT like a browser would."""
 
 import warnings
@@ -7,9 +7,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from backtide.blackbox import BlackBox
+from backtide.web import BoxReader, create_app
 from tests.conftest import FakeClock
-from vigia.blackbox import BlackBox
-from vigia.web import BoxReader, create_app
 
 KEY = bytes(range(32))
 TOKEN = "t0ken-for-the-tests-only"  # noqa: S105 - the link's one-time token, a test value
@@ -52,7 +52,7 @@ def new_client(tmp_path: Path, *, logged_in: bool = True, **options) -> TestClie
         warnings.simplefilter("ignore")
         client = TestClient(new_app(tmp_path, **options), base_url=BASE)
     if logged_in:
-        client.cookies.set("vigia_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
+        client.cookies.set("backtide_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
     return client
 
 
@@ -79,7 +79,7 @@ class LiveServer:
     ``live.base``."""
 
     def __init__(self, tmp_path: Path, **options) -> None:
-        from vigia.web.server import bind, make_server
+        from backtide.web.server import bind, make_server
 
         self.sock = bind(0)
         self.port = self.sock.getsockname()[1]

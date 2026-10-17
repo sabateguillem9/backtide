@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import Event, Source
+from backtide.service.config import ServiceConfig
+from backtide.snapshots import SnapshotError
 from scripts.demo import demo
-from vigia.blackbox import Event, Source
-from vigia.service.config import ServiceConfig
-from vigia.snapshots import SnapshotError
 
 
 def test_the_written_config_is_one_the_service_accepts(tmp_path: Path) -> None:

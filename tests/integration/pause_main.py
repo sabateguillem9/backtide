@@ -1,4 +1,4 @@
-"""`vigia vigilar` on a capped workspace, for the VM tests of the pause by space (T04d-2).
+"""`backtide vigilar` on a capped workspace, for the VM tests of the pause by space (T04d-2).
 
     python -m tests.integration.pause_main <config.toml> <quota volume mount point>
 
@@ -17,14 +17,14 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-import vigia.cli as cli
-import vigia.service.runner as runner
+import backtide.cli as cli
+import backtide.service.runner as runner
+from backtide.jail import AgentJail
+from backtide.service.config import ServiceConfig
+from backtide.service.pause import make_space_gate
+from backtide.snapshots import SnapshotStore, space
+from backtide.snapshots.space import GIB, HostSpace
 from tests.integration.conftest import VOLUME_IMAGE, QuotaVolume
-from vigia.jail import AgentJail
-from vigia.service.config import ServiceConfig
-from vigia.service.pause import make_space_gate
-from vigia.snapshots import SnapshotStore, space
-from vigia.snapshots.space import GIB, HostSpace
 
 PLENTY = HostSpace(total=500 * GIB, free=400 * GIB)
 

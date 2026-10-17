@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from vigia.analyzer import History, Observation, assess, default_rules, parse_rules
-from vigia.analyzer.assess import MAX_WEIGHT
+from backtide.analyzer import History, Observation, assess, default_rules, parse_rules
+from backtide.analyzer.assess import MAX_WEIGHT
 
 DEFAULTS = default_rules().rules
 

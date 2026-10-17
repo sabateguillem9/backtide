@@ -1,4 +1,4 @@
-# Vigía · development commands. Run `make help` to list them.
+# backtide · development commands. Run `make help` to list them.
 
 VM := vigia-dev
 # Run a command inside the dev VM, in this same folder.
@@ -11,7 +11,7 @@ DEMO_VM = $(UV_VM) python -m scripts.demo.demo
 
 # The web of the demo (docs/demo.md): in the VM, on the config that `make demo` writes. A port
 # apart from the Mac's own `make web-demo`, so both can be open at once (Lima forwards the VM's).
-DEMO_WEB_CONFIG = $$HOME/vigia-demo-run/vigia.toml
+DEMO_WEB_CONFIG = $$HOME/backtide-demo-run/backtide.toml
 DEMO_WEB_PORT = 8766
 
 .PHONY: help test lint fmt it ataques demo demo-crear demo-archivos demo-borrar demo-instantaneas \
@@ -39,7 +39,7 @@ ataques: ## Evil-agent battery inside the VM (only some: make ataques ATK="-k ne
 	@case "$(ATK)" in *"'"*) echo "ATK cannot contain single quotes: it goes inside sh -c '...'" >&2; exit 2;; esac
 	$(VM_SH) '$(UV_VM) pytest -m ataques -q --tb=short tests/attacks $(ATK)'
 
-demo: ## Demo: volume + `vigia vigilar` in front (terminal 1; docs/demo.md)
+demo: ## Demo: volume + `backtide vigilar` in front (terminal 1; docs/demo.md)
 	$(VM_SH) '$(DEMO_VM) up'
 
 demo-crear: ## Demo: the agent creates some files
@@ -65,16 +65,16 @@ demo-web: ## Demo: the web of the running demo, in the VM (open the link on the 
 	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
 	@if lsof -nP -iTCP:$(DEMO_WEB_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
-	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) vigia web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --rebobinar'
+	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --rebobinar'
 
 web-demo: ## Web demo on the Mac, no VM: made-up black box and snapshots + the web; Ctrl-C stops (docs/demo.md)
-	@dir=$$(mktemp -d "$${TMPDIR:-/tmp}/vigia-web-demo.XXXXXX") || exit 1; \
+	@dir=$$(mktemp -d "$${TMPDIR:-/tmp}/backtide-web-demo.XXXXXX") || exit 1; \
 	seeder=; trap 'kill $$seeder 2>/dev/null; rm -rf "$$dir"' EXIT INT TERM; \
 	uv run python scripts/web-demo/seed.py "$$dir" --live >/dev/null & seeder=$$!; \
 	n=0; while [ ! -e "$$dir/.ready" ]; do \
 	  n=$$((n+1)); if [ $$n -gt 240 ]; then echo "The demo data did not appear" >&2; exit 1; fi; \
 	  sleep 0.5; done; \
-	uv run python scripts/web-demo/serve.py "$$dir/vigia.toml"
+	uv run python scripts/web-demo/serve.py "$$dir/backtide.toml"
 
 vm-up: ## Create (first time) and start the dev VM
 	@status=$$(limactl list --format '{{.Status}}' $(VM) 2>/dev/null); \

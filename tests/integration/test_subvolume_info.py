@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from vigia.service.clock import clock_synced
-from vigia.snapshots import Reason, SnapshotError, SnapshotStore, btrfs
-from vigia.snapshots.activity import SnapshotInfo, changed_since, lineage_reference
+from backtide.service.clock import clock_synced
+from backtide.snapshots import Reason, SnapshotError, SnapshotStore, btrfs
+from backtide.snapshots.activity import SnapshotInfo, changed_since, lineage_reference
 
 pytestmark = pytest.mark.integration
 

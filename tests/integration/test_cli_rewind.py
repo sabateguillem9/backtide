@@ -1,10 +1,10 @@
-"""T04c-2 in the VM: `vigia rebobinar`, with and without a service, against the real OpenClaw.
+"""T04c-2 in the VM: `backtide rebobinar`, with and without a service, against the real OpenClaw.
 
 docs/19-diseno-t04.md, section 4 ("El socket de control" and "La CLI"). The command is the real
-one, run as a process (tests/integration/cli_main.py); the service is the real `vigia vigilar`.
+one, run as a process (tests/integration/cli_main.py); the service is the real `backtide vigilar`.
 
 - With the service running, the command goes through the control socket (the real ``SO_PEERCRED``
-  on both ends) and the deleted files come back; the id it takes is the one `vigia instantaneas`
+  on both ends) and the deleted files come back; the id it takes is the one `backtide instantaneas`
   printed.
 - Without a service, it rewinds in its own process and leaves the agent stopped (also one that a
   killed service left running); with the lock held and no socket it does nothing and never falls
@@ -29,6 +29,9 @@ from pathlib import Path
 
 import pytest
 
+from backtide.service.control import ControlError, ask_rewind
+from backtide.service.runner import ServiceRunning, take_lock
+from backtide.snapshots import Snapshot
 from tests.integration.service_kit import (
     CYCLE,
     Service,
@@ -39,9 +42,6 @@ from tests.integration.service_kit import (
     write_in_agent,
 )
 from tests.integration.service_kit import exec_in_agent as exec_ok
-from vigia.service.control import ControlError, ask_rewind
-from vigia.service.runner import ServiceRunning, take_lock
-from vigia.snapshots import Snapshot
 
 pytestmark = pytest.mark.integration
 
@@ -68,7 +68,7 @@ def snapshot_with_files(service: Service) -> str:
 
 
 def listed_ids(service: Service) -> list[str]:
-    """The first column of `vigia instantaneas --todas`: what a person would copy."""
+    """The first column of `backtide instantaneas --todas`: what a person would copy."""
     result = run_cli(service, "instantaneas", "--todas")
     assert result.returncode == 0, (result.stdout, result.stderr)
     lines = result.stdout.strip().splitlines()
@@ -166,7 +166,7 @@ def test_the_live_socket_is_private_unreachable_for_the_agent_and_refuses_what_i
     service.wait_ready()
     path = service.config.state_dir / "control.sock"
 
-    # Private, in Vigía's state folder, never in the volume, and not mounted into the agent.
+    # Private, in backtide's state folder, never in the volume, and not mounted into the agent.
     info = os.lstat(path)
     assert stat.S_ISSOCK(info.st_mode)
     assert stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.geteuid()
@@ -228,7 +228,7 @@ def test_the_live_socket_is_private_unreachable_for_the_agent_and_refuses_what_i
     existing = service.snapshots()[-1]
     unknown = Snapshot(existing.taken_at.replace(year=2020), "periodic")
     garbage = run_cli(service, "rebobinar", "--si", "latest")
-    assert garbage.returncode == 2 and "vigia instantaneas" in garbage.stderr
+    assert garbage.returncode == 2 and "backtide instantaneas" in garbage.stderr
     missing = run_cli(service, "rebobinar", "--si", unknown.id)
     assert missing.returncode == 2 and "no existe" in missing.stderr
     assert "Vas a volver" not in missing.stdout
@@ -265,7 +265,7 @@ def test_without_a_service_it_rewinds_in_its_own_process_and_leaves_the_agent_st
 
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "No hay un servicio en marcha" in result.stdout
-    assert "El agente queda parado" in result.stdout and "vigia vigilar" in result.stdout
+    assert "El agente queda parado" in result.stdout and "backtide vigilar" in result.stdout
     assert "socket de control" not in result.stdout
     assert workspace_holds(service, FILES)
     assert service.store.workspace_id() != workspace_before

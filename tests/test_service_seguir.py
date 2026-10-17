@@ -1,5 +1,5 @@
-"""`vigia seguir` (T04d-2): what the command says and returns, with the lock and the socket
-played by fakes. The CLI wiring (`vigia/cli.py`) only reads the config and calls ``seguir``."""
+"""`backtide seguir` (T04d-2): what the command says and returns, with the lock and the socket
+played by fakes. The CLI wiring (`backtide/cli.py`) only reads the config and calls ``seguir``."""
 
 import io
 from pathlib import Path
@@ -7,11 +7,11 @@ from typing import Any
 
 import pytest
 
-import vigia.service.seguir as seguir_module
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
-from vigia.service.runner import ServiceLocked, ServiceRunning
-from vigia.service.seguir import seguir
+import backtide.service.seguir as seguir_module
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
+from backtide.service.runner import ServiceLocked, ServiceRunning
+from backtide.service.seguir import seguir
 
 TOKEN = "T0kenForTestsOnly_" + "a1B2c3D4e5F6g7H8i9J0" * 2
 
@@ -122,8 +122,8 @@ def test_without_a_service_nothing_is_resumed_and_it_says_how(
     code, out, err, asked = run(monkeypatch, config, lock=lock)
     assert code == 1
     assert asked == []
-    assert lock.closed  # the lock is let go at once: a `vigia vigilar` may start
-    assert "vigia vigilar" in err and "vigia seguir" in err
+    assert lock.closed  # the lock is let go at once: a `backtide vigilar` may start
+    assert "backtide vigilar" in err and "backtide seguir" in err
 
 
 @pytest.mark.parametrize(

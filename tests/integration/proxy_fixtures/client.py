@@ -134,7 +134,7 @@ def listen(path: str) -> dict:
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(path)
-        os.chmod(path, 0o666)  # noqa: S103 - production: 0600, Vigía connects as root
+        os.chmod(path, 0o666)  # noqa: S103 - production: 0600, backtide connects as root
         server.listen(1)
         server.settimeout(TIMEOUT)
         conn, _ = server.accept()

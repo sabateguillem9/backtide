@@ -1,4 +1,4 @@
-"""`vigia vigilar` and `vigia instantaneas`: arguments, messages in Spanish and exit codes.
+"""`backtide vigilar` and `backtide instantaneas`: arguments, messages in Spanish and exit codes.
 
 `vigilar` is driven with a fake ``serve`` (the real one is tested in tests/test_service_runner.py
 and in the VM); `instantaneas` with a fake store that lists snapshots.
@@ -9,14 +9,14 @@ from pathlib import Path
 
 import pytest
 
-import vigia.cli as cli
-from vigia.blackbox import BlackBoxError
-from vigia.cli import main
-from vigia.jail import JailError
-from vigia.jail.openclaw import RewindProblem, UnrewindableConfig
-from vigia.service.config import ConfigError
-from vigia.service.runner import ServiceLocked
-from vigia.snapshots import Reason, Snapshot, SnapshotError
+import backtide.cli as cli
+from backtide.blackbox import BlackBoxError
+from backtide.cli import main
+from backtide.jail import JailError
+from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
+from backtide.service.config import ConfigError
+from backtide.service.runner import ServiceLocked
+from backtide.snapshots import Reason, Snapshot, SnapshotError
 
 TOKEN = "T0kenForTestsOnly_" + "a1B2c3D4e5F6g7H8i9J0" * 2
 NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=UTC)
@@ -28,7 +28,7 @@ def config_file(tmp_path: Path) -> Path:
     state.mkdir(mode=0o700)
     (state / "gateway.token").write_text(TOKEN + "\n")
     (state / "gateway.token").chmod(0o600)
-    path = tmp_path / "vigia.toml"
+    path = tmp_path / "backtide.toml"
     path.write_text(f'state_dir = "{state}"\nvolume = "{tmp_path / "vol"}"\n')
     path.chmod(0o600)
     return path
@@ -59,22 +59,22 @@ def test_vigilar_serves_the_config_it_is_given(
     assert code == 0
     (config,) = served
     assert config.state_dir == config_file.parent / "state"
-    assert "Vigía parado" in out
+    assert "backtide parado" in out
 
 
 def test_vigilar_reads_the_default_config_path(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(cli, "serve", lambda config: None)
-    code, _, err = run(capsys, "vigilar")  # /etc/vigia/vigia.toml does not exist here
+    code, _, err = run(capsys, "vigilar")  # /etc/backtide/backtide.toml does not exist here
     assert code == 2
-    assert "/etc/vigia/vigia.toml" in err
+    assert "/etc/backtide/backtide.toml" in err
 
 
 def test_vigilar_with_a_broken_config_is_a_usage_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    broken = tmp_path / "vigia.toml"
+    broken = tmp_path / "backtide.toml"
     broken.write_text("this is = = not toml")
     broken.chmod(0o600)
     code, _, err = run(capsys, "vigilar", "--config", broken)
@@ -95,19 +95,19 @@ def test_a_config_the_rewind_would_break_prints_its_notice_and_exits_cleanly(
     assert code == 2
     assert error.notice in err
     assert "Traceback" not in err + out
-    assert "Vigía parado" not in out  # it never ran
+    assert "backtide parado" not in out  # it never ran
 
 
 def test_a_second_service_is_refused_with_the_reason(
     config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     def serve(config: object) -> None:
-        raise ServiceLocked("Ya hay un `vigia vigilar` en marcha")
+        raise ServiceLocked("Ya hay un `backtide vigilar` en marcha")
 
     monkeypatch.setattr(cli, "serve", serve)
     code, _, err = run(capsys, "vigilar", "--config", config_file)
     assert code == 1
-    assert "Ya hay un `vigia vigilar` en marcha" in err
+    assert "Ya hay un `backtide vigilar` en marcha" in err
 
 
 def test_an_unusable_telegram_file_is_a_config_error(
@@ -162,7 +162,7 @@ def test_an_unexpected_failure_says_it_is_unknown_if_the_agent_runs_and_how_to_c
     assert code == 1
     assert "no se sabe si el agente sigue en marcha" in err.lower()
     assert "docker ps" in err
-    assert "vigia-agente" in err  # the container name of this config
+    assert "backtide-agente" in err  # the container name of this config
 
 
 def test_an_agent_that_keeps_running_is_said_loudly(
@@ -175,7 +175,7 @@ def test_an_agent_that_keeps_running_is_said_loudly(
     code, out, err = run(capsys, "vigilar", "--config", config_file)
     assert code == 1
     assert "SIGUE EN MARCHA" in err
-    assert "Vigía parado" not in out
+    assert "backtide parado" not in out
 
 
 def test_an_unexpected_failure_is_logged_with_its_traceback_and_exits_with_1(
@@ -333,7 +333,7 @@ def test_instantaneas_does_not_need_the_service(
         cli, "serve", lambda config: pytest.fail("instantaneas started the service")
     )
     assert main(["instantaneas", "--config", str(config_file)]) == 0
-    assert not (config_file.parent / "state" / "vigia.lock").exists()
+    assert not (config_file.parent / "state" / "backtide.lock").exists()
 
 
 def test_a_snapshot_reason_has_a_spanish_name_for_every_known_reason() -> None:
@@ -377,4 +377,4 @@ def test_seguir_without_a_service_says_so(
 ) -> None:
     code, _, err = run(capsys, "seguir", "--config", config_file)
     assert code == 1
-    assert "vigia vigilar" in err
+    assert "backtide vigilar" in err

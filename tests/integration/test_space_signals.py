@@ -1,4 +1,4 @@
-"""T04d-1 in the VM: the space signals of vigia.snapshots.space against a real btrfs.
+"""T04d-1 in the VM: the space signals of backtide.snapshots.space against a real btrfs.
 
 The unit tests (tests/test_snapshot_space.py) feed ``evaluate`` the numbers measured in docs/16.
 Here the numbers come from a real 1 GiB volume with simple quotas (``quota_volume``), read
@@ -44,9 +44,9 @@ from test_quota_assumptions import (
     try_rewind,
 )
 
-from vigia.snapshots import SnapshotError, btrfs
-from vigia.snapshots import space as signals
-from vigia.snapshots.space import DEFAULT_CONFIG, GIB, HostSpace
+from backtide.snapshots import SnapshotError, btrfs
+from backtide.snapshots import space as signals
+from backtide.snapshots.space import DEFAULT_CONFIG, GIB, HostSpace
 
 pytestmark = pytest.mark.integration
 

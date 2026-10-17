@@ -6,9 +6,9 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
+from backtide.web.narrate import Narrator  # noqa: F401 - the stream folds with it
 from tests.conftest import FakeClock
 from tests.webkit import START, new_box, new_client, parse_sse
-from vigia.web.narrate import Narrator  # noqa: F401 - the stream folds with it
 
 
 def stream(
@@ -58,8 +58,8 @@ def test_new_events_arrive_as_html_lines_with_their_seq_as_id(tmp_path: Path) ->
     lines = of_kind(events, "lines")
     html = "\n".join(e["data"] for e in lines)
     assert "Ha creado" in html and ">notas.md<" in html
-    assert "Aviso de Vigía" in html
-    assert "El agente ha arrancado" not in html and "Vigía se ha parado" not in html
+    assert "Aviso de backtide" in html
+    assert "El agente ha arrancado" not in html and "backtide se ha parado" not in html
     assert lines[-1]["id"] == "4"
 
 

@@ -1,12 +1,12 @@
-"""Demo data for `vigia web` (T12): a throwaway state with a believable black box, no VM.
+"""Demo data for `backtide web` (T12): a throwaway state with a believable black box, no VM.
 
 Usage: python scripts/web-demo/seed.py <folder> [--live]
 
-Writes into <folder>: ``vigia.toml``, ``state/`` (a black box written by the real BlackBox),
+Writes into <folder>: ``backtide.toml``, ``state/`` (a black box written by the real BlackBox),
 ``volume/snapshots/`` (one empty folder per snapshot, which serve.py lists: no btrfs on a Mac)
 and a ``.ready`` file when the first story is in. Before the last hour there is a day of work
 with quiet stretches, so the tide has a shape. The last hour: an agent creates notes, a report
-and a spreadsheet, Vigía takes snapshots, the agent deletes a whole project (a
+and a spreadsheet, backtide takes snapshots, the agent deletes a whole project (a
 burst of 120 files), the person rewinds, and the agent carries on. With ``--live`` it then keeps
 adding events like an agent at work (some edits, now and then a burst of deletions, a snapshot
 every half minute) until it is stopped, so the "Ahora" page has something to show.
@@ -21,7 +21,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from vigia.blackbox import BlackBox, create_key, load_key
+from backtide.blackbox import BlackBox, create_key, load_key
 
 LIVE_EVERY = 2.0  # seconds between live events
 SNAPSHOT_EVERY = 15  # live events between two snapshots
@@ -218,7 +218,7 @@ def main(argv: list[str]) -> int:
     state.chmod(0o700)
     (state / "gateway.token").write_text("demo-token-not-a-secret\n")
     (state / "gateway.token").chmod(0o600)
-    config = folder / "vigia.toml"
+    config = folder / "backtide.toml"
     config.write_text(f'state_dir = "{state}"\nvolume = "{folder / "volume"}"\n')
     config.chmod(0o600)
     if not (state / "blackbox.key").exists():
@@ -240,7 +240,7 @@ def main(argv: list[str]) -> int:
         if wait > 0:
             time.sleep(wait + 0.1)
     (folder / ".ready").write_text("ready\n")
-    print(f"python -m vigia.cli web --config {config}", flush=True)
+    print(f"python -m backtide.cli web --config {config}", flush=True)
     if "--live" in argv:
         clock.sync()
         live(story)

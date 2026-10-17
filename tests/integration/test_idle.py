@@ -21,9 +21,9 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import Event
+from backtide.snapshots import btrfs
 from tests.integration.service_kit import Service
-from vigia.blackbox import Event
-from vigia.snapshots import btrfs
 
 pytestmark = pytest.mark.integration
 

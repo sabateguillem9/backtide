@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from backtide.web.ask import MAX_WINDOW, answer, normalize, parse, summarize
+from backtide.web.i18n import Translator
+from backtide.web.reader import BoxReader, BoxUnavailable
 from tests.conftest import FakeClock
 from tests.webkit import START, new_box
-from vigia.web.ask import MAX_WINDOW, answer, normalize, parse, summarize
-from vigia.web.i18n import Translator
-from vigia.web.reader import BoxReader, BoxUnavailable
 
 ES, EN = Translator("es"), Translator("en")
 
@@ -163,7 +163,7 @@ def test_help_and_unknown_point_to_t15(story) -> None:
 
 
 def test_a_huge_window_is_capped_and_says_so(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("vigia.web.ask.MAX_EVENTS", 5)
+    monkeypatch.setattr("backtide.web.ask.MAX_EVENTS", 5)
     box = new_box(tmp_path)
     for i in range(12):
         box.append("file", "create", f"f{i}")

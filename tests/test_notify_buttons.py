@@ -1,6 +1,6 @@
 """The server-side book of the bot's buttons and the rate limit (T09)."""
 
-from vigia.notify.buttons import Action, Button, ButtonBook, RateLimit, Refused
+from backtide.notify.buttons import Action, Button, ButtonBook, RateLimit, Refused
 
 
 class Clock:

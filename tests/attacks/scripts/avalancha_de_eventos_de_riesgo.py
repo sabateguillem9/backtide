@@ -3,7 +3,7 @@
 Runs INSIDE the jail, as the agent's user (python3 -c). Usage: <script> build|storm <directory>.
 Prints one JSON object on its last line.
 
-``build``: 1,500 small files, which Vigía will snapshot.
+``build``: 1,500 small files, which backtide will snapshot.
 ``storm``: three rounds of "delete every file, make them again": 4,500 deletes in about twenty
 seconds. Each round is far past the 100 deletes a minute that the default rules rate as risk 3,
 so the black box gets hundreds of events of risk 3 (and the watcher folds the rest into

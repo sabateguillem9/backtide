@@ -22,8 +22,8 @@ from uuid import uuid4
 
 import pytest
 
-from vigia.jail import AgentJail, JailError, docker
-from vigia.jail.config import (
+from backtide.jail import AgentJail, JailError, docker
+from backtide.jail.config import (
     AGENT_DIR,
     AGENT_SUBDIRS,
     CONTAINER_CONFIG_DIR,
@@ -38,10 +38,10 @@ from vigia.jail.config import (
     openclaw_config,
     token_env,
 )
-from vigia.jail.openclaw import check_rewindable
-from vigia.jail.seccomp import BLOCKED_ERRNO
-from vigia.jail.verify import container_problems
-from vigia.snapshots import Reason, btrfs
+from backtide.jail.openclaw import check_rewindable
+from backtide.jail.seccomp import BLOCKED_ERRNO
+from backtide.jail.verify import container_problems
+from backtide.snapshots import Reason, btrfs
 
 pytestmark = pytest.mark.integration
 
@@ -56,7 +56,7 @@ CONTAINER_WRITABLE = {"/proc", "/dev", "/dev/pts", "/dev/mqueue", "/dev/shm"}
 SECRET_WORDS = ("KEY", "SECRET", "PASSWORD")
 NO_CAPABILITIES = "0" * 16
 GIB = 1024**3
-# Docker's default profile, without the btrfs block: what an older Vigía's container has.
+# Docker's default profile, without the btrfs block: what an older backtide's container has.
 DOCKER_DEFAULT_PROFILE = SECCOMP_PROFILE.with_name("docker-default.json")
 
 # Runs inside the container (python3 of the image). Prints one JSON object.
@@ -368,10 +368,10 @@ def test_the_agent_cannot_see_the_btrfs_sysfs_or_where_the_volume_image_lives(
             assert running_agent.exec(["test", "-e", path]).returncode == 1, path
 
 
-def test_vigia_files_are_invisible(running_agent) -> None:
-    """Snapshots and Vigía's own data (the black box lives next to them) never show up."""
-    marker = running_agent.store.root / f"vigia-blackbox-stand-in-{uuid4().hex}"
-    marker.write_text("only Vigía may see this\n")
+def test_backtide_files_are_invisible(running_agent) -> None:
+    """Snapshots and backtide's own data (the black box lives next to them) never show up."""
+    marker = running_agent.store.root / f"backtide-blackbox-stand-in-{uuid4().hex}"
+    marker.write_text("only backtide may see this\n")
     try:
         snap = running_agent.store.take(Reason.MANUAL)
         found = sh(
@@ -430,11 +430,11 @@ def test_host_is_unreachable(running_agent) -> None:
 
 def test_root_filesystem_is_read_only(running_agent) -> None:
     # /var/tmp is world-writable in the image: only the read-only mount stops the write.
-    for path in ("/var/tmp/vigia-probe", "/etc/vigia-probe", "/app/vigia-probe"):
+    for path in ("/var/tmp/backtide-probe", "/etc/backtide-probe", "/app/backtide-probe"):
         result = running_agent.exec(["touch", path])
         assert result.returncode != 0, path
     assert "Read-only file system" in running_agent.exec(["touch", "/var/tmp/x"]).stderr
-    for path in (f"{CONTAINER_WORKSPACE}/work/vigia-probe", "/tmp/vigia-probe"):
+    for path in (f"{CONTAINER_WORKSPACE}/work/backtide-probe", "/tmp/backtide-probe"):
         running_agent.exec(["touch", path], check=True)
         running_agent.exec(["rm", path], check=True)
 
@@ -471,12 +471,12 @@ def test_cannot_create_subvolumes_but_copies_fall_back(running_agent) -> None:
     assert all(entry.stat().st_ino != 256 for entry in host_side.iterdir())  # no subvolume
 
 
-# What Vigía reads from the container is the agent's, never trusted
+# What backtide reads from the container is the agent's, never trusted
 
 
 def test_readiness_ignores_a_curlrc_planted_by_the_agent(running_agent) -> None:
     """HOME is the agent's /workspace/home, and curl reads ~/.curlrc. One there would hand
-    Vigía's own /healthz probe a URL of the agent's choosing first (``file:///dev/zero`` made
+    backtide's own /healthz probe a URL of the agent's choosing first (``file:///dev/zero`` made
     it print 1 GB/s). This one is harmless: the hostname printed before the JSON would just
     keep the probe failing, so wait_ready would time out."""
     curlrc = f"{CONTAINER_HOME}/.curlrc"
@@ -494,7 +494,7 @@ def test_readiness_ignores_a_curlrc_planted_by_the_agent(running_agent) -> None:
 def test_start_refuses_a_container_that_is_not_the_jail(
     running_agent, agent_leftovers, kind: str
 ) -> None:
-    """A container under the jail's name made by an older Vigía (here: without the btrfs
+    """A container under the jail's name made by an older backtide (here: without the btrfs
     block in its seccomp profile, which Docker read when it was created) or by hand (a plain
     ``docker create``) is never started as if it were the jail."""
     name, _ = agent_leftovers.names(os.getpid())

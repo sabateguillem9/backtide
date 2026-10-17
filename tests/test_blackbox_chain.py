@@ -4,8 +4,8 @@ import math
 
 import pytest
 
-from vigia.blackbox import GENESIS, Source, canonical, compute_hash, key_id
-from vigia.blackbox.chain import CANONICAL_FIELDS, canonical_json, checkpoint_mac
+from backtide.blackbox import GENESIS, Source, canonical, compute_hash, key_id
+from backtide.blackbox.chain import CANONICAL_FIELDS, canonical_json, checkpoint_mac
 
 KEY = bytes(range(32))
 FIELDS = {
@@ -93,6 +93,15 @@ def test_key_id_is_short_stable_and_reveals_nothing() -> None:
     assert len(key_id(KEY)) == 16
     assert KEY.hex()[:16] not in key_id(KEY)
     assert key_id(KEY) not in hashlib.sha256(KEY).hexdigest()
+
+
+def test_key_id_and_checkpoint_mac_keep_their_bytes() -> None:
+    """Existing black boxes store key_id and checkpoint macs: the labels must never change."""
+    assert key_id(KEY) == "a5e5531163507cc6"
+    fields = {"seq": 1, "hash": "0" * 64, "ts": "2026-10-17T00:00:00Z", "key_id": key_id(KEY)}
+    assert checkpoint_mac(KEY, fields) == (
+        "01d52e1684b84a1540c50c3f924b02e6329970df0755a7456efb11a16d8e7965"
+    )
 
 
 def test_checkpoint_mac_covers_every_field_and_differs_from_event_hashes() -> None:

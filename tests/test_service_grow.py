@@ -14,6 +14,13 @@ from pathlib import Path
 
 import pytest
 
+from backtide.jail import JailError
+from backtide.notify import AlertLevel
+from backtide.service.guardian import AgentState
+from backtide.service.rewind import RewindStatus, read_pending
+from backtide.snapshots import Reason, SnapshotError, SnapshotNoSpace
+from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
+from backtide.snapshots.space import GIB, MIB
 from tests.test_service_guardian import (  # noqa: F401 - fixtures, used by name
     Violation,
     World,
@@ -25,13 +32,6 @@ from tests.test_service_guardian import (  # noqa: F401 - fixtures, used by name
 )
 from tests.test_snapshot_grow import IMAGE, VOLUME
 from tests.test_snapshot_grow import World as Disk
-from vigia.jail import JailError
-from vigia.notify import AlertLevel
-from vigia.service.guardian import AgentState
-from vigia.service.rewind import RewindStatus, read_pending
-from vigia.snapshots import Reason, SnapshotError, SnapshotNoSpace
-from vigia.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
-from vigia.snapshots.space import GIB, MIB
 
 CEILING = 3 * GIB // 2
 

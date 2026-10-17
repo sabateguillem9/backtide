@@ -25,10 +25,10 @@ from test_service_guardian import (  # noqa: F401 - fixtures, used by name
 )
 from test_service_space_thread import second_guardian
 
-from vigia.jail import JailError
-from vigia.service.guardian import AgentState
-from vigia.service.pause import PauseStatus, ResumeStatus
-from vigia.service.rewind import RewindStatus
+from backtide.jail import JailError
+from backtide.service.guardian import AgentState
+from backtide.service.pause import PauseStatus, ResumeStatus
+from backtide.service.rewind import RewindStatus
 
 P1 = Violation("P1", "metadatos: quedan 100 MiB, mínimo 341 MiB")
 

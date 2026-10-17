@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from vigia.jail import docker
-from vigia.jail.docker import JailError
+from backtide.jail import docker
+from backtide.jail.docker import JailError
 
 FAKE_SECRET = "fake-value-for-the-test"  # noqa: S105 - not a real secret
 OSC52 = "\x1b]52;c;ZWNobyBoYWNrZWQ=\x07"  # "write this to the clipboard", in a terminal
@@ -73,7 +73,7 @@ def test_runs_docker_with_a_fixed_argv(fake_cli: FakeCli) -> None:
 
 
 def test_the_cli_runs_in_a_process_group_of_its_own(fake_cli: FakeCli) -> None:
-    """Ctrl-C in the terminal goes to the foreground process group: it must reach Vigía, which
+    """Ctrl-C in the terminal goes to the foreground process group: it must reach backtide, which
     stops the agent in an orderly way, and not kill the `docker stop` it is waiting for."""
     docker.run(["stop", "agent"])
     record = fake_cli.record()

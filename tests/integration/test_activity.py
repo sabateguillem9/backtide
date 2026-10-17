@@ -1,6 +1,6 @@
 """T04b-2 in the VM: snapshots by activity, with the real service and the real OpenClaw.
 
-docs/19-diseno-t04.md, sections 2 and 3. `vigia vigilar` runs as a process with a 3 s cycle;
+docs/19-diseno-t04.md, sections 2 and 3. `backtide vigilar` runs as a process with a 3 s cycle;
 the agent is the real OpenClaw in its jail. What is proven:
 
 - With nothing changing there is no snapshot, and with a change there is one within a cycle.
@@ -24,8 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from backtide.snapshots import Snapshot
 from tests.integration.service_kit import CYCLE, Service, wait_until
-from vigia.snapshots import Snapshot
 
 pytestmark = pytest.mark.integration
 

@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 import pytest
 
-from vigia.notify import (
+from backtide.notify import (
     Alert,
     AlertLevel,
     AlertQueue,
@@ -66,7 +66,7 @@ def test_log_notifier_logs_at_the_matching_level(
 ) -> None:
     with caplog.at_level(logging.DEBUG):
         LogNotifier().send(Alert(level, "Titulo", "Cuerpo", event_seq=42))
-    (record,) = [r for r in caplog.records if r.name.startswith("vigia.notify")]
+    (record,) = [r for r in caplog.records if r.name.startswith("backtide.notify")]
     assert record.levelno == log_level
     assert "Titulo" in record.message
     assert "Cuerpo" in record.message
@@ -78,7 +78,7 @@ def test_log_notifier_escapes_control_characters_chosen_by_the_agent(
 ) -> None:
     with caplog.at_level(logging.DEBUG):
         LogNotifier().send(Alert(AlertLevel.WARNING, "t", "file \x1b[2J\nOK: all fine"))
-    (record,) = [r for r in caplog.records if r.name.startswith("vigia.notify")]
+    (record,) = [r for r in caplog.records if r.name.startswith("backtide.notify")]
     assert "\x1b" not in record.message
     assert "\n" not in record.message
     assert "\\x1b" in record.message
@@ -95,7 +95,7 @@ def test_the_queue_delivers_in_order_on_its_own_thread() -> None:
         assert queue.submit(alert(str(i)))
     assert queue.close(WAIT)
     assert [a.title for a in notifier.sent] == ["0", "1", "2", "3", "4"]
-    assert notifier.threads == {"vigia-alerts"}
+    assert notifier.threads == {"backtide-alerts"}
     assert queue.dropped == 0
 
 
@@ -139,7 +139,7 @@ def test_a_failing_notifier_does_not_kill_the_queue(caplog: pytest.LogCaptureFix
     assert [a.title for a in notifier.sent] == ["kept"]
     failure = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert failure
-    assert all(r.name.startswith("vigia.notify") for r in failure)  # the bridge ignores them
+    assert all(r.name.startswith("backtide.notify") for r in failure)  # the bridge ignores them
 
 
 def test_alerts_submitted_before_start_are_delivered_after_it() -> None:
@@ -213,7 +213,7 @@ def test_close_logs_the_drops_nobody_was_told_about(caplog: pytest.LogCaptureFix
     with caplog.at_level(logging.ERROR):
         assert queue.close(WAIT)
     (record,) = [r for r in caplog.records if "dropped" in r.getMessage()]
-    assert record.name.startswith("vigia.notify")  # the bridge ignores it
+    assert record.name.startswith("backtide.notify")  # the bridge ignores it
     assert "2" in record.getMessage()
     caplog.clear()
     with caplog.at_level(logging.ERROR):
@@ -245,7 +245,7 @@ def make_bridge(
     seen: list[LoggedProblem] = []
     bridge = LogBridge(sink or seen.append, clock=clock, **options)  # type: ignore[arg-type]
     bridge.start()
-    logger = logging.getLogger(f"vigia.test_bridge.{id(bridge)}")
+    logger = logging.getLogger(f"backtide.test_bridge.{id(bridge)}")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     logger.addHandler(bridge)
@@ -275,7 +275,7 @@ def test_the_sink_runs_on_the_bridges_own_thread_never_on_the_loggers(clock: Clo
     )
     logger.warning("anything")
     assert bridge.close(WAIT)
-    assert threads == ["vigia-logbridge"]
+    assert threads == ["backtide-logbridge"]
 
 
 def test_logging_does_not_wait_for_a_slow_sink(clock: Clock) -> None:
@@ -313,7 +313,7 @@ def test_a_full_bridge_drops_and_says_how_many(clock: Clock) -> None:
     assert bridge.dropped == 4  # two fit in the queue
     release.set()
     assert bridge.close(WAIT)
-    (report,) = [p for p in seen if p.logger == "vigia.notify.bridge"]
+    (report,) = [p for p in seen if p.logger == "backtide.notify.bridge"]
     assert "4" in report.message
 
 
@@ -377,7 +377,9 @@ def test_a_failing_sink_reports_through_logging_and_the_thread_survives(
     assert seen == ["fine"]
 
 
-@pytest.mark.parametrize("name", ["vigia.notify", "vigia.notify.log", "vigia.notify.queue"])
+@pytest.mark.parametrize(
+    "name", ["backtide.notify", "backtide.notify.log", "backtide.notify.queue"]
+)
 def test_records_of_the_notifier_itself_are_ignored(clock: Clock, name: str) -> None:
     seen: list[LoggedProblem] = []
     bridge = LogBridge(seen.append, clock=clock)

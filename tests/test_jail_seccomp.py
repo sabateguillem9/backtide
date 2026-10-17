@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from vigia.jail import config as jail_config
-from vigia.jail import seccomp
-from vigia.jail.seccomp import (
+from backtide.jail import config as jail_config
+from backtide.jail import seccomp
+from backtide.jail.seccomp import (
     ALLOW,
     BLOCKED_ERRNO,
     COPY_FILE_RANGE_ERRNO,

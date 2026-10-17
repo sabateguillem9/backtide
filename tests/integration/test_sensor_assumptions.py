@@ -1,4 +1,4 @@
-"""The T07-1 spike: what Tetragon really does in the VM, before Vigía relies on it (docs/23).
+"""The T07-1 spike: what Tetragon really does in the VM, before backtide relies on it (docs/23).
 
 Each test pins one assumption of the design (P1-P14 in docs/23, "Sesiones") and stays as a
 regression test for Tetragon and kernel upgrades. The results and figures are in docs/23,
@@ -7,10 +7,10 @@ regression test for Tetragon and kernel upgrades. The results and figures are in
 How it runs:
 - Tetragon is the pinned v1.7.1 image, started with the argv of docs/23 section 2:
   ``--privileged --pid=host --cgroupns=host --network none``, the BTF read-only, and only its
-  own folders mounted (events read-write, tp.d and conf.d read-only). Nothing of Vigía, no
+  own folders mounted (events read-write, tp.d and conf.d read-only). Nothing of backtide, no
   docker.sock. Every sensor container is removed when its test or module ends, also on
   failure, and a killed run's are removed by the next one (the names carry the pytest pid).
-- Settings go in conf.d, one file per option, as Vigía will write them. One difference with
+- Settings go in conf.d, one file per option, as backtide will write them. One difference with
   production: ``export-file-perm`` is 644 here, so the unprivileged test user can read the
   file (production: 600, root only). The file lives in this run's 0700 tmp directory.
 - The processes to watch run in a throwaway "target" container from the OpenClaw image (it
@@ -39,8 +39,8 @@ from uuid import uuid4
 
 import pytest
 
+from backtide.jail import docker as jail_docker
 from tests.integration.conftest import RunningAgent
-from vigia.jail import docker as jail_docker
 
 pytestmark = pytest.mark.integration
 
@@ -54,10 +54,10 @@ BTF = "/sys/kernel/btf/vmlinux"
 SOCKET = "unix:///var/run/tetragon/tetragon.sock"
 EVENTS_IN_CONTAINER = "/var/log/tetragon"
 LOG_NAME = "tetragon.log"
-POLICY = Path(__file__).parents[1] / "fixtures" / "tetragon" / "vigia-connect.yaml"
+POLICY = Path(__file__).parents[1] / "fixtures" / "tetragon" / "backtide-connect.yaml"
 # Test containers are named <prefix><pytest pid>-<random>, like the test agents (conftest.py).
-SENSOR_PREFIX = "vigia-test-tetragon-"
-TARGET_PREFIX = "vigia-test-sensortarget-"
+SENSOR_PREFIX = "backtide-test-tetragon-"
+TARGET_PREFIX = "backtide-test-sensortarget-"
 READY_TIMEOUT = 90.0
 EVENT_TIMEOUT = 30.0
 TARGET_USER = "1000:1000"
@@ -387,7 +387,7 @@ def wait_ready(sensor: Sensor, target: Target, timeout: float = READY_TIMEOUT) -
     ``docker run`` returned."""
     start = time.monotonic()
     ready = Readiness()
-    nonce = f"vigia-ready-{secrets.token_hex(6)}"
+    nonce = f"backtide-ready-{secrets.token_hex(6)}"
 
     def elapsed() -> float:
         return round(time.monotonic() - start, 2)
@@ -482,7 +482,7 @@ def test_p2_selinux_is_enforcing_and_the_sensor_runs_unconfined(sensor: Sensor) 
 def test_p3_the_docker_field_is_a_prefix_of_the_container_id(
     sensor: Sensor, target: Target
 ) -> None:
-    nonce = f"vigia-p3-{secrets.token_hex(6)}"
+    nonce = f"backtide-p3-{secrets.token_hex(6)}"
     target.exec("/bin/true", nonce)
     event = sensor.wait_for(lambda e: e.kind == "process_exec" and nonce in e.arguments)
     docker_id = event.docker_id
@@ -496,7 +496,7 @@ def test_p4_in_init_tree_tells_docker_exec_from_the_containers_own_tree(
     sensor: Sensor, target: Target
 ) -> None:
     start = len(sensor.events)
-    nonce = f"vigia-p4-{secrets.token_hex(6)}"
+    nonce = f"backtide-p4-{secrets.token_hex(6)}"
     target.exec("/bin/true", nonce)
     injected = sensor.wait_for(exec_with(nonce, target.id), since=start)
     own = sensor.wait_for(
@@ -553,7 +553,7 @@ def test_p5_long_arguments_arrive_whole_up_to_320_kib_and_vanish_beyond(
     still comes, with the binary, but with no ``arguments`` at all and no flag saying so."""
     results: dict[str, dict[str, Any]] = {}
     for size in (256, 1024, 100_000):
-        nonce = f"vigia-p5-{size}-{secrets.token_hex(4)}"
+        nonce = f"backtide-p5-{size}-{secrets.token_hex(4)}"
         script = f"pass  # {nonce} " + "x" * size
         start = len(sensor.events)
         target.exec("python3", "-c", script)
@@ -562,7 +562,7 @@ def test_p5_long_arguments_arrive_whole_up_to_320_kib_and_vanish_beyond(
         if size == 100_000:
             capture("exec_long_arguments", event.raw)
     for total in (320_000, 400_000):  # several arguments: one cannot pass 128 KiB
-        nonce = f"vigia-p5-many-{total}-{secrets.token_hex(4)}"
+        nonce = f"backtide-p5-many-{total}-{secrets.token_hex(4)}"
         chunks = ["y" * 100_000] * (total // 100_000) + ["z" * (total % 100_000)]
         start = len(sensor.events)
         assert target.exec("/bin/true", nonce, *filter(None, chunks)).returncode == 0
@@ -600,8 +600,8 @@ def _argument_info(event: Event) -> dict[str, Any]:
 def test_p6_the_allowlist_drops_host_processes_and_keeps_containers(
     sensor: Sensor, target: Target
 ) -> None:
-    host_nonce = f"vigia-p6-host-{secrets.token_hex(6)}"
-    container_nonce = f"vigia-p6-ctr-{secrets.token_hex(6)}"
+    host_nonce = f"backtide-p6-host-{secrets.token_hex(6)}"
+    container_nonce = f"backtide-p6-ctr-{secrets.token_hex(6)}"
     subprocess.run(["/bin/true", host_nonce], check=True)
     target.exec("/bin/true", container_nonce)
     sensor.wait_for(exec_with(container_nonce, target.id))
@@ -658,7 +658,7 @@ except OSError as e:
 def _policy_loaded(sensor: Sensor) -> str:
     listing = sensor.tetra("tracingpolicy", "list")
     assert listing.returncode == 0, listing
-    assert "vigia-connect" in listing.stdout
+    assert "backtide-connect" in listing.stdout
     assert "enabled" in listing.stdout.lower(), listing.stdout
     return listing.stdout
 
@@ -843,7 +843,7 @@ FAKE_SECRETS = {
 
 
 def test_p11_redaction_filters_apply_to_the_file(sensor: Sensor, target: Target) -> None:
-    nonce = f"vigia-p11-{secrets.token_hex(6)}"
+    nonce = f"backtide-p11-{secrets.token_hex(6)}"
     f = FAKE_SECRETS
     args = [
         nonce,
@@ -878,7 +878,7 @@ def test_p11_field_filters_shrink_the_exec_events(
         "process.parent_exec_id,parent.pid,parent.binary"
     )
     filters = json.dumps({"event_set": ["PROCESS_EXEC"], "fields": keep, "action": "INCLUDE"})
-    nonce = f"vigia-p11f-{secrets.token_hex(6)}"
+    nonce = f"backtide-p11f-{secrets.token_hex(6)}"
     target.exec("/bin/true", nonce)
     full = sensor.wait_for(exec_with(nonce, target.id))
     settings = design_settings(**{"field-filters": filters})

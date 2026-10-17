@@ -12,8 +12,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from backtide.blackbox import Event
 from tests.integration.service_kit import CYCLE, Service, wait_until
-from vigia.blackbox import Event
 
 # `fdinfo` prints one line per watch; on btrfs its file handle is the inode (8 bytes), the
 # subvolume id (8 bytes) and the generation (4): that tells a watch apart from the same inode
@@ -94,7 +94,7 @@ def watches_of(pid: int) -> list[Watch]:
 
 
 def service_watches(service: Service) -> list[Watch]:
-    """The watches of the running `vigia vigilar` process of ``service``."""
+    """The watches of the running `backtide vigilar` process of ``service``."""
     return watches_of(service.require_process().pid)
 
 

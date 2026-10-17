@@ -6,32 +6,32 @@ from typing import Any
 
 import pytest
 
-import vigia.cli as cli
-from vigia import __version__
-from vigia.blackbox import BlackBoxError
-from vigia.cli import main
-from vigia.jail import JailError
-from vigia.service.control import (
+import backtide.cli as cli
+from backtide import __version__
+from backtide.blackbox import BlackBoxError
+from backtide.cli import main
+from backtide.jail import JailError
+from backtide.service.control import (
     ControlError,
     ControlOutcomeUnknown,
     ControlUnavailable,
 )
-from vigia.service.notice import rewind_notice
-from vigia.service.rewind import RewindOutcome, RewindStatus
-from vigia.service.runner import ServiceLocked, ServiceRunning, take_lock
-from vigia.snapshots import Snapshot, SnapshotError
+from backtide.service.notice import rewind_notice
+from backtide.service.rewind import RewindOutcome, RewindStatus
+from backtide.service.runner import ServiceLocked, ServiceRunning, take_lock
+from backtide.snapshots import Snapshot, SnapshotError
 
 
 def test_version_flag_prints_version(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
         main(["--version"])
     assert exit_info.value.code == 0
-    assert f"vigia {__version__}" in capsys.readouterr().out
+    assert f"backtide {__version__}" in capsys.readouterr().out
 
 
 def test_without_arguments_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert main([]) == 0
-    assert "usage: vigia" in capsys.readouterr().out
+    assert "usage: backtide" in capsys.readouterr().out
 
 
 def test_help_lists_the_verificar_command(capsys: pytest.CaptureFixture[str]) -> None:
@@ -43,7 +43,7 @@ def test_help_lists_the_verificar_command(capsys: pytest.CaptureFixture[str]) ->
 #
 # The command is driven with a fake store (the snapshots that exist), a fake `ask_rewind` (the
 # service over its socket) and a fake `rewind_without_service` (this process). The real lock is
-# used: whether a service "exists" is decided by who holds `vigia.lock`. The socket itself is
+# used: whether a service "exists" is decided by who holds `backtide.lock`. The socket itself is
 # tested in test_service_control.py and the whole thing in the VM (test_cli_rewind.py).
 
 
@@ -59,7 +59,7 @@ def config_file(tmp_path: Path) -> Path:
     state.mkdir(mode=0o700)
     (state / "gateway.token").write_text(TOKEN + "\n")
     (state / "gateway.token").chmod(0o600)
-    path = tmp_path / "vigia.toml"
+    path = tmp_path / "backtide.toml"
     path.write_text(f'state_dir = "{state}"\nvolume = "{tmp_path / "vol"}"\n')
     path.chmod(0o600)
     return path
@@ -157,7 +157,7 @@ def test_the_help_of_rebobinar_says_where_the_id_comes_from_and_the_exit_codes(
     with pytest.raises(SystemExit):
         main(["rebobinar", "--help"])
     text = " ".join(capsys.readouterr().out.split())
-    assert "vigia instantaneas" in text
+    assert "backtide instantaneas" in text
     assert "--si" in text
     assert "3 si se rebobinó pero con un problema" in text
 
@@ -181,7 +181,7 @@ def test_the_notice_says_what_is_undone_what_is_not_and_when(
     assert "puede reenviar algún mensaje que estuviera en cola" in text
     assert "Se guarda un punto para deshacer el rebobinado" in text
     assert "el agente se queda parado" in text  # what happens when there is no service
-    # The same text as Telegram and the web (vigia/service/notice.py), channels included.
+    # The same text as Telegram and the web (backtide/service/notice.py), channels included.
     for paragraph in rewind_notice(TARGET.taken_at, now=NOW, tz=timezone(timedelta(hours=2))):
         assert " ".join(paragraph.split()) in text
     assert "WhatsApp y Signal no se pueden usar en esta versión" in text
@@ -239,7 +239,7 @@ def test_anything_but_yes_does_nothing_and_exits_with_1(
     assert code == 1
     assert "No se ha hecho nada." in out
     assert offline.calls == [] and service.calls == []
-    assert not (config_file.parent / "state" / "vigia.lock").exists()  # no lock even taken
+    assert not (config_file.parent / "state" / "backtide.lock").exists()  # no lock even taken
 
 
 def test_end_of_input_at_the_question_is_a_no(
@@ -286,10 +286,10 @@ def test_an_id_that_is_not_a_snapshot_id_is_a_usage_error_and_touches_nothing(
     offline, service = rebob
     code, out, err = rebobinar(capsys, config_file, "--si", bad)
     assert code == 2
-    assert "vigia instantaneas" in err
+    assert "backtide instantaneas" in err
     assert "Vas a volver" not in out
     assert offline.calls == [] and service.calls == []
-    assert not (config_file.parent / "state" / "vigia.lock").exists()
+    assert not (config_file.parent / "state" / "backtide.lock").exists()
 
 
 def test_a_snapshot_that_does_not_exist_is_a_usage_error_before_the_question(
@@ -326,9 +326,9 @@ def test_a_broken_config_is_a_usage_error(
 def test_the_default_config_path_is_the_one_of_vigilar(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    code = main(["rebobinar", "--si", TARGET.id])  # /etc/vigia/vigia.toml is not here
+    code = main(["rebobinar", "--si", TARGET.id])  # /etc/backtide/backtide.toml is not here
     assert code == 2
-    assert "/etc/vigia/vigia.toml" in capsys.readouterr().err
+    assert "/etc/backtide/backtide.toml" in capsys.readouterr().err
 
 
 # no service: in this process, with the lock, the agent left stopped
@@ -345,10 +345,10 @@ def test_without_a_service_it_rewinds_in_this_process_holding_the_lock(
     assert offline.calls == [(TARGET.id, True)]  # the lock was held while it rewound
     assert service.calls == []
     assert f"Rebobinado a {TARGET.id}." in out
-    assert f"Para deshacer: vigia rebobinar {UNDO.id}" in out
+    assert f"Para deshacer: backtide rebobinar {UNDO.id}" in out
     assert "No hay un servicio en marcha" in out
-    assert "El agente queda parado" in out and "vigia vigilar" in out
-    take_lock(config_file.parent / "state" / "vigia.lock").close()  # and it was released
+    assert "El agente queda parado" in out and "backtide vigilar" in out
+    take_lock(config_file.parent / "state" / "backtide.lock").close()  # and it was released
 
 
 def test_the_lock_is_released_even_if_the_rewind_blows_up(
@@ -359,7 +359,7 @@ def test_the_lock_is_released_even_if_the_rewind_blows_up(
     offline, _ = rebob
     offline.error = RuntimeError("bug")
     rebobinar(capsys, config_file, "--si", TARGET.id)
-    take_lock(config_file.parent / "state" / "vigia.lock").close()
+    take_lock(config_file.parent / "state" / "backtide.lock").close()
 
 
 @pytest.mark.parametrize(
@@ -385,7 +385,7 @@ def test_the_exit_code_follows_the_outcome_without_a_service(
     assert got == code
     assert "lo que pasó" in (out if code == 0 else err)
     if status in (RewindStatus.DONE, RewindStatus.PROBLEM):
-        assert f"Para deshacer: vigia rebobinar {UNDO.id}" in out
+        assert f"Para deshacer: backtide rebobinar {UNDO.id}" in out
     else:
         assert "Para deshacer" not in out
 
@@ -451,7 +451,7 @@ def test_an_unexpected_failure_is_exit_3_logged_with_its_trace(
     code, _, err = rebobinar(capsys, config_file, "--si", TARGET.id)
     assert code == 3  # nobody knows how far it got
     assert "no se sabe si se rebobinó" in err
-    assert "vigia instantaneas" in err
+    assert "backtide instantaneas" in err
     assert any(record.exc_info for record in caplog.records)  # nothing is swallowed
 
 
@@ -499,12 +499,12 @@ def test_the_log_of_the_package_is_shown_safely_during_the_rewind_and_then_put_b
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     offline, _ = rebob
-    package = logging.getLogger("vigia")
+    package = logging.getLogger("backtide")
     handlers, level = list(package.handlers), package.level
     key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123"
 
     def noisy(config: Any, snapshot_id: str, **options: object) -> RewindOutcome:
-        logging.getLogger("vigia.snapshots.store").warning("agent wrote %s\x1b[2J", key)
+        logging.getLogger("backtide.snapshots.store").warning("agent wrote %s\x1b[2J", key)
         return offline.outcome
 
     cli.rewind_without_service = noisy  # type: ignore[assignment]  # restored by the fixture
@@ -520,7 +520,7 @@ def test_the_log_of_the_package_is_shown_safely_during_the_rewind_and_then_put_b
 
 @pytest.fixture
 def held_lock(config_file: Path) -> Any:
-    lock = take_lock(config_file.parent / "state" / "vigia.lock")
+    lock = take_lock(config_file.parent / "state" / "backtide.lock")
     yield lock
     lock.close()
 
@@ -537,7 +537,7 @@ def test_with_a_service_it_asks_over_the_socket_and_does_not_rewind_itself(
     assert service.calls == [(config_file.parent / "state" / "control.sock", TARGET.id)]
     assert offline.calls == []  # never in this process with the lock taken
     assert "socket de control" in out
-    assert f"Para deshacer: vigia rebobinar {UNDO.id}" in out
+    assert f"Para deshacer: backtide rebobinar {UNDO.id}" in out
     assert "El agente está en marcha otra vez." in out
 
 
@@ -575,10 +575,10 @@ def test_the_exit_code_follows_the_services_outcome(
     code: int,
 ) -> None:
     offline, service = rebob
-    service.reply = {**service.reply, "outcome": outcome, "ok": ok, "message": "dicho por Vigía"}
+    service.reply = {**service.reply, "outcome": outcome, "ok": ok, "message": "dicho por backtide"}
     got, out, err = rebobinar(capsys, config_file, "--si", TARGET.id)
     assert got == code
-    assert "dicho por Vigía" in (out if code == 0 else err)
+    assert "dicho por backtide" in (out if code == 0 else err)
     assert offline.calls == []
 
 
@@ -632,7 +632,7 @@ def test_ctrl_c_while_the_service_rewinds_says_it_goes_on_and_exits_3(
     service.error = KeyboardInterrupt()
     code, _, err = rebobinar(capsys, config_file, "--si", TARGET.id)
     assert code == 3
-    assert "sigue con el rebobinado" in err and "vigia instantaneas" in err
+    assert "sigue con el rebobinado" in err and "backtide instantaneas" in err
     assert "Traceback" not in err
 
 
@@ -642,7 +642,7 @@ def test_a_lock_file_that_cannot_be_used_is_not_a_service(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     offline, service = rebob
-    (config_file.parent / "state" / "vigia.lock").symlink_to(config_file.parent / "elsewhere")
+    (config_file.parent / "state" / "backtide.lock").symlink_to(config_file.parent / "elsewhere")
     code, _, err = rebobinar(capsys, config_file, "--si", TARGET.id)
     assert code == 2 and "enlace simbólico" in err
     assert offline.calls == [] and service.calls == []
@@ -657,7 +657,7 @@ def test_a_lock_taken_while_the_question_was_open_is_still_not_a_fallback(
     """The mode is decided when the person says yes, not before the question: a service that
     started in the meantime gets the request, and this process leaves the agent alone."""
     offline, service = rebob
-    lock = take_lock(config_file.parent / "state" / "vigia.lock")
+    lock = take_lock(config_file.parent / "state" / "backtide.lock")
     try:
         monkeypatch.setattr("sys.stdin", Stdin(True))
         monkeypatch.setattr("builtins.input", lambda prompt: "s")
@@ -704,7 +704,7 @@ def test_an_undo_point_that_is_not_a_snapshot_id_is_not_offered_as_a_command(
     assert "punto para deshacer que no es válido" in err
 
 
-# vigia instantaneas and vigia rebobinar, together
+# backtide instantaneas and backtide rebobinar, together
 
 
 def test_the_id_that_instantaneas_shows_is_the_one_rebobinar_takes(

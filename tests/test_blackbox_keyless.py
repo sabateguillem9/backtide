@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import BlackBox, BlackBoxError
 from tests.webkit import KEY, new_box
-from vigia.blackbox import BlackBox, BlackBoxError
 
 
 def test_a_keyless_reader_lists_events_and_the_head(tmp_path: Path) -> None:

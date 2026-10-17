@@ -2,8 +2,8 @@ import copy
 
 import pytest
 
-from vigia.blackbox import REDACTED, redact
-from vigia.blackbox.redact import MAX_TEXT_BYTES
+from backtide.blackbox import REDACTED, redact
+from backtide.blackbox.redact import MAX_TEXT_BYTES
 
 LEAKED = "s3cr3tVALUE-0123456789abcdefXYZ"
 

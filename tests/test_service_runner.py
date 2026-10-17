@@ -14,14 +14,14 @@ from pathlib import Path
 
 import pytest
 
-from vigia.blackbox import BlackBox, BlackBoxError, load_key
-from vigia.jail import AgentJail, JailError
-from vigia.jail.openclaw import RewindProblem, UnrewindableConfig
-from vigia.notify import Alert, AlertLevel, AlertQueue, LogNotifier
-from vigia.sensors.files import FileWatcher
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.guardian import Guardian
-from vigia.service.runner import (
+from backtide.blackbox import BlackBox, BlackBoxError, load_key
+from backtide.jail import AgentJail, JailError
+from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
+from backtide.notify import Alert, AlertLevel, AlertQueue, LogNotifier
+from backtide.sensors.files import FileWatcher
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.guardian import Guardian
+from backtide.service.runner import (
     ServiceLocked,
     ServiceRunning,
     build_guardian,
@@ -30,7 +30,7 @@ from vigia.service.runner import (
     serve,
     take_lock,
 )
-from vigia.snapshots import SnapshotStore
+from backtide.snapshots import SnapshotStore
 
 TOKEN = "T0kenForTestsOnly_" + "a1B2c3D4e5F6g7H8i9J0" * 2
 
@@ -56,16 +56,16 @@ def test_the_lock_is_taken_and_a_second_owner_is_refused(config: ServiceConfig) 
 def test_a_lock_held_by_a_live_process_is_told_apart_from_an_unusable_lock_file(
     config: ServiceConfig, tmp_path: Path
 ) -> None:
-    """`vigia rebobinar` asks the service over the socket only when the lock is HELD
+    """`backtide rebobinar` asks the service over the socket only when the lock is HELD
     (ServiceRunning); a lock file it cannot use is an error, not a service."""
     with take_lock(config.lock_file):
         with pytest.raises(ServiceRunning):
             take_lock(config.lock_file)
     other = tmp_path / "other-state"
     other.mkdir(mode=0o700)
-    (other / "vigia.lock").symlink_to(tmp_path / "elsewhere")
+    (other / "backtide.lock").symlink_to(tmp_path / "elsewhere")
     with pytest.raises(ServiceLocked) as raised:
-        take_lock(other / "vigia.lock")
+        take_lock(other / "backtide.lock")
     assert not isinstance(raised.value, ServiceRunning)
 
 
@@ -98,7 +98,7 @@ def test_a_symlinked_lock_file_is_refused(config: ServiceConfig, tmp_path: Path)
 
 
 def test_the_lock_is_the_flock_the_cli_will_probe(config: ServiceConfig) -> None:
-    """T04c-2's `vigia rebobinar` decides between "no service" and "send it over the
+    """T04c-2's `backtide rebobinar` decides between "no service" and "send it over the
     socket" with a non-blocking flock on this same file."""
     with take_lock(config.lock_file):
         fd = os.open(config.lock_file, os.O_RDONLY)
@@ -206,8 +206,8 @@ def test_build_guardian_takes_a_store_and_a_gate_the_tests_can_adjust(
 
 def test_growth_is_wired_but_not_configured_until_t13(tmp_path: Path) -> None:
     """T04e-1: with an image and a ceiling the grower has its limits, and the privileged steps
-    are the stub that says "not configured" (nothing in vigia/ runs sudo)."""
-    from vigia.snapshots.grow import NOT_CONFIGURED, GrowLimits  # noqa: PLC0415
+    are the stub that says "not configured" (nothing in backtide/ runs sudo)."""
+    from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits  # noqa: PLC0415
 
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -340,7 +340,7 @@ def test_serve_opens_the_control_socket_for_the_whole_life_of_the_service(
 ) -> None:
     """serve() builds the real ControlServer on ``config.control_socket`` and gives it to the
     guardian, which starts it once the agent is up (the guardian is a fake here)."""
-    import vigia.service.runner as runner  # noqa: PLC0415
+    import backtide.service.runner as runner  # noqa: PLC0415
 
     seen: list[object] = []
 
@@ -696,7 +696,7 @@ class RecordingNotifier:
 def test_an_unrewindable_config_is_recorded_and_its_notice_is_delivered(
     config: ServiceConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The whole way of `vigia vigilar`: the guardian records why it did not start, the alert
+    """The whole way of `backtide vigilar`: the guardian records why it did not start, the alert
     queue hands the Spanish notice to the notifier before serve() returns, and the error
     reaches the caller. (Reading the workspace's counters needs btrfs: skipped here.)"""
     monkeypatch.setattr(Guardian, "_note_downtime", lambda self: None)
@@ -710,7 +710,7 @@ def test_an_unrewindable_config_is_recorded_and_its_notice_is_delivered(
             store=QuietStore(),  # type: ignore[arg-type]
             handle_signals=False,
         )
-    assert raised.value is jail.error  # `vigia vigilar` prints its notice too
+    assert raised.value is jail.error  # `backtide vigilar` prints its notice too
     assert "create" not in jail.calls and "start" not in jail.calls
     (alert,) = [sent for sent in notifier.sent if sent.body == jail.error.notice]
     assert alert.level is AlertLevel.ERROR

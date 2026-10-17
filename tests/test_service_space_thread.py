@@ -1,6 +1,6 @@
 """The pause by space in the Guardian (T04d-2, docs/19 section 5), with the fakes of
 test_service_guardian.py: the space thread (``check_space``), its watchdog (``check_watchdog``),
-P7, the early warnings, ``resume`` (`vigia seguir`) and a pause that survives the service.
+P7, the early warnings, ``resume`` (`backtide seguir`) and a pause that survives the service.
 
 The threads themselves are not run here (except one test of ``run``): each pass is called by
 the test, with the monotonic clock in its hands. The real `docker pause` is in the VM test
@@ -28,13 +28,13 @@ from test_service_guardian import (  # noqa: F401 - fixtures, used by name
     world,
 )
 
-from vigia.blackbox import BlackBoxError
-from vigia.jail import JailError
-from vigia.notify import AlertLevel
-from vigia.service.guardian import AgentState, Guardian
-from vigia.service.pause import Holder, ResumeStatus
-from vigia.service.rewind import RewindStatus
-from vigia.snapshots import SnapshotError
+from backtide.blackbox import BlackBoxError
+from backtide.jail import JailError
+from backtide.notify import AlertLevel
+from backtide.service.guardian import AgentState, Guardian
+from backtide.service.pause import Holder, ResumeStatus
+from backtide.service.rewind import RewindStatus
+from backtide.snapshots import SnapshotError
 
 P1 = Violation("P1", "metadatos: quedan 100 MiB, mínimo 341 MiB")
 P3 = Violation("P3", "el uso pasa del tope")
@@ -100,7 +100,7 @@ def test_a_condition_freezes_first_and_then_confirms_after_a_sync(live: World) -
     assert (event.risk, event.details["conditions"], event.details["frozen"]) == (2, ["P1"], True)
     (alert,) = live.alerts.titled("pausado")
     assert alert.event_seq == event.seq
-    assert "vigia seguir" in alert.body
+    assert "backtide seguir" in alert.body
     assert "no libera nada" in alert.body
 
 
@@ -329,7 +329,7 @@ def test_a_successful_append_resets_the_streak(live: World) -> None:
     assert "jail.pause" not in live.log
 
 
-# --- resume (vigia seguir) ---------------------------------------------------------------------
+# --- resume (backtide seguir) ---------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -462,7 +462,7 @@ def test_an_open_pause_keeps_the_agent_stopped_after_a_restart_until_seguir(
     carried = again.events("space_pause")[-1]
     assert carried.details["carried_over"] is True
     (alert,) = again.alerts.titled("sigue pausado")
-    assert "vigia seguir" in alert.body
+    assert "backtide seguir" in alert.body
     again.log.clear()
     outcome = again.guardian.resume(requested_by="cli")
     assert outcome.status is ResumeStatus.RESUMED
@@ -519,7 +519,7 @@ def test_a_rewind_of_a_frozen_agent_never_leaves_a_frozen_container(frozen: Worl
 def test_a_rewind_during_a_freeze_to_confirm_starts_the_agent_again(live: World) -> None:
     """The space thread froze the agent to confirm a condition (no reason is open yet) and a
     rewind comes in: the agent was running, so it runs after the rewind. It is not left stopped
-    with nothing written down, where `vigia seguir` would say there is nothing to resume."""
+    with nothing written down, where `backtide seguir` would say there is nothing to resume."""
     epoch = live.guardian._freeze_to_confirm()  # noqa: SLF001 - the space thread, mid-confirmation
     assert isinstance(epoch, int) and live.guardian.pause_reasons == frozenset()
     script(live, [])
@@ -557,14 +557,14 @@ def test_a_rewind_of_a_freeze_that_was_not_a_confirmation_is_unchanged(live: Wor
 
 
 def test_resume_of_an_agent_stopped_with_no_pause_says_what_to_do(live: World) -> None:
-    """Nothing is paused by space and the agent is stopped: `vigia seguir` does not say "nothing
+    """Nothing is paused by space and the agent is stopped: `backtide seguir` does not say "nothing
     to resume" as if all were well; it says the agent is stopped and how to get it back."""
     live.guardian._set_state(AgentState.STOPPED)  # noqa: SLF001
     live.jail.running = False
     outcome = live.guardian.resume(requested_by="cli")
     assert outcome.status is ResumeStatus.STOPPED
     assert outcome.exit_code == 1
-    assert "parado" in outcome.message and "vigia vigilar" in outcome.message
+    assert "parado" in outcome.message and "backtide vigilar" in outcome.message
     assert "jail.start" not in live.log  # it is not started behind anybody's back
 
 
@@ -597,7 +597,7 @@ def test_run_ticks_the_space_threads_and_ends_them_before_stopping_the_agent(
     runner.join(10)
     assert not runner.is_alive()
     names = {thread.name for thread in threading.enumerate()}
-    assert "vigia-space" not in names and "vigia-space-guard" not in names
+    assert "backtide-space" not in names and "backtide-space-guard" not in names
     assert world.guardian.agent_state is AgentState.STOPPED
 
 

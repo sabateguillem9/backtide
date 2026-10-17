@@ -1,6 +1,6 @@
-"""Evil-agent scenarios against the file watcher's limits (T04a), with `vigia vigilar` as a
+"""Evil-agent scenarios against the file watcher's limits (T04a), with `backtide vigilar` as a
 process and the real OpenClaw: the attack runs INSIDE the agent's jail, and the test reads what
-Vigía did from the host, the way a person would (the black box, the snapshots, and the kernel's
+backtide did from the host, the way a person would (the black box, the snapshots, and the kernel's
 own list of what the service watches: /proc/<pid>/fdinfo).
 
 - ``avalancha-de-archivos``: more files than anyone can write down.
@@ -30,6 +30,7 @@ from watcher_kit import (
     watches_outside,
 )
 
+from backtide.sensors.files import WatcherConfig
 from tests.integration.service_kit import (
     CYCLE,
     Service,
@@ -38,7 +39,6 @@ from tests.integration.service_kit import (
     wait_until,
     workspace_holds,
 )
-from vigia.sensors.files import WatcherConfig
 
 DEFAULTS = WatcherConfig()  # the limits of the real service: the tests do not lower any
 
@@ -282,9 +282,9 @@ def test_deleting_during_an_overflow(
 ) -> None:
     """The agent fills the kernel's event queue and, with it full, deletes what matters: those
     deletes are never reported (the kernel drops them). The service's reader is stopped
-    (SIGSTOP) for the attack so that the overflow is certain, not a race. What Vigía must do:
+    (SIGSTOP) for the attack so that the overflow is certain, not a race. What backtide must do:
     say that it went blind and when, point at a snapshot from before, and that snapshot must
-    bring the files back through a real `vigia rebobinar`."""
+    bring the files back through a real `backtide rebobinar`."""
     service = started(make_real_service)
     attack.run_script(service.jail, "borrar_durante_desbordamiento", "prepare", VAULT)
     wait_until(
@@ -350,9 +350,9 @@ def test_deleting_during_an_overflow(
         workspace_holds(service, PRECIOUS)
         and not any((vault / "flood").iterdir())
         and service.jail.is_running(),
-        f"`vigia rebobinar {pointed}` (el nombre del aviso) devuelve los dos archivos y deja vacía "
-        f"la carpeta con la que se llenó la cola ({outcome['flooded']} archivos); el agente está "
-        "en marcha otra vez",
+        f"`backtide rebobinar {pointed}` (el nombre del aviso) devuelve los dos archivos y deja "
+        f"vacía la carpeta con la que se llenó la cola ({outcome['flooded']} archivos); el agente "
+        "está en marcha otra vez",
     )
     assert service.stop() == 0
     report = service.box.verify()

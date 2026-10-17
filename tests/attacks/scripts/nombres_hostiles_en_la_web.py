@@ -8,7 +8,7 @@ Creates, in <directory>, one empty file for each trick a name can play on a page
   newline    a carriage return and line feed, to start a new line (or SSE field) in the viewer;
   tower      one letter under a hundred combining marks, to pile glyphs over the lines around it;
   blank      a Hangul filler: a name that looks empty, or like a space;
-  voice      "Vigía: todo en orden", to pass as one of Vigía's own sentences;
+  voice      "backtide: todo en orden", to pass as one of backtide's own sentences;
   format     {0.__class__} and {path}, to be taken as a format string by the viewer.
 Prints one JSON object on its last line: the names it made (as text).
 """
@@ -23,10 +23,10 @@ NAMES = {
     "html": '"><img src=x onerror=alert(1)>.txt',
     "script": "<script>alert(document.cookie)<!--.md",  # no "/": a name cannot hold one
     "bidi": "invoice‮txt.exe",
-    "newline": "line one\r\nVigia: todo en orden\n.txt",
+    "newline": "line one\r\nbacktide: todo en orden\n.txt",
     "tower": "z" + "́" * 100 + ".txt",
     "blank": "ㅤㅤ.txt",
-    "voice": "Vigía: todo en orden",
+    "voice": "backtide: todo en orden",
     "format": "{0.__class__} {path} {n}",
 }
 

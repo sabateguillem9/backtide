@@ -1,12 +1,12 @@
-"""Evil-agent scenario of the pause by space (T04d-2), with `vigia vigilar` as a process on a
+"""Evil-agent scenario of the pause by space (T04d-2), with `backtide vigilar` as a process on a
 1 GiB volume with simple quotas, a 64 MiB cap and the real OpenClaw:
 
-- ``pausar-por-espacio``: the agent fills its workspace up to the cap, waits for Vigía's
+- ``pausar-por-espacio``: the agent fills its workspace up to the cap, waits for backtide's
   snapshot and deletes after it, which is charged with no quota check (A13): the workspace ends
   past its cap. The space thread sees it (P3) and freezes the agent for real; a rewind (the
   frozen agent is killed, never woken) gives a whole new cap and the agent runs again.
 
-The other cases of the pause (metadata and data below the minimum, `vigia seguir`, the service
+The other cases of the pause (metadata and data below the minimum, `backtide seguir`, the service
 killed with the agent frozen) are in tests/integration/test_space_pause.py, whose service
 fixture and helpers this reuses. Freezing in the middle of a rewind (`docker stop`,
 `wait_ready`) is proved with fakes in tests/test_service_guardian.py.
@@ -22,8 +22,8 @@ from test_space_pause import (  # noqa: F401 - `service` is a fixture, used by n
     wait_frozen,
 )
 
+from backtide.snapshots import btrfs
 from tests.integration.service_kit import Service, exec_in_agent, run_cli, wait_until
-from vigia.snapshots import btrfs
 
 SCRIPT = "pausar_por_espacio"
 

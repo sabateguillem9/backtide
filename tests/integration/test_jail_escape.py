@@ -7,7 +7,7 @@ shell the attacker already has in the container (python3, node, curl, sh are in 
 The pytest process itself runs on the VM host, so the host-side assertions look at the real
 workspace, the snapshot store and the btrfs volume from outside the jail.
 
-This file is written independently from ``vigia/jail`` (another agent implements it): it only
+This file is written independently from ``backtide/jail`` (another agent implements it): it only
 assumes the design (docs/13-diseno-t03-jaula.md) and the fixture contract, and it asserts the
 security properties, never the implementation.
 
@@ -37,8 +37,8 @@ from uuid import uuid4
 
 import pytest
 
-from vigia.snapshots import btrfs
-from vigia.snapshots.store import SnapshotStore
+from backtide.snapshots import btrfs
+from backtide.snapshots.store import SnapshotStore
 
 pytestmark = pytest.mark.integration
 
@@ -417,7 +417,7 @@ def test_cannot_ptrace_other_processes(running_agent: RunningAgent) -> None:
     filter), and the host's Yama setting decides whether they can trace one another: Fedora
     ships ptrace_scope 0, so they can. That reaches nothing the agent does not already have,
     so it is not asserted either way. CAP_SYS_PTRACE is absent (see the capabilities test)."""
-    marker = f"vigia-ptrace-target-{uuid4().hex}"
+    marker = f"backtide-ptrace-target-{uuid4().hex}"
     target = subprocess.Popen(  # a sleeping process, recognisable by its marker
         [sys.executable, "-c", "import time; time.sleep(120)", marker]
     )
@@ -508,7 +508,7 @@ except OSError as error:
     print("blocked: no ping socket:", error)
     sys.exit(0)
 sock.settimeout(3)
-echo_request = struct.pack("!BBHHH", 8, 0, 0, 0, 1) + b"vigia-jail-probe"
+echo_request = struct.pack("!BBHHH", 8, 0, 0, 0, 1) + b"backtide-jail-probe"
 try:
     sock.sendto(echo_request, ("1.1.1.1", 0))
     reply = sock.recvfrom(1024)

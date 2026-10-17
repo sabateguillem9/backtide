@@ -21,18 +21,18 @@ from urllib.parse import urlencode
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.webkit import PREFIX_PATH, ROOT, SESSION, TOKEN, new_box, new_client
-from vigia.service.control import (
+from backtide.service.control import (
     ControlError,
     ControlOutcomeUnknown,
     ControlServer,
     ControlUnavailable,
 )
-from vigia.service.notice import rewind_notice
-from vigia.service.pause import ResumeOutcome
-from vigia.service.rewind import RewindOutcome, RewindStatus
-from vigia.snapshots import Reason, Snapshot, SnapshotError
-from vigia.web.rewind import Availability, ControlRewinder, Redeemed, Tickets
+from backtide.service.notice import rewind_notice
+from backtide.service.pause import ResumeOutcome
+from backtide.service.rewind import RewindOutcome, RewindStatus
+from backtide.snapshots import Reason, Snapshot, SnapshotError
+from backtide.web.rewind import Availability, ControlRewinder, Redeemed, Tickets
+from tests.webkit import PREFIX_PATH, ROOT, SESSION, TOKEN, new_box, new_client
 
 NOW = datetime(2026, 10, 16, 10, 0, tzinfo=UTC)
 SNAPS = [
@@ -144,7 +144,7 @@ def test_with_the_service_reachable_every_row_links_to_its_confirmation(web: Tes
 @pytest.mark.parametrize(
     ("state", "says"),
     [
-        (Availability.NO_SERVICE, "vigia vigilar"),
+        (Availability.NO_SERVICE, "backtide vigilar"),
         (Availability.OTHER_USER, "mismo usuario que el servicio"),
         (Availability.OFF, "no está disponible"),
     ],
@@ -419,7 +419,7 @@ def test_the_service_gone_between_confirming_and_clicking_rewinds_nothing_here(
     rewinder.state = Availability.NO_SERVICE
     response = post(web, fields)
     assert response.status_code == 503 and rewinder.calls == []
-    assert "vigia vigilar" in text_of(response.text)
+    assert "backtide vigilar" in text_of(response.text)
 
 
 def test_nobody_at_the_socket_is_said_and_nothing_is_done_in_process(
@@ -429,7 +429,7 @@ def test_nobody_at_the_socket_is_said_and_nothing_is_done_in_process(
     response = post(web, form_of(confirm(web)))
     assert response.status_code == 503
     assert 'data-outcome="no_service"' in response.text
-    assert "vigia vigilar" in text_of(response.text)
+    assert "backtide vigilar" in text_of(response.text)
 
 
 def test_a_lost_reply_is_unknown_not_failed(web: TestClient, rewinder: FakeRewinder) -> None:
@@ -568,7 +568,7 @@ def guard_status(headers: list[tuple[bytes, bytes]]) -> int:
     """The Guard alone, with a hand-built scope: what an HTTP parser might let through."""
     import asyncio
 
-    from vigia.web.security import Guard
+    from backtide.web.security import Guard
 
     async def inner(scope: Any, receive: Any, send: Any) -> None:
         await send({"type": "http.response.start", "status": 299, "headers": []})
@@ -644,7 +644,7 @@ def test_the_rewind_path_takes_no_other_method(web: TestClient, method: str) -> 
 def test_a_post_under_another_prefix_finds_nothing(web: TestClient, rewinder: FakeRewinder) -> None:
     fields = form_of(confirm(web))
     other = TestClient(web.app, base_url=f"{ROOT}/s/another")
-    other.cookies.set("vigia_web", SESSION, domain="127.0.0.1", path="/s/another")
+    other.cookies.set("backtide_web", SESSION, domain="127.0.0.1", path="/s/another")
     assert other.post(REWIND, data=fields, headers=POST_HEADERS).status_code in {404, 405}
     assert rewinder.calls == []
 
@@ -680,7 +680,7 @@ class FakeGuardian:
 
 
 def test_without_the_flag_the_web_only_watches(folder: Path) -> None:
-    """`vigia web` without --rebobinar: never asks, even as the service's user with the service
+    """`backtide web` without --rebobinar: never asks, even as the service's user with the service
     up (writes are explicit). It does not even look at the socket."""
     guardian = FakeGuardian()
     server = ControlServer(guardian, folder / "control.sock", peer=me)

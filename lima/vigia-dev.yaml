@@ -1,4 +1,4 @@
-# Vigía dev VM: Fedora with Docker, Btrfs and uv.
+# backtide dev VM: Fedora with Docker, Btrfs and uv.
 # Create and start it with `make vm-up`, which mounts only the project folder (writable).
 minimumLimaVersion: 2.0.0
 

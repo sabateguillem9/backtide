@@ -1,4 +1,4 @@
-"""Evil agent: swap folders for links to the host's / and /etc while Vigía looks at them.
+"""Evil agent: swap folders for links to the host's / and /etc while backtide looks at them.
 
 Runs INSIDE the jail, as the agent's user (python3 -c). Usage: <script> <dir> <seconds>
 <workers>. Forks ``workers`` processes that, in a tight loop, make a folder with files in it

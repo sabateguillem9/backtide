@@ -6,7 +6,7 @@ appear); a loop device's ``backing_file`` is the host path of the image file. Th
 looks for both in every way it can think of, tries to write in what hides them and to take
 the hiding away, and prints one JSON object on its last line:
 
-  listed   what it can list in the two folders that Vigía hides
+  listed   what it can list in the two folders that backtide hides
   found    paths that gave away the volume: its fsid folder, a ``backing_file`` it could
            read, or any file in /sys that holds the host path of the image
   writes   errno of each attempt to create something in the hidden folders
@@ -57,7 +57,7 @@ for base in ("/sys/block", "/sys/class/block", "/sys/dev/block", "/sys/devices/v
 writes: dict[str, int] = {}
 for path in HIDDEN:
     for kind in ("file", "dir"):
-        target = os.path.join(path, "vigia-probe")
+        target = os.path.join(path, "backtide-probe")
         try:
             if kind == "file":
                 os.close(os.open(target, os.O_CREAT | os.O_WRONLY, 0o600))

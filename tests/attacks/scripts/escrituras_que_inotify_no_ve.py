@@ -81,7 +81,7 @@ def attack() -> dict:
                 finally:
                     os.close(descriptor)
             else:
-                os.setxattr(FILES["xattr"], "user.vigia-test", b"hidden")
+                os.setxattr(FILES["xattr"], "user.backtide-test", b"hidden")
             done[name] = True
         except OSError as error:
             done[name] = False

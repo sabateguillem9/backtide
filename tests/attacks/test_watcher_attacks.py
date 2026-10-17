@@ -1,5 +1,5 @@
 """Evil-agent scenarios against the file watcher (T04), with the real service and the real
-OpenClaw: `vigia vigilar` as a process, a 3 s cycle, the attack INSIDE the agent's jail.
+OpenClaw: `backtide vigilar` as a process, a 3 s cycle, the attack INSIDE the agent's jail.
 
 The agent is frozen (``docker pause``) around the attack so that the snapshots can be told
 apart from OpenClaw's own noise: see tests/integration/test_activity.py.
@@ -12,8 +12,8 @@ from pathlib import Path
 from attack_kit import Attack, scenario
 from risk_kit import rules_of, summary
 
+from backtide.snapshots import Snapshot
 from tests.integration.service_kit import Service, wait_until
-from vigia.snapshots import Snapshot
 
 BLIND_DIR = "/workspace/work/blind"
 HOST_DIR = "agente/work/blind"
@@ -33,7 +33,7 @@ def has_original_content(service: Service, snapshot: Snapshot) -> bool:
             and copy_of(service, snapshot, "a/hl.bin").read_bytes() == original
             and copy_of(service, snapshot, "fa.bin").stat().st_size == 4096
             and copy_of(service, snapshot, "xa.bin").read_bytes() == original
-            and "user.vigia-test" not in os.listxattr(copy_of(service, snapshot, "xa.bin"))
+            and "user.backtide-test" not in os.listxattr(copy_of(service, snapshot, "xa.bin"))
         )
     except OSError:
         return False
@@ -45,7 +45,7 @@ def holds_every_write(service: Service, snapshot: Snapshot) -> bool:
             copy_of(service, snapshot, "a/mm.bin").read_bytes()[:8] == b"MMAPPED!"
             and copy_of(service, snapshot, "a/hl.bin").read_bytes()[:8] == b"HARDLINK"
             and copy_of(service, snapshot, "fa.bin").stat().st_size == 65536
-            and os.getxattr(copy_of(service, snapshot, "xa.bin"), "user.vigia-test") == b"hidden"
+            and os.getxattr(copy_of(service, snapshot, "xa.bin"), "user.backtide-test") == b"hidden"
         )
     except OSError:
         return False

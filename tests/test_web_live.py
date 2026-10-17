@@ -9,8 +9,8 @@ from pathlib import Path
 import httpx2 as httpx
 import pytest
 
+from backtide.web.server import LOOPBACK, bind
 from tests.webkit import PREFIX_PATH, SESSION, TOKEN, LiveServer, new_box
-from vigia.web.server import LOOPBACK, bind
 
 
 def read_until(response: httpx.Response, wanted: str, seconds: float = 10.0) -> list[str]:
@@ -105,7 +105,7 @@ def test_the_server_stops_promptly_with_a_stream_open(tmp_path: Path) -> None:
     new_box(tmp_path).append("system", "agent_start", "")
     started = time.monotonic()
     with LiveServer(tmp_path) as live, httpx.Client(base_url=live.base) as browser:
-        browser.cookies.set("vigia_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
+        browser.cookies.set("backtide_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
         with browser.stream("GET", "/ahora/stream?after=1") as events:
             lines = events.iter_lines()
             next(lines)

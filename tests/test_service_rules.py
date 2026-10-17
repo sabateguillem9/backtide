@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from backtide.analyzer import AssessedBlackBox, RiskResponder
+from backtide.jail import JailError
+from backtide.service.config import ConfigError, Secret, ServiceConfig
+from backtide.service.runner import build_guardian, load_rules
 from tests.test_service_runner import TOKEN, StubJail
-from vigia.analyzer import AssessedBlackBox, RiskResponder
-from vigia.jail import JailError
-from vigia.service.config import ConfigError, Secret, ServiceConfig
-from vigia.service.runner import build_guardian, load_rules
 
 RULES = """
 [[rule]]

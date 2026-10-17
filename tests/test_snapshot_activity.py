@@ -8,9 +8,9 @@ from uuid import UUID
 
 import pytest
 
-from vigia.snapshots import Reason, Snapshot
-from vigia.snapshots.activity import SnapshotInfo, changed_since, lineage_reference
-from vigia.snapshots.btrfs import SubvolumeInfo
+from backtide.snapshots import Reason, Snapshot
+from backtide.snapshots.activity import SnapshotInfo, changed_since, lineage_reference
+from backtide.snapshots.btrfs import SubvolumeInfo
 
 T0 = datetime(2026, 10, 16, 9, 0, tzinfo=UTC)
 WS_UUID = UUID(int=0xA1)

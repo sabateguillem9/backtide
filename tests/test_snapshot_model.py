@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from vigia.snapshots import (
+from backtide.snapshots import (
     PruneIncomplete,
     Reason,
     RestoreIncomplete,

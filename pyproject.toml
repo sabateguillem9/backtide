@@ -1,5 +1,5 @@
 [project]
-name = "vigia"
+name = "backtide"
 version = "0.1.0"
 description = "Caja negra para agentes de IA: graba lo que hacen, rebobina y frena lo irreversible."
 readme = "README.md"
@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-vigia = "vigia.cli:main"
+backtide = "backtide.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Import vigia from source: on macOS the .venv gets the "hidden" flag and Python skips hidden .pth files.
+# Import backtide from source: on macOS the .venv gets the "hidden" flag and Python skips hidden .pth files.
 pythonpath = ["."]
 markers = [
     "integration: needs the Linux dev VM (Docker, Btrfs, eBPF)",

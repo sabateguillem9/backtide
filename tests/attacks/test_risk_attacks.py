@@ -1,5 +1,5 @@
-"""Evil-agent scenario of the risk rules (T08), with `vigia vigilar` as a process and the real
-OpenClaw: the attack runs INSIDE the agent's jail, and the test reads what Vigía did from the
+"""Evil-agent scenario of the risk rules (T08), with `backtide vigilar` as a process and the real
+OpenClaw: the attack runs INSIDE the agent's jail, and the test reads what backtide did from the
 host (the black box, the snapshots, the service's log).
 
 - ``avalancha-de-eventos-de-riesgo``: thousands of deletes in a row, every one of them past the
@@ -15,8 +15,8 @@ from attack_kit import CONTAINER_WORK, Attack, files_under, scenario
 from risk_kit import at_risk, peak, rules_of, summary
 from watcher_kit import WITHIN, calm, file_events, in_snapshot, last_seq, started
 
+from backtide.analyzer.respond import ALERT_EVERY, EVIDENCE_EVERY
 from tests.integration.service_kit import Service, wait_until
-from vigia.analyzer.respond import ALERT_EVERY, EVIDENCE_EVERY
 
 SCRIPT = "avalancha_de_eventos_de_riesgo"
 FOLDER = "work/risk"

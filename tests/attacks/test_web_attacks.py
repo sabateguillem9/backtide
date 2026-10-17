@@ -2,7 +2,7 @@
 
 - ``nombres-hostiles-en-la-web``: the agent names files so that a page showing them would run
   script, reorder what the person reads, start a fake line, pile glyphs over the page or speak as
-  Vigía. The real service records them, and the real web, reading that same black box without
+  backtide. The real service records them, and the real web, reading that same black box without
   its key, must show every one inert in "Ahora", in the live stream and in "Historia".
 - ``rebobinar-desde-la-web`` (T12's done-when): the agent deletes the person's project; the web
   shows it, and one click (the confirmation, then the POST) has the real service rewind through
@@ -29,13 +29,13 @@ from attack_kit import CONTAINER_WORK, Attack, is_healthy, scenario, tree_digest
 from fastapi.testclient import TestClient
 from risk_kit import peak, rules_of, summary
 
+from backtide.blackbox import Event
+from backtide.jail import docker as jail_docker
+from backtide.web import BoxReader, create_app
+from backtide.web.rewind import ControlRewinder
+from backtide.web.server import bind, make_server
 from tests.integration.service_kit import CYCLE, Service, wait_until
 from tests.webkit import BASE, PREFIX_PATH, ROOT, SESSION, parse_sse
-from vigia.blackbox import Event
-from vigia.jail import docker as jail_docker
-from vigia.web import BoxReader, create_app
-from vigia.web.rewind import ControlRewinder
-from vigia.web.server import bind, make_server
 
 HOSTILE_DIR = "/workspace/work/hostile"
 WITHIN = 30.0  # the watcher dumps every 2 s: this is generous for a loaded VM
@@ -58,7 +58,7 @@ def web_for(service: Service, **options) -> TestClient:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         client = TestClient(app, base_url=BASE)
-    client.cookies.set("vigia_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
+    client.cookies.set("backtide_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
     return client
 
 
@@ -67,7 +67,7 @@ def inert(html: str, where: str) -> list[str]:
     problems = [f"{where}: raw {item!r}" for item in RAW if item in html]
     if re.search(r"<script(?![^>]*\bsrc=)", html):  # (the page's own scripts all have a src)
         problems.append(f"{where}: an inline script element")
-    # The sentence of Vigía's voice must only ever appear as a quoted name of the agent.
+    # The sentence of backtide's voice must only ever appear as a quoted name of the agent.
     # (The target and the JSON of Historia's details are labelled, not sentences: leave them out.)
     sentences = re.sub(r"<(dd|pre)[ >].*?</\1>", "", html, flags=re.S)
     voice = sentences.count("todo en orden")
@@ -161,10 +161,14 @@ def test_hostile_names_are_inert_in_the_web(attack: Attack, real_service: Servic
     )
 
     # Risk (T08): the names that deceive a reader (a right-to-left override, a line break, a
-    # tower of marks, a blank letter) are risk 1; markup, a script, a sentence of Vigía's voice
+    # tower of marks, a blank letter) are risk 1; markup, a script, a sentence of backtide's voice
     # and a format string are only text, so 0 (the web is what must keep them inert).
     deceiving = ("bidi", "newline", "tower", "blank")
-    named = {kind: [e for e in events if name in e.target] for kind, name in made.items()}
+    # By the whole file name: the voice is also a part of the newline's name.
+    named = {
+        kind: [e for e in events if e.target == name or e.target.endswith("/" + name)]
+        for kind, name in made.items()
+    }
     attack.check(
         "risk",
         all(named[kind] and peak(named[kind]) == 1 for kind in deceiving)
@@ -183,7 +187,7 @@ POST_HEADERS = {"origin": ROOT, "sec-fetch-site": "same-origin", "sec-fetch-mode
 
 
 def rewinding_web(service: Service) -> TestClient:
-    """The web as `vigia web --rebobinar` builds it, run as the service's user: the box without
+    """The web as `backtide web --rebobinar` builds it, run as the service's user: the box without
     its key, the volume's own snapshot list and the real control socket."""
     return web_for(
         service,
@@ -337,7 +341,7 @@ WEB_PORTS = (8765, 8766)
 
 @contextmanager
 def web_on_loopback(service: Service, port: int) -> Iterator[bool]:
-    """The real web of ``service`` on 127.0.0.1:``port``, as `vigia web --rebobinar` binds it
+    """The real web of ``service`` on 127.0.0.1:``port``, as `backtide web --rebobinar` binds it
     (the most it can do: rewinds on). Yields False
     when the port is already taken in the VM (a `make demo-web`): whatever listens there is just
     as good a target."""

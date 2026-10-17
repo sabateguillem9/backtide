@@ -3,7 +3,7 @@
 - ``autorizarse-en-sqlite``: the agent runs as the same user as OpenClaw, so its SQLite is not a
   boundary (docs/20, "Idea central"). It writes itself into the DM pairing store (the only
   authorization of a channel that OpenClaw keeps there) and tries to open the groups, which
-  live only in the config. Vigía's answer is that who may talk to the agent comes only from
+  live only in the config. backtide's answer is that who may talk to the agent comes only from
   openclaw.json, which is read-only for the agent and passes ``check_rewindable`` (no
   ``pairing``: with ``allowlist`` or ``disabled`` OpenClaw never reads that store). The canary
   (tests/integration/openclaw_canary.py), reading a snapshot from the host, sees the forged row.
@@ -17,10 +17,10 @@ from pathlib import Path
 
 from attack_kit import Attack, scenario
 
+from backtide.jail.config import AGENT_DIR, CONTAINER_CONFIG_DIR, CONTAINER_WORKSPACE
+from backtide.jail.openclaw import problems_in
+from backtide.snapshots import Reason
 from tests.integration.openclaw_canary import OPENCLAW_DB, read_openclaw_db
-from vigia.jail.config import AGENT_DIR, CONTAINER_CONFIG_DIR, CONTAINER_WORKSPACE
-from vigia.jail.openclaw import problems_in
-from vigia.snapshots import Reason
 
 FORGED_SENDER = "666000666"  # a made-up Telegram user id: the agent "approving" itself
 CONTAINER_DB = f"{CONTAINER_WORKSPACE}/{OPENCLAW_DB}"
@@ -79,7 +79,7 @@ def test_the_agent_authorizes_itself_in_openclaws_sqlite(
     groups = agent.exec(["sh", "-c", OPEN_THE_GROUPS])
     said = dict(line.split("=", 1) for line in groups.stdout.split() if "=" in line)
 
-    # What the gateway reads is still Vigía's config: untouched and safe to rewind.
+    # What the gateway reads is still backtide's config: untouched and safe to rewind.
     config = json.loads(config_file.read_text())
     unchanged = sha256(config_file) == config_before
     problems = problems_in(config)

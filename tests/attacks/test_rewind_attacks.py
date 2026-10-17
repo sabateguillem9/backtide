@@ -5,7 +5,7 @@
   record names brings everything back. The real service's parts run in this process
   (``guardian_in_process``): there is no control socket until T04c-2.
 - ``rebobinado-matado``: a rewind dies (SIGKILL) just before and just after the swap; the next
-  `vigia vigilar` reconciles it and nothing is lost.
+  `backtide vigilar` reconciles it and nothing is lost.
 """
 
 import os
@@ -17,6 +17,9 @@ import pytest
 from attack_kit import CONTAINER_WORK, Attack, files_under, is_healthy, scenario, tree_digest
 from risk_kit import peak, rules_of, summary
 
+from backtide.blackbox import Event
+from backtide.service.rewind import RewindStatus, read_pending
+from backtide.snapshots import btrfs
 from tests.integration.service_kit import (
     CYCLE,
     MARKER,
@@ -27,9 +30,6 @@ from tests.integration.service_kit import (
     wait_until,
     workspace_holds,
 )
-from vigia.blackbox import Event
-from vigia.service.rewind import RewindStatus, read_pending
-from vigia.snapshots import btrfs
 
 PROJECT = "work/proyecto"
 WITHIN = CYCLE + 30  # a cycle, the sync, the snapshot and a loaded VM
@@ -193,7 +193,7 @@ def test_a_rewind_killed_half_way(
         swapped = service.store.workspace_id() != workspace_before
         assert swapped is (when == "after")
 
-        service.start()  # a fresh `vigia vigilar` reconciles it
+        service.start()  # a fresh `backtide vigilar` reconciles it
         service.wait_ready()
         settled = [
             e
@@ -227,7 +227,7 @@ def test_a_rewind_killed_half_way(
         "recorded",
         set(recorded) == {"before", "after"},
         f"matado justo antes del intercambio: {recorded.get('before', 'NADA')}; justo después: "
-        f"{recorded.get('after', 'NADA')}; lo concilia el siguiente `vigia vigilar` y la caja "
+        f"{recorded.get('after', 'NADA')}; lo concilia el siguiente `backtide vigilar` y la caja "
         "negra sigue íntegra",
     )
     attack.check(

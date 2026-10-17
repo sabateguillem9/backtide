@@ -12,11 +12,11 @@ from typing import Any
 
 import pytest
 
+from backtide.analyzer import AssessedBlackBox, RiskResponder, parse_rules
+from backtide.analyzer.respond import EXCERPT_CHARS
+from backtide.blackbox import BlackBox, Event, Source
+from backtide.notify import Alert, AlertLevel
 from tests.conftest import FakeClock
-from vigia.analyzer import AssessedBlackBox, RiskResponder, parse_rules
-from vigia.analyzer.respond import EXCERPT_CHARS
-from vigia.blackbox import BlackBox, Event, Source
-from vigia.notify import Alert, AlertLevel
 
 KEY = bytes(range(32))
 WAIT = 5.0
@@ -204,8 +204,8 @@ def test_if_the_rules_break_the_event_is_recorded_anyway_with_risk_2(
     def explode(*_: object) -> None:
         raise RuntimeError("bug in a rule")
 
-    monkeypatch.setattr("vigia.analyzer.recorder.assess", explode)
-    with caplog.at_level(logging.ERROR, logger="vigia.analyzer"):
+    monkeypatch.setattr("backtide.analyzer.recorder.assess", explode)
+    with caplog.at_level(logging.ERROR, logger="backtide.analyzer"):
         event = rig.box.append(Source.FILE, "modify", "work/a.txt")
         calm = rig.box.append(Source.FILE, "modify", "work/b.txt", risk=3)
     assert (event.risk, calm.risk) == (2, 3)
@@ -459,7 +459,7 @@ def test_a_snapshot_that_raises_does_not_stop_the_alert(
         raise RuntimeError("btrfs said no")
 
     rig.snapshot_result = boom
-    with caplog.at_level(logging.ERROR, logger="vigia.analyzer"):
+    with caplog.at_level(logging.ERROR, logger="backtide.analyzer"):
         delete_burst(rig, 3)
         (alert,) = rig.sink.wait_for(1)
     assert "No se ha podido hacer la instantánea" in alert.body

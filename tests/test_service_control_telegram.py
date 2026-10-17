@@ -18,7 +18,7 @@ from test_service_control import (  # noqa: F401 - fixtures, used by name
     talk,
 )
 
-from vigia.service.control import ControlServer
+from backtide.service.control import ControlServer
 
 REQUEST = json.dumps({"cmd": "rewind", "snapshot_id": SNAPSHOT, "via": "telegram"}).encode()
 

@@ -1,21 +1,21 @@
 """T04d-2 in the VM: the pause by space with the real OpenClaw, the real `docker pause` and the
 real signals of a 1 GiB volume with simple quotas and a 64 MiB cap (docs/19, section 5).
 
-The service is the real `vigia vigilar` (tests/integration/pause_main.py: the cap set through
+The service is the real `backtide vigilar` (tests/integration/pause_main.py: the cap set through
 the tests' one sudo command, the VM's small /tmp not counted as P6) and the person's side is
-the real CLI (`vigia seguir`, `vigia rebobinar --si`) talking to it over the control socket.
+the real CLI (`backtide seguir`, `backtide rebobinar --si`) talking to it over the control socket.
 "Frozen" is checked for real every time: Docker says Paused, the container's cgroup has
 ``cgroup.freeze`` at 1 and a process writing a heartbeat inside the agent does not move.
 
 - Metadata below P1 (filled from the host in a sibling subvolume): frozen, the alert names
-  what holds the space, `vigia seguir` refuses while it stands; a rewind of the frozen agent
+  what holds the space, `backtide seguir` refuses while it stands; a rewind of the frozen agent
   kills it (never wakes it) and leaves it stopped, not frozen, with the pause open; freeing the
-  metadata, `vigia seguir` starts it.
-- Data below P2: frozen; freed, `vigia seguir` thaws the same run of the agent.
+  metadata, `backtide seguir` starts it.
+- Data below P2: frozen; freed, `backtide seguir` thaws the same run of the agent.
 - The workspace past its cap after a snapshot and deletes (P3, what the cap of T03b does not
   see): frozen; a rewind gives a new cap, so it ends green and the agent runs again.
 - The service killed (SIGKILL) with the agent frozen: the next one kills the frozen agent at
-  boot and keeps it stopped until `vigia seguir`.
+  boot and keeps it stopped until `backtide seguir`.
 """
 
 import errno
@@ -36,6 +36,8 @@ from test_quota_assumptions import (
     make_subvolume,
 )
 
+from backtide.jail import docker as jail_docker
+from backtide.snapshots import btrfs, space
 from tests.integration.conftest import (
     _agent_names,
     _remove_stale_test_agents,
@@ -48,8 +50,6 @@ from tests.integration.service_kit import (
     run_cli,
     wait_until,
 )
-from vigia.jail import docker as jail_docker
-from vigia.snapshots import btrfs, space
 
 pytestmark = pytest.mark.integration
 
@@ -213,7 +213,7 @@ def test_metadata_below_the_minimum_freezes_the_agent_and_seguir_starts_it_once_
     log = service.log_text()
     assert "El agente está pausado" in log
     assert "Lo que más ocupa" in log and "el espacio de trabajo actual" in log
-    assert "vigia seguir" in log
+    assert "backtide seguir" in log
 
     assert seguir(service) == 1  # still red: nothing changes
     assert_frozen_for_real(service)
@@ -232,7 +232,7 @@ def test_metadata_below_the_minimum_freezes_the_agent_and_seguir_starts_it_once_
     assert seguir(service) == 1
 
     empty(filler)
-    wait_until(lambda: seguir(service) == 0, FREE_WITHIN, "`vigia seguir` to start the agent")
+    wait_until(lambda: seguir(service) == 0, FREE_WITHIN, "`backtide seguir` to start the agent")
     wait_until(service.jail.is_running, 60, "the agent to run", context=service.diagnosis)
     assert not service.jail.is_paused()
     assert service.events("agent_start")[-1].details == {"reason": "resume"}
@@ -251,7 +251,7 @@ def test_data_below_the_minimum_freezes_the_agent_and_seguir_thaws_the_same_run(
     assert_frozen_for_real(service, heartbeat=True)
 
     empty(filler)
-    wait_until(lambda: seguir(service) == 0, FREE_WITHIN, "`vigia seguir` to thaw the agent")
+    wait_until(lambda: seguir(service) == 0, FREE_WITHIN, "`backtide seguir` to thaw the agent")
     found = state(service)
     assert found["Running"] is True and found["Paused"] is False
     assert found["StartedAt"] == started_at  # thawed: the same run, not a restart
@@ -347,6 +347,6 @@ def test_a_service_killed_with_the_agent_frozen_leaves_it_stopped_until_seguir(
     assert len(service.events("agent_start")) == starts
 
     empty(filler)
-    wait_until(lambda: seguir(service) == 0, FREE_WITHIN, "`vigia seguir` to start the agent")
+    wait_until(lambda: seguir(service) == 0, FREE_WITHIN, "`backtide seguir` to start the agent")
     wait_until(service.jail.is_running, 60, "the agent to run", context=service.diagnosis)
     assert service.events("agent_start")[-1].details == {"reason": "resume"}

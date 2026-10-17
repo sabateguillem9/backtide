@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from vigia.sensors import inotify
-from vigia.sensors.inotify import (
+from backtide.sensors import inotify
+from backtide.sensors.inotify import (
     IN_CREATE,
     IN_ISDIR,
     IN_MODIFY,

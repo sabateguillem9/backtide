@@ -25,9 +25,9 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
-from vigia.jail import AgentJail
-from vigia.service.config import ServiceConfig
-from vigia.service.runner import build_guardian, take_lock
+from backtide.jail import AgentJail
+from backtide.service.config import ServiceConfig
+from backtide.service.runner import build_guardian, take_lock
 
 
 def main(config_path: Path, target: str, when: str) -> None:

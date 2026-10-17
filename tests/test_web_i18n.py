@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from vigia.web.i18n import DEFAULT_LANGUAGE, EN, ES, Translator, negotiate
+from backtide.web.i18n import DEFAULT_LANGUAGE, EN, ES, Translator, negotiate
 
 FIELDS = re.compile(r"\{(\w+)\}")
 
@@ -40,7 +40,7 @@ def test_every_template_key_exists() -> None:
     """Every t('literal.key') of a template is a real key (computed keys are checked by the
     tests of the pages)."""
     used: set[str] = set()
-    for path in (Path(__file__).parent.parent / "vigia/web/templates").glob("*.html"):
+    for path in (Path(__file__).parent.parent / "backtide/web/templates").glob("*.html"):
         used |= set(re.findall(r"""\bt\(\s*'([\w.]+)'""", path.read_text()))
     assert used, "found no keys: the pattern is wrong"
     literal = {key for key in used if not key.endswith(".")}

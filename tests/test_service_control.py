@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from vigia.service.control import (
+from backtide.service.control import (
     MAX_REQUEST_BYTES,
     OUTCOME_EXIT_CODES,
     ControlError,
@@ -35,9 +35,9 @@ from vigia.service.control import (
     ask_rewind,
     peer_credentials,
 )
-from vigia.service.pause import ResumeOutcome, ResumeStatus
-from vigia.service.rewind import RewindOutcome, RewindStatus
-from vigia.snapshots import Snapshot
+from backtide.service.pause import ResumeOutcome, ResumeStatus
+from backtide.service.rewind import RewindOutcome, RewindStatus
+from backtide.snapshots import Snapshot
 
 SNAPSHOT = Snapshot(datetime(2026, 10, 16, 12, 0, 0, tzinfo=UTC), "periodic").id
 UNDO = Snapshot(datetime(2026, 10, 16, 12, 5, 0, tzinfo=UTC), "pre_restore").id
@@ -95,7 +95,7 @@ class FakeGuardian:
 
 @pytest.fixture
 def folder() -> Iterator[Path]:
-    """A short folder (Unix socket paths are limited), private like Vigía's state."""
+    """A short folder (Unix socket paths are limited), private like backtide's state."""
     path = Path(tempfile.mkdtemp(prefix="vg"))
     path.chmod(0o700)
     yield path
@@ -188,7 +188,7 @@ def test_the_client_refuses_to_send_an_unknown_via(folder: Path) -> None:
 
 
 def test_the_cli_request_is_unchanged(folder: Path) -> None:
-    """`vigia rebobinar` sends exactly what it sent before T12b (no `via`)."""
+    """`backtide rebobinar` sends exactly what it sent before T12b (no `via`)."""
     seen: list[bytes] = []
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(folder / "control.sock"))
@@ -301,7 +301,7 @@ def test_a_client_that_leaves_does_not_stop_the_rewind_and_the_lost_reply_is_log
     sock.sendall(rewind_request())
     assert guardian.entered.wait(5)
     sock.close()  # Ctrl-C on the client while the service rewinds
-    with caplog.at_level(logging.WARNING, logger="vigia.service.control"):
+    with caplog.at_level(logging.WARNING, logger="backtide.service.control"):
         guardian.gate.set()
         server.close()
     assert guardian.calls  # it ran to its end
@@ -314,7 +314,7 @@ def test_an_unexpected_exception_of_the_guardian_is_an_unknown_outcome_without_i
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     guardian.error = RuntimeError("secret internals sk-ant-api03-abcdefghijklmnopqrstuvwxyz")
-    with caplog.at_level(logging.ERROR, logger="vigia.service.control"):
+    with caplog.at_level(logging.ERROR, logger="backtide.service.control"):
         reply = ask_rewind(make_server().path, SNAPSHOT, peer=me)
     assert reply["outcome"] == "unknown" and reply["ok"] is False
     assert "sk-ant" not in json.dumps(reply)
@@ -342,7 +342,7 @@ def test_another_uid_is_refused_without_reading_or_calling_the_guardian(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     server = make_server(peer=somebody_else)
-    with caplog.at_level(logging.WARNING, logger="vigia.service.control"):
+    with caplog.at_level(logging.WARNING, logger="backtide.service.control"):
         reply = talk(server, rewind_request())
     assert reply["outcome"] == "refused" and reply["ok"] is False
     assert guardian.calls == []
@@ -364,7 +364,7 @@ def test_a_peer_whose_credentials_cannot_be_read_is_refused(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     server = make_server(peer=unreadable)
-    with caplog.at_level(logging.ERROR, logger="vigia.service.control"):
+    with caplog.at_level(logging.ERROR, logger="backtide.service.control"):
         reply = talk(server, rewind_request())
     assert reply["outcome"] == "refused"
     assert guardian.calls == []
@@ -517,7 +517,7 @@ def test_too_many_open_connections_are_turned_away_and_logged(
             held.connect(str(server.path))
             holders.append(held)
         time.sleep(0.2)  # let both threads start
-        with caplog.at_level(logging.WARNING, logger="vigia.service.control"):
+        with caplog.at_level(logging.WARNING, logger="backtide.service.control"):
             third = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             third.settimeout(5)
             third.connect(str(server.path))
@@ -842,14 +842,14 @@ def test_if_the_serving_thread_dies_the_listener_is_closed_so_clients_fail_fast(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from vigia.service import control  # noqa: PLC0415
+    from backtide.service import control  # noqa: PLC0415
 
     def die(self: Any) -> None:
         raise RuntimeError("serve_forever broke")
 
     monkeypatch.setattr(control._Server, "service_actions", die)  # called by serve_forever
     server = ControlServer(guardian, folder / "control.sock", peer=me)
-    with caplog.at_level(logging.ERROR, logger="vigia.service.control"):
+    with caplog.at_level(logging.ERROR, logger="backtide.service.control"):
         server.start()
         try:
             deadline = time.monotonic() + 5
@@ -868,7 +868,7 @@ def test_if_the_serving_thread_dies_the_listener_is_closed_so_clients_fail_fast(
     assert any(r.exc_info for r in caplog.records)
 
 
-# --- `vigia seguir` through the socket (T04d-2) ------------------------------------------------
+# --- `backtide seguir` through the socket (T04d-2) ------------------------------------------------
 
 
 def test_a_resume_goes_to_the_guardian_and_its_outcome_comes_back(

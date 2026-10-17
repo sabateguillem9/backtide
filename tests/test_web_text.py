@@ -3,7 +3,7 @@ page, or reorder what the person reads."""
 
 import pytest
 
-from vigia.web.text import tail, visible
+from backtide.web.text import tail, visible
 
 
 def test_html_is_escaped() -> None:

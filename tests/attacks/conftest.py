@@ -28,7 +28,7 @@ def _load_vm_fixtures() -> ModuleType:
     """tests/integration/conftest.py, imported once under a name of its own. The helpers of its
     sibling test modules (test_quota.py...) are imported by name, so its folder joins the path
     after the other folders (it only adds names that nothing else uses)."""
-    name = "vigia_vm_fixtures"
+    name = "backtide_vm_fixtures"
     if name in sys.modules:
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, _INTEGRATION / "conftest.py")

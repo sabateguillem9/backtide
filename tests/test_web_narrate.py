@@ -4,9 +4,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from vigia.blackbox import Event, Source
-from vigia.web.i18n import Translator
-from vigia.web.narrate import Counts, Narrator, line_for, sentence
+from backtide.blackbox import Event, Source
+from backtide.web.i18n import Translator
+from backtide.web.narrate import Counts, Narrator, line_for, sentence
 
 START = datetime(2026, 10, 16, 10, 0, tzinfo=UTC)
 ES, EN = Translator("es"), Translator("en")
@@ -166,7 +166,7 @@ def test_dropped_says_why() -> None:
 
 
 def test_system_events() -> None:
-    assert say(ev(1, "system", "service_start")) == "Vigía ha empezado a vigilar"
+    assert say(ev(1, "system", "service_start")) == "backtide ha empezado a vigilar"
     assert say(ev(1, "system", "agent_stop", details={"reason": "rewind"})) == (
         "El agente se ha parado (por un rebobinado)"
     )
@@ -236,7 +236,7 @@ def test_an_unknown_dropped_reason_is_told_as_another_reason(reason: object) -> 
 def test_a_line_that_cannot_be_told_is_a_generic_line_and_the_failure_is_logged(
     monkeypatch, caplog
 ) -> None:
-    from vigia.web import narrate
+    from backtide.web import narrate
 
     line = line_for(ev(7, "file", "create", "x"))
 

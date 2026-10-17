@@ -47,16 +47,16 @@ from test_quota_assumptions import (
     usage,
 )
 
-from vigia.jail import JailError, docker
-from vigia.jail.config import (
+from backtide.jail import JailError, docker
+from backtide.jail.config import (
     CONTAINER_WORKSPACE,
     HEALTH_URL,
     SYS_MASKS,
     docker_create_argv,
     token_env,
 )
-from vigia.snapshots import Reason, RestoreIncomplete, RestoreResult, SnapshotNoSpace, btrfs
-from vigia.snapshots.store import SnapshotStore
+from backtide.snapshots import Reason, RestoreIncomplete, RestoreResult, SnapshotNoSpace, btrfs
+from backtide.snapshots.store import SnapshotStore
 
 pytestmark = pytest.mark.integration
 
@@ -243,7 +243,7 @@ attempt("qgroup_limit_ioctl", qgroup_limit_ioctl)
 attempt("quota_override", write(fs + "/quota_override", "1"))
 attempt("max_referenced", write(fs + "/qgroups/0_" + subvolume_id + "/max_referenced", str(NONE)))
 attempt("limit_flags", write(fs + "/qgroups/0_" + subvolume_id + "/limit_flags", "0"))
-attempt("create_in_the_mask", write("/sys/fs/btrfs/vigia-probe", "1"))
+attempt("create_in_the_mask", write("/sys/fs/btrfs/backtide-probe", "1"))
 print(json.dumps(results))
 """
 

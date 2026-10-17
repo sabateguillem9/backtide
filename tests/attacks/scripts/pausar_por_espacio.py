@@ -4,7 +4,7 @@ Runs INSIDE the jail, as the agent user (python3 -c). Usage: <script> fill|delet
 Prints one JSON object on its last line.
 
 ``fill``: 2000-byte files (inline: metadata only) until the cap answers EDQUOT, which is where
-the cap of T03b stops the agent. ``delete``: once Vigía has snapshotted them, delete one file in
+the cap of T03b stops the agent. ``delete``: once backtide has snapshotted them, delete one file in
 every leaf: each delete copies a leaf the snapshot shares and is charged with no quota check
 (docs/16, A13), so the workspace ends past its cap without a single write being refused.
 """

@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from backtide.service import guardian as guardian_module
+from backtide.snapshots import SnapshotError
 from tests.test_service_guardian import (  # noqa: F401 - fixtures, used by name
     Violation,
     World,
@@ -14,8 +16,6 @@ from tests.test_service_guardian import (  # noqa: F401 - fixtures, used by name
     running,
     world,
 )
-from vigia.service import guardian as guardian_module
-from vigia.snapshots import SnapshotError
 
 
 class FakeRisk:

@@ -11,11 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from vigia.blackbox import BlackBox, create_key
-from vigia.notify import Alert
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.guardian import AgentState, Guardian
-from vigia.snapshots import Reason, Snapshot, SnapshotStore
+from backtide.blackbox import BlackBox, create_key
+from backtide.notify import Alert
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.guardian import AgentState, Guardian
+from backtide.snapshots import Reason, Snapshot, SnapshotStore
 
 pytestmark = pytest.mark.integration
 

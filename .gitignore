@@ -15,7 +15,7 @@ build/
 .env.*
 !.env.example
 
-# Datos locales de Vigía (caja negra, instantáneas, volúmenes)
+# Datos locales de backtide (caja negra, instantáneas, volúmenes)
 data/
 *.db
 *.db-wal

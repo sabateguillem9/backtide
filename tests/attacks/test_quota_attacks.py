@@ -21,7 +21,7 @@ from test_quota import (
 )
 from test_quota_assumptions import FILL_TIMEOUT, MIB, TEST_CAP, commit, mib, shares_extents, space
 
-from vigia.snapshots import Reason, btrfs
+from backtide.snapshots import Reason, btrfs
 
 MAX_ROUNDS = 6  # periodic snapshots between two rewriting passes, before giving up
 SEED_FILES, SEED_MIB = 6, 16  # the data the rewrite pass overwrites: half of the cap

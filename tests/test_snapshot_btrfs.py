@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from vigia.snapshots import SnapshotError, SnapshotNoSpace, btrfs
+from backtide.snapshots import SnapshotError, SnapshotNoSpace, btrfs
 
 linux_only = pytest.mark.skipif(sys.platform != "linux", reason="needs glibc renameat2")
 MIB = 1024**2
@@ -195,14 +195,14 @@ def test_run_uses_a_fixed_argv_list_c_locale_and_a_timeout(
     recorder: Recorder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("LC_ALL", "es_ES.UTF-8")
-    monkeypatch.setenv("VIGIA_TEST_MARKER", "kept")
+    monkeypatch.setenv("BACKTIDE_TEST_MARKER", "kept")
     btrfs.run("filesystem", "sync", Path("/vol"))
     (call,) = recorder.calls
     assert call.argv == ["btrfs", "filesystem", "sync", "/vol"]
     env = call.kwargs["env"]
     assert isinstance(env, dict)
     assert env["LC_ALL"] == "C"
-    assert env["VIGIA_TEST_MARKER"] == "kept"
+    assert env["BACKTIDE_TEST_MARKER"] == "kept"
     assert call.kwargs.get("shell", False) is False
     assert call.kwargs["timeout"] == btrfs.DEFAULT_TIMEOUT == 120.0
     assert call.kwargs["capture_output"] is True
@@ -212,7 +212,7 @@ def test_run_uses_a_fixed_argv_list_c_locale_and_a_timeout(
 
 
 def test_run_starts_btrfs_in_a_session_of_its_own(recorder: Recorder) -> None:
-    """A Ctrl-C in the terminal must reach Vigía only, not a `btrfs subvolume snapshot` in the
+    """A Ctrl-C in the terminal must reach backtide only, not a `btrfs subvolume snapshot` in the
     middle of its work. A timeout still kills the child: subprocess.run kills its pid."""
     btrfs.run("filesystem", "sync", Path("/vol"))
     assert recorder.calls[0].kwargs["start_new_session"] is True

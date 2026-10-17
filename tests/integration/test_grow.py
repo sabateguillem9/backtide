@@ -28,17 +28,17 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import BlackBox, create_key
+from backtide.service.config import Secret, ServiceConfig
+from backtide.service.guardian import Guardian
+from backtide.service.offline import NullWatcher
+from backtide.service.rewind import RewindStatus
+from backtide.snapshots import Reason, SnapshotError, SnapshotStore
+from backtide.snapshots.grow import GrowLimits, SystemProbe, VolumeGrower
+from backtide.snapshots.space import GIB, MIB, HostSpace
 from tests.integration.conftest import VOLUME_IMAGE
 from tests.integration.test_snapshots import fill_data, fill_metadata
 from tests.test_service_guardian import TOKEN, Alerts, FakeJail
-from vigia.blackbox import BlackBox, create_key
-from vigia.service.config import Secret, ServiceConfig
-from vigia.service.guardian import Guardian
-from vigia.service.offline import NullWatcher
-from vigia.service.rewind import RewindStatus
-from vigia.snapshots import Reason, SnapshotError, SnapshotStore
-from vigia.snapshots.grow import GrowLimits, SystemProbe, VolumeGrower
-from vigia.snapshots.space import GIB, MIB, HostSpace
 
 IMAGE_SIZE = GIB + 256 * MIB  # measured: the loop sees 1,280 MiB and btrfs uses 1,024
 FS_SIZE = GIB

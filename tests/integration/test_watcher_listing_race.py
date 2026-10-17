@@ -20,6 +20,12 @@ from pathlib import Path
 
 import pytest
 
+from backtide.blackbox import BlackBox
+from backtide.sensors import inotify
+from backtide.sensors.files import FileWatcher, WatcherConfig
+from backtide.sensors.inotify import Inotify
+from backtide.snapshots import Reason
+from backtide.snapshots.store import SnapshotStore
 from tests.integration.test_file_watcher import (  # noqa: F401 - box and plain_agent_dir are fixtures
     box,
     by_target,
@@ -28,12 +34,6 @@ from tests.integration.test_file_watcher import (  # noqa: F401 - box and plain_
     settle,
     watch_of,
 )
-from vigia.blackbox import BlackBox
-from vigia.sensors import inotify
-from vigia.sensors.files import FileWatcher, WatcherConfig
-from vigia.sensors.inotify import Inotify
-from vigia.snapshots import Reason
-from vigia.snapshots.store import SnapshotStore
 
 pytestmark = pytest.mark.integration
 

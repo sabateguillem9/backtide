@@ -1,4 +1,4 @@
-"""Evil agent: try to reach the service's control socket, to have Vigía rewind (or to feed it
+"""Evil agent: try to reach the service's control socket, to have backtide rewind (or to feed it
 garbage) from inside the jail.
 
 Runs INSIDE the jail, as the agent's user (python3 -c). Usage: <script> <host path of

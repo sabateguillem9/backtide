@@ -1,4 +1,4 @@
-"""Evil-agent scenarios of the Telegram bot (T09), with the real `vigia vigilar`, the real
+"""Evil-agent scenarios of the Telegram bot (T09), with the real `backtide vigilar`, the real
 OpenClaw and a FAKE Bot API (tests/telegram_fake.py) on the VM's 127.0.0.1: nothing reaches
 api.telegram.org and no real token is used. The service finds it through ``api_base`` in its
 ``telegram.toml``, exactly as it would find Telegram.
@@ -25,6 +25,7 @@ import pytest
 from attack_kit import CONTAINER_WORK, Attack, scenario
 from test_space_pause import CAP, cgroup_freeze, state, wait_frozen
 
+from backtide.service.telegram_config import STATE_TELEGRAM
 from tests.integration.conftest import (
     _agent_names,
     _remove_stale_test_agents,
@@ -38,7 +39,6 @@ from tests.integration.service_kit import (
     write_in_agent,
 )
 from tests.telegram_fake import OWNER, STRANGER, TOKEN, Call, FakeBotApi, buttons
-from vigia.service.telegram_config import STATE_TELEGRAM
 
 FREEZE_WITHIN = 2.0  # the criterion of T09
 ALERT_WITHIN = 5.0  # likewise
@@ -84,7 +84,7 @@ def capped_service(
 def plain_service(
     btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory, fake_telegram: FakeBotApi
 ) -> Iterator[Service]:
-    """`vigia vigilar` on the shared btrfs, no cap, with the bot pointed at the fake."""
+    """`backtide vigilar` on the shared btrfs, no cap, with the bot pointed at the fake."""
     _require_agent_image()
     _remove_stale_test_agents()
     root = btrfs_volume / f"svc-{uuid4().hex}"
@@ -162,8 +162,10 @@ def test_pausar_freezes_and_an_alert_rewinds(
     service, fake = capped_service, fake_telegram
 
     took = time_to_freeze(service, fake)
-    paused = service.events("user_pause")
+    # The Guardian freezes first and records system/user_pause right after: read the events once
+    # the bot has answered, which it does after recording.
     replied = fake.wait_call("sendMessage", lambda c: "congelado" in c.params["text"])
+    paused = service.events("user_pause")
     attack.check(
         "stopped",
         took < FREEZE_WITHIN and bool(paused) and paused[-1].details["requested_by"] == "telegram",

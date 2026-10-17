@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from vigia.blackbox import BlackBox, Source, create_key
-from vigia.cli import MAX_LISTED_PROBLEMS, NOT_VERIFIED, main
+from backtide.blackbox import BlackBox, Source, create_key
+from backtide.cli import MAX_LISTED_PROBLEMS, NOT_VERIFIED, main
 
 
 @pytest.fixture
@@ -169,7 +169,7 @@ def test_usage_errors_exit_2(capsys: pytest.CaptureFixture[str], args: list[str]
     with pytest.raises(SystemExit) as exit_info:
         main(["verificar", *args])
     assert exit_info.value.code == 2
-    assert "usage: vigia verificar" in capsys.readouterr().err
+    assert "usage: backtide verificar" in capsys.readouterr().err
 
 
 def _tables(db: Path) -> list[str]:

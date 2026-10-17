@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-from vigia.jail.config import AgentJailConfig, openclaw_config
-from vigia.jail.openclaw import (
+from backtide.jail.config import AgentJailConfig, openclaw_config
+from backtide.jail.openclaw import (
     RewindProblem,
     UnrewindableConfig,
     check_rewindable,
