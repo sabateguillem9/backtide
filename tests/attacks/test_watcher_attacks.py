@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from attack_kit import Attack, scenario
+from risk_kit import rules_of, summary
 
 from tests.integration.service_kit import Service, wait_until
 from vigia.snapshots import Snapshot
@@ -98,6 +99,15 @@ def test_writes_inotify_does_not_see(attack: Attack, real_service: Service) -> N
         isinstance(nlink, int) and nlink > 1,
         f"the snapshot {after.id} holds all four changes, and the hard-link write is recorded as "
         f"{link.action} of {link.target} with nlink={nlink} ({time.monotonic() - started:.1f} s)",
+    )
+
+    # Risk (T08): a file with two names is risk 1 (the rule "hardlink"): written by one name,
+    # seen by the other.
+    attack.check(
+        "risk",
+        link.risk == 1 and "hardlink" in rules_of([link]),
+        f"el evento del segundo nombre lleva riesgo {link.risk} por la regla hardlink "
+        f"(nlink={nlink}). {summary([link])}",
     )
 
     # Recoverable: the snapshot from before the attack still has the four files as they were,

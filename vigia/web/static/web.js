@@ -281,7 +281,7 @@
   wakers.push(heart);
 
   // The rewind, drawn: the tide retracts to a snapshot and the dot goes back to rest on it.
-  // T12b calls window.backtide.retractTo(iso) when a rewind is chosen; here it is a preview.
+  // A preview while you point at a row; held while a rewind is confirmed, runs and is done.
   // It returns false and changes nothing when the tide has no mark for ``iso``: a preview must
   // never show a rewind to a point that is not there. The line itself is redrawn by the stream
   // every minute, so its parts are looked up on every call and the retraction is put back on
@@ -470,6 +470,7 @@
     stagger(rows, 24);
   }
 
+  var pinned = null; // the snapshot the rewind panel is about: the preview leaves it alone
   function snapshotRows() {
     var list = document.querySelector(".snaplist");
     if (!list) return;
@@ -479,7 +480,7 @@
     if (hint) hint.hidden = false;
     var current = null;
     function show(row) {
-      if (current === row) return;
+      if (pinned !== null || current === row) return;
       if (current) current.classList.remove("is-previewing");
       current = row;
       if (!row) {
@@ -499,6 +500,71 @@
       if (!list.contains(event.relatedTarget)) show(null);
     });
   }
+
+  // -- the rewind (T12b): confirm, run, done ----------------------------------------------------
+  // The server sends each step (confirmation, result, or why not) into #rewind-panel. Here we
+  // only hold the tide where the step says, move the focus to its title, and clear the panel on
+  // "Cancel". Nothing is written as HTML: the panel is emptied node by node.
+
+  var panel = document.getElementById("rewind-panel");
+  function clearPanel() {
+    while (panel.firstChild) panel.removeChild(panel.firstChild);
+  }
+  function onPanel() {
+    var step = panel.querySelector(".rewind-step");
+    if (frame) frame.classList.remove("is-rewinding");
+    document.querySelectorAll(".snaprow.is-previewing").forEach(function (row) {
+      row.classList.remove("is-previewing");
+    });
+    if (!step) {
+      pinned = null;
+      restore();
+      return;
+    }
+    var view = step.getAttribute("data-view");
+    var outcome = step.getAttribute("data-outcome");
+    var at = step.getAttribute("data-rewind-to") || "";
+    var hold = view === "confirm" || (view === "result" && (outcome === "done" || outcome === "problem"));
+    pinned = hold ? at : null;
+    if (!hold || !retractTo(at)) restore();
+    var title = step.querySelector("#rewind-title");
+    if (title) title.focus({ preventScroll: true });
+    step.scrollIntoView({ block: "nearest", behavior: moving() ? "smooth" : "auto" });
+  }
+  if (panel) {
+    panel.addEventListener("click", function (event) {
+      var cancel = event.target.closest && event.target.closest(".rewind-cancel");
+      if (!cancel) return;
+      event.preventDefault();
+      clearPanel();
+      onPanel();
+    });
+  }
+  document.body.addEventListener("htmx:beforeRequest", function (event) {
+    var form = event.target;
+    if (form && form.classList && form.classList.contains("rewind-confirm") && frame) {
+      frame.classList.add("is-rewinding");
+      retractTo(form.getAttribute("data-rewind-to") || "");
+    }
+  });
+  document.body.addEventListener("htmx:afterSwap", function (event) {
+    if (panel && event.target === panel) onPanel();
+  });
+  // A refusal of the guard (not ours to show) or a lost connection: say so, let go of the tide.
+  function failed(event) {
+    var form = event.target;
+    if (!form || !form.classList || !form.classList.contains("rewind-confirm")) return;
+    if (frame) frame.classList.remove("is-rewinding");
+    var note = form.querySelector(".rewind-working");
+    if (note) {
+      note.textContent = form.getAttribute("data-failed") || "";
+      note.classList.add("is-failed");
+    }
+    pinned = null;
+    restore();
+  }
+  document.body.addEventListener("htmx:responseError", failed);
+  document.body.addEventListener("htmx:sendError", failed);
 
   // -- wiring -----------------------------------------------------------------------------------
 

@@ -159,6 +159,67 @@ def test_a_rewind_goes_to_the_guardian_and_its_outcome_comes_back(
     }
 
 
+def test_the_web_says_it_is_the_web_and_the_black_box_gets_it_with_the_kernels_ids(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    """T12b: the request may name where it came from, one of a fixed set. It is a label (any
+    process of the user could claim it); the uid and pid next to it are the kernel's."""
+    server = make_server()
+    assert ask_rewind(server.path, SNAPSHOT, via="web", peer=me)["outcome"] == "done"
+    assert talk(server, rewind_request(via="cli"))["outcome"] == "done"
+    assert guardian.calls == [
+        (SNAPSHOT, f"web (uid {ME}, pid 4242)"),
+        (SNAPSHOT, f"cli (uid {ME}, pid 4242)"),
+    ]
+
+
+@pytest.mark.parametrize("via", ["email", "WEB", "web ", "", None, 7, ["web"], {"web": 1}])
+def test_an_unknown_via_is_refused_without_calling_the_guardian(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian, via: object
+) -> None:
+    reply = talk(make_server(), rewind_request(via=via))
+    assert reply["outcome"] == "refused" and reply["ok"] is False
+    assert guardian.calls == []
+
+
+def test_the_client_refuses_to_send_an_unknown_via(folder: Path) -> None:
+    with pytest.raises(ValueError):
+        ask_rewind(folder / "control.sock", SNAPSHOT, via="email", wait=0, peer=me)
+
+
+def test_the_cli_request_is_unchanged(folder: Path) -> None:
+    """`vigia rebobinar` sends exactly what it sent before T12b (no `via`)."""
+    seen: list[bytes] = []
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(folder / "control.sock"))
+    listener.listen(1)
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            data = b""
+            # Read up to the client's half-close, like the real server's request read and
+            # drain: replying and closing first races the client's own shutdown (on macOS).
+            while chunk := connection.recv(4096):
+                data += chunk
+            seen.append(data)
+            connection.sendall(
+                json.dumps(
+                    {"ok": False, "outcome": "refused", "message": "x", "undo": None}
+                ).encode()
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        ask_rewind(folder / "control.sock", SNAPSHOT, wait=0, peer=me)
+    finally:
+        thread.join(5)
+        listener.close()
+    assert json.loads(seen[0]) == {"cmd": "rewind", "snapshot_id": SNAPSHOT}
+
+
 @pytest.mark.parametrize("status", list(RewindStatus))
 def test_every_outcome_status_travels_and_keeps_its_exit_code(
     make_server: Callable[..., ControlServer], guardian: FakeGuardian, status: RewindStatus
@@ -678,7 +739,13 @@ def raw_server(folder: Path, answer: bytes, *, hold: float = 0.0) -> threading.T
     def serve() -> None:
         conn, _ = listener.accept()
         conn.settimeout(5)
-        conn.recv(4096)
+        # Up to the client's half-close (as the real server reads and drains): answering and
+        # closing before it races the client's own shutdown, which fails on macOS.
+        try:
+            while conn.recv(4096):
+                pass
+        except OSError:
+            pass
         time.sleep(hold)
         try:
             conn.sendall(answer)

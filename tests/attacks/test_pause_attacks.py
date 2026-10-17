@@ -13,6 +13,7 @@ fixture and helpers this reuses. Freezing in the middle of a rewind (`docker sto
 """
 
 from attack_kit import CONTAINER_WORK, Attack, scenario
+from risk_kit import peak, rules_of, summary
 from test_space_pause import (  # noqa: F401 - `service` is a fixture, used by name
     CAP,
     cgroup_freeze,
@@ -40,6 +41,7 @@ def test_going_past_the_cap_freezes_the_agent(attack: Attack, service: Service) 
     )  # fmt: skip
     # ...but not the deletes after a snapshot. In the background: the agent may be frozen
     # before the script ends, and a `docker exec` waiting for it would hang.
+    seq_before_delete = service.box.head()[0]  # type: ignore[index]
     exec_in_agent(service, f"python3 -c '{_source()}' delete {small} >/dev/null 2>&1 &")
     wait_frozen(service, "P3")
 
@@ -58,6 +60,32 @@ def test_going_past_the_cap_freezes_the_agent(attack: Attack, service: Service) 
         pause.risk == 2 and pause.details["frozen"] is True,
         f"system/space_pause {{conditions: {pause.details['conditions']}, frozen: true}} con "
         f"riesgo {pause.risk}, y un aviso que dice qué retiene el espacio",
+    )
+
+    # Risk (T08): the pause is the service's own event (risk 2), and so is what the agent did to
+    # cause it: ~700 deletes in seconds, which the watcher has to fold into a summary (the
+    # fill emptied its bucket), rated 2 by the rules ("100 or more in a minute, folded"; the
+    # line of risk 3 is 1.000, because a summary cannot tell a start-up's temporary files).
+    def deleted() -> list:
+        return [
+            e
+            for e in service.events(source="file")
+            if e.seq > seq_before_delete and e.action in ("delete", "summary")
+        ]
+
+    wait_until(
+        lambda: peak(deleted()) >= 2,
+        60,
+        "the rules to rate the deletes",
+        context=service.diagnosis,
+    )
+    attack.check(
+        "risk",
+        pause.risk == 2
+        and peak(deleted()) == 2
+        and bool(rules_of(deleted()) & {"mass-delete", "mass-delete-folded"}),
+        f"la pausa lleva riesgo {pause.risk} (la fija el servicio) y los borrados que la causan "
+        f"salen con riesgo 2 por las reglas. {summary(deleted())}",
     )
     rewound = run_cli(service, "rebobinar", "--si", first)
     after = state(service)

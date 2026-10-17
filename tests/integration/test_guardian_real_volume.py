@@ -154,7 +154,9 @@ def test_boot_and_cycles_on_a_real_volume(
     assert not jail.running
     report = box.verify()
     assert report.ok, report.problems
-    assert alerts.sent == []
+    # This volume has no workspace_limit, so the only alert is that the space is not watched
+    # (T04d-2); anything else would be a real problem.
+    assert [a.title for a in alerts.sent] == ["El espacio no se vigila"]
     box.close()
 
 

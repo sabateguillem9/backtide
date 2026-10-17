@@ -317,7 +317,10 @@ def test_every_response_carries_the_security_headers(client: TestClient, path: s
     assert headers["content-security-policy"] == CSP
     assert headers["x-frame-options"] == "DENY"
     assert headers["x-content-type-options"] == "nosniff"
-    assert headers["referrer-policy"] == "no-referrer"
+    # same-origin, not no-referrer (T12b): with no-referrer a browser sends "Origin: null" on
+    # the confirmation's plain form POST, and the guard (rightly) refuses null. There are no
+    # links to other sites, so nothing of ours travels anywhere else.
+    assert headers["referrer-policy"] == "same-origin"
     assert headers["cache-control"] == "no-store"
     assert headers["cross-origin-resource-policy"] == "same-origin"
 

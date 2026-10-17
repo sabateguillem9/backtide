@@ -39,11 +39,16 @@ STATE_AGENT_CONFIG = "openclaw"
 STATE_LOCK = "vigia.lock"
 STATE_PENDING = "rewind.pending"
 STATE_SOCKET = "control.sock"
+STATE_RULES = "rules.toml"  # the risk rules (T08); absent: the ones that ship with Vigía
+MAX_RULES_BYTES = 64 * 1024
 
 _TOP_LEVEL_KEYS = frozenset(
-    {"state_dir", "volume", "workspace_limit", "cycle_interval", "prune_interval", "agent"}
-)
-_OPTIONAL_KEYS = ("workspace_limit", "cycle_interval", "prune_interval")
+    {
+        "state_dir", "volume", "workspace_limit", "cycle_interval", "prune_interval", "agent",
+        "volume_image", "max_volume_bytes",
+    }
+)  # fmt: skip
+_OPTIONAL_KEYS = ("workspace_limit", "cycle_interval", "prune_interval", "max_volume_bytes")
 # The container options a file may change. ``allow_shared_ids`` is a test-only concession and
 # ``seccomp_profile`` ships with Vigía, so neither is here; the token is never a setting.
 _AGENT_KEYS = frozenset(
@@ -91,7 +96,12 @@ class ServiceConfig:
 
     ``state_dir`` is Vigía's own folder (black box, token, the agent's config) and ``volume``
     the root of the snapshot store (``<volume>/workspace`` is the agent's subvolume). ``agent``
-    holds overrides of AgentJailConfig's options."""
+    holds overrides of AgentJailConfig's options.
+
+    ``volume_image`` (the file behind the volume's loop device) and ``max_volume_bytes`` (the
+    size the volume may never pass) go together: with both, a rewind that fails for lack of
+    space may grow the volume once (T04e-1, ``vigia.snapshots.grow``); without them it is never
+    grown. T13 writes them (by default 1.5 times the installed size)."""
 
     state_dir: Path
     volume: Path
@@ -100,6 +110,8 @@ class ServiceConfig:
     cycle_interval: float = DEFAULT_CYCLE_INTERVAL
     prune_interval: float = DEFAULT_PRUNE_INTERVAL
     agent: Mapping[str, Any] = field(default_factory=dict)
+    volume_image: Path | None = None
+    max_volume_bytes: int | None = None
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("volume", self.volume)):
@@ -134,6 +146,30 @@ class ServiceConfig:
                 f"contain state_dir {self.state_dir}: the agent would see the black box"
             )
         self.jail_config()  # validates every agent option; the result is rebuilt on demand
+        self._check_growth(config_dir)
+
+    def _check_growth(self, config_dir: Path) -> None:
+        image, ceiling = self.volume_image, self.max_volume_bytes
+        if (image is None) != (ceiling is None):
+            raise ConfigError(
+                "volume_image and max_volume_bytes go together: set both to let Vigía grow the "
+                "volume when a rewind runs out of space, or neither"
+            )
+        if image is None:
+            return
+        if not isinstance(image, Path) or not image.is_absolute() or "\0" in str(image):
+            raise ConfigError(f"volume_image must be an absolute path, got {str(image)!r}")
+        _require_no_dotdot("volume_image", image)
+        for label, folder in (("volume", self.volume), ("[agent] config_dir", config_dir)):
+            if image.is_relative_to(folder):
+                raise ConfigError(
+                    f"volume_image {image} must not be inside {label} {folder}: the agent "
+                    "would see (and could change) the file behind its own volume"
+                )
+        if not _positive_int(ceiling):
+            raise ConfigError(
+                f"max_volume_bytes must be a positive number of bytes, got {ceiling!r}"
+            )
 
     # Where things live (docs/19, "Disposición")
 
@@ -171,6 +207,12 @@ class ServiceConfig:
         return self.state_dir / STATE_SOCKET
 
     @property
+    def rules_file(self) -> Path:
+        """The user's risk rules. Vigía's own config: it lives in ``state_dir``, which the agent
+        never sees (invariant 1)."""
+        return self.state_dir / STATE_RULES
+
+    @property
     def workspace(self) -> Path:
         return self.volume / "workspace"
 
@@ -187,6 +229,15 @@ class ServiceConfig:
             )
         except ValueError as error:
             raise ConfigError(f"invalid [agent] settings: {error}") from error
+
+    def read_rules(self) -> str | None:
+        """The text of ``rules_file``, or None if there is none (the default rules apply). Read
+        like the rest of the config: no symlink, ours, not writable by others. Raises
+        ConfigError."""
+        if not os.path.lexists(self.rules_file):
+            return None
+        data = _read_file(self.rules_file, "rules file", MAX_RULES_BYTES, private=False)
+        return _decode(data)
 
     @classmethod
     def from_file(cls, path: Path) -> "ServiceConfig":
@@ -211,6 +262,8 @@ class ServiceConfig:
         token_file = state_dir / STATE_TOKEN
         token = _decode(_read_file(token_file, "gateway token file", MAX_TOKEN_BYTES, private=True))
         optional = {key: data[key] for key in _OPTIONAL_KEYS if key in data}
+        if "volume_image" in data:
+            optional["volume_image"] = _as_path("volume_image", data["volume_image"])
         return cls(
             state_dir=state_dir,
             volume=volume,

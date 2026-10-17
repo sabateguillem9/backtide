@@ -204,6 +204,34 @@ def test_build_guardian_takes_a_store_and_a_gate_the_tests_can_adjust(
     assert guardian._space is gate  # noqa: SLF001
 
 
+def test_growth_is_wired_but_not_configured_until_t13(tmp_path: Path) -> None:
+    """T04e-1: with an image and a ceiling the grower has its limits, and the privileged steps
+    are the stub that says "not configured" (nothing in vigia/ runs sudo)."""
+    from vigia.snapshots.grow import NOT_CONFIGURED, GrowLimits  # noqa: PLC0415
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    image = tmp_path / "volume.img"
+    configured = ServiceConfig(
+        state_dir=state,
+        volume=tmp_path / "vol",
+        gateway_token=Secret(TOKEN),
+        volume_image=image,
+        max_volume_bytes=3 * 1024**3,
+    )
+    guardian, _, _ = build_guardian(configured)
+    grower = guardian._grow  # noqa: SLF001
+    assert grower.configured
+    assert grower._limits == GrowLimits(image, 3 * 1024**3)  # noqa: SLF001
+    assert grower._steps is NOT_CONFIGURED  # noqa: SLF001
+    assert grower._volume == configured.volume  # noqa: SLF001
+
+
+def test_without_an_image_the_volume_is_never_grown(config: ServiceConfig) -> None:
+    guardian, _, _ = build_guardian(config)
+    assert not guardian._grow.configured  # noqa: SLF001
+
+
 def test_build_guardian_takes_a_jail_the_tests_can_adjust(config: ServiceConfig) -> None:
     """The VM tests run without root, so the agent's ids are the user's: they hand in a jail
     with that one concession instead of the config file growing a switch for it."""

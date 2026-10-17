@@ -202,6 +202,31 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 .rewind { display: flex; align-items: center; gap: var(--space-3); flex: none; }
 .rewind small { font-size: 13px; letter-spacing: 0.02em; color: var(--ink-muted); }
 @media (max-width: 480px) { .rewind small { display: none; } }
+/* the rewind (T12b): the arrow points back; the steps sit on a hairline, no card */
+.rewind .dot-button svg, .rewind-yes .dot-button svg { transform: scaleX(-1); }
+a.dot-button { text-decoration: none; }
+.rewind-go:hover { transform: translateX(-3px); }
+.rewind-off { margin-top: var(--space-6); }
+.rewind-panel:empty { display: none; }
+.rewind-panel { margin-top: var(--space-8); }
+.rewind-step { border-top: var(--stroke-hairline) solid var(--ink); padding-top: var(--space-6); }
+.rewind-step h2 { margin: 0; font-size: 24px; line-height: 1.2; font-weight: 500; letter-spacing: -0.01em; text-wrap: balance; }
+.rewind-step h2:focus { outline: 0; }
+.rewind-step h2:focus-visible { outline: var(--stroke-focus) solid var(--ink); outline-offset: 3px; }
+.rewind-snap { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--space-3); margin: var(--space-2) 0 0; }
+.rewind-snap .sid { margin: 0; }
+.notice { margin-top: var(--space-6); color: var(--ink-soft); font-size: 15px; }
+.notice p { margin: 0 0 var(--space-3); }
+.rewind-said { margin: var(--space-4) 0 0; color: var(--ink-soft); overflow-wrap: anywhere; }
+.rewind-step > p { margin: var(--space-3) 0 0; }
+.rewind-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4) var(--space-8); margin-top: var(--space-6); }
+.rewind-yes { display: inline-flex; align-items: center; gap: var(--space-3); padding: 0; border: 0; background: none; font: inherit; font-size: 17px; font-weight: 500; color: var(--ink); cursor: pointer; }
+.rewind-yes:disabled { cursor: default; color: var(--ink-muted); }
+.rewind-yes:disabled .dot-button { background: transparent; color: var(--ink-muted); border: var(--stroke-hairline) solid var(--ink-muted); }
+.rewind-cancel, .rewind-back { color: var(--ink-muted); }
+.rewind-working { display: none; }
+.rewind-confirm.htmx-request .rewind-working, .rewind-working.is-failed { display: block; }
+.rewind-working.is-failed { color: var(--ink); }
 
 /* ---------------------------------------------------------------------------------------------
    Motion. Everything below moves only transform and opacity, and only when the person has not
@@ -281,6 +306,10 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
   .burst[open] .burst-more { animation: rise 0.35s var(--ease-arrive) both; }
   .jump:not([hidden]) { animation: rise 0.35s var(--ease-arrive) both; }
   .ask.htmx-request .dot-button { animation: breathe 1.1s var(--ease-travel) infinite; }
+  /* a rewind running: the dot breathes where the tide went back to, the step rises in */
+  .tide-frame.is-rewinding .tide-head { animation: breathe 1.1s var(--ease-travel) infinite; }
+  .rewind-confirm.htmx-request .rewind-yes .dot-button { animation: breathe 1.1s var(--ease-travel) infinite; }
+  .rewind-step { animation: rise 0.45s var(--ease-arrive) both; }
   .field input:focus-visible ~ .field-line { animation: draw-line 0.45s var(--ease-arrive) both; }
 
   /* history and snapshots: rows rise in, a little apart */

@@ -1,8 +1,9 @@
 """The pause by space outside the Guardian: what resuming answers, what holds the space, the
 real space gate and the threads that tick. Design: docs/19-diseno-t04.md, section 5.
 
-- ``ResumeOutcome`` is what ``Guardian.resume`` (``vigia seguir``) returns, with the CLI's
-  exit code.
+- ``ResumeOutcome`` is what ``Guardian.resume`` (``vigia seguir``, Telegram's ``/seguir``)
+  returns, with the CLI's exit code; ``PauseOutcome`` is what ``Guardian.pause_by_user``
+  (Telegram's ``/pausar``, T09) returns.
 - ``read_holders`` lists what holds room on the volume, from the level-0 qgroups in /sys: the
   workspace (against its cap), every undo point and the subvolumes that are gone but still hold
   space through snapshots (simple quotas keep their qgroup). ``holders_text`` is the part of the
@@ -72,6 +73,33 @@ class ResumeOutcome:
     @property
     def exit_code(self) -> int:
         return RESUME_EXIT_CODES[self.status]
+
+
+class PauseStatus(StrEnum):
+    """What ``Guardian.pause_by_user`` (Telegram's ``/pausar``, T09) left the agent as."""
+
+    FROZEN = "frozen"  # frozen (now, or it already was): it runs no code until `seguir`
+    STOPPED = "stopped"  # it was not running: it stays stopped until `seguir`
+    KILLED = "killed"  # it could not be frozen, so it was stopped by force
+    STILL_RUNNING = "still_running"  # it could be neither frozen nor stopped: the worst case
+    FAILED = "failed"  # no service: nothing was paused
+
+
+@dataclass(frozen=True)
+class PauseOutcome:
+    """What ``Guardian.pause_by_user`` did. ``already``: the person's pause was open before
+    this request. ``message`` is for the person, in Spanish, and carries nothing of the
+    agent's."""
+
+    status: PauseStatus
+    message: str
+    agent_state: str = ""
+    already: bool = False
+
+    @property
+    def held(self) -> bool:
+        """The agent runs no code now."""
+        return self.status in (PauseStatus.FROZEN, PauseStatus.STOPPED, PauseStatus.KILLED)
 
 
 # What holds the space
@@ -282,6 +310,8 @@ def _mib(size: int | None) -> str:
 
 __all__ = [
     "Holder",
+    "PauseOutcome",
+    "PauseStatus",
     "RESUME_EXIT_CODES",
     "ResumeOutcome",
     "ResumeStatus",

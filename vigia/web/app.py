@@ -1,12 +1,14 @@
-"""The web of Vigía: a lookout post on 127.0.0.1, read-only.
+"""The web of Vigía: a lookout post on 127.0.0.1.
 
 Four pages: "Ahora" (a live conversation of what the agent does, over Server-Sent Events),
-"Historia" (the filtered timeline), "Instantáneas" (the list; the rewind button is disabled
-until the web gets the control socket) and "Preguntar" (the question box on a page of its own).
-The security reasoning is in ``vigia.web.security``.
+"Historia" (the filtered timeline), "Instantáneas" (the list, and the rewind button) and
+"Preguntar" (the question box on a page of its own). The security reasoning is in
+``vigia.web.security``; the rewind's in ``vigia.web.rewind``.
 
-Everything here reads the black box through ``BoxReader`` (read-only, without its key); nothing
-writes, and the only method the app answers is GET.
+Everything here reads the black box through ``BoxReader`` (read-only, without its key). The one
+thing it can change is the agent's workspace, and only by asking the service (T12b): a
+confirmation page (GET, the fixed notice and a one-time ticket) and then a POST from it. Every
+other route answers GET only.
 """
 
 import asyncio
@@ -20,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 import jinja2
 from fastapi import Depends, FastAPI, Request
@@ -30,15 +32,20 @@ from markupsafe import Markup
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from vigia.blackbox import Event, Source
+from vigia.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
+from vigia.service.notice import rewind_notice
 from vigia.snapshots import Snapshot, SnapshotError
 from vigia.web import format as fmt
 from vigia.web.ask import MAX_QUESTION, answer
 from vigia.web.i18n import LANGUAGES, Translator, negotiate
 from vigia.web.narrate import Line, Name, Narrator, line_for, safe_sentence, sentence
 from vigia.web.reader import BoxReader, BoxUnavailable
+from vigia.web.rewind import Availability, Redeemed, Rewinder, Tickets
 from vigia.web.security import (
     COOKIE_NAME,
     LANG_COOKIE,
+    MAX_FORM_BYTES,
+    POST_PATH,
     Access,
     Guard,
     make_prefix,
@@ -63,6 +70,9 @@ LISTED_SNAPSHOTS = 30
 SNAPSHOT_FALLBACK = 200
 MAX_ACTION_CHARS = 64
 RANGES = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}
+FORM_FIELDS = ("csrf", "id", "ticket")  # the rewind's form: these, once each, and nothing else
+MAX_FIELD_CHARS = 128
+FROM_THE_BOX = "list"  # the rewind state when the list did not come from the volume
 
 
 class Unauthorized(Exception):  # noqa: N818 - an HTTP outcome, not an error
@@ -86,6 +96,7 @@ def create_app(
     prefix: str | None = None,
     run_name: str | None = None,
     snapshots: Callable[[], Sequence[Snapshot]] | None = None,
+    rewinder: Rewinder | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
     keepalive: float = KEEPALIVE,
@@ -97,7 +108,8 @@ def create_app(
     the whole app lives under, ``run_name`` the name shown to compare with the terminal (see
     ``vigia.web.security``; all random unless given, which the tests do). ``port`` is the one the
     server listens on (the ``Host`` check needs it). A stream lasts ``stream_seconds`` and the
-    browser reconnects by itself, so no connection lives forever."""
+    browser reconnects by itself, so no connection lives forever. ``rewinder`` asks the service
+    to rewind (``vigia.web.rewind``); without one the rewind buttons are disabled."""
     access = Access(token or make_token(), session)
     prefix = prefix or make_prefix()
     base = f"/s/{prefix}"
@@ -142,6 +154,14 @@ def create_app(
         raise Unauthorized
 
     protected = [Depends(require_access)]
+
+    def require_session(request: Request) -> None:
+        """The cookie and nothing else: a change never starts from the link's token."""
+        if not access.session_in(request.headers.get("cookie")):
+            raise Unauthorized
+
+    tickets = Tickets(clock)
+    rewinding = threading.Lock()  # one rewind in flight at a time, whoever asks
 
     @app.exception_handler(StartSession)
     async def _start_session(request: Request, started: StartSession) -> Response:
@@ -454,18 +474,161 @@ def create_app(
             ]
         newest_first = list(reversed(rows))
         shown = newest_first if show_all else newest_first[:LISTED_SNAPSHOTS]
+        rewind_state = FROM_THE_BOX if from_box else str(_availability())
         return _page(
             "snapshots.html",
             request,
             active="snapshots",
             t=t,
             rows=shown,
+            rewind_state=rewind_state,
             hidden=len(newest_first) - len(shown),
             error=error,
             from_box=from_box,
             box_unreadable=box_unreadable,
             now=now,
             tide=_tide_view(now, _snapshot_window(shown, now), shown),
+        )
+
+    # -- the rewind (T12b) -----------------------------------------------------------------
+
+    def _availability() -> Availability:
+        if rewinder is None:
+            return Availability.OFF
+        try:
+            return rewinder.availability()
+        except Exception:  # never a 500 for a disabled button; the log says why
+            logger.exception("cannot tell whether the service can be asked to rewind")
+            return Availability.OFF
+
+    def _listed() -> list[Snapshot] | None:
+        """The volume's own list, or None: a rewind is only ever to a snapshot in it."""
+        if snapshots is None:
+            return None
+        try:
+            return list(snapshots())
+        except (SnapshotError, OSError) as failure:
+            logger.warning("the snapshot list cannot be read: %s", failure)
+            return None
+
+    def _rewind_view(
+        request: Request, t: Translator, status: int, view: str, **values: Any
+    ) -> Response:
+        """The rewind's step: a fragment for HTMX (always 200, or it would not be shown), the
+        whole page otherwise (with the real status)."""
+        for name in ("snap", "message", "undo"):
+            values.setdefault(name, None)
+        values.setdefault("agent_started", False)
+        if request.headers.get("hx-request") == "true":
+            return _page("rewind.html", request, active="snapshots", t=t, view=view, **values)
+        return _page(
+            "rewind_page.html",
+            request,
+            status=status,
+            active="snapshots",
+            t=t,
+            view=view,
+            **values,
+        )
+
+    def _not_now(
+        request: Request, t: Translator, status: int, reason: str, **values: Any
+    ) -> Response:
+        return _rewind_view(request, t, status, "refused", reason=reason, **values)
+
+    def _target(snapshot_id: str) -> tuple[Snapshot | None, str | None]:
+        """The snapshot ``snapshot_id`` names if it is in the volume's list now; else why not."""
+        listed = _listed()
+        if listed is None:
+            return None, "rewind.off.list"
+        target = Snapshot.parse(snapshot_id) if len(snapshot_id) <= MAX_FIELD_CHARS else None
+        if target is None or target not in listed:
+            return None, "rewind.err.not_listed"
+        return target, None
+
+    @app.get(POST_PATH, dependencies=protected)
+    def rewind_confirm(request: Request) -> Response:
+        """The confirmation: the fixed notice, and a form with a ticket for this snapshot. It
+        changes nothing, and it is the only way to get a ticket."""
+        t = Translator(_language(request)[0])
+        target, why = _target(request.query_params.get("id", ""))
+        if target is None:
+            return _not_now(request, t, 200, why or "rewind.err.not_listed")
+        state = _availability()
+        if state is not Availability.READY:
+            return _not_now(request, t, 200, f"rewind.off.{state}", snap=target)
+        return _rewind_view(
+            request,
+            t,
+            200,
+            "confirm",
+            snap=target,
+            notice=rewind_notice(target.taken_at, now=clock(), tz=zone),
+            csrf=access.csrf,
+            ticket=tickets.issue(target.id),
+        )
+
+    @app.post(POST_PATH, dependencies=[Depends(require_session)])
+    async def rewind(request: Request) -> Response:
+        """The rewind. The Guard already checked where it comes from and its size."""
+        t = Translator(_language(request)[0])
+        form = await _read_form(request)
+        if form is None:
+            return _not_now(request, t, 400, "rewind.err.form")
+        if not access.csrf_is(form["csrf"]):
+            logger.warning("a rewind from the web was refused: wrong form token")
+            return _not_now(request, t, 403, "rewind.err.form")
+        redeemed = tickets.redeem(form["ticket"], form["id"])
+        if redeemed is Redeemed.SPENT:  # a second click on the same form
+            return _not_now(request, t, 400, "rewind.err.used")
+        if redeemed is not Redeemed.OK:
+            if rewinding.locked():
+                return _not_now(request, t, 409, "rewind.err.busy")
+            return _not_now(request, t, 400, "rewind.err.expired")
+        target, why = await asyncio.to_thread(_target, form["id"])
+        if target is None:
+            return _not_now(request, t, 503 if why == "rewind.off.list" else 400, why or "")
+        state = await asyncio.to_thread(_availability)
+        if state is not Availability.READY or rewinder is None:
+            return _not_now(request, t, 503, f"rewind.off.{state}", snap=target)
+        ask = rewinder.rewind
+
+        def run() -> tuple[str, dict[str, Any] | None]:
+            # Taken and released in this thread, which runs the rewind to its end whatever the
+            # browser does (a closed tab does not stop it), so the lock is held exactly as long
+            # as the rewind and the next one waits for it.
+            if not rewinding.acquire(blocking=False):
+                return "busy", None
+            try:
+                return "asked", ask(target.id)
+            except ControlUnavailable:
+                return "no_service", None
+            except ControlOutcomeUnknown as error:
+                logger.warning("a rewind from the web has no known outcome: %s", error)
+                return "unknown", None
+            except ControlError as error:
+                logger.error("a rewind from the web was not sent: %s", error)
+                return "untrusted", None
+            finally:
+                rewinding.release()
+
+        what, reply = await asyncio.to_thread(run)
+        if what == "busy":
+            return _not_now(request, t, 409, "rewind.err.busy", snap=target)
+        if reply is None:
+            status = 503 if what == "no_service" else 200
+            return _rewind_view(request, t, status, "result", snap=target, outcome=what)
+        undo = Snapshot.parse(reply["undo"]) if isinstance(reply.get("undo"), str) else None
+        return _rewind_view(
+            request,
+            t,
+            200,
+            "result",
+            snap=target,
+            outcome=reply["outcome"],
+            message=reply["message"],
+            undo=undo,
+            agent_started=reply.get("agent_started") is True,
         )
 
     # -- the stream ------------------------------------------------------------------------
@@ -545,6 +708,32 @@ def _recent(reader: BoxReader, count: int, up_to: int | None = None) -> list[Eve
     if up_to is not None:
         return reader.events(before_seq=up_to + 1, newest_first=True, limit=count)
     return reader.events(newest_first=True, limit=count)
+
+
+async def _read_form(request: Request) -> dict[str, str] | None:
+    """The rewind's form: ``FORM_FIELDS``, once each, short and printable; None for anything
+    else. Read up to ``MAX_FORM_BYTES`` whatever the request says its length is."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_FORM_BYTES:
+            return None
+    try:
+        pairs = parse_qsl(
+            body.decode("ascii"),
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=len(FORM_FIELDS),
+            errors="strict",
+        )
+    except ValueError:  # also UnicodeDecodeError, and more fields than allowed
+        return None
+    form = dict(pairs)
+    if len(pairs) != len(FORM_FIELDS) or set(form) != set(FORM_FIELDS):
+        return None
+    if any(len(value) > MAX_FIELD_CHARS or not value.isprintable() for value in form.values()):
+        return None
+    return form
 
 
 def _snapshot_window(shown: Sequence[Snapshot], now: datetime) -> timedelta:

@@ -7,7 +7,15 @@ program on this machine that listens on a port of its own (cookies ignore ports)
   * the ``Host`` header must be exactly ``127.0.0.1:<port>`` (not ``localhost``: that name can
     also resolve to ``::1``, where another program may be listening): a page on ``evil.example``
     that re-points its name at 127.0.0.1 (DNS rebinding) arrives with ITS name in ``Host``;
-  * only GET: this web is read-only, so there is nothing to forge;
+  * only GET, except ONE path: ``POST /instantaneas/rebobinar`` (T12b), the only request that
+    changes anything. A POST anywhere else, and any other method, is a 405;
+  * that POST must come from our own page: exactly one ``Origin``, ours (every browser sends it
+    on a POST), ``Sec-Fetch-Site: same-origin`` when the browser sends it (anything else, even
+    ``none``, is refused), a plain form body (``application/x-www-form-urlencoded``: no
+    ``text/plain`` or multipart tricks) with a ``Content-Length`` of at most ``MAX_FORM_BYTES``
+    (no chunked bodies). Behind that the app still wants the session cookie (never the link
+    token), the session's CSRF token from the form, and a one-time confirmation ticket for that
+    very snapshot (``vigia.web.rewind.Tickets``);
   * a browser ``Origin`` that is not ours is refused, and so is any request the browser says is
     ``same-site`` or ``cross-site`` unless it is a top-level navigation (``Sec-Fetch-Mode:
     navigate``): the stream and the fragments are only ever fetched from our own pages;
@@ -17,7 +25,18 @@ program on this machine that listens on a port of its own (cookies ignore ports)
 - ``Access``: the link carries a one-time token. The first request that uses it gets a session
   secret (a different random value) in an HttpOnly, SameSite=Strict cookie whose Path is the
   prefix, and the token stops working. A copy of the link in the shell history or the terminal
-  scrollback is then worth nothing.
+  scrollback is then worth nothing. The session also has a CSRF token (another random value),
+  which only our pages carry, in the rewind's confirmation form. Since T12b a web that runs as
+  the service's user can rewind, so a stolen, unspent link is worth a rewind too, not only a
+  look: it is printed once, and nothing else may read the terminal it is printed in.
+- What this does NOT stop: another program on this machine can set cookies for 127.0.0.1 (cookies
+  ignore ports) with ``Path=/``, enough of them to make every request too big to be served.
+  That is a denial of service of the web, not a way in: the session check reads every
+  ``vigia_web`` cookie and needs ours, which that program does not know. The CLI still works.
+- ``Referrer-Policy: same-origin`` (not ``no-referrer``): with ``no-referrer`` a browser sends
+  ``Origin: null`` on the confirmation's plain form POST (no JavaScript), which the POST check
+  refuses, as it refuses ``null`` everywhere. The pages link to no other site, so a ``Referer``
+  only ever travels back to us.
 - ``CSP``: scripts, styles, fonts and images only from this origin, no inline anything, no
   frames, no form posts elsewhere. HTMX is vendored for this reason.
 """
@@ -46,13 +65,17 @@ SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
     (b"content-security-policy", CSP.encode()),
     (b"x-frame-options", b"DENY"),
     (b"x-content-type-options", b"nosniff"),
-    (b"referrer-policy", b"no-referrer"),
+    (b"referrer-policy", b"same-origin"),
     (b"cross-origin-resource-policy", b"same-origin"),
     (b"cross-origin-opener-policy", b"same-origin"),
     (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), payment=()"),
     (b"cache-control", b"no-store"),
 )
 ALLOWED_METHODS = frozenset({"GET"})
+# The one path that takes a POST (under the prefix), and how big its form may be.
+POST_PATH = "/instantaneas/rebobinar"
+MAX_FORM_BYTES = 2048
+FORM_TYPE = "application/x-www-form-urlencoded"
 
 
 RUN_WORDS = (
@@ -95,6 +118,8 @@ class Access:
     def __init__(self, token: str, session: str | None = None) -> None:
         self._token: str | None = token
         self._session = session or secrets.token_urlsafe(TOKEN_BYTES)
+        # The form token of the session (T12b): in the pages, never in a cookie or a link.
+        self.csrf = secrets.token_urlsafe(TOKEN_BYTES)
         self._lock = threading.Lock()
 
     def use_link(self, given: str) -> str | None:
@@ -108,6 +133,9 @@ class Access:
 
     def session_is(self, given: str | None) -> bool:
         return token_matches(given, self._session)
+
+    def csrf_is(self, given: str | None) -> bool:
+        return token_matches(given, self.csrf)
 
     def session_in(self, cookie_header: str | None) -> bool:
         """Is our session among the cookies of this ``Cookie`` header? Cookies ignore ports, so
@@ -173,7 +201,11 @@ class Guard:
         hosts = [v for k, v in headers if k == b"host"]
         if len(hosts) != 1 or hosts[0].decode("latin-1").lower() not in self._hosts:
             return 400, "Host not allowed", []
-        if scope["method"] not in ALLOWED_METHODS:
+        if scope["method"] == "POST" and token_matches(scope["path"], self.base + POST_PATH):
+            refusal = self._post_refusal(headers)
+            if refusal is not None:
+                return refusal
+        elif scope["method"] not in ALLOWED_METHODS:
             return 405, "Read-only", [(b"allow", b"GET")]
         origins = [v for k, v in headers if k == b"origin"]
         if origins and (len(origins) != 1 or origins[0].decode("latin-1") not in self._origins):
@@ -184,6 +216,32 @@ class Guard:
             return 403, "Cross-site request", []
         if not self._under_prefix(scope["path"]):
             return 404, "Not found", []
+        return None
+
+    def _post_refusal(
+        self, headers: list[tuple[bytes, bytes]]
+    ) -> tuple[int, str, list[tuple[bytes, bytes]]] | None:
+        """The rewind's POST: from our own page, a small plain form, or nothing."""
+
+        def values(name: bytes) -> list[str]:
+            return [v.decode("latin-1") for k, v in headers if k == name]
+
+        origins = values(b"origin")
+        if len(origins) != 1 or origins[0] not in self._origins:
+            return 403, "A change needs our own Origin", []
+        sites = values(b"sec-fetch-site")
+        if len(sites) > 1 or (sites and sites[0].lower() != "same-origin"):
+            return 403, "Cross-site request", []
+        types = values(b"content-type")
+        if len(types) != 1 or types[0].split(";")[0].strip().lower() != FORM_TYPE:
+            return 415, "Only a plain form", []
+        if values(b"transfer-encoding"):
+            return 411, "Length required", []
+        lengths = values(b"content-length")
+        if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
+            return 411, "Length required", []
+        if len(lengths[0]) > 6 or int(lengths[0]) > MAX_FORM_BYTES:
+            return 413, "Too large", []
         return None
 
     def _under_prefix(self, path: str) -> bool:

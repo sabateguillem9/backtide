@@ -24,6 +24,7 @@ class Reason(StrEnum):
     MANUAL = "manual"
     PRE_RESTORE = "pre_restore"
     RECOVERED = "recovered"
+    EVIDENCE = "evidence"  # T08: taken because an event had risk 3; never pruned
 
 
 @dataclass(frozen=True)

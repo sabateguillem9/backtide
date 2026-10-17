@@ -381,13 +381,15 @@ def test_resume_without_a_pause_does_nothing(live: World) -> None:
 
 
 def test_resume_keeps_the_agent_paused_for_another_reason(frozen: World) -> None:
+    # `seguir` closes the space pause and the person's own (T09, test_service_user_pause.py);
+    # a reason it does not know stays.
     with frozen.guardian.freeze_lock:
-        frozen.guardian._pause_reasons.add("user")  # noqa: SLF001 - T09's pause
+        frozen.guardian._pause_reasons.add("other")  # noqa: SLF001
     script(frozen, [])
     outcome = frozen.guardian.resume(requested_by="cli")
     assert outcome.status is ResumeStatus.STILL_PAUSED
     assert frozen.jail.paused
-    assert frozen.guardian.pause_reasons == {"user"}
+    assert frozen.guardian.pause_reasons == {"other"}
     assert frozen.only("space_resume").details["agent"] == "still_paused"
 
 

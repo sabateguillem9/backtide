@@ -427,12 +427,16 @@ def _remove_agent(jail: AgentJail) -> None:
 
 
 @contextmanager
-def _mounted_btrfs(base: Path, size: int, *, squota: bool = False) -> Iterator[Path]:
+def _mounted_btrfs(
+    base: Path, size: int, *, squota: bool = False, fs_size: int | None = None
+) -> Iterator[Path]:
     """Format a sparse ``size``-byte image in ``base`` and mount it at ``base/mnt``.
 
     ``base`` must come from ``tmp_path_factory.mktemp``, so its parent is this session's
     pytest base directory. ``squota`` formats it with simple quotas enabled (mkfs runs on the
-    image file, so it needs no privileges)."""
+    image file, so it needs no privileges). ``fs_size`` makes the btrfs smaller than the image
+    (``mkfs.btrfs -b``): the loop device already sees the whole file, so growing it needs only
+    ``btrfs filesystem resize max`` (test_grow.py), never ``losetup --set-capacity``."""
     base = base.resolve()  # mountinfo and the loop device report resolved paths
     _require_dev_vm_user_with_sudo()
     img, mnt = base / VOLUME_IMAGE, base / "mnt"
@@ -442,6 +446,8 @@ def _mounted_btrfs(base: Path, size: int, *, squota: bool = False) -> Iterator[P
         with open(img, "xb") as image:  # x: never reuse or overwrite an existing file
             image.truncate(size)
         features = ["-O", "squota"] if squota else []
+        if fs_size is not None:
+            features += ["-b", str(fs_size)]
         _run([_require_binary("mkfs.btrfs"), "-q", "-L", "vigia-test", *features, str(img)])
         _sudo("mount", "-o", MOUNT_OPTIONS, str(img), str(mnt))
         try:

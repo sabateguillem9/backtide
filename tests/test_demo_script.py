@@ -107,3 +107,44 @@ def test_the_live_view_shows_the_demo_files_and_hides_the_agents_own_noise() -> 
     snapshot = demo.describe(_event(Source.SNAPSHOT, "take", "20261016T151947.648086Z-periodic"))
     assert snapshot is not None and "instantánea" in snapshot
     assert datetime.strptime(snapshot[:8], "%H:%M:%S")  # a time, in the local zone
+
+
+def _paths_with_state(tmp_path: Path) -> "demo.Paths":
+    paths = demo.Paths(tmp_path / "demo")
+    paths.state.mkdir(parents=True, mode=0o700)
+    return paths
+
+
+def test_the_founders_bot_is_copied_with_mode_600(tmp_path: Path) -> None:
+    source = tmp_path / "telegram.toml"
+    source.write_bytes(b'token = "1:fake"\nchat_id = 1\n')
+    source.chmod(0o600)
+    paths = _paths_with_state(tmp_path)
+    assert demo.copy_telegram(paths, source)
+    copied = paths.state / "telegram.toml"
+    assert copied.read_bytes() == source.read_bytes()
+    assert copied.stat().st_mode & 0o777 == 0o600
+
+
+def test_without_a_bot_there_is_nothing_to_copy(tmp_path: Path) -> None:
+    paths = _paths_with_state(tmp_path)
+    assert not demo.copy_telegram(paths, tmp_path / "missing.toml")
+    assert not (paths.state / "telegram.toml").exists()
+
+
+def test_a_bot_file_others_can_read_is_refused(tmp_path: Path) -> None:
+    source = tmp_path / "telegram.toml"
+    source.write_bytes(b'token = "1:fake"\n')
+    source.chmod(0o644)
+    with pytest.raises(demo.DemoError, match="600"):
+        demo.copy_telegram(_paths_with_state(tmp_path), source)
+
+
+def test_a_linked_bot_file_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "real.toml"
+    real.write_bytes(b'token = "1:fake"\n')
+    real.chmod(0o600)
+    link = tmp_path / "telegram.toml"
+    link.symlink_to(real)
+    with pytest.raises(demo.DemoError, match="archivo normal"):
+        demo.copy_telegram(_paths_with_state(tmp_path), link)

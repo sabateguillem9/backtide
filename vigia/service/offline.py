@@ -32,7 +32,7 @@ from vigia.notify import AlertQueue, LogNotifier, Notifier
 from vigia.service.config import ServiceConfig
 from vigia.service.guardian import Guardian
 from vigia.service.rewind import RewindOutcome
-from vigia.service.runner import _stop_unrecorded_agent, open_black_box
+from vigia.service.runner import _stop_unrecorded_agent, make_grower, open_black_box
 from vigia.snapshots import Snapshot, SnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ def rewind_without_service(
         blackbox=box,
         watcher=NullWatcher(),
         alerts=alerts,
-        **(guardian_options or {}),
+        **{"grow": make_grower(config), **(guardian_options or {})},
     )
     alerts.start()
     try:

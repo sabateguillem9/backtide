@@ -215,7 +215,7 @@ def test_the_report_says_pending_and_never_yes_for_what_was_not_checked() -> Non
     lines = format_scenario(scenario, Result(outcome="passed", evidence={}))
     text = "\n".join(lines)
     assert "sin comprobar" in text  # nothing was checked
-    assert "pendiente (T07)" in text and "pendiente (T08)" in text
+    assert "pendiente (T07)" in text  # recorded and risk both wait for the process sensor
     assert text.splitlines()[0].startswith("[OK]")
 
 

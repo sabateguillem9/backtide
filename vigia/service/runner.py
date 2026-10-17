@@ -31,15 +31,26 @@ from pathlib import Path
 from types import FrameType, TracebackType
 from typing import Protocol
 
+from vigia.analyzer import (
+    AssessedBlackBox,
+    RiskResponder,
+    RulesError,
+    RuleSet,
+    default_rules,
+    parse_rules,
+)
 from vigia.blackbox import BlackBox, BlackBoxError, create_key, load_key
 from vigia.jail import AgentJail, JailError
-from vigia.notify import AlertQueue, LogNotifier, Notifier
+from vigia.notify import AlertQueue, FanOut, LogNotifier, Notifier
 from vigia.sensors.files import FileWatcher, WatcherConfig
-from vigia.service.config import ServiceConfig
+from vigia.service.bot import Hooks, telegram_parts
+from vigia.service.config import ConfigError, ServiceConfig
 from vigia.service.control import ControlServer
 from vigia.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
 from vigia.service.pause import Holder, make_space_gate, read_holders
+from vigia.service.telegram_config import load_telegram
 from vigia.snapshots import SnapshotStore
+from vigia.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +193,21 @@ def open_black_box(config: ServiceConfig) -> BlackBox:
     return BlackBox(config.blackbox_db, key, checkpoint_path=config.blackbox_checkpoint)
 
 
+def load_rules(config: ServiceConfig) -> RuleSet:
+    """The risk rules: ``<state_dir>/rules.toml`` if it exists (it REPLACES the default ones),
+    else the ones that ship with Vigía. A file that is wrong is a ConfigError that says which
+    rule and which key: the service does not start with rules nobody can read."""
+    text = config.read_rules()
+    try:
+        if text is None:
+            return default_rules()
+        return parse_rules(text, origin=str(config.rules_file))
+    except RulesError as error:
+        raise ConfigError(f"{config.rules_file}: {error}") from None
+    except Exception as error:  # the packaged file missing or broken: the same refusal
+        raise ConfigError(f"las reglas de riesgo no se pueden leer: {error}") from error
+
+
 def build_guardian(
     config: ServiceConfig,
     *,
@@ -190,6 +216,7 @@ def build_guardian(
     watcher_config: WatcherConfig | None = None,
     store: SnapshotStore | None = None,
     space: SpaceGate | None = None,
+    grow: VolumeGrower | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -198,8 +225,17 @@ def build_guardian(
     (``make_space_gate``) and the reader of what holds the space. Without one there is no cap
     to measure against and the pause is off, which is logged. ``store`` and ``space`` replace
     the real ones (the VM tests: a cap set through their one sudo command, and a gate that does
-    not count the VM's tmpfs against P6)."""
+    not count the VM's tmpfs against P6).
+
+    The emergency growth (T04e-1) gets the configured image and ceiling, if any, and the
+    privileged steps ``NOT_CONFIGURED``: until T13 decides how Vigía gets that privilege, a
+    growth is recorded as failed at its first step and nothing changes. ``grow`` replaces it."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
+    try:
+        rules = load_rules(config)  # a broken file is an error, not a guess
+    except ConfigError as error:
+        _stop_unrecorded_agent(jail, error, what="las reglas de riesgo no se pueden usar")
+        raise
     try:
         box = open_black_box(config)
     except BlackBoxError as error:
@@ -213,43 +249,65 @@ def build_guardian(
         logger.warning(
             "no workspace_limit is configured: the agent is not paused for lack of space"
         )
-    watcher = FileWatcher(
-        jail.config.agent_dir, box, workspace_id=store.workspace_id, config=watcher_config
-    )
     alerts = AlertQueue(notifier if notifier is not None else LogNotifier())
+    # The rules sit in front of the black box (T08): the Guardian and the watcher record through
+    # it, and an event of risk 3 gets an evidence snapshot and an alert.
+    responder = RiskResponder(alerts)
+    rated_box = AssessedBlackBox(box, rules, responder)
+    watcher = FileWatcher(
+        jail.config.agent_dir, rated_box, workspace_id=store.workspace_id, config=watcher_config
+    )
     holders_of = store
 
     def holders() -> list[Holder]:
         return read_holders(holders_of)
 
+    if grow is None:
+        grow = make_grower(config)
     guardian = Guardian(
         config,
         store=store,
         jail=jail,
-        blackbox=box,
+        blackbox=rated_box,
         watcher=watcher,
         alerts=alerts,
         space=space,
         holders=holders,
+        grow=grow,
+        risk=responder,
     )
+    responder.bind(snapshot=guardian.take_evidence, record=rated_box.append)
     return guardian, alerts, box
 
 
-def _stop_unrecorded_agent(jail: AgentJail, error: BlackBoxError) -> None:
-    """The black box cannot be used, so the Guardian (which would do this) does not exist yet.
-    An agent that a killed service left running is running unrecorded: stop it. Raises a
-    JailError, caused by ``error``, if it cannot be stopped; else adds a note to ``error``."""
+def make_grower(config: ServiceConfig) -> VolumeGrower:
+    """The emergency growth of the volume (T04e-1) as configured: the image and the ceiling,
+    if both are set, and the privileged steps ``NOT_CONFIGURED`` until T13 decides how Vigía
+    gets that privilege (a growth then fails at its first step and changes nothing)."""
+    limits = None
+    if config.volume_image is not None and config.max_volume_bytes is not None:
+        limits = GrowLimits(config.volume_image, config.max_volume_bytes)
+    return VolumeGrower(config.volume, limits, steps=NOT_CONFIGURED)
+
+
+def _stop_unrecorded_agent(
+    jail: AgentJail, error: Exception, *, what: str = "la caja negra no se puede usar"
+) -> None:
+    """The black box (or the rules) cannot be used, so the Guardian (which would do this) does
+    not exist yet. An agent that a killed service left running is running unrecorded: stop it.
+    Raises a JailError, caused by ``error``, if it cannot be stopped; else adds a note to
+    ``error``. ``what`` says why, in Spanish, for the JailError."""
     try:
         running = jail.is_running()
     except JailError:
         running = True  # cannot tell: halt_agent confirms
     if not running:
         return
-    logger.error("cannot use the black box, so the agent that was running is stopped: %s", error)
+    logger.error("the service cannot start, so the agent that was running is stopped: %s", error)
     stop_error = halt_agent(jail, kill_first=True)  # unwatched: no `docker stop` grace period
     if stop_error is not None:
         raise JailError(
-            f"EL AGENTE SIGUE EN MARCHA sin vigilancia: la caja negra no se puede usar ({error}) "
+            f"EL AGENTE SIGUE EN MARCHA sin vigilancia: {what} ({error}) "
             f"y no se ha podido parar: {stop_error}"
         ) from error
     error.add_note("Se ha parado al agente que estaba en marcha: sin grabar no hay vigilancia.")
@@ -352,8 +410,16 @@ def serve(
     ServiceLocked, ControlError (the socket cannot be opened; the agent is stopped then),
     BlackBoxError, ConfigError-like errors from the parts, ``UnrewindableConfig`` (the caller
     shows its ``notice``) or, if the agent could not be stopped, the JailError that says it
-    keeps running."""
+    keeps running.
+
+    With ``<state_dir>/telegram.toml`` (T09) the alerts also go to Telegram and the bot runs
+    inside the service, started after the control socket and closed before it; an unusable
+    file is a ConfigError, before anything starts."""
+    settings = load_telegram(config.state_dir)
     with take_lock(config.lock_file):
+        telegram = telegram_parts(config, settings) if settings is not None else None
+        if telegram is not None:
+            notifier = FanOut(notifier or LogNotifier(), telegram.notifier)
         guardian, alerts, box = build_guardian(
             config,
             jail=jail,
@@ -362,7 +428,11 @@ def serve(
             store=store,
             space=space,
         )
-        control = ControlServer(guardian, config.control_socket)
+        control: ControlHook = ControlServer(guardian, config.control_socket)
+        if telegram is not None:
+            snapshots = store if store is not None else SnapshotStore(config.volume)
+            telegram.actions.bind(guardian, box, snapshots)
+            control = Hooks(control, telegram.bot)
         run_guardian(
             guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control
         )

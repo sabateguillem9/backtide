@@ -8,6 +8,8 @@
   {% include "tide_frame.html" %}
   <p class="note preview-hint" hidden>{{ t('snaps.preview') }}</p>
   {% if error and box_unreadable %}<p class="note">{{ t('snaps.unreadable') }} {{ t('box.unreadable') }}</p>{% elif error %}<p class="note source">{{ t('snaps.from_box') }}</p>{% endif %}
+  {% if rows and rewind_state != 'ready' %}<p class="note rewind-off">{{ t('rewind.off.' ~ rewind_state) }}</p>{% endif %}
+  <div id="rewind-panel" class="rewind-panel" aria-live="polite"></div>
   {% if not rows %}
   <p class="note">{{ t('snaps.empty') }}</p>
   {% else %}
@@ -24,8 +26,12 @@
         <span class="sid">{{ vis(snap.id, 80) }}</span>
       </div>
       <span class="rewind">
-        <small>{{ t('snaps.rewind.soon') }}</small>
-        <button class="dot-button" type="button" disabled aria-label="{{ t('snaps.rewind') }}: {{ t('snaps.rewind.soon') }}">{% include "arrow.html" %}</button>
+        {% if rewind_state == 'ready' %}
+        <small>{{ t('snaps.rewind') }}</small>
+        <a class="dot-button rewind-go" href="{{ base }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-get="{{ base }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-target="#rewind-panel" hx-swap="innerHTML" aria-label="{{ t('snaps.rewind.to', time=day_time(snap.taken_at)) }}">{% include "arrow.html" %}</a>
+        {% else %}
+        <button class="dot-button" type="button" disabled aria-label="{{ t('snaps.rewind') }}: {{ t('snaps.rewind.off') }}">{% include "arrow.html" %}</button>
+        {% endif %}
       </span>
     </li>
     {% endfor %}

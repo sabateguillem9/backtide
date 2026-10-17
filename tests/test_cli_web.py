@@ -72,7 +72,7 @@ def test_it_never_asks_for_the_key_or_the_token(
         "from_file",
         classmethod(lambda *a, **k: pytest.fail("the web read the whole configuration")),
     )
-    monkeypatch.setattr(server_module, "run_web", lambda paths, port, announce: None)
+    monkeypatch.setattr(server_module, "run_web", lambda paths, port, announce, **_: None)
     assert run(capsys, "web", "--config", config_file)[0] == 0
 
 
@@ -81,8 +81,8 @@ def test_it_prints_the_link_once_and_the_name_of_the_run_and_opens_nothing(
 ) -> None:
     seen = {}
 
-    def fake(paths: WebPaths, port: int, announce) -> None:
-        seen.update(paths=paths, port=port)
+    def fake(paths: WebPaths, port: int, announce, **options) -> None:
+        seen.update(paths=paths, port=port, **options)
         announce("http://127.0.0.1:8765/s/abc/?t=SECRET", "marea-faro-nube")
 
     monkeypatch.setattr(server_module, "run_web", fake)
@@ -92,12 +92,50 @@ def test_it_prints_the_link_once_and_the_name_of_the_run_and_opens_nothing(
     assert "solo en este ordenador" in out and "Ctrl-C" in out
     assert "Nombre de esta ejecución: marea-faro-nube" in out and "una sola vez" in out
     assert seen["port"] == 8765 and isinstance(seen["paths"], WebPaths)
+    # T12b: whether this web can rewind, said once at the start. Writes are explicit: without
+    # --rebobinar it only watches.
+    assert seen["can_rewind"] is False
+    assert "Rebobinar desde la web: no; sin `--rebobinar` esta web solo mira" in out
+
+
+def test_with_the_flag_it_may_rewind_once_the_service_runs(
+    capsys, config_file: Path, recorded: BlackBox, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake(paths: WebPaths, port: int, announce, **options) -> None:
+        seen.update(options)
+        announce("http://x", "a-b-c")
+
+    monkeypatch.setattr(server_module, "run_web", fake)
+    code, out, _ = run(capsys, "web", "--config", config_file, "--rebobinar")
+    assert code == 0 and seen["can_rewind"] is True
+    assert "Rebobinar desde la web: cuando el servicio esté en marcha" in out
+
+
+def test_a_web_of_another_user_says_it_cannot_rewind(
+    capsys, config_file: Path, recorded: BlackBox, monkeypatch
+) -> None:
+    from vigia.web import rewind as web_rewind
+
+    monkeypatch.setattr(
+        web_rewind.ControlRewinder,
+        "availability",
+        lambda self: web_rewind.Availability.OTHER_USER,
+    )
+    monkeypatch.setattr(
+        server_module, "run_web", lambda paths, port, announce, **_: announce("http://x", "a-b-c")
+    )
+    out = run(capsys, "web", "--config", config_file, "--rebobinar")[1]
+    assert "Rebobinar desde la web: no" in out and "vigia rebobinar" in out
 
 
 @pytest.mark.parametrize("flag", ["--puerto", "--port"])
 def test_the_port_can_be_chosen(capsys, config_file: Path, monkeypatch, flag: str) -> None:
     ports = []
-    monkeypatch.setattr(server_module, "run_web", lambda paths, port, announce: ports.append(port))
+    monkeypatch.setattr(
+        server_module, "run_web", lambda paths, port, announce, **_: ports.append(port)
+    )
     assert run(capsys, "web", "--config", config_file, flag, "9123")[0] == 0
     assert ports == [9123]
 
@@ -158,3 +196,30 @@ def test_the_real_web_of_a_real_config(config_file: Path, recorded: BlackBox, mo
         servers[0].should_exit = True
         thread.join(10)
     assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("euid", [0, 1000])
+def test_a_web_run_as_root_needs_the_flag_and_says_so(
+    capsys, config_file: Path, recorded: BlackBox, monkeypatch, euid: int
+) -> None:
+    """T12b: a root web has every privilege of root. Without --rebobinar it does not start (to
+    watch, run it as a reader); with it, it starts and says so."""
+    import vigia.cli as cli_module
+
+    started = []
+    monkeypatch.setattr(cli_module, "_effective_uid", lambda: euid)
+    monkeypatch.setattr(
+        server_module,
+        "run_web",
+        lambda paths, port, announce, **_: (started.append(1), announce("http://x", "a-b-c")),
+    )
+    code, out, err = run(capsys, "web", "--config", config_file)
+    if euid == 0:
+        assert code == 2 and started == []
+        assert "como root" in err and "--rebobinar" in err and "usuario lector" in err
+    else:
+        assert code == 0 and started == [1]
+    code, out, _ = run(capsys, "web", "--config", config_file, "--rebobinar")
+    assert code == 0
+    warned = "Ojo: esta web corre como root; para solo mirar, lánzala con un usuario lector" in out
+    assert warned is (euid == 0)

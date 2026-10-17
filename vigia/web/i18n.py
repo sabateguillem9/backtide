@@ -130,7 +130,53 @@ ES: dict[str, str] = {
     "snaps.reason": "Motivo",
     "snaps.age": "Hace",
     "snaps.rewind": "Rebobinar",
-    "snaps.rewind.soon": "muy pronto",
+    "snaps.rewind.off": "no disponible",
+    "snaps.rewind.to": "Rebobinar a {time}",
+    # the rewind (T12b)
+    "rewind.off.no_service": "Para rebobinar desde aquí, el servicio de Vigía tiene que estar en "
+    "marcha (`vigia vigilar`).",
+    "rewind.off.other_user": "Esta web corre como un usuario de solo lectura y no puede pedir un "
+    "rebobinado. Para hacerlo desde aquí, lánzala con el mismo usuario que el servicio; si no, "
+    "usa `vigia rebobinar`.",
+    "rewind.off.off": "Rebobinar no está disponible desde esta web: usa `vigia rebobinar`.",
+    "rewind.off.list": "Sin la lista del propio volumen de instantáneas no se rebobina desde "
+    "aquí: usa `vigia rebobinar`.",
+    "rewind.off.ready": "Se puede rebobinar.",
+    "rewind.off.disabled": "Esta web solo mira. Para rebobinar desde aquí, lánzala con "
+    "`vigia web --rebobinar` y con el mismo usuario que el servicio; si no, usa `vigia rebobinar`.",
+    "rewind.err.used": "Esta confirmación ya se ha usado: mira en Instantáneas cómo ha ido antes "
+    "de pedir otra.",
+    "rewind.confirm.title": "¿Rebobinar a esta instantánea?",
+    "rewind.notice.same": "Es el mismo aviso que da `vigia rebobinar`.",
+    "rewind.confirm.yes": "Rebobinar",
+    "rewind.confirm.no": "Cancelar",
+    "rewind.working": "Rebobinando: la marea vuelve atrás. Puede tardar unos segundos.",
+    "rewind.out.done": "Hecho: el espacio de trabajo ha vuelto a esta instantánea.",
+    "rewind.out.problem": "Se ha rebobinado, pero algo ha fallado después.",
+    "rewind.out.failed": "No se ha rebobinado: el espacio de trabajo no ha cambiado.",
+    "rewind.out.unknown": "No se sabe si se ha rebobinado. Mira las instantáneas y la caja negra "
+    "antes de repetirlo.",
+    "rewind.out.refused": "El servicio no ha aceptado la petición: no se ha hecho nada.",
+    "rewind.out.invalid": "El servicio no ha aceptado la petición: no se ha hecho nada.",
+    "rewind.out.no_service": "El servicio no contesta: no se ha hecho nada. Para rebobinar desde "
+    "aquí, tiene que estar en marcha (`vigia vigilar`).",
+    "rewind.out.untrusted": "No se puede hablar con el servicio de forma segura: no se ha hecho "
+    "nada. El motivo está en el registro de `vigia web`.",
+    "rewind.said": "El servicio dice:",
+    "rewind.agent.started": "El agente está en marcha otra vez.",
+    "rewind.agent.stopped": "El agente no se ha arrancado.",
+    "rewind.undo": "Para deshacerlo, rebobina a este punto:",
+    "rewind.undo.none": "No se ha podido guardar un punto para deshacer.",
+    "rewind.back": "Volver a las instantáneas",
+    "rewind.not.title": "No se ha rebobinado",
+    "rewind.err.not_listed": "Esa instantánea no está en la lista: no se ha hecho nada.",
+    "rewind.err.form": "La petición no es la que manda esta página: no se ha hecho nada.",
+    "rewind.err.expired": "Esta confirmación ya no vale (sirve una vez y caduca a los 10 "
+    "minutos): no se ha hecho nada. Vuelve a pedirla.",
+    "rewind.err.lost": "No ha llegado respuesta. Puede que no se haya hecho nada, o que sí: "
+    "recarga la página y mira las instantáneas antes de repetirlo.",
+    "rewind.err.busy": "Ya hay un rebobinado en marcha. Espera a que termine: no se ha hecho "
+    "nada más.",
     "snaps.empty": "No hay instantáneas todavía.",
     "snaps.unreadable": "No se puede leer el volumen de instantáneas desde aquí.",
     "snaps.fallback": "Esto es lo que dice la caja negra.",
@@ -366,7 +412,52 @@ EN: dict[str, str] = {
     "snaps.reason": "Reason",
     "snaps.age": "Ago",
     "snaps.rewind": "Rewind",
-    "snaps.rewind.soon": "coming soon",
+    "snaps.rewind.off": "not available",
+    "snaps.rewind.to": "Rewind to {time}",
+    # the rewind (T12b)
+    "rewind.off.no_service": "To rewind from here, Vigía's service has to be running "
+    "(`vigia vigilar`).",
+    "rewind.off.other_user": "This web runs as a read-only user and cannot ask for a rewind. To "
+    "rewind from here, start it as the same user as the service; otherwise use "
+    "`vigia rebobinar`.",
+    "rewind.off.off": "Rewinding is not available from this web: use `vigia rebobinar`.",
+    "rewind.off.list": "Without the snapshot volume's own list there is no rewinding from "
+    "here: use `vigia rebobinar`.",
+    "rewind.off.ready": "Rewinding is possible.",
+    "rewind.off.disabled": "This web only watches. To rewind from here, start it with "
+    "`vigia web --rebobinar` as the same user as the service; otherwise use `vigia rebobinar`.",
+    "rewind.err.used": "This confirmation has already been used: check the snapshots to see how "
+    "it went before asking for another.",
+    "rewind.confirm.title": "Rewind to this snapshot?",
+    "rewind.notice.same": "The same notice `vigia rebobinar` gives, in Spanish for now.",
+    "rewind.confirm.yes": "Rewind",
+    "rewind.confirm.no": "Cancel",
+    "rewind.working": "Rewinding: the tide goes back. It can take a few seconds.",
+    "rewind.out.done": "Done: the workspace is back at this snapshot.",
+    "rewind.out.problem": "Rewound, but something failed afterwards.",
+    "rewind.out.failed": "Not rewound: the workspace did not change.",
+    "rewind.out.unknown": "It is not known whether it rewound. Check the snapshots and the black "
+    "box before trying again.",
+    "rewind.out.refused": "The service did not accept the request: nothing was done.",
+    "rewind.out.invalid": "The service did not accept the request: nothing was done.",
+    "rewind.out.no_service": "The service does not answer: nothing was done. To rewind from "
+    "here, it has to be running (`vigia vigilar`).",
+    "rewind.out.untrusted": "The service cannot be talked to safely: nothing was done. The "
+    "reason is in the log of `vigia web`.",
+    "rewind.said": "The service says:",
+    "rewind.agent.started": "The agent is running again.",
+    "rewind.agent.stopped": "The agent was not started.",
+    "rewind.undo": "To undo it, rewind to this point:",
+    "rewind.undo.none": "No undo point could be saved.",
+    "rewind.back": "Back to the snapshots",
+    "rewind.not.title": "Not rewound",
+    "rewind.err.not_listed": "That snapshot is not in the list: nothing was done.",
+    "rewind.err.form": "That request is not the one this page sends: nothing was done.",
+    "rewind.err.expired": "This confirmation is no longer valid (it works once and expires "
+    "after 10 minutes): nothing was done. Ask for it again.",
+    "rewind.err.lost": "No answer came back. Maybe nothing was done, maybe it was: reload the "
+    "page and check the snapshots before trying again.",
+    "rewind.err.busy": "A rewind is already running. Wait for it to finish: nothing else was done.",
     "snaps.empty": "No snapshots yet.",
     "snaps.unreadable": "The snapshot volume cannot be read from here.",
     "snaps.fallback": "This is what the black box says.",

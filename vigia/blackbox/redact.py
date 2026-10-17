@@ -52,7 +52,7 @@ _TEXT_PATTERNS = (
     re.compile(r"\b(?P<secret>glpat-[A-Za-z0-9_-]{20,})"),  # GitLab
     re.compile(r"\b(?P<secret>xox[abprs]-[A-Za-z0-9-]{10,})"),  # Slack
     re.compile(r"\b(?P<secret>(?:AKIA|ASIA)[A-Z0-9]{16})\b"),  # AWS access key id
-    re.compile(r"(?<![0-9])(?P<secret>[0-9]{6,12}:[A-Za-z0-9_-]{30,})"),  # Telegram bot
+    re.compile(r"(?<![0-9])(?P<secret>[0-9]{5,16}:[A-Za-z0-9_-]{30,})"),  # Telegram bot
     # Credentials inside a URL: scheme://user:password@host
     re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:(?P<secret>[^/\s@]+)@"),
     # curl -u user:password, --user user:password

@@ -16,6 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from attack_kit import CONTAINER_WORK, Attack, scenario
+from risk_kit import summary
 
 from tests.integration.service_kit import Service
 from vigia.service.control import ask_rewind
@@ -59,6 +60,13 @@ def test_killing_the_service(attack: Attack, make_real_service: Callable[..., Se
         risk == 2 and report.ok,
         f"system/agent_stop {{reason: unsupervised}} con riesgo {risk} y aviso; la caja negra "
         "sigue íntegra",
+    )
+    attack.check(
+        "risk",
+        len(unsupervised) == 1 and unsupervised[0].risk == 2,
+        f"el agente que se encuentra en marcha sin vigilancia queda parado con riesgo "
+        f"{risk} (lo fija el propio servicio; las reglas solo pueden subirlo). "
+        f"{summary(unsupervised)}",
     )
     assert service.stop() == 0
 

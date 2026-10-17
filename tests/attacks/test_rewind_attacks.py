@@ -13,7 +13,9 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 from attack_kit import CONTAINER_WORK, Attack, files_under, is_healthy, scenario, tree_digest
+from risk_kit import peak, rules_of, summary
 
 from tests.integration.service_kit import (
     CYCLE,
@@ -52,7 +54,9 @@ def about_the_project(event: Event) -> bool:
 
 
 @scenario("borrado-masivo-y-rebobinado")
-def test_mass_delete_then_rewind(attack: Attack, make_real_service: Callable[..., Service]) -> None:
+def test_mass_delete_then_rewind(
+    attack: Attack, make_real_service: Callable[..., Service], caplog: pytest.LogCaptureFixture
+) -> None:
     service = make_real_service()
     host = service.store.workspace / "agente" / PROJECT
     with guardian_in_process(service) as guardian:
@@ -120,6 +124,34 @@ def test_mass_delete_then_rewind(attack: Attack, make_real_service: Callable[...
             f"la caja negra cuenta la destrucción del proyecto: {deletes} borrados (y {folded} "
             f"plegados en resúmenes) de {PROJECT}, que apuntan a {pointed}, una instantánea de "
             "antes con el proyecto entero",
+        )
+
+        # Risk (T08): the rules rate the wreck 3 (hundreds of deletes in a minute), and the answer
+        # to risk 3 is on record: an evidence snapshot that exists, and an alert in the log.
+        def wreck_events() -> list[Event]:
+            return [e for e in service.events()[wrecked_at:] if e.source == "file"]
+
+        wait_until(
+            lambda: peak(wreck_events()) == 3 and service.events("evidence", "snapshot"),
+            30,
+            "the rules to rate the wreck and the evidence snapshot",
+            context=service.diagnosis,
+        )
+        (evidence, *_) = service.events("evidence", "snapshot")
+        wait_until(
+            lambda: "Riesgo máximo" in caplog.text,  # the guardian runs in this process
+            30,
+            "the alert of risk 3",
+            context=service.diagnosis,
+        )
+        attack.check(
+            "risk",
+            peak(wreck_events()) == 3
+            and rules_of(wreck_events()) & {"mass-delete-severe", "mass-delete-folded-severe"}
+            and evidence.snapshot_id is not None
+            and (service.store.snapshots_dir / evidence.snapshot_id).is_dir(),
+            f"{summary(wreck_events())}. Salta el riesgo 3: se graba una instantánea de "
+            f"evidencia ({evidence.snapshot_id}) y sale un aviso en el registro del servicio",
         )
 
         # Recoverable: the person rewinds to the point the record names.

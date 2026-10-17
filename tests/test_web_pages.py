@@ -342,10 +342,10 @@ def test_snapshots_list_newest_first_with_a_disabled_rewind(tmp_path: Path) -> N
     ids = re.findall(r'<span class="sid">([^<]+)</span>', html)
     assert ids == sorted((s.id for s in snaps), reverse=True)
     assert html.count('<button class="dot-button" type="button" disabled') == 4
-    assert html.count("muy pronto") >= 4
+    assert "no está disponible desde esta web" in html, "without a rewinder: disabled, and why"
     assert "periódica" in html and "manual" in html
     assert "hace 2 min" in text_of(html)
-    assert "<form" not in html, "nothing here can rewind yet"
+    assert "<form" not in html, "the list itself never rewinds (T12b: only the confirmation)"
     assert not re.search(r"<a [^>]*rebobinar|hx-(post|put|delete|get)=\"[^\"]*rebob", html, re.I)
 
 
@@ -362,7 +362,7 @@ def test_snapshots_in_english(tmp_path: Path) -> None:
     now = datetime(2026, 10, 16, 10, 0, tzinfo=UTC)
     web = new_client(tmp_path, snapshots=lambda: snapshots(1, now))
     text = text_of(web.get("/instantaneas", headers={"accept-language": "en"}).text)
-    assert "coming soon" in text and "periodic" in text and "2 min ago" in text
+    assert "not available from this web" in text and "periodic" in text and "2 min ago" in text
 
 
 def test_an_unreadable_volume_falls_back_to_what_the_black_box_says(

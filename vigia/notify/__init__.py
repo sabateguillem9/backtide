@@ -6,7 +6,8 @@ Design: docs/19-diseno-t04.md, section 3 ("Avisos").
   recorded first.
 - Whoever alerts never does network I/O, and least of all while holding the volume lock: alerts
   go into an ``AlertQueue`` and one thread of its own hands them to a ``Notifier``. Telegram (T09)
-  is one more Notifier; today there is only ``LogNotifier``.
+  is one more Notifier (``vigia.notify.telegram``): with it, ``FanOut`` hands every alert to the
+  log and then to Telegram.
 - A queue that is full refuses a new WARNING, or pushes out the oldest non-ERROR to make room for
   an ERROR; it never blocks, counts what it loses and reports it later.
 - ``LogBridge`` is a ``logging.Handler``: every WARNING or ERROR of the ``vigia.*`` loggers (the
@@ -81,6 +82,24 @@ class LogNotifier:
         }[alert.level]
         cited = f" (evento {alert.event_seq})" if alert.event_seq is not None else ""
         self._logger.log(level, "%s: %s%s", _printable(alert.title), _printable(alert.body), cited)
+
+
+class FanOut:
+    """Hands each alert to every notifier in turn (the log, then Telegram): one that fails
+    does not stop the others, and the first failure is raised after all were tried."""
+
+    def __init__(self, *notifiers: Notifier) -> None:
+        self._notifiers = notifiers
+
+    def send(self, alert: Alert) -> None:
+        failure: Exception | None = None
+        for notifier in self._notifiers:
+            try:
+                notifier.send(alert)
+            except Exception as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
 
 
 class AlertQueue:

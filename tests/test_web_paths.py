@@ -21,6 +21,8 @@ def test_it_reads_the_state_and_the_volume_and_nothing_else(tmp_path: Path) -> N
     paths = WebPaths.from_file(config)
     assert paths.blackbox_db == Path("/var/lib/vigia/blackbox.db")
     assert paths.volume == Path("/mnt/vol")
+    # T12b: where the service listens (the web only connects; it never opens a secret)
+    assert paths.control_socket == Path("/var/lib/vigia/control.sock")
 
 
 def test_a_complete_service_config_is_accepted_as_it_is(tmp_path: Path) -> None:

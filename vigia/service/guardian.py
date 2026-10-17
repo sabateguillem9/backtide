@@ -46,7 +46,13 @@ says something changed, and stops it. Design: docs/19-diseno-t04.md, section 3.
   survives the service: at boot the open ones are read back from the black box and the agent
   stays stopped until ``vigia seguir``. If freezing fails, the agent is killed.
 
-Not here yet: growth (T04e).
+- **The emergency growth** (T04e-1, docs/19 section 6, ``vigia.snapshots.grow``): a rewind that
+  fails for lack of space kills the agent and opens the pause ``rewind_no_space`` (as before);
+  then the volume grows once, within its limits (``snapshot/volume_grow``), and the rewind is
+  retried once with the same request id and intent. If it was swapped but its undo point could
+  not be published (``RestoreIncomplete``), the growth is followed by ``store.recover()``
+  instead of a second rewind. Never deletes a snapshot to make room. Until T13 gives Vigía the
+  privilege, the production steps say "not configured" and nothing grows.
 
 Synchronous and thread-hostile in the places that matter: ``start()``, ``cycle()`` and
 ``stop()`` are called by one thread (``run()``); ``rewind()`` may come from another one.
@@ -78,6 +84,8 @@ from vigia.service.clock import clock_synced as kernel_clock_synced
 from vigia.service.config import ServiceConfig
 from vigia.service.pause import (
     Holder,
+    PauseOutcome,
+    PauseStatus,
     ResumeOutcome,
     ResumeStatus,
     Ticker,
@@ -109,10 +117,12 @@ from vigia.snapshots import (
     utc_now,
 )
 from vigia.snapshots.activity import SnapshotInfo, changed_since, lineage_reference
+from vigia.snapshots.grow import GrowResult, GrowStatus, VolumeGrower
 
 logger = logging.getLogger(__name__)
 
 BUSY_ALERT_AFTER = 3  # SnapshotBusy cycles in a row before the user hears about it
+EVIDENCE_LOCK_WAIT = 10.0  # seconds an evidence snapshot waits for a rewind or a stop to end
 CLOCK_ALERT_EVERY = 24 * 3600.0  # prune blocked by the clock: one alert a day
 REPEAT_ALERT_EVERY = 3600.0  # the same failure, over and over: one alert an hour
 MAX_LISTED_SNAPSHOTS = 20  # ids kept in the details of a prune event
@@ -156,6 +166,23 @@ class ControlHook(Protocol):
 
     def close(self) -> None:
         """Stop accepting and wait for the requests in flight."""
+        ...
+
+
+class RiskResponses(Protocol):
+    """The answers to events of risk 3 as the Guardian sees them (``vigia.analyzer.RiskResponder``,
+    T08): it takes the evidence snapshot by calling ``take_evidence`` and alerts."""
+
+    def open(self) -> None:
+        """Ready for events again (the Guardian starts)."""
+        ...
+
+    def close(self, timeout: float = ...) -> bool:
+        """Answer what is pending and stop. Called before the stop takes ``agent_lock``."""
+        ...
+
+    def flush_held(self) -> None:
+        """Send the alerts that were held back (the last step of the stop)."""
         ...
 
 
@@ -222,6 +249,16 @@ class _Blind:
 
 
 @dataclass(frozen=True)
+class _Held:
+    """What ``_freeze`` did to the agent."""
+
+    frozen: bool
+    pause_error: Exception | None
+    killed: bool
+    kill_error: JailError | None
+
+
+@dataclass(frozen=True)
 class CycleResult:
     """What one cycle did. ``snapshot`` is None when nothing changed or the snapshot failed or
     was refused; ``pruned`` is None when pruning was not due, did not run or failed. ``skipped``:
@@ -247,6 +284,8 @@ class _RewindAttempt:
     agent_started: bool = False
     start_error: Exception | None = None
     problems: list[str] = field(default_factory=list)
+    grow: GrowResult | None = None  # the emergency growth after a space error (T04e-1)
+    retried: bool = False  # grown, then rewound again (or its undo point published)
 
 
 @dataclass(frozen=True)
@@ -277,14 +316,21 @@ class Guardian:
         sleep: Callable[[float], None] = time.sleep,
         space_interval: float = SPACE_TICK,
         space_config: space.SpaceConfig = space.DEFAULT_CONFIG,
+        grow: VolumeGrower | None = None,
+        risk: RiskResponses | None = None,
     ) -> None:
         """Every collaborator is injected, so the tests use fakes. ``alerts`` is where alerts
         go (an ``AlertQueue`` in production); the caller starts and closes it. ``sample``
         reads the space signals (``space.sample(root, workspace, state_dir)``) for the start
         after a rewind when ``space`` is not plugged in (no cap configured). ``holders`` lists
         what holds the space (``pause.read_holders``) for the pause alert; ``space_interval``
-        is the space thread's tick and ``space_config`` its thresholds (staleness, P7)."""
+        is the space thread's tick and ``space_config`` its thresholds (staleness, P7).
+        ``grow`` grows the volume after a rewind runs out of space (T04e-1); without it the
+        volume is never grown (recorded as ``volume_grow {phase: refused, reason:
+        not_configured}``). ``risk`` (T08) is closed when the service stops, before ``stop()``
+        takes ``agent_lock``: its evidence snapshot (``take_evidence``) needs that lock."""
         self._config = config
+        self._risk = risk
         self._store = store
         self._jail = jail
         self._box = blackbox
@@ -301,6 +347,7 @@ class Guardian:
         self._sleep = sleep
         self._tick = space_interval
         self._space_config = space_config
+        self._grow = grow if grow is not None else VolumeGrower(None, None)
 
         self.agent_lock = threading.Lock()
         self.freeze_lock = threading.Lock()
@@ -308,6 +355,10 @@ class Guardian:
         self._state_epoch = 0  # bumped by every change of state: a stale thaw never applies
         self._thaw_to = AgentState.RUNNING  # what a freeze to confirm a condition goes back to
         self._pause_reasons: set[str] = set()
+        # T09: bumped (under freeze_lock) by every freeze the person asks for, also when the
+        # pause was open already, so a `seguir` decided before a later `/pausar` never undoes it.
+        self._user_pause_epoch = 0
+        self._last_user_pause_seq: int | None = None  # the user_pause a user_resume closes
         # The space thread (T04d-2). All monotonic seconds.
         self._last_check: float | None = None  # the last finished space evaluation
         self._serving_since: float | None = None  # before any check, the watchdog counts from here
@@ -388,6 +439,8 @@ class Guardian:
             except BaseException:
                 self._wound_down = True  # nothing was recorded or armed: only the agent is left
                 raise
+            if self._risk is not None:
+                self._risk.open()
             self._serving = True
             with self.freeze_lock:
                 self._serving_since = self._mono()
@@ -645,28 +698,76 @@ class Guardian:
                 reasons |= {reason for reason in listed if reason in SPACE_REASONS}
         if pauses and not reasons:
             reasons.add("space")
+        if self._user_pause_open():
+            reasons.add("user")
         return reasons
+
+    def _user_pause_open(self) -> bool:
+        """The person's pause (T09) is open unless a ``system/user_resume`` says it closed the
+        newest ``system/user_pause`` (``closes``: that event's seq). A resume that raced a
+        later `/pausar` closes only the older one. Fails closed, like the space pauses."""
+        try:
+            paused = self._box.events(
+                source="system", action="user_pause", newest_first=True, limit=1
+            )
+            if not paused:
+                return False
+            newest = paused[0].seq
+            resumed = self._box.events(source="system", action="user_resume", since_seq=newest)
+        except BlackBoxError as error:
+            logger.error(
+                "cannot read the person's pause from the black box, so the agent stays paused: %s",
+                error,
+            )
+            return True
+        with self.freeze_lock:
+            self._last_user_pause_seq = newest
+        return not any(
+            type(event.details.get("closes")) is int and event.details["closes"] >= newest
+            for event in resumed
+        )
+
+    def _record_user_pause(self, details: dict[str, Any], *, risk: int) -> Event | None:
+        """``system/user_pause``, remembering its seq: the ``user_resume`` that closes it says
+        so, and that is what the next boot reads."""
+        event = self._record("system", "user_pause", details=details, risk=risk)
+        if event is not None:
+            with self.freeze_lock:
+                self._last_user_pause_seq = max(event.seq, self._last_user_pause_seq or 0)
+        return event
 
     def _carried_pause(self, reasons: set[str]) -> None:
         """Nothing is red now, but an earlier run left the agent paused: it stays so, and the
-        person hears why and how to resume."""
-        event = self._record(
-            "system",
-            "space_pause",
-            details={
-                "conditions": [],
-                "reasons": sorted(reasons),
-                "frozen": False,
-                "carried_over": True,
-            },
-            risk=2,
-        )
+        person hears why and how to resume. The space reasons go back into ``space_pause``,
+        the person's own into ``user_pause`` (each event only carries its own kind)."""
+        space_reasons = reasons & SPACE_REASONS
+        event: Event | None = None
+        if space_reasons:
+            event = self._record(
+                "system",
+                "space_pause",
+                details={
+                    "conditions": [],
+                    "reasons": sorted(space_reasons),
+                    "frozen": False,
+                    "carried_over": True,
+                },
+                risk=2,
+            )
+        if "user" in reasons:
+            user_event = self._record_user_pause(
+                {"requested_by": "boot", "agent": "stopped", "carried_over": True}, risk=1
+            )
+            event = event or user_event
+        why = "por falta de espacio" if space_reasons else ""
+        if "user" in reasons:
+            why = (why + " y " if why else "") + "porque lo pediste tú (/pausar)"
         self._alert(
             AlertLevel.ERROR,
             "El agente sigue pausado",
-            "Vigía se paró con el agente pausado por falta de espacio, y la pausa sigue abierta: "
-            "el agente no arranca. Ahora no falta espacio; para reanudarlo, ejecuta "
-            "`vigia seguir`.",
+            f"Vigía se paró con el agente pausado {why}, y la pausa sigue abierta: el agente no "
+            "arranca. Ahora no falta espacio; para reanudarlo, ejecuta `vigia seguir` (o "
+            "/seguir en Telegram).",
             event,
         )
 
@@ -696,9 +797,19 @@ class Guardian:
         )
 
     def _start_agent(self, reason: str | None = None) -> None:
-        """Step 11 (and ``resume()`` with ``reason="resume"``)."""
-        self._set_state(AgentState.STARTING)
+        """Step 11 (and ``resume()`` with ``reason="resume"``). Never while the person's pause
+        is open (T09): a `/pausar` that came in after the decision to start wins."""
+        with self.freeze_lock:
+            held = "user" in self._pause_reasons
+            if not held:
+                self._agent_state = AgentState.STARTING
+                self._state_epoch += 1
+        if held:
+            self._record("system", "agent_start_skipped", details={"reason": "user_pause"})
+            return
         try:
+            if not self._jail.exists():  # a pause that had to kill it may have removed it too
+                self._jail.create()
             self._jail.start()
             self._jail.wait_ready()
         except JailError as error:
@@ -706,6 +817,38 @@ class Guardian:
             return
         self._advance(AgentState.STARTING, AgentState.RUNNING)
         self._record("system", "agent_start", details={"reason": reason} if reason else None)
+        self._catch_up_user_pause()
+
+    def _catch_up_user_pause(self) -> None:
+        """Right after a start: a `/pausar` that came in while `docker start` ran found nothing
+        to freeze yet (or killed what was there) and the start went on. Docker says whether
+        the agent runs; if it does, it is frozen now (killed if that fails)."""
+        with self.freeze_lock:
+            if "user" not in self._pause_reasons or self._agent_state is AgentState.FROZEN:
+                return
+        try:
+            running = self._jail.is_running() and not self._jail.is_paused()
+        except JailError:
+            running = True  # cannot tell: freezing (or killing) is the safe side
+        if not running:
+            return
+        with self.freeze_lock:
+            if self._agent_state is not AgentState.FROZEN:
+                self._agent_state = AgentState.RUNNING
+                self._state_epoch += 1
+        held = self._freeze(set(), freeze=True, frozen_already=False)
+        still_running = held.pause_error is not None and not held.killed
+        self._record_user_pause(
+            {
+                "requested_by": "catch_up",
+                "agent": str(self.agent_state),
+                "late": True,
+                "killed": held.killed,
+            },
+            risk=3 if still_running else 1,
+        )
+        if still_running:
+            logger.error("the agent was started during a pause and cannot be frozen nor stopped")
 
     def _agent_did_not_start(self, error: JailError) -> None:
         """``start`` or ``wait_ready`` failed. Docker's error may quote the agent's own logs,
@@ -992,36 +1135,9 @@ class Guardian:
         the one failure that cannot be left. Resuming is manual (``resume``). ``frozen_already``:
         the space thread froze it to confirm the condition."""
         reasons = {violation.reason for violation in violations}
-        frozen = False
-        pause_error: Exception | None = None
-        stopping = False
-        with self.freeze_lock:
-            self._pause_reasons |= reasons
-            if frozen_already and self._agent_state is AgentState.FROZEN:
-                frozen = True
-            elif freeze and self._agent_state is AgentState.STOPPING:
-                stopping = True  # being stopped: killed below, never frozen (stop would wake it)
-            elif freeze and self._agent_state in _CAN_RUN_CODE:
-                try:
-                    self._jail.pause()  # milliseconds; never waits for agent_lock
-                except Exception as error:
-                    pause_error = error
-                else:
-                    self._agent_state = AgentState.FROZEN
-                    self._state_epoch += 1
-                    frozen = True
-        if pause_error is not None and self._already_paused():
-            pause_error, frozen = None, True
-            self._set_state(AgentState.FROZEN)
-        if stopping:
-            pause_error = _BeingStopped("the agent was being stopped: killed instead of frozen")
-        killed = False
-        kill_error: JailError | None = None
-        if pause_error is not None:
-            kill_error = self._halt(kill_first=True)
-            killed = kill_error is None
-            if killed:
-                self._set_state(AgentState.STOPPED)
+        held = self._freeze(reasons, freeze=freeze, frozen_already=frozen_already)
+        frozen, pause_error = held.frozen, held.pause_error
+        killed, kill_error = held.killed, held.kill_error
         details: dict[str, Any] = {
             "conditions": [violation.code for violation in violations],
             "reasons": sorted(reasons),
@@ -1082,6 +1198,47 @@ class Guardian:
                 + body,
                 event,
             )
+
+    def _freeze(self, reasons: set[str], *, freeze: bool, frozen_already: bool) -> "_Held":
+        """Open ``reasons`` and, with ``freeze``, freeze an agent that can run code, in one
+        hold of ``freeze_lock`` (so the space thread never thaws in between). Being stopped,
+        or impossible to freeze, it is killed instead: a `docker stop` would wake a frozen
+        one, and an agent that should be paused and is not is the one failure that cannot be
+        left. Never waits for ``agent_lock``. ``frozen_already``: the space thread froze it to
+        confirm a condition."""
+        frozen = False
+        pause_error: Exception | None = None
+        stopping = False
+        with self.freeze_lock:
+            self._pause_reasons |= reasons
+            if "user" in reasons:
+                self._user_pause_epoch += 1
+            if frozen_already and self._agent_state is AgentState.FROZEN:
+                frozen = True
+            elif freeze and self._agent_state is AgentState.STOPPING:
+                stopping = True  # being stopped: killed below, never frozen (stop would wake it)
+            elif freeze and self._agent_state in _CAN_RUN_CODE:
+                try:
+                    self._jail.pause()  # milliseconds; never waits for agent_lock
+                except Exception as error:
+                    pause_error = error
+                else:
+                    self._agent_state = AgentState.FROZEN
+                    self._state_epoch += 1
+                    frozen = True
+        if pause_error is not None and self._already_paused():
+            pause_error, frozen = None, True
+            self._set_state(AgentState.FROZEN)
+        if stopping:
+            pause_error = _BeingStopped("the agent was being stopped: killed instead of frozen")
+        killed = False
+        kill_error: JailError | None = None
+        if pause_error is not None:
+            kill_error = self._halt(kill_first=True)
+            killed = kill_error is None
+            if killed:
+                self._set_state(AgentState.STOPPED)
+        return _Held(frozen, pause_error, killed, kill_error)
 
     def _already_paused(self) -> bool:
         """``docker pause`` failed: maybe because the agent is frozen already (that counts)."""
@@ -1310,23 +1467,128 @@ class Guardian:
                 event,
             )
 
+    # The person's pause (Telegram's `/pausar`, T09)
+
+    def pause_by_user(self, *, requested_by: str) -> PauseOutcome:
+        """Freeze the agent now, from outside (``docker pause``), and keep it so until
+        ``resume`` (`/seguir`, `vigia seguir`): the pause reason ``user``. Never waits for
+        ``agent_lock``, so it is immediate also while a rewind or a long `docker stop` runs; an
+        agent being stopped is killed instead (a stop would wake it), and so is one that cannot
+        be frozen. A stopped agent stays stopped: nothing starts it while the pause is open,
+        not a rewind and not a restart of the service (the pause is read back at boot).
+        Recorded: ``system/user_pause`` (and ``agent_stop`` or ``agent_stop_failed`` if it had
+        to be killed). Never raises."""
+        requester = str(requested_by)[:MAX_REQUESTER_CHARS] or "unknown"
+        if not self._serving:
+            return PauseOutcome(
+                PauseStatus.FAILED, "Vigía no está en marcha: no hay ningún agente que pausar."
+            )
+        try:
+            return self._pause_by_user(requester)
+        except Exception as error:  # nothing on this path is swallowed
+            logger.exception("pausing the agent failed")
+            return PauseOutcome(
+                PauseStatus.STILL_RUNNING,
+                f"Ha fallado algo al pausar: {_excerpt(error)}. Puede que el agente siga en "
+                "marcha: mira /estado.",
+                str(self.agent_state),
+            )
+
+    def _pause_by_user(self, requester: str) -> PauseOutcome:
+        with self.freeze_lock:
+            already = "user" in self._pause_reasons
+            before = self._agent_state
+        held = self._freeze({"user"}, freeze=True, frozen_already=False)
+        after = self.agent_state
+        failed_freeze = held.pause_error is not None and not isinstance(
+            held.pause_error, _BeingStopped
+        )
+        still_running = held.pause_error is not None and not held.killed
+        details: dict[str, Any] = {
+            "requested_by": requester,
+            "agent_before": str(before),
+            "agent": str(after),
+            "already": already,
+        }
+        if held.pause_error is not None:
+            details["pause_error"] = _short(held.pause_error)
+            details["killed"] = held.killed
+        event = self._record_user_pause(details, risk=3 if still_running else 1)
+        reason = "user_pause_freeze_failed" if failed_freeze else "user_pause_while_stopping"
+        if held.killed:
+            self._record("system", "agent_stop", details={"reason": reason}, risk=2)
+            return PauseOutcome(
+                PauseStatus.KILLED,
+                "No se ha podido congelar al agente, así que se ha parado a la fuerza. No "
+                "arranca hasta /seguir.",
+                str(after),
+                already,
+            )
+        if still_running:
+            stop_failed = self._record(
+                "system",
+                "agent_stop_failed",
+                details={"reason": reason, "error": _short(held.kill_error)},
+                risk=3,
+            )
+            self._alert(
+                AlertLevel.ERROR,
+                "No se pudo congelar ni parar al agente",
+                "Has pedido pausar al agente y sigue en marcha: no se ha podido congelar ni "
+                "parar. Detalles en el evento.",
+                stop_failed or event,
+            )
+            return PauseOutcome(
+                PauseStatus.STILL_RUNNING,
+                "No se ha podido congelar ni parar al agente: SIGUE EN MARCHA. Detalles en la "
+                "caja negra.",
+                str(after),
+                already,
+            )
+        if after is AgentState.FROZEN:
+            text = "El agente ya estaba congelado" if not held.frozen else "Agente congelado"
+            return PauseOutcome(
+                PauseStatus.FROZEN,
+                f"{text}: no hace nada hasta /seguir.",
+                str(after),
+                already,
+            )
+        return PauseOutcome(
+            PauseStatus.STOPPED,
+            "El agente no estaba en marcha: queda parado y no arranca hasta /seguir.",
+            str(after),
+            already,
+        )
+
     # Resume (`vigia seguir`)
 
-    def resume(self, *, requested_by: str) -> ResumeOutcome:
+    def user_pause_mark(self) -> int:
+        """How many times the person has asked to pause so far (T09): a ``resume`` given this
+        mark refuses if another `/pausar` came after it."""
+        with self.freeze_lock:
+            return self._user_pause_epoch
+
+    def resume(self, *, requested_by: str, pause_mark: int | None = None) -> ResumeOutcome:
         """Close a pause by space and let the agent run again (``vigia seguir``; T09's
         ``/seguir``). Refuses while any condition stands (read after a sync, as at every
         start). Otherwise the space reasons are removed and, only if no other reason is left,
         the agent is thawed (or started, if it was stopped: as at boot, after a snapshot and
         with the watcher armed). Recorded: ``system/resume_requested``, then ``resume_refused``
-        or ``space_resume {by: user}``. Never raises."""
+        or ``space_resume {by: user}``. Never raises.
+
+        It also closes the person's pause (``user``, T09; ``user_resume``), but never one asked
+        for after the request: ``pause_mark`` is ``user_pause_mark()`` when the person sent it
+        (taken here, before waiting for ``agent_lock``, if not given). A `/pausar` after that,
+        even while this waits or syncs, wins: STILL_PAUSED and nothing closed."""
         requester = str(requested_by)[:MAX_REQUESTER_CHARS] or "unknown"
+        mark = self.user_pause_mark() if pause_mark is None else pause_mark
         with self.agent_lock:
             if not self._serving:
                 return ResumeOutcome(
                     ResumeStatus.FAILED, "Vigía no está en marcha: no se ha reanudado nada."
                 )
             try:
-                return self._resume_locked(requester)
+                return self._resume_locked(requester, mark)
             except Exception as error:  # nothing on this path is swallowed
                 logger.exception("resuming the agent failed")
                 return ResumeOutcome(
@@ -1335,12 +1597,12 @@ class Guardian:
                     str(self.agent_state),
                 )
 
-    def _resume_locked(self, requester: str) -> ResumeOutcome:
+    def _resume_locked(self, requester: str, mark: int) -> ResumeOutcome:
         # Recorded first: a black box that works again resets P7 with this very append.
         self._record("system", "resume_requested", details={"requested_by": requester})
         with self.freeze_lock:
             reasons = set(self._pause_reasons)
-        if not reasons & SPACE_REASONS:
+        if not reasons & (SPACE_REASONS | {"user"}):
             if not reasons and self._stopped_with_no_pause():
                 return ResumeOutcome(
                     ResumeStatus.STOPPED,
@@ -1352,9 +1614,11 @@ class Guardian:
                 )
             return ResumeOutcome(
                 ResumeStatus.NOT_PAUSED,
-                "El agente no está pausado por falta de espacio: no hay nada que reanudar.",
+                "El agente no está pausado: no hay nada que reanudar.",
                 str(self.agent_state),
             )
+        # Also when only the person paused it: nothing runs with a condition standing (the
+        # space thread does not look at a frozen agent, so a pause could hide one).
         violations = self._space_verdict()
         if violations:
             event = self._record(
@@ -1379,12 +1643,69 @@ class Guardian:
                 str(self.agent_state),
             )
         with self.freeze_lock:
-            cleared = self._pause_reasons & SPACE_REASONS
-            self._pause_reasons -= SPACE_REASONS
-            remaining = set(self._pause_reasons)
+            paused_after = self._user_pause_epoch != mark
+            if not paused_after:
+                cleared = self._pause_reasons & SPACE_REASONS
+                self._pause_reasons -= SPACE_REASONS
+                cleared_user = "user" in self._pause_reasons
+                self._pause_reasons.discard("user")
+                remaining = set(self._pause_reasons)
+                closes = self._last_user_pause_seq
+        if paused_after:
+            self._record(
+                "system",
+                "resume_refused",
+                details={"requested_by": requester, "reason": "paused_after"},
+                risk=1,
+            )
+            return ResumeOutcome(
+                ResumeStatus.STILL_PAUSED,
+                "Se ha pedido pausar después de esta orden de seguir: el agente sigue pausado.",
+                str(self.agent_state),
+            )
         for key in [key for key in self._last_alerted if key.startswith("pause:")]:
             self._last_alerted.pop(key, None)  # the next pause is told about at once
         if remaining:
+            self._record_resumed(
+                cleared, cleared_user, requester, "still_paused", remaining, closes
+            )
+            return ResumeOutcome(
+                ResumeStatus.STILL_PAUSED,
+                "La pausa se ha cerrado, pero el agente sigue pausado por otra razón.",
+                str(self.agent_state),
+            )
+        agent = self._wake_agent()
+        self._record_resumed(cleared, cleared_user, requester, agent, set(), closes)
+        if self.agent_state is AgentState.RUNNING:
+            message = (
+                "El agente sigue donde estaba." if agent == "thawed" else "El agente ha arrancado."
+            )
+            return ResumeOutcome(ResumeStatus.RESUMED, message, str(self.agent_state))
+        if agent == "paused_again":
+            return ResumeOutcome(
+                ResumeStatus.STILL_PAUSED,
+                "Se ha vuelto a pausar al agente mientras se reanudaba: sigue pausado.",
+                str(self.agent_state),
+            )
+        return ResumeOutcome(
+            ResumeStatus.PROBLEM,
+            "La pausa se ha cerrado, pero el agente no ha arrancado. Detalles en la caja negra.",
+            str(self.agent_state),
+        )
+
+    def _record_resumed(
+        self,
+        cleared: set[str],
+        cleared_user: bool,
+        requester: str,
+        agent: str,
+        remaining: set[str],
+        closes: int | None,
+    ) -> None:
+        """``space_resume {by: user}`` closes the space reasons (what the boot reads back) and
+        ``user_resume`` the person's pause (T09): each only if it was open."""
+        extra: dict[str, Any] = {"remaining": sorted(remaining)} if remaining else {}
+        if cleared:
             self._record(
                 "system",
                 "space_resume",
@@ -1392,36 +1713,16 @@ class Guardian:
                     "by": "user",
                     "reasons": sorted(cleared),
                     "requested_by": requester,
-                    "agent": "still_paused",
-                    "remaining": sorted(remaining),
+                    "agent": agent,
+                    **extra,
                 },
             )
-            return ResumeOutcome(
-                ResumeStatus.STILL_PAUSED,
-                "La pausa por espacio se ha cerrado, pero el agente sigue pausado por otra razón.",
-                str(self.agent_state),
+        if cleared_user:
+            self._record(
+                "system",
+                "user_resume",
+                details={"requested_by": requester, "agent": agent, "closes": closes, **extra},
             )
-        agent = self._wake_agent()
-        self._record(
-            "system",
-            "space_resume",
-            details={
-                "by": "user",
-                "reasons": sorted(cleared),
-                "requested_by": requester,
-                "agent": agent,
-            },
-        )
-        if self.agent_state is AgentState.RUNNING:
-            message = (
-                "El agente sigue donde estaba." if agent == "thawed" else "El agente ha arrancado."
-            )
-            return ResumeOutcome(ResumeStatus.RESUMED, message, str(self.agent_state))
-        return ResumeOutcome(
-            ResumeStatus.PROBLEM,
-            "La pausa se ha cerrado, pero el agente no ha arrancado. Detalles en la caja negra.",
-            str(self.agent_state),
-        )
 
     def _stopped_with_no_pause(self) -> bool:
         """Docker says the agent is not running while no pause is open (Docker's word, as in
@@ -1443,13 +1744,20 @@ class Guardian:
             logger.error("cannot tell the state of the agent to resume it: %s", error)
             running, frozen = True, True  # assume the worst: try to thaw, else kill
         if frozen:
-            try:
-                self._jail.unpause()
-            except Exception as error:
-                logger.error("cannot thaw the agent, so it is restarted: %s", error)
-            else:
-                self._set_state(AgentState.RUNNING)
-                return "thawed"
+            # Under freeze_lock: a `/pausar` that came in meanwhile (it never waits for
+            # agent_lock) either wins and keeps it frozen, or freezes it right after.
+            with self.freeze_lock:
+                if self._pause_reasons:
+                    return "paused_again"
+                try:
+                    self._jail.unpause()
+                except Exception as error:
+                    thaw_error: Exception | None = error
+                else:
+                    self._agent_state = AgentState.RUNNING
+                    self._state_epoch += 1
+                    return "thawed"
+            logger.error("cannot thaw the agent, so it is restarted: %s", thaw_error)
             self._mark_stopping()
             halt_error = self._halt(kill_first=True)
             if halt_error is not None:
@@ -1466,7 +1774,11 @@ class Guardian:
             self._start_from_pause()
             return "restarted"
         if running and self.agent_state is not AgentState.STOPPED:
-            self._set_state(AgentState.RUNNING)
+            with self.freeze_lock:  # a `/pausar` meanwhile froze it: FROZEN stays
+                if self._pause_reasons or self._agent_state is AgentState.FROZEN:
+                    return "paused_again"
+                self._agent_state = AgentState.RUNNING
+                self._state_epoch += 1
             return "running"
         if running:
             # Running while we had it stopped: nobody armed the watcher for it. Stop it and
@@ -1626,7 +1938,9 @@ class Guardian:
         5. What happened is decided by comparing ``workspace_id()`` with the one before, never
            by the type of an exception: a failure after the swap is still a rewind.
         6. A space error (even before the agent was stopped) kills the agent and opens the
-           pause ``rewind_no_space``.
+           pause ``rewind_no_space``. Then the volume grows once (T04e-1) and, if it grew, the
+           rewind is retried once (or, if it was swapped without its undo point, the undo point
+           is published with ``recover()``), under the same lock, request id and intent.
         7. Remove ``rewind.pending``.
 
         If the black box fails at 3 or 5 the rewind goes on (it is the person's safety action),
@@ -1679,15 +1993,10 @@ class Guardian:
             snapshot_id=target.id,
         )
 
-        result: RestoreResult | None = None
-        error: Exception | None = None
-        try:
-            result = self._store.restore(target.id, quiesce=lambda: self._rewind_quiesce(attempt))
-        except Exception as caught:  # decided below by the workspace id, never by the type
-            error = caught
-
+        result, error = self._restore(attempt)
         if is_space_error(error):
             self._pause_for_rewind_space(attempt, error)
+            result, error = self._grow_and_retry(attempt, result, error)
         try:
             after = self._store.workspace_id()
         except SnapshotError as read_error:
@@ -1710,6 +2019,157 @@ class Guardian:
                 attempt.request_id,
             )
         return outcome
+
+    def _restore(self, attempt: _RewindAttempt) -> tuple[RestoreResult | None, Exception | None]:
+        try:
+            result = self._store.restore(
+                attempt.target.id, quiesce=lambda: self._rewind_quiesce(attempt)
+            )
+        except Exception as caught:  # decided by the workspace id afterwards, never by the type
+            return None, caught
+        return result, None
+
+    # The emergency growth (T04e-1, docs/19 section 6)
+
+    def _grow_and_retry(
+        self, attempt: _RewindAttempt, result: RestoreResult | None, error: Exception | None
+    ) -> tuple[RestoreResult | None, Exception | None]:
+        """The rewind failed for lack of space and the agent is stopped (or could not be: then
+        the grower refuses). Grow the volume once and, if it grew, try once more: the rewind
+        again if the workspace was not swapped, or ``recover()`` (which publishes the undo
+        point) if it was. Never deletes a snapshot. Returns the new result and error; whether
+        the rewind happened is still decided by the workspace id, by the caller."""
+        try:
+            swapped = self._store.workspace_id() != attempt.from_workspace
+        except SnapshotError as read_error:
+            logger.error(
+                "cannot tell whether the rewind %s swapped the workspace, so the volume is not "
+                "grown: %s",
+                attempt.request_id,
+                read_error,
+            )
+            return result, error
+        if swapped and not isinstance(error, RestoreIncomplete):
+            logger.error(
+                "the rewind %s swapped the workspace and then ran out of space: nothing to retry, "
+                "so the volume is not grown",
+                attempt.request_id,
+            )
+            return result, error
+        events: list[Event] = []
+
+        def record(details: dict[str, Any], risk: int) -> bool:
+            event = self._record(
+                "snapshot", "volume_grow", str(self._store.root), details=details, risk=risk
+            )
+            if event is not None:
+                events.append(event)
+            return event is not None
+
+        grown = self._grow.grow(
+            attempt.request_id, agent_stopped=self._agent_is_stopped, record=record
+        )
+        attempt.grow = grown
+        self._growth_alert(grown, events[-1] if events else None)
+        if not grown.grown:
+            return result, error
+        attempt.retried = True
+        if swapped:
+            return self._recover_after_growth(attempt, result, error)
+        # Once, with the same request id and intent: rewind.pending still says where it starts.
+        attempt.stopped = attempt.start_requested = attempt.agent_started = False
+        attempt.start_error = None
+        return self._restore(attempt)
+
+    def _agent_is_stopped(self) -> bool:
+        """For the grower: stopped in our state AND in Docker's. A JailError propagates (the
+        grower refuses: it cannot tell)."""
+        return self.agent_state is AgentState.STOPPED and not self._jail.is_running()
+
+    def _recover_after_growth(
+        self, attempt: _RewindAttempt, result: RestoreResult | None, error: Exception | None
+    ) -> tuple[RestoreResult | None, Exception | None]:
+        """The rewind happened but its undo point was left unpublished for lack of space: with
+        room now, ``recover()`` publishes it (as ``recovered``), and the agent may start."""
+        try:
+            recovered = self._store.recover()
+        except SnapshotError as recover_error:
+            logger.error(
+                "the volume grew, but the undo point of the rewind %s still cannot be "
+                "published: %s",
+                attempt.request_id,
+                recover_error,
+            )
+            return result, error
+        self._start_after_recovery(attempt)
+        return RestoreResult(target=attempt.target, undo=None, recovered=tuple(recovered)), None
+
+    def _start_after_recovery(self, attempt: _RewindAttempt) -> None:
+        """What the quiesce's exit does after a swap, for the rewind whose quiesce is long gone:
+        start the agent only if ``_start_after_rewind`` allows it (it should run, the space is
+        green, only space reasons keep it paused, and those are closed)."""
+        if not self._start_after_rewind(attempt, None):
+            return
+        try:
+            self._jail.start()
+            self._jail.wait_ready()
+        except JailError as start_error:
+            attempt.start_error = start_error
+            attempt.problems.append("agent")
+            self._agent_did_not_start(start_error)
+            return
+        self._advance(AgentState.STARTING, AgentState.RUNNING)
+        attempt.agent_started = True
+        self._record(
+            "system", "agent_start", details={"reason": "rewind", "request_id": attempt.request_id}
+        )
+        self._catch_up_user_pause()  # a `/pausar` during the start found nothing to freeze
+
+    def _growth_alert(self, grown: GrowResult, event: Event | None) -> None:
+        """One alert per growth, citing its last ``volume_grow``. Never the step's own text (it
+        is in the event): only what it means for the person. Nothing is said for a Guardian
+        without growth configured: the space alert already says what to do."""
+        if grown.status is GrowStatus.REFUSED and grown.reason == "not_configured":
+            return
+        if grown.grown:
+            self._alert(
+                AlertLevel.WARNING,
+                "El volumen ha crecido",
+                f"Un rebobinado se ha quedado sin espacio y Vigía ha agrandado el volumen de "
+                f"{_mib(grown.from_bytes)} a {_mib(grown.reached_bytes)}, una sola vez y sin "
+                "borrar ninguna instantánea. Ahora lo reintenta.",
+                event,
+            )
+            return
+        if grown.status is GrowStatus.REFUSED:
+            why = _GROW_REFUSED_TEXT.get(grown.reason or "", "no se cumplían sus condiciones")
+            self._alert(
+                AlertLevel.ERROR,
+                "No se ha agrandado el volumen",
+                f"El rebobinado se ha quedado sin espacio y Vigía no ha agrandado el volumen: "
+                f"{why}. Libera espacio y vuelve a rebobinar.",
+                event,
+            )
+            return
+        if grown.reason == "not_configured":
+            how = (
+                "Vigía todavía no tiene permiso para agrandarlo (lo prepara el instalador). "
+                "No ha cambiado nada."
+            )
+        elif grown.done_steps:
+            how = (
+                f"Ha fallado el paso {grown.step} después de {', '.join(grown.done_steps)}: "
+                "el volumen puede haber quedado a medias, revísalo."
+            )
+        else:
+            how = f"Ha fallado el primer paso ({grown.step}): no ha cambiado nada."
+        self._alert(
+            AlertLevel.ERROR,
+            "No se ha podido agrandar el volumen",
+            f"El rebobinado se ha quedado sin espacio. {how} Libera espacio y vuelve a "
+            "rebobinar. Detalles en el evento.",
+            event,
+        )
 
     def _want_running(self) -> bool:
         """Should the agent run after the rewind? Yes if it was running, or if only a space
@@ -1803,6 +2263,7 @@ class Guardian:
                 "agent_start",
                 details={"reason": "rewind", "request_id": attempt.request_id},
             )
+            self._catch_up_user_pause()
 
     def _rewind_stop_failed(self, attempt: _RewindAttempt, error: JailError) -> None:
         """quiesce could not stop the agent, so ``restore`` raises with the workspace unchanged.
@@ -1902,8 +2363,12 @@ class Guardian:
                         "request_id": attempt.request_id,
                     },
                 )
+            with self.freeze_lock:  # a `/pausar` meanwhile (it never waits for agent_lock) wins
+                if "user" in self._pause_reasons:
+                    return False
+                self._agent_state = AgentState.STARTING
+                self._state_epoch += 1
             attempt.start_requested = True
-            self._set_state(AgentState.STARTING)
             return True
         except Exception as failure:
             attempt.problems.append("start_check")
@@ -1942,8 +2407,8 @@ class Guardian:
     def _pause_for_rewind_space(self, attempt: _RewindAttempt, error: BaseException) -> None:
         """The rewind failed for lack of space, maybe before the agent was stopped (the
         recovery at the start of restore, the staging copy): kill the agent, open the pause
-        ``rewind_no_space`` and say so. Freeing space and rewinding again (or, in T04e-1,
-        growing the volume) is what comes next."""
+        ``rewind_no_space`` and say so. Growing the volume once (T04e-1, ``_grow_and_retry``)
+        or, failing that, freeing space and rewinding again is what comes next."""
         with self.freeze_lock:
             self._pause_reasons.add("rewind_no_space")
             reasons = sorted(self._pause_reasons)
@@ -1990,10 +2455,14 @@ class Guardian:
             agent = "El agente se ha parado. "
         else:
             agent = "El agente ya estaba parado y sigue así. "
+        if self._grow.can_grow and kill_error is None:
+            then = "Vigía va a agrandar el volumen una sola vez y a reintentarlo."
+        else:
+            then = "Libera espacio (borra instantáneas que no necesites) y vuelve a rebobinar."
         body = (
             "El rebobinado no ha podido terminar por falta de espacio en el volumen. "
             + agent
-            + "Libera espacio (borra instantáneas que no necesites) y vuelve a rebobinar."
+            + then
         )
         self._alert(AlertLevel.ERROR, "No hay espacio para rebobinar", body, event)
 
@@ -2035,6 +2504,7 @@ class Guardian:
             problems.append("agent")
         if problems:
             details["problems"] = sorted(set(problems))
+        details.update(_growth_details(attempt))
         event = self._record(
             "snapshot",
             "rewind_done",
@@ -2055,6 +2525,8 @@ class Guardian:
                 event,
             )
         message = f"Rebobinado a {attempt.target.id}."
+        if attempt.retried:
+            message += " Antes, el volumen ha crecido una vez porque faltaba espacio."
         if problems:
             message += f" Pero {_rewind_problems(problems)}."
         return RewindOutcome(
@@ -2078,12 +2550,25 @@ class Guardian:
             "no_space": no_space,
             "agent_started": attempt.agent_started,
             "agent_state": str(self.agent_state),
+            **_growth_details(attempt),
         }
+        # Grown and retried, and still not rewound: the last resort failed (docs/19, section 6).
+        risk = 3 if attempt.retried else 2
         event = self._record(
-            "snapshot", "rewind_failed", attempt.target.id, details=details, risk=2
+            "snapshot", "rewind_failed", attempt.target.id, details=details, risk=risk
         )
         attempt.final_recorded = event is not None
-        if no_space:
+        if attempt.retried and no_space:
+            body = (
+                "El volumen ha crecido una vez y sigue sin haber espacio: el espacio de trabajo "
+                "no ha cambiado y el agente sigue parado. Libera espacio y vuelve a rebobinar."
+            )
+        elif attempt.retried:
+            body = (
+                "El volumen ha crecido, pero el reintento ha fallado: el espacio de trabajo no "
+                "ha cambiado. Detalles en el evento."
+            )
+        elif no_space:
             body = "No hay espacio en el volumen: el espacio de trabajo no ha cambiado."
         elif isinstance(error, JailError):
             body = "No se ha podido parar al agente: el espacio de trabajo no ha cambiado."
@@ -2319,6 +2804,7 @@ class Guardian:
         service. Parar Vigía para al agente. If Docker's stop fails, the agent is killed and
         removed before giving up; if it still runs, ``stop()`` records that, finishes closing
         the watcher and the log, and raises, and calling it again tries the agent once more."""
+        self._settle_risk()
         with self.agent_lock:
             if self._stopped:
                 return
@@ -2330,6 +2816,7 @@ class Guardian:
                 self._record("system", "service_stop", details={"agent_stopped": error is None})
                 logging.getLogger(_BRIDGED_LOGGERS).removeHandler(self._bridge)
                 self._bridge.close()
+                self._flush_risk()
             if error is None:
                 self._stopped = True
         if error is not None:
@@ -2368,6 +2855,49 @@ class Guardian:
     def _halt(self, *, kill_first: bool = False) -> JailError | None:
         """Make sure the agent is not running (see ``halt_agent``)."""
         return halt_agent(self._jail, kill_first=kill_first)
+
+    def _settle_risk(self) -> None:
+        """Answer the events of risk 3 still waiting (alerts only), before the stop."""
+        if self._risk is None:
+            return
+        try:
+            self._risk.close()
+        except Exception:
+            logger.exception("could not settle the answers to dangerous events")
+
+    def _flush_risk(self) -> None:
+        """The agent's grace period and the watcher's last dump may have added events of risk 3
+        after the responder closed: send what its alert throttle held back."""
+        if self._risk is None:
+            return
+        try:
+            self._risk.flush_held()
+        except Exception:
+            logger.exception("could not flush the alerts held back")
+
+    def take_evidence(self) -> str | None:
+        """The id of a new snapshot (reason ``evidence``) that holds the workspace as it is now:
+        the evidence of a dangerous event (T08). Always a new one, even if nothing changed: the
+        newest periodic snapshot would do as a picture, but retention deletes it in time and
+        evidence is kept (a snapshot of an unchanged workspace costs next to nothing). None if it
+        cannot be had: the service is not up, a rewind or a stop kept ``agent_lock`` for
+        ``EVIDENCE_LOCK_WAIT`` s, or the snapshot failed (recorded and alerted as any failed
+        snapshot). Called from the risk thread; never from one that holds ``agent_lock``."""
+        if not self.agent_lock.acquire(timeout=EVIDENCE_LOCK_WAIT):
+            logger.warning("no evidence snapshot: the agent lock was busy for too long")
+            return None
+        try:
+            if not self._serving:
+                return None
+            try:
+                assessment = self._assess()
+            except SnapshotError as error:
+                self._cycle_problem("evidence", error)
+                return None
+            snapshot = self._take(Reason.EVIDENCE, "risk", assessment.workspace, check_space=True)
+            return snapshot.id if snapshot is not None else None
+        finally:
+            self.agent_lock.release()
 
     def flush_logs(self, timeout: float = 5.0) -> bool:
         """Wait until the log messages bridged so far are in the black box (for tests, and for
@@ -2627,6 +3157,36 @@ _PROBLEM_TEXT = {
     "start_check": "no se pudo comprobar si el agente podía arrancar",
     "watcher": "el vigilante de archivos ha fallado",
 }
+
+
+_GROW_REFUSED_TEXT = {
+    "agent_running": "el agente no está parado",
+    "agent_state_unknown": "no se sabe si el agente está parado",
+    "not_a_loop": "el volumen no está montado desde un archivo (un dispositivo loop)",
+    "not_the_image": "el dispositivo del volumen no es el archivo configurado",
+    "unreadable": "no se han podido leer los tamaños del volumen",
+    "ceiling": "superaría el tamaño máximo configurado (max_volume_bytes)",
+    "host_space": "al disco del ordenador no le quedaría margen suficiente",
+    "already_grown": "ya ha crecido una vez para este rebobinado",
+    "blackbox": "no se ha podido grabar en la caja negra, y sin registro no se agranda",
+}
+
+
+def _growth_details(attempt: _RewindAttempt) -> dict[str, Any]:
+    """What a rewind_done / rewind_failed says about the growth, if there was one."""
+    if attempt.grow is None:
+        return {}
+    grown = attempt.grow
+    details: dict[str, Any] = {"grow": str(grown.status), "retried": attempt.retried}
+    if grown.reason is not None:
+        details["grow_reason"] = grown.reason
+    if grown.step is not None:
+        details["grow_step"] = grown.step
+    return details
+
+
+def _mib(size: int | None) -> str:
+    return "?" if size is None else f"{size / 1024**2:.0f} MiB"
 
 
 def _rewind_problems(problems: Sequence[str]) -> str:

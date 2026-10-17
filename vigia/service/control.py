@@ -17,7 +17,8 @@ The server (inside the service):
   credentials cannot be read, the connection is refused.
 - One JSON object per connection, on one line, at most 4 KiB, and 5 s to send it (a total
   deadline, not per read: a client that sends a byte every 4 s does not get more time):
-  ``{"cmd": "rewind", "snapshot_id": ...}`` or ``{"cmd": "resume"}``, with exactly those keys.
+  ``{"cmd": "rewind", "snapshot_id": ...}`` (plus ``"via": "web"`` from `vigia web`, T12b) or
+  ``{"cmd": "resume"}``, with exactly those keys.
   Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
   not a snapshot id) is refused WITHOUT calling the Guardian.
 - One thread per connection (``socketserver``), at most ``MAX_CONNECTIONS`` at a time, so a
@@ -79,6 +80,10 @@ OUTCOME_EXIT_CODES = {
     REFUSED: EXIT_CODES[RewindStatus.INVALID],
 }
 _RESUME_OK = frozenset({ResumeStatus.RESUMED, ResumeStatus.NOT_PAUSED})
+# Where a rewind request may say it comes from (T12b). A label for the black box, from a fixed
+# set: any process of the allowed user could claim either, and the uid and pid recorded next to
+# it are the kernel's. "cli" is what a request without ``via`` means.
+REQUESTERS = frozenset({"cli", "web", "telegram"})  # "telegram": the bot in the service (T09)
 
 
 class ControlError(Exception):
@@ -302,8 +307,15 @@ class ControlServer:
         }
 
     def _rewind(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
-        if set(request) != {"cmd", "snapshot_id"}:
-            raise _BadRequest("Una petición de rebobinar lleva `cmd` y `snapshot_id`, y nada más.")
+        if set(request) - {"via"} != {"cmd", "snapshot_id"}:
+            raise _BadRequest(
+                "Una petición de rebobinar lleva `cmd`, `snapshot_id` y quizá `via`, y nada más."
+            )
+        via = request.get("via", "cli")
+        if not isinstance(via, str) or via not in REQUESTERS:
+            raise _BadRequest("`via` tiene que ser uno de: " + ", ".join(sorted(REQUESTERS)) + ".")
+        if via == "telegram" and pid != os.getpid():  # the bot lives in this very process (T09)
+            raise _BadRequest("Solo el bot de Vigía, dentro del servicio, pide como `telegram`.")
         snapshot_id = request["snapshot_id"]
         if not isinstance(snapshot_id, str) or Snapshot.parse(snapshot_id) is None:
             return _reply_of(
@@ -314,7 +326,9 @@ class ControlServer:
                 )
             )
         try:
-            outcome = self._guardian.rewind(snapshot_id, requested_by=f"cli (uid {uid}, pid {pid})")
+            outcome = self._guardian.rewind(
+                snapshot_id, requested_by=f"{via} (uid {uid}, pid {pid})"
+            )
         except (
             Exception
         ):  # the Guardian should not raise; if it does, nobody can tell what happened
@@ -530,6 +544,7 @@ def ask_rewind(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    via: str = "cli",
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to rewind to ``snapshot_id`` and return its reply, checked:
     a dict whose ``outcome`` is known, ``ok`` a bool, ``message`` a str and ``undo`` a str or
@@ -539,10 +554,17 @@ def ask_rewind(
     retries for ``wait`` seconds and then raises ControlUnavailable. Raises ControlError if the
     path is not a socket of ours, the server is not our user, or the reply makes no sense.
     Waits for the reply as long as ``reply_timeout``: a rewind takes seconds, and a client that
-    gives up early would leave the person guessing whether it happened."""
+    gives up early would leave the person guessing whether it happened. ``via`` says who asks
+    (one of ``REQUESTERS``; ValueError otherwise, nothing sent); "cli" is not sent, so the CLI's
+    request is the one it always was."""
+    if via not in REQUESTERS:
+        raise ValueError(f"via must be one of {sorted(REQUESTERS)}")
+    request: dict[str, Any] = {"cmd": "rewind", "snapshot_id": snapshot_id}
+    if via != "cli":
+        request["via"] = via
     raw = _ask(
         Path(path),
-        {"cmd": "rewind", "snapshot_id": snapshot_id},
+        request,
         what="el rebobinado",
         wait=wait,
         reply_timeout=reply_timeout,

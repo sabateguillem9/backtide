@@ -33,6 +33,7 @@ from attack_kit import (
     scenario,
     tree_digest,
 )
+from attack_manifest import SCRIPTS_DIR
 
 from vigia.jail import AgentJail, AgentJailConfig
 from vigia.jail import docker as jail_docker
@@ -283,6 +284,51 @@ def test_reading_secrets(attack: Attack, agent) -> None:
         f"claves y no se puede crear, cambiar, renombrar ni borrar ({len(outcome['config_writes'])}"
         " intentos, todos EROFS). Control: la misma búsqueda sí encuentra una credencial y un "
         "señuelo puestos dentro del contenedor",
+    )
+
+
+@scenario("leer-sys-btrfs")
+def test_reading_the_btrfs_sysfs(attack: Attack, agent) -> None:
+    """/sys/fs/btrfs and /sys/devices/virtual/block are empty read-only tmpfs in the jail
+    (T04d-1). The control runs the same probe in a container without them: it must find the
+    volume and the host path of its image, or an empty result would prove nothing."""
+    fsid = btrfs.fsid(agent.store.root)
+    images = sorted(
+        {
+            text
+            for path in Path("/sys/block").glob("loop*/loop/backing_file")
+            if (text := path.read_text().strip()).endswith("/volume.img")
+        }
+    )
+    assert images, "the VM has no loop device backed by a volume.img"
+    source = (SCRIPTS_DIR / "leer_sys_btrfs.py").read_text(encoding="utf-8")
+    unmasked = jail_docker.run(
+        ["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL"]
+        + ["--entrypoint", "python3", agent.jail.config.image, "-c", source, fsid, *images],
+        timeout=120,
+    )
+    control = json.loads(unmasked.stdout.strip().splitlines()[-1])
+    assert fsid in control["listed"]["/sys/fs/btrfs"], control
+    assert f"/sys/fs/btrfs/{fsid}" in control["found"], control
+    assert any(p.endswith("/loop/backing_file") for p in control["found"]), control
+
+    outcome = attack.run_script(agent, "leer_sys_btrfs", fsid, *images)
+    every_attempt = {**outcome["writes"], **outcome["umounts"]}
+    attack.check(
+        "stopped",
+        outcome["listed"] == {"/sys/fs/btrfs": [], "/sys/devices/virtual/block": []}
+        and outcome["listed_after"] == outcome["listed"]
+        and outcome["found"] == []
+        and all(code == errno.EROFS for code in outcome["writes"].values())
+        and all(code in (errno.EPERM, errno.EACCES) for code in outcome["umounts"].values())
+        and len(every_attempt) == 6,
+        f"/sys/fs/btrfs y /sys/devices/virtual/block salen vacías: ni la carpeta del volumen "
+        f"({fsid[:8]}...), ni su uso y sus topes, ni ningún backing_file ni archivo de /sys con "
+        f"la ruta de la imagen en el anfitrión ({len(images)} imágenes de volumen en los "
+        "bucles). No se puede "
+        "crear nada ahí (EROFS) ni quitar la máscara (umount2 da EPERM). Control: el mismo "
+        f"sondeo en un contenedor sin máscaras encuentra {len(control['found'])} rutas, la "
+        "carpeta del volumen y el backing_file",
     )
 
 

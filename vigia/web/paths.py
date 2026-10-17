@@ -1,11 +1,12 @@
-"""The only two paths the web needs from the configuration: the black box's database and the
-snapshot volume.
+"""The only paths the web needs from the configuration: the black box's database, the snapshot
+volume and the service's control socket (to ask for a rewind, T12b).
 
 ``ServiceConfig.from_file`` also reads the gateway token (and the service opens the HMAC key):
 secrets a viewer has no use for, and which would force it to run as root. This reads the same
 TOML, with the same checks on the file (not writable by others, not a link, small), and takes
 ``state_dir`` and ``volume`` and nothing else: no token, no key, no checkpoint. Everything else
-in the file is ignored, so the service's own configuration works as it is.
+in the file is ignored, so the service's own configuration works as it is. The control socket is
+only ever connected to (``vigia.web.rewind``), never opened as a file.
 """
 
 import tomllib
@@ -15,6 +16,7 @@ from pathlib import Path
 from vigia.service.config import (
     MAX_CONFIG_BYTES,
     STATE_DB,
+    STATE_SOCKET,
     ConfigError,
     _as_path,
     _decode,
@@ -26,6 +28,7 @@ from vigia.service.config import (
 class WebPaths:
     blackbox_db: Path
     volume: Path
+    control_socket: Path
 
     @classmethod
     def from_file(cls, path: Path) -> "WebPaths":
@@ -42,4 +45,8 @@ class WebPaths:
                 raise ConfigError(f"the setting {key!r} is required")
         state_dir = _as_path("state_dir", data["state_dir"])
         volume = _as_path("volume", data["volume"])
-        return cls(blackbox_db=state_dir / STATE_DB, volume=volume)
+        return cls(
+            blackbox_db=state_dir / STATE_DB,
+            volume=volume,
+            control_socket=state_dir / STATE_SOCKET,
+        )

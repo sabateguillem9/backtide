@@ -452,3 +452,53 @@ def test_a_state_dir_that_is_a_file_or_missing_is_refused(layout: Path) -> None:
     (layout / "state").rmdir()
     with pytest.raises(ConfigError, match="cannot read state_dir"):
         ServiceConfig.from_file(path)
+
+
+# --- the emergency growth (T04e-1) -------------------------------------------------------------
+
+
+def test_growth_is_off_by_default(layout: Path) -> None:
+    config = ServiceConfig.from_file(write_toml(layout))
+    assert config.volume_image is None and config.max_volume_bytes is None
+
+
+def test_growth_reads_the_image_and_the_ceiling(layout: Path) -> None:
+    image = layout / "volume.img"
+    config = ServiceConfig.from_file(
+        write_toml(layout, f'volume_image = "{image}"\nmax_volume_bytes = 1610612736\n')
+    )
+    assert config.volume_image == image
+    assert config.max_volume_bytes == 3 * 1024**3 // 2
+
+
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        pytest.param('volume_image = "/srv/v.img"\n', "go together", id="image-alone"),
+        pytest.param("max_volume_bytes = 10\n", "go together", id="ceiling-alone"),
+        pytest.param(
+            'volume_image = "v.img"\nmax_volume_bytes = 10\n', "absolute", id="relative-image"
+        ),
+        pytest.param(
+            'volume_image = "/srv/../v.img"\nmax_volume_bytes = 10\n', "'\\.\\.'", id="dotdot"
+        ),
+        pytest.param(
+            'volume_image = "/srv/v.img"\nmax_volume_bytes = 0\n', "max_volume", id="zero"
+        ),
+        pytest.param(
+            'volume_image = "/srv/v.img"\nmax_volume_bytes = true\n', "max_volume", id="bool"
+        ),
+    ],
+)
+def test_invalid_growth_settings_are_refused(layout: Path, extra: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        ServiceConfig.from_file(write_toml(layout, extra))
+
+
+@pytest.mark.parametrize("where", ["volume", "state/openclaw"])
+def test_the_image_never_lives_where_the_agent_sees_it(layout: Path, where: str) -> None:
+    image = layout / where / "volume.img"
+    with pytest.raises(ConfigError, match="must not be inside"):
+        ServiceConfig.from_file(
+            write_toml(layout, f'volume_image = "{image}"\nmax_volume_bytes = 10\n')
+        )

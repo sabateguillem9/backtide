@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import textwrap
@@ -50,6 +51,7 @@ REASON_NAMES = {
     "manual": "manual",
     "pre_restore": "antes de rebobinar",
     "recovered": "recuperada",
+    "evidence": "de evidencia",
 }
 
 
@@ -188,6 +190,9 @@ def _watch(args: argparse.Namespace) -> int:
     except ServiceLocked as error:
         _error(str(error))
         return EXIT_FAILED
+    except ConfigError as error:  # a file the service reads at start (telegram.toml, T09)
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
     except ControlError as error:  # the guardian stopped (and the agent with it) before this
         _error(f"no se puede abrir el socket de control, así que Vigía se ha parado: {error}")
         return EXIT_FAILED
@@ -510,14 +515,16 @@ def _printable(text: str) -> str:
 def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     web = commands.add_parser(
         "web",
-        help="abre el puesto de vigilancia en este ordenador (solo lectura)",
+        help="abre el puesto de vigilancia en este ordenador",
         description="Sirve la web de Vigía en 127.0.0.1 (solo este ordenador): lo que hace el "
         "agente en directo, la historia con filtros y las instantáneas. Solo lee la base de la "
         "caja negra (sin su clave ni el token) y se puede lanzar como un usuario sin privilegios "
-        "con permiso de lectura sobre ella. Imprime un enlace de un solo uso, nuevo en cada "
-        "ejecución, y el nombre de la ejecución; ábrelo en el navegador (no abre nada por sí "
-        "mismo). Ctrl-C la para. Sale con 0 si paró bien, 1 si no pudo arrancar y 2 si la "
-        "configuración no sirve.",
+        "con permiso de lectura sobre ella: así solo mira. Con --rebobinar y con el mismo usuario "
+        "que el servicio, también rebobina, pidiéndoselo al servicio por su socket de control "
+        "(con su aviso y una confirmación); como root, sin --rebobinar no arranca. Imprime un "
+        "enlace de un solo uso, nuevo en cada ejecución, y el nombre de la ejecución; ábrelo en "
+        "el navegador (no abre nada por sí mismo). Ctrl-C la para. Sale con 0 si paró bien, 1 si "
+        "no pudo arrancar y 2 si la configuración no sirve.",
     )
     _add_config(web)
     web.add_argument(
@@ -528,19 +535,61 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         default=None,
         help="puerto en 127.0.0.1 (por defecto 8765; 0 elige uno libre)",
     )
+    web.add_argument(
+        "--rebobinar",
+        action="store_true",
+        help="deja que la web pida rebobinados al servicio (hace falta su mismo usuario); sin "
+        "esto, la web solo mira",
+    )
     web.set_defaults(handler=_web)
+
+
+WEB_REWIND_LINES = {
+    "ready": "Rebobinar desde la web: sí. Esta web corre con el mismo usuario que el servicio y se "
+    "lo pide por su socket de control (con el aviso y una confirmación).",
+    "no_service": "Rebobinar desde la web: cuando el servicio esté en marcha (`vigia vigilar`).",
+    "other_user": "Rebobinar desde la web: no. Esta web no corre con el usuario del servicio, así "
+    "que solo mira; para rebobinar, `vigia rebobinar`.",
+    "off": "Rebobinar desde la web: no disponible; para rebobinar, `vigia rebobinar`.",
+    "disabled": "Rebobinar desde la web: no; sin `--rebobinar` esta web solo mira. Para rebobinar, "
+    "`vigia rebobinar` (o `vigia web --rebobinar` con el usuario del servicio).",
+}
+ROOT_WEB_REFUSAL = (
+    "esta web iba a correr como root: con todos los privilegios y solo para mirar. Para mirar, "
+    "lánzala con un usuario lector (con permiso de lectura sobre la caja negra); si de verdad "
+    "quieres rebobinar desde la web como root, pásale --rebobinar sabiendo lo que haces."
+)
+
+
+ROOT_WEB_WARNING = (
+    "Ojo: esta web corre como root; para solo mirar, lánzala con un usuario lector (con permiso "
+    "de lectura sobre la caja negra). Como root puede rebobinar, pero cualquier fallo suyo sería "
+    "un fallo con todos los privilegios."
+)
+
+
+def _effective_uid() -> int:
+    return os.geteuid()
+
+
+def _web_rewind_line(availability: str) -> str:
+    return WEB_REWIND_LINES.get(str(availability), WEB_REWIND_LINES["off"])
 
 
 def _web(args: argparse.Namespace) -> int:
     from vigia.web.paths import WebPaths
+    from vigia.web.rewind import ControlRewinder
     from vigia.web.server import DEFAULT_PORT, run_web
 
+    if _effective_uid() == 0 and not args.rebobinar:
+        _error(ROOT_WEB_REFUSAL)
+        return EXIT_ERROR
     port = DEFAULT_PORT if args.port is None else args.port
     if not 0 <= port <= 65535:
         _error(f"el puerto debe estar entre 0 y 65535, no {port}")
         return EXIT_ERROR
     try:
-        # Only the two paths the web needs: never the gateway token, never the black box's key.
+        # Only the paths the web needs: never the gateway token, never the black box's key.
         paths = WebPaths.from_file(args.config)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
@@ -555,9 +604,13 @@ def _web(args: argparse.Namespace) -> int:
             "Ctrl-C la para.",
             flush=True,
         )
+        rewinder = ControlRewinder(paths.control_socket, enabled=args.rebobinar)
+        print(_web_rewind_line(rewinder.availability()), flush=True)
+        if _effective_uid() == 0:
+            print(ROOT_WEB_WARNING, flush=True)
 
     try:
-        run_web(paths, port, announce)
+        run_web(paths, port, announce, can_rewind=args.rebobinar)
     except OSError as error:
         _error(f"no se puede abrir el puerto {port} en 127.0.0.1: {error.strerror or error}")
         return EXIT_FAILED

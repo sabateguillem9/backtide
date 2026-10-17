@@ -14,6 +14,7 @@ from vigia.blackbox import BlackBoxError
 from vigia.cli import main
 from vigia.jail import JailError
 from vigia.jail.openclaw import RewindProblem, UnrewindableConfig
+from vigia.service.config import ConfigError
 from vigia.service.runner import ServiceLocked
 from vigia.snapshots import Reason, Snapshot, SnapshotError
 
@@ -107,6 +108,19 @@ def test_a_second_service_is_refused_with_the_reason(
     code, _, err = run(capsys, "vigilar", "--config", config_file)
     assert code == 1
     assert "Ya hay un `vigia vigilar` en marcha" in err
+
+
+def test_an_unusable_telegram_file_is_a_config_error(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def serve(config: object) -> None:
+        raise ConfigError("Telegram settings file x is open to group or others: chmod 600 it")
+
+    monkeypatch.setattr(cli, "serve", serve)
+    code, out, err = run(capsys, "vigilar", "--config", config_file)
+    assert code == 2
+    assert "configuración no válida" in err and "chmod 600" in err
+    assert "error inesperado" not in err and "Traceback" not in err + out
 
 
 def test_a_black_box_that_cannot_be_used_is_an_error_not_a_traceback(

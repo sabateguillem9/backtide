@@ -31,6 +31,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -413,9 +414,33 @@ def create_volume(paths: Paths) -> None:
         token.chmod(0o600)
         paths.config.write_text(render_config(paths, os.getuid(), os.getgid()))
         paths.config.chmod(0o600)
+        copy_telegram(paths)
     except BaseException:
         teardown(paths)  # leave nothing mounted behind
         raise
+
+
+# The founder's own bot (docs/28): kept outside the demo folder, which `parar` deletes.
+TELEGRAM_SOURCE = Path.home() / ".config" / "backtide" / "telegram.toml"
+
+
+def copy_telegram(paths: Paths, source: Path = TELEGRAM_SOURCE) -> bool:
+    """Copy the bot's settings into the demo's state folder, if the founder made them. The
+    token is never read into a string here or printed: the bytes go from file to file. The
+    source must be the user's own regular file with mode 0600, as the service will check."""
+    try:
+        info = source.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise DemoError(f"{source} debe ser un archivo normal y tuyo")
+    if info.st_mode & 0o077:
+        raise DemoError(f"{source} debe tener permisos 600 (chmod 600 {source})")
+    data = source.read_bytes()
+    fd = os.open(paths.state / "telegram.toml", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as target:
+        target.write(data)
+    return True
 
 
 def command_up(paths: Paths) -> int:
@@ -433,6 +458,8 @@ def command_up(paths: Paths) -> int:
         "Para parar: Ctrl-C aquí. Para limpiarlo todo: `make demo-parar`.\n",
         flush=True,
     )
+    if (paths.state / "telegram.toml").exists():
+        print("Telegram: los avisos irán a tu bot. Prueba /estado y /pausar.\n", flush=True)
     paths.pid_file.write_text(f"{os.getpid()}\n")
     stop = threading.Event()
     feed = threading.Thread(target=feed_black_box, args=(paths, stop), name="demo-feed")
