@@ -473,6 +473,10 @@ def make_service(
         f"gid = {os.getgid()}\n"
         'memory = "2g"\n'
         'cpus = "2"\n'
+        # The proxy's CA is group-readable by the proxy's gid: without root, only this user's.
+        "[proxy]\n"
+        f"uid = {os.getuid()}\n"
+        f"gid = {os.getgid()}\n"
     )
     config_path.chmod(0o600)
     config = ServiceConfig.from_file(config_path)

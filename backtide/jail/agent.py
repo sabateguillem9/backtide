@@ -12,7 +12,8 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
   rewound workspace (a running container would keep the old one mounted).
 - create() and start() refuse an agent that shares backtide's uid or gid (see AgentJailConfig),
   and start() refuses a container that is not exactly this config's jail (backtide/jail/verify.py)
-  or whose mounted config folder holds anything but openclaw.json.
+  or whose mounted config folder holds anything but openclaw.json, or whose CA folder holds
+  anything but the certificate (ca.py writes it; the CA's key never goes there).
 - Whatever comes out of the container (exec output, logs) is the agent's: bounded in size,
   sanitized before it reaches a message, and never trusted to configure backtide's own probes.
 """
@@ -32,6 +33,7 @@ from backtide.jail import docker
 from backtide.jail.config import (
     AGENT_DIR,
     AGENT_SUBDIRS,
+    CA_CERT_FILE,
     CONFIG_FILE,
     HEALTH_URL,
     READY_LOG_LINE,
@@ -71,6 +73,7 @@ _NOT_PAUSED = "is not paused"
 PAUSE_TIMEOUT = 10.0  # seconds for docker pause / unpause, which take milliseconds
 _NETWORK_NOT_FOUND = "not found"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_CA_CERT_MAX = 64 * 1024  # one PEM certificate is about 2 KB
 
 # Whether quiesce starts the agent on exit, given the exception of its body (or None).
 type StartIf = Callable[[BaseException | None], bool]
@@ -551,9 +554,11 @@ class AgentJail:
 
     def _check_mount_sources(self) -> None:
         """``docker -v`` would create a missing source as an empty root-owned folder, and it
-        follows symlinks: so both sources must already be real directories. The config folder
-        is checked again here, right before the agent can see it: backtide's and nothing else."""
+        follows symlinks: so every source must already be a real directory. The config and CA
+        folders are checked again here, right before the agent can see them: backtide's, and
+        nothing in them but their one file."""
         os.close(_open_dir(self.config.agent_dir))
+        _check_ca_dir(self.config.ca_dir)
         config_fd = _open_dir(self.config.config_dir)
         try:
             _require_owned_by_backtide(config_fd, self.config.config_dir)
@@ -581,6 +586,42 @@ def _require_only_the_config(dir_fd: int, path: Path) -> None:
             f"{path} is mounted into the agent and must hold only {CONFIG_FILE}; "
             f"found {strays}: move them elsewhere (a stray {_TMP_CONFIG}: run write_config())"
         )
+
+
+def _check_ca_dir(path: Path) -> None:
+    """The CA folder the agent sees: backtide's, holding only ``ca.pem``, a regular file. Never
+    the key: ca.py writes the certificate alone, and a stray file here is refused."""
+    fd = _open_dir(path)
+    try:
+        _require_owned_by_backtide(fd, path)
+        if stat.S_IMODE(os.fstat(fd).st_mode) & 0o022:
+            raise JailError(f"{path} is writable by group or others")
+        names = sorted(os.listdir(fd))
+        if names != [CA_CERT_FILE]:
+            raise JailError(
+                f"{path} is mounted into the agent and must hold only {CA_CERT_FILE}; found "
+                f"{names}: let backtide write it again (backtide/jail/ca.py)"
+            )
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        try:
+            file_fd = os.open(CA_CERT_FILE, flags, dir_fd=fd)
+        except OSError as e:  # ELOOP: a symlink
+            raise JailError(f"cannot open {path / CA_CERT_FILE}: {e}") from e
+        try:
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise JailError(f"{path / CA_CERT_FILE} is not a regular file")
+            if file_stat.st_uid != os.geteuid() or stat.S_IMODE(file_stat.st_mode) & 0o022:
+                raise JailError(f"{path / CA_CERT_FILE} may be changed by someone but backtide")
+            content = os.read(file_fd, _CA_CERT_MAX + 1)
+        finally:
+            os.close(file_fd)
+        if len(content) > _CA_CERT_MAX or b"PRIVATE KEY" in content:
+            raise JailError(
+                f"{path / CA_CERT_FILE} is not just a certificate: refusing to show it to the agent"
+            )
+    finally:
+        os.close(fd)
 
 
 def _check_network(name: str, info: dict[str, Any]) -> None:

@@ -40,7 +40,7 @@ from backtide.analyzer import (
     parse_rules,
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
-from backtide.jail import AgentJail, JailError
+from backtide.jail import AgentJail, JailError, ca
 from backtide.notify import AlertQueue, FanOut, LogNotifier, Notifier
 from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.service.bot import Hooks, telegram_parts
@@ -275,9 +275,18 @@ def build_guardian(
         holders=holders,
         grow=grow,
         risk=responder,
+        prepare_egress=lambda: prepare_egress(config),
     )
     responder.bind(snapshot=guardian.take_evidence, record=rated_box.append)
     return guardian, alerts, box
+
+
+def prepare_egress(config: ServiceConfig) -> None:
+    """What the agent's way out needs before its container is made (T06-2): the proxy's CA,
+    made once, and the agent's copy of its certificate. Starting the proxy itself, and watching
+    it, is T06-4's (docs/21, section 9)."""
+    if ca.ensure_ca(config.ca_paths()):
+        logger.info("made the egress proxy's CA in %s", config.proxy_ca_dir)
 
 
 def make_grower(config: ServiceConfig) -> VolumeGrower:

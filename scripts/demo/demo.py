@@ -386,6 +386,11 @@ def render_config(paths: Paths, uid: int, gid: int) -> str:
         f"gid = {gid}\n"
         'memory = "2g"\n'
         'cpus = "2"\n'
+        "\n"
+        "# The egress proxy's CA (T06): group-readable by the proxy's gid, here the VM user's.\n"
+        "[proxy]\n"
+        f"uid = {uid}\n"
+        f"gid = {gid}\n"
     )
 
 

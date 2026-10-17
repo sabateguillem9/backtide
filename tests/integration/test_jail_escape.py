@@ -179,8 +179,9 @@ def test_runs_without_capabilities_and_with_no_new_privileges(
 
 def test_only_workspace_config_and_tmp_are_mounted(running_agent: RunningAgent) -> None:
     """Invariant 1: the agent never sees the black box, the snapshots or the Docker socket.
-    /proc/self/mountinfo shows only /workspace (rw), /config (ro) and /tmp, plus the pseudo
-    filesystems and the small /etc files Docker always binds."""
+    /proc/self/mountinfo shows only /workspace (rw), /config (ro), the proxy's CA certificate
+    (/etc/backtide-ca, ro: T06-2) and /tmp, plus the pseudo filesystems and the small /etc
+    files Docker always binds."""
     result = running_agent.exec(["cat", "/proc/self/mountinfo"])
     assert result.returncode == 0, output(result)
     mounts = parse_mountinfo(result.stdout or "")
@@ -191,6 +192,8 @@ def test_only_workspace_config_and_tmp_are_mounted(running_agent: RunningAgent) 
     assert "/config" in by_point, by_point
     assert "ro" in by_point["/config"].options.split(","), by_point["/config"]
     assert TMP_MOUNT in by_point, by_point
+    assert "/etc/backtide-ca" in by_point, by_point
+    assert "ro" in by_point["/etc/backtide-ca"].options.split(","), by_point["/etc/backtide-ca"]
 
     for mount in mounts:
         assert not mount.point.endswith("docker.sock"), mount
@@ -202,6 +205,7 @@ def test_only_workspace_config_and_tmp_are_mounted(running_agent: RunningAgent) 
         "/",
         "/workspace",
         "/config",
+        "/etc/backtide-ca",
         TMP_MOUNT,
         "/etc/resolv.conf",
         "/etc/hostname",
@@ -530,10 +534,11 @@ def test_cannot_create_raw_sockets_or_ping(running_agent: RunningAgent) -> None:
 def test_no_network_egress_to_public_ips(running_agent: RunningAgent) -> None:
     """The agent's Docker network is --internal: no route to any public address. 192.0.2.1 is
     TEST-NET-1 (guaranteed unroutable); 1.1.1.1 only proves there is no default route. Nothing
-    is ever sent anywhere real."""
+    is ever sent anywhere real. Direct (``--noproxy '*'``): what goes through the proxy is
+    test_proxy_container.py's."""
     script = """
     for url in http://1.1.1.1 http://192.0.2.1 https://1.1.1.1; do
-      if curl -sS --max-time 8 -o /dev/null "$url" 2>/dev/null; then
+      if curl --noproxy '*' -sS --max-time 8 -o /dev/null "$url" 2>/dev/null; then
         echo ESCAPED reached $url
         exit 1
       fi
@@ -631,6 +636,14 @@ print("own:", sorted(own), "targets:", sorted(targets))
 if mode == "list":
     print("TARGETS", json.dumps(sorted(targets)))
     sys.exit(0)
+# The egress proxy is the one neighbour on the agent's network (T06-2): test_proxy_container.py
+# probes it on its own (only its port 8080 answers).
+try:
+    proxy = {info[4][0] for info in socket.getaddrinfo("backtide-proxy", None, socket.AF_INET)}
+except OSError:
+    proxy = set()
+targets -= proxy
+print("proxy, not probed here:", sorted(proxy))
 reached = []
 for address in sorted(targets):
     for port in (22, 2375):
@@ -657,7 +670,7 @@ def test_cannot_reach_host_gateway_or_cloud_metadata(running_agent: RunningAgent
       http://169.254.169.254/latest/meta-data/ \
       http://metadata.google.internal/ \
       http://host.docker.internal/; do
-      if curl -sS --max-time 6 -o /dev/null "$url" 2>/dev/null; then
+      if curl --noproxy '*' -sS --max-time 6 -o /dev/null "$url" 2>/dev/null; then
         echo ESCAPED reached $url
         exit 1
       fi

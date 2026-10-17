@@ -565,6 +565,7 @@ def world(tmp_path: Path, clock: Callable[[], datetime]) -> Iterator[World]:
         info=volume.info,
         sync=volume.sync,
         clock_synced=lambda: world.synced[0],
+        prepare_egress=lambda: log.append("egress.prepare"),
     )
     world = World(config, volume, jail, watcher, box, alerts, log, guardian)
     yield world
@@ -595,6 +596,7 @@ def test_a_first_boot_does_everything_in_the_documented_order(world: World) -> N
         "jail.ensure_network",
         "jail.prepare_workspace",
         "jail.write_config",
+        "egress.prepare",  # the proxy's CA, whose certificate the agent mounts (T06-2)
         "jail.create",
         "btrfs.sync",  # the space check always reads a committed volume
         "space.evaluate",
@@ -654,6 +656,21 @@ def test_an_agent_that_cannot_be_stopped_stops_the_boot(world: World) -> None:
     assert failed.risk == 3
     assert world.alerts.titled("No se pudo parar")
     assert world.only("service_start_failed")
+
+
+def test_without_the_proxys_ca_the_agent_is_never_created(world: World) -> None:
+    """The agent's only way out trusts that CA (T06-2): no CA, no boot, and no agent."""
+
+    def no_ca() -> None:
+        world.log.append("egress.prepare")
+        raise JailError("cannot create /var/lib/backtide/proxy-ca: Permission denied")
+
+    world.guardian._prepare_egress = no_ca  # noqa: SLF001
+    with pytest.raises(JailError, match="proxy-ca"):
+        world.guardian.start()
+    assert "egress.prepare" in world.log
+    assert "jail.create" not in world.log and "jail.start" not in world.log
+    assert "proxy-ca" in world.only("service_start_failed").details["error"]
 
 
 def test_without_a_black_box_nothing_starts(world: World) -> None:
@@ -2560,6 +2577,7 @@ def test_a_real_jail_whose_stop_fails_in_the_middle_of_a_rewind(
         AgentJailConfig(
             workspace=workspace,
             config_dir=tmp_path / "jail-config",
+            ca_dir=tmp_path / "jail-ca",
             gateway_token="u" * 43,
             name="agent-under-test",
             network="net-under-test",

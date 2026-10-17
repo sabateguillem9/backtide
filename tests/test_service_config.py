@@ -10,8 +10,11 @@ from pathlib import Path
 import pytest
 
 from backtide.jail import AgentJailConfig
+from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.service.config import (
     ConfigError,
+    Provider,
+    ProxySettings,
     Secret,
     ServiceConfig,
     _require_private_state_dir,
@@ -502,3 +505,137 @@ def test_the_image_never_lives_where_the_agent_sees_it(layout: Path, where: str)
         ServiceConfig.from_file(
             write_toml(layout, f'volume_image = "{image}"\nmax_volume_bytes = 10\n')
         )
+
+
+# --- [proxy] (T06, docs/21) ---------------------------------------------------------------------
+
+
+def test_the_proxy_folders_live_in_the_state(layout: Path) -> None:
+    config = ServiceConfig.from_file(write_toml(layout))
+    state = layout / "state"
+    assert config.proxy_ca_dir == state / "proxy-ca"
+    assert config.agent_ca_dir == state / "agent-ca"
+    assert config.proxy_channel_dir == state / "proxy-channel"
+    assert config.keys_dir == state / "keys"
+    assert config.jail_config().ca_dir == state / "agent-ca"  # what the agent sees
+    paths = config.ca_paths()
+    assert (paths.proxy_dir, paths.agent_dir, paths.gid) == (
+        state / "proxy-ca",
+        state / "agent-ca",
+        61001,
+    )
+
+
+def test_the_proxy_defaults_are_the_designs(layout: Path) -> None:
+    config = ServiceConfig.from_file(write_toml(layout))
+    proxy = config.proxy_jail_config()
+    assert isinstance(proxy, ProxyJailConfig)
+    assert (proxy.ca_dir, proxy.channel_dir) == (config.proxy_ca_dir, config.proxy_channel_dir)
+    assert (proxy.uid, proxy.gid) == (61001, 61001)
+    assert proxy.agent_network == config.jail_config().network
+    assert (proxy.internal_egress, proxy.allow_shared_ids) == (False, False)
+    assert config.proxy_settings() == ProxySettings(allow_hosts=(), providers=())
+
+
+def test_the_proxy_options_are_read(layout: Path) -> None:
+    config = ServiceConfig.from_file(
+        write_toml(
+            layout,
+            '[agent]\nnetwork = "agent-net-2"\nuid = 62000\ngid = 62000\n'
+            '[proxy]\nname = "proxy-2"\nnetwork = "egress-2"\nuid = 62001\ngid = 62001\n'
+            'memory = "512m"\nallow_hosts = ["github.com", "*.pypi.org"]\n'
+            '[[proxy.providers]]\nname = "anthropic"\nkind = "anthropic"\n'
+            '[[proxy.providers]]\nname = "groq"\nkind = "openai"\nhost = "api.groq.com"\n',
+        )
+    )
+    proxy = config.proxy_jail_config()
+    assert (proxy.name, proxy.network, proxy.memory) == ("proxy-2", "egress-2", "512m")
+    assert (proxy.uid, proxy.gid, proxy.agent_uid, proxy.agent_gid) == (62001, 62001, 62000, 62000)
+    assert proxy.agent_network == "agent-net-2"
+    assert config.ca_paths().gid == 62001
+    assert config.proxy_settings() == ProxySettings(
+        allow_hosts=("github.com", "*.pypi.org"),
+        providers=(
+            Provider("anthropic", "anthropic", "api.anthropic.com"),
+            Provider("groq", "openai", "api.groq.com"),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '[proxy]\napi_key = "sk-ant-api03-REAL"\n',
+        '[proxy]\nanthropic_key = "sk-ant-api03-REAL"\n',
+        '[proxy]\ntoken = "sk-ant-api03-REAL"\n',
+        '[[proxy.providers]]\nname = "a"\nkind = "anthropic"\napi_key = "sk-ant-api03-REAL"\n',
+        '[[proxy.providers]]\nname = "a"\nkind = "openai"\napiKey = "sk-ant-api03-REAL"\n',
+    ],
+)
+def test_a_key_in_the_proxy_section_is_refused_without_quoting_it(layout: Path, extra: str) -> None:
+    with pytest.raises(ConfigError, match="never hold a key") as error:
+        ServiceConfig.from_file(write_toml(layout, extra))
+    assert "sk-ant" not in str(error.value)
+    assert "keys/" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        pytest.param("proxy = 3\n", r"\[proxy\] must be a table", id="not-a-table"),
+        pytest.param("[proxy]\nsurprise = 1\n", "unknown", id="unknown-key"),
+        pytest.param("[proxy]\ninternal_egress = true\n", "unknown", id="test-only-egress"),
+        pytest.param("[proxy]\nallow_shared_ids = true\n", "unknown", id="test-only-ids"),
+        pytest.param("[proxy]\nuid = 0\n", "proxy", id="root"),
+        pytest.param('[proxy]\nimage = "mitmproxy/mitmproxy:latest"\n', "proxy", id="unpinned"),
+        pytest.param('[proxy]\nnetwork = "backtide-agente-net"\n', "proxy", id="agents-network"),
+        pytest.param('[proxy]\nallow_hosts = "github.com"\n', "allow_hosts", id="hosts-str"),
+        pytest.param('[proxy]\nallow_hosts = ["*"]\n', "allow_hosts", id="hosts-everything"),
+        pytest.param('[proxy]\nallow_hosts = ["a b"]\n', "allow_hosts", id="hosts-space"),
+        pytest.param('[proxy]\nallow_hosts = ["evil.com/x"]\n', "allow_hosts", id="hosts-path"),
+        pytest.param('[proxy]\nallow_hosts = ["127.0.0.1:22"]\n', "allow_hosts", id="hosts-port"),
+        pytest.param("[proxy]\nallow_hosts = [3]\n", "allow_hosts", id="hosts-number"),
+        pytest.param('[proxy]\nallow_hosts = [".com"]\n', "allow_hosts", id="hosts-dot"),
+        pytest.param("[proxy]\nproviders = [1]\n", "table", id="provider-not-table"),
+        pytest.param(
+            '[[proxy.providers]]\nname = "x"\nkind = "gemini"\n', "kind", id="provider-kind"
+        ),
+        pytest.param(
+            '[[proxy.providers]]\nname = "Bad Name"\nkind = "openai"\n', "name", id="provider-name"
+        ),
+        pytest.param(
+            '[[proxy.providers]]\nname = "x"\nkind = "openai"\nhost = "*.openai.com"\n',
+            "exact",
+            id="provider-wildcard",
+        ),
+        pytest.param(
+            '[[proxy.providers]]\nname = "x"\nkind = "openai"\nweird = 1\n',
+            "unknown",
+            id="provider-unknown",
+        ),
+        pytest.param(
+            '[[proxy.providers]]\nname = "x"\nkind = "openai"\n'
+            '[[proxy.providers]]\nname = "x"\nkind = "anthropic"\n',
+            "once",
+            id="provider-twice",
+        ),
+    ],
+)
+def test_invalid_proxy_settings_are_refused(layout: Path, extra: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        ServiceConfig.from_file(write_toml(layout, extra))
+
+
+@pytest.mark.parametrize("folder", ["proxy-ca", "agent-ca", "proxy-channel", "keys"])
+def test_the_agent_config_dir_is_never_a_folder_of_the_proxy(layout: Path, folder: str) -> None:
+    """The agent's config folder is mounted into the agent: it must never be (or hold) the CA's
+    key, the channel or the real keys (invariant 1)."""
+    state = layout / "state"
+    for config_dir in (state / folder, state / folder / "openclaw"):
+        with pytest.raises(ConfigError, match="must not (be or )?contain"):
+            ServiceConfig(
+                state_dir=state,
+                volume=layout / "volume",
+                gateway_token=Secret(TOKEN),
+                agent={"config_dir": config_dir},
+            )

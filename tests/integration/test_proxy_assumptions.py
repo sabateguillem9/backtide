@@ -381,6 +381,10 @@ def lab(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Lab]:
         remove_all(containers, networks)
 
 
+def option_values(argv: list[str], option: str) -> list[str]:
+    return [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == option]
+
+
 def run_client(lab: Lab, *args: str, container: str | None = None, timeout: float = 60) -> dict:
     result = docker(
         "exec", container or lab.client, "python3", "/opt/t06/client.py", *args,
@@ -927,7 +931,7 @@ FAKE_MODEL = "fake-claude"
 REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"  # proxy_fixtures/fake_internet.py
 AGENT_CA_DIR = "/etc/backtide-ca"
 PROXY_URL = f"http://{PROXY}"
-# docs/21, sections 2 and 3: what T06-2 adds to the agent's _FIXED_ENV.
+# docs/21, sections 2 and 3: what T06-2 added to the agent's environment.
 PROXY_ENV = (
     ("HTTP_PROXY", PROXY_URL),
     ("HTTPS_PROXY", PROXY_URL),
@@ -1002,6 +1006,7 @@ def openclaw_files(lab: Lab, tmp_path_factory: pytest.TempPathFactory) -> OpenCl
     config = AgentJailConfig(
         workspace=workspace,
         config_dir=config_dir,
+        ca_dir=agent_ca,
         gateway_token=secrets.token_urlsafe(32),
         name=unique(CONTAINER_PREFIX),
         network=lab.agent_net,
@@ -1022,16 +1027,15 @@ def openclaw_files(lab: Lab, tmp_path_factory: pytest.TempPathFactory) -> OpenCl
 @contextmanager
 def openclaw_container(files: OpenClawFiles, *, gateway: bool) -> Iterator[OpenClaw]:
     """The real OpenClaw with the jail's own argv (backtide/jail/config.py) on the lab's agent
-    network, plus docs/21's variables and the agent CA in /etc/backtide-ca. With ``gateway`` it
+    network: docs/21's variables and the agent CA in /etc/backtide-ca (T06-2). With ``gateway`` it
     runs the Gateway, as the jail does; without, only ``sleep``, for embedded turns
     (``--local`` refuses to run next to a Gateway, and both at once do not fit in 2 GB)."""
     config = replace(files.config, name=unique(CONTAINER_PREFIX))
     argv = docker_create_argv(config)
-    entry = argv.index("--entrypoint")
-    extra = ["--volume", f"{files.agent_ca}:{AGENT_CA_DIR}:ro,z"]
-    for name, value in PROXY_ENV:
-        extra += ["--env", f"{name}={value}"]
-    argv[entry:entry] = extra
+    # Since T06-2 the jail's own argv carries docs/21's variables and the CA's mount.
+    env = option_values(argv, "--env")
+    assert all(f"{name}={value}" in env for name, value in PROXY_ENV), env
+    assert f"{files.agent_ca}:{AGENT_CA_DIR}:ro,z" in option_values(argv, "--volume")
     if not gateway:
         argv = [*argv[: argv.index(config.image) + 1], "-s", "--", "sleep", "infinity"]
     try:

@@ -1,7 +1,8 @@
 # The connect policy of docs/23, section 4: every connect() to an IPv4 or IPv6 address made
 # outside the host's network namespace. Loopback is filtered by the reader, not here (sockaddr
-# cannot be matched by address). Checked in the VM by test_sensor_assumptions.py (P7);
-# T07-2 moves it to its final place next to the sensor's code.
+# cannot be matched by address). Checked in the VM by test_sensor_assumptions.py (P7).
+# backtide copies it into the sensor's tp.d/ on every start (backtide/jail/sensor.py). It only
+# observes, with no enforcement action of any kind (docs/23, decision 11).
 apiVersion: cilium.io/v1alpha1
 kind: TracingPolicy
 metadata:

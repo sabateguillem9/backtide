@@ -31,7 +31,10 @@ from before the mount until after the unmount. The kernel drops it when the owne
   ``sudo umount <mount point>``.
 
 ``running_agent`` (T03a) starts the real OpenClaw image in its jail on that btrfs, with docker
-and no sudo at all. It pulls the pinned image the first time (about 1.3 GB, by digest).
+and no sudo at all. It pulls the pinned image the first time (about 1.3 GB, by digest). Since
+T06-2 the egress proxy runs beside it, as in production: the agent's only neighbour, with its
+CA made by the VM's openssl, refusing everything (backtide/gate/main.py). Its egress network is
+``--internal`` too (a concession of the tests, docs/21): nothing can reach the internet.
 ``start_quota_agent`` (T03b-2) starts the same agent on a ``quota_volume`` with its workspace
 capped; the cap is the only sudo it needs, through ``QuotaVolume.set_limit``. Test
 containers and networks carry the pid of the pytest process that made them, so a later run
@@ -58,8 +61,10 @@ from uuid import uuid4
 
 import pytest
 
-from backtide.jail import IMAGE, AgentJail, AgentJailConfig, JailError
+from backtide.jail import IMAGE, AgentJail, AgentJailConfig, JailError, ca, proxy_config
 from backtide.jail import docker as jail_docker
+from backtide.jail.proxy import ProxyJail
+from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.snapshots import SnapshotError, btrfs, grow
 from backtide.snapshots.store import SnapshotStore
 from tests.integration.service_kit import Service, make_service
@@ -269,6 +274,7 @@ class RunningAgent:
 
     jail: AgentJail
     store: SnapshotStore
+    proxy: ProxyJail | None = None  # the egress proxy beside it (T06-2)
 
     @property
     def name(self) -> str:
@@ -342,13 +348,15 @@ def start_quota_agent(
 
 @contextmanager
 def _jailed_agent(agent_store: SnapshotStore, config_dir: Path) -> Iterator[RunningAgent]:
-    """Set up, create and start the agent's jail on ``agent_store``'s workspace, wait until it
-    is ready and yield it. The container and its network are removed on the way out, also when
-    any step of the setup fails."""
+    """Set up, create and start the agent's jail on ``agent_store``'s workspace, with the
+    egress proxy beside it, wait until both are ready and yield it. The containers and their
+    networks are removed on the way out, also when any step of the setup fails."""
     name, network = _agent_names(os.getpid())
+    egress = TestEgress(config_dir.with_name(f"{config_dir.name}-egress"))
     config = AgentJailConfig(
         workspace=agent_store.workspace,
         config_dir=config_dir,
+        ca_dir=egress.agent_ca,
         gateway_token=secrets.token_urlsafe(32),
         name=name,
         network=network,
@@ -359,16 +367,80 @@ def _jailed_agent(agent_store: SnapshotStore, config_dir: Path) -> Iterator[Runn
         cpus="2",
     )
     jail = AgentJail(config)
+    proxy = egress.proxy(network)
     try:
         jail.ensure_network()
+        egress.start(proxy)
         jail.prepare_workspace()
         jail.write_config()
         jail.create()
         jail.start()
         jail.wait_ready()
-        yield RunningAgent(jail=jail, store=agent_store)
+        yield RunningAgent(jail=jail, store=agent_store, proxy=proxy)
     finally:
-        _remove_agent(jail)
+        _remove_agent(jail, proxy)
+
+
+class TestEgress:
+    """The egress side of a test agent, as production lays it out in ``<state_dir>``
+    (docs/21): the CA made by ca.py with the VM's openssl, the proxy's channel folder and a
+    copy of backtide's package (the repository is a Lima mount, which SELinux's :z cannot
+    relabel). Everything belongs to the Lima user: the proxy runs with its ids
+    (``allow_shared_ids``) and its egress network is internal (``internal_egress``)."""
+
+    __test__ = False  # not a test class, whatever its name says
+
+    def __init__(self, root: Path) -> None:
+        root.mkdir(mode=0o700, exist_ok=True)
+        self.root = root
+        self.proxy_ca = root / "proxy-ca"
+        self.agent_ca = root / "agent-ca"
+        self.channel = root / "proxy-channel"
+        self.package = root / "code" / "backtide"
+        ca.ensure_ca(ca.CaPaths(proxy_dir=self.proxy_ca, agent_dir=self.agent_ca, gid=os.getgid()))
+        if not self.package.exists():
+            shutil.copytree(
+                proxy_config.PACKAGE_DIR,
+                self.package,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+
+    def config(self, agent_network: str, **changes: object) -> ProxyJailConfig:
+        name, egress_network = _agent_names(os.getpid())
+        settings: dict[str, object] = {
+            "ca_dir": self.proxy_ca,
+            "channel_dir": self.channel,
+            "package_dir": self.package,
+            "name": name,
+            "agent_network": agent_network,
+            "network": egress_network,
+            "uid": os.getuid(),
+            "gid": os.getgid(),
+            "agent_uid": os.getuid(),
+            "agent_gid": os.getgid(),
+            "internal_egress": True,
+            "allow_shared_ids": True,
+        }
+        return ProxyJailConfig(**(settings | changes))  # type: ignore[arg-type]
+
+    def proxy(self, agent_network: str, **changes: object) -> ProxyJail:
+        return ProxyJail(self.config(agent_network, **changes))
+
+    @staticmethod
+    def start(proxy: ProxyJail) -> None:
+        """The agent's network must exist already: the proxy joins it."""
+        _require_proxy_image()
+        proxy.ensure_network()
+        proxy.prepare_channel()
+        proxy.create()
+        proxy.start()
+        proxy.wait_ready()
+
+
+def _require_proxy_image() -> None:
+    if jail_docker.run(["image", "inspect", proxy_config.IMAGE], check=False).returncode == 0:
+        return
+    jail_docker.run(["pull", "--quiet", proxy_config.IMAGE], timeout=IMAGE_PULL_TIMEOUT)
 
 
 def _require_agent_image() -> None:
@@ -442,10 +514,14 @@ def _is_pytest_alive(pid: int) -> bool:
     return b"pytest" in cmdline
 
 
-def _remove_agent(jail: AgentJail) -> None:
-    """Remove the container, then its network. Both are attempted; a failure is raised."""
+def _remove_agent(jail: AgentJail, proxy: ProxyJail | None = None) -> None:
+    """Remove the containers, then their networks (the proxy is on the agent's). Every step
+    is attempted; the first failure is raised."""
     errors: list[JailError] = []
-    for step in (jail.remove, jail.remove_network):
+    steps = [jail.remove, jail.remove_network]
+    if proxy is not None:
+        steps = [jail.remove, proxy.remove, jail.remove_network, proxy.remove_network]
+    for step in steps:
         try:
             step()
         except JailError as error:

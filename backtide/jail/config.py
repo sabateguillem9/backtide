@@ -12,6 +12,12 @@ Mac unit tests check every security option of the container.
   host on the bridge. No ports are published and no host entries are added.
 - No API key ever reaches the container. The Gateway token reaches it through the docker
   CLI's environment (``-e NAME`` without a value), never through an argv that ``ps`` shows.
+- The only way out is the egress proxy (docs/21-diseno-t06-proxy.md), a neighbour on the same
+  internal network under the alias ``backtide-proxy``. The variables only help programs find
+  it: whatever ignores them has no route at all. The agent trusts the proxy's CA through its
+  certificate alone, mounted read-only from ``ca_dir`` (ca.py writes it; the key never leaves
+  the proxy's folder). No ``--dns``, ever: with one, Docker forwards outside names even from an
+  internal network (T06-1, P5), and verify.py requires it empty.
 """
 
 import re
@@ -37,6 +43,9 @@ TOKEN_ENV = "OPENCLAW_GATEWAY_TOKEN"  # noqa: S105 - the variable's name, not a 
 
 CONTAINER_WORKSPACE = PurePosixPath("/workspace")
 CONTAINER_CONFIG_DIR = PurePosixPath("/config")
+CONTAINER_CA_DIR = PurePosixPath("/etc/backtide-ca")
+CA_CERT_FILE = "ca.pem"  # the only file of ca_dir: the CA's certificate, never its key
+CONTAINER_CA_FILE = CONTAINER_CA_DIR / CA_CERT_FILE
 CONTAINER_HOME = CONTAINER_WORKSPACE / "home"
 CONTAINER_STATE = CONTAINER_WORKSPACE / "state"
 CONTAINER_WORK = CONTAINER_WORKSPACE / "work"
@@ -71,6 +80,12 @@ LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}  # bounded: the agent prints 
 ENTRYPOINT = "tini"
 COMMAND = ("-s", "--", "node", "openclaw.mjs", "gateway")
 
+# The egress proxy (docs/21, sections 1 and 2): its alias exists only on the agent's network.
+PROXY_ALIAS = "backtide-proxy"
+PROXY_PORT = 8080
+PROXY_URL = f"http://{PROXY_ALIAS}:{PROXY_PORT}"
+NO_PROXY_HOSTS = "localhost,127.0.0.1,::1"  # the Gateway listens in the container itself
+
 # Turn off everything that would phone home or start background work (docs/12).
 _FIXED_ENV = (
     ("HOME", str(CONTAINER_HOME)),
@@ -86,6 +101,27 @@ _FIXED_ENV = (
     ("OPENCLAW_SKIP_GMAIL_WATCHER", "1"),
     ("CLAWHUB_DISABLE_TELEMETRY", "1"),
     ("DO_NOT_TRACK", "1"),
+)
+
+# The way out and the CA (docs/21, sections 2 and 3). Both spellings of the proxy variables:
+# curl reads only the lowercase http_proxy. NODE_USE_ENV_PROXY makes Node's own fetch and http
+# honour them (for the agent's node scripts; OpenClaw has its own dispatcher, T06-1 P9).
+# NODE_EXTRA_CA_CERTS adds the CA to Node's; the other four REPLACE the system's CAs with ours
+# for curl, Python and git: everything goes through the proxy, which signs every certificate.
+_PROXY_ENV = (
+    ("HTTP_PROXY", PROXY_URL),
+    ("HTTPS_PROXY", PROXY_URL),
+    ("http_proxy", PROXY_URL),
+    ("https_proxy", PROXY_URL),
+    ("OPENCLAW_PROXY_URL", PROXY_URL),
+    ("NO_PROXY", NO_PROXY_HOSTS),
+    ("no_proxy", NO_PROXY_HOSTS),
+    ("NODE_USE_ENV_PROXY", "1"),
+    ("NODE_EXTRA_CA_CERTS", str(CONTAINER_CA_FILE)),
+    ("SSL_CERT_FILE", str(CONTAINER_CA_FILE)),
+    ("REQUESTS_CA_BUNDLE", str(CONTAINER_CA_FILE)),
+    ("CURL_CA_BUNDLE", str(CONTAINER_CA_FILE)),
+    ("GIT_SSL_CAINFO", str(CONTAINER_CA_FILE)),
 )
 
 # Docker object names, a hostname label, docker's memory sizes and CPU counts.
@@ -104,13 +140,15 @@ class AgentJailConfig:
 
     ``workspace`` is ``<root>/workspace``, the snapshotted subvolume; only its ``agente/``
     folder is mounted. ``config_dir`` holds only ``openclaw.json`` and must live outside the
-    workspace. ``uid``/``gid`` are the agent's: AgentJail refuses to create or start the
-    container when either is backtide's own (or one of backtide's groups), unless
+    workspace. ``ca_dir`` holds only ``ca.pem``, the egress proxy's CA certificate (ca.py),
+    and lives apart from both. ``uid``/``gid`` are the agent's: AgentJail refuses to create or
+    start the container when either is backtide's own (or one of backtide's groups), unless
     ``allow_shared_ids`` says so. Only the VM tests set it: they run without root, so the
     agent's folders can only belong to the test user."""
 
     workspace: Path
     config_dir: Path
+    ca_dir: Path
     gateway_token: str = field(repr=False)
     name: str = "backtide-agente"
     network: str = "backtide-agente-net"
@@ -133,6 +171,7 @@ class AgentJailConfig:
         for label, path in (
             ("workspace", self.workspace),
             ("config_dir", self.config_dir),
+            ("ca_dir", self.ca_dir),
             ("seccomp_profile", self.seccomp_profile),
         ):
             _require_absolute(label, path)
@@ -142,6 +181,12 @@ class AgentJailConfig:
                 f"config_dir {self.config_dir} and workspace {self.workspace} must not contain "
                 "each other: the agent must never see or snapshot its own config"
             )
+        for label, other in (("workspace", self.workspace), ("config_dir", self.config_dir)):
+            if _overlap(self.ca_dir, other):
+                raise ValueError(
+                    f"ca_dir {self.ca_dir} and {label} {other} must not contain each other: the "
+                    "CA's folder holds only its certificate, and the agent must never write it"
+                )
         for label, value in (("name", self.name), ("network", self.network)):
             _require_match(label, value, _DOCKER_NAME_RE)
         _require_match("hostname", self.hostname, _HOSTNAME_RE)
@@ -178,11 +223,15 @@ class AgentJailConfig:
     def config_file(self) -> Path:
         return self.config_dir / CONFIG_FILE
 
+    @property
+    def ca_file(self) -> Path:
+        return self.ca_dir / CA_CERT_FILE
+
 
 def container_env(config: AgentJailConfig) -> list[tuple[str, str]]:
     """The variables the agent sees, without the token's value (see token_env)."""
     del config  # the same for every agent today; kept for symmetry with the other builders
-    return list(_FIXED_ENV)
+    return [*_FIXED_ENV, *_PROXY_ENV]
 
 
 def token_env(config: AgentJailConfig) -> dict[str, str]:
@@ -191,13 +240,15 @@ def token_env(config: AgentJailConfig) -> dict[str, str]:
 
 
 def volume_binds(config: AgentJailConfig) -> list[str]:
-    """The only two host folders the container sees: its workspace and its config (read-only).
+    """The only three host folders the container sees: its workspace, its config (read-only)
+    and the proxy's CA certificate (read-only).
 
     -v (not --mount) because only -v relabels for SELinux (:z). It would create a missing
-    source as root, so agent.py checks both sources right before create and start."""
+    source as root, so agent.py checks every source right before create and start."""
     return [
         f"{config.agent_dir}:{CONTAINER_WORKSPACE}:z",
         f"{config.config_dir}:{CONTAINER_CONFIG_DIR}:ro,z",
+        f"{config.ca_dir}:{CONTAINER_CA_DIR}:ro,z",
     ]
 
 

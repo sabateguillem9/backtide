@@ -26,6 +26,7 @@ from backtide.jail import AgentJail, JailError, docker
 from backtide.jail.config import (
     AGENT_DIR,
     AGENT_SUBDIRS,
+    CONTAINER_CA_DIR,
     CONTAINER_CONFIG_DIR,
     CONTAINER_HOME,
     CONTAINER_WORKSPACE,
@@ -197,8 +198,10 @@ def test_container_settings(running_agent) -> None:
         [
             f"{jail.agent_dir}:{CONTAINER_WORKSPACE}:z",
             f"{jail.config_dir}:{CONTAINER_CONFIG_DIR}:ro,z",
+            f"{jail.ca_dir}:{CONTAINER_CA_DIR}:ro,z",
         ]
     )
+    assert not host["Dns"] and not host["DnsOptions"] and not host["DnsSearch"]  # T06-1, P5
     assert list(info["NetworkSettings"]["Networks"]) == [jail.network]
     # The check start() makes before every start accepts what Docker really reports.
     image_env = json.loads(
@@ -238,7 +241,8 @@ def test_the_agent_is_confined_by_selinux(running_agent) -> None:
     for path in ("/proc/self/attr/current", "/proc/1/attr/current"):
         label = running_agent.exec(["cat", path], check=True).stdout.rstrip("\x00\n")
         assert label.split(":")[2] == "container_t", (path, label)
-    for host_path in (running_agent.workspace, running_agent.jail.config.config_file):
+    jail = running_agent.jail.config
+    for host_path in (running_agent.workspace, jail.config_file, jail.ca_file):
         context = os.getxattr(host_path, "security.selinux").rstrip(b"\x00").decode()
         assert context.split(":")[2:] == ["container_file_t", "s0"], (host_path, context)
 
@@ -250,7 +254,9 @@ def test_network_is_internal_and_the_host_has_no_address_on_it(running_agent) ->
     assert info["Options"]["com.docker.network.bridge.gateway_mode_ipv4"] == "isolated"
     assert all("Gateway" not in pool for pool in info["IPAM"]["Config"])
     attached = [container["Name"] for container in info["Containers"].values()]
-    assert attached == [running_agent.name]
+    # Its one neighbour is the egress proxy (T06-2).
+    assert running_agent.proxy is not None
+    assert sorted(attached) == sorted([running_agent.name, running_agent.proxy.config.name])
 
 
 # Isolation, seen from inside
@@ -277,24 +283,28 @@ def test_no_docker_socket(running_agent) -> None:
 
 
 def test_only_the_workspace_the_config_tmp_and_the_sys_masks_are_added(running_agent) -> None:
-    """Besides Docker's standard mounts, only /workspace, /config (read-only), /tmp and the two
-    empty read-only tmpfs that hide /sys/fs/btrfs and /sys/devices/virtual/block."""
+    """Besides Docker's standard mounts, only /workspace, /config (read-only), the proxy's CA
+    certificate (read-only), /tmp and the two empty read-only tmpfs that hide /sys/fs/btrfs and
+    /sys/devices/virtual/block."""
     jail = running_agent.jail.config
     mounts = _mountinfo(running_agent.exec(["cat", "/proc/self/mountinfo"], check=True).stdout)
     masks = [m for m in mounts if _is_docker_mask(m["point"])]
     others = [m for m in mounts if not _is_docker_mask(m["point"])]
     sys_masks = {"/sys/fs/btrfs", "/sys/devices/virtual/block"}  # spelled out: not from config
-    ours = {str(CONTAINER_WORKSPACE), str(CONTAINER_CONFIG_DIR), "/tmp", *sys_masks}
+    ours = {str(CONTAINER_WORKSPACE), str(CONTAINER_CONFIG_DIR), str(CONTAINER_CA_DIR), "/tmp"}
+    ours |= sys_masks
     assert sorted(m["point"] for m in others) == sorted(DOCKER_STANDARD_MOUNTS | ours)
     # Docker hides parts of /proc and /sys: read-only, or its own /dev/null bound over them.
     assert [m for m in masks if m["options"][0] != "ro" and m["root"] != "/null"] == []
     by_point = {m["point"]: m for m in others}
-    for read_only in ("/", "/sys", str(CONTAINER_CONFIG_DIR), *DOCKER_ETC_FILES, *sys_masks):
+    read_only_ours = (str(CONTAINER_CONFIG_DIR), str(CONTAINER_CA_DIR))
+    for read_only in ("/", "/sys", *read_only_ours, *DOCKER_ETC_FILES, *sys_masks):
         assert by_point[read_only]["options"][0] == "ro", read_only
     writable = {m["point"] for m in others if m["options"][0] == "rw"}
     assert writable == CONTAINER_WRITABLE | {str(CONTAINER_WORKSPACE), "/tmp"}
     assert by_point[str(CONTAINER_WORKSPACE)]["root"].endswith(f"/workspace/{AGENT_DIR}")
     assert by_point[str(CONTAINER_CONFIG_DIR)]["root"].endswith(f"/{jail.config_dir.name}")
+    assert by_point[str(CONTAINER_CA_DIR)]["root"].endswith(f"/{jail.ca_dir.name}")
     tmp = by_point["/tmp"]
     assert tmp["fs"] == "tmpfs" and tmp["root"] == "/"  # a fresh tmpfs, not a host folder
     assert {"rw", "nosuid", "nodev"} <= set(tmp["options"])
@@ -387,9 +397,11 @@ def test_backtide_files_are_invisible(running_agent) -> None:
 
 
 def test_no_route_to_the_internet(running_agent) -> None:
+    """Directly (``--noproxy '*'``, as a program that ignores the proxy variables would)."""
     for url in ("https://1.1.1.1", "http://192.0.2.1"):
         result = running_agent.exec(
-            ["curl", "--silent", "--show-error", "--max-time", "5", url], timeout=30
+            ["curl", "--noproxy", "*", "--silent", "--show-error", "--max-time", "5", url],
+            timeout=30,
         )
         assert result.returncode != 0, url
     routes = running_agent.exec(["cat", "/proc/net/route"], check=True).stdout.splitlines()[1:]
@@ -411,7 +423,11 @@ def test_host_is_unreachable(running_agent) -> None:
     own addresses are left out. A refusal counts as reaching: the address answered."""
     jail = running_agent.jail.config
     candidates = _host_ipv4_addresses() | _network_first_hosts(jail)
-    targets = sorted(candidates - _container_ipv4_addresses(running_agent.name, jail.network))
+    # The proxy is the one neighbour (T06-2): test_proxy_container.py probes it on its own.
+    assert running_agent.proxy is not None
+    neighbours = _container_ipv4_addresses(running_agent.proxy.config.name, jail.network)
+    own = _container_ipv4_addresses(running_agent.name, jail.network)
+    targets = sorted(candidates - own - neighbours)
     assert targets, "nothing left to probe"
     result = running_agent.exec(
         ["python3", "-c", CONNECT_PROBE, str(PROBE_PORT), str(CONNECT_TIMEOUT), *targets],
@@ -440,6 +456,8 @@ def test_root_filesystem_is_read_only(running_agent) -> None:
 
 
 def test_environment_has_no_keys(running_agent) -> None:
+    """No API key: the model's fake key goes in openclaw.json (T06-5), the real one never
+    leaves the proxy (docs/21, section 6)."""
     entries = running_agent.exec(["env", "-0"], check=True).stdout.split("\0")
     names = [entry.split("=", 1)[0] for entry in entries if entry]
     assert [n for n in names if any(word in n.upper() for word in SECRET_WORDS)] == []

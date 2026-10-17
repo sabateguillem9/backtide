@@ -14,6 +14,10 @@ Design: docs/21-diseno-t06-proxy.md, section 1.
   each one; with ``connection_strategy=lazy`` none is attempted before a request is let
   through, T06-1 P6). Each hook is wrapped: mitmproxy carries on after a hook raises (T06-1,
   P7), so on any error the flow is killed.
+- Only the agent's side may use it. mitmproxy listens on every interface, the egress one too,
+  where the host (any local user) and whatever else reaches that network could connect. So a
+  client is let in only if it connected to the proxy's own address on the agent's network,
+  which the proxy learns by resolving its alias there; if that fails, nobody is let in.
 
 Imports only the standard library and mitmproxy (it runs in the proxy's image, where backtide
 is not installed): never the service.
@@ -22,6 +26,7 @@ is not installed): never the service.
 import asyncio
 import logging
 import os
+import socket
 
 from mitmproxy import http, options
 from mitmproxy.tools.dump import DumpMaster
@@ -31,6 +36,7 @@ logger = logging.getLogger(__name__)
 # backtide/jail/proxy_config.py waits for this line in the logs (a unit test keeps both equal).
 READY_LOG_LINE = "backtide-proxy ready"
 REFUSAL = b"backtide: nothing goes out until it can be recorded\n"
+AGENT_SIDE_ALIAS = "backtide-proxy"  # backtide/jail/config.py PROXY_ALIAS: only on that network
 
 # docs/21, section 1 ("Opciones de mitmproxy"). Every name must exist, or the process dies.
 OPTIONS = {
@@ -55,8 +61,24 @@ OPTIONS = {
 class RefuseEverything:
     """The gate while nothing records: no request is answered by anyone but the proxy."""
 
+    def __init__(self) -> None:
+        self.agent_side: frozenset[str] = frozenset()
+
     def running(self) -> None:
+        self.agent_side = agent_side_addresses()
+        if not self.agent_side:
+            logger.error("cannot resolve %s: no client will be let in", AGENT_SIDE_ALIAS)
         print(READY_LOG_LINE, flush=True)  # noqa: T201 - the one line ProxyJail waits for
+
+    def client_connected(self, client: object) -> None:
+        """Only clients that came in through the agent's network; any other is cut at once."""
+        try:
+            local = client.sockname[0]  # type: ignore[attr-defined]
+            if _plain_ip(local) not in self.agent_side:
+                client.error = "backtide: only the agent's side may use the proxy"  # type: ignore[attr-defined]
+        except Exception:  # cannot tell where it came from: a dead proxy lets nothing out
+            logger.exception("checking a client failed: stopping the proxy")
+            os._exit(70)
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         _refuse(flow)
@@ -71,6 +93,20 @@ class RefuseEverything:
         except Exception:  # mitmproxy would connect anyway: a dead proxy lets nothing out
             logger.exception("refusing a server connection failed: stopping the proxy")
             os._exit(70)
+
+
+def agent_side_addresses() -> frozenset[str]:
+    """The proxy's own addresses on the agent's network: its alias resolves only there."""
+    try:
+        infos = socket.getaddrinfo(AGENT_SIDE_ALIAS, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return frozenset()
+    return frozenset(_plain_ip(info[4][0]) for info in infos)
+
+
+def _plain_ip(address: str) -> str:
+    """``::ffff:172.18.0.2`` (a dual-stack listener) is ``172.18.0.2``."""
+    return address.removeprefix("::ffff:")
 
 
 def _refuse(flow: http.HTTPFlow) -> None:

@@ -23,6 +23,7 @@ from backtide.jail.config import (
 TOKEN = "t" * 43  # the length of secrets.token_urlsafe(32)
 WORKSPACE = Path("/srv/backtide/volume/workspace")
 CONFIG_DIR = Path("/srv/backtide/agent-config")
+CA_DIR = Path("/srv/backtide/agent-ca")
 SECRET_WORDS = ("KEY", "SECRET", "PASSWORD")
 # The tmpfs mounts of the design: /tmp, and the two /sys directories hidden from the agent.
 SYS_MASK_ARGS = [
@@ -48,12 +49,35 @@ FORBIDDEN_OPTIONS = {
     "--volumes-from",
     "--group-add",
     "--sysctl",
+    "--dns",
+    "--dns-option",
+    "--dns-search",
+}
+PROXY_URL = "http://backtide-proxy:8080"
+CA_FILE = "/etc/backtide-ca/ca.pem"
+# docs/21, sections 2 and 3: the way out and the CA the agent trusts. None carries a secret.
+PROXY_ENV = {
+    "HTTP_PROXY": PROXY_URL,
+    "HTTPS_PROXY": PROXY_URL,
+    "http_proxy": PROXY_URL,
+    "https_proxy": PROXY_URL,
+    "OPENCLAW_PROXY_URL": PROXY_URL,
+    "NO_PROXY": "localhost,127.0.0.1,::1",
+    "no_proxy": "localhost,127.0.0.1,::1",
+    "NODE_USE_ENV_PROXY": "1",
+    "NODE_EXTRA_CA_CERTS": CA_FILE,
+    "SSL_CERT_FILE": CA_FILE,
+    "REQUESTS_CA_BUNDLE": CA_FILE,
+    "CURL_CA_BUNDLE": CA_FILE,
+    "GIT_SSL_CAINFO": CA_FILE,
 }
 
 
 @pytest.fixture
 def cfg() -> AgentJailConfig:
-    return AgentJailConfig(workspace=WORKSPACE, config_dir=CONFIG_DIR, gateway_token=TOKEN)
+    return AgentJailConfig(
+        workspace=WORKSPACE, config_dir=CONFIG_DIR, ca_dir=CA_DIR, gateway_token=TOKEN
+    )
 
 
 def option_values(argv: list[str], option: str) -> list[str]:
@@ -86,11 +110,15 @@ def test_create_argv_has_every_option_of_the_design(cfg: AgentJailConfig) -> Non
     assert "--read-only" in argv
 
 
-def test_create_argv_mounts_only_the_agent_folder_and_the_config(cfg: AgentJailConfig) -> None:
+def test_create_argv_mounts_only_the_agent_folder_the_config_and_the_ca(
+    cfg: AgentJailConfig,
+) -> None:
+    """The CA's folder holds only its certificate (ca.py), read-only: never the key."""
     argv = docker_create_argv(cfg)
     assert option_values(argv, "--volume") == [
         f"{WORKSPACE}/agente:/workspace:z",
         f"{CONFIG_DIR}:/config:ro,z",
+        f"{CA_DIR}:/etc/backtide-ca:ro,z",
     ]
     assert "-v" not in argv and "--mount" not in argv
 
@@ -168,7 +196,20 @@ def test_create_argv_sets_the_environment_of_the_design(cfg: AgentJailConfig) ->
         "OPENCLAW_SKIP_GMAIL_WATCHER": "1",
         "CLAWHUB_DISABLE_TELEMETRY": "1",
         "DO_NOT_TRACK": "1",
+        **PROXY_ENV,
     }
+
+
+def test_the_agent_finds_the_proxy_and_trusts_only_its_ca(cfg: AgentJailConfig) -> None:
+    """Every variable points at the one way out and at the certificate mounted read-only; the
+    loopback Gateway stays out of the proxy. No DNS server is ever given: with --dns, Docker
+    forwards outside names even from an internal network (docs/21, T06-1 P5)."""
+    argv = docker_create_argv(cfg)
+    env = dict(entry.split("=", 1) for entry in option_values(argv, "--env")[:-1])
+    for name, value in PROXY_ENV.items():
+        assert env[name] == value, name
+    assert jail_config.CONTAINER_CA_DIR.as_posix() == "/etc/backtide-ca"
+    assert not any(arg.startswith("--dns") for arg in argv)
 
 
 def test_create_argv_follows_the_config(cfg: AgentJailConfig) -> None:
@@ -185,6 +226,7 @@ def test_create_argv_follows_the_config(cfg: AgentJailConfig) -> None:
         tmp_size="64m",
         seccomp_profile=Path("/etc/backtide/agent.json"),
         stop_timeout=5,
+        ca_dir=Path("/var/lib/other/agent-ca"),
     )
     argv = docker_create_argv(custom)
     assert option_values(argv, "--name") == ["agent-2"]
@@ -198,6 +240,7 @@ def test_create_argv_follows_the_config(cfg: AgentJailConfig) -> None:
     assert option_values(argv, "--tmpfs") == ["/tmp:rw,nosuid,nodev,size=64m", *SYS_MASK_ARGS]
     assert "seccomp=/etc/backtide/agent.json" in option_values(argv, "--security-opt")
     assert option_values(argv, "--stop-timeout") == ["5"]
+    assert "/var/lib/other/agent-ca:/etc/backtide-ca:ro,z" in option_values(argv, "--volume")
 
 
 def test_logs_are_bounded(cfg: AgentJailConfig) -> None:
@@ -291,6 +334,7 @@ def _keys(value: object) -> list[str]:
 def test_paths_of_the_agent(cfg: AgentJailConfig) -> None:
     assert cfg.agent_dir == WORKSPACE / "agente"
     assert cfg.config_file == CONFIG_DIR / "openclaw.json"
+    assert cfg.ca_file == CA_DIR / "ca.pem"
 
 
 def test_repr_hides_the_token(cfg: AgentJailConfig) -> None:
@@ -335,10 +379,21 @@ def test_repr_hides_the_token(cfg: AgentJailConfig) -> None:
         {"gateway_token": "t" * 40 + "\n"},
         {"gateway_token": "t" * 40 + "=="},
         {"allow_shared_ids": "yes"},
+        {"ca_dir": Path("agent-ca")},
+        {"ca_dir": Path("/srv/with:colon/agent-ca")},
+        {"ca_dir": WORKSPACE / "agente" / "ca"},  # the agent could write it
+        {"ca_dir": WORKSPACE},
+        {"ca_dir": CONFIG_DIR},  # one folder, one purpose: the config holds only openclaw.json
+        {"ca_dir": CONFIG_DIR / "ca"},
     ],
 )
 def test_invalid_configs_are_refused(changes: dict[str, object]) -> None:
-    fields = {"workspace": WORKSPACE, "config_dir": CONFIG_DIR, "gateway_token": TOKEN}
+    fields = {
+        "workspace": WORKSPACE,
+        "config_dir": CONFIG_DIR,
+        "ca_dir": CA_DIR,
+        "gateway_token": TOKEN,
+    }
     with pytest.raises(ValueError):
         AgentJailConfig(**(fields | changes))  # type: ignore[arg-type]
 
@@ -347,6 +402,7 @@ def test_valid_custom_config_is_accepted() -> None:
     config = AgentJailConfig(
         workspace=WORKSPACE,
         config_dir=CONFIG_DIR,
+        ca_dir=CA_DIR,
         gateway_token="A-b_9" * 8,
         name="backtide-test-agent-0123abcd",
         network="backtide-test-net-0123abcd",

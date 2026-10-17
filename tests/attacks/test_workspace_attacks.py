@@ -366,9 +366,19 @@ def fake_local_service() -> Iterator[tuple[int, list[tuple[str, int]]]]:
         server.close()
 
 
+def proxy_addresses(agent) -> tuple[list[str], list[str]]:
+    """The egress proxy's IPv4 address on the agent's network and on the egress one (T06-2)."""
+    assert agent.proxy is not None, "the agent runs with its egress proxy beside it"
+    proxy = agent.proxy.config
+    info = json.loads(jail_docker.run(["container", "inspect", proxy.name]).stdout)[0]
+    networks = info["NetworkSettings"]["Networks"]
+    return [networks[proxy.agent_network]["IPAddress"]], [networks[proxy.network]["IPAddress"]]
+
+
 def host_ipv4_addresses(agent) -> tuple[list[str], list[str]]:
     """Every IPv4 address of the VM, and the first host of the agent's network (where Docker
-    would put the gateway if the network were not isolated: the VM has no address there)."""
+    would put the gateway if the network were not isolated: the VM has no address there),
+    without the agent's own address or the proxy's (probed apart, see test_direct_egress)."""
     addresses = subprocess.run(
         ["ip", "-j", "-4", "addr", "show"], capture_output=True, text=True, check=True, timeout=30
     ).stdout
@@ -387,6 +397,7 @@ def host_ipv4_addresses(agent) -> tuple[list[str], list[str]]:
     # With the gateway isolated, Docker hands that first address to the container itself.
     container = json.loads(jail_docker.run(["container", "inspect", agent.name]).stdout)[0]
     own = {container["NetworkSettings"]["Networks"][agent.jail.config.network]["IPAddress"]}
+    own |= set(proxy_addresses(agent)[0])
     for pool in network["IPAM"]["Config"]:
         subnet = ipaddress.ip_network(pool["Subnet"])
         if subnet.version == 4:
@@ -408,17 +419,24 @@ def test_direct_egress(attack: Attack, agent) -> None:
             time.sleep(0.05)
         assert len(visitors) == len(vm_addresses), "the fake service does not see its visitors"
         visitors.clear()
-        outcome = attack.run_script(agent, "salida_directa", str(port), *addresses)
+        proxy_ips, egress_ips = proxy_addresses(agent)
+        extra = [f"proxy={ip}" for ip in proxy_ips] + [f"egress={ip}" for ip in egress_ips]
+        outcome = attack.run_script(agent, "salida_directa", str(port), *addresses, *extra)
     names_failed = all(value.isidentifier() for value in outcome["resolved"].values())
+    only_the_door = [f"{ip}:8080" for ip in proxy_ips]
     attack.check(
         "stopped",
         outcome["reached"] == []
         and outcome["dns_replies"] == []
+        and outcome["proxy_open"] == only_the_door
         and names_failed
         and visitors == [],
-        f"{outcome['tcp_attempts']} conexiones TCP (IPv4 a 8 puertos, IPv6, y el servicio "
-        f"falso del anfitrión por {len(addresses)} direcciones) y 3 servidores DNS propios: "
-        f"ninguna sale ({', '.join(outcome['tcp_errors'])}); los nombres no se resuelven; "
-        f"el servicio falso recibió {len(visitors)} visitas (control: desde el propio anfitrión sí "
-        f"recibe {len(vm_addresses)})",
+        f"{outcome['tcp_attempts']} conexiones TCP (IPv4 a 8 puertos, IPv6, el servicio falso "
+        f"del anfitrión por {len(addresses)} direcciones y la dirección del proxy en la red de "
+        f"salida) y {3 + len(proxy_ips)} servidores DNS (3 propios y el proxy): ninguna sale "
+        f"({', '.join(outcome['tcp_errors'])}); los nombres no se resuelven; del proxy, "
+        f"vecino en la red, solo responde su puerto 8080 de {outcome['proxy_attempts']} "
+        f"probados ({', '.join(outcome['proxy_open']) or 'ninguno'}); el servicio falso recibió "
+        f"{len(visitors)} visitas (control: desde el propio anfitrión sí recibe "
+        f"{len(vm_addresses)})",
     )

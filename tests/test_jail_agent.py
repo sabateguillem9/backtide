@@ -144,13 +144,21 @@ def container_check(monkeypatch: pytest.MonkeyPatch) -> ContainerCheck:
     return check
 
 
+CERTIFICATE = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> AgentJailConfig:
+    """The CA folder is there already, as ca.py leaves it: only the certificate."""
     workspace = tmp_path / "root" / "workspace"
     workspace.mkdir(parents=True)
+    ca_dir = tmp_path / "agent-ca"
+    ca_dir.mkdir(mode=0o755)
+    (ca_dir / "ca.pem").write_text(CERTIFICATE)
     return AgentJailConfig(
         workspace=workspace,
         config_dir=tmp_path / "agent-config",
+        ca_dir=ca_dir,
         gateway_token=TOKEN,
         name="agent-under-test",
         network="net-under-test",
@@ -895,7 +903,10 @@ def test_create_and_start_refuse_ids_shared_with_backtide(
 
 def test_the_default_ids_are_the_agents_own(tmp_path: Path) -> None:
     config = AgentJailConfig(
-        workspace=tmp_path / "workspace", config_dir=tmp_path / "config", gateway_token=TOKEN
+        workspace=tmp_path / "workspace",
+        config_dir=tmp_path / "config",
+        ca_dir=tmp_path / "ca",
+        gateway_token=TOKEN,
     )
     assert (config.uid, config.gid) == (61000, 61000)
     assert config.allow_shared_ids is False
@@ -922,6 +933,96 @@ def test_create_and_start_refuse_a_subfolder_in_the_config_folder(
 ) -> None:
     (ready_jail.config.config_dir / "keys").mkdir()
     with pytest.raises(JailError, match="must hold only openclaw.json"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+# The CA folder holds the certificate and nothing else, checked right before the agent sees it
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+def test_create_and_start_need_the_ca_folder(
+    ready_jail: AgentJail, fake_docker: FakeDocker, method: str
+) -> None:
+    (ready_jail.config.ca_file).unlink()
+    ready_jail.config.ca_dir.rmdir()
+    with pytest.raises(JailError, match="agent-ca is missing"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+@pytest.mark.parametrize("stray", ["mitmproxy-ca.pem", "ca.key", ".ca.pem.tmp"])
+def test_create_and_start_refuse_anything_else_in_the_ca_folder(
+    ready_jail: AgentJail, fake_docker: FakeDocker, method: str, stray: str
+) -> None:
+    (ready_jail.config.ca_dir / stray).write_text("never mount me")
+    with pytest.raises(JailError, match=f"must hold only ca.pem.*{re.escape(stray)}"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+def test_create_and_start_refuse_a_private_key_in_the_certificate(
+    ready_jail: AgentJail, fake_docker: FakeDocker, method: str
+) -> None:
+    """The CA's key must never reach the agent (invariant 1), not even pasted into ca.pem."""
+    key = "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n"
+    ready_jail.config.ca_file.write_text(key + CERTIFICATE)
+    with pytest.raises(JailError, match="not just a certificate"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+def test_create_and_start_refuse_a_ca_others_may_change(
+    ready_jail: AgentJail, fake_docker: FakeDocker, method: str
+) -> None:
+    ready_jail.config.ca_file.chmod(0o666)
+    with pytest.raises(JailError, match="may be changed by someone"):
+        getattr(ready_jail, method)()
+    ready_jail.config.ca_file.chmod(0o444)
+    ready_jail.config.ca_dir.chmod(0o777)
+    with pytest.raises(JailError, match="writable by group or others"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+def test_create_and_start_refuse_a_symlinked_ca(
+    ready_jail: AgentJail, fake_docker: FakeDocker, tmp_path: Path, method: str
+) -> None:
+    secret = tmp_path / "proxy-ca.pem"
+    secret.write_text("the key would be here")
+    ready_jail.config.ca_file.unlink()
+    ready_jail.config.ca_file.symlink_to(secret)
+    with pytest.raises(JailError, match="cannot open"):
+        getattr(ready_jail, method)()
+    ready_jail.config.ca_file.unlink()
+    ready_jail.config.ca_dir.rmdir()
+    ready_jail.config.ca_dir.symlink_to(tmp_path / "root")
+    with pytest.raises(JailError, match="not a directory"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+def test_create_and_start_refuse_a_ca_folder_of_someone_else(
+    ready_jail: AgentJail, fake_docker: FakeDocker, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    real_fstat = os.fstat
+    ca_ino = ready_jail.config.ca_dir.stat().st_ino
+
+    def fstat(fd: int) -> os.stat_result:
+        st = real_fstat(fd)
+        if st.st_ino != ca_ino:
+            return st
+        fields = list(st)
+        fields[stat.ST_UID] = os.geteuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(agent_module.os, "fstat", fstat)
+    with pytest.raises(JailError, match="agent-ca is owned by uid"):
         getattr(ready_jail, method)()
     assert fake_docker.calls == []
 

@@ -13,10 +13,15 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   contain the state.
 - Reading the configuration touches no Docker, no btrfs and no black box. backtide runs on the host,
   not in a container (docs/19), so these paths are host paths.
+- ``[proxy]`` (T06, docs/21): the egress proxy's container options, the allowed hosts and the
+  model providers (name, kind, host). NEVER a key: the real ones live in ``<state_dir>/keys/``
+  (T06-4), and a key-like setting is refused. The proxy's CA and channel folders live in the
+  state too, and the agent's config folder may never be or contain any of them.
 """
 
 import errno
 import os
+import re
 import stat
 import tomllib
 from collections.abc import Mapping
@@ -24,7 +29,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
 
+from backtide.jail.ca import CaPaths
 from backtide.jail.config import AgentJailConfig
+from backtide.jail.proxy_config import ProxyJailConfig
 
 DEFAULT_CYCLE_INTERVAL = 120.0  # seconds between two "did anything change?" checks
 DEFAULT_PRUNE_INTERVAL = 600.0
@@ -40,12 +47,16 @@ STATE_LOCK = "backtide.lock"
 STATE_PENDING = "rewind.pending"
 STATE_SOCKET = "control.sock"
 STATE_RULES = "rules.toml"  # the risk rules (T08); absent: the ones that ship with backtide
+STATE_PROXY_CA = "proxy-ca"  # the CA's key and certificate: the proxy's /ca (docs/21)
+STATE_AGENT_CA = "agent-ca"  # the CA's certificate alone: the agent's /etc/backtide-ca
+STATE_PROXY_CHANNEL = "proxy-channel"  # the proxy's folder for the channel's socket
+STATE_KEYS = "keys"  # the real keys of the model providers (T06-4): never mounted anywhere
 MAX_RULES_BYTES = 64 * 1024
 
 _TOP_LEVEL_KEYS = frozenset(
     {
         "state_dir", "volume", "workspace_limit", "cycle_interval", "prune_interval", "agent",
-        "volume_image", "max_volume_bytes",
+        "volume_image", "max_volume_bytes", "proxy",
     }
 )  # fmt: skip
 _OPTIONAL_KEYS = ("workspace_limit", "cycle_interval", "prune_interval", "max_volume_bytes")
@@ -57,10 +68,43 @@ _AGENT_KEYS = frozenset(
         "tmp_size", "stop_timeout", "ready_timeout", "config_dir",
     }
 )  # fmt: skip
+# [proxy]: the container options a file may change (``internal_egress`` and ``allow_shared_ids``
+# are test-only concessions, so not here), and what the proxy lets out. Never a key.
+_PROXY_CONTAINER_KEYS = frozenset(
+    {"name", "network", "image", "uid", "gid", "memory", "cpus", "pids_limit"}
+)
+_PROXY_KEYS = _PROXY_CONTAINER_KEYS | {"allow_hosts", "providers"}
+_PROVIDER_KEYS = frozenset({"name", "kind", "host"})
+# docs/21, section 6: the providers of T06 and their default hosts.
+PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
+MAX_ALLOW_HOSTS = 1000
+MAX_PROVIDERS = 16
+_SECRET_WORDS = ("key", "token", "secret", "password", "credential")
+_PROVIDER_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}", re.ASCII)
+# A host name, or ``*.`` and a domain. Matching (case, trailing dot, IDNA) is the gate's job.
+_HOST_RE = re.compile(r"(?:\*\.)?[^\s/\\:@*?#%\[\]]{1,253}")
 
 
 class ConfigError(ValueError):
     """The configuration is unusable. The message never contains a secret."""
+
+
+@dataclass(frozen=True)
+class Provider:
+    """A model provider the proxy knows (docs/21, section 6): its name, its ``kind`` (which
+    header carries the key) and its host. Its keys are never here."""
+
+    name: str
+    kind: str
+    host: str
+
+
+@dataclass(frozen=True)
+class ProxySettings:
+    """What ``[proxy]`` says the proxy lets out: the hosts the user allows and the providers."""
+
+    allow_hosts: tuple[str, ...]
+    providers: tuple[Provider, ...]
 
 
 class Secret:
@@ -112,6 +156,7 @@ class ServiceConfig:
     agent: Mapping[str, Any] = field(default_factory=dict)
     volume_image: Path | None = None
     max_volume_bytes: int | None = None
+    proxy: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("volume", self.volume)):
@@ -147,6 +192,28 @@ class ServiceConfig:
             )
         self.jail_config()  # validates every agent option; the result is rebuilt on demand
         self._check_growth(config_dir)
+        self._check_proxy(config_dir)
+
+    def _check_proxy(self, config_dir: Path) -> None:
+        if not isinstance(self.proxy, Mapping):
+            raise ConfigError("[proxy] must be a table")
+        _reject_secret_keys("[proxy]", self.proxy)
+        unknown = sorted(set(self.proxy) - _PROXY_KEYS)
+        if unknown:
+            raise ConfigError(f"unknown [proxy] settings: {', '.join(map(repr, unknown))}")
+        for label, folder in (
+            ("the proxy's CA folder", self.proxy_ca_dir),
+            ("the agent's CA folder", self.agent_ca_dir),
+            ("the proxy's channel folder", self.proxy_channel_dir),
+            ("the keys folder", self.keys_dir),
+        ):
+            if _overlap(config_dir, folder):
+                raise ConfigError(
+                    f"the agent's config_dir {config_dir} must not be or contain {label} "
+                    f"{folder}: the agent would see it"
+                )
+        self.proxy_settings()
+        self.proxy_jail_config()
 
     def _check_growth(self, config_dir: Path) -> None:
         image, ceiling = self.volume_image, self.max_volume_bytes
@@ -213,6 +280,22 @@ class ServiceConfig:
         return self.state_dir / STATE_RULES
 
     @property
+    def proxy_ca_dir(self) -> Path:
+        return self.state_dir / STATE_PROXY_CA
+
+    @property
+    def agent_ca_dir(self) -> Path:
+        return self.state_dir / STATE_AGENT_CA
+
+    @property
+    def proxy_channel_dir(self) -> Path:
+        return self.state_dir / STATE_PROXY_CHANNEL
+
+    @property
+    def keys_dir(self) -> Path:
+        return self.state_dir / STATE_KEYS
+
+    @property
     def workspace(self) -> Path:
         return self.volume / "workspace"
 
@@ -224,11 +307,55 @@ class ServiceConfig:
             return AgentJailConfig(
                 workspace=self.workspace,
                 config_dir=self.agent_config_dir,
+                ca_dir=self.agent_ca_dir,
                 gateway_token=self.gateway_token.reveal(),
                 **options,
             )
         except ValueError as error:
             raise ConfigError(f"invalid [agent] settings: {error}") from error
+
+    def proxy_jail_config(self) -> ProxyJailConfig:
+        """The egress proxy's container settings, on the agent's network and apart from its
+        ids. No secret in it."""
+        agent = self.jail_config()
+        options = {key: value for key, value in self.proxy.items() if key in _PROXY_CONTAINER_KEYS}
+        try:
+            return ProxyJailConfig(
+                ca_dir=self.proxy_ca_dir,
+                channel_dir=self.proxy_channel_dir,
+                agent_network=agent.network,
+                agent_uid=agent.uid,
+                agent_gid=agent.gid,
+                **options,
+            )
+        except (TypeError, ValueError) as error:
+            raise ConfigError(f"invalid [proxy] settings: {error}") from error
+
+    def ca_paths(self) -> CaPaths:
+        """Where ca.py makes the proxy's CA, readable by the proxy's group only."""
+        return CaPaths(
+            proxy_dir=self.proxy_ca_dir,
+            agent_dir=self.agent_ca_dir,
+            gid=self.proxy_jail_config().gid,
+        )
+
+    def proxy_settings(self) -> ProxySettings:
+        """``allow_hosts`` and ``providers`` of ``[proxy]``, checked (ConfigError)."""
+        hosts = self.proxy.get("allow_hosts", [])
+        if not isinstance(hosts, list) or len(hosts) > MAX_ALLOW_HOSTS:
+            raise ConfigError(
+                f"[proxy] allow_hosts must be a list of at most {MAX_ALLOW_HOSTS} host names"
+            )
+        for host in hosts:
+            _check_host("[proxy] allow_hosts", host)
+        entries = self.proxy.get("providers", [])
+        if not isinstance(entries, list) or len(entries) > MAX_PROVIDERS:
+            raise ConfigError(f"[proxy] providers must be a list of at most {MAX_PROVIDERS} tables")
+        providers = tuple(_provider(entry) for entry in entries)
+        names = [provider.name for provider in providers]
+        if len(set(names)) != len(names):
+            raise ConfigError("[proxy] providers: each name must appear once")
+        return ProxySettings(allow_hosts=tuple(hosts), providers=providers)
 
     def read_rules(self) -> str | None:
         """The text of ``rules_file``, or None if there is none (the default rules apply). Read
@@ -264,6 +391,10 @@ class ServiceConfig:
         optional = {key: data[key] for key in _OPTIONAL_KEYS if key in data}
         if "volume_image" in data:
             optional["volume_image"] = _as_path("volume_image", data["volume_image"])
+        if "proxy" in data:
+            if not isinstance(data["proxy"], dict):
+                raise ConfigError("[proxy] must be a table")
+            optional["proxy"] = dict(data["proxy"])
         return cls(
             state_dir=state_dir,
             volume=volume,
@@ -293,6 +424,43 @@ def _require_private_state_dir(path: Path) -> None:
         raise ConfigError(
             f"state_dir {path} is writable by group or others (mode {mode:04o}): chmod 700 it"
         )
+
+
+def _reject_secret_keys(label: str, table: Mapping[str, Any]) -> None:
+    """A key, token or password in the TOML is refused without quoting it: the real keys of the
+    providers live in ``<state_dir>/keys/``, never in this file (docs/21, section 6)."""
+    secret = sorted(key for key in table if any(word in str(key).lower() for word in _SECRET_WORDS))
+    if secret:
+        raise ConfigError(
+            f"{label} must never hold a key ({', '.join(map(repr, secret))}): the providers' "
+            f"keys live in <state_dir>/{STATE_KEYS}/, never in the configuration file"
+        )
+
+
+def _check_host(label: str, host: object) -> None:
+    if not isinstance(host, str) or not _HOST_RE.fullmatch(host) or host.startswith("."):
+        raise ConfigError(f"{label}: {host!r} is not a host name nor '*.' and a domain")
+
+
+def _provider(entry: object) -> Provider:
+    if not isinstance(entry, dict):
+        raise ConfigError("[proxy] providers: each one must be a table (name, kind, host)")
+    _reject_secret_keys("[proxy] providers", entry)
+    unknown = sorted(set(entry) - _PROVIDER_KEYS)
+    if unknown:
+        raise ConfigError(f"unknown [proxy] providers settings: {', '.join(map(repr, unknown))}")
+    name, kind = entry.get("name"), entry.get("kind")
+    if not isinstance(name, str) or not _PROVIDER_NAME_RE.fullmatch(name):
+        raise ConfigError(f"[proxy] providers: invalid name {name!r} (a-z, 0-9 and '-')")
+    if kind not in PROVIDER_HOSTS:
+        raise ConfigError(
+            f"[proxy] providers: {name} has kind {kind!r}, not one of {sorted(PROVIDER_HOSTS)}"
+        )
+    host = entry.get("host", PROVIDER_HOSTS[kind])
+    _check_host(f"[proxy] providers: {name}'s host", host)
+    if "*" in host:
+        raise ConfigError(f"[proxy] providers: {name}'s host must be one exact name")
+    return Provider(name=name, kind=kind, host=host)
 
 
 def _reject_unknown(data: dict[str, Any]) -> None:

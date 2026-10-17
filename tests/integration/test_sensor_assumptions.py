@@ -54,7 +54,7 @@ BTF = "/sys/kernel/btf/vmlinux"
 SOCKET = "unix:///var/run/tetragon/tetragon.sock"
 EVENTS_IN_CONTAINER = "/var/log/tetragon"
 LOG_NAME = "tetragon.log"
-POLICY = Path(__file__).parents[1] / "fixtures" / "tetragon" / "backtide-connect.yaml"
+POLICY = Path(__file__).parents[2] / "deploy" / "tetragon" / "backtide-connect.yaml"
 # Test containers are named <prefix><pytest pid>-<random>, like the test agents (conftest.py).
 SENSOR_PREFIX = "backtide-test-tetragon-"
 TARGET_PREFIX = "backtide-test-sensortarget-"

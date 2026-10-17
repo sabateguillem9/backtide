@@ -29,7 +29,9 @@ TOKEN = "u" * 43
 @pytest.fixture
 def base() -> Config:
     return openclaw_config(
-        AgentJailConfig(workspace=Path("/w"), config_dir=Path("/c"), gateway_token=TOKEN)
+        AgentJailConfig(
+            workspace=Path("/w"), config_dir=Path("/c"), ca_dir=Path("/ca"), gateway_token=TOKEN
+        )
     )
 
 

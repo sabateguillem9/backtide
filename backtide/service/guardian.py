@@ -319,6 +319,7 @@ class Guardian:
         space_config: space.SpaceConfig = space.DEFAULT_CONFIG,
         grow: VolumeGrower | None = None,
         risk: RiskResponses | None = None,
+        prepare_egress: Callable[[], None] | None = None,
     ) -> None:
         """Every collaborator is injected, so the tests use fakes. ``alerts`` is where alerts
         go (an ``AlertQueue`` in production); the caller starts and closes it. ``sample``
@@ -329,9 +330,12 @@ class Guardian:
         ``grow`` grows the volume after a rewind runs out of space (T04e-1); without it the
         volume is never grown (recorded as ``volume_grow {phase: refused, reason:
         not_configured}``). ``risk`` (T08) is closed when the service stops, before ``stop()``
-        takes ``agent_lock``: its evidence snapshot (``take_evidence``) needs that lock."""
+        takes ``agent_lock``: its evidence snapshot (``take_evidence``) needs that lock.
+        ``prepare_egress`` (T06-2) makes what the agent's way out needs before its container is
+        made (the proxy's CA); if it raises, the service does not start and no agent is made."""
         self._config = config
         self._risk = risk
+        self._prepare_egress = prepare_egress
         self._store = store
         self._jail = jail
         self._box = blackbox
@@ -643,6 +647,8 @@ class Guardian:
         self._jail.ensure_network()
         self._jail.prepare_workspace()
         self._jail.write_config()
+        if self._prepare_egress is not None:
+            self._prepare_egress()
         if not self._jail.exists():
             self._jail.create()
 
