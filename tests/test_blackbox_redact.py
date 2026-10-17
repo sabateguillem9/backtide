@@ -1,9 +1,10 @@
 import copy
+from urllib.parse import quote, quote_plus
 
 import pytest
 
 from backtide.blackbox import REDACTED, redact
-from backtide.blackbox.redact import MAX_TEXT_BYTES
+from backtide.blackbox.redact import MAX_TEXT_BYTES, KnownScrubber, scrub_known
 
 LEAKED = "s3cr3tVALUE-0123456789abcdefXYZ"
 
@@ -301,3 +302,131 @@ def test_keys_that_collide_once_cut_are_all_kept() -> None:
     result = redact({first: "rm -rf /", second: "ls"})
     assert sorted(result.values()) == ["ls", "rm -rf /"]
     assert all(len(key.encode()) <= MAX_TEXT_BYTES for key in result)
+
+
+# --- scrub_known: the secrets backtide knows, wherever they show up -----------------------------
+
+KNOWN = "kn0wnS3cret-" + "Q7w8E9r0T1y2U3i4O5p6"
+FAKE = "backtide-fake-anthropic-" + "a" * 32
+SPECIAL = "sp3c/al+key=" + "Zz9Yy8Xx7Ww6Vv5Uu4"  # characters that URL encoding changes
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        KNOWN,
+        f"prefix {KNOWN} suffix",
+        f"https://x.example/a?q={KNOWN}&page=2",
+        f"/bot{KNOWN}/sendMessage",
+        f"{KNOWN}{KNOWN}",
+        f'{{"note": "{KNOWN}"}}',
+    ],
+)
+def test_scrub_known_strikes_each_exact_appearance(text: str) -> None:
+    result = scrub_known(text, [KNOWN])
+    assert KNOWN not in result
+    assert result == text.replace(KNOWN, REDACTED)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        quote(SPECIAL, safe=""),
+        quote(SPECIAL, safe="").replace("%2F", "%2f").replace("%2B", "%2b"),  # lower-case hex
+        quote(SPECIAL),
+        quote_plus(SPECIAL),
+    ],
+)
+def test_scrub_known_strikes_url_encoded_forms(encoded: str) -> None:
+    result = scrub_known(f"https://x.example/?v={encoded}&page=2", [SPECIAL])
+    assert result == f"https://x.example/?v={REDACTED}&page=2"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x=" + KNOWN[:5] + "%53" + KNOWN[6:],  # partly encoded ("S")
+        "x=" + "".join(f"%{ord(c):02X}" for c in KNOWN),  # every character encoded
+        "x=" + "".join(f"%{ord(c):02x}" for c in KNOWN),
+        "x=" + KNOWN[:5] + "%2553" + KNOWN[6:],  # encoded twice
+        '{"v": "' + "".join(f"\\u{ord(c):04x}" for c in KNOWN) + '"}',  # JSON escapes
+        "&#" + str(ord(KNOWN[0])) + ";" + KNOWN[1:],  # an HTML entity
+    ],
+)
+def test_scrub_known_strikes_a_whole_text_where_a_decoded_form_shows_a_secret(text: str) -> None:
+    assert scrub_known(text, [KNOWN]) == REDACTED
+
+
+def test_scrub_known_is_recursive_and_strikes_keys_too() -> None:
+    value = {
+        "a": [KNOWN, ("x", f"y{FAKE}")],
+        KNOWN: 1,
+        f"k-{FAKE}": {"n": 3, "deep": {"v": quote(KNOWN, safe="")}},
+        "other": None,
+    }
+    assert scrub_known(value, [KNOWN, FAKE]) == {
+        "a": [REDACTED, ["x", f"y{REDACTED}"]],
+        REDACTED: 1,
+        f"k-{REDACTED}": {"n": 3, "deep": {"v": REDACTED}},
+        "other": None,
+    }
+
+
+def test_scrub_known_keeps_keys_that_collide_once_struck() -> None:
+    result = scrub_known({KNOWN: "a", REDACTED: "b"}, [KNOWN])
+    assert sorted(result.values()) == ["a", "b"]
+    assert len(result) == 2
+
+
+def test_scrub_known_leaves_other_texts_and_the_input_alone() -> None:
+    value = {"text": "nothing secret here", "items": (1, 2.5, True)}
+    before = copy.deepcopy(value)
+    assert scrub_known(value, [KNOWN]) == {"text": "nothing secret here", "items": [1, 2.5, True]}
+    assert value == before
+    assert scrub_known("anything", []) == "anything"
+
+
+def test_scrub_known_strikes_the_longer_secret_first() -> None:
+    longer = KNOWN + "-and-more"
+    assert scrub_known(f"a {longer} b", [KNOWN, longer]) == f"a {REDACTED} b"
+
+
+def test_scrub_known_before_redact_leaves_no_piece_of_a_secret_at_the_cut() -> None:
+    text = "a" * (MAX_TEXT_BYTES - 80) + KNOWN + "b" * 200
+    assert KNOWN[:10] not in redact(scrub_known(text, [KNOWN]))
+
+
+def test_scrub_known_is_idempotent() -> None:
+    once = scrub_known(f"{KNOWN} and {quote(SPECIAL, safe='')}", [KNOWN, SPECIAL])
+    assert scrub_known(once, [KNOWN, SPECIAL]) == once
+
+
+@pytest.mark.parametrize("secret", ["", "short", "1234567", None, b"bytes-secret-123"])
+def test_scrub_known_refuses_secrets_it_cannot_strike_safely(secret: object) -> None:
+    with pytest.raises(ValueError):
+        scrub_known("text", [secret])  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize("kept", [4, 10, len(KNOWN) - 1])
+def test_scrub_known_with_cut_tails_strikes_the_start_of_a_secret_at_the_end(kept: int) -> None:
+    # The proxy cut a field it could not strike: what is left of the secret ends the text.
+    text = "user-agent padding " + KNOWN[:kept]
+    assert scrub_known(text, [KNOWN], cut_tails=True) == "user-agent padding " + REDACTED
+    assert scrub_known({"ua": [text]}, [KNOWN], cut_tails=True) == {
+        "ua": ["user-agent padding " + REDACTED]
+    }
+    assert scrub_known(text, [KNOWN]) == text  # off by default
+
+
+def test_cut_tails_leaves_short_or_unrelated_ends_alone() -> None:
+    assert scrub_known("text " + KNOWN[:3], [KNOWN], cut_tails=True) == "text " + KNOWN[:3]
+    assert scrub_known(KNOWN[:10] + " end", [KNOWN], cut_tails=True) == KNOWN[:10] + " end"
+
+
+def test_a_known_scrubber_is_reusable_and_never_shows_its_secrets() -> None:
+    scrubber = KnownScrubber([KNOWN, FAKE])
+    assert scrubber(f"a {KNOWN}") == f"a {REDACTED}"
+    assert scrubber({"k": FAKE}) == {"k": REDACTED}
+    assert KNOWN not in repr(scrubber) and FAKE not in repr(scrubber)
+    with pytest.raises(TypeError):
+        copy.deepcopy(scrubber)

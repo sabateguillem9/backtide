@@ -4,9 +4,12 @@ This is the second barrier (invariant 5); the first one is the proxy (T06). Reda
 errs on the side of striking too much: a lost word is better than a stored key.
 """
 
+import html
+import json
 import re
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import Any, NoReturn
+from urllib.parse import quote, quote_plus, unquote, unquote_plus
 
 REDACTED = "[REDACTED]"
 MAX_TEXT_BYTES = 4096
@@ -156,3 +159,127 @@ def _truncate(text: str) -> str:
     head = data[: MAX_TEXT_BYTES - _SUFFIX_RESERVE].decode("utf-8", errors="ignore")
     dropped = len(data) - len(head.encode("utf-8"))
     return f"{head}…[truncated {dropped} bytes]"
+
+
+# --- scrub_known: the secrets backtide knows (T06) ----------------------------------------------
+
+# Shorter secrets would strike ordinary words; the configuration never holds one this short.
+MIN_KNOWN_SECRET = 8
+_JSON_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_PERCENT_RE = re.compile(r"%([0-9A-F])([0-9A-F])")
+
+
+# A text cut by someone who did not know a secret may end with its first characters.
+MIN_CUT_TAIL = 4
+
+
+def scrub_known(value: Any, secrets: Iterable[str], *, cut_tails: bool = False) -> Any:
+    """Return a copy of ``value`` with each exact appearance of the given secrets (the real
+    and fake keys, the Gateway token) replaced by REDACTED, in texts and in keys.
+
+    - Also URL-encoded: ``%xx`` in any letter case, ``+`` for spaces.
+    - A text in which a secret still shows once decoded some other way (partly or twice
+      URL-encoded, ``\\uXXXX`` JSON escapes, HTML entities) becomes REDACTED as a whole:
+      the place cannot be pinned down, so the whole text goes.
+    - With ``cut_tails``, a text that ENDS with the first MIN_CUT_TAIL+ characters of a
+      secret loses that end too: for texts already cut by someone who did not know the
+      secret (backtide re-striking what the proxy sends, docs/21 section 5).
+    - Mappings, lists and tuples are walked as in redact(); colliding keys are all kept.
+
+    Run it BEFORE redact() or any cut: a secret split by a cut can no longer be found.
+    Raises ValueError for a secret that is not a str or is shorter than MIN_KNOWN_SECRET.
+    For many values with the same secrets, build one KnownScrubber and reuse it.
+    """
+    return KnownScrubber(secrets, cut_tails=cut_tails)(value)
+
+
+class KnownScrubber:
+    """scrub_known() with its secrets prepared once (the pattern is built here)."""
+
+    __slots__ = ("_cut_tails", "_pattern", "_plain")
+
+    def __init__(self, secrets: Iterable[str], *, cut_tails: bool = False) -> None:
+        plain: list[str] = []
+        for secret in secrets:
+            if not isinstance(secret, str) or len(secret) < MIN_KNOWN_SECRET:
+                raise ValueError(f"a known secret must be a text of {MIN_KNOWN_SECRET}+ characters")
+            plain.append(secret)
+        self._plain = tuple(dict.fromkeys(plain))
+        self._pattern = _known_pattern(self._plain) if self._plain else None
+        self._cut_tails = cut_tails
+
+    def __repr__(self) -> str:
+        return f"KnownScrubber({len(self._plain)} secrets)"
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("a KnownScrubber cannot be pickled or copied")
+
+    def __call__(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self.text(value)
+        if isinstance(value, Mapping):
+            result: dict[Any, Any] = {}
+            for key, item in value.items():
+                new_key = self.text(key) if isinstance(key, str) else key
+                result[_unused_key(result, new_key)] = self(item)
+            return result
+        if isinstance(value, list | tuple):
+            return [self(item) for item in value]
+        return value
+
+    def text(self, text: str) -> str:
+        if self._pattern is None:
+            return text
+        text = self._pattern.sub(REDACTED, text)
+        if any(secret in decoded for decoded in _decodings(text) for secret in self._plain):
+            return REDACTED
+        if self._cut_tails:
+            text = _strike_cut_tail(text, self._plain)
+        return text
+
+
+def _strike_cut_tail(text: str, plain: tuple[str, ...]) -> str:
+    longest = 0
+    for secret in plain:
+        for size in range(min(len(secret) - 1, len(text)), MIN_CUT_TAIL - 1, -1):
+            if size <= longest:
+                break
+            if text.endswith(secret[:size]):
+                longest = size
+                break
+    return text[: len(text) - longest] + REDACTED if longest else text
+
+
+def _known_pattern(plain: tuple[str, ...]) -> re.Pattern[str]:
+    forms = {
+        encoded
+        for secret in plain
+        for encoded in (
+            secret,
+            quote(secret, safe=""),
+            quote(secret),
+            quote_plus(secret, safe=""),
+            json.dumps(secret)[1:-1],
+        )
+    }
+    # Longest first, so a secret that contains another is struck whole.
+    ordered = sorted(forms, key=len, reverse=True)
+    return re.compile("|".join(_PERCENT_RE.sub(_any_case_escape, re.escape(f)) for f in ordered))
+
+
+def _any_case_escape(match: re.Match[str]) -> str:
+    """``%2F`` (already through re.escape) matches ``%2f`` too."""
+    high, low = match.group(1), match.group(2)
+    return "%" + "".join(f"[{c.upper()}{c.lower()}]" if c.isalpha() else c for c in high + low)
+
+
+def _decodings(text: str) -> tuple[str, ...]:
+    """Ways a server or a program could read ``text`` back."""
+    once = unquote(text)
+    return (
+        once,
+        unquote(once),
+        unquote_plus(text),
+        _JSON_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text).replace("\\/", "/"),
+        html.unescape(text),
+    )
