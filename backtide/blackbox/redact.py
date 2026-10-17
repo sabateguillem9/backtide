@@ -171,6 +171,7 @@ _PERCENT_RE = re.compile(r"%([0-9A-F])([0-9A-F])")
 
 # A text cut by someone who did not know a secret may end with its first characters.
 MIN_CUT_TAIL = 4
+_PARTIAL_ESCAPE_RE = re.compile(r"(?:\\u[0-9a-fA-F]{0,3}|\\|%[0-9a-fA-F]?|&#?[0-9a-zA-Z]{0,8})\Z")
 
 
 def scrub_known(value: Any, secrets: Iterable[str], *, cut_tails: bool = False) -> Any:
@@ -241,13 +242,27 @@ class KnownScrubber:
 def _strike_cut_tail(text: str, plain: tuple[str, ...]) -> str:
     longest = 0
     for secret in plain:
-        for size in range(min(len(secret) - 1, len(text)), MIN_CUT_TAIL - 1, -1):
-            if size <= longest:
-                break
-            if text.endswith(secret[:size]):
-                longest = size
-                break
-    return text[: len(text) - longest] + REDACTED if longest else text
+        size = _tail_prefix(text, secret)
+        longest = max(longest, size)
+    if longest:
+        return text[: len(text) - longest] + REDACTED
+    # The start of a secret may end the text only once decoded (%xx, \\uXXXX, entities):
+    # its place in the raw text is unknown, so up to 10 raw characters per character of the
+    # secret (the longest HTML entity) are struck from the end. Striking too much is fine.
+    # A cut can also split the last escape: it is left out before decoding.
+    decodings = _decodings(_PARTIAL_ESCAPE_RE.sub("", text))
+    for secret in plain:
+        if any(_tail_prefix(decoded, secret) for decoded in decodings):
+            return text[: max(0, len(text) - 10 * len(secret))] + REDACTED
+    return text
+
+
+def _tail_prefix(text: str, secret: str) -> int:
+    """The length of the longest start of ``secret`` (MIN_CUT_TAIL+) that ends ``text``."""
+    for size in range(min(len(secret) - 1, len(text)), MIN_CUT_TAIL - 1, -1):
+        if text.endswith(secret[:size]):
+            return size
+    return 0
 
 
 def _known_pattern(plain: tuple[str, ...]) -> re.Pattern[str]:

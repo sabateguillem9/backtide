@@ -70,6 +70,7 @@ _LIMIT_SHORT = 64
 _LIMIT_NAME = 128
 _LIMIT_HEADER_VALUE = 256
 _LIMIT_PATH = 2048
+_LIMIT_HOST = 253  # the DNS limit: a valid name is never cut
 
 
 Secrets = Sequence[str] | KnownScrubber
@@ -188,20 +189,23 @@ def _path(path: object, scrub: KnownScrubber) -> str:
 
 def _host(host: object, scrub: KnownScrubber) -> str:
     # Struck before normalizing: lower-casing first would hide a known secret from the strike.
-    struck = _clean(host, scrub, _LIMIT_NAME)
+    struck = _clean(host, scrub, _LIMIT_HOST)
     name = normalize_host(struck)
     return name if name is not None else struck
 
 
 def _target(flow: Mapping[str, Any], scrub: KnownScrubber) -> str:
     host = _host(flow.get("host", ""), scrub)
+    if normalize_host(host) is None:
+        # Not a host name or IP (so maybe cut): nothing goes after a text that may have been
+        # cut, or the piece of a secret it ends with would sit in the middle (cut_tails).
+        return host
     if ":" in host:
         host = f"[{host}]"
     port = flow.get("port")
     scheme = flow.get("scheme")
-    if "path" not in flow or not isinstance(scheme, str):
-        return host if port is None else f"{host}:{port}"
-    scheme = _clean(scheme, scrub, _LIMIT_SHORT, lower=True)
+    if "path" not in flow or not isinstance(scheme, str) or scheme not in _DEFAULT_PORTS:
+        return host if type(port) is not int else f"{host}:{port}"
     port_text = "" if port is None or _DEFAULT_PORTS.get(scheme) == port else f":{port}"
     return _cut(f"{scheme}://{host}{port_text}{_path(flow['path'], scrub)}", _LIMIT_PATH)
 

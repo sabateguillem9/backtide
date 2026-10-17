@@ -1,9 +1,11 @@
 import base64
+import html
 import json
+import re
 import secrets
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import pytest
 
@@ -511,3 +513,32 @@ def test_a_scrubber_built_once_can_be_reused_for_many_events() -> None:
     scrubber = KnownScrubber(KNOWN)
     for key in KNOWN:
         no_key_in(request_event(flow(path=f"/x/{key}"), scrubber))
+
+
+def test_a_cut_host_ends_the_target_so_backtide_can_strike_its_tail() -> None:
+    host = "a" * 63 + "." + "b" * 20 + "." + UNKNOWN_TO_PROXY  # 133 characters, a valid name
+    event = request_event(flow(host=host, path="/x"), KNOWN)
+    assert event["details"]["host"] == host.lower()  # a valid name is never cut
+    long_host = "x" * 300 + UNKNOWN_TO_PROXY  # not a host name: cut, and nothing after it
+    event = request_event(flow(host=long_host, path="/x"), KNOWN)
+    assert not event["target"].endswith("/x")
+
+
+@pytest.mark.parametrize(
+    "encode",
+    [
+        lambda key: "".join(f"%{ord(c):02X}" for c in key),
+        lambda key: "".join(f"\\u{ord(c):04x}" for c in key),
+        lambda key: "".join(f"&#{ord(c)};" for c in key),
+    ],
+)
+def test_backtide_strikes_an_encoded_start_of_a_secret_at_a_cut(encode: Any) -> None:
+    body = ("b" * (EXCERPT_BYTES - 200) + encode(UNKNOWN_TO_PROXY)).encode()
+    path = "/" + "p" * (record._LIMIT_PATH - 200) + "?q=" + encode(UNKNOWN_TO_PROXY)
+    event = request_event(flow(headers=[TEXT], body=body, path=path), KNOWN)
+    again = scrub_known(event, [UNKNOWN_TO_PROXY], cut_tails=True)
+    for text in (again["details"]["body"]["excerpt"], again["details"]["path"], again["target"]):
+        unescaped = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+        for decoded in (text, unquote(text), html.unescape(text), unescaped):
+            for start in range(len(UNKNOWN_TO_PROXY) - 7):
+                assert UNKNOWN_TO_PROXY[start : start + 8] not in decoded
