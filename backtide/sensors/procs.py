@@ -33,13 +33,28 @@ from datetime import UTC, datetime
 from typing import Any
 
 from backtide.blackbox.model import Source
-from backtide.blackbox.redact import REDACTED, redact
+from backtide.blackbox.redact import REDACTED, strike_text
 
 ARGV_LIMIT = 1024  # bytes of argv, binary or cwd kept (docs/23, decision 8)
 # Hostile text longer than two windows is struck window by window (its head and its tail):
 # it bounds the work of the patterns (an exec may carry 320 KiB of arguments), and nothing
-# between the windows is ever kept.
+# between the windows is ever kept. Each window is struck with _MARGIN more characters past its
+# cut, so a secret that straddles the cut is seen whole (the bounded patterns reach 512), and
+# the run of token characters touching a cut is dropped: no head or tail of a secret is left.
 _WINDOW = 2048
+_MARGIN = 512
+_TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+/=.-"  # noqa: S105 - characters, not a secret
+# The tail window starts back at the last line break or quote before it (at most this far),
+# with a little more before it, so an unbounded pattern (a header line, a PEM block, a cookie)
+# sees the name or the flag that starts it.
+_TAIL_REACH = 64 * 1024
+_TAIL_LEAD = 64
+_TERMINATORS = "\r\n\"'"
+# The lines of a key body right before its END (whose BEGIN may be out of the window). Only
+# those lines: a fake END line cannot wipe the commands before it.
+_PEM_BODY_RE = re.compile(
+    r"(?:[A-Za-z0-9+/=]{1,76}\r?\n)+(?=-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----)"
+)
 _SHORT_LIMIT = 64  # a signal name, a timestamp, a protocol
 MIN_PREFIX = 12  # characters of a container id that make an attribution
 
@@ -80,19 +95,39 @@ _KEYED_ACTIONS = frozenset({"exec", "exit", "connect"})
 # with one of these words (``--pass x``, ``--password "two words"``) and an assignment inside a
 # script (``password = 'x'``). Each quantifier is bounded and each name starts after a
 # non-word character, so the scans stay linear on hostile text.
-_SECRET_WORDS = r"(?:password|passwd|pass|pwd|secret|token|api[-_]?key|apikey|auth)"  # noqa: S105
+_SECRET_WORDS = r"(?:password|passwd|pass|pwd|secret|token|api[-_]?key|apikey|auth|cookie)"  # noqa: S105
 _FLAG = rf"(?i)(?<!\S)--?[\w-]*?{_SECRET_WORDS}(?:[ \t]+|=)"
+# redact.py's sensitive names, for JSON and Python values a cut window leaves unclosed.
+_VALUE_WORDS = (
+    r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
+    r"|authorization|cookie)"
+)
+# A value that crosses spaces is only taken between quotes: without an opening quote a pattern
+# strikes ONE token, so an ordinary flag (`git checkout -b x`, `sort -b`) never swallows the
+# rest of a command. The closing quote may be missing at the end of the text or of a window
+# (``\Z``): a cut must not leave the inside of a quoted secret.
 _ARGV_PATTERNS = (
     *(
         re.compile(pattern)
         for quote in ('"', "'")
         for pattern in (
-            rf"{_FLAG}{quote}(?P<secret>[^{quote}\r\n]{{1,512}}){quote}",
+            # A quoted value is struck whole, with no cap (AWS session tokens are ~1,300
+            # chars; cookies, kilobytes): anchored at the name, so the scan stays linear. An
+            # unclosed quote (the end of the text or of a cut window) strikes to that end.
+            rf"{_FLAG}{quote}(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
             rf"(?i)(?<![\w.-])[\w.-]*?{_SECRET_WORDS}[\"']?[ \t]*[:=][ \t]*{quote}"
-            rf"(?P<secret>[^{quote}\r\n]{{1,512}}){quote}",
+            rf"(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
+            # curl -b / --cookie "a=b; c=d".
+            rf"(?<!\S)(?:-b|--cookie)(?:[ \t]+|=){quote}(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
+            # "api_key": "… or 'api_key': '…, closed or cut by the end.
+            rf"(?i){quote}[\w.-]*?{_VALUE_WORDS}{quote}\s*:\s*{quote}"
+            rf"(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
         )
     ),
-    re.compile(rf"{_FLAG}(?P<secret>[^\s\"']{{1,512}})"),
+    re.compile(rf"{_FLAG}(?P<secret>[^\s\"']+)"),
+    re.compile(r"(?<!\S)(?:-b|--cookie)(?:[ \t]+|=)(?P<secret>[^\s\"']+)"),
+    # Three or more lines of 64 base64 characters: the body of a key, even without its BEGIN.
+    re.compile(r"(?<![A-Za-z0-9+/])(?P<secret>(?:[A-Za-z0-9+/]{64}\r?\n){3,}[A-Za-z0-9+/=]{0,64})"),
 )
 # A unit of 1 to 4 characters repeated 16 times or more (padding): folded to one copy and a
 # count. After escaping, so a run of escaped controls (\x01\x01...) folds too.
@@ -104,7 +139,8 @@ _RUN_RE = re.compile(r"(.{1,4}?)\1{15,}", re.DOTALL)
 # protojson may put a space after a colon, so every pattern allows whitespace around it.
 _KIND_B = re.compile(rb'\A\{\s*"(process_exec|process_exit|process_kprobe)"\s*:')
 _DOCKER_B = re.compile(rb'"docker"\s*:\s*"([0-9a-f]{12,64})"')
-_STRING_B = r'"{}"\s*:\s*"((?:[^"\\]|\\.){{0,4096}})"'
+# A path of 4096 control characters is 24 KiB once escaped (\u0001): the bound covers it.
+_STRING_B = r'"{}"\s*:\s*"((?:[^"\\]|\\.){{0,32768}})"'
 _BINARY_B = re.compile(_STRING_B.format("binary").encode())
 _CWD_B = re.compile(_STRING_B.format("cwd").encode())
 _FLAGS_B = re.compile(_STRING_B.format("flags").encode())
@@ -285,6 +321,8 @@ def classify_oversize(head: bytes, tail: bytes, ctx: Context) -> Parsed:
     parsed = classify(data, ctx)
     if isinstance(parsed, Record):
         parsed.details["oversize"] = True
+        if not process["binary"]:
+            parsed.details["binary_lost"] = True  # not in the bytes kept: an unknown program
     return parsed
 
 
@@ -293,17 +331,26 @@ def belongs(process: Mapping[str, Any], ctx: Context) -> bool:
     return ctx.match(process.get("docker")) is not None
 
 
-def safe_text(text: str, ctx: Context | None = None, limit: int = ARGV_LIMIT) -> str:
+def safe_text(
+    text: str, ctx: Context | None = None, limit: int = ARGV_LIMIT, *, scrubbed: str | None = None
+) -> str:
     """Hostile ``text`` made safe to keep: struck, escaped, its runs folded and cut to
     ``limit`` bytes, keeping its head and its tail.
 
     The order matters: strike first (the patterns need the real newlines, and a cut must
-    never leave the head of a key), then escape, then fold and cut."""
+    never leave the head of a key), then escape, then fold and cut. The exact secrets backtide
+    knows are struck over the whole text, before any window: a cut cannot split them
+    (``scrubbed``: that already done by the caller, so it is not done twice)."""
     total = len(text.encode("utf-8", "surrogatepass"))
+    if scrubbed is not None:
+        text = scrubbed
+    elif ctx is not None and ctx.scrub is not None:
+        text = ctx.scrub(text)
     if len(text) > 2 * _WINDOW:
-        head, tail = _clean(text[:_WINDOW], ctx), _clean(text[-_WINDOW:], ctx)
-        return _join(head, tail, limit, total)
-    clean = _clean(text, ctx)
+        head = _cut_head(_strike_patterns(text[: _WINDOW + _MARGIN]), _WINDOW)
+        tail = _cut_tail(_strike_patterns(_tail_window(text)), _WINDOW)
+        return _join(_shown(head), _shown(tail), limit, total)
+    clean = _shown(_strike_patterns(text))
     if len(clean.encode("utf-8")) <= limit:
         return clean
     return _join(clean, clean, limit, total)
@@ -339,8 +386,12 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
     injected = process.get("in_init_tree") is not True
     binary = safe_text(raw_binary, ctx)
     parent_binary = safe_text(raw_parent, ctx)
+    # A known secret written so that only its decodings show it (twice %-encoded, say) makes
+    # the scrubber strike the whole text: visible, so it cannot be a quiet way to hide a command.
+    scrubbed_args = ctx.scrub(raw_args) if ctx.scrub is not None else raw_args
+    struck_whole = scrubbed_args == REDACTED and raw_args.strip() not in ("", REDACTED)
     details: dict[str, Any] = {
-        "argv": safe_text(raw_args, ctx),
+        "argv": safe_text(raw_args, ctx, scrubbed=scrubbed_args),
         "cwd": safe_text(_str(process.get("cwd")), ctx),
         "pid": _int(process.get("pid")),
         "uid": _int(process.get("uid")),
@@ -353,6 +404,8 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         "t": t,
         "exec_id": _exec_id(process),
     }
+    if struck_whole:
+        details["argv_struck_whole"] = True
     if "dataArgs" in flags and not raw_args:
         # T07-1, P5: past ~320 KiB Tetragon drops the arguments without any flag saying so.
         details["arguments_lost"] = True
@@ -373,6 +426,7 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         "exec",
         binary,
         details,
+        risk=1 if struck_whole else 0,
         binary=binary,
         parent=parent_binary,
         time=t,
@@ -458,14 +512,54 @@ def _throttle(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
 # --- text -----------------------------------------------------------------------------------
 
 
-def _clean(text: str, ctx: Context | None) -> str:
-    """Struck and escaped (not cut)."""
-    if ctx is not None and ctx.scrub is not None:
-        text = ctx.scrub(text)
+def _strike_patterns(text: str) -> str:
+    """Our command-line forms and redact()'s patterns struck (not cut, not escaped)."""
     for pattern in _ARGV_PATTERNS:
         text = pattern.sub(_strike, text)
-    struck = redact(text)
-    return _fold(_escape(struck if isinstance(struck, str) else ""))
+    return strike_text(text)
+
+
+def _shown(text: str) -> str:
+    """Escaped and folded: what is kept of an already struck text."""
+    return _fold(_escape(text))
+
+
+def _tail_window(text: str) -> str:
+    """The end of ``text`` to strike: the last _WINDOW + _MARGIN characters, reaching back to
+    the last line break or quote before them (and _TAIL_LEAD more), so a secret whose name or
+    flag is far before the cut (a 3 KB cookie, a PEM block) is still matched whole. Without
+    one within _TAIL_REACH, the plain window. The key lines right before a PEM block's END are
+    struck even without its BEGIN."""
+    start = len(text) - (_WINDOW + _MARGIN)
+    reach = max(0, start - _TAIL_REACH)
+    stop = max(text.rfind(char, reach, start) for char in _TERMINATORS)
+    # Without one within reach, the plain window: dropping it would hide the end of the
+    # command, which padding must never do (the cut's token run is still dropped).
+    window = text[max(0, stop - _TAIL_LEAD) :] if stop >= 0 else text[start:]
+    return _PEM_BODY_RE.sub(REDACTED + "\n", window)
+
+
+def _cut_head(text: str, size: int) -> str:
+    """The first ``size`` characters of a struck window, never ending inside a REDACTED
+    marker, without the run of token characters the cut touches (the head of a secret)."""
+    return text[: _redacted_end(text, size)].rstrip(_TOKEN_CHARS)
+
+
+def _cut_tail(text: str, size: int) -> str:
+    """The last ``size`` characters, the same way at the other end."""
+    start = max(0, len(text) - size)
+    for found in re.finditer(re.escape(REDACTED), text):
+        if found.start() < start < found.end():
+            start = found.start()
+            break
+    return text[start:].lstrip(_TOKEN_CHARS)
+
+
+def _redacted_end(text: str, size: int) -> int:
+    for found in re.finditer(re.escape(REDACTED), text):
+        if found.start() < size < found.end():
+            return found.end()
+    return size
 
 
 def _strike(match: re.Match[str]) -> str:

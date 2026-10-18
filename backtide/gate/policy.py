@@ -173,6 +173,39 @@ class AllowList:
         return name in self._exact or any(name.endswith(suffix) for suffix in self._suffixes)
 
 
+_NUMBER_RE = re.compile(r"0[xX][0-9a-fA-F]*|0[0-7]*|[1-9][0-9]*", re.ASCII)  # glibc: "0x" is 0
+
+
+def _number(part: str) -> int:
+    if part[:2].lower() == "0x":
+        return int(part[2:] or "0", 16)
+    return int(part, 8 if part[0] == "0" else 10)
+
+
+def numeric_ipv4(host: object) -> str | None:
+    """The IPv4 address a host written as numbers stands for, as ``inet_aton`` (and so the
+    resolver behind ``getaddrinfo``) reads it, or None: one to four parts, each decimal, octal
+    (``0177``) or hex (``0x7f``), the last one filling the bytes left (``127.1``, ``0x7f.1``,
+    ``2130706433``). ``ip_address`` takes none of these, so they would pass for host names."""
+    if not isinstance(host, str):
+        return None
+    text = host.strip()
+    if text.endswith("."):
+        text = text[:-1]
+    parts = text.split(".")
+    if not 1 <= len(parts) <= 4 or not all(_NUMBER_RE.fullmatch(part) for part in parts):
+        return None
+    values = [_number(part) for part in parts]
+    *head, last = values
+    if any(value > 255 for value in head) or last >= 256 ** (5 - len(parts)):
+        return None
+    number = 0
+    for value in head:
+        number = number << 8 | value
+    number = number << 8 * (5 - len(parts)) | last
+    return str(IPv4Address(number))
+
+
 def is_ip(name: str) -> bool:
     """Whether ``name`` is an IP literal (as normalize_host leaves one)."""
     try:

@@ -1,4 +1,5 @@
-"""The OpenClaw profile for T04: which configs can be rewound safely.
+"""The OpenClaw profile: which configs can be rewound safely (T04), and where OpenClaw reads the
+fake key of each model provider (T06-5).
 
 Rewinding the agent's volume also rewinds OpenClaw's SQLite state. Anything that authorizes
 someone or something and lives there would come back after a rewind (a sender the user revoked,
@@ -13,9 +14,11 @@ repeats a value of the config in its messages: only paths, so no secret can reac
 """
 
 import re
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from typing import Any
+
+from backtide.gate.providers import is_fake_key
 
 # The only channel allowed (rule 1); the others hold ratchet credentials or are not verified.
 CHANNELS = ("telegram",)
@@ -35,6 +38,80 @@ REWIND_NOTICE_LINES = (
 )
 _NUMERIC_ID = re.compile(r"(?:(?:telegram|tg):)?[0-9]+")
 _WILDCARD = re.compile(r"(?:(?:telegram|tg):)?\s*\*\s*")
+
+
+# The fake key (T06-5, docs/21 section 6). OpenClaw reads it as a literal
+# ``models.providers.<name>.apiKey`` (T06-1, P9); with ``auth: "api-key"`` that literal wins over
+# auth profiles and environment variables. It sends it as ``x-api-key`` (anthropic-messages) or
+# ``Authorization: Bearer`` (openai-completions), and the proxy swaps it for the real one. OpenClaw
+# also copies it into its state (``agents/<id>/agent/models.json``): it is the fake one, so the
+# agent finding it there is expected. Only "anthropic" and "openai" are providers OpenClaw knows by
+# itself (their model catalogs); any other name needs its model list (OpenClaw's schema refuses a
+# custom provider without one).
+BUILT_IN_PROVIDERS = ("anthropic", "openai")
+_API = {"anthropic": "anthropic-messages", "openai": "openai-completions"}
+# anthropic-messages adds /v1/messages to its base; the OpenAI client adds only /chat/completions.
+_BASE_PATH = {"anthropic": "", "openai": "/v1"}
+_PROVIDER_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", re.ASCII)
+_HOST_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", re.ASCII)
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}", re.ASCII)
+
+
+@dataclass(frozen=True)
+class ModelProvider:
+    """A model provider as the agent sees it: its name (OpenClaw's provider id), how it takes
+    its key (``kind``), its host and the FAKE key. Never the real one: the proxy holds that.
+    ``models`` are model ids OpenClaw must know (required for a name OpenClaw has no catalog
+    of); the first of the first provider that has them is the agent's default model."""
+
+    name: str
+    kind: str
+    host: str
+    fake_key: str = field(repr=False)
+    models: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not _PROVIDER_NAME.fullmatch(self.name):
+            raise ValueError(f"invalid provider name {self.name!r}")
+        if self.kind not in _API:
+            raise ValueError(f"provider {self.name}: unknown kind {self.kind!r}")
+        if not isinstance(self.host, str) or not _HOST_NAME.fullmatch(self.host):
+            raise ValueError(f"provider {self.name}: the host must be a lower-case host name")
+        if not is_fake_key(self.fake_key, self.name):
+            raise ValueError(f"provider {self.name}: the agent only ever gets its fake key")
+        if not isinstance(self.models, tuple) or not all(
+            isinstance(model, str) and MODEL_ID.fullmatch(model) for model in self.models
+        ):
+            raise ValueError(f"provider {self.name}: models must be a tuple of model ids")
+        if self.name not in BUILT_IN_PROVIDERS and not self.models:
+            raise ValueError(
+                f"provider {self.name}: OpenClaw needs its model ids (it only knows the models "
+                f"of {', '.join(BUILT_IN_PROVIDERS)} by itself)"
+            )
+
+
+def model_settings(providers: Iterable[ModelProvider]) -> dict[str, Any]:
+    """What openclaw.json says of the providers: ``models`` (merged with OpenClaw's catalog) and
+    the agent's default model. Empty without providers."""
+    items = tuple(providers)
+    if not items:
+        return {}
+    entries: dict[str, Any] = {}
+    for provider in items:
+        entry: dict[str, Any] = {
+            "baseUrl": f"https://{provider.host}{_BASE_PATH[provider.kind]}",
+            "api": _API[provider.kind],
+            "auth": "api-key",
+            "apiKey": provider.fake_key,
+        }
+        if provider.models:
+            entry["models"] = [{"id": model, "name": model} for model in provider.models]
+        entries[provider.name] = entry
+    settings: dict[str, Any] = {"models": {"mode": "merge", "providers": entries}}
+    default = next((p for p in items if p.models), None)
+    if default is not None:
+        settings["primary"] = f"{default.name}/{default.models[0]}"
+    return settings
 
 
 @dataclass(frozen=True)

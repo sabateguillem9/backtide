@@ -430,3 +430,32 @@ def test_a_known_scrubber_is_reusable_and_never_shows_its_secrets() -> None:
     assert KNOWN not in repr(scrubber) and FAKE not in repr(scrubber)
     with pytest.raises(TypeError):
         copy.deepcopy(scrubber)
+
+
+# --- T07 third-pass H1: no redaction pattern is quadratic on hostile text -------------------
+
+import importlib as _importlib  # noqa: E402
+import time as _time  # noqa: E402
+
+# The package exposes a ``redact`` function, which shadows the submodule by that name.
+_redact_mod = _importlib.import_module("backtide.blackbox.redact")
+
+
+@pytest.mark.parametrize(
+    "unit",
+    ["a.", "a-", "-x ", "eyJ-", "token ", "basic ", "Bearer ", "-----BEGIN A", "a\n", "x://"],
+)
+def test_each_pattern_is_fast_on_70_kib_of_hostile_text(unit: str) -> None:
+    hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
+    for pattern in _redact_mod._TEXT_PATTERNS:
+        start = _time.perf_counter()
+        pattern.search(hostile)
+        elapsed = _time.perf_counter() - start
+        assert elapsed < 0.05, f"{pattern.pattern[:40]!r} took {elapsed:.3f}s on {unit!r}"
+
+
+def test_redact_a_half_mib_text_is_quick() -> None:
+    hostile = ("https://a.a.a.a" * (512 * 1024 // 14))[: 512 * 1024]
+    start = _time.perf_counter()
+    redact(hostile)
+    assert _time.perf_counter() - start < 0.5

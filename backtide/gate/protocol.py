@@ -9,7 +9,7 @@ fixes (the proxy cannot choose it). Errors never quote the offending value.
 | Message | Sent by | What |
 |---|---|---|
 | ``hello {version, pid}`` | proxy | When it starts |
-| ``config {allow_hosts, providers, limits}`` | backtide | The answer to ``hello``; holds the keys |
+| ``config {allow_hosts, providers, limits, provider_tools}`` | backtide | The answer to ``hello``; holds the keys |
 | ``request {id, event}`` / ``ack {id, verdict, seq, reason?, retry_after?}`` | proxy / backtide | Before a request goes out |
 | ``event {event}`` | proxy | Anything that does not send a request out |
 | ``ping`` / ``pong`` | both | Every few seconds |
@@ -23,6 +23,7 @@ from enum import StrEnum
 from typing import Any
 
 from backtide.gate.policy import normalize_pattern
+from backtide.gate.provider_tools import check_allow_entry
 from backtide.gate.providers import Kind, Provider, Providers, Secret
 
 MAX_LINE_BYTES = 64 * 1024
@@ -33,6 +34,7 @@ _MAX_ID = 2**53 - 1  # exact in any JSON reader
 _MAX_SEQ = 2**63 - 1
 _MAX_ALLOW_HOSTS = 1000
 _MAX_PROVIDERS = 32
+MAX_PROVIDER_TOOLS = 64
 
 
 class ProtocolError(ValueError):
@@ -64,6 +66,10 @@ BLOCK_RISK = {
     "not_recorded": 2,
     "not_allowed": 1,
     "undecodable": 2,  # a Content-Encoding the proxy cannot undo: its content cannot be checked
+    # T06-6: what goes to a provider's host leaves with the real key (provider_tools.py).
+    "provider_endpoint": 2,  # not one of the provider's model endpoints
+    "provider_body": 2,  # a body that is not the provider's JSON: its tools cannot be checked
+    "provider_side_tool": 2,  # a tool or connector that runs on the provider's side
 }
 DENY_REASONS = frozenset({"not_allowed", "throttled", "not_recorded"})
 
@@ -87,7 +93,9 @@ EVENT_SCHEMA: dict[tuple[str, str], tuple[int | None, frozenset[str]]] = {
         0,
         frozenset({"flow_id", "status", "size", "type", "duration_ms", "streamed"}),
     ),
-    ("net", "blocked"): (None, _REQUEST_KEYS | {"reason"}),
+    # tools: the provider-side ones refused (provider_side_tool); side: "response" when what
+    # was refused is the provider's answer (a real key in it: real_key, T06-6).
+    ("net", "blocked"): (None, _REQUEST_KEYS | {"reason", "tools", "side"}),
     ("net", "error"): (1, frozenset({"stage", "error", "sni", "flow_id", "host", "port"})),
     ("net", "tls_failed"): (1, frozenset({"sni", "host", "port"})),
     ("net", "websocket_start"): (0, _WEBSOCKET_KEYS),
@@ -98,7 +106,17 @@ EVENT_SCHEMA: dict[tuple[str, str], tuple[int | None, frozenset[str]]] = {
     ("llm", "request"): (
         0,
         _REQUEST_KEYS
-        | {"provider", "model", "stream", "max_tokens", "messages", "tools", "key", "body"},
+        | {
+            "provider",
+            "model",
+            "stream",
+            "max_tokens",
+            "messages",
+            "tools",
+            "key",
+            "body",
+            "provider_tools",
+        },
     ),
     ("llm", "response"): (0, _LLM_RESPONSE_KEYS),
 }
@@ -207,10 +225,15 @@ def hello(version: str, pid: int) -> dict[str, Any]:
 
 
 def config(
-    allow_hosts: Iterable[str], providers: Providers, limits: Mapping[str, int]
+    allow_hosts: Iterable[str],
+    providers: Providers,
+    limits: Mapping[str, int],
+    *,
+    provider_tools: Iterable[str] = (),
 ) -> dict[str, Any]:
     """The configuration for the proxy. It holds the real keys in clear: never log it (use
-    describe()), and drop it as soon as it is encoded."""
+    describe()), and drop it as soon as it is encoded. ``provider_tools``: the provider-side
+    tools that may go to a provider anyway (``[proxy] allow_provider_tools``, T06-6)."""
     message = {
         "type": "config",
         "allow_hosts": list(allow_hosts),
@@ -221,10 +244,12 @@ def config(
                 "host": p.host,
                 "fake_key": p.fake_key,
                 "real_key": p.real_key.reveal(),
+                "models": list(p.models),
             }
             for p in providers.items
         ],
         "limits": dict(limits),
+        "provider_tools": list(provider_tools),
     }
     return _check(message)
 
@@ -287,10 +312,15 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
         raise ProtocolError("config.providers: not a list of providers")
     built = []
     for entry in items:
-        if not isinstance(entry, dict) or set(entry) != _PROVIDER_KEYS:
+        if not isinstance(entry, dict) or not _PROVIDER_KEYS <= set(entry) <= _PROVIDER_KEYS | {
+            "models"
+        }:
             raise ProtocolError("config.providers: wrong fields")
         if not all(isinstance(entry[key], str) for key in _PROVIDER_KEYS):
             raise ProtocolError("config.providers: a field is not a text")
+        models = entry.get("models", [])
+        if not isinstance(models, list):
+            raise ProtocolError("config.providers: models is not a list")
         try:
             built.append(
                 Provider(
@@ -299,6 +329,7 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
                     host=entry["host"],
                     fake_key=entry["fake_key"],
                     real_key=Secret(entry["real_key"]),
+                    models=tuple(models),
                 )
             )
         except ValueError:
@@ -351,7 +382,7 @@ def _check_hello(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _check_config(message: dict[str, Any]) -> dict[str, Any]:
-    _fields(message, {"allow_hosts", "providers", "limits"})
+    _fields(message, {"allow_hosts", "providers", "limits"}, {"provider_tools"})
     hosts = message["allow_hosts"]
     if not isinstance(hosts, list) or len(hosts) > _MAX_ALLOW_HOSTS:
         raise ProtocolError("config.allow_hosts: not a list of hosts")
@@ -360,6 +391,13 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
     except ValueError:
         raise ProtocolError("config.allow_hosts: a host is not valid") from None
     providers = providers_from_config(message)
+    tools = message.get("provider_tools", [])
+    if not isinstance(tools, list) or len(tools) > MAX_PROVIDER_TOOLS:
+        raise ProtocolError("config.provider_tools: not a list of tool names")
+    try:
+        allowed_tools = list(dict.fromkeys(check_allow_entry(tool) for tool in tools))
+    except ValueError:
+        raise ProtocolError("config.provider_tools: a tool name is not valid") from None
     limits = message["limits"]
     if not isinstance(limits, dict) or not set(limits) <= set(DEFAULT_LIMITS):
         raise ProtocolError("config.limits: unknown limits")
@@ -376,10 +414,12 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
                 "host": p.host,
                 "fake_key": p.fake_key,
                 "real_key": p.real_key.reveal(),
+                "models": list(p.models),
             }
             for p in providers.items
         ],
         "limits": checked,
+        "provider_tools": allowed_tools,
     }
 
 

@@ -98,6 +98,8 @@ class FakeSensorJail:
         self.start_error: JailError | None = None
         self.stop_error: JailError | None = None
         self.prepare_error: Exception | None = None
+        self.losses = {"kernel": 0, "ringbuf": 0, "queue": 0, "notify": 0, "export": 0}
+        self.losses_error: JailError | None = None
 
     def prepare(self) -> None:
         self.log.append("sensor.prepare")
@@ -140,6 +142,14 @@ class FakeSensorJail:
 
     def die(self) -> None:
         self.running = False
+
+    def loss_counters(self) -> dict[str, int]:
+        if self.losses_error is not None:
+            raise self.losses_error
+        return dict(self.losses)
+
+    def lose(self, kind: str, count: int) -> None:
+        self.losses[kind] += count
 
     def write_exec(
         self, arguments: str, *, docker: str = AGENT_ID, binary: str = "/bin/true"
@@ -198,6 +208,8 @@ class World:
     agent_running: list[bool]
     lost: list[str]
     back: list[str]
+    lost_result: list[bool] = field(default_factory=lambda: [True])
+    reasons: list[str] = field(default_factory=list)
 
     def start(self) -> bool:
         return self.sensor.start(
@@ -207,10 +219,16 @@ class World:
                     (level, title, body)
                 ),
                 agent_running=lambda: self.agent_running[0],
-                lost=lambda: (self.lost.append("lost"), self.log.append("guardian.lost")),
+                lost=self._lost,
                 back=lambda: (self.back.append("back"), self.log.append("guardian.back")),
             )
         )
+
+    def _lost(self, reason: str = "sensor_down") -> bool:
+        self.lost.append("lost")
+        self.reasons.append(reason)
+        self.log.append("guardian.lost")
+        return self.lost_result[0]
 
     def beat(self, times: int = 1) -> None:
         for _ in range(times):
@@ -645,3 +663,224 @@ def test_a_required_sensor_whose_first_probe_could_not_launch_asks_again(tmp_pat
         world.beat(1)
         world.sensor.agent_started()  # the Guardian's start, failing again
     assert world.back == ["back"] * 3
+
+
+# --- review of T07: required keeps failing closed, Tetragon's own losses, the budget --------
+
+
+def test_a_required_sensor_stops_the_agent_on_every_unproven_streak(tmp_path: Path) -> None:
+    """Finding 4: after the first alert, a second streak of 3 must stop the agent again."""
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.agent.exec_code = 126
+    world.beat(3)
+    assert world.lost == ["lost"]
+    world.beat(3)  # the agent still runs (it came back, or could not be stopped)
+    assert world.lost == ["lost", "lost"]
+    assert len(world.box.of("sensor_unproven")) == 1  # recorded and alerted once
+    # The next start must prove the path again: no stale confirmation.
+    world.agent.exec_code = 0
+    world.agent.execs.clear()
+    assert world.sensor.agent_started() is True
+    assert world.agent.execs and world.agent.execs[0][1].startswith("backtide-ready-")
+
+
+def test_a_new_agent_container_is_proven_again(world: World) -> None:
+    _running(world)
+    world.agent.id = NEW_AGENT_ID
+    world.sensor.follow_agent()
+    world.agent.execs.clear()
+    assert world.sensor.agent_started() is True
+    assert world.agent.execs  # probed again, not trusted from the old container
+
+
+def test_a_failed_attribution_is_not_proven(world: World) -> None:
+    _running(world)
+
+    def broken() -> str:
+        raise JailError("docker is gone")
+
+    world.agent.container_id = broken  # type: ignore[method-assign]
+    world.sensor.follow_agent()
+    world.agent.container_id = lambda: AGENT_ID  # type: ignore[method-assign]
+    world.agent.execs.clear()
+    world.sensor.agent_started()
+    assert world.agent.execs
+
+
+def test_tetragons_own_losses_are_a_gap_and_an_alert(world: World) -> None:
+    """Finding 2: a connect flood fills Tetragon's ring buffer and queues; nothing in its file
+    or its logs says so, only its counters."""
+    _running(world)
+    world.beat(1)
+    assert world.box.of("sensor_gap") == []
+    world.jail.lose("kernel", 3000)
+    world.jail.lose("notify", 12)
+    world.beat(1)
+    (gap,) = world.box.of("sensor_gap")
+    assert gap.risk == 2
+    assert gap.details == {
+        "kind": "kernel_lost",
+        "count": 3012,
+        "counters": {"kernel": 3000, "notify": 12},
+    }
+    alerts = [title for _, title, _ in world.alerts]
+    assert alerts.count("El sensor de procesos ha perdido eventos") == 1
+    world.jail.lose("queue", 5)
+    world.beat(1)
+    assert len(world.box.of("sensor_gap")) == 2
+    assert alerts.count("El sensor de procesos ha perdido eventos") == 1  # once per spell
+    assert world.lost == []  # not required: the agent goes on
+
+
+def test_with_required_tetragons_losses_stop_the_agent_and_ask_it_back(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.jail.lose("kernel", 10)
+    world.beat(1)
+    assert world.lost == ["lost"]
+    world.agent_running[0] = False
+    world.beat(1)
+    assert world.back == ["back"]
+
+
+def test_unreadable_loss_counters_are_a_failure_and_unproven_when_required(
+    tmp_path: Path,
+) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.jail.losses_error = JailError("wget: connection refused")
+    world.beat(2)
+    failed = [e for e in world.box.of("sensor_failed") if e.details["stage"] == "losses"]
+    assert len(failed) == 1
+    assert world.lost == ["lost", "lost"]
+
+
+def test_losses_of_a_reused_tetragon_are_a_gap(world: World) -> None:
+    world.jail.created = world.jail.running = True
+    world.jail.config.events_dir.mkdir(parents=True)
+    world.jail.lose("queue", 7)
+    world.start()
+    (gap,) = world.box.of("sensor_gap")
+    assert gap.details["count"] == 7 and gap.details["while_down"] is True
+
+
+def test_a_spent_budget_alerts_and_with_required_holds_the_agent(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    spent = ["exec"]
+    world.reader.exhausted_budgets = lambda: list(spent)  # type: ignore[method-assign]
+    world.beat(1)
+    assert world.lost == ["lost"]
+    assert world.sensor.allows_agent() is False
+    world.agent_running[0] = False
+    world.beat(3)
+    assert world.back == []  # never while the budget is spent
+    spent.clear()
+    assert world.sensor.allows_agent() is True
+    world.beat(1)
+    assert world.back == ["back"]
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos ha agotado su cupo diario") == 1
+
+
+def test_a_spent_budget_without_required_only_alerts(world: World) -> None:
+    _running(world)
+    world.reader.exhausted_budgets = lambda: ["net"]  # type: ignore[method-assign]
+    world.beat(2)
+    assert world.lost == [] and world.sensor.allows_agent() is True
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos ha agotado su cupo diario") == 1
+
+
+def test_tetragon_is_not_restarted_while_a_required_agent_still_runs(tmp_path: Path) -> None:
+    """Finding 13: `lost` says whether it stopped the agent; until it did, no restart."""
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.lost_result[0] = False
+    world.log.clear()
+    world.jail.die()
+    world.beat(2)
+    assert world.box.of("sensor_down") and world.box.of("sensor_restart") == []
+    assert "sensor.create" not in world.log
+    world.lost_result[0] = True
+    world.beat(1)
+    assert len(world.box.of("sensor_restart")) == 1
+    assert world.sensor.state is SensorState.UP
+
+
+# --- T07 re-review: blind spots of the reader, the reason to stop, no baseline -----------
+
+
+def test_a_throttle_or_lost_novelty_alerts_and_with_required_stops_the_agent(
+    tmp_path: Path,
+) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.reader.take_blind_spots = lambda: {"throttle": 1}  # type: ignore[method-assign]
+    world.beat(1)
+    assert world.lost == ["lost"] and world.reasons == ["sensor_lost_events"]
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos ha dejado de ver comandos") == 1
+
+
+def test_blind_spots_without_required_only_alert(world: World) -> None:
+    _running(world)
+    world.reader.take_blind_spots = lambda: {"novelty_lost": 2}  # type: ignore[method-assign]
+    world.beat(2)
+    assert world.lost == []
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos ha dejado de ver comandos") == 1
+
+
+def test_the_unproven_streak_records_its_misses(world: World) -> None:
+    _running(world)
+    world.agent.exec_code = 126
+    world.beat(3)
+    (unproven,) = world.box.of("sensor_unproven")
+    assert unproven.details["misses"] == 3
+
+
+def test_without_a_baseline_every_loss_counts() -> None:
+    from backtide.service.process_sensor import KernelLoss  # noqa: PLC0415
+
+    losses = KernelLoss(lambda: {"kernel": 5, "queue": 0})
+    assert losses.check() == {"kernel": 5}
+    assert losses.check() == {}
+
+
+def test_a_failure_to_read_the_losses_is_said_again_every_hour(world: World) -> None:
+    _running(world)
+    world.jail.losses_error = JailError("wget: bad address")
+    world.beat(3)
+    stage = [e for e in world.box.of("sensor_failed") if e.details["stage"] == "losses"]
+    assert len(stage) == 1
+    world.clock.sleep(3600)
+    world.beat(1)
+    stage = [e for e in world.box.of("sensor_failed") if e.details["stage"] == "losses"]
+    assert len(stage) == 2
+
+
+# --- T07 third pass: a stuck reader poll is a blind spot ------------------------------------
+
+
+def test_a_stalled_reader_is_blind_and_with_required_stops_the_agent(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.reader.polling_since = world.clock() - 120  # a poll has been running for 2 minutes
+    world.beat(1)
+    (gap,) = [e for e in world.box.of("sensor_gap") if e.details["kind"] == "reader_stalled"]
+    assert gap.risk == 2 and world.lost == ["lost"] and world.reasons == ["sensor_lost_events"]
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos va muy por detrás") == 1
+    # No probe is launched while the reader is stuck.
+    assert world.agent.execs == []
+
+
+def test_a_stalled_reader_without_required_only_alerts(world: World) -> None:
+    _running(world)
+    world.reader.polling_since = world.clock() - 120
+    world.beat(2)
+    assert world.lost == []
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos va muy por detrás") == 1

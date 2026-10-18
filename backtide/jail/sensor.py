@@ -21,11 +21,18 @@ every start, and nothing here is ever mounted into the agent (invariant 1).
 - ``serving()`` (T07-3) is the readiness before the agent runs: ``tetra status`` says running
   and the policy is enabled (T07-1, P13). The whole path (kernel, file, reader) is proven
   later, by a probe in the agent's container (backtide/service/process_sensor.py).
+- ``loss_counters()`` (T07 review): what Tetragon itself lost (its ring buffer full in the
+  kernel, its queues and its exporter overflowing), from its metrics. They are served on
+  127.0.0.1 of the sensor's own network namespace (``--network none``: nothing but its
+  loopback, which no other container can reach) and read with ``docker exec`` and the image's
+  wget, as ``tetra status`` is: no port leaves the container, no new privilege for backtide.
+  Tetragon writes nothing about these losses to its file or its logs (measured in the VM).
 """
 
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -78,6 +85,28 @@ POLICY_NAME = "backtide-connect"  # metadata.name in the policy
 _RUNNING_RE = re.compile(r"^Health Status:[ \t]*running[ \t]*$", re.MULTILINE)
 SERVING_TIMEOUT = 10.0  # seconds one `tetra` call may take
 _TETRA_OUTPUT = 64 * 1024
+# Tetragon's metrics, inside its own network namespace only (see the module's docstring).
+METRICS_ADDRESS = "127.0.0.1:2112"
+METRICS_URL = f"http://{METRICS_ADDRESS}/metrics"
+_METRICS_OUTPUT = 1024 * 1024  # ~44 KB in the VM
+# What each loss counter is (summed over its labels). T07 review, measured in the VM with a
+# connect flood: the kernel's ring buffer full (bpf_missed, EAGAIN), the queue between the ring
+# buffer and Tetragon's handlers, and the exporter's queue (notify_overflowed) all drop events
+# silently, real execs among them.
+LOSS_METRICS = {
+    "kernel": "tetragon_bpf_missed_events_total",
+    "ringbuf": "tetragon_observer_ringbuf_events_lost_total",
+    "queue": "tetragon_observer_ringbuf_queue_events_lost_total",
+    "notify": "tetragon_notify_overflowed_events_total",
+    "export": "tetragon_export_ratelimit_events_dropped_total",
+}
+_RINGBUF_ERRORS = "tetragon_observer_ringbuf_errors_total"
+# Always there, even at 0: an output without them is not Tetragon's metrics. The kernel's is
+# only listed once something was missed.
+_ALWAYS = ("ringbuf", "queue", "notify")
+# Only the loss counters are parsed: a label of another metric may carry what the agent chose
+# (a binary named "x}y"), and nothing of it may break the reading or reach an error message.
+_LOSS_NAMES = frozenset({*LOSS_METRICS.values(), _RINGBUF_ERRORS})
 # The events file's mode. 600 in production; the VM tests, without root, need 644 (T07-1).
 _FILE_PERMS = frozenset({"600", "640", "644"})
 
@@ -86,6 +115,11 @@ _FILE_PERMS = frozenset({"600", "640", "644"})
 # (T07-1, P11) with the capture refined afterwards to ``([^\s"']+)``, so a closing quote stays.
 # The second barrier is backtide/sensors/procs.py (redact and its own patterns).
 _SECRET_VALUE = r"""([^\s"']+)"""  # noqa: S105 - a pattern, not a secret
+# redact.py's sensitive names (backtide/blackbox/redact.py, _SENSITIVE_WORDS), in RE2.
+_SENSITIVE = (
+    r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
+    r"|authorization|cookie)"
+)
 REDACTION_RULES: tuple[tuple[str, ...], ...] = (
     (
         r"(?i)(?:authorization|x-api-key|api-key|x-goog-api-key|cookie)[\"']?\s*[:=]\s*"
@@ -98,7 +132,32 @@ REDACTION_RULES: tuple[tuple[str, ...], ...] = (
         r"\b(AKIA[A-Z0-9]{16})\b",
         r"(?://[^/\s:@]+:)([^/\s@]+)(?:@)",
     ),
+    # The T07 review: the forms that only the second barrier knew, ported to RE2 from
+    # redact.py and checked in the VM (tests/integration/test_sensor_review.py). RE2 has no
+    # lookbehind, so a name may start anywhere: it strikes more, never less.
+    (
+        rf"(?i)[A-Za-z0-9_.-]*{_SENSITIVE}=([^\s&#;,\"']+)",
+        rf"(?i)[A-Za-z0-9_-]*{_SENSITIVE}[ \t]*:[ \t]*(?:bearer[ \t]+|basic[ \t]+)?"
+        + _SECRET_VALUE,
+        r"(?i)\bbearer\s+([A-Za-z0-9._~+/-]{8,}=*)",
+        r"(?:^|\s)(?:-u|--user)(?:\s+|=)[^\s:\"']+:" + _SECRET_VALUE,
+    ),
+    (
+        r"(?:^|[^0-9])[0-9]{5,16}:([A-Za-z0-9_-]{30,})",  # Telegram bot token
+        r"\b(eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)",  # JWT
+        r"\b(AIza[0-9A-Za-z_-]{35})",  # Google
+        r"\b(xox[abprs]-[A-Za-z0-9-]{10,})",  # Slack
+        r"\b([rs]k_(?:live|test)_[A-Za-z0-9]{16,})",  # Stripe
+        r"\b(github_pat_[A-Za-z0-9_]{20,})",
+        r"\b(glpat-[A-Za-z0-9_-]{20,})",  # GitLab
+        r"\b(ASIA[A-Z0-9]{16})\b",  # AWS temporary
+    ),
 )
+# Accepted limit (T07 review, finding 5): the Gateway token and the providers' keys are exact
+# values with no shape, and Tetragon only knows patterns. They are not written into conf.d
+# (that would copy a secret into one more file); a bare one can reach Tetragon's file, which is
+# root's alone (0600 in a 0700 folder, like the config the token comes from), and the reader
+# strikes it before anything reaches the black box (procs.safe_text with KnownScrubber).
 # Plan B of T07-1, P10: THROTTLE events carry no process, so no container id, and the
 # container filter alone dropped them. Lines are OR-ed.
 EXPORT_ALLOWLIST = ({"container_id": ["."]}, {"event_set": ["PROCESS_THROTTLE"]})
@@ -218,6 +277,9 @@ def sensor_settings(config: SensorJailConfig) -> dict[str, str]:
         ),
         "server-address": SOCKET,
         "health-server-address": "",  # empty: no health port at all
+        "metrics-server": METRICS_ADDRESS,  # its own loopback only: see loss_counters()
+        # No binary, pod or workload labels: smaller, and no text of the agent's in them.
+        "metrics-label-filter": "namespace",
         "log-level": "warn",
     }
 
@@ -354,6 +416,34 @@ class SensorJail:
             POLICY_NAME in fields and "enabled" in fields
             for fields in (line.split() for line in policies.splitlines())
         )
+
+    def loss_counters(self) -> dict[str, int]:
+        """What Tetragon lost so far, by kind (``LOSS_METRICS``; ``ringbuf`` includes the ring
+        buffer's read errors). The counters only grow while the container runs. Raises
+        JailError if the metrics cannot be read or are not Tetragon's."""
+        argv = ["exec", self.config.name, "wget", "-q", "-O", "-", METRICS_URL]
+        result = docker.run(argv, check=False, timeout=SERVING_TIMEOUT, max_output=_METRICS_OUTPUT)
+        if result.returncode != 0:
+            stderr = docker.sanitize(result.stderr.strip())
+            raise JailError(f"cannot read the sensor's metrics: {stderr}", stderr=stderr)
+        values: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            name = line.split("{", 1)[0].split(" ", 1)[0]
+            if name not in _LOSS_NAMES:
+                continue
+            try:
+                number = float(line.rsplit(" ", 1)[1])
+            except (IndexError, ValueError):
+                number = float("nan")
+            if not math.isfinite(number) or number < 0:
+                raise JailError(f"the sensor's metric {name} is not a count")
+            values[name] = values.get(name, 0) + int(number)
+        names = {metric: kind for kind, metric in LOSS_METRICS.items()}
+        if not all(LOSS_METRICS[kind] in values for kind in _ALWAYS):
+            raise JailError("the sensor's metrics have no loss counters: not Tetragon's?")
+        counters = {kind: values.get(metric, 0) for metric, kind in names.items()}
+        counters["ringbuf"] += values.get(_RINGBUF_ERRORS, 0)
+        return counters
 
     def is_running(self) -> bool:
         state = self._inspect("{{json .State}}")

@@ -201,6 +201,7 @@ class Policy:
     allow_hosts: tuple[str, ...]
     providers: Providers
     secrets: tuple[str, ...] = ()  # e.g. the Gateway token: struck from whatever is recorded
+    provider_tools: tuple[str, ...] = ()  # [proxy] allow_provider_tools (T06-6)
 
     def __repr__(self) -> str:
         return f"Policy({len(self.allow_hosts)} hosts, {self.providers!r})"
@@ -333,7 +334,10 @@ class ProxyChannel:
             raise ChannelError(f"the proxy started with a {message['type']}, not a hello")
         self.hello = message
         config = protocol.config(
-            self._allow.entries, self._policy.providers, self._limits or protocol.DEFAULT_LIMITS
+            self._allow.entries,
+            self._policy.providers,
+            self._limits or protocol.DEFAULT_LIMITS,
+            provider_tools=self._policy.provider_tools,
         )
         try:
             self._send(protocol.encode(config, Sender.BACKTIDE))

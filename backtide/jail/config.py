@@ -26,6 +26,8 @@ from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from backtide.jail.openclaw import ModelProvider, model_settings
+
 # OpenClaw 2026.9.8 (docs/12). Bump the digest and the version together, after testing in the VM.
 OPENCLAW_VERSION = "2026.9.8"
 IMAGE = (
@@ -150,6 +152,9 @@ class AgentJailConfig:
     config_dir: Path
     ca_dir: Path
     gateway_token: str = field(repr=False)
+    # The model providers with their FAKE keys, for openclaw.json only (T06-5): never in the
+    # environment or the argv. The real keys never reach this object.
+    model_providers: tuple[ModelProvider, ...] = field(default=(), repr=False)
     name: str = "backtide-agente"
     network: str = "backtide-agente-net"
     # Fixed, so a Gateway owner lease restored from a snapshot names this same host and
@@ -213,6 +218,13 @@ class AgentJailConfig:
             raise ValueError(f"ready_timeout must be positive, got {self.ready_timeout!r}")
         if not isinstance(self.allow_shared_ids, bool):
             raise ValueError(f"allow_shared_ids must be a bool, got {self.allow_shared_ids!r}")
+        if not isinstance(self.model_providers, tuple) or not all(
+            isinstance(p, ModelProvider) for p in self.model_providers
+        ):
+            raise ValueError("model_providers must be a tuple of ModelProvider")
+        names = [p.name for p in self.model_providers]
+        if len(set(names)) != len(names):
+            raise ValueError("two model providers have the same name")
 
     @property
     def agent_dir(self) -> Path:
@@ -330,11 +342,21 @@ def network_create_argv(config: AgentJailConfig) -> list[str]:
 
 
 def openclaw_config(config: AgentJailConfig) -> dict[str, Any]:
-    """OpenClaw's openclaw.json: the hardened baseline of docs/12, with no secrets in it.
+    """OpenClaw's openclaw.json: the hardened baseline of docs/12, with no secrets in it, and
+    the model providers with their FAKE keys (T06-5: openclaw.model_settings).
 
     Validated against the pinned image with ``openclaw config validate`` (a VM test), and it
     passes ``openclaw.check_rewindable`` (AgentJail.write_config enforces it)."""
-    del config  # the same for every agent today
+    claw = _baseline()
+    models = model_settings(config.model_providers)
+    if models:
+        claw["models"].update(models["models"])
+        if "primary" in models:
+            claw["agents"]["defaults"]["model"] = {"primary": models["primary"]}
+    return claw
+
+
+def _baseline() -> dict[str, Any]:
     return {
         "gateway": {
             "mode": "local",

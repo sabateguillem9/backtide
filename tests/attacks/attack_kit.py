@@ -18,22 +18,33 @@ is reported as pending). So a task that builds a pending piece has to flip the m
 add the check in the same change.
 """
 
+import fnmatch
 import hashlib
 import json
 import os
 import stat
+import time
 from collections.abc import Callable
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pytest
 from attack_manifest import DIMENSIONS, SCRIPTS_DIR, Scenario, load_manifest
 from attack_report import Result
 
+if TYPE_CHECKING:
+    from sensor_battery import BatterySensor
+
+    from backtide.blackbox import Event
+
 # What the agent sees inside its container (docs/13): its folder of the snapshotted volume.
 CONTAINER_WORK = "/workspace/work"
 SCRIPT_TIMEOUT = 180.0
+# How long to wait for an attack's exec/connect to reach the black box: the command, Tetragon's
+# buffered write, the reader's 0.5 s poll (docs/23, sections 3 and 6).
+RECORDED_TIMEOUT = 60.0
+_RECORDED_POLL = 0.5
 # Fake secrets (see conftest.canary_environment): each value is "<prefix><its own name>".
 CANARY_PREFIX = "backtide-canary-"
 CANARY_VARIABLES = (
@@ -92,6 +103,9 @@ class Attack:
     def __init__(self, scenario: Scenario, result: Result) -> None:
         self.scenario = scenario
         self.result = result
+        self._sensor: BatterySensor | None = None
+        self._container: str | None = None
+        self._since = 0
 
     def check(self, dimension: str, ok: bool, evidence: str) -> None:
         """Check one dimension of the manifest. ``evidence`` is what the report prints next to
@@ -124,6 +138,98 @@ class Attack:
         """Run ``scripts/<name>.py`` inside the agent's container (python3 -c, as the agent's
         user) and return the JSON object it prints on its last line."""
         return run_script(agent, name, *args, timeout=timeout)
+
+    # The ``recorded`` dimension (docs/23, section 9): the process sensor.
+
+    def watch(self, sensor: "BatterySensor", jail: Any) -> int:
+        """Point the shared sensor at this agent's container and prove the whole path, so from
+        now on ``recorded_exec`` and ``recorded_connect`` see this agent's events. Returns the
+        black box's seq right before the attack: call it just before running the attack, so a
+        scenario only looks at what its own attack adds. ``jail`` is the agent's ``AgentJail``
+        (``.container_id()`` and ``.exec``)."""
+        container = jail.container_id()
+        assert container is not None, "the agent's container must exist to be watched"
+        self._sensor = sensor
+        self._container = container
+        self._since = sensor.watch(container, jail.exec)
+        return self._since
+
+    @property
+    def container_short(self) -> str:
+        """The watched container's short id, as the events carry it (``details.container``)."""
+        assert self._container is not None, "call attack.watch(...) first"
+        return self._container[:12]
+
+    @property
+    def since(self) -> int:
+        """The black box seq just before the attack (set by ``watch``): read only what the
+        attack added."""
+        return self._since
+
+    def recorded_exec(
+        self,
+        *,
+        argv: str | None = None,
+        binary: str | None = None,
+        at_least: int = 1,
+        timeout: float = RECORDED_TIMEOUT,
+    ) -> list["Event"]:
+        """Wait for and return the watched agent's ``exec`` events whose ``argv`` contains
+        ``argv`` and whose binary matches the glob ``binary``. docs/23, decision 6: ``recorded``
+        here means the process that made the attempt, with its arguments struck and cut."""
+
+        def matches(event: "Event") -> bool:
+            details = event.details
+            if details.get("container") != self.container_short:
+                return False
+            if argv is not None and argv not in str(details.get("argv", "")):
+                return False
+            return binary is None or fnmatch.fnmatch(event.target, binary)
+
+        return self._wait_records("exec", "exec", matches, at_least, timeout)
+
+    def recorded_connect(
+        self,
+        *,
+        target: str | None = None,
+        addr: str | None = None,
+        port: int | None = None,
+        at_least: int = 1,
+        timeout: float = RECORDED_TIMEOUT,
+    ) -> list["Event"]:
+        """Wait for and return the watched agent's ``net/connect`` events to ``target``
+        (``ip:port``), or to ``addr`` and/or ``port``. The attempt is recorded even when it
+        fails (docs/23, section 4)."""
+
+        def matches(event: "Event") -> bool:
+            details = event.details
+            if details.get("container") != self.container_short:
+                return False
+            if target is not None and event.target != target:
+                return False
+            if addr is not None and details.get("addr") != addr:
+                return False
+            return port is None or details.get("port") == port
+
+        return self._wait_records("net", "connect", matches, at_least, timeout)
+
+    def _wait_records(
+        self,
+        source: str,
+        action: str,
+        matches: Callable[["Event"], bool],
+        at_least: int,
+        timeout: float,
+    ) -> list["Event"]:
+        assert self._sensor is not None, "call attack.watch(sensor, jail) before recorded_*"
+        deadline = time.monotonic() + timeout
+        found: list[Event] = []
+        while True:
+            events = self._sensor.events(source, action=action, since=self._since)
+            found = [event for event in events if matches(event)]
+            if len(found) >= at_least or time.monotonic() >= deadline:
+                return found
+            time.sleep(_RECORDED_POLL)
 
 
 def run_script(agent: Agent, name: str, *args: str, timeout: float = SCRIPT_TIMEOUT) -> Any:

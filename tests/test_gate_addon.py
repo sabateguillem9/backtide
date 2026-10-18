@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from backtide.blackbox.redact import KnownScrubber
+from backtide.gate import addon
 from backtide.gate.addon import FAILED, REFUSALS, Gate
 from backtide.gate.client import NOT_RECORDED, Ack, GateConfig
 from backtide.gate.protocol import DEFAULT_LIMITS
@@ -75,6 +76,12 @@ class Response:
     content: bytes = b""
     headers: Headers = field(default_factory=Headers)
     stream: Any = None
+    reason: str = "OK"
+    trailers: Headers | None = None
+
+    @property
+    def raw_content(self) -> bytes:
+        return self.content
 
 
 def respond(status: int, content: bytes, headers: Any) -> Response:
@@ -137,9 +144,20 @@ def providers() -> Providers:
 
 
 class FakeChannel:
-    def __init__(self, *, configured: bool = True, limits: dict[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        configured: bool = True,
+        limits: dict[str, int] | None = None,
+        provider_tools: frozenset[str] = frozenset(),
+    ) -> None:
         self.config = (
-            GateConfig(providers(), KnownScrubber(providers().known_secrets()), DEFAULT_LIMITS)
+            GateConfig(
+                providers(),
+                KnownScrubber(providers().known_secrets()),
+                DEFAULT_LIMITS,
+                provider_tools=provider_tools,
+            )
             if configured
             else None
         )
@@ -490,14 +508,70 @@ def test_only_public_addresses_are_connected(addresses: list[str]) -> None:
     assert channel.actions() == ["blocked:private_address"]
 
 
-def test_an_ip_literal_is_checked_without_resolving() -> None:
+def test_a_public_ip_literal_is_checked_without_resolving() -> None:
     channel = FakeChannel()
-    gate, _ = make_gate(channel, addresses=[PUBLIC])
-    flow = Flow(Request(host="127.0.0.1", headers=Headers([("Host", "127.0.0.1")])),
+    gate, _ = make_gate(channel, addresses=["127.0.0.1"])  # what a name would resolve to
+    flow = Flow(Request(host=PUBLIC, headers=Headers([("Host", PUBLIC)])),
                 client_conn=Client(sni=None))  # fmt: skip
     send(gate, flow)
     assert flow.response is None
-    assert connect(gate, flow).error is not None
+    server = connect(gate, flow)
+    assert server.error is None and server.address == (PUBLIC, 443)
+
+
+PRIVATE_LITERALS = ["127.0.0.1", "169.254.169.254", "10.0.0.5", "192.168.5.2", "::1",
+                    "::ffff:127.0.0.1", "fe80::1", "100.64.0.1", "0.0.0.0"]  # noqa: S104  # fmt: skip
+
+
+def bracketed(host: str) -> str:
+    return f"[{host}]" if ":" in host else host
+
+
+@pytest.mark.parametrize("host", PRIVATE_LITERALS)
+def test_a_private_ip_literal_is_refused_before_backtide_is_asked(host: str) -> None:
+    """T06-5: the fixed rule comes first. An IP literal that is not public never reaches the
+    allowed list (which would say not_allowed): it is private_address, risk 2, at once."""
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = Flow(Request(host=host, port=80, scheme="http",
+                        headers=Headers([("Host", bracketed(host))])),
+                client_conn=Client(sni=None))  # fmt: skip
+    send(gate, flow)
+    assert status(flow) == REFUSALS["private_address"][0]
+    assert channel.asked == []
+    assert channel.actions() == ["blocked:private_address"]
+    assert channel.told[0]["risk"] == 2
+
+
+@pytest.mark.parametrize("host", PRIVATE_LITERALS)
+def test_a_connect_to_a_private_ip_literal_is_refused(host: str) -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = Flow(Request(host=host, port=443, method="CONNECT",
+                        headers=Headers([("Host", f"{bracketed(host)}:443")])),
+                client_conn=Client(sni=None))  # fmt: skip
+    gate.http_connect(flow)
+    assert status(flow) == REFUSALS["private_address"][0]
+    assert channel.actions() == ["blocked:private_address"]
+
+
+def test_a_real_key_towards_a_private_ip_literal_is_still_a_real_key() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = Flow(Request(host="10.0.0.1", port=80, scheme="http", raw_content=REAL.encode(),
+                        headers=Headers([("Host", "10.0.0.1")])),
+                client_conn=Client(sni=None))  # fmt: skip
+    send(gate, flow)
+    assert channel.actions() == ["blocked:real_key"]
+
+
+def test_a_granted_ip_literal_is_not_refused_early() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel, public=frozenset({"172.30.0.9"}))
+    flow = Flow(Request(host="172.30.0.9", headers=Headers([("Host", "172.30.0.9")])),
+                client_conn=Client(sni=None))  # fmt: skip
+    send(gate, flow)
+    assert flow.response is None and len(channel.asked) == 1
 
 
 def test_the_tests_fake_internet_can_be_granted_as_public() -> None:
@@ -632,12 +706,25 @@ SSE = (
 )
 
 
-def stream_through(gate: Gate, flow: Flow, body: bytes, content_type: str) -> bytes:
-    flow.response = Response(200, headers=Headers([("content-type", content_type)]))
+def stream_through(
+    gate: Gate, flow: Flow, body: bytes, content_type: str, *headers: tuple[str, str]
+) -> bytes:
+    """What the agent gets, as mitmproxy would send it: a stream chunk by chunk (and an empty
+    chunk at its end), or, when the gate holds the answer whole, all of it after the response
+    hook, unless that hook killed the flow."""
+    flow.response = Response(200, headers=Headers([("content-type", content_type), *headers]))
     gate.responseheaders(flow)
-    out = b"".join(flow.response.stream(body[i : i + 7]) for i in range(0, len(body), 7))
+    if callable(flow.response.stream):
+        chunks = [body[i : i + 7] for i in range(0, len(body), 7)] + [b""]
+        out = b""
+        for chunk in chunks:
+            out += flow.response.stream(chunk)
+        gate.response(flow)
+        return out
+    assert flow.response.stream is False
+    flow.response.content = body
     gate.response(flow)
-    return out
+    return b"" if flow.killed else body
 
 
 def test_a_provider_stream_passes_untouched_and_only_its_usage_is_recorded() -> None:
@@ -699,6 +786,36 @@ def test_a_transport_error_after_the_ack_is_recorded() -> None:
     assert channel.told[0]["details"]["stage"] == "flow"
 
 
+def test_a_provider_stream_cut_after_its_answer_still_records_its_summary() -> None:
+    """Seen in the VM (T06-5): a client that closes the stream as soon as it has the answer
+    (OpenAI's ``[DONE]``) makes mitmproxy end the flow with an error, not ``response``. What
+    the tap saw is still recorded (``llm/response``), then the error."""
+    times = iter([10.0, 10.5])
+    channel = FakeChannel()
+    gate, _ = make_gate(channel, clock=lambda: next(times))
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    flow.response = Response(200, headers=Headers([("content-type", "text/event-stream")]))
+    gate.responseheaders(flow)
+    flow.response.stream(SSE)
+    gate.error(flow)
+    assert [(e["source"], e["action"]) for e in channel.told] == [
+        ("llm", "response"),
+        ("net", "error"),
+    ]
+    assert channel.told[0]["details"]["usage"] == {"input": 11, "output": 5}
+    assert channel.told[0]["details"]["size"] == len(SSE)
+
+
+def test_an_error_before_any_answer_records_only_the_error() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    gate.error(flow)
+    assert [e["action"] for e in channel.told] == ["error"]
+
+
 def test_a_tls_failure_is_recorded() -> None:
     channel = FakeChannel()
     gate, _ = make_gate(channel)
@@ -746,3 +863,344 @@ def test_websocket_messages_are_summarized_and_a_real_key_kills_it() -> None:
     gate.websocket_end(flow)
     assert channel.told[-1]["details"]["close_code"] == 1006
     assert REAL not in json.dumps(channel.told) and "hello there" not in json.dumps(channel.told)
+
+
+# --- provider-side tools (T06-6) -----------------------------------------------------------------
+
+
+def model_flow(body: bytes, path: str = "/v1/messages", method: str = "POST") -> Flow:
+    flow = provider_flow(("x-api-key", FAKE), ("content-type", "application/json"))
+    flow.request.raw_content = body
+    flow.request.path = path
+    flow.request.method = method
+    return flow
+
+
+def tool_body(*tools: dict[str, Any], **extra: Any) -> bytes:
+    request = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+    return json.dumps(request | {"tools": list(tools)} | extra).encode()
+
+
+def test_a_provider_side_tool_is_refused_before_backtide_is_asked() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = model_flow(tool_body({"type": "web_fetch_20250910", "name": "web_fetch"}))
+    send(gate, flow)
+    assert status(flow) == 403
+    assert channel.asked == []
+    [event] = channel.told
+    assert event["details"]["reason"] == "provider_side_tool"
+    assert event["details"]["tools"] == ["web_fetch_20250910"]
+    assert event["risk"] == 2
+    assert dict(flow.request.headers.items())["x-api-key"] == FAKE  # never swapped
+    assert REAL not in json.dumps(event)
+
+
+def test_mcp_servers_are_refused_and_named() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    servers = [{"type": "url", "url": "https://mcp.example/", "name": "x"}]
+    send(gate, model_flow(tool_body(mcp_servers=servers)))
+    assert channel.told[0]["details"]["tools"] == ["mcp_servers"]
+    assert "mcp.example" not in json.dumps(channel.told)
+
+
+def test_an_allowed_provider_tool_goes_on_and_is_recorded() -> None:
+    channel = FakeChannel(provider_tools=frozenset({"web_search_20250305"}))
+    gate, _ = make_gate(channel)
+    flow = model_flow(tool_body({"type": "web_search_20250305", "name": "web_search"}))
+    send(gate, flow)
+    assert flow.response is None
+    [event] = channel.asked
+    assert event["details"]["provider_tools"] == ["web_search_20250305"]
+
+
+@pytest.mark.parametrize(
+    ("flow_", "code", "reason"),
+    [
+        (lambda: model_flow(b"not json"), 400, "provider_body"),
+        (lambda: model_flow(b'{"tools": [], "tools": [{"type": "x"}]}'), 400, "provider_body"),
+        (lambda: model_flow(tool_body(), path="/v1/messages/batches"), 403, "provider_endpoint"),
+        (lambda: model_flow(tool_body(), path="/v1/files"), 403, "provider_endpoint"),
+        (lambda: model_flow(b"", path="/v1/files/f/content", method="GET"), 403,
+         "provider_endpoint"),
+    ],
+)  # fmt: skip
+def test_what_is_not_a_model_call_is_refused(
+    flow_: Callable[[], Flow], code: int, reason: str
+) -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = flow_()
+    send(gate, flow)
+    assert (status(flow), channel.actions(), channel.asked) == (code, [f"blocked:{reason}"], [])
+
+
+def test_a_plain_model_call_still_goes_on() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = model_flow(tool_body({"name": "exec", "input_schema": {"type": "object"}}))
+    send(gate, flow)
+    assert flow.response is None
+    assert dict(flow.request.headers.items())["x-api-key"] == REAL
+    assert "provider_tools" not in channel.asked[0]["details"]
+
+
+def test_the_same_body_to_an_ordinary_host_is_left_to_the_allowed_list() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = Flow()
+    flow.request.raw_content = tool_body({"type": "web_search"})
+    send(gate, flow)
+    assert flow.response is None and len(channel.asked) == 1
+
+
+# --- IPv4 written as numbers (T06-6) -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["127.1", "0x7f.1", "2130706433", "0177.0.0.1", "169.254.43518"])
+def test_a_private_ip_written_as_numbers_is_refused_before_backtide_is_asked(host: str) -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = Flow(
+        Request(host=host, port=80, scheme="http", headers=Headers([("Host", host)])),
+        client_conn=Client(sni=None),
+    )
+    send(gate, flow)
+    assert (status(flow), channel.actions(), channel.asked) == (
+        403,
+        ["blocked:private_address"],
+        [],
+    )
+    tunnel = Flow(Request(host=host, port=443, method="CONNECT"))
+    gate.http_connect(tunnel)
+    assert status(tunnel) == 403
+
+
+def test_a_public_ip_written_as_numbers_is_left_to_the_allowed_list() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    host = "134744072"  # 8.8.8.8
+    flow = Flow(
+        Request(host=host, port=80, scheme="http", headers=Headers([("Host", host)])),
+        client_conn=Client(sni=None),
+    )
+    send(gate, flow)
+    assert len(channel.asked) == 1
+
+
+# --- the provider's answer, checked for the real key (T06-6) --------------------------------------
+
+
+def echo_events(*texts: str) -> bytes:
+    out = SSE.split(b"\n\n", 1)[0] + b"\n\n"
+    for text in texts:
+        data = {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": text}}  # fmt: skip
+        out += b"event: content_block_delta\ndata: " + json.dumps(data).encode() + b"\n\n"
+    return out
+
+
+def test_a_whole_answer_from_a_provider_is_held_and_checked_before_it_goes_on() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    body = json.dumps({"type": "error", "error": {"message": f"invalid x-api-key {REAL}"}})
+    got = stream_through(gate, flow, body.encode(), "application/json")
+    assert got == b"" and flow.killed
+    [event] = channel.told
+    assert (event["details"]["reason"], event["details"]["side"], event["risk"]) == (
+        "real_key", "response", 3,
+    )  # fmt: skip
+    assert REAL not in json.dumps(event)
+
+
+def test_a_clean_whole_answer_goes_on_and_is_summarized() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    body = json.dumps({"model": "claude-x", "usage": {"input_tokens": 3, "output_tokens": 4}})
+    assert stream_through(gate, flow, body.encode(), "application/json") == body.encode()
+    assert not flow.killed
+    assert channel.told[0]["details"]["usage"] == {"input": 3, "output": 4}
+    assert channel.told[0]["details"]["size"] == len(body)
+
+
+def test_a_key_in_a_compressed_answer_is_found() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    body = gzip.compress(echo_events(REAL))
+    got = stream_through(gate, flow, body, "text/event-stream", ("content-encoding", "gzip"))
+    assert got == b"" and flow.killed
+    assert channel.actions() == ["blocked:real_key"]
+
+
+def test_an_answer_that_cannot_be_decoded_is_not_let_through() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    got = stream_through(gate, flow, b"\x00garbage", "application/json", ("content-encoding", "br"))
+    assert got == b"" and flow.killed
+    assert [e["action"] for e in channel.told] == ["error"]
+
+
+@pytest.mark.parametrize("cut", [10, 40, 77])
+def test_a_streamed_answer_is_cut_before_the_key_is_whole(cut: int) -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    body = echo_events("Your key: ", REAL[:cut], REAL[cut:], " bye")
+    got = stream_through(gate, flow, body, "text/event-stream")
+    assert REAL not in got.decode() and flow.killed
+    assert b" bye" not in got
+    blocked_ = [e for e in channel.told if e["action"] == "blocked"]
+    assert [(e["details"]["reason"], e["details"]["side"]) for e in blocked_] == [
+        ("real_key", "response")
+    ]
+
+
+def test_a_clean_stream_still_passes_untouched() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    body = echo_events("sk-ant-api03-", "TEST is how keys start")
+    assert stream_through(gate, flow, body, "text/event-stream") == body
+    assert not flow.killed
+
+
+def test_after_a_failure_the_tap_lets_nothing_more_through() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = Flow()
+    send(gate, flow)
+    flow.response = Response(200, headers=Headers([("content-type", "text/plain")]))
+    gate.responseheaders(flow)
+    tap = flow.response.stream
+    tap._json = None
+    tap.size = "broken"  # the next chunk makes the tap fail
+    assert tap(b"one") == b""
+    tap.size = 0
+    assert tap(b"two") == b""
+    assert flow.killed
+
+
+# --- after the review of T06-6 --------------------------------------------------------------------
+
+
+def answered(gate: Gate, flow: Flow, **response: Any) -> None:
+    send(gate, flow)
+    flow.response = Response(200, **response)
+    gate.responseheaders(flow)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"headers": Headers([("content-type", "application/json"), ("x-debug", f"k={REAL}")])},
+        {"headers": Headers([("content-type", "text/event-stream"), ("x-debug", REAL.lower())])},
+        {"headers": Headers([("content-type", "text/event-stream")]), "reason": f"bad {REAL}"},
+    ],
+)
+def test_a_key_in_the_answers_headers_or_status_is_stopped_before_they_go(
+    response: dict[str, Any],
+) -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    answered(gate, flow, **response)
+    assert flow.killed and flow.response.stream is None
+    assert channel.actions() == ["blocked:real_key"]
+
+
+@pytest.mark.parametrize("content_type", ["application/json", "text/event-stream"])
+def test_a_key_in_the_answers_trailers_is_stopped(content_type: str) -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    flow.response = Response(200, headers=Headers([("content-type", content_type)]))
+    gate.responseheaders(flow)
+    flow.response.trailers = Headers([("x-trailer", REAL)])
+    if callable(flow.response.stream):
+        flow.response.stream(b"")
+    gate.response(flow)
+    assert flow.killed
+    assert [e["action"] for e in channel.told] == ["blocked"]
+
+
+def test_an_answer_with_another_transfer_encoding_is_not_let_through() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    headers = Headers(
+        [("content-type", "text/event-stream"), ("transfer-encoding", "gzip, chunked")]
+    )
+    answered(gate, flow, headers=headers)
+    assert flow.killed
+    assert [e["details"]["stage"] for e in channel.told] == ["response_transfer_encoding"]
+
+
+def test_answers_held_whole_share_a_memory_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(addon, "HELD_BUDGET", 1000)
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    json_headers = [("content-type", "application/json")]
+    first = provider_flow(("x-api-key", FAKE))
+    answered(gate, first, headers=Headers([*json_headers, ("content-length", "800")]))
+    assert not first.killed
+    second = provider_flow(("x-api-key", FAKE))
+    second.id = "flow-2"
+    answered(gate, second, headers=Headers([*json_headers, ("content-length", "800")]))
+    assert second.killed
+    assert channel.told[-1]["details"]["stage"] == "response_budget"
+    unknown = provider_flow(("x-api-key", FAKE))
+    unknown.id = "flow-3"
+    answered(gate, unknown, headers=Headers(json_headers))  # no length: the worst is reserved
+    assert unknown.killed
+    first.response.content = b'{"model": "m"}'
+    gate.response(first)  # done: its part of the budget is free again
+    third = provider_flow(("x-api-key", FAKE))
+    third.id = "flow-4"
+    answered(gate, third, headers=Headers([*json_headers, ("content-length", "800")]))
+    assert not third.killed
+    gate.error(third)  # an error frees it too
+    assert gate.held_bytes == 0
+
+
+def test_the_answer_is_checked_against_the_key_its_request_carried() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    other = "sk-ant-api03-TEST" + "r0tat3dK3y" * 5
+    rotated = Providers(
+        [Provider("anthropic", Kind.ANTHROPIC, "api.anthropic.com", FAKE, Secret(other))]
+    )
+    channel.config = GateConfig(rotated, KnownScrubber(rotated.known_secrets()), DEFAULT_LIMITS)
+    got = stream_through(gate, flow, json.dumps({"echo": REAL}).encode(), "application/json")
+    assert got == b"" and flow.killed
+
+
+def test_a_key_in_the_answer_is_recorded_even_when_the_flow_cannot_be_killed() -> None:
+    channel = FakeChannel()
+    gate, died = make_gate(channel)
+
+    class Unkillable(Flow):
+        def kill(self) -> None:
+            raise RuntimeError("cannot kill")
+
+    flow = Unkillable(provider_flow(("x-api-key", FAKE)).request,
+                      client_conn=Client(sni="api.anthropic.com"))  # fmt: skip
+    send(gate, flow)
+    flow.response = Response(200, headers=Headers([("content-type", "text/event-stream")]))
+    gate.responseheaders(flow)
+    assert flow.response.stream(echo_events(REAL)) == b""
+    assert channel.actions()[-1] == "blocked:real_key"
+    assert died == ["died"]

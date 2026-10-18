@@ -298,14 +298,23 @@ def request_event(flow: Mapping[str, Any], secrets: Secrets) -> dict[str, Any]:
     return _finish("net", "request", _target(flow, scrub), details, scrub)
 
 
-def llm_request_event(flow: Mapping[str, Any], provider: str, secrets: Secrets) -> dict[str, Any]:
-    """``llm/request``: a request to a provider's host. Of its body, only metadata."""
+def llm_request_event(
+    flow: Mapping[str, Any],
+    provider: str,
+    secrets: Secrets,
+    *,
+    provider_tools: Sequence[str] = (),
+) -> dict[str, Any]:
+    """``llm/request``: a request to a provider's host. Of its body, only metadata, and the
+    provider-side tools that ``allow_provider_tools`` let through (T06-6), by name."""
     scrub = _scrubber(secrets)
     details = _request_details(flow, scrub)
     details["body"] = _body(flow, scrub, excerpt=False)
     details["provider"] = _clean(provider, scrub, _LIMIT_SHORT)
     details |= _llm_metadata(flow.get("body"), scrub)
     details["key"] = "swapped"
+    if provider_tools:
+        details["provider_tools"] = _names(provider_tools, scrub)
     return _finish("llm", "request", _target(flow, scrub), details, scrub)
 
 
@@ -381,13 +390,37 @@ def llm_response_event(
     return _finish("llm", "response", _target(flow, scrub), details, scrub)
 
 
-def blocked_event(reason: str, flow: Mapping[str, Any], secrets: Secrets) -> dict[str, Any]:
+_SIDES = frozenset({"response"})
+_MAX_NAMES = 16
+
+
+def _names(names: Sequence[str], scrub: KnownScrubber) -> list[str]:
+    """Tool names (the agent wrote them): struck, cut, at most _MAX_NAMES."""
+    return [_clean(name, scrub, _LIMIT_SHORT) for name in list(names)[:_MAX_NAMES]]
+
+
+def blocked_event(
+    reason: str,
+    flow: Mapping[str, Any],
+    secrets: Secrets,
+    *,
+    tools: Sequence[str] = (),
+    side: str | None = None,
+) -> dict[str, Any]:
     """``net/blocked``: a refused request, with what is known of it (a ``CONNECT`` only
-    knows its host and port). Never its body. ValueError for an unknown reason."""
+    knows its host and port). Never its body. ``tools``: the provider-side tools refused;
+    ``side="response"``: what was refused is the provider's answer (T06-6). ValueError for an
+    unknown reason or side."""
     scrub = _scrubber(secrets)
     if reason not in BLOCK_RISK:
         raise ValueError("unknown block reason")
+    if side is not None and side not in _SIDES:
+        raise ValueError("unknown side")
     details = {"reason": reason} | _request_details(flow, scrub)
+    if tools:
+        details["tools"] = _names(tools, scrub)
+    if side is not None:
+        details["side"] = side
     return _finish("net", "blocked", _target(flow, scrub), details, scrub)
 
 

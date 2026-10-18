@@ -507,7 +507,7 @@ def host_addresses(service: Service) -> Targets:
 
 @scenario("web-desde-la-carcel")
 def test_the_agent_cannot_reach_the_web(
-    attack: Attack, make_real_service: Callable[..., Service]
+    attack: Attack, make_real_service: Callable[..., Service], battery_sensor
 ) -> None:
     service = make_real_service()
     service.start()
@@ -528,6 +528,7 @@ def test_the_agent_cannot_reach_the_web(
     ):
         controls = [answers_from_the_host(port) for port in WEB_PORTS]
         assert all(line.startswith("HTTP/1.1 ") for line in controls), controls
+        attack.watch(battery_sensor, service.jail)
         outcome = attack.run_script(
             service.jail,
             "web_desde_la_carcel",
@@ -584,5 +585,15 @@ def test_the_agent_cannot_reach_the_web(
         f"contesta ({'nuestra' if ours_a and ours_b else 'otra web ya escuchaba'}: {controls}), "
         "la sonda sí conecta a un puerto que el agente abre en su loopback, y cada intento por el "
         "proxy recibe la respuesta de la puerta",
+    )
+
+    # The sensor saw the attempt, with the web's port: a connect() to a non-loopback address on
+    # 8765 fires security_socket_connect even when nothing listens there (docs/23, section 4).
+    recorded = attack.recorded_connect(port=WEB_PORTS[0])
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} intento(s) de conexión al puerto {WEB_PORTS[0]} de la "
+        f"web desde {attack.container_short} (net/connect, aunque no haya nada escuchando)",
     )
     assert service.stop() == 0

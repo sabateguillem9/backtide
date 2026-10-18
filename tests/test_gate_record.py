@@ -542,3 +542,35 @@ def test_backtide_strikes_an_encoded_start_of_a_secret_at_a_cut(encode: Any) -> 
         for decoded in (text, unquote(text), html.unescape(text), unescaped):
             for start in range(len(UNKNOWN_TO_PROXY) - 7):
                 assert UNKNOWN_TO_PROXY[start : start + 8] not in decoded
+
+
+# --- provider-side tools and the provider's answer (T06-6) ----------------------------------------
+
+
+def test_a_provider_side_tool_refusal_names_its_tools_struck_and_cut() -> None:
+    tools = ["web_fetch_20250910", f"x_{REAL}", "y" * 300]
+    event = blocked_event("provider_side_tool", llm_flow(), KNOWN, tools=tools)
+    assert event["risk"] == 2
+    named = event["details"]["tools"]
+    assert named[0] == "web_fetch_20250910"
+    assert all(len(name) <= 64 for name in named)
+    no_key_in(event)
+    assert validate_event(event) == event
+
+
+def test_a_refused_answer_says_it_was_the_response() -> None:
+    event = blocked_event("real_key", llm_flow(), KNOWN, side="response")
+    assert (event["risk"], event["details"]["side"]) == (3, "response")
+    assert validate_event(event) == event
+    with pytest.raises(ValueError):
+        blocked_event("real_key", llm_flow(), KNOWN, side="sideways")
+
+
+def test_a_blocked_event_without_tools_has_no_tools_field() -> None:
+    assert "tools" not in blocked_event("port", flow(), KNOWN)["details"]
+
+
+def test_an_llm_request_names_the_allowed_provider_tools() -> None:
+    event = llm_request_event(llm_flow(), "anthropic", KNOWN, provider_tools=["web_search_x"])
+    assert event["details"]["provider_tools"] == ["web_search_x"]
+    assert "provider_tools" not in llm_request_event(llm_flow(), "anthropic", KNOWN)["details"]

@@ -263,6 +263,9 @@ def test_the_block_risks_are_the_design_ones() -> None:
         "not_recorded": 2,
         "not_allowed": 1,
         "undecodable": 2,
+        "provider_endpoint": 2,
+        "provider_body": 2,
+        "provider_side_tool": 2,
     }
 
 
@@ -376,3 +379,66 @@ def test_the_gate_modules_are_pure() -> None:
         cwd=Path(__file__).resolve().parents[1],
     )
     assert result.stdout.strip() == "[]"
+
+
+# --- provider-side tools (T06-6) -----------------------------------------------------------------
+
+
+def test_a_config_carries_the_allowed_provider_tools() -> None:
+    message = config([], providers(), {}, provider_tools=["web_search_20250305", "mcp"])
+    back = roundtrip(message, Sender.BACKTIDE)
+    assert back["provider_tools"] == ["web_search_20250305", "mcp"]
+
+
+def test_a_config_without_provider_tools_allows_none() -> None:
+    message = config([], providers(), {})
+    assert message["provider_tools"] == []
+    del message["provider_tools"]
+    assert roundtrip(message, Sender.BACKTIDE)["provider_tools"] == []
+
+
+@pytest.mark.parametrize(
+    "tools", [["Web Search"], "mcp", [7], ["x" * 65], [f"t{n}" for n in range(100)]]
+)
+def test_bad_provider_tools_are_refused(tools: object) -> None:
+    message = config([], providers(), {}) | {"provider_tools": tools}
+    with pytest.raises(ProtocolError):
+        encode(message, Sender.BACKTIDE)
+
+
+def test_a_refusal_names_the_provider_tools_and_its_side() -> None:
+    event_ = blocked("provider_side_tool", risk=2)
+    event_["details"]["tools"] = ["web_fetch_20250910", "mcp_servers"]
+    assert validate_event(event_) == event_
+    echo = blocked("real_key", risk=3)
+    echo["details"]["side"] = "response"
+    assert validate_event(echo) == echo
+
+
+def test_an_llm_request_may_name_the_allowed_provider_tools() -> None:
+    event_ = {
+        "source": "llm",
+        "action": "request",
+        "target": "https://api.anthropic.com/v1/messages",
+        "risk": 0,
+        "details": {"provider": "anthropic", "provider_tools": ["web_search_20250305"]},
+    }
+    assert validate_event(event_) == event_
+
+
+def test_a_config_carries_each_providers_models() -> None:
+    listed = Providers(
+        [Provider("anthropic", Kind.ANTHROPIC, "api.anthropic.com", FAKE, Secret(REAL),
+                  models=("claude-x", "claude-y"))]
+    )  # fmt: skip
+    back = roundtrip(config([], listed, {}), Sender.BACKTIDE)
+    assert back["providers"][0]["models"] == ["claude-x", "claude-y"]
+    assert providers_from_config(back).items[0].models == ("claude-x", "claude-y")
+
+
+@pytest.mark.parametrize("models", ["claude-x", [7], [""], ["x" * 200], ["m"] * 40])
+def test_bad_provider_models_are_refused(models: object) -> None:
+    message = config([], providers(), {})
+    message["providers"][0]["models"] = models
+    with pytest.raises(ProtocolError):
+        encode(message, Sender.BACKTIDE)

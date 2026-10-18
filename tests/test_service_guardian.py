@@ -3083,3 +3083,24 @@ def test_a_rewind_that_starts_the_agent_asks_the_required_sensor(
     world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
     assert not world.jail.running
     assert world.events("agent_stop")[-1].details == {"reason": "sensor_required"}
+
+
+def test_the_lost_hook_says_whether_the_agent_is_stopped(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    """T07 review, finding 13: the sensor restarts Tetragon only once the agent is stopped."""
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    assert sensor.hooks.lost() is True and not world.jail.running
+    assert sensor.hooks.lost() is True  # already stopped
+    world.guardian.stop()
+    assert sensor.hooks.lost() is False  # the stop's own business
+
+
+def test_the_lost_hook_records_why_the_sensor_stops_the_agent(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    assert sensor.hooks.lost("sensor_lost_events") is True
+    assert world.events("agent_stop")[-1].details == {"reason": "sensor_lost_events"}

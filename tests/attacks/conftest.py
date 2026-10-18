@@ -142,6 +142,22 @@ def quota_agent(
     return start_quota_agent
 
 
+@pytest.fixture(scope="module")
+def battery_sensor(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
+    """The shared process sensor for the scenarios that check ``recorded`` (T07-4): one real
+    Tetragon, its reader and its black box, up for the whole module, torn down at the end
+    (never two sensors at once: one privileged Tetragon per VM). A scenario calls
+    ``attack.watch(battery_sensor, agent.jail)`` right before its attack."""
+    from sensor_battery import BatterySensor  # noqa: PLC0415 - only the VM battery needs it
+
+    sensor = BatterySensor(tmp_path_factory.mktemp("battery-sensor"))
+    sensor.start()
+    try:
+        yield sensor
+    finally:
+        sensor.stop()
+
+
 @pytest.fixture
 def attack(request: pytest.FixtureRequest) -> Iterator[Attack]:
     """The handle of the scenario this test runs (marked with ``@scenario``). When the test

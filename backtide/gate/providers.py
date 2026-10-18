@@ -32,6 +32,8 @@ _OAUTH_MARK = "sk-ant-oat"
 # Printable ASCII without spaces: anything else could break or inject a header line.
 _REAL_KEY_RE = re.compile(r"[\x21-\x7e]+", re.ASCII)
 MIN_REAL_KEY = 20
+MAX_MODELS = 32
+MAX_MODEL_ID = 128
 
 # Dropped from every request to a provider host, whatever the provider (docs/21, section 6).
 CREDENTIAL_HEADERS = frozenset(
@@ -114,6 +116,9 @@ class Provider:
     host: str
     fake_key: str = field(repr=False)
     real_key: Secret = field(repr=False)
+    # The model ids of [[proxy.providers]] models: when there are any, a request to this
+    # provider may only ask for one of them (T06-6). Empty: any model.
+    models: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.fullmatch(self.name):
@@ -138,6 +143,15 @@ class Provider:
             )
         if real.startswith(FAKE_KEY_PREFIX) or real in self.fake_key or self.fake_key in real:
             raise ValueError(f"provider {self.name}: the real key cannot be a fake key")
+        models = tuple(self.models) if isinstance(self.models, list | tuple) else None
+        if (
+            models is None
+            or len(models) > MAX_MODELS
+            or not all(isinstance(m, str) and 0 < len(m) <= MAX_MODEL_ID and m.isprintable()
+                       for m in models)
+        ):  # fmt: skip
+            raise ValueError(f"provider {self.name}: models must be up to {MAX_MODELS} model ids")
+        object.__setattr__(self, "models", models)
 
     @property
     def header(self) -> str:

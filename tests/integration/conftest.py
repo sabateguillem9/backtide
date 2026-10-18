@@ -57,6 +57,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -229,7 +230,7 @@ def make_real_service(
     is shut down when the test ends."""
     made: list[Service] = []
 
-    def make(**kwargs: float) -> Service:
+    def make(**kwargs: Any) -> Service:
         service = _new_service(btrfs_volume, tmp_path_factory, **kwargs)
         made.append(service)
         return service
@@ -248,7 +249,7 @@ def make_real_service(
 
 
 def _new_service(
-    btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory, **kwargs: float
+    btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory, **kwargs: Any
 ) -> Service:
     _require_agent_image()
     _remove_stale_test_agents()

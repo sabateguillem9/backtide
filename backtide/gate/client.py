@@ -66,11 +66,13 @@ def peer_uid(sock: socket.socket) -> int:
 @dataclass(frozen=True)
 class GateConfig:
     """What backtide sent: the providers (real keys inside ``Secret``), one scrubber built
-    for them (reused by every event of this config) and the limits."""
+    for them (reused by every event of this config), the limits, and the provider-side tools
+    that may go to a provider anyway (``[proxy] allow_provider_tools``, T06-6)."""
 
     providers: Providers
     scrubber: KnownScrubber
     limits: Mapping[str, int]
+    provider_tools: frozenset[str] = frozenset()
 
     def __repr__(self) -> str:
         return f"GateConfig({self.providers!r})"
@@ -99,6 +101,7 @@ def gate_config(message: Mapping[str, Any]) -> GateConfig:
         providers=providers,
         scrubber=KnownScrubber(providers.known_secrets()),
         limits=dict(message["limits"]),
+        provider_tools=frozenset(message.get("provider_tools", [])),
     )
 
 

@@ -14,9 +14,13 @@ Design: docs/19-diseno-t04.md, section "Disposición".
 - Reading the configuration touches no Docker, no btrfs and no black box. backtide runs on the host,
   not in a container (docs/19), so these paths are host paths.
 - ``[proxy]`` (T06, docs/21): the egress proxy's container options, the allowed hosts and the
-  model providers (name, kind, host). NEVER a key: the real ones live in ``<state_dir>/keys/``
-  (T06-4), and a key-like setting is refused. The proxy's CA and channel folders live in the
-  state too, and the agent's config folder may never be or contain any of them.
+  model providers (name, kind, host, models). NEVER a key: a key-like setting is refused. The
+  real key of each provider lives in ``<state_dir>/keys/<name>.key`` (0600, in a 0700 folder,
+  both ours, no symlinks), read here into a ``Secret`` that only the proxy's channel reveals
+  (T06-5). Its fake key, ``<name>.fake``, is made once per installation the first time it is
+  needed; only the fake one reaches the agent (in openclaw.json). The proxy's CA and channel
+  folders live in the state too, and the agent's config folder may never be or contain any of
+  them.
 - ``[sensor]`` (T07-3, docs/23): whether the agent may run without the process sensor
   (``required``, false by default: decision 7), the sensor container's limits and the reader's
   rate limits. Never the image (pinned in backtide/jail/sensor.py) nor its folder, which is
@@ -33,8 +37,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
 
+from backtide.gate.provider_tools import check_allow_entry
+from backtide.gate.providers import Provider as GateProvider
+from backtide.gate.providers import Providers, is_fake_key, new_fake_key
+from backtide.gate.providers import Secret as GateSecret
 from backtide.jail.ca import CaPaths
 from backtide.jail.config import AgentJailConfig
+from backtide.jail.openclaw import MODEL_ID, ModelProvider
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
@@ -43,6 +52,7 @@ DEFAULT_CYCLE_INTERVAL = 120.0  # seconds between two "did anything change?" che
 DEFAULT_PRUNE_INTERVAL = 600.0
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 1024
+MAX_KEY_BYTES = 4096
 
 STATE_DB = "blackbox.db"
 STATE_KEY = "blackbox.key"
@@ -80,8 +90,9 @@ _AGENT_KEYS = frozenset(
 _PROXY_CONTAINER_KEYS = frozenset(
     {"name", "network", "image", "uid", "gid", "memory", "cpus", "pids_limit"}
 )
-_PROXY_KEYS = _PROXY_CONTAINER_KEYS | {"allow_hosts", "providers"}
-_PROVIDER_KEYS = frozenset({"name", "kind", "host"})
+_PROXY_KEYS = _PROXY_CONTAINER_KEYS | {"allow_hosts", "providers", "allow_provider_tools"}
+_PROVIDER_KEYS = frozenset({"name", "kind", "host", "models"})
+MAX_PROVIDER_MODELS = 32
 # [sensor]: the container's limits, the reader's rate limits and `required`. Not the image (it is
 # pinned in code), not `file_perm` (a test-only concession) and not its folder.
 _SENSOR_CONTAINER_KEYS = frozenset({"name", "memory", "cpus", "cgroup_rate"})
@@ -91,6 +102,7 @@ _SENSOR_KEYS = _SENSOR_CONTAINER_KEYS | _SENSOR_RATES | _SENSOR_COUNTS | {"requi
 # docs/21, section 6: the providers of T06 and their default hosts.
 PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
 MAX_ALLOW_HOSTS = 1000
+MAX_PROVIDER_TOOLS = 64
 MAX_PROVIDERS = 16
 _SECRET_WORDS = ("key", "token", "secret", "password", "credential")
 _PROVIDER_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}", re.ASCII)
@@ -105,19 +117,23 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Provider:
     """A model provider the proxy knows (docs/21, section 6): its name, its ``kind`` (which
-    header carries the key) and its host. Its keys are never here."""
+    header carries the key), its host and the model ids OpenClaw should know (required for a
+    name that is not one of OpenClaw's own providers). Its keys are never here."""
 
     name: str
     kind: str
     host: str
+    models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ProxySettings:
-    """What ``[proxy]`` says the proxy lets out: the hosts the user allows and the providers."""
+    """What ``[proxy]`` says the proxy lets out: the hosts the user allows, the providers, and
+    the provider-side tools that may go to a provider anyway (T06-6; none by default)."""
 
     allow_hosts: tuple[str, ...]
     providers: tuple[Provider, ...]
+    allow_provider_tools: tuple[str, ...] = ()
 
 
 class Secret:
@@ -148,6 +164,15 @@ class Secret:
 
 
 @dataclass(frozen=True)
+class ProviderKey:
+    """The two keys of one model provider: the real one (only the proxy's channel reveals it)
+    and the fake one the agent gets. Neither shows in a repr."""
+
+    real: Secret = field(repr=False)
+    fake: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class ServiceConfig:
     """What the service needs, validated on creation (ConfigError).
 
@@ -171,6 +196,8 @@ class ServiceConfig:
     max_volume_bytes: int | None = None
     proxy: Mapping[str, Any] = field(default_factory=dict)
     sensor: Mapping[str, Any] = field(default_factory=dict)
+    # One per provider of [proxy] (from_file reads them from keys/): the real and fake keys.
+    provider_keys: Mapping[str, ProviderKey] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("volume", self.volume)):
@@ -227,7 +254,19 @@ class ServiceConfig:
                     f"the agent's config_dir {config_dir} must not be or contain {label} "
                     f"{folder}: the agent would see it"
                 )
-        self.proxy_settings()
+        names = [provider.name for provider in self.proxy_settings().providers]
+        missing = [name for name in names if name not in self.provider_keys]
+        if missing:
+            raise ConfigError(
+                f"[proxy] providers {', '.join(missing)} have no keys: put each real key in "
+                f"<state_dir>/{STATE_KEYS}/<name>.key (0600)"
+            )
+        extra = sorted(set(self.provider_keys) - set(names))
+        if extra:
+            raise ConfigError(f"keys for no provider of [proxy]: {', '.join(extra)}")
+        if not all(isinstance(key, ProviderKey) for key in self.provider_keys.values()):
+            raise ConfigError("provider_keys must map each provider to its ProviderKey")
+        self.model_providers()
         self.proxy_jail_config()
 
     def _check_sensor(self, config_dir: Path) -> None:
@@ -345,18 +384,61 @@ class ServiceConfig:
 
     def jail_config(self) -> AgentJailConfig:
         """The agent's container settings. It carries the token in the clear (it must reach
-        ``docker create``'s environment), so do not log it; AgentJailConfig's repr hides it."""
+        ``docker create``'s environment), so do not log it; AgentJailConfig's repr hides it.
+        The model providers go with their FAKE keys only (for openclaw.json)."""
         options = {key: value for key, value in self.agent.items() if key != "config_dir"}
+        try:
+            providers = tuple(
+                ModelProvider(
+                    name=p.name,
+                    kind=p.kind,
+                    host=p.host,
+                    fake_key=self.provider_keys[p.name].fake,
+                    models=p.models,
+                )
+                for p in self.proxy_settings().providers
+                if p.name in self.provider_keys
+            )
+        except ValueError as error:
+            raise ConfigError(f"invalid [proxy] providers: {error}") from error
         try:
             return AgentJailConfig(
                 workspace=self.workspace,
                 config_dir=self.agent_config_dir,
                 ca_dir=self.agent_ca_dir,
                 gateway_token=self.gateway_token.reveal(),
+                model_providers=providers,
                 **options,
             )
         except ValueError as error:
             raise ConfigError(f"invalid [agent] settings: {error}") from error
+
+    def model_providers(self) -> Providers:
+        """The providers as the proxy gets them through the channel (docs/21, section 6): host,
+        fake key and real key (inside the gate's own Secret). ConfigError, never quoting a
+        key, for a key the gate cannot use or two providers that clash."""
+        items = []
+        for provider in self.proxy_settings().providers:
+            key = self.provider_keys.get(provider.name)
+            if key is None:
+                continue
+            try:
+                items.append(
+                    GateProvider(
+                        name=provider.name,
+                        kind=provider.kind,  # type: ignore[arg-type]
+                        host=provider.host,
+                        fake_key=key.fake,
+                        real_key=GateSecret(key.real.reveal()),
+                        models=provider.models,
+                    )
+                )
+            except ValueError as error:  # Provider's messages never hold a key
+                raise ConfigError(f"[proxy] providers: {error}") from None
+        try:
+            return Providers(items)
+        except ValueError as error:
+            raise ConfigError(f"[proxy] providers: {error}") from None
 
     def proxy_jail_config(self) -> ProxyJailConfig:
         """The egress proxy's container settings, on the agent's network and apart from its
@@ -414,7 +496,8 @@ class ServiceConfig:
         )
 
     def proxy_settings(self) -> ProxySettings:
-        """``allow_hosts`` and ``providers`` of ``[proxy]``, checked (ConfigError)."""
+        """``allow_hosts``, ``providers`` and ``allow_provider_tools`` of ``[proxy]``, checked
+        (ConfigError)."""
         hosts = self.proxy.get("allow_hosts", [])
         if not isinstance(hosts, list) or len(hosts) > MAX_ALLOW_HOSTS:
             raise ConfigError(
@@ -429,7 +512,19 @@ class ServiceConfig:
         names = [provider.name for provider in providers]
         if len(set(names)) != len(names):
             raise ConfigError("[proxy] providers: each name must appear once")
-        return ProxySettings(allow_hosts=tuple(hosts), providers=providers)
+        tools = self.proxy.get("allow_provider_tools", [])
+        if not isinstance(tools, list) or len(tools) > MAX_PROVIDER_TOOLS:
+            raise ConfigError(
+                f"[proxy] allow_provider_tools must be a list of at most {MAX_PROVIDER_TOOLS} "
+                "tool names"
+            )
+        try:
+            allowed = tuple(dict.fromkeys(check_allow_entry(tool) for tool in tools))
+        except ValueError as error:
+            raise ConfigError(f"[proxy] allow_provider_tools: {error}") from None
+        return ProxySettings(
+            allow_hosts=tuple(hosts), providers=providers, allow_provider_tools=allowed
+        )
 
     def read_rules(self) -> str | None:
         """The text of ``rules_file``, or None if there is none (the default rules apply). Read
@@ -473,6 +568,9 @@ class ServiceConfig:
             if not isinstance(data["sensor"], dict):
                 raise ConfigError("[sensor] must be a table")
             optional["sensor"] = dict(data["sensor"])
+        names = _provider_names(optional.get("proxy", {}))
+        if names:
+            optional["provider_keys"] = read_provider_keys(state_dir / STATE_KEYS, names)
         return cls(
             state_dir=state_dir,
             volume=volume,
@@ -502,6 +600,80 @@ def _require_private_state_dir(path: Path) -> None:
         raise ConfigError(
             f"state_dir {path} is writable by group or others (mode {mode:04o}): chmod 700 it"
         )
+
+
+def _provider_names(proxy: Mapping[str, Any]) -> list[str]:
+    """The names of the providers of ``[proxy]`` (each checked), to read their keys."""
+    entries = proxy.get("providers", []) if isinstance(proxy, Mapping) else []
+    if not isinstance(entries, list) or len(entries) > MAX_PROVIDERS:
+        return []  # the full check (ServiceConfig) says what is wrong
+    names = [_provider(entry).name for entry in entries]
+    if len(set(names)) != len(names):
+        raise ConfigError("[proxy] providers: each name must appear once")
+    return names
+
+
+def read_provider_keys(folder: Path, names: list[str]) -> dict[str, ProviderKey]:
+    """The keys of each provider in ``names``: ``<name>.key``, the real one, which the person
+    puts there; and ``<name>.fake``, made here the first time (0600, never replaced). The
+    folder must be ours and 0700, and nothing in it a symlink. ConfigError, saying what a file
+    IS (path, size, mode, owner) and never what it holds."""
+    _require_private_dir(folder, "the keys folder")
+    keys = {}
+    for name in names:
+        real_file = folder / f"{name}.key"
+        real = _decode(_read_file(real_file, "real key file", MAX_KEY_BYTES, private=True)).strip()
+        if not real:
+            raise ConfigError(f"real key file {real_file} of provider {name} is empty")
+        keys[name] = ProviderKey(real=Secret(real), fake=_fake_key(folder / f"{name}.fake", name))
+    return keys
+
+
+def _fake_key(path: Path, name: str) -> str:
+    """The fake key in ``path``, made (``O_EXCL``, 0600) if there is none yet."""
+    if not os.path.lexists(path):
+        fake = new_fake_key(name)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            pass  # made meanwhile by another backtide: read it below
+        except OSError as error:
+            raise ConfigError(
+                f"cannot make fake key file {path}: {os.strerror(error.errno or 0)}"
+            ) from None
+        else:
+            try:
+                os.write(fd, (fake + "\n").encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    value = _decode(_read_file(path, "fake key file", MAX_KEY_BYTES, private=True)).strip()
+    if not is_fake_key(value, name):
+        raise ConfigError(
+            f"fake key file {path} does not hold a fake key of provider {name}: delete it and "
+            "backtide makes a new one"
+        )
+    return value
+
+
+def _require_private_dir(path: Path, what: str) -> None:
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise ConfigError(
+            f"cannot read {what} {path}: {os.strerror(error.errno or 0)} (it holds the providers' "
+            "real keys: create it, 0700, and put each key in <name>.key, 0600)"
+        ) from None
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        raise ConfigError(f"{what} {path} is a symlink: refusing it")
+    if not stat.S_ISDIR(info.st_mode):
+        raise ConfigError(f"{what} {path} is not a directory")
+    if info.st_uid != os.geteuid():
+        raise ConfigError(f"{what} {path} is owned by uid {info.st_uid}, not {os.geteuid()}")
+    if mode & 0o077:
+        raise ConfigError(f"{what} {path} is open to group or others ({mode:04o}): chmod 700 it")
 
 
 def _reject_secret_keys(label: str, table: Mapping[str, Any]) -> None:
@@ -538,7 +710,23 @@ def _provider(entry: object) -> Provider:
     _check_host(f"[proxy] providers: {name}'s host", host)
     if "*" in host:
         raise ConfigError(f"[proxy] providers: {name}'s host must be one exact name")
-    return Provider(name=name, kind=kind, host=host)
+    others = {default for other, default in PROVIDER_HOSTS.items() if other != kind}
+    if host.lower().rstrip(".") in others:
+        raise ConfigError(
+            f"[proxy] providers: {name} is of kind {kind} but its host is another kind's: its "
+            "real key would go to the wrong provider"
+        )
+    models = entry.get("models", [])
+    if (
+        not isinstance(models, list)
+        or len(models) > MAX_PROVIDER_MODELS
+        or not all(isinstance(m, str) and MODEL_ID.fullmatch(m) for m in models)
+    ):
+        raise ConfigError(
+            f"[proxy] providers: {name}'s models must be a list of at most "
+            f"{MAX_PROVIDER_MODELS} model ids"
+        )
+    return Provider(name=name, kind=kind, host=host, models=tuple(models))
 
 
 def _reject_unknown(data: dict[str, Any]) -> None:

@@ -7,6 +7,7 @@ Every launcher of a test service (service_main, pause_main, rewind_main, guardia
 hands ``test_proxy(config)`` to the real ``serve``/``build_guardian``.
 """
 
+import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -55,3 +56,14 @@ def remove_proxy(config: ServiceConfig) -> list[JailError]:
         except JailError as error:
             errors.append(error)
     return errors
+
+
+def read_grants(path: Path) -> dict[str, object]:
+    """The proxy's test grants written by internet_kit (``--egress-grants``): the fake internet
+    as the one neighbour on the egress network, its address counted as public, and its CA."""
+    data = json.loads(path.read_text())
+    return {
+        "egress_neighbours": tuple(data["egress_neighbours"]),
+        "test_public_addresses": tuple(data["test_public_addresses"]),
+        "test_upstream_ca": data["test_upstream_ca"],
+    }

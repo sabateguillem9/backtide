@@ -12,7 +12,10 @@ Design: docs/21-diseno-t06-proxy.md, sections 4 to 8. What each hook does:
   header, the trailers, the raw and the decoded body: ``real_key``, on any host), a
   ``Content-Encoding`` that cannot be undone (``undecodable``), ``Host`` against the
   connection and the SNI (``host_mismatch``), OAuth logins, and on a provider's host the fake
-  key swapped for the real one (``foreign_credential`` otherwise). Then backtide is asked
+  key swapped for the real one (``foreign_credential`` otherwise) and only a model call with the
+  client's own tools (``provider_endpoint``, ``provider_body`` or ``provider_side_tool``
+  otherwise: provider_tools.py, T06-6). An IP literal that is not public, also written as numbers
+  (``127.1``, ``0x7f.1``), is ``private_address`` before backtide is asked. Then backtide is asked
   (``request`` -> ``ack``): only with ``allow`` and a ``seq`` (the event is in the black box)
   does the request go on. ``connection_strategy=lazy`` means no server was contacted so far.
 - ``server_connect`` (async): only for a host and port that an ack let through on this client
@@ -20,7 +23,10 @@ Design: docs/21-diseno-t06-proxy.md, sections 4 to 8. What each hook does:
   pinned to the address that was checked (the SNI keeps the name).
 - ``responseheaders``/``response``: every response streams through a tap that counts it and,
   for a provider, reads the usage (SSE or JSON, bounded); then ``net/response`` or
-  ``llm/response``. Never the body.
+  ``llm/response``. Never the body. A provider's answer is checked for the real key before it
+  reaches the agent (echo.py, T06-6): a plain SSE stream event by event, anything else whole
+  (mitmproxy holds it until the ``response`` hook). On a hit the flow is killed, or the stream
+  cut at once, and ``net/blocked {reason: real_key, side: response}`` (risk 3) is queued.
 - ``error``, ``tls_failed_client`` and the WebSocket hooks: ``net/error``, ``net/tls_failed``
   and the WebSocket summaries; a client message with a real key kills the WebSocket.
 
@@ -44,15 +50,18 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from backtide.gate import record
-from backtide.gate.client import Ack, Channel
+from backtide.gate.client import Ack, Channel, GateConfig
+from backtide.gate.echo import KeyEcho, KeyScanner, SseGuard
 from backtide.gate.policy import (
     host_mismatch,
     is_ip,
     is_oauth_login,
     is_public,
     normalize_host,
+    numeric_ipv4,
     port_allowed,
 )
+from backtide.gate.provider_tools import check_request
 from backtide.gate.providers import Provider, swap_key
 from backtide.gate.sse import UsageStream, summarize_json
 
@@ -60,6 +69,10 @@ logger = logging.getLogger(__name__)
 
 BODY_LIMIT = 16 * 1024 * 1024  # body_size_limit of main.py (docs/21, section 8)
 JSON_SUMMARY_LIMIT = 1 << 20  # a provider's non-streamed answer is summarized up to 1 MiB
+# Bytes of providers' answers held whole at once (each is BODY_LIMIT at most; one without a
+# length counts as that much). Past it, the answer is not let through: the proxy keeps to its
+# memory (1 GiB) whatever the agent asks for at the same time.
+HELD_BUDGET = 128 * 1024 * 1024
 WEBSOCKET_SUMMARY_EVERY = 2.0  # seconds
 EXIT_CODE = 70
 
@@ -75,6 +88,12 @@ REFUSALS = {
     "foreign_credential": (403, "backtide: only the fake key works with this provider\n"),
     "too_large": (413, "backtide: the body is over the limit\n"),
     "undecodable": (400, "backtide: this Content-Encoding cannot be checked\n"),
+    "provider_endpoint": (403, "backtide: only the provider's model endpoints are allowed\n"),
+    "provider_body": (400, "backtide: a model request must be the provider's JSON\n"),
+    "provider_side_tool": (
+        403,
+        "backtide: tools that run on the provider's side are not allowed (allow_provider_tools)\n",
+    ),
 }
 FAILED = (502, "backtide: the gate failed, so nothing went out\n")
 
@@ -137,33 +156,54 @@ def _guard_after(stage: str) -> Callable[..., Any]:
 
 
 class _Tap:
-    """``flow.response.stream``: every chunk passes at once; a copy is counted and, for a
-    provider, read for its usage. A failure inside kills the flow (it never raises)."""
+    """``flow.response.stream``: every chunk is counted and, for a provider, read for its usage
+    and held back by ``guard`` until it is checked for the real key (whole SSE events only).
+    Anything else passes at once. A failure, or a key, stops the stream for good: from then on
+    not one byte more goes to the agent (it never raises)."""
 
-    def __init__(self, gate: "Gate", flow: Any, provider: Provider | None, media: str) -> None:
+    def __init__(
+        self,
+        gate: "Gate",
+        flow: Any,
+        provider: Provider | None,
+        media: str,
+        guard: SseGuard | None = None,
+    ) -> None:
         self._gate = gate
         self._flow = flow
+        self._guard = guard
         self.size = 0
         self.kind = None if provider is None else str(provider.kind)
         self._sse = UsageStream(self.kind) if self.kind and media == "text/event-stream" else None
         self._json: bytearray | None = bytearray() if self.kind and self._sse is None else None
-        self.failed = False
+        self.stopped = False
 
     def __call__(self, chunk: bytes) -> bytes:
+        if self.stopped:
+            return b""
         try:
-            self.size += len(chunk)
-            if self._sse is not None:
-                self._sse.feed(chunk)
-            elif self._json is not None:
-                if len(self._json) + len(chunk) <= JSON_SUMMARY_LIMIT:
-                    self._json += chunk
-                else:
-                    self._json = None  # too big to summarize: usage_missing
-            return chunk
+            self.count(chunk)
+            if self._guard is None:
+                return chunk
+            return self._guard.feed(chunk) if chunk else self._guard.finish()
+        except KeyEcho:
+            self.stopped = True
+            self._gate._key_in_answer(self._flow)
+            return b""
         except Exception as error:
-            self.failed = True
+            self.stopped = True
             self._gate._failed("response_stream", self._flow, error, before=False)
             return b""
+
+    def count(self, chunk: bytes) -> None:
+        self.size += len(chunk)
+        if self._sse is not None:
+            self._sse.feed(chunk)
+        elif self._json is not None:
+            if len(self._json) + len(chunk) <= JSON_SUMMARY_LIMIT:
+                self._json += chunk
+            else:
+                self._json = None  # too big to summarize: usage_missing
 
     def summary(self) -> Any:
         if self._sse is not None:
@@ -200,6 +240,8 @@ class Gate:
         self._clients: set[str] = set()
         self._waiting: set[str] = set()  # flows reading their body or waiting for their ack
         self._acked: dict[str, set[tuple[str, int]]] = {}  # client id -> targets let through
+        self._scanner_of: tuple[GateConfig, KeyScanner] | None = None
+        self.held_bytes = 0  # reserved by the providers' answers held whole right now
 
     # Clients
 
@@ -241,6 +283,10 @@ class Gate:
     def http_connect(self, flow: Any) -> None:
         if not port_allowed(flow.request.port):
             self._block("port", flow, {"host": flow.request.host, "port": flow.request.port})
+        elif self._private_literal(flow.request.host):
+            self._block(
+                "private_address", flow, {"host": flow.request.host, "port": flow.request.port}
+            )
 
     @_guard_request_phase("requestheaders")
     def requestheaders(self, flow: Any) -> None:
@@ -298,6 +344,11 @@ class Gate:
         if refusal is not None:
             self._block(refusal, flow, fields)
             return
+        if self._private_literal(request.host):
+            # A fixed rule, before the allowed list (which never allows an IP): risk 2, not 1.
+            # After the real key's search, so a real key towards one is still real_key (risk 3).
+            self._block("private_address", flow, fields)
+            return
         if host_mismatch(
             request.host,
             request.host_header,
@@ -317,7 +368,26 @@ class Gate:
             if swapped is None:
                 self._block("foreign_credential", flow, fields)
                 return
-            event = record.llm_request_event(fields, provider.name, config.scrubber)
+            # What goes there leaves with the real key: only a model call with the client's own
+            # tools, never one that has the provider reach other hosts for the agent (T06-6).
+            verdict = check_request(
+                str(provider.kind),
+                request.method,
+                request.path,
+                headers,
+                body,
+                allowed=config.provider_tools,
+                models=provider.models,
+                trailers=trailers,
+            )
+            if verdict.reason is not None:
+                self._block(verdict.reason, flow, fields, tools=verdict.tools)
+                if verdict.reason == "provider_side_tool":
+                    logger.warning("a model request with provider-side tools: refused")
+                return
+            event = record.llm_request_event(
+                fields, provider.name, config.scrubber, provider_tools=verdict.tools
+            )
         else:
             event = record.request_event(fields, config.scrubber)
         ack = await self._channel.ask(event)
@@ -338,6 +408,8 @@ class Gate:
         self._acked.setdefault(flow.client_conn.id, set()).add((host, request.port))
         flow.metadata["backtide"] = {
             "provider": provider,
+            # The answer is checked for the keys of the config this request went out with.
+            "scanner": self._scanner() if provider is not None else None,
             "start": self._clock(),
             "fields": {key: fields[key] for key in ("flow_id", "scheme", "host", "port", "path")},
         }
@@ -382,6 +454,19 @@ class Gate:
             return
         data.server.address = (chosen, port)
 
+    def _private_literal(self, raw_host: object) -> bool:
+        """Whether the host is an IP literal that may not be reached (server_connect would
+        refuse it too, but only once backtide had been asked)."""
+        host = normalize_host(raw_host)
+        if host is None:
+            return False
+        if not is_ip(host):
+            # 127.1, 0x7f.1, 2130706433: the resolver reads them as addresses (inet_aton).
+            host = numeric_ipv4(host)
+            if host is None:
+                return False
+        return self._pick([host]) is None
+
     def _pick(self, addresses: Iterable[str]) -> str | None:
         """policy.pick_address, where the VM tests' fake internet counts as public."""
         candidates = list(addresses)
@@ -398,17 +483,135 @@ class Gate:
     def responseheaders(self, flow: Any) -> None:
         meta = flow.metadata.get("backtide")
         provider = meta["provider"] if meta else None
-        media = (flow.response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-        tap = _Tap(self, flow, provider, media)
+        headers = flow.response.headers
+        media = (headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if provider is not None:
+            if not self._provider_headers(flow, meta):
+                return
+            encoding = (headers.get("content-encoding") or "").strip().lower()
+            if media != "text/event-stream" or encoding not in ("", "identity"):
+                self._hold_whole(flow, provider, media)
+                return
+        guard = SseGuard(meta["scanner"]) if provider is not None else None
+        tap = _Tap(self, flow, provider, media, guard)
         flow.metadata["backtide_tap"] = tap
         flow.response.stream = tap
 
+    def _provider_headers(self, flow: Any, meta: Mapping[str, Any]) -> bool:
+        """A provider's status line and headers, checked before mitmproxy sends them on.
+        False (and the flow stopped) when they may not go to the agent."""
+        response = flow.response
+        pairs = _header_pairs(response.headers)
+        if meta["scanner"].found_in(str(response.reason or ""), *[t for p in pairs for t in p]):
+            self._key_in_answer(flow)
+            return False
+        codings = [v.strip().lower() for n, v in pairs if n.lower() == "transfer-encoding"]
+        if any(coding not in ("", "chunked") for coding in codings):
+            # Another transfer coding (gzip, chunked): the body would be checked as compressed
+            # while the agent could read it decompressed.
+            self._stop_answer(flow, "response_transfer_encoding")
+            return False
+        return True
+
+    def _hold_whole(self, flow: Any, provider: Provider, media: str) -> None:
+        """mitmproxy holds the answer whole (BODY_LIMIT at most, body_size_limit) and
+        ``response`` checks it before any byte of it goes to the agent, within HELD_BUDGET."""
+        length = flow.response.headers.get("content-length")
+        size = int(length) if length is not None and length.strip().isdigit() else BODY_LIMIT
+        size = min(size, BODY_LIMIT)
+        if self.held_bytes + size > HELD_BUDGET:
+            self._stop_answer(flow, "response_budget")
+            return
+        self.held_bytes += size
+        flow.metadata["backtide_held"] = size
+        flow.metadata["backtide_tap"] = _Tap(self, flow, provider, media)
+        flow.metadata["backtide_whole"] = True
+        flow.response.stream = False
+
+    def _release(self, flow: Any) -> None:
+        self.held_bytes -= flow.metadata.pop("backtide_held", 0)
+
     @_guard_after("response")
     def response(self, flow: Any) -> None:
+        self._release(flow)
+        meta = flow.metadata.get("backtide")
+        if meta and meta["provider"] is not None:
+            if flow.metadata.get("backtide_told"):
+                return  # stopped already (a key in its stream, or a failure)
+            trailers = flow.response.trailers
+            pairs = _header_pairs(trailers) if trailers is not None else []
+            if pairs and meta["scanner"].found_in(*[t for p in pairs for t in p]):
+                self._key_in_answer(flow)
+                return
+            if flow.metadata.get("backtide_whole") and not self._check_whole(flow, meta):
+                return
+        self._tell_response(flow)
+
+    def _check_whole(self, flow: Any, meta: Mapping[str, Any]) -> bool:
+        """A provider's answer held whole: False (and the flow killed) when it may not go on."""
+        raw = flow.response.raw_content or b""
+        try:
+            decoded = decode_body(raw, flow.response.headers.get("content-encoding")) or b""
+        except Undecodable as error:
+            self._stop_answer(flow, f"response_{error.reason}")  # it cannot be checked
+            return False
+        parts = (raw,) if decoded is raw else (raw, decoded)  # once when it was not compressed
+        if meta["scanner"].found_in(*parts):
+            self._key_in_answer(flow)
+            return False
+        tap = flow.metadata["backtide_tap"]
+        tap.count(decoded)
+        tap.size = len(raw)
+        return True
+
+    def _stop_answer(self, flow: Any, stage: str) -> None:
+        """An answer that may not go to the agent, for a reason that is not a key: killed, and
+        ``net/error {stage}`` queued. No ``llm/response``."""
+        flow.metadata["backtide_told"] = True
+        flow.kill()
+        fields = flow.metadata["backtide"]["fields"]
+        self._tell_error(
+            stage, None, flow_id=fields["flow_id"], host=fields["host"], port=fields["port"]
+        )
+
+    def _key_in_answer(self, flow: Any) -> None:
+        """A provider's answer carried a real key: ``net/blocked {real_key, side: response}`` is
+        queued and the flow dies (what was not sent yet never is). No ``llm/response``. If
+        either fails, the proxy stops: a dead proxy lets nothing through."""
+        flow.metadata["backtide_told"] = True
+        logger.error("a provider's answer carried a real key: the flow is killed")
+        try:
+            meta = flow.metadata.get("backtide") or {}
+            fields = meta.get("fields") or {"flow_id": flow.id}
+            self._channel.tell(
+                record.blocked_event("real_key", fields, self._channel.scrubber, side="response")
+            )
+        except Exception:
+            logger.exception("cannot record a key in an answer: stopping the proxy")
+            self._die()
+        try:
+            flow.kill()
+        except Exception:
+            logger.exception("cannot stop an answer that carries a key: stopping the proxy")
+            self._die()
+
+    def _scanner(self) -> KeyScanner:
+        """The real keys' forms of the current config, built once per config."""
+        config = self._channel.config
+        if config is None:
+            raise RuntimeError("no config to check an answer against")
+        if self._scanner_of is None or self._scanner_of[0] is not config:
+            keys = [provider.real_key.reveal() for provider in config.providers.items]
+            self._scanner_of = (config, KeyScanner(keys))
+        return self._scanner_of[1]
+
+    def _tell_response(self, flow: Any) -> None:
+        """The ``net/response`` or ``llm/response`` of what the tap saw, once per flow."""
         meta = flow.metadata.get("backtide")
         tap = flow.metadata.get("backtide_tap")
-        if not meta or tap is None:
-            return  # an answer of the proxy itself: its refusal is already recorded
+        if not meta or tap is None or flow.metadata.get("backtide_told"):
+            return  # an answer of the proxy itself (its refusal is recorded), or told already
+        flow.metadata["backtide_told"] = True
         response = {
             "status": flow.response.status_code,
             "headers": _header_pairs(flow.response.headers),
@@ -429,9 +632,14 @@ class Gate:
     @_guard_after("error")
     def error(self, flow: Any) -> None:
         self._waiting.discard(flow.id)
+        self._release(flow)
         meta = flow.metadata.get("backtide")
         if not meta:
             return
+        if flow.response is not None:
+            # The answer had started (a client that hangs up once it has it, as OpenAI's do
+            # after [DONE]): what went by is recorded first, then the error.
+            self._tell_response(flow)
         fields = meta["fields"]
         self._channel.tell(
             record.error_event(
@@ -530,10 +738,14 @@ class Gate:
             "headers": _header_pairs(request.headers),
         }
 
-    def _block(self, reason: str, flow: Any, fields: Mapping[str, Any]) -> None:
+    def _block(
+        self, reason: str, flow: Any, fields: Mapping[str, Any], *, tools: Iterable[str] = ()
+    ) -> None:
         """Refuse with the reason's status, and queue its ``net/blocked`` (never the body)."""
         known = {key: value for key, value in fields.items() if key != "body"}
-        self._channel.tell(record.blocked_event(reason, known, self._channel.scrubber))
+        self._channel.tell(
+            record.blocked_event(reason, known, self._channel.scrubber, tools=tuple(tools))
+        )
         self._answer(flow, reason)
 
     def _refuse_unrecorded(self, flow: Any, fields: Mapping[str, Any] | None = None) -> None:

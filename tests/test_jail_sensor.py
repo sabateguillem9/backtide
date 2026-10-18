@@ -152,6 +152,9 @@ def test_the_settings_are_the_design() -> None:
         "redaction-filters": settings["redaction-filters"],
         "server-address": "unix:///var/run/tetragon/tetragon.sock",
         "health-server-address": "",
+        # T07 review: the loss counters, on the loopback of the sensor's own netns (none).
+        "metrics-server": "127.0.0.1:2112",
+        "metrics-label-filter": "namespace",
         "log-level": "warn",
     }
 
@@ -693,3 +696,144 @@ def test_serving_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(docker, "run", broken)
     assert _jail(tmp_path).serving() is False
+
+
+# --- T07 review: the forms only the second barrier knew, and Tetragon's loss counters --------
+
+
+REVIEW_FAKE = {
+    "env": "Lp4TzW8nBc3YdF6hJs1QaE",
+    "secret_env": "Gq7vR2mX9kLp4TzW8nBc",
+    "user_u": "R2mX9kLp4TzW8nBc3Yd",
+    "user_long": "W8nBc3YdF6hJs1QaEGq",
+    "telegram": "AAHx7Kp2Lq9Zr4Mw8Nt3Vb6Yc1Df5Gh0Jq",
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.Rk3Vb6Yc1Df5Gh0Jx7Kp",
+    "aiza": "AIzaSyD8nBc3YdF6hJs1QaEGq7vR2mX9kLp4TzW",
+    "xox": "xoxb-123456789012-Bc3YdF6hJs1QaEGq7vR2",
+    "stripe": "sk_live_Bc3YdF6hJs1QaEGq7vR2",
+    "ghpat": "github_pat_Bc3YdF6hJs1QaEGq7vR2mX9kLp4",
+    "glpat": "glpat-Bc3YdF6hJs1QaEGq7vR2",
+    "asia": "ASIAQQQQQQQQQQQQQQQQ",
+    "bearer_plain": "Bc3YdF6hJs1QaEGq7vR2mX",
+    "xauth": "YdF6hJs1QaEGq7vR2mX9",
+    "client_secret": "hJs1QaEGq7vR2mX9kLp4",
+}
+
+
+def test_the_redaction_rules_strike_what_only_backtide_struck_before() -> None:
+    f = REVIEW_FAKE
+    arguments = " ".join(
+        [
+            f"API_KEY={f['env']}",
+            f"MY_SECRET={f['secret_env']}",
+            "-u",
+            f"alice:{f['user_u']}",
+            f"--user=bob:{f['user_long']}",
+            f"123456789:{f['telegram']}",
+            f["jwt"],
+            f["aiza"],
+            f["xox"],
+            f["stripe"],
+            f["ghpat"],
+            f["glpat"],
+            f["asia"],
+            f'"Bearer {f["bearer_plain"]}"',
+            f'"X-Auth-Token: {f["xauth"]}"',
+            f"https://x.invalid/?client_secret={f['client_secret']}&keep=visible",
+            "plain-word-kept",
+        ]
+    )
+    struck = _tetragon_redact(arguments)
+    assert not [name for name, value in f.items() if value in struck], struck
+    assert "keep=visible" in struck and struck.endswith("plain-word-kept")
+    assert struck.startswith("API_KEY=***** MY_SECRET=*****")
+
+
+def test_the_new_rules_do_not_strike_ordinary_arguments() -> None:
+    ordinary = "ls -la /tmp --color=auto input_tokens=5 git commit -m 'fix: 12:30 meeting'"
+    assert _tetragon_redact(ordinary) == ordinary
+
+
+METRICS_TEXT = """# HELP tetragon_bpf_missed_events_total Number of failed perf events
+tetragon_bpf_missed_events_total{error="EAGAIN",msg_op="13"} 371099
+tetragon_bpf_missed_events_total{error="EAGAIN",msg_op="5"} 10
+tetragon_notify_overflowed_events_total 143854
+tetragon_observer_ringbuf_errors_total 0
+tetragon_observer_ringbuf_events_lost_total 0
+tetragon_observer_ringbuf_events_received_total 429620
+tetragon_observer_ringbuf_queue_events_lost_total 169260
+tetragon_export_ratelimit_events_dropped_total 0
+tetragon_events_total{binary="/usr/bin/x",type="PROCESS_EXEC"} 3
+"""
+
+METRICS_CALL = (
+    "exec",
+    "backtide-sensor",
+    "wget",
+    "-q",
+    "-O",
+    "-",
+    "http://127.0.0.1:2112/metrics",
+)
+
+
+def test_the_loss_counters_are_read_from_the_metrics(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    fake_docker.answer(*METRICS_CALL, stdout=METRICS_TEXT)
+    assert _jail(tmp_path).loss_counters() == {
+        "kernel": 371109,
+        "notify": 143854,
+        "ringbuf": 0,
+        "queue": 169260,
+        "export": 0,
+    }
+    assert fake_docker.calls == [list(METRICS_CALL)]
+
+
+def test_a_missing_kernel_counter_is_zero(tmp_path: Path, fake_docker: FakeDocker) -> None:
+    text = "\n".join(line for line in METRICS_TEXT.splitlines() if "bpf_missed" not in line)
+    fake_docker.answer(*METRICS_CALL, stdout=text)
+    assert _jail(tmp_path).loss_counters()["kernel"] == 0
+
+
+@pytest.mark.parametrize(
+    ("stdout", "code"),
+    [
+        ("", 0),
+        ("tetragon_events_total 3\n", 0),
+        (METRICS_TEXT, 1),
+        ("tetragon_notify_overflowed_events_total NaN\n" + METRICS_TEXT, 0),
+    ],
+)
+def test_odd_metrics_are_an_error(
+    tmp_path: Path, fake_docker: FakeDocker, stdout: str, code: int
+) -> None:
+    fake_docker.answer(*METRICS_CALL, stdout=stdout, code=code)
+    with pytest.raises(JailError):
+        _jail(tmp_path).loss_counters()
+
+
+def test_what_the_agent_puts_in_other_metrics_cannot_break_the_reading(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    """Re-review M1: a binary named "x}y" in a label, or a float in any notation."""
+    hostile = (
+        'tetragon_events_total{binary="/tmp/x}y",type="PROCESS_EXEC"} 3\n'
+        'tetragon_events_total{binary="/tmp/a b c"} 1.2e-05\n'
+        "tetragon_notify_overflowed_events_total 1.2e+01\n"
+    )
+    fake_docker.answer(*METRICS_CALL, stdout=hostile + METRICS_TEXT)
+    counters = _jail(tmp_path).loss_counters()
+    assert counters["notify"] == 143854 + 12
+
+
+def test_an_odd_loss_line_is_an_error_without_the_line(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    fake_docker.answer(
+        *METRICS_CALL, stdout='tetragon_notify_overflowed_events_total{x="secretX"} bad\n'
+    )
+    with pytest.raises(JailError) as raised:
+        _jail(tmp_path).loss_counters()
+    assert "secretX" not in str(raised.value)

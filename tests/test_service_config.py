@@ -538,6 +538,10 @@ def test_the_proxy_defaults_are_the_designs(layout: Path) -> None:
 
 
 def test_the_proxy_options_are_read(layout: Path) -> None:
+    keys = layout / "state" / "keys"
+    keys.mkdir(mode=0o700)
+    for name in ("anthropic", "groq"):
+        write_token(keys / f"{name}.key", f"sk-test-made-up-{name}-key-0123456789")
     config = ServiceConfig.from_file(
         write_toml(
             layout,
@@ -545,7 +549,8 @@ def test_the_proxy_options_are_read(layout: Path) -> None:
             '[proxy]\nname = "proxy-2"\nnetwork = "egress-2"\nuid = 62001\ngid = 62001\n'
             'memory = "512m"\nallow_hosts = ["github.com", "*.pypi.org"]\n'
             '[[proxy.providers]]\nname = "anthropic"\nkind = "anthropic"\n'
-            '[[proxy.providers]]\nname = "groq"\nkind = "openai"\nhost = "api.groq.com"\n',
+            '[[proxy.providers]]\nname = "groq"\nkind = "openai"\nhost = "api.groq.com"\n'
+            'models = ["llama-3.3-70b"]\n',
         )
     )
     proxy = config.proxy_jail_config()
@@ -557,7 +562,7 @@ def test_the_proxy_options_are_read(layout: Path) -> None:
         allow_hosts=("github.com", "*.pypi.org"),
         providers=(
             Provider("anthropic", "anthropic", "api.anthropic.com"),
-            Provider("groq", "openai", "api.groq.com"),
+            Provider("groq", "openai", "api.groq.com", ("llama-3.3-70b",)),
         ),
     )
 
@@ -720,3 +725,28 @@ def test_the_agent_config_dir_never_overlaps_the_sensors_folder(layout: Path) ->
                 gateway_token=Secret(TOKEN),
                 agent={"config_dir": config_dir},
             )
+
+
+# --- [proxy] allow_provider_tools (T06-6) --------------------------------------------------------
+
+
+def test_no_provider_tool_is_allowed_by_default(layout: Path) -> None:
+    config = ServiceConfig.from_file(write_toml(layout))
+    assert config.proxy_settings().allow_provider_tools == ()
+
+
+def test_the_allowed_provider_tools_are_read(layout: Path) -> None:
+    config = ServiceConfig.from_file(
+        write_toml(layout, '[proxy]\nallow_provider_tools = ["web_search_20250305", "mcp"]\n')
+    )
+    assert config.proxy_settings().allow_provider_tools == ("web_search_20250305", "mcp")
+
+
+@pytest.mark.parametrize(
+    "value", ['"mcp"', '["Web Search"]', "[1]", '["*"]', "[" + ", ".join(['"t"'] * 65) + "]"]
+)
+def test_bad_allowed_provider_tools_are_refused(layout: Path, value: str) -> None:
+    with pytest.raises(ConfigError, match="allow_provider_tools"):
+        ServiceConfig.from_file(
+            write_toml(layout, f"[proxy]\nallow_provider_tools = {value}\n")
+        ).proxy_settings()

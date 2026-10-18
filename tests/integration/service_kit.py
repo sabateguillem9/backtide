@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -459,15 +459,29 @@ def make_service(
     *,
     cycle_interval: float = CYCLE,
     workspace_limit: int | None = None,
+    proxy_toml: str = "",
+    real_keys: Mapping[str, str] | None = None,
+    agent_memory: str = "2g",
 ) -> Service:
     """Write the config and token of a service for the btrfs folder ``root`` (nothing runs
-    yet). ``names`` are the container and network names, from the fixtures' cleanup scheme."""
+    yet). ``names`` are the container and network names, from the fixtures' cleanup scheme.
+
+    ``proxy_toml`` goes at the end of ``[proxy]`` (``allow_hosts``, ``[[proxy.providers]]``),
+    and ``real_keys`` (provider name -> a key the TEST made, never a real one) are written to
+    ``<state_dir>/keys/<name>.key`` (0600, in a 0700 folder) as an installation would."""
     container, network = names
     token = secrets.token_urlsafe(32)
     state_dir.chmod(0o700)
     token_file = state_dir / "gateway.token"
     token_file.write_text(token + "\n")
     token_file.chmod(0o600)
+    if real_keys:
+        keys = state_dir / "keys"
+        keys.mkdir(mode=0o700, exist_ok=True)
+        for name, value in real_keys.items():
+            key_file = keys / f"{name}.key"
+            key_file.write_text(value + "\n")
+            key_file.chmod(0o600)
     config_path = state_dir.parent / f"{state_dir.name}.toml"
     config_path.write_text(
         f'state_dir = "{state_dir}"\n'
@@ -479,14 +493,14 @@ def make_service(
         f'network = "{network}"\n'
         f"uid = {os.getuid()}\n"
         f"gid = {os.getgid()}\n"
-        'memory = "2g"\n'
+        f'memory = "{agent_memory}"\n'
         'cpus = "2"\n'
         # The proxy's CA is group-readable by the proxy's gid: without root, only this user's.
         "[proxy]\n"
         f'name = "{container}-px"\n'  # under the cleanup's prefixes, with this run's pid
         f'network = "{network}-out"\n'
         f"uid = {os.getuid()}\n"
-        f"gid = {os.getgid()}\n"
+        f"gid = {os.getgid()}\n" + proxy_toml
     )
     config_path.chmod(0o600)
     config = ServiceConfig.from_file(config_path)

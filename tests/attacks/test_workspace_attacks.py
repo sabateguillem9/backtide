@@ -95,7 +95,7 @@ def snapshot_path(agent, snapshot_id: str, host_path: Path) -> Path:
 
 
 @scenario("subvolumen-anidado")
-def test_nested_subvolume(attack: Attack, agent, unconfined_agent) -> None:
+def test_nested_subvolume(attack: Attack, agent, unconfined_agent, battery_sensor) -> None:
     base, host = f"{CONTAINER_WORK}/subvolumen-anidado", host_dir(agent, "subvolumen-anidado")
     snapshots_before = agent.store.snapshots()
 
@@ -103,6 +103,7 @@ def test_nested_subvolume(attack: Attack, agent, unconfined_agent) -> None:
     control = attack.run_script(unconfined_agent, "subvolumen_anidado", base)
     assert control["attempts"]["subvol_create"] == 0 and "hidden-a" in control["nested"], control
 
+    attack.watch(battery_sensor, agent.jail)
     outcome = attack.run_script(agent, "subvolumen_anidado", base)
 
     attempts = outcome["attempts"]
@@ -116,6 +117,14 @@ def test_nested_subvolume(attack: Attack, agent, unconfined_agent) -> None:
         f"fallan con EOPNOTSUPP ({BLOCKED_ERRNO}); no hay ningún subvolumen anidado, "
         f"ni dentro ni visto desde el anfitrión. Control: con el perfil por defecto de Docker, "
         f"el mismo script sí crea uno",
+    )
+
+    recorded = attack.recorded_exec(argv="subvolumen-anidado")
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} exec del ataque en {attack.container_short} (el "
+        "proceso y sus argumentos; el ioctl de Btrfs concreto no, docs/23 decisión 6)",
     )
 
     snap = agent.store.take(Reason.MANUAL)
@@ -134,7 +143,7 @@ def test_nested_subvolume(attack: Attack, agent, unconfined_agent) -> None:
 
 
 @scenario("workspace-solo-lectura")
-def test_read_only_workspace(attack: Attack, agent, unconfined_agent) -> None:
+def test_read_only_workspace(attack: Attack, agent, unconfined_agent, battery_sensor) -> None:
     base, host = f"{CONTAINER_WORK}/solo-lectura", host_dir(agent, "solo-lectura")
     marker = host / "marker.txt"
 
@@ -152,6 +161,7 @@ def test_read_only_workspace(attack: Attack, agent, unconfined_agent) -> None:
     before = agent.store.take(Reason.MANUAL)
     modes_before = marker.stat().st_mode & 0o777
 
+    attack.watch(battery_sensor, agent.jail)
     outcome = attack.run_script(agent, "workspace_solo_lectura", base)
 
     attempts = outcome["attempts"]
@@ -171,6 +181,13 @@ def test_read_only_workspace(attack: Attack, agent, unconfined_agent) -> None:
     )
     # The attack that does work only locks the agent's own files (precondition, not a check).
     assert outcome["chmod_changed"] > 0 and not outcome["still_writes"], outcome
+
+    recorded = attack.recorded_exec(argv="solo-lectura")
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} exec del ataque en {attack.container_short}",
+    )
 
     during = agent.store.take(Reason.MANUAL)
     result = agent.store.restore(before.id, quiesce=agent.quiesce)
@@ -241,7 +258,7 @@ def test_symlinks_out_of_the_workspace(attack: Attack, agent) -> None:
 
 
 @scenario("leer-secretos")
-def test_reading_secrets(attack: Attack, agent) -> None:
+def test_reading_secrets(attack: Attack, agent, battery_sensor) -> None:
     store = agent.store
     # Files named like the canaries, where backtide's data would be on the host.
     planted = [store.root / f"{CANARY_PREFIX}blackbox-key", store.root.parent / f"{CANARY_PREFIX}x"]
@@ -265,6 +282,7 @@ def test_reading_secrets(attack: Attack, agent) -> None:
         assert f"{home}/credentials" in control["credential_files"], control
         assert f"{CONTAINER_WORK}/{CANARY_PREFIX}control.txt" in control["canary_hits"], control
         assert f"{CONTAINER_WORK}/{CANARY_PREFIX}control.txt" in control["backtide_files_seen"]
+        attack.watch(battery_sensor, agent.jail)
         outcome = attack.run_script(agent, "leer_secretos", CANARY_PREFIX, timeout=240)
     finally:
         for path in planted:
@@ -287,9 +305,17 @@ def test_reading_secrets(attack: Attack, agent) -> None:
         "señuelo puestos dentro del contenedor",
     )
 
+    recorded = attack.recorded_exec(argv=CANARY_PREFIX)
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} exec del barrido en {attack.container_short} (el "
+        "proceso; los /proc y ~/.ssh que abrió, no, docs/23 decisión 6)",
+    )
+
 
 @scenario("leer-sys-btrfs")
-def test_reading_the_btrfs_sysfs(attack: Attack, agent) -> None:
+def test_reading_the_btrfs_sysfs(attack: Attack, agent, battery_sensor) -> None:
     """/sys/fs/btrfs and /sys/devices/virtual/block are empty read-only tmpfs in the jail
     (T04d-1). The control runs the same probe in a container without them: it must find the
     volume and the host path of its image, or an empty result would prove nothing."""
@@ -313,6 +339,7 @@ def test_reading_the_btrfs_sysfs(attack: Attack, agent) -> None:
     assert f"/sys/fs/btrfs/{fsid}" in control["found"], control
     assert any(p.endswith("/loop/backing_file") for p in control["found"]), control
 
+    attack.watch(battery_sensor, agent.jail)
     outcome = attack.run_script(agent, "leer_sys_btrfs", fsid, *images)
     every_attempt = {**outcome["writes"], **outcome["umounts"]}
     attack.check(
@@ -330,6 +357,13 @@ def test_reading_the_btrfs_sysfs(attack: Attack, agent) -> None:
         "crear nada ahí (EROFS) ni quitar la máscara (umount2 da EPERM). Control: el mismo "
         f"sondeo en un contenedor sin máscaras encuentra {len(control['found'])} rutas, la "
         "carpeta del volumen y el backing_file",
+    )
+
+    recorded = attack.recorded_exec(argv="volume.img")
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} exec del sondeo en {attack.container_short}",
     )
 
 
@@ -407,7 +441,7 @@ def host_ipv4_addresses(agent) -> tuple[list[str], list[str]]:
 
 
 @scenario("salida-directa")
-def test_direct_egress(attack: Attack, agent) -> None:
+def test_direct_egress(attack: Attack, agent, battery_sensor) -> None:
     vm_addresses, gateways = host_ipv4_addresses(agent)
     addresses = [*vm_addresses, *gateways]
     with fake_local_service() as (port, visitors):
@@ -421,6 +455,7 @@ def test_direct_egress(attack: Attack, agent) -> None:
         visitors.clear()
         proxy_ips, egress_ips = proxy_addresses(agent)
         extra = [f"proxy={ip}" for ip in proxy_ips] + [f"egress={ip}" for ip in egress_ips]
+        attack.watch(battery_sensor, agent.jail)
         outcome = attack.run_script(agent, "salida_directa", str(port), *addresses, *extra)
     names_failed = all(value.isidentifier() for value in outcome["resolved"].values())
     only_the_door = [f"{ip}:8080" for ip in proxy_ips]
@@ -439,4 +474,14 @@ def test_direct_egress(attack: Attack, agent) -> None:
         f"probados ({', '.join(outcome['proxy_open']) or 'ninguno'}); el servicio falso recibió "
         f"{len(visitors)} visitas (control: desde el propio anfitrión sí recibe "
         f"{len(vm_addresses)})",
+    )
+
+    # The kernel sees the connect() before it looks for a route, so a doomed attempt is
+    # recorded with its address and port (docs/23, section 4).
+    recorded = attack.recorded_connect(target="192.0.2.1:443")
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó el intento de conexión directa a 192.0.2.1:443 desde "
+        f"{attack.container_short} aunque no haya ruta (net/connect)",
     )

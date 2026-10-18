@@ -244,6 +244,12 @@ class FileWatcher(Protocol):
         ...
 
 
+# Why a required sensor stops the agent (``agent_stop {reason}``).
+_SENSOR_REASONS = frozenset(
+    {"sensor_down", "sensor_unproven", "sensor_lost_events", "sensor_budget"}
+)
+
+
 class Sensor(Protocol):
     """The process sensor as the Guardian sees it (``backtide.service.process_sensor``). None
     of its methods raises: it records and alerts its own failures."""
@@ -3024,21 +3030,25 @@ class Guardian:
             return False
         return True
 
-    def _sensor_lost(self) -> None:
-        """A required sensor fell: the agent stops until it is back (the sensor alerted)."""
+    def _sensor_lost(self, reason: str = "sensor_down") -> bool:
+        """A required sensor fell, or cannot vouch for what the agent runs (``reason``: the
+        sensor's, recorded in ``agent_stop``): the agent stops until it is back (the sensor
+        alerted). Returns whether the agent is stopped now: the sensor does not restart
+        Tetragon while it may still run unseen (False: it could not be stopped, or the service
+        is closing and its stop will do it)."""
         if not self._sensor_lock():
-            return
+            return False
         try:
-            if not self._serving:
-                return
             try:
                 running = self._jail.is_running()
             except JailError:
                 running = True  # cannot tell: _stop_agent confirms
             if not running:
-                return
+                return True
+            if not self._serving:
+                return False
             self._sensor_held = True
-            self._stop_agent("sensor_down")
+            return self._stop_agent(reason if reason in _SENSOR_REASONS else "sensor_down") is None
         finally:
             self.agent_lock.release()
 

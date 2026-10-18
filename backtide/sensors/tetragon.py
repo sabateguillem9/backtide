@@ -20,7 +20,15 @@ Tetragon, nor Tetragon for it. What it loses it records as lost (``system/sensor
 - **The cheap prefilter**: a line without the first 12 characters of the agent's id is counted
   as ``other`` without being parsed. What decides is the parsed field (procs.belongs).
 - **Rate limits** (section 6): a token bucket and a daily budget per class (``exec``, ``net``).
-  What does not fit is folded into one ``exec/summary`` or ``net/summary`` every 10 s at most.
+  What does not fit is folded into one ``exec/summary`` or ``net/summary`` every 10 s at most,
+  which lists every distinct binary it folded (up to 50, the least frequent first: a flood of
+  one program cannot hide another). Past the bucket, the first ``novel_per_binary`` events of
+  each binary in a summary window are still recorded one by one (``novel: true``), from a
+  bucket and a daily budget of their own: a flood does not erase who else ran. An exhausted
+  daily budget is a ``sensor_gap`` of risk 2 (the process sensor alerts and, when required,
+  treats it as the sensor down: ``exhausted_budgets``).
+- **Throttles**: Tetragon's THROTTLE start and stop are gaps, at most one every
+  ``summary_interval``; the rest are counted into the next one.
 - **Probes** (section 7): ``expect(nonce)`` and ``wait_seen``. An expected probe is consumed
   once and never recorded; ``wait_ready`` is "a probe exec was seen", with a 30 s cap (P13).
   With ``stale_probes_before``, an unexpected probe older than that moment (one a killed
@@ -33,10 +41,12 @@ Tetragon, nor Tetragon for it. What it loses it records as lost (``system/sensor
 """
 
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import stat
 import threading
 import time
@@ -63,15 +73,21 @@ _ROTATED_RE = re.compile(r"tetragon-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d\.\d{3}\.log",
 _TIME_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z", re.ASCII)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 HEAD_BYTES = 256  # the fingerprint of a file: its first bytes
-OVERSIZE_KEEP = 8 * 1024  # bytes kept from each end of a line too big to parse
+# Bytes kept from each end of a line too big to parse: the binary and the cwd come before the
+# arguments, and each may be 4 KiB of controls escaped six times over.
+OVERSIZE_KEEP = 64 * 1024
 SENSOR_TARGET = "backtide-sensor"
 READY_TIMEOUT = 30.0  # docs/23, section 7 (T07-1, P13: 1.2 s in the VM)
 _SUMMARY_TOP = 5
 _SUMMARY_KEYS = 1000  # distinct binaries or targets kept while folding (then "…")
+_SUMMARY_BINARIES = 50  # distinct binaries listed in a summary, the least frequent first
+# Folders of the image the agent cannot write to (it runs without root): their programs go
+# first among the equally rare, so decoys the agent names cannot push them out of the list.
+_SYSTEM_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/opt/")
 _SEEN_KEPT = 64
 _STAT_NAMES = (
     "lines", "other", "parse_errors", "oversize", "preexisting", "exit", "loopback", "unknown",
-    "invalid", "recorded", "folded", "probes", "lost", "duplicates", "stale_probes",
+    "invalid", "recorded", "folded", "probes", "lost", "duplicates", "stale_probes", "novel",
 )  # fmt: skip
 MAX_REPLAY_KEYS = 50_000  # keys of recorded events kept to spot a line read twice
 _ERROR_CHARS = 300
@@ -113,6 +129,9 @@ class ReaderConfig:
     max_line: int = 2560 * 1024
     read_size: int = 256 * 1024
     max_bytes_per_poll: int = 16 * 1024 * 1024
+    # A poll holds the reader's lock, which the heartbeat needs: it returns after this long so
+    # the lock is free between batches, and the thread loops to read the rest.
+    poll_time_budget: float = 2.0
     poll_interval: float = 0.5
     cursor_interval: float = 5.0
     summary_interval: float = 10.0
@@ -122,6 +141,15 @@ class ReaderConfig:
     net_rate: float = 20.0
     net_burst: int = 200
     net_daily: int = 50_000
+    # Past the bucket: the first events of each distinct binary in a summary window.
+    novel_per_binary: int = 3
+    novel_rate: float = 5.0
+    novel_burst: int = 100
+    # The first event of each binary not recorded yet in the window has a bucket of its own,
+    # so repeats (a decoy name, argv variations) cannot use up the room for new programs.
+    first_rate: float = 50.0
+    first_burst: int = 200
+    novel_daily: int = 20_000
     budget_window: float = 24 * 3600.0
     lag_warning: float = 60.0
     lag_interval: float = 600.0
@@ -160,7 +188,14 @@ class _Folded:
 
     def __init__(self, second: str) -> None:
         self._second = second  # "parents" for commands, "targets" for connections
+        self._salt = secrets.token_bytes(16)  # the tie-break the agent cannot predict
         self._reset()
+
+    def _rank(self, item: tuple[str, int]) -> tuple[int, int, bytes]:
+        binary, count = item
+        system = 0 if binary.startswith(_SYSTEM_DIRS) else 1
+        mixed = hmac.new(self._salt, binary.encode("utf-8", "replace"), "sha256").digest()
+        return count, system, mixed
 
     def _reset(self) -> None:
         self.folded = 0
@@ -187,12 +222,18 @@ class _Folded:
 
     def build(self) -> dict[str, Any]:
         key = "binary" if self._second == "parents" else "target"
+        # Every distinct binary, the least frequent first: the one command among a flood of
+        # another is at the top of the list, not cut off by it.
+        # Ties: the image's own programs first, then an order keyed by a secret salt.
+        rarest = sorted(self._binaries.items(), key=self._rank)
         details = {
             "window": {"from": self._first, "to": self._last},
             "counts": dict(self._counts),
             "top_binaries": [
                 {"binary": b, "count": c} for b, c in self._binaries.most_common(_SUMMARY_TOP)
             ],
+            "binaries": [{"binary": b, "count": c} for b, c in rarest[:_SUMMARY_BINARIES]],
+            "distinct_binaries": len(self._binaries),
             f"top_{self._second}": [
                 {key: k, "count": c} for k, c in self._others.most_common(_SUMMARY_TOP)
             ],
@@ -264,10 +305,51 @@ class TetragonReader:
             Source.NET: DailyBudget(config.net_daily, config.budget_window),
         }
         self._budget_warned: dict[Source, float | None] = {Source.EXEC: None, Source.NET: None}
+        self._novel_buckets = {
+            kind: TokenBucket(config.novel_rate, config.novel_burst, now)
+            for kind in (Source.EXEC, Source.NET)
+        }
+        self._first_buckets = {
+            kind: TokenBucket(config.first_rate, config.first_burst, now)
+            for kind in (Source.EXEC, Source.NET)
+        }
+        self._novel_budgets = {
+            kind: DailyBudget(config.novel_daily, config.budget_window)
+            for kind in (Source.EXEC, Source.NET)
+        }
+        # Per summary window, by command (the binary and a hash of the head of its struck argv):
+        # how many went past the bucket. A new command line of a binary already seen is new.
+        self._novel_seen: dict[Source, Counter[_Command]] = {
+            Source.EXEC: Counter(),
+            Source.NET: Counter(),
+        }
+        # Per summary window: the commands and the binaries recorded one by one, and the
+        # commands folded without a single event of theirs recorded.
+        self._window_kept: dict[Source, set[_Command]] = {Source.EXEC: set(), Source.NET: set()}
+        self._window_binaries: dict[Source, set[str]] = {Source.EXEC: set(), Source.NET: set()}
+        # Commands still novel that a drained bucket or budget turned away: their identity is
+        # lost to a flood, not to a legitimate build's own quota.
+        self._window_starved: dict[Source, set[_Command]] = {Source.EXEC: set(), Source.NET: set()}
+        # Folds of a command already recorded this window (a build running it many times): no
+        # loss, only a note (argv_folded, risk 1).
+        self._window_repeats: dict[Source, Counter[_Command]] = {
+            Source.EXEC: Counter(),
+            Source.NET: Counter(),
+        }
+        self._window_unseen: dict[Source, Counter[_Command]] = {
+            Source.EXEC: Counter(),
+            Source.NET: Counter(),
+        }
+        # What the process sensor must hear about (alert, and with required stop the agent):
+        # throttles of the agent's cgroup and windows with novelty lost, since it last asked.
+        self._blind = Counter[str]()
         self._folded = {Source.EXEC: _Folded("parents"), Source.NET: _Folded("targets")}
         self._last_summary = now
         self._reported = Counter[str]()
         self._throttle_since: str | None = None
+        self._throttle_last: float | None = None  # when the last throttle gap was recorded
+        self._throttle_held: Counter[str] = Counter()  # starts and stops not recorded yet
+        self._throttle_window: list[str | None] = [None, None]
         self._last_lag: float | None = None
         self._last_time: str | None = None
         self._expected: dict[str, float] = {}
@@ -275,6 +357,10 @@ class TetragonReader:
         self._failing: set[str] = set()
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
+        # Read lock-free by the heartbeat to notice a poll that is taking too long (a flood of
+        # hostile lines): a stuck poll holds the lock, so nothing under it would answer.
+        self.polling_since: float | None = None
+        self.last_progress: float = now
 
     # The agent
 
@@ -340,27 +426,61 @@ class TetragonReader:
     # Reading
 
     def poll(self) -> int:
-        """Read what Tetragon added since the last round; returns the number of lines."""
-        with self._lock:
-            now = self.clock()
-            self._expire_nonces(now)
-            if any(until <= now for until in self._retired.values()):
-                self._rebuild_context()
-            lines_before = self._counts["lines"]
-            try:
-                self._poll_files()
-            except OSError as e:
-                self._failed("read", e)
-            else:
-                self._failing.discard("read")
-            self._flush(now)
-            return self._counts["lines"] - lines_before
+        """Read what Tetragon added since the last round; returns the number of lines. One poll
+        reads for at most ``poll_time_budget`` seconds (the thread loops for the rest), so the
+        lock it holds does not keep the heartbeat waiting."""
+        self.polling_since = self.clock()
+        try:
+            with self._lock:
+                now = self.clock()
+                self._expire_nonces(now)
+                if any(until <= now for until in self._retired.values()):
+                    self._rebuild_context()
+                lines_before = self._counts["lines"]
+                try:
+                    self._poll_files()
+                except OSError as e:
+                    self._failed("read", e)
+                else:
+                    self._failing.discard("read")
+                self._flush(now)
+                return self._counts["lines"] - lines_before
+        finally:
+            self.last_progress = self.clock()
+            self.polling_since = None
+
+    def blocked(self, seconds: float) -> bool:
+        """Whether a poll has been running for at least ``seconds`` (read without the lock): the
+        reader is stuck and nothing under its lock would answer."""
+        since = self.polling_since
+        return since is not None and self.clock() - since >= seconds
 
     def stats(self) -> dict[str, int]:
         """What the reader counted: lines, other, parse_errors, oversize, preexisting, exit,
         loopback, folded, probes, lost (appends that failed)..."""
         with self._lock:
             return {name: 0 for name in _STAT_NAMES} | dict(self._counts)
+
+    def exhausted_budgets(self) -> list[str]:
+        """The classes (``exec``, ``net``) whose daily budget is spent now: events of those
+        are only folded, and the summaries cannot say every command that ran."""
+        with self._lock:
+            now = self.clock()
+            spent = [kind.value for kind, budget in self._budgets.items() if budget.exhausted(now)]
+            spent += [
+                f"{kind.value}_novel"
+                for kind, budget in self._novel_budgets.items()
+                if budget.exhausted(now)
+            ]
+            return spent
+
+    def take_blind_spots(self) -> dict[str, int]:
+        """What made the reader blind since the last call: ``throttle`` (the kernel dropped the
+        agent's exec/exit events, cgroup-rate) and ``novelty_lost`` (binaries folded without a
+        single event of theirs recorded). Each was a gap of risk 2 already."""
+        with self._lock:
+            blind, self._blind = dict(self._blind), Counter()
+            return blind
 
     @property
     def preexisting(self) -> int:
@@ -431,10 +551,14 @@ class TetragonReader:
                 return
         self._note_lost(listing)
         budget = self.config.max_bytes_per_poll
+        deadline = self.clock() + self.config.poll_time_budget
         while budget > 0:
             got = self._read(budget)
             budget -= got
             if got:
+                self.last_progress = self.clock()
+                if self.clock() >= deadline:
+                    break  # more to read: the thread polls again, the lock free meanwhile
                 continue
             if not self._rotated_away(listing):
                 break
@@ -733,7 +857,14 @@ class TetragonReader:
         budget = self._budgets[kind]
         if budget.exhausted(now):
             self._warn_budget(kind, budget)
-        elif self._buckets[kind].take(now) and budget.try_spend(now):
+            fits = False
+        else:
+            fits = self._buckets[kind].take(now) and budget.try_spend(now)
+        if not fits and self._novel(kind, record, now):
+            record.details["novel"] = True
+            self._counts["novel"] += 1
+            fits = True
+        if fits:
             if self._append(
                 record.source,
                 record.action,
@@ -743,17 +874,77 @@ class TetragonReader:
                 snapshot_id=snapshot_id,
             ):
                 self._counts["recorded"] += 1
+                if len(self._window_kept[kind]) < _SUMMARY_KEYS:
+                    self._window_kept[kind].add(_command(record))
+                    self._window_binaries[kind].add(record.binary)
             return
         self._folded[kind].add(record, snapshot_id)
         self._counts["folded"] += 1
+        command = _command(record)
+        if command in self._window_kept[kind]:
+            self._window_repeats[kind][command] += 1  # recorded already: a repeat, no loss
+        else:
+            unseen = self._window_unseen[kind]
+            if command in unseen or len(unseen) < _SUMMARY_KEYS:
+                unseen[command] += 1
+            else:
+                unseen[("…", "")] += 1
+
+    def _novel(self, kind: Source, record: Record, now: float) -> bool:
+        """Whether this event, past the bucket, is still one of the first of its command in
+        this summary window (and the novelty buckets and budget have room). The first event of
+        a binary not recorded yet in the window takes from its own bucket."""
+        seen = self._novel_seen[kind]
+        command = _command(record)
+        if seen[command] >= self.config.novel_per_binary:
+            return False
+        if command not in seen and len(seen) >= _SUMMARY_KEYS:
+            self._window_starved[kind].add(command)
+            return False
+        first = record.binary not in self._window_binaries[kind]
+        bucket = self._first_buckets[kind] if first else self._novel_buckets[kind]
+        if not bucket.take(now):
+            self._window_starved[kind].add(command)  # a drained bucket, not the per-command quota
+            return False
+        if not self._novel_budgets[kind].try_spend(now):
+            self._window_starved[kind].add(command)
+            return False
+        seen[command] += 1
+        return True
 
     def _throttle(self, throttle: Throttle) -> None:
+        """At most one throttle gap every ``summary_interval``: the rest are counted into the
+        next one (an agent that flaps around the rate cannot flood the black box with them)."""
+        now = self.clock()
+        since = self._throttle_since
         if throttle.state == "start":
-            self._throttle_since = throttle.time
-            self._gap("throttle", 1, state="start", since=throttle.time)
+            self._throttle_since = since = throttle.time
         else:
-            self._gap("throttle", 1, state="stop", since=self._throttle_since, until=throttle.time)
             self._throttle_since = None
+        if (
+            self._throttle_last is not None
+            and now - self._throttle_last < self.config.summary_interval
+        ):
+            self._throttle_held[throttle.state] += 1
+            first, _ = self._throttle_window
+            self._throttle_window = [first or since or throttle.time, throttle.time]
+            return
+        details: dict[str, Any] = {"state": throttle.state, "since": since}
+        if throttle.state == "stop":
+            details["until"] = throttle.time
+        self._record_throttle(now, details)
+
+    def _record_throttle(self, now: float, details: dict[str, Any]) -> None:
+        if self._throttle_held:
+            held, self._throttle_held = self._throttle_held, Counter()
+            first, last = self._throttle_window
+            self._throttle_window = [None, None]
+            details["held"] = {"starts": held["start"], "stops": held["stop"]}
+            details["held_window"] = {"from": first, "to": last}
+        self._throttle_last = now
+        if details.get("state") == "start" or details.get("held", {}).get("starts"):
+            self._blind["throttle"] += 1
+        self._gap("throttle", 2, **details)
 
     def _consume(self, nonce: str) -> bool:
         if self._expected.pop(nonce, None) is None:
@@ -784,16 +975,44 @@ class TetragonReader:
         self._gap("lag", 1, seconds=int(lag))
 
     def _warn_budget(self, kind: Source, budget: DailyBudget) -> None:
+        """Once per budget window, at risk 2: from here on that class is only folded."""
         if self._budget_warned[kind] == budget.window_start:
             return
         self._budget_warned[kind] = budget.window_start
-        self._gap("budget", 1, **{"class": kind.value, "limit": budget.limit})
+        self._gap("budget", 2, **{"class": kind.value, "limit": budget.limit})
 
     def _flush(self, now: float, *, final: bool = False) -> None:
         """At most every ``summary_interval``: the summaries and the parse errors."""
+        if self._throttle_held and (
+            final
+            or self._throttle_last is None
+            or now - self._throttle_last >= self.config.summary_interval
+        ):
+            self._record_throttle(now, {"state": "repeated", "since": self._throttle_since})
         if not final and now - self._last_summary < self.config.summary_interval:
             return
         self._last_summary = now
+        for seen in self._novel_seen.values():
+            seen.clear()  # a new summary window: every binary is new again
+        for kind, unseen in self._window_unseen.items():
+            # Commands recorded later in the window are not lost after all.
+            kept = self._window_kept[kind]
+            # A command with no event of its own recorded in the window lost its identity to
+            # a flood (its binary never seen, or a drained bucket or budget turned it away):
+            # risk 2, and the sensor is blind (take_blind_spots). Folds of a command already
+            # recorded are a build's repeats: risk 1 and not blind.
+            blind = {cmd: n for cmd, n in unseen.items() if cmd not in kept}
+            repeats = self._window_repeats[kind]
+            if blind:
+                self._blind["novelty_lost"] += 1
+                self._gap("novelty_lost", 2, **_lost_details(kind, blind))
+            if repeats:
+                self._gap("argv_folded", 1, **_lost_details(kind, repeats))
+            unseen.clear()
+            kept.clear()
+            self._window_binaries[kind].clear()
+            self._window_starved[kind].clear()
+            repeats.clear()
         for kind, folded in self._folded.items():
             if folded:
                 snapshot_id = folded.snapshot_id
@@ -951,6 +1170,27 @@ def wait_ready(
             return reader.clock() - start
         if reader.clock() >= deadline:
             raise SensorNotReady(f"the sensor saw no probe in {timeout} s")
+
+
+type _Command = tuple[str, str]  # (binary, hash of the head of its struck argv)
+_ARGV_HEAD = 256
+
+
+def _command(record: Record) -> _Command:
+    """What makes a command distinct for novelty: its binary and the head of its argv (already
+    struck and escaped: no secret goes into the hash)."""
+    argv = record.details.get("argv")
+    head = argv[:_ARGV_HEAD] if isinstance(argv, str) else ""
+    return record.binary, hashlib.sha256(head.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _lost_details(kind: Source, lost: Mapping[_Command, int]) -> dict[str, Any]:
+    return {
+        "class": kind.value,
+        "binaries": len({binary for binary, _ in lost}),
+        "commands": len(lost),
+        "events": sum(lost.values()),
+    }
 
 
 def _bump(counter: Counter[str], key: str) -> None:

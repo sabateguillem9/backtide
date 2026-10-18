@@ -10,6 +10,7 @@ from backtide.gate.policy import (
     is_public,
     normalize_host,
     normalize_pattern,
+    numeric_ipv4,
     parse_host_header,
     pick_address,
     port_allowed,
@@ -392,3 +393,38 @@ def test_the_oauth_lists_are_normalized() -> None:
     for host, prefix in policy.OAUTH_PATHS:
         assert normalize_host(host) == host
         assert prefix.startswith("/") and prefix == prefix.lower()
+
+
+# --- IPv4 written as numbers (T06-6) -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "address"),
+    [
+        ("127.1", "127.0.0.1"),
+        ("0x7f.1", "127.0.0.1"),
+        ("0x7F.0.0.1", "127.0.0.1"),
+        ("2130706433", "127.0.0.1"),
+        ("0177.0.0.1", "127.0.0.1"),
+        ("0x7f000001", "127.0.0.1"),
+        ("169.254.43518", "169.254.169.254"),
+        ("10.1", "10.0.0.1"),
+        ("0", "0.0.0.0"),  # noqa: S104 - a target, nothing binds
+        ("134744072", "8.8.8.8"),
+        ("127.0.0.1.", "127.0.0.1"),
+        ("1.2.3.4", "1.2.3.4"),
+        ("0x", "0.0.0.0"),  # noqa: S104 - a target
+        ("0x.0x.0x.0x", "0.0.0.0"),  # noqa: S104 - a target
+    ],
+)
+def test_ipv4_written_as_numbers_is_read_as_inet_aton_does(host: str, address: str) -> None:
+    assert numeric_ipv4(host) == address
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["example.com", "1.2.3.4.5", "256.1.1.1", "1.2.65536", "08.1", "1..2", "", "1.2.3.4a",
+     "4294967296", "::1", "a.0x7f", 7, None],
+)  # fmt: skip
+def test_other_hosts_are_not_numeric_ipv4(host: object) -> None:
+    assert numeric_ipv4(host) is None

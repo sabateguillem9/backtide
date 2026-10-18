@@ -530,3 +530,17 @@ def test_close_ends_the_threads(box: BlackBox) -> None:
     channel.start()
     channel.close()
     assert threading.active_count() <= before
+
+
+def test_the_config_carries_the_allowed_provider_tools(box: BlackBox) -> None:
+    allowed = Policy(allow_hosts=(), providers=providers(), provider_tools=("web_search_20250305",))
+    channel, proxy = make_channel(box, policy=allowed)
+    proxy.send(protocol.hello("12.2.3-test", 4242))
+    channel.handshake(timeout=2)
+    assert proxy.receive()["provider_tools"] == ["web_search_20250305"]
+    channel.close()
+    plain, proxy = make_channel(box)
+    proxy.send(protocol.hello("12.2.3-test", 4242))
+    plain.handshake(timeout=2)
+    assert proxy.receive()["provider_tools"] == []
+    plain.close()

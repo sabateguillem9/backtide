@@ -132,12 +132,13 @@ def test_filling_metadata_then_rewinding(attack: Attack, quota_agent) -> None:
 
 
 @scenario("reflink-copy-file-range")
-def test_cheap_copies(attack: Attack, quota_agent) -> None:
+def test_cheap_copies(attack: Attack, quota_agent, battery_sensor) -> None:
     agent, _, _ = start(quota_agent)
     directory = f"{CONTAINER_WORK}/reflink"
     host = agent.workspace / "work" / "reflink"
     start_usage = referenced(agent)
 
+    attack.watch(battery_sensor, agent.jail)
     outcome = attack.run_script(
         agent, "reflink_copy_file_range", directory, str(COPY_MIB), str(COPIES)
     )
@@ -163,13 +164,22 @@ def test_cheap_copies(attack: Attack, quota_agent) -> None:
         f"{mib(wanted)} esperados",
     )
 
+    recorded = attack.recorded_exec(argv="reflink")
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} exec del ataque en {attack.container_short} (el "
+        "proceso; el copy_file_range/FICLONE concreto no, docs/23 decisión 6)",
+    )
+
 
 @scenario("quitar-su-propio-tope")
-def test_lifting_the_cap(attack: Attack, quota_agent) -> None:
+def test_lifting_the_cap(attack: Attack, quota_agent, battery_sensor) -> None:
     agent, mnt, _ = start(quota_agent)
     store = agent.store
     workspace_id = store.workspace_id()
 
+    attack.watch(battery_sensor, agent.jail)
     outcome = attack.run_script(
         agent,
         "quitar_su_propio_tope",
@@ -204,4 +214,11 @@ def test_lifting_the_cap(attack: Attack, quota_agent) -> None:
         f"los {len(ioctls)} ioctl de cuotas fallan con EOPNOTSUPP (95) y los {len(sysfs)} archivos "
         f"de sysfs no se pueden escribir; el tope sigue en {mib(TEST_CAP)} y las cuotas siguen "
         f"activas; al escribir más allá, para con EDQUOT tras {mib(outcome['written'])}",
+    )
+
+    recorded = attack.recorded_exec(argv="past-the-cap")
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} exec del intento en {attack.container_short}",
     )

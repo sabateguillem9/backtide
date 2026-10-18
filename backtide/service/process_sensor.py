@@ -15,11 +15,22 @@ calls it at a few points of its life; everything else happens here, on the senso
   ``system/sensor_down`` (risk 2) and an alert; then a restart, at most 3 an hour, each one
   recorded (``system/sensor_restart``). Failures are ``system/sensor_failed {stage, error}``.
   With ``required`` the agent is stopped (``lost``) BEFORE Tetragon is restarted: a restart
-  leaves the agent unseen for up to 40 s.
+  leaves the agent unseen for up to 40 s. ``lost`` says whether the agent is stopped; while it
+  is not (it could not be stopped), Tetragon is not restarted: the next tick asks again.
 - **Unproven**: three heartbeats in a row that ``docker exec`` could not even launch while the
   agent runs (an agent that fills its process limit can do that) are ``system/sensor_unproven``
   (risk 2) and an alert, once until a heartbeat goes through. Tetragon is not restarted (it is
-  fine); with ``required`` the agent is stopped, and asked back on the next tick.
+  fine); with ``required`` the agent is stopped on every such streak (not only the first), and
+  asked back on the next tick.
+- **Lost by Tetragon itself** (T07 review): every heartbeat reads Tetragon's loss counters
+  (``SensorJail.loss_counters``: its ring buffer full in the kernel, its queues overflowing; a
+  connect flood does that, and real execs are lost with it, without a line or a log). What grew
+  since the last reading is ``system/sensor_gap {kind: kernel_lost, count, counters}`` (risk 2)
+  and an alert; with ``required`` it is unproven: the agent is stopped and asked back. Counters
+  that cannot be read are ``sensor_failed {stage: losses}``, and the same with ``required``.
+- **Budget**: the reader's daily budget spent (``exhausted_budgets``) means the summaries cannot
+  say every command any more: an alert and, with ``required``, the sensor counts as down (the
+  agent stops and only comes back once the budget has room again).
 - **Required** (``[sensor] required``, decision 7): without it the agent runs anyway, with a
   warning. With it, ``allows_agent()`` is False while the sensor is not up, and the hooks tell
   the Guardian to stop the agent (``lost``) and to start it again once the sensor is back
@@ -53,6 +64,7 @@ from backtide.snapshots import Snapshot
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL = 30.0  # docs/23, decision 10
+READER_STALL = 60.0  # a poll running this long holds the reader's lock: the reader is blind
 HEARTBEAT_TIMEOUT = 10.0
 MISSES_FOR_DOWN = 3
 RESTARTS_PER_HOUR = 3
@@ -89,6 +101,7 @@ class SensorContainer(Protocol):
     def stop(self) -> None: ...
     def remove(self) -> None: ...
     def serving(self) -> bool: ...
+    def loss_counters(self) -> dict[str, int]: ...
 
 
 class AgentContainer(Protocol):
@@ -106,12 +119,14 @@ class SensorHooks:
     """The Guardian's side. ``record`` and ``alert`` are its own (``_record``, ``_alert``), so
     a sensor event goes through the same door as every other. ``agent_running`` says whether
     the agent runs code now (no heartbeat otherwise). ``lost`` and ``back`` only matter with
-    ``required``."""
+    ``required``; ``lost(reason)`` returns whether the agent is stopped now (False: it still
+    runs); ``reason`` is why (``sensor_down``, ``sensor_unproven``, ``sensor_lost_events``,
+    ``sensor_budget``)."""
 
     record: Callable[..., Event | object | None]
     alert: Callable[..., None]
     agent_running: Callable[[], bool]
-    lost: Callable[[], None] = lambda: None
+    lost: Callable[..., bool | None] = lambda reason="sensor_down": True
     back: Callable[[], None] = lambda: None
 
 
@@ -121,6 +136,39 @@ class _NotServing(Exception):
 
 class _AgentGone(Exception):
     """A probe could not even be launched: the agent does not run (not the sensor's fault)."""
+
+
+class KernelLoss:
+    """What Tetragon itself lost since the last reading (``SensorJail.loss_counters``), for
+    the heartbeat and for the evil-agent battery. ``baseline()`` after every (re)start of the
+    container; ``check()`` returns the counters that grew (empty: nothing lost). Both raise
+    JailError if the counters cannot be read."""
+
+    def __init__(self, read: Callable[[], dict[str, int]]) -> None:
+        self._read = read
+        self._last: dict[str, int] | None = None
+
+    def baseline(self) -> dict[str, int]:
+        self._last = dict(self._read())
+        return dict(self._last)
+
+    def forget(self) -> None:
+        self._last = None
+
+    def check(self) -> dict[str, int]:
+        now = dict(self._read())
+        last, self._last = self._last, now
+        if last is None:  # no baseline (it failed): all it lost so far may be new
+            return {kind: value for kind, value in now.items() if value > 0}
+        # A counter that went down means a new Tetragon: what it lost so far is all new.
+        grew = {kind: value - last.get(kind, 0) if value >= last.get(kind, 0) else value
+                for kind, value in now.items()}  # fmt: skip
+        return {kind: value for kind, value in grew.items() if value > 0}
+
+
+def kernel_lost_details(grew: dict[str, int], **more: Any) -> dict[str, Any]:
+    """The details of ``system/sensor_gap {kind: kernel_lost}``."""
+    return {"kind": "kernel_lost", "count": sum(grew.values()), "counters": dict(grew), **more}
 
 
 class ProcessSensor:
@@ -140,6 +188,7 @@ class ProcessSensor:
         misses_for_down: int = MISSES_FOR_DOWN,
         restarts_per_hour: int = RESTARTS_PER_HOUR,
         ready_timeout: float | None = None,
+        reader_stall: float = READER_STALL,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         thread: bool = True,
@@ -155,6 +204,8 @@ class ProcessSensor:
         self._ready_timeout = (
             ready_timeout if ready_timeout is not None else jail.config.ready_timeout
         )
+        self._reader_stall = reader_stall
+        self._stalled_said = False
         self._clock = clock
         self._sleep = sleep
         self._use_thread = thread
@@ -172,6 +223,11 @@ class ProcessSensor:
         self._unproven_said = False
         self._owes_back = False  # required and up: the Guardian stopped the agent for us
         self._backs: deque[float] = deque()
+        self._losses = KernelLoss(jail.loss_counters)
+        self._losses_said = False  # alerted about Tetragon's losses, until a clean heartbeat
+        self._losses_failing: float | None = None  # when the last failure to read them was said
+        self._budget_said = False
+        self._followed: str | None = None  # the agent container the reader attributes to
 
     @property
     def required(self) -> bool:
@@ -186,8 +242,11 @@ class ProcessSensor:
         return self._jail.config.name
 
     def allows_agent(self) -> bool:
-        """Whether the agent may run now: always, unless the sensor is required and not up."""
-        return not self._required or self._state is SensorState.UP
+        """Whether the agent may run now: always, unless the sensor is required and not up
+        (or up but with its daily budget spent: it cannot say what the agent runs)."""
+        if not self._required:
+            return True
+        return self._state is SensorState.UP and not self._reader.exhausted_budgets()
 
     # The Guardian's calls
 
@@ -208,12 +267,18 @@ class ProcessSensor:
     def follow_agent(self) -> None:
         """Attribute events to the agent's container as it is now (called right before the
         agent starts: the container may have been created again). Never raises."""
-        try:
-            agent_id = self._agent.container_id()
-            if agent_id is not None:
-                self._reader.set_agent(agent_id)
-        except (JailError, ValueError) as error:
-            self._failed("attribution", error, alert=False)
+        with self._lock:
+            try:
+                agent_id = self._agent.container_id()
+                if agent_id is not None:
+                    self._reader.set_agent(agent_id)
+            except (JailError, ValueError) as error:
+                self._confirmed = False  # not proven for whatever container runs now
+                self._failed("attribution", error, alert=False)
+                return
+            if agent_id != self._followed:
+                self._followed = agent_id
+                self._confirmed = False  # another container: its own probe proves it
 
     def agent_started(self) -> bool:
         """The agent just got ready: prove the whole path once per (re)start of the sensor.
@@ -274,7 +339,7 @@ class ProcessSensor:
     def tick(self) -> None:
         """One heartbeat: check an up sensor, or try to restart a fallen one. The thread calls
         it every ``heartbeat_interval`` seconds. Never raises."""
-        after: list[Callable[[], None]] = []
+        after: list[Callable[[], object]] = []
         with self._lock:
             if self._closing.is_set() or self._hooks is None:
                 return
@@ -284,6 +349,13 @@ class ProcessSensor:
         # with required, `lost` stops the agent before Tetragon goes away for a restart.
         self._answer(after)
         with self._lock:
+            if self._closing.is_set() or self._state is not SensorState.DOWN:
+                return
+            hooks = self._hooks
+        if self._required and hooks is not None and not self._agent_stopped(hooks):
+            logger.info("the agent still runs: the sensor waits to restart Tetragon")
+            return  # never restart Tetragon while a required sensor's agent may run unseen
+        with self._lock:
             if self._closing.is_set():
                 return
             if self._state is SensorState.DOWN:
@@ -291,13 +363,22 @@ class ProcessSensor:
         self._answer(after)
 
     @staticmethod
-    def _answer(calls: list[Callable[[], None]]) -> None:
+    def _answer(calls: list[Callable[[], object]]) -> None:
         while calls:
             call = calls.pop(0)
             try:
                 call()
             except Exception:
                 logger.exception("the Guardian's answer to the sensor failed")
+
+    @staticmethod
+    def _agent_stopped(hooks: SensorHooks) -> bool:
+        """Ask the Guardian to stop the agent (it is a no-op when it is stopped already)."""
+        try:
+            return hooks.lost("sensor_down") is not False
+        except Exception:
+            logger.exception("the Guardian could not stop the agent for the sensor")
+            return False
 
     def _run(self) -> None:
         while not self._closing.wait(self._interval):
@@ -310,7 +391,15 @@ class ProcessSensor:
                 except Exception:
                     logger.exception("cannot record that the sensor's heartbeat failed")
 
-    def _check(self, after: list[Callable[[], None]]) -> None:
+    def _check(self, after: list[Callable[[], object]]) -> None:
+        # Lock-free: a poll stuck on a flood of hostile lines holds the reader's lock, so
+        # nothing below (follow_agent, the probe) would answer. Treat it as blind.
+        if self._reader.blocked(self._reader_stall):
+            self._say_stalled()
+            if self._required:
+                self._stop_unproven(after, "sensor_lost_events")
+            return
+        self._stalled_said = False
         try:
             running = self._jail.is_running()
         except JailError as error:
@@ -321,12 +410,14 @@ class ProcessSensor:
             return
         hooks = self._hooks
         if hooks is None or not hooks.agent_running():
-            if self._owes_back:
+            if self._owes_back and not self._blind():
                 self._ask_back(after)
             return  # a frozen or stopped agent runs nothing to see
         self._owes_back = False
         if running is True:
             self.follow_agent()
+            if self._check_budget(after) or self._check_losses(after):
+                return  # required: the agent is being stopped, nothing to probe
             nonce = procs.new_nonce("hb")
             self._reader.expect(nonce)
             try:
@@ -343,7 +434,7 @@ class ProcessSensor:
         if self._misses >= self._misses_for_down:
             self._down("heartbeat", after)
 
-    def _not_launched(self, gone: _AgentGone, after: list[Callable[[], None]]) -> None:
+    def _not_launched(self, gone: _AgentGone, after: list[Callable[[], object]]) -> None:
         """A heartbeat docker exec did not launch. Nobody's fault if the agent is not running
         (or frozen) any more; if it runs, the agent may be keeping the probe out."""
         try:
@@ -353,7 +444,12 @@ class ProcessSensor:
         if not running:
             return
         self._unlaunched += 1
-        if self._unlaunched < self._misses_for_down or self._unproven_said:
+        if self._unlaunched < self._misses_for_down:
+            return
+        misses, self._unlaunched = self._unlaunched, 0  # a new streak: with required, each stops
+        if self._unproven_said:
+            if self._required:
+                self._stop_unproven(after)
             return
         self._unproven_said = True
         event = self._record(
@@ -362,7 +458,7 @@ class ProcessSensor:
             self.name,
             details={
                 "reason": "probe_launch",
-                "misses": self._unlaunched,
+                "misses": misses,
                 "error": docker.sanitize(str(gone), _ERROR_CHARS),
             },
             risk=2,
@@ -380,11 +476,155 @@ class ProcessSensor:
             + tail,
             event,
         )
-        if self._required and self._hooks is not None:
-            self._owes_back = True
-            after.append(self._hooks.lost)
+        if self._required:
+            self._stop_unproven(after)
 
-    def _ask_back(self, after: list[Callable[[], None]]) -> None:
+    def _stop_unproven(
+        self, after: list[Callable[[], object]], reason: str = "sensor_unproven"
+    ) -> None:
+        """Required, and what the agent runs is not proven to be recorded: stop it (``lost``)
+        and ask for it again once it is stopped. The next start proves the path again."""
+        if self._hooks is None:
+            return
+        self._confirmed = False
+        self._owes_back = True
+        lost = self._hooks.lost
+        after.append(lambda: lost(reason))
+
+    def _blind(self) -> bool:
+        """Required and the reader's daily budget is spent: the agent stays stopped."""
+        return self._required and bool(self._reader.exhausted_budgets())
+
+    def _check_budget(self, after: list[Callable[[], object]]) -> bool:
+        """The reader's daily budget spent: an alert (once per spell) and, with required, the
+        agent stops until it has room (True)."""
+        spent = self._reader.exhausted_budgets()
+        if not spent:
+            self._budget_said = False
+            return False
+        if not self._budget_said:
+            self._budget_said = True
+            tail = (
+                " Es obligatorio en esta configuración, así que el agente se para hasta que "
+                "haya cupo."
+                if self._required
+                else " El agente sigue."
+            )
+            self._alert(
+                AlertLevel.ERROR,
+                "El sensor de procesos ha agotado su cupo diario",
+                f"El agente ha generado tantos eventos ({', '.join(spent)}) que el cupo diario "
+                "se ha agotado: lo que haga ahora solo queda resumido, y un resumen no puede "
+                "nombrar cada comando." + tail,
+            )
+        if not self._required:
+            return False
+        self._stop_unproven(after, "sensor_budget")
+        return True
+
+    def _check_losses(self, after: list[Callable[[], object]]) -> bool:
+        """What went unseen since the last heartbeat: Tetragon's own losses (recorded here),
+        and the reader's blind spots (a throttle of the agent's cgroup, binaries folded
+        without one event of theirs: recorded by the reader). Alerted once per spell and, with
+        required, the agent stopped (True). Unreadable counters are the same with required,
+        and their failure is said again every hour."""
+        blind = self._reader.take_blind_spots()
+        try:
+            grew = self._losses.check()
+        except JailError as error:
+            now = self._clock()
+            if self._losses_failing is None or now - self._losses_failing >= RESTART_WINDOW:
+                self._losses_failing = now
+                self._failed("losses", error)
+            if self._required:
+                self._stop_unproven(after, "sensor_lost_events")
+                return True
+            grew = {}
+        else:
+            self._losses_failing = None
+        if not grew and not blind:
+            self._losses_said = False
+            return False
+        if grew:
+            self._record_losses(grew)
+        if blind:
+            self._say_blind(blind)
+        if self._required:
+            self._stop_unproven(after, "sensor_lost_events")
+            return True
+        return False
+
+    def _say_stalled(self) -> None:
+        if self._stalled_said:
+            return
+        self._stalled_said = True
+        tail = (
+            " Es obligatorio en esta configuración, así que el agente se para."
+            if self._required
+            else " El agente sigue."
+        )
+        event = self._record(
+            "system",
+            "sensor_gap",
+            self.name,
+            details={"kind": "reader_stalled", "seconds": round(self._reader_stall)},
+            risk=2,
+        )
+        self._alert(
+            AlertLevel.ERROR,
+            "El sensor de procesos va muy por detrás",
+            "El lector del sensor lleva demasiado tiempo en una sola lectura (una avalancha de "
+            "líneas hostiles): puede estar perdiendo comandos." + tail,
+            event,
+        )
+
+    def _say_blind(self, blind: dict[str, int]) -> None:
+        if self._losses_said:
+            return
+        self._losses_said = True
+        what = []
+        if blind.get("throttle"):
+            what.append(
+                "el kernel ha dejado de pasarle comandos (más de los que admite por segundo)"
+            )
+        if blind.get("novelty_lost"):
+            what.append("hay programas que solo constan en un resumen, sin un solo evento suyo")
+        tail = (
+            " Es obligatorio en esta configuración, así que el agente se para y se vuelve a "
+            "arrancar después."
+            if self._required
+            else " El agente sigue."
+        )
+        self._alert(
+            AlertLevel.ERROR,
+            "El sensor de procesos ha dejado de ver comandos",
+            "Una avalancha del agente ha cegado al sensor: " + "; ".join(what) + ". Algún "
+            "comando puede faltar en la caja negra." + tail,
+        )
+
+    def _record_losses(self, grew: dict[str, int], **more: Any) -> None:
+        event = self._record(
+            "system", "sensor_gap", self.name, details=kernel_lost_details(grew, **more), risk=2
+        )
+        if self._losses_said:
+            return
+        self._losses_said = True
+        tail = (
+            " Es obligatorio en esta configuración, así que el agente se para y se vuelve a "
+            "arrancar después."
+            if self._required
+            else " El agente sigue."
+        )
+        self._alert(
+            AlertLevel.ERROR,
+            "El sensor de procesos ha perdido eventos",
+            f"Tetragon no ha podido guardar {sum(grew.values())} eventos (una avalancha de "
+            "conexiones o de procesos lo desborda): algún comando del agente puede faltar en "
+            "la caja negra." + tail,
+            event,
+        )
+
+    def _ask_back(self, after: list[Callable[[], object]]) -> None:
         """Required and up, and the Guardian stopped the agent for us: ask it to start the
         agent again, at most ``BACKS_PER_HOUR`` times an hour."""
         now = self._clock()
@@ -396,10 +636,11 @@ class ProcessSensor:
         self._owes_back = False
         after.append(self._hooks.back)
 
-    def _down(self, reason: str, after: list[Callable[[], None]]) -> None:
+    def _down(self, reason: str, after: list[Callable[[], object]]) -> None:
         misses, self._misses = self._misses, 0
         self._state = SensorState.DOWN
         self._confirmed = False
+        self._losses.forget()
         event = self._record(
             "system", "sensor_down", self.name, details={"reason": reason, "misses": misses}, risk=2
         )
@@ -414,10 +655,9 @@ class ProcessSensor:
                 "se graban hasta que vuelva. El agente sigue. Se reintenta."
             )
         self._alert(AlertLevel.ERROR, "El sensor de procesos no responde", body, event)
-        if self._required and self._hooks is not None:
-            after.append(self._hooks.lost)
+        # With required, tick() asks `lost` (and waits for it) before any restart.
 
-    def _retry(self, after: list[Callable[[], None]]) -> None:
+    def _retry(self, after: list[Callable[[], object]]) -> None:
         now = self._clock()
         while self._restarts and now - self._restarts[0] >= RESTART_WINDOW:
             self._restarts.popleft()
@@ -467,6 +707,7 @@ class ProcessSensor:
             return False
         self._state = SensorState.UP
         self._misses, self._confirmed = 0, False
+        self._baseline_losses(reused)
         self._reader.poll()
         self._record(
             "system",
@@ -482,6 +723,19 @@ class ProcessSensor:
             },
         )
         return True
+
+    def _baseline_losses(self, reused: bool) -> None:
+        """Read Tetragon's loss counters right after it serves. A Tetragon a killed service
+        left running may have lost events while nobody looked: those are a gap too."""
+        try:
+            counters = self._losses.baseline()
+        except JailError as error:
+            self._losses.forget()
+            self._failed("losses", error, alert=False)
+            return
+        lost = {kind: value for kind, value in counters.items() if value > 0}
+        if reused and lost:
+            self._record_losses(lost, while_down=True)
 
     def _start_container(self) -> bool:
         """Start the sensor; True if it reused one already running (a killed service's)."""

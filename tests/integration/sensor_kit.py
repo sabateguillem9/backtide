@@ -46,13 +46,17 @@ def remove_sensor(name: str) -> None:
 
 
 @contextmanager
-def sensed_service(make_real_service: Callable[..., Service]) -> Iterator[Service]:
+def sensed_service(
+    make_real_service: Callable[..., Service], *, required: bool = False
+) -> Iterator[Service]:
     """A service (not started) whose config has a ``[sensor]`` and whose launcher runs it."""
     remove_stale_sensors()
     service = make_real_service()
     name = f"{SENSOR_PREFIX}{os.getpid()}-{uuid4().hex[:12]}"
     with service.config_path.open("a") as config:
         config.write(f'[sensor]\nname = "{name}"\n')
+        if required:
+            config.write("required = true\n")
     service.config = ServiceConfig.from_file(service.config_path)
     service.main_args = ("--with-sensor",)
     try:

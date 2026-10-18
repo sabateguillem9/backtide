@@ -31,14 +31,16 @@ _PAIR_VALUE_KEYS = frozenset({"value", "values"})
 # blocks first, then header lines, then single tokens, then name/value pairs. A name is
 # matched from its first character (the lookbehinds), which also keeps the scans linear.
 _TEXT_PATTERNS = (
-    # PEM private keys. A block without its END line is struck to the end of the text.
+    # PEM private keys (and PGP's KEY BLOCK). Without its END line, struck to the end.
     re.compile(
-        r"(?P<secret>-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
-        r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|.*))",
+        r"(?P<secret>-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"
+        r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|.*))",
         re.DOTALL,
     ),
     # JSON Web Tokens: base64url('{"...') . base64url('{"...') . signature
-    re.compile(r"\b(?P<secret>eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)"),
+    re.compile(
+        r"\b(?P<secret>eyJ[A-Za-z0-9_-]{1,512}+\.eyJ[A-Za-z0-9_-]{1,4096}+\.[A-Za-z0-9_-]{0,2048}+)"
+    ),
     # Header lines with a secret name: "Authorization: Basic ...", "X-Auth-Token: ..."
     re.compile(rf"(?i)(?<![\w-])[\w-]*?{_SENSITIVE_WORDS}[ \t]*:[ \t]*(?P<secret>[^\r\n\"']+)"),
     re.compile(r"(?i)\bbearer\s+(?P<secret>[A-Za-z0-9._~+/-]{8,}=*)"),
@@ -57,7 +59,7 @@ _TEXT_PATTERNS = (
     re.compile(r"\b(?P<secret>(?:AKIA|ASIA)[A-Z0-9]{16})\b"),  # AWS access key id
     re.compile(r"(?<![0-9])(?P<secret>[0-9]{5,16}:[A-Za-z0-9_-]{30,})"),  # Telegram bot
     # Credentials inside a URL: scheme://user:password@host
-    re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:(?P<secret>[^/\s@]+)@"),
+    re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://[^/\s:@]+:(?P<secret>[^/\s@]+)@"),
     # curl -u user:password, --user user:password
     re.compile(r"(?<!\S)(?:-u|--user)(?:[ \t]+|=)[^\s:]+:(?P<secret>\S+)"),
     # A flag with a secret name and its value after a space: --password hunter2
@@ -129,10 +131,16 @@ def _redact_key(key: object) -> object:
 
 
 def _redact_text(text: str) -> str:
+    return _truncate(strike_text(text))
+
+
+def strike_text(text: str) -> str:
+    """The secret patterns of redact() struck out of ``text``, without cutting it: for callers
+    that cut texts themselves (the process sensor keeps the head and the tail of a command)."""
     text = _to_valid_utf8(text)
     for pattern in _TEXT_PATTERNS:
         text = pattern.sub(_strike_secret, text)
-    return _truncate(text)
+    return text
 
 
 def _strike_secret(match: re.Match[str]) -> str:

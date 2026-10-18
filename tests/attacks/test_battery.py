@@ -54,8 +54,8 @@ def decorated_scenarios() -> dict[str, list[str]]:
 
 def test_the_manifest_lists_both_kinds_of_scenario() -> None:
     assert READY, "no scenario runs today"
-    assert PENDING, "nothing is waiting for a later task: T06-T10 have scenarios to list"
-    assert {s.task for s in PENDING} >= {"T04a", "T06", "T10"}
+    assert PENDING, "nothing is waiting for a later task: T07-T10 have scenarios to list"
+    assert {s.task for s in PENDING} >= {"T04a", "T10"}
 
 
 def test_every_ready_scenario_has_exactly_one_test() -> None:

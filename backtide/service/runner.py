@@ -42,7 +42,6 @@ from backtide.analyzer import (
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
 from backtide.blackbox.redact import KnownScrubber
-from backtide.gate.providers import Providers
 from backtide.jail import AgentJail, JailError, ca
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
@@ -319,10 +318,15 @@ def build_sensor(
     snapshot to rewind to, the Gateway token struck and what an earlier run already recorded
     skipped. Constructed only: the Guardian starts it."""
     jail_config = jail_config if jail_config is not None else config.sensor_jail_config()
-    try:
-        scrub = KnownScrubber([config.gateway_token.reveal()]).text
-    except ValueError:
-        scrub = None  # a token too short to search for: redact() still runs
+    # The Gateway token and the providers' keys (the agent may type its fake one in a command;
+    # the real one it never has, but nothing it could show is recorded either). known_secrets
+    # leaves out what is too short to search for (redact() still runs), so nothing here fails
+    # quietly: a config whose providers cannot be built raises.
+    known = known_secrets(
+        [config.gateway_token.reveal(), *config.model_providers().known_secrets()]
+    )
+    # cut_tails: Tetragon cuts long arguments (~327 KiB), maybe in the middle of a secret.
+    scrub = KnownScrubber(list(known), cut_tails=True).text if known else None
     reader = TetragonReader(
         config.sensor_reader_config(),
         box,
@@ -342,16 +346,17 @@ def build_egress(
     proxy: ProxyJail | None = None,
 ) -> Egress:
     """The egress proxy of ``config`` (docs/21, section 9): its container, and what backtide lets
-    out through it, the allowed hosts of ``[proxy]``. The channel records through the rules
-    (``box``) and strikes the Gateway token too. The model providers and their keys come in
-    T06-5: until then no host is a provider's, and nothing is swapped. Constructed only: the
-    Guardian starts it. ConfigError for an allowed host the gate cannot use."""
+    out through it, the allowed hosts of ``[proxy]`` and the model providers' hosts. The channel
+    hands the proxy each provider's real and fake key (in memory only: the ``config`` message,
+    T06-5), records through the rules (``box``) and strikes the Gateway token too. Constructed
+    only: the Guardian starts it. ConfigError for an allowed host the gate cannot use."""
     proxy = proxy if proxy is not None else ProxyJail(config.proxy_jail_config())
     settings = config.proxy_settings()
     policy = Policy(
         allow_hosts=settings.allow_hosts,
-        providers=Providers([]),
+        providers=config.model_providers(),
         secrets=known_secrets([config.gateway_token.reveal()]),
+        provider_tools=settings.allow_provider_tools,
     )
     try:
         policy.allow_list()

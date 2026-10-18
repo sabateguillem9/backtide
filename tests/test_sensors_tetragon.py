@@ -565,7 +565,7 @@ def test_a_truncated_file_is_read_again_from_the_start(
 def test_a_burst_is_folded_into_one_summary_every_ten_seconds(
     tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
 ) -> None:
-    reader = make_reader(exec_rate=0.001, exec_burst=3)
+    reader = make_reader(exec_rate=0.001, exec_burst=3, novel_per_binary=0)
     tetragon.write(*(exec_line(f"n{i}", binary=f"/usr/bin/b{i % 2}") for i in range(10)))
     reader.poll()
     assert box.argvs() == ["n0", "n1", "n2"]
@@ -593,7 +593,9 @@ def test_the_summary_carries_the_snapshot_of_the_first_folded_command(
     tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
 ) -> None:
     ids = iter(["s1", "s2", "s3", "s4"])
-    reader = make_reader(exec_rate=0.001, exec_burst=1, snapshot_for=lambda t: next(ids))
+    reader = make_reader(
+        exec_rate=0.001, exec_burst=1, snapshot_for=lambda t: next(ids), novel_per_binary=0
+    )
     tetragon.write(exec_line("a"), exec_line("b"), exec_line("c"))
     reader.poll()
     clock.advance(10)
@@ -604,7 +606,9 @@ def test_the_summary_carries_the_snapshot_of_the_first_folded_command(
 def test_connects_have_their_own_bucket(
     tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
 ) -> None:
-    reader = make_reader(exec_rate=0.001, exec_burst=1, net_rate=0.001, net_burst=2)
+    reader = make_reader(
+        exec_rate=0.001, exec_burst=1, net_rate=0.001, net_burst=2, novel_per_binary=0
+    )
     tetragon.write(
         exec_line("a"),
         exec_line("b"),
@@ -625,7 +629,7 @@ def test_connects_have_their_own_bucket(
 def test_the_daily_budget_leaves_only_summaries_and_one_warning(
     tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
 ) -> None:
-    reader = make_reader(exec_daily=2)
+    reader = make_reader(exec_daily=2, novel_per_binary=0)
     tetragon.write(*(exec_line(f"n{i}") for i in range(5)))
     reader.poll()
     tetragon.write(exec_line("later"))
@@ -634,6 +638,9 @@ def test_the_daily_budget_leaves_only_summaries_and_one_warning(
     assert box.argvs() == ["n0", "n1"]
     (warning,) = box.gaps("budget")
     assert warning["class"] == "exec"
+    budget_gaps = [e for e in box.of("system", "sensor_gap") if e.details["kind"] == "budget"]
+    assert [e.risk for e in budget_gaps] == [2]  # the review: risk 2
+    assert reader.exhausted_budgets() == ["exec"]
     assert box.of("exec", "summary")[0].details["folded"] == 4
     clock.advance(24 * 3600)
     tetragon.write(exec_line("next day"))
@@ -644,7 +651,7 @@ def test_the_daily_budget_leaves_only_summaries_and_one_warning(
 def test_stop_writes_the_last_summary(
     tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
 ) -> None:
-    reader = make_reader(exec_rate=0.001, exec_burst=1)
+    reader = make_reader(exec_rate=0.001, exec_burst=1, novel_per_binary=0)
     tetragon.write(exec_line("a"), exec_line("b"))
     reader.poll()
     reader.stop()
@@ -655,10 +662,14 @@ def test_stop_writes_the_last_summary(
 
 
 def test_throttle_becomes_a_gap_with_its_window(
-    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
 ) -> None:
-    tetragon.write(raw("throttle_start"), raw("throttle_stop"))
-    make_reader().poll()
+    reader = make_reader()
+    tetragon.write(raw("throttle_start"))
+    reader.poll()
+    clock.advance(10)
+    tetragon.write(raw("throttle_stop"))
+    reader.poll()
     start, stop = box.gaps("throttle")
     assert start == {
         "kind": "throttle",
@@ -986,3 +997,260 @@ def test_probes_of_an_earlier_run_are_not_recorded(
     reader.poll()
     assert box.argvs() == [new]  # unexpected and newer than the reader: recorded, as before
     assert reader.stats()["stale_probes"] == 1
+
+
+# --- T07 review: floods must not erase who else ran ----------------------------------------
+
+
+def test_past_the_bucket_the_first_of_each_binary_are_still_recorded(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(exec_rate=0.001, exec_burst=2, novel_per_binary=3)
+    flood = [exec_line("t", binary="/bin/true") for _ in range(200)]
+    tetragon.write(*flood[:100], exec_line("the real one", binary="/usr/bin/curl"), *flood[100:])
+    reader.poll()
+    recorded = box.of("exec", "exec")
+    # 2 from the bucket, then 3 more of /bin/true and the curl, marked novel.
+    assert [e.target for e in recorded].count("/bin/true") == 5
+    (curl,) = [e for e in recorded if e.target == "/usr/bin/curl"]
+    assert curl.details["argv"] == "the real one" and curl.details["novel"] is True
+    assert reader.stats()["novel"] == 4
+    clock.advance(10)
+    reader.poll()
+    (summary,) = box.of("exec", "summary")
+    assert summary.details["folded"] == 195
+    # A new window: every binary is new again.
+    tetragon.write(*(exec_line("t", binary="/bin/true") for _ in range(10)))
+    reader.poll()
+    assert [e.target for e in box.of("exec", "exec")].count("/bin/true") == 8
+
+
+def test_the_novelty_bucket_is_bounded(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(
+        exec_rate=0.001,
+        exec_burst=1,
+        novel_per_binary=1,
+        novel_rate=0.001,
+        novel_burst=10,
+        first_rate=0.001,
+        first_burst=10,
+    )
+    tetragon.write(*(exec_line("x", binary=f"/w/bin{i}") for i in range(100)))
+    reader.poll()
+    assert len(box.of("exec", "exec")) == 1 + 10
+
+
+def test_the_novelty_budget_is_bounded(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(exec_rate=0.001, exec_burst=1, novel_per_binary=1, novel_daily=3)
+    for i in range(10):
+        tetragon.write(exec_line("x", binary=f"/w/bin{i}"))
+        reader.poll()
+        clock.advance(10)
+    assert len(box.of("exec", "exec")) == 1 + 3
+
+
+def test_an_exhausted_budget_still_records_the_first_of_each_binary(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(exec_daily=2, novel_per_binary=1)
+    tetragon.write(*(exec_line("n") for _ in range(5)), exec_line("rm", binary="/bin/rm"))
+    reader.poll()
+    assert [e.target for e in box.of("exec", "exec")] == ["/bin/true"] * 3 + ["/bin/rm"]
+    (warning,) = box.gaps("budget")
+    assert warning["class"] == "exec"
+
+
+def test_the_summary_lists_every_binary_the_rarest_first(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(exec_rate=0.001, exec_burst=1, novel_per_binary=0)
+    lines = [exec_line("x", binary="/bin/true") for _ in range(300)]
+    lines += [exec_line("y", binary=f"/w/tool{i}") for i in range(60)]
+    lines += [exec_line("z", binary="/bin/sh"), exec_line("z", binary="/bin/sh")]
+    tetragon.write(*lines)
+    reader.poll()
+    clock.advance(10)
+    reader.poll()
+    (summary,) = box.of("exec", "summary")
+    listed = summary.details["binaries"]
+    assert len(listed) == 50
+    assert summary.details["distinct_binaries"] == 62
+    assert all(item["count"] == 1 for item in listed)  # the flood of /bin/true is last
+    assert summary.details["top_binaries"][0] == {"binary": "/bin/true", "count": 299}
+
+
+def test_throttles_are_one_gap_per_summary_interval_with_a_count(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader()
+    for _ in range(20):
+        tetragon.write(raw("throttle_start"), raw("throttle_stop"))
+        reader.poll()
+        clock.advance(0.5)
+    assert len(box.gaps("throttle")) == 1  # the first one, at once
+    reader.poll()  # 10 s later: the held ones, in one gap
+    reader.poll()
+    gaps = box.gaps("throttle")
+    held = sum(g.get("held", {}).get("starts", 0) + g.get("held", {}).get("stops", 0) for g in gaps)
+    assert len(gaps) == 2
+    assert gaps[1]["state"] == "repeated" and gaps[1]["held"] == {"starts": 19, "stops": 20}
+    assert held + 1 == 40  # every start and stop is accounted for
+
+
+def test_an_oversize_line_keeps_a_long_binary_and_says_when_it_is_lost(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    long_cwd = "/w/" + "\x01" * 4000  # 24 KiB once escaped: past the old 8 KiB
+    data = json.loads(exec_line("a" + "\x02" * 500_000, binary="/usr/bin/sh"))
+    process = data["process_exec"]["process"]
+    process["cwd"] = long_cwd
+    # Tetragon writes cwd before binary (field order of the fixture is kept by json.dumps).
+    tetragon.write(json.dumps(data))
+    reader = make_reader()
+    reader.poll()
+    (first,) = box.of("exec", "exec")
+    assert first.target == "/usr/bin/sh" and "binary_lost" not in first.details
+
+    data = json.loads(exec_line("a" + "\x02" * 500_000, binary="/x"))
+    data["process_exec"]["process"]["binary"] = "/" + "\x03" * 20000  # 120 KiB escaped
+    tetragon.write(json.dumps(data))
+    reader.poll()
+    second = box.of("exec", "exec")[1]
+    assert second.details["oversize"] is True and second.details["binary_lost"] is True
+
+
+# --- T07 re-review: throttles and lost novelty make the reader blind ----------------------
+
+
+def test_a_throttle_is_risk_2_and_a_blind_spot(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader()
+    tetragon.write(raw("throttle_start"))
+    reader.poll()
+    assert [e.risk for e in box.of("system", "sensor_gap")] == [2]
+    assert reader.take_blind_spots() == {"throttle": 1}
+    assert reader.take_blind_spots() == {}
+
+
+def test_decoys_with_names_of_their_own_cannot_hide_the_real_command(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """Re-review A3: the buckets drained by a flood, the novelty burst by decoys, then more
+    decoys named to sort first, then the real command."""
+    reader = make_reader(
+        exec_rate=0.001,
+        exec_burst=1,
+        novel_rate=0.001,
+        novel_burst=3,
+        first_rate=0.001,
+        first_burst=3,
+    )
+    lines = [exec_line("x", binary="/bin/true") for _ in range(5)]
+    lines += [exec_line("y", binary=f"/workspace/d/{i:04d}") for i in range(80)]
+    lines.append(exec_line("evil.invalid", binary="/usr/bin/curl"))
+    tetragon.write(*lines)
+    reader.poll()
+    assert "/usr/bin/curl" not in [e.target for e in box.of("exec", "exec")]
+    clock.advance(10)
+    reader.poll()
+    (summary,) = box.of("exec", "summary")
+    # Among the equally rare, the image's programs come first: /bin/true's one folded, curl.
+    assert {"binary": "/usr/bin/curl", "count": 1} in summary.details["binaries"][:2]
+    (lost,) = box.gaps("novelty_lost")
+    # /bin/true's repeats took the repeat bucket; 3 decoys took the first-event bucket: the
+    # other 77 decoys and curl have no event of their own.
+    assert lost["class"] == "exec" and lost["binaries"] == 78
+    risks = sorted(e.risk for e in box.of("system", "sensor_gap"))
+    assert risks == [1, 2]  # novelty_lost (risk 2) and /bin/true's repeats (argv_folded, risk 1)
+    assert reader.take_blind_spots() == {"novelty_lost": 1}
+
+
+def test_a_spent_novelty_budget_is_a_spent_budget(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(exec_rate=0.001, exec_burst=1, novel_daily=2)
+    tetragon.write(*(exec_line("x", binary=f"/w/b{i}") for i in range(5)))
+    reader.poll()
+    assert reader.exhausted_budgets() == ["exec_novel"]
+
+
+# --- T07 third pass: a command line of its own, and the first of each binary --------------
+
+
+def test_a_new_command_line_of_a_seen_binary_gets_its_own_novelty(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """Third pass M-b: three `sh -c true` must not use up the novelty of `sh -c <evil>`."""
+    reader = make_reader(exec_rate=0.001, exec_burst=1)
+    lines = [exec_line("x") for _ in range(10)]
+    lines += [exec_line("-c true", binary="/bin/sh") for _ in range(3)]
+    lines.append(exec_line('-c "rm -rf /work/x"', binary="/bin/sh"))
+    tetragon.write(*lines)
+    reader.poll()
+    argvs = [e.details["argv"] for e in box.of("exec", "exec") if e.target == "/bin/sh"]
+    assert '-c "rm -rf /work/x"' in argvs
+
+
+def test_a_builds_repeated_command_is_a_risk_1_gap_not_a_blind_spot(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """Quota met for one command (a build running it many times): risk 1, not blind."""
+    reader = make_reader(
+        exec_rate=0.001, exec_burst=1, novel_per_binary=3, novel_burst=100, first_burst=100
+    )
+    tetragon.write(*(exec_line("-c make", binary="/bin/sh") for _ in range(10)))
+    reader.poll()
+    clock.advance(10)
+    reader.poll()
+    (folded,) = box.gaps("argv_folded")
+    assert folded["class"] == "exec" and folded["events"] == 10 - 1 - 3
+    assert box.gaps("novelty_lost") == []
+    assert [e.risk for e in box.of("system", "sensor_gap")] == [1]
+    assert reader.take_blind_spots() == {}  # a build must not stop a required agent
+
+
+def test_a_command_a_drained_bucket_turned_away_is_blind(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """M1: seed rm, drain the buckets with argv variants of /bin/true, then run rm -rf: it is
+    folded because the bucket was empty, not because of its own quota: risk 2 and blind."""
+    reader = make_reader(
+        exec_rate=0.001,
+        exec_burst=1,
+        novel_per_binary=3,
+        novel_rate=0.001,
+        novel_burst=3,
+        first_rate=0.001,
+        first_burst=2,
+    )
+    lines = [exec_line("/nada", binary="/bin/rm")]  # seed: /bin/rm seen
+    lines += [exec_line(f"-c 'v {i}'", binary="/bin/true") for i in range(20)]  # drains buckets
+    lines.append(exec_line("-rf /work/x", binary="/bin/rm"))  # a new command of a seen binary
+    tetragon.write(*lines)
+    reader.poll()
+    assert "-rf /work/x" not in [e.details["argv"] for e in box.of("exec", "exec")]
+    clock.advance(10)
+    reader.poll()
+    (lost,) = box.gaps("novelty_lost")
+    assert lost["class"] == "exec" and lost["events"] >= 1
+    assert 2 in [e.risk for e in box.of("system", "sensor_gap")]
+    assert reader.take_blind_spots().get("novelty_lost") == 1
+
+
+def test_the_first_event_of_each_binary_has_its_own_bucket(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """Third pass B-b: repeats (decoys of one name, or argv variations) cannot use up the
+    room for programs not seen yet in the window."""
+    reader = make_reader(exec_rate=0.001, exec_burst=1, novel_rate=0.001, novel_burst=5)
+    lines = [exec_line(f"-c 'step {i}'", binary="/bin/sh") for i in range(50)]
+    lines += [exec_line("x", binary=f"/usr/bin/tool{i}") for i in range(40)]
+    tetragon.write(*lines)
+    reader.poll()
+    targets = {e.target for e in box.of("exec", "exec")}
+    assert {f"/usr/bin/tool{i}" for i in range(40)} <= targets
