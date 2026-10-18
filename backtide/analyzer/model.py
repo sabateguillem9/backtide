@@ -51,11 +51,13 @@ class Burst:
     """The rule only matches once ``count`` is reached within the last ``window`` seconds,
     counting this event and the earlier ones that match the rule's other conditions. With
     ``sum_path`` each event weighs what that number in ``details`` says (a summary that folded
-    300 deletes weighs 300); without it, 1."""
+    300 deletes weighs 300), and an event without that number weighs ``default`` (so one rule
+    can count loose deletes as 1 each and add a summary's folded ones); without it, 1."""
 
     count: int
     window: int
     sum_path: tuple[str, ...] | None = None
+    default: float = 0.0
 
 
 @dataclass(frozen=True)

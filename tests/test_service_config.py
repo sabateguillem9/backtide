@@ -639,3 +639,84 @@ def test_the_agent_config_dir_is_never_a_folder_of_the_proxy(layout: Path, folde
                 gateway_token=Secret(TOKEN),
                 agent={"config_dir": config_dir},
             )
+
+
+# --- [sensor] (T07-3, docs/23) -----------------------------------------------------------------
+
+
+def test_the_sensor_defaults_are_the_designs(layout: Path) -> None:
+    config = ServiceConfig.from_file(write_toml(layout))
+    state = layout / "state"
+    assert config.sensor_dir == state / "sensor"
+    assert config.sensor_required is False  # decision 7: the agent runs without it, warned
+    jail = config.sensor_jail_config()
+    assert (jail.state_dir, jail.name, jail.memory, jail.cpus) == (
+        state / "sensor",
+        "backtide-sensor",
+        "1g",
+        "1",
+    )
+    assert (jail.cgroup_rate, jail.file_perm) == ("1000,1s", "600")
+    reader = config.sensor_reader_config()
+    assert (reader.events_dir, reader.cursor_file) == (jail.events_dir, jail.cursor_file)
+    assert reader.agent_name == config.jail_config().name
+    assert (reader.exec_rate, reader.exec_burst, reader.exec_daily) == (20.0, 500, 100_000)
+    assert (reader.net_rate, reader.net_burst, reader.net_daily) == (20.0, 200, 50_000)
+
+
+def test_the_sensor_options_are_read(layout: Path) -> None:
+    config = ServiceConfig.from_file(
+        write_toml(
+            layout,
+            '[sensor]\nname = "sensor-2"\nrequired = true\nmemory = "2g"\ncpus = "0.5"\n'
+            'cgroup_rate = "500,1s"\nexec_rate = 10\nexec_burst = 100\nexec_daily = 1000\n'
+            "net_rate = 5.5\nnet_burst = 50\nnet_daily = 500\n",
+        )
+    )
+    assert config.sensor_required is True
+    jail = config.sensor_jail_config()
+    assert (jail.memory, jail.cpus, jail.cgroup_rate) == ("2g", "0.5", "500,1s")
+    assert jail.name == config.sensor_reader_config().sensor_name == "sensor-2"
+    reader = config.sensor_reader_config()
+    assert (reader.exec_rate, reader.exec_burst, reader.exec_daily) == (10, 100, 1000)
+    assert (reader.net_rate, reader.net_burst, reader.net_daily) == (5.5, 50, 500)
+
+
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        pytest.param("sensor = 3\n", r"\[sensor\] must be a table", id="not-a-table"),
+        pytest.param("[sensor]\nsurprise = 1\n", "unknown", id="unknown-key"),
+        pytest.param('[sensor]\nimage = "quay.io/cilium/tetragon:latest"\n', "unknown", id="image"),
+        pytest.param('[sensor]\nfile_perm = "644"\n', "unknown", id="test-only-perm"),
+        pytest.param('[sensor]\nstate_dir = "/tmp/x"\n', "unknown", id="state-dir"),
+        pytest.param('[sensor]\nrequired = "yes"\n', "required", id="required-str"),
+        pytest.param('[sensor]\nmemory = "lots"\n', "sensor", id="memory"),
+        pytest.param('[sensor]\ncgroup_rate = "1000"\n', "sensor", id="rate"),
+        pytest.param("[sensor]\nexec_rate = 0\n", "exec_rate", id="exec-rate-0"),
+        pytest.param("[sensor]\nexec_burst = 1.5\n", "exec_burst", id="burst-float"),
+        pytest.param("[sensor]\nnet_daily = -1\n", "net_daily", id="daily-negative"),
+        pytest.param("[sensor]\nnet_daily = true\n", "net_daily", id="daily-bool"),
+        pytest.param('[sensor]\ntoken = "x"\n', "never hold a key", id="secret"),
+        pytest.param('[sensor]\nname = "backtide-agente"\n', "another container", id="agents"),
+        pytest.param('[sensor]\nname = "backtide-proxy"\n', "another container", id="proxys"),
+        pytest.param('[sensor]\nname = "-x"\n', "sensor", id="bad-name"),
+    ],
+)
+def test_invalid_sensor_settings_are_refused(layout: Path, extra: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        ServiceConfig.from_file(write_toml(layout, extra))
+
+
+def test_the_agent_config_dir_never_overlaps_the_sensors_folder(layout: Path) -> None:
+    """T07-2's review: the sensor's folder (its events, its settings, the cursor) is never
+    mounted into the agent (invariant 1)."""
+    state = layout / "state"
+    for config_dir in (state / "sensor", state / "sensor" / "events", state / "sensor" / "x"):
+        with pytest.raises(ConfigError, match="sensor"):
+            ServiceConfig(
+                state_dir=state,
+                volume=layout / "volume",
+                gateway_token=Secret(TOKEN),
+                agent={"config_dir": config_dir},
+            )

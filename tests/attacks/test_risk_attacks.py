@@ -6,6 +6,10 @@ host (the black box, the snapshots, the service's log).
   line of risk 3. The answer to risk 3 (an evidence snapshot and an alert) must be grouped: a
   snapshot at most every two minutes and one alert per rule per minute, whatever the number of
   events, and the black box must stay whole.
+- ``borrar-con-el-cubo-vacio``: the agent spends the watcher's token bucket with harmless
+  creates and then deletes a project, so that most deletes are folded into a summary and few are
+  recorded one by one. Neither count alone reaches its line; the rules add the loose deletes and
+  the summary's ``lasting.delete``, and the deletion is risk 3 with its evidence snapshot.
 """
 
 import time
@@ -120,6 +124,112 @@ def test_a_flood_of_events_of_risk_3(
         f"{baseline.id}, la de antes de la avalancha, conserva los {kept} archivos, y los "
         f"{len(one_by_one)} borrados que la caja negra cuenta uno a uno apuntan a una "
         "instantánea: rebobinar a la de antes lo devuelve todo",
+    )
+    assert service.stop() == 0
+    assert service.box.verify().ok
+
+
+# -- borrar-con-el-cubo-vacio ----------------------------------------------------------------------
+
+BUCKET_SCRIPT = "borrar_con_el_cubo_vacio"
+PROJECT = "work/cubo"
+JUNK = 1200  # more than the bucket's burst of 1.000
+
+
+@scenario("borrar-con-el-cubo-vacio")
+def test_deleting_after_emptying_the_bucket(
+    attack: Attack, make_real_service: Callable[..., Service]
+) -> None:
+    service = started(make_real_service)
+    calm(service)
+    built = attack.run_script(service.jail, BUCKET_SCRIPT, "build", f"{CONTAINER_WORK}/cubo")
+    assert built["files"] == 150, built
+    holding: list = []
+
+    def snapshotted() -> bool:
+        holding[:] = [
+            snap
+            for snap in service.snapshots()
+            if files_under(in_snapshot(service, snap.id, PROJECT)) == 155  # and 5 folders
+        ]
+        return bool(holding)
+
+    wait_until(snapshotted, WITHIN, "a snapshot with the 150 files", context=service.diagnosis)
+    baseline = holding[0]
+    first_seq = last_seq(service)
+    outcome = attack.run_script(
+        service.jail,
+        BUCKET_SCRIPT,
+        "burn-and-wreck",
+        f"{CONTAINER_WORK}/cubo",
+        f"{CONTAINER_WORK}/cubo-junk",
+        str(JUNK),
+    )
+    assert outcome["gone"] and outcome["deleted"] == 156, outcome
+
+    def ours() -> list:
+        """The project's own deletes, and the summaries (which fold what did not fit)."""
+        return [
+            e
+            for e in file_events(service, since_seq=first_seq)
+            if e.action == "summary" or (e.action == "delete" and e.target.startswith(PROJECT))
+        ]
+
+    def loose() -> int:
+        return sum(1 for e in ours() if e.action == "delete")
+
+    def lasting() -> int:
+        return sum(
+            e.details.get("lasting", {}).get("delete", 0) for e in ours() if e.action == "summary"
+        )
+
+    def folded() -> int:
+        return sum(
+            e.details.get("counts", {}).get("delete", 0) for e in ours() if e.action == "summary"
+        )
+
+    wait_until(
+        lambda: (
+            loose() + lasting() >= outcome["deleted"]
+            and peak(ours()) == 3
+            and [e for e in service.events("evidence", "snapshot") if e.seq > first_seq]
+        ),
+        WITHIN,
+        "every delete accounted for (loose or folded), rated 3, and the evidence snapshot",
+        context=lambda: (
+            f"{service.diagnosis()}\nloose {loose()}, lasting {lasting()}, "
+            f"folded {folded()}: {summary(ours())}"
+        ),
+    )
+    events = ours()
+    # The attack worked: the bucket was empty, so neither count alone reaches its line of 3
+    # (100 loose deletes, 1.000 folded ones). Without that, this scenario proves nothing.
+    assert loose() < 100 and folded() < 1000 and lasting() > 0, (loose(), folded(), lasting())
+    (evidence, *_) = [e for e in service.events("evidence", "snapshot") if e.seq > first_seq]
+    attack.check(
+        "recorded",
+        loose() + lasting() >= outcome["deleted"] and service.box.verify().ok,
+        f"el agente crea {outcome['junk']} archivos vacíos y borra los {outcome['deleted']} del "
+        f"proyecto en {outcome['seconds']} s: la caja negra graba {loose()} borrados sueltos y "
+        f"pliega el resto en resúmenes ({folded()} borrados, {lasting()} de archivos que ya "
+        "existían), y la cadena verifica",
+    )
+    attack.check(
+        "risk",
+        peak(events) == 3
+        and "mass-delete-severe" in rules_of(at_risk(events, 3))
+        and evidence.snapshot_id is not None
+        and (service.store.snapshots_dir / evidence.snapshot_id).is_dir(),
+        f"ni los {loose()} sueltos llegan a 100 ni los {folded()} plegados a 1.000, pero la regla "
+        f"mass-delete-severe los suma ({loose()} + {lasting()}): riesgo 3, con la instantánea de "
+        f"evidencia {evidence.snapshot_id}. {summary(events)}",
+    )
+    kept = files_under(in_snapshot(service, baseline.id, PROJECT))
+    attack.check(
+        "recoverable",
+        kept == 155,
+        f"{baseline.id}, la de antes del borrado, conserva el proyecto entero ({kept} archivos "
+        "y carpetas)",
     )
     assert service.stop() == 0
     assert service.box.verify().ok

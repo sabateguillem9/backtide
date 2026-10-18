@@ -3,6 +3,7 @@
 closed with the service. Same fakes as test_service_guardian.py (a fake volume, jail and watcher
 around the real black box)."""
 
+import threading
 from typing import Any
 
 import pytest
@@ -150,3 +151,37 @@ def test_without_a_responder_nothing_changes(world: World) -> None:
     world.guardian.start()
     world.guardian.stop()
     assert world.events("service_stop")
+
+
+def test_a_slow_evidence_snapshot_never_delays_the_space_pause(running: World) -> None:
+    """The risk thread holds ``agent_lock`` while the snapshot is made (it can be slow: the
+    barrier drains the watcher). The space thread must freeze the agent all the same: it never
+    waits for that lock, and a pause by space is never behind an evidence snapshot."""
+    running.guardian._sleep = lambda seconds: None  # noqa: SLF001
+    running.volume.write()
+    inside, release = threading.Event(), threading.Event()
+    real_barrier = running.watcher.barrier
+
+    def slow_barrier(take: Any) -> Any:
+        inside.set()
+        assert release.wait(10), "the test never released the evidence snapshot"
+        return real_barrier(take)
+
+    running.watcher.barrier = slow_barrier  # type: ignore[method-assign]
+    evidence: list[str | None] = []
+    risk = threading.Thread(target=lambda: evidence.append(running.guardian.take_evidence()))
+    risk.start()
+    try:
+        assert inside.wait(5), "the evidence snapshot never reached the barrier"
+        assert running.guardian.agent_lock.locked()  # the risk thread holds it, and is stuck
+        running.violations.append(Violation("P3", "el uso pasa del tope", "space"))
+        space = threading.Thread(target=running.guardian.check_space)
+        space.start()
+        space.join(5)
+        assert not space.is_alive(), "the space check waited for the evidence snapshot"
+        assert running.jail.paused
+        assert "P3" in running.only("space_pause").details["conditions"]
+    finally:
+        release.set()
+        risk.join(10)
+    assert not risk.is_alive()

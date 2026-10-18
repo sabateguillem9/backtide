@@ -683,6 +683,7 @@ class SummaryBuffer:
 
     def _reset(self) -> None:
         self._counts: Counter[str] = Counter()
+        self._lasting_deletes = 0  # folded deletes not known to be of files made in the window
         self._dirs: Counter[str] = Counter()
         self._sample: list[str] = []
         self._folded = 0
@@ -697,6 +698,8 @@ class SummaryBuffer:
     def add(self, record: FileRecord) -> None:
         self._folded += 1
         self._counts[record.action] += 1
+        if record.action == "delete" and not record.transient:
+            self._lasting_deletes += 1
         key = _top_dirs(record.path)
         if key in self._dirs or len(self._dirs) < _SUMMARY_DIR_KEYS:
             self._dirs[key] += 1
@@ -715,6 +718,8 @@ class SummaryBuffer:
         for action, count in spilled.items():
             self._folded += count
             self._counts[action] += count
+            if action == "delete":
+                self._lasting_deletes += count  # nothing says they were new: fail closed
             self._first = now if self._first is None else self._first
             self._last = now
 
@@ -728,6 +733,10 @@ class SummaryBuffer:
         details = {
             "window": {"from": _iso(self._first), "to": _iso(self._last)},
             "counts": dict(self._counts),
+            # The deletes that were not transient, which the rules add to the loose deletes.
+            # The spilled ones are only counted, so whether they were new is unknown: they are
+            # in (an agent that fills the pending queue must not hide a mass deletion).
+            "lasting": {"delete": self._lasting_deletes},
             "dirs": [{"dir": d, "count": c} for d, c in self._dirs.most_common(SUMMARY_DIRS)],
             "sample": list(self._sample),
             "folded": self._folded,

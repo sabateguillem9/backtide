@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -2660,3 +2661,425 @@ def test_run_without_a_control_socket_is_what_it_was(world: World) -> None:
     world.guardian.run(stop)
     assert "control.start" not in world.log
     assert not world.jail.running
+
+
+# --- the process sensor (T07-3, docs/23 section 7) ------------------------------------------
+
+
+class FakeSensor:
+    """Stands in for backtide.service.process_sensor.ProcessSensor."""
+
+    def __init__(self, log: list[str], *, required: bool = False) -> None:
+        self.log = log
+        self.required = required
+        self.up = True  # what start() and agent_started() find
+        self.sees_agent = True
+        self.hooks: Any = None
+
+    def start(self, hooks: Any) -> bool:
+        self.log.append("sensor.start")
+        self.hooks = hooks
+        return self.up
+
+    def follow_agent(self) -> None:
+        self.log.append("sensor.follow_agent")
+
+    def agent_started(self) -> bool:
+        self.log.append("sensor.agent_started")
+        return self.up and self.sees_agent
+
+    def allows_agent(self) -> bool:
+        return not self.required or self.up
+
+    def stop(self, reason: str = "service_stop") -> None:
+        self.log.append("sensor.stop")
+
+
+def sensed(world: World, clock: Callable[[], datetime], *, required: bool = False) -> FakeSensor:
+    """``world``'s Guardian again, with a process sensor."""
+    sensor = FakeSensor(world.log, required=required)
+
+    def gate() -> list[Violation]:
+        world.log.append("space.evaluate")
+        return list(world.violations)
+
+    world.guardian = Guardian(
+        world.config,
+        store=world.volume,  # type: ignore[arg-type]
+        jail=world.jail,  # type: ignore[arg-type]
+        blackbox=world.box,  # type: ignore[arg-type]
+        watcher=world.watcher,
+        alerts=world.alerts,
+        space=gate,
+        clock=clock,
+        monotonic=lambda: world.mono[0],
+        info=world.volume.info,
+        sync=world.volume.sync,
+        clock_synced=lambda: world.synced[0],
+        prepare_egress=lambda: world.log.append("egress.prepare"),
+        sensor=sensor,
+    )
+    return sensor
+
+
+def test_the_sensor_starts_before_the_agent_and_follows_its_container(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensed(world, clock)
+    world.guardian.start()
+    log = world.log
+    assert index(log, "sensor.start") < index(log, "jail.ensure_network")
+    assert index(log, "egress.prepare") < index(log, "sensor.follow_agent")
+    assert index(log, "sensor.follow_agent") < index(log, "jail.start")
+    assert index(log, "jail.wait_ready") < index(log, "sensor.agent_started")
+    assert world.guardian.agent_state is AgentState.RUNNING
+
+
+def test_the_sensor_hooks_see_the_agent_and_record_through_the_guardian(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock)
+    world.guardian.start()
+    assert sensor.hooks.agent_running() is True
+    sensor.hooks.record("system", "sensor_down", "backtide-sensor", details={"reason": "x"}, risk=2)
+    assert world.only("sensor_down").risk == 2
+    world.guardian.pause_by_user(requested_by="test")
+    assert sensor.hooks.agent_running() is False
+
+
+def test_without_a_sensor_the_agent_starts_anyway(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    """Decision 7: the sensor is observation, not a barrier (it records and alerts itself)."""
+    sensor = sensed(world, clock)
+    sensor.up = False
+    world.guardian.start()
+    assert world.guardian.agent_state is AgentState.RUNNING
+    assert "jail.start" in world.log
+
+
+def test_a_required_sensor_that_is_not_up_holds_the_agent(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock, required=True)
+    sensor.up = False
+    world.guardian.start()
+    assert "jail.start" not in world.log
+    assert world.guardian.agent_state is AgentState.STOPPED
+    assert world.only("agent_start_skipped").details == {"reason": "sensor_required"}
+    assert world.alerts.titled("sensor")
+
+
+def test_a_required_sensor_blind_to_the_agent_stops_it(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock, required=True)
+    sensor.sees_agent = False
+    world.guardian.start()
+    assert not world.jail.running
+    assert world.guardian.agent_state is AgentState.STOPPED
+    assert world.events("agent_stop")[-1].details == {"reason": "sensor_required"}
+
+
+def test_a_blind_sensor_that_is_not_required_leaves_the_agent_running(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock)
+    sensor.sees_agent = False
+    world.guardian.start()
+    assert world.jail.running and world.guardian.agent_state is AgentState.RUNNING
+
+
+def test_a_required_sensor_lost_stops_the_agent_and_back_starts_it(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    sensor.up = False
+    sensor.hooks.lost()
+    assert not world.jail.running
+    assert world.events("agent_stop")[-1].details == {"reason": "sensor_down"}
+    sensor.up = True
+    sensor.hooks.back()
+    assert world.jail.running and world.guardian.agent_state is AgentState.RUNNING
+    assert world.events("agent_start")[-1].details == {"reason": "sensor_back"}
+
+
+def test_back_never_starts_an_agent_the_sensor_did_not_stop(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    """The person's pause, a rewind or a space pause decide on their own."""
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    world.guardian.pause_by_user(requested_by="test")
+    starts = world.log.count("jail.start")
+    sensor.hooks.back()
+    assert world.log.count("jail.start") == starts
+
+
+def test_back_respects_a_pause_that_came_while_the_sensor_was_down(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    sensor.up = False
+    sensor.hooks.lost()
+    world.guardian.pause_by_user(requested_by="test")
+    sensor.up = True
+    starts = world.log.count("jail.start")
+    sensor.hooks.back()
+    assert world.log.count("jail.start") == starts
+
+
+def test_the_sensor_stops_after_the_agent(world: World, clock: Callable[[], datetime]) -> None:
+    sensed(world, clock)
+    world.guardian.start()
+    world.guardian.stop()
+    log = world.log
+    assert index(log, "jail.stop") < index(log, "sensor.stop") < index(log, "watcher.close")
+    assert world.actions()[-1] == "system/service_stop"
+
+
+def test_a_failed_boot_stops_the_sensor(world: World, clock: Callable[[], datetime]) -> None:
+    sensed(world, clock)
+    world.jail.setup_error = JailError("network create failed")
+    with pytest.raises(JailError):
+        world.guardian.start()
+    assert "sensor.stop" in world.log
+
+
+def test_hooks_after_the_stop_do_nothing(world: World, clock: Callable[[], datetime]) -> None:
+    """The heartbeat thread may call them late: a stopped service starts nothing."""
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    world.guardian.stop()
+    starts = world.log.count("jail.start")
+    sensor.hooks.lost()
+    sensor.hooks.back()
+    assert world.log.count("jail.start") == starts
+
+
+def test_a_lost_hook_waiting_for_the_lock_gives_up_when_the_service_stops(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    """No deadlock: the stop closes the sensor (joining its thread) while holding agent_lock."""
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    done = threading.Event()
+    with world.guardian.agent_lock:
+        thread = threading.Thread(target=lambda: (sensor.hooks.lost(), done.set()))
+        thread.start()
+        world.guardian._sensor_closing.set()  # what stop() does before joining the sensor
+        assert done.wait(5)
+    assert world.jail.running  # it gave up: the stop is the one that stops the agent
+
+
+# --- the egress proxy (T06-4, docs/21 section 9) -------------------------------------------
+
+
+class FakeEgress:
+    """Stands in for backtide.service.egress.Egress."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+        self.up = True  # what start() finds
+        self.hooks: Any = None
+        self.stops: list[str] = []
+
+    def start(self, hooks: Any) -> bool:
+        self.log.append("egress.start")
+        self.hooks = hooks
+        return self.up
+
+    def allows_agent(self) -> bool:
+        return self.up
+
+    def stop(self, reason: str = "service_stop") -> None:
+        self.log.append("egress.stop")
+        self.stops.append(reason)
+        self.up = False
+
+
+def proxied(world: World, clock: Callable[[], datetime], *, up: bool = True) -> FakeEgress:
+    """``world``'s Guardian again, with the egress proxy."""
+    egress = FakeEgress(world.log)
+    egress.up = up
+
+    def gate() -> list[Violation]:
+        world.log.append("space.evaluate")
+        return list(world.violations)
+
+    world.guardian = Guardian(
+        world.config,
+        store=world.volume,  # type: ignore[arg-type]
+        jail=world.jail,  # type: ignore[arg-type]
+        blackbox=world.box,  # type: ignore[arg-type]
+        watcher=world.watcher,
+        alerts=world.alerts,
+        space=gate,
+        clock=clock,
+        monotonic=lambda: world.mono[0],
+        info=world.volume.info,
+        sync=world.volume.sync,
+        clock_synced=lambda: world.synced[0],
+        prepare_egress=lambda: world.log.append("egress.prepare"),
+        egress=egress,
+    )
+    return egress
+
+
+def test_the_proxy_starts_after_the_jail_is_prepared_and_before_the_agent(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    proxied(world, clock)
+    world.guardian.start()
+    log = world.log
+    assert index(log, "egress.prepare") < index(log, "egress.start")  # its CA exists
+    assert index(log, "jail.ensure_network") < index(log, "egress.start")  # it joins that net
+    assert index(log, "egress.start") < index(log, "jail.start")
+    assert world.guardian.agent_state is AgentState.RUNNING
+
+
+def test_without_the_proxys_hello_the_agent_does_not_start(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    proxied(world, clock, up=False)
+    world.guardian.start()  # the service stays up
+    assert "jail.start" not in world.log
+    assert world.guardian.agent_state is AgentState.STOPPED
+    skipped = world.only("agent_start_skipped")
+    assert skipped.details == {"reason": "proxy_down"} and skipped.risk == 1
+    [alert] = world.alerts.titled("sin el proxy")
+    assert alert.level is AlertLevel.ERROR and alert.event_seq == skipped.seq
+
+
+def test_the_agent_starts_once_the_proxy_is_back(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    egress = proxied(world, clock, up=False)
+    world.guardian.start()
+    egress.up = True
+    egress.hooks.back()
+    assert world.guardian.agent_state is AgentState.RUNNING
+    assert world.events("agent_start")[-1].details == {"reason": "proxy_back"}
+    egress.hooks.back()  # a second "back" starts nothing more
+    assert world.log.count("jail.start") == 1
+
+
+def test_a_proxy_that_comes_back_never_overrides_a_pause(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    egress = proxied(world, clock, up=False)
+    world.guardian.start()
+    world.guardian.pause_by_user(requested_by="test")
+    egress.up = True
+    egress.hooks.back()
+    assert "jail.start" not in world.log
+
+
+def test_a_proxy_that_falls_while_the_agent_runs_leaves_it_running(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    """It has no way out without the proxy: failing closed is the network's job."""
+    egress = proxied(world, clock)
+    world.guardian.start()
+    egress.up = False
+    egress.hooks.back()  # not held: nothing to start, nothing to stop
+    assert world.jail.running and world.log.count("jail.start") == 1
+
+
+def test_resuming_waits_for_the_proxy_too(world: World, clock: Callable[[], datetime]) -> None:
+    egress = proxied(world, clock)
+    world.guardian.start()
+    world.guardian.pause_by_user(requested_by="test")
+    world.jail.running = world.jail.paused = False  # say the pause had to kill it
+    egress.up = False
+    world.guardian.resume(requested_by="test")
+    assert world.events("agent_start_skipped")[-1].details == {"reason": "proxy_down"}
+    egress.up = True
+    egress.hooks.back()
+    assert world.jail.running
+
+
+def test_the_proxy_stops_after_the_agent(world: World, clock: Callable[[], datetime]) -> None:
+    egress = proxied(world, clock)
+    world.guardian.start()
+    world.log.clear()
+    world.guardian.stop()
+    assert world.log[:3] == ["jail.stop", "egress.stop", "watcher.close"]
+    assert egress.stops == ["service_stop"]
+    world.guardian.stop()
+    assert egress.stops == ["service_stop"]  # once
+
+
+def test_the_proxy_stops_even_when_the_agent_will_not(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    egress = proxied(world, clock)
+    world.guardian.start()
+    world.jail.stop_error = JailError("stuck")
+    world.jail.kill_error = JailError("stuck")
+    world.jail.remove_error = JailError("stuck")
+    with pytest.raises(JailError):
+        world.guardian.stop()
+    assert egress.stops == ["service_stop"]
+
+
+def test_a_failed_boot_stops_the_proxy(world: World, clock: Callable[[], datetime]) -> None:
+    """A boot that breaks after the proxy is up leaves no proxy that nobody watches."""
+    egress = proxied(world, clock)
+
+    def broken() -> None:
+        raise JailError("something after the proxy failed")
+
+    world.guardian._start_agent = broken  # type: ignore[method-assign]
+    with pytest.raises(JailError):
+        world.guardian.start()
+    assert egress.stops == ["boot_failed"]
+
+
+def test_a_back_hook_waiting_for_the_lock_gives_up_when_the_service_stops(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    egress = proxied(world, clock, up=False)
+    world.guardian.start()
+    egress.up = True
+    done = threading.Event()
+    with world.guardian.agent_lock:
+        thread = threading.Thread(target=lambda: (egress.hooks.back(), done.set()))
+        thread.start()
+        world.guardian._egress_closing.set()  # what stop() does before stopping the proxy
+        assert done.wait(5)
+    assert not world.jail.running
+
+
+def test_a_rewind_never_starts_the_agent_while_a_required_sensor_is_down(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    """Review of T07-3, finding 1: a rewind is a way to start the agent too."""
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    world.volume.write()
+    world.guardian.cycle()
+    sensor.up = False
+    sensor.hooks.lost()
+    starts = world.log.count("jail.start")
+    world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    assert world.log.count("jail.start") == starts
+    assert not world.jail.running
+    sensor.up = True
+    sensor.hooks.back()
+    assert world.jail.running
+
+
+def test_a_rewind_that_starts_the_agent_asks_the_required_sensor(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    sensor = sensed(world, clock, required=True)
+    world.guardian.start()
+    world.volume.write()
+    world.guardian.cycle()
+    sensor.sees_agent = False
+    world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    assert not world.jail.running
+    assert world.events("agent_stop")[-1].details == {"reason": "sensor_required"}

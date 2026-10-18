@@ -63,6 +63,7 @@ BLOCK_RISK = {
     "throttled": 1,
     "not_recorded": 2,
     "not_allowed": 1,
+    "undecodable": 2,  # a Content-Encoding the proxy cannot undo: its content cannot be checked
 }
 DENY_REASONS = frozenset({"not_allowed", "throttled", "not_recorded"})
 

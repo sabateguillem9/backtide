@@ -25,6 +25,7 @@ from backtide.service.pause import make_space_gate
 from backtide.snapshots import SnapshotStore, space
 from backtide.snapshots.space import GIB, HostSpace
 from tests.integration.conftest import VOLUME_IMAGE, QuotaVolume
+from tests.integration.proxy_kit import test_proxy
 
 PLENTY = HostSpace(total=500 * GIB, free=400 * GIB)
 
@@ -44,7 +45,10 @@ def serve_on(mnt: Path) -> None:
             config.volume, workspace_limit=config.workspace_limit, set_limit=volume.set_limit
         )
         gate = make_space_gate(config, store, sample=sample_with_plenty_of_host)
-        runner.serve(config, jail=jail, store=store, space=gate)
+        # No process sensor: one privileged Tetragon per VM, and it is not what this tests.
+        runner.serve(
+            config, jail=jail, store=store, space=gate, sensor=False, proxy=test_proxy(config)
+        )
 
     cli.serve = serve  # type: ignore[attr-defined]
 

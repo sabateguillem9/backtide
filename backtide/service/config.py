@@ -17,6 +17,10 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   model providers (name, kind, host). NEVER a key: the real ones live in ``<state_dir>/keys/``
   (T06-4), and a key-like setting is refused. The proxy's CA and channel folders live in the
   state too, and the agent's config folder may never be or contain any of them.
+- ``[sensor]`` (T07-3, docs/23): whether the agent may run without the process sensor
+  (``required``, false by default: decision 7), the sensor container's limits and the reader's
+  rate limits. Never the image (pinned in backtide/jail/sensor.py) nor its folder, which is
+  ``<state_dir>/sensor`` and never overlaps anything mounted into the agent.
 """
 
 import errno
@@ -32,6 +36,8 @@ from typing import Any, NoReturn
 from backtide.jail.ca import CaPaths
 from backtide.jail.config import AgentJailConfig
 from backtide.jail.proxy_config import ProxyJailConfig
+from backtide.jail.sensor import SensorJailConfig
+from backtide.sensors.tetragon import ReaderConfig
 
 DEFAULT_CYCLE_INTERVAL = 120.0  # seconds between two "did anything change?" checks
 DEFAULT_PRUNE_INTERVAL = 600.0
@@ -51,12 +57,13 @@ STATE_PROXY_CA = "proxy-ca"  # the CA's key and certificate: the proxy's /ca (do
 STATE_AGENT_CA = "agent-ca"  # the CA's certificate alone: the agent's /etc/backtide-ca
 STATE_PROXY_CHANNEL = "proxy-channel"  # the proxy's folder for the channel's socket
 STATE_KEYS = "keys"  # the real keys of the model providers (T06-4): never mounted anywhere
+STATE_SENSOR = "sensor"  # Tetragon's events, settings and the reader's cursor (T07)
 MAX_RULES_BYTES = 64 * 1024
 
 _TOP_LEVEL_KEYS = frozenset(
     {
         "state_dir", "volume", "workspace_limit", "cycle_interval", "prune_interval", "agent",
-        "volume_image", "max_volume_bytes", "proxy",
+        "volume_image", "max_volume_bytes", "proxy", "sensor",
     }
 )  # fmt: skip
 _OPTIONAL_KEYS = ("workspace_limit", "cycle_interval", "prune_interval", "max_volume_bytes")
@@ -75,6 +82,12 @@ _PROXY_CONTAINER_KEYS = frozenset(
 )
 _PROXY_KEYS = _PROXY_CONTAINER_KEYS | {"allow_hosts", "providers"}
 _PROVIDER_KEYS = frozenset({"name", "kind", "host"})
+# [sensor]: the container's limits, the reader's rate limits and `required`. Not the image (it is
+# pinned in code), not `file_perm` (a test-only concession) and not its folder.
+_SENSOR_CONTAINER_KEYS = frozenset({"name", "memory", "cpus", "cgroup_rate"})
+_SENSOR_RATES = frozenset({"exec_rate", "net_rate"})
+_SENSOR_COUNTS = frozenset({"exec_burst", "exec_daily", "net_burst", "net_daily"})
+_SENSOR_KEYS = _SENSOR_CONTAINER_KEYS | _SENSOR_RATES | _SENSOR_COUNTS | {"required"}
 # docs/21, section 6: the providers of T06 and their default hosts.
 PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
 MAX_ALLOW_HOSTS = 1000
@@ -157,6 +170,7 @@ class ServiceConfig:
     volume_image: Path | None = None
     max_volume_bytes: int | None = None
     proxy: Mapping[str, Any] = field(default_factory=dict)
+    sensor: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("volume", self.volume)):
@@ -193,6 +207,7 @@ class ServiceConfig:
         self.jail_config()  # validates every agent option; the result is rebuilt on demand
         self._check_growth(config_dir)
         self._check_proxy(config_dir)
+        self._check_sensor(config_dir)
 
     def _check_proxy(self, config_dir: Path) -> None:
         if not isinstance(self.proxy, Mapping):
@@ -214,6 +229,25 @@ class ServiceConfig:
                 )
         self.proxy_settings()
         self.proxy_jail_config()
+
+    def _check_sensor(self, config_dir: Path) -> None:
+        if not isinstance(self.sensor, Mapping):
+            raise ConfigError("[sensor] must be a table")
+        _reject_secret_keys("[sensor]", self.sensor)
+        unknown = sorted(set(self.sensor) - _SENSOR_KEYS)
+        if unknown:
+            raise ConfigError(f"unknown [sensor] settings: {', '.join(map(repr, unknown))}")
+        if not isinstance(self.sensor.get("required", False), bool):
+            raise ConfigError("[sensor] required must be true or false")
+        if _overlap(config_dir, self.sensor_dir):
+            raise ConfigError(
+                f"the agent's config_dir {config_dir} must not be, contain or be inside the "
+                f"sensor's folder {self.sensor_dir}: the agent would see what the sensor saw"
+            )
+        name = self.sensor_jail_config().name
+        if name in (self.jail_config().name, self.proxy_jail_config().name):
+            raise ConfigError(f"[sensor] name {name!r} is the name of another container")
+        self.sensor_reader_config()
 
     def _check_growth(self, config_dir: Path) -> None:
         image, ceiling = self.volume_image, self.max_volume_bytes
@@ -296,6 +330,16 @@ class ServiceConfig:
         return self.state_dir / STATE_KEYS
 
     @property
+    def sensor_dir(self) -> Path:
+        """The process sensor's folder: never mounted into the agent (invariant 1)."""
+        return self.state_dir / STATE_SENSOR
+
+    @property
+    def sensor_required(self) -> bool:
+        """Whether the agent may only run with the process sensor working (decision 7)."""
+        return self.sensor.get("required", False) is True
+
+    @property
     def workspace(self) -> Path:
         return self.volume / "workspace"
 
@@ -326,10 +370,40 @@ class ServiceConfig:
                 agent_network=agent.network,
                 agent_uid=agent.uid,
                 agent_gid=agent.gid,
+                backtide_uid=os.geteuid(),  # the one uid the proxy lets onto its channel
                 **options,
             )
         except (TypeError, ValueError) as error:
             raise ConfigError(f"invalid [proxy] settings: {error}") from error
+
+    def sensor_jail_config(self) -> SensorJailConfig:
+        """The process sensor's container (docs/23, section 2). No secret in it."""
+        options = {k: v for k, v in self.sensor.items() if k in _SENSOR_CONTAINER_KEYS}
+        try:
+            return SensorJailConfig(state_dir=self.sensor_dir, **options)
+        except (TypeError, ValueError) as error:
+            raise ConfigError(f"invalid [sensor] settings: {error}") from error
+
+    def sensor_reader_config(self) -> ReaderConfig:
+        """The reader of the sensor's events, with the rate limits of docs/23, section 6."""
+        limits: dict[str, Any] = {}
+        for key in sorted(_SENSOR_RATES | _SENSOR_COUNTS):
+            if key not in self.sensor:
+                continue
+            value = self.sensor[key]
+            number = int | float if key in _SENSOR_RATES else int
+            if isinstance(value, bool) or not isinstance(value, number) or value <= 0:
+                kind = "number" if key in _SENSOR_RATES else "whole number"
+                raise ConfigError(f"[sensor] {key} must be a positive {kind}, got {value!r}")
+            limits[key] = value
+        jail = self.sensor_jail_config()
+        return ReaderConfig(
+            events_dir=jail.events_dir,
+            cursor_file=jail.cursor_file,
+            agent_name=self.jail_config().name,
+            sensor_name=jail.name,
+            **limits,
+        )
 
     def ca_paths(self) -> CaPaths:
         """Where ca.py makes the proxy's CA, readable by the proxy's group only."""
@@ -395,6 +469,10 @@ class ServiceConfig:
             if not isinstance(data["proxy"], dict):
                 raise ConfigError("[proxy] must be a table")
             optional["proxy"] = dict(data["proxy"])
+        if "sensor" in data:
+            if not isinstance(data["sensor"], dict):
+                raise ConfigError("[sensor] must be a table")
+            optional["sensor"] = dict(data["sensor"])
         return cls(
             state_dir=state_dir,
             volume=volume,

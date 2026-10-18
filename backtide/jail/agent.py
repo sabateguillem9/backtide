@@ -21,6 +21,7 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
 import json
 import logging
 import os
+import re
 import stat
 import subprocess
 import time
@@ -68,6 +69,7 @@ CONFIG_DIR_MODE = 0o750  # group: the agent's gid, so it can read its config and
 CONFIG_FILE_MODE = 0o640
 _TMP_CONFIG = f".{CONFIG_FILE}.tmp"
 _NO_SUCH_CONTAINER = "No such container"
+_CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _NOT_RUNNING = "is not running"
 _NOT_PAUSED = "is not paused"
 PAUSE_TIMEOUT = 10.0  # seconds for docker pause / unpause, which take milliseconds
@@ -231,6 +233,31 @@ class AgentJail:
     def is_running(self) -> bool:
         state = self._state()
         return state is not None and state.get("Running") is True
+
+    def container_id(self) -> str | None:
+        """The container's full id (64 hex characters), or None if it does not exist. The
+        process sensor attributes events by it (T07-3)."""
+        result = docker.run(
+            ["container", "inspect", "--format", "{{json .Id}}", self.config.name], check=False
+        )
+        if result.returncode != 0:
+            if _NO_SUCH_CONTAINER in result.stderr:
+                return None
+            stderr = docker.sanitize(result.stderr.strip())
+            raise JailError(
+                f"cannot inspect container {self.config.name}: {stderr}",
+                returncode=result.returncode,
+                stderr=stderr,
+            )
+        try:
+            value = json.loads(result.stdout)
+        except ValueError:
+            value = None
+        if not isinstance(value, str) or not _CONTAINER_ID_RE.fullmatch(value):
+            raise JailError(
+                f"unexpected id for container {self.config.name}: {result.stdout[:100]!r}"
+            )
+        return value
 
     def is_paused(self) -> bool:
         """Whether the container is frozen (``docker pause``). Read from Docker, never from

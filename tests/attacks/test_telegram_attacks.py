@@ -14,6 +14,7 @@ api.telegram.org and no real token is used. The service finds it through ``api_b
 """
 
 import hashlib
+import math
 import os
 import time
 from collections.abc import Iterator
@@ -23,6 +24,7 @@ from uuid import uuid4
 
 import pytest
 from attack_kit import CONTAINER_WORK, Attack, scenario
+from test_pause_attacks import LEAF, OVER, fill_near_the_cap
 from test_space_pause import CAP, cgroup_freeze, state, wait_frozen
 
 from backtide.service.telegram_config import STATE_TELEGRAM
@@ -178,13 +180,15 @@ def test_pausar_freezes_and_an_alert_rewinds(
     assert service.events("user_resume"), service.diagnosis()
 
     # The dangerous action: past the cap by deleting after a snapshot (pausar-por-espacio).
+    # Same steps as pausar-por-espacio: fill short of the cap (a fill at the cap can trip P3 and
+    # freeze the script itself), then delete enough leaves after a snapshot to end past it.
     small = f"{CONTAINER_WORK}/small"
-    filled = attack.run_script(service.jail, "pausar_por_espacio", "fill", small)
-    assert filled["edquot"], filled
+    used = fill_near_the_cap(attack, service, small)
     takes = len(service.takes())
     wait_until(lambda: len(service.takes()) > takes, 60, "a snapshot of the full workspace")
     before_alerts = time.monotonic()
-    exec_in_agent(service, f"python3 -c '{_source()}' delete {small} >/dev/null 2>&1 &")
+    leaves = math.ceil((CAP + OVER - used) / LEAF)
+    exec_in_agent(service, f"python3 -c '{_source()}' delete {small} {leaves} >/dev/null 2>&1 &")
     wait_frozen(service, "P3")
     alert = fake.wait_call(
         "sendMessage",

@@ -32,6 +32,7 @@ from backtide.service.config import Secret, ServiceConfig
 from backtide.service.guardian import Guardian
 from backtide.service.runner import build_guardian, run_guardian, take_lock
 from backtide.snapshots import Snapshot, SnapshotStore, btrfs
+from tests.integration.proxy_kit import remove_proxy, test_proxy
 
 REPO = Path(__file__).resolve().parents[2]
 CYCLE = 3.0  # seconds between two cycles of a test service (the real one is 120)
@@ -162,11 +163,15 @@ class Service:
         if self._box is not None:
             self._box.close()
         errors = []
-        for step in (self.jail.remove, self.jail.remove_network):
-            try:
-                step()
-            except Exception as error:  # noqa: BLE001 - every step is tried, the first is raised
-                errors.append(error)
+        try:
+            self.jail.remove()
+        except Exception as error:  # noqa: BLE001 - every step is tried, the first is raised
+            errors.append(error)
+        errors += remove_proxy(self.config)  # the proxy is on the agent's network: first
+        try:
+            self.jail.remove_network()
+        except Exception as error:  # noqa: BLE001 - every step is tried, the first is raised
+            errors.append(error)
         if errors:
             raise errors[0]
 
@@ -290,7 +295,10 @@ def guardian_in_process(service: Service) -> Iterator[Guardian]:
     would (the agent stops and ``service_stop`` is recorded) when the block ends."""
     lock = take_lock(service.config.lock_file)
     try:
-        guardian, alerts, box = build_guardian(service.config, jail=service.jail)
+        # No process sensor here: one privileged Tetragon per VM (test_sensor_exec.py runs it).
+        guardian, alerts, box = build_guardian(
+            service.config, jail=service.jail, sensor=False, proxy=test_proxy(service.config)
+        )
         stop = threading.Event()
         failures: list[BaseException] = []
 
@@ -475,6 +483,8 @@ def make_service(
         'cpus = "2"\n'
         # The proxy's CA is group-readable by the proxy's gid: without root, only this user's.
         "[proxy]\n"
+        f'name = "{container}-px"\n'  # under the cleanup's prefixes, with this run's pid
+        f'network = "{network}-out"\n'
         f"uid = {os.getuid()}\n"
         f"gid = {os.getgid()}\n"
     )

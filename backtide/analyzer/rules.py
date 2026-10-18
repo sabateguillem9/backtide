@@ -17,8 +17,10 @@ The format is TOML (the standard library reads it; YAML would need a new depende
 ``where`` looks inside the event's details (``field = "counts.delete"`` goes into ``counts``);
 ``op`` is one of ``eq ne gt ge lt le in glob exists``, and ``glob`` takes a pattern or a list of
 them. ``burst`` may carry ``sum = "counts.delete"`` to add up a number in the details instead of
-counting events. A rule needs at least one of ``source``, ``action``, ``target`` or ``where``, any
-other key is an error, and there is no regex on purpose (see glob.py).
+counting events, and with it ``default = 1``: what an event without that number weighs (0 if
+omitted), so one rule can add loose events and the ones a summary folded. A rule needs at least
+one of ``source``, ``action``, ``target`` or ``where``, any other key is an error, and there is
+no regex on purpose (see glob.py).
 """
 
 import math
@@ -50,7 +52,7 @@ _RULE_KEYS = frozenset(
     {"id", "description", "risk", "source", "action", "target", "unless", "where", "burst"}
 )
 _WHERE_KEYS = frozenset({"field", "op", "value"})
-_BURST_KEYS = frozenset({"count", "window", "sum"})
+_BURST_KEYS = frozenset({"count", "window", "sum", "default"})
 _SOURCES = frozenset(source.value for source in Source)
 MAX_LIST = 64
 MAX_WHERE = 8
@@ -220,7 +222,9 @@ def _parse_condition(item: object, label: str) -> Condition:
 
 def _parse_burst(value: object, label: str) -> Burst:
     if not isinstance(value, dict) or not {"count", "window"} <= set(value) <= _BURST_KEYS:
-        raise RulesError(f"{label}: `burst` lleva `count`, `window` y quizá `sum`, y nada más")
+        raise RulesError(
+            f"{label}: `burst` lleva `count`, `window` y quizá `sum` (y `default`), y nada más"
+        )
     count, window = value["count"], value["window"]
     if type(count) is not int or not 2 <= count <= MAX_BURST_COUNT:
         raise RulesError(f"{label}: `burst.count` tiene que ser un entero de 2 a {MAX_BURST_COUNT}")
@@ -229,7 +233,14 @@ def _parse_burst(value: object, label: str) -> Burst:
             f"{label}: `burst.window` tiene que ser un entero de 1 a {MAX_BURST_WINDOW} segundos"
         )
     sum_path = _parse_path(value["sum"], label, "burst.sum") if "sum" in value else None
-    return Burst(count, window, sum_path)
+    default = value.get("default", 0)
+    if "default" in value and sum_path is None:
+        raise RulesError(f"{label}: `burst.default` solo tiene sentido con `burst.sum`")
+    if not _finite_number(default) or not 0 <= default <= MAX_BURST_COUNT:
+        raise RulesError(
+            f"{label}: `burst.default` tiene que ser un número de 0 a {MAX_BURST_COUNT}"
+        )
+    return Burst(count, window, sum_path, float(default))
 
 
 def _scalar(value: object) -> bool:

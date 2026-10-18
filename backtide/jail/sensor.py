@@ -16,8 +16,14 @@ every start, and nothing here is ever mounted into the agent (invariant 1).
   tp.d: nothing left on the disk decides. The environment of processes is never turned on.
 - Bind sources are never relabelled for SELinux (no ``:z``): a privileged container runs
   unconfined (``spc_t``, T07-1 P2), and relabelling the host's BTF would be wrong.
+- The policy is code that a privileged container loads into the kernel: it is pinned by its
+  sha256 (``POLICY_SHA256``), and a file that differs is refused, never loaded.
+- ``serving()`` (T07-3) is the readiness before the agent runs: ``tetra status`` says running
+  and the policy is enabled (T07-1, P13). The whole path (kernel, file, reader) is proven
+  later, by a probe in the agent's container (backtide/service/process_sensor.py).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -65,6 +71,15 @@ SETTINGS_DIR_MODE = 0o755
 SETTINGS_FILE_MODE = 0o644  # Tetragon's settings and policy are not secret
 
 POLICY_FILE = Path(__file__).resolve().parents[2] / "deploy" / "tetragon" / "backtide-connect.yaml"
+# Change it only with the policy, after test_sensor_assumptions.py (P7) passes in the VM.
+POLICY_SHA256 = "61ffa6ba9efb14ccc0fc9b95dbbbe2bd83c35458493928a3ecd715bfb5bf1898"
+TETRA = "tetra"  # Tetragon's CLI, inside its image
+POLICY_NAME = "backtide-connect"  # metadata.name in the policy
+_RUNNING_RE = re.compile(r"^Health Status:[ \t]*running[ \t]*$", re.MULTILINE)
+SERVING_TIMEOUT = 10.0  # seconds one `tetra` call may take
+_TETRA_OUTPUT = 64 * 1024
+# The events file's mode. 600 in production; the VM tests, without root, need 644 (T07-1).
+_FILE_PERMS = frozenset({"600", "640", "644"})
 
 # The first barrier against secrets in command lines (docs/23, section 5): RE2 rules whose
 # capture groups Tetragon replaces with ***** before a line reaches the file. Checked in the VM
@@ -133,6 +148,9 @@ class SensorJailConfig:
     file_max_backups: int = 8
     cgroup_rate: str = "1000,1s"  # exec/exit per second and cgroup, cut in the kernel
     ready_timeout: float = 30.0  # T07-1, P13: ready = a probe exec seen, 1.2 s in the VM
+    # A test-only concession, never in the TOML: the VM tests run without root and must read
+    # the file Tetragon (root) writes. In production the events are root's alone.
+    file_perm: str = "600"
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("btf", self.btf)):
@@ -156,6 +174,8 @@ class SensorJailConfig:
                 raise ValueError(f"{label} must be a positive integer, got {number!r}")
         if self.ready_timeout <= 0:
             raise ValueError(f"ready_timeout must be positive, got {self.ready_timeout!r}")
+        if self.file_perm not in _FILE_PERMS:
+            raise ValueError(f"file_perm must be one of {sorted(_FILE_PERMS)}: {self.file_perm!r}")
 
     @property
     def events_dir(self) -> Path:
@@ -187,7 +207,7 @@ def sensor_settings(config: SensorJailConfig) -> dict[str, str]:
         "export-file-max-backups": str(config.file_max_backups),
         # A compressed rotated file cannot be read halfway: the reader must finish old ones.
         "export-file-compress": "false",
-        "export-file-perm": "600",
+        "export-file-perm": config.file_perm,
         "export-allowlist": "\n".join(json.dumps(rule) for rule in EXPORT_ALLOWLIST),
         "field-filters": json.dumps(
             {"event_set": ["PROCESS_EXEC"], "fields": ",".join(EXEC_FIELDS), "action": "INCLUDE"}
@@ -203,11 +223,22 @@ def sensor_settings(config: SensorJailConfig) -> dict[str, str]:
 
 
 def policy_text() -> str:
-    """The connect policy (deploy/tetragon/backtide-connect.yaml), tested in the VM (P7)."""
+    """The connect policy (deploy/tetragon/backtide-connect.yaml), tested in the VM (P7), if
+    it is the pinned one (``POLICY_SHA256``): a privileged container loads it into the kernel."""
     try:
-        return POLICY_FILE.read_text()
+        data = POLICY_FILE.read_bytes()
     except OSError as e:
         raise JailError(f"cannot read the sensor's policy {POLICY_FILE}: {e}") from e
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != POLICY_SHA256:
+        raise JailError(
+            f"the sensor's policy {POLICY_FILE} has sha256 {digest}, not the pinned "
+            f"{POLICY_SHA256}: refusing to load it"
+        )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise JailError(f"the sensor's policy {POLICY_FILE} is not UTF-8") from e
 
 
 def volume_binds(config: SensorJailConfig) -> list[str]:
@@ -312,6 +343,18 @@ class SensorJail:
     def exists(self) -> bool:
         return self._inspect("{{json .State}}") is not None
 
+    def serving(self) -> bool:
+        """Whether Tetragon answers ``tetra status`` with "running" and lists its policy as
+        enabled (T07-1, P13). Never raises: anything odd is False."""
+        status = self._tetra("status")
+        if status is None or not _RUNNING_RE.search(status):
+            return False
+        policies = self._tetra("tracingpolicy", "list")
+        return policies is not None and any(
+            POLICY_NAME in fields and "enabled" in fields
+            for fields in (line.split() for line in policies.splitlines())
+        )
+
     def is_running(self) -> bool:
         state = self._inspect("{{json .State}}")
         return isinstance(state, dict) and state.get("Running") is True
@@ -326,6 +369,18 @@ class SensorJail:
         return value
 
     # Helpers
+
+    def _tetra(self, *args: str) -> str | None:
+        """The output of ``tetra <args>`` inside the sensor, or None if it failed."""
+        argv = ["exec", self.config.name, TETRA, "--server-address", SOCKET, *args]
+        try:
+            result = docker.run(
+                argv, check=False, timeout=SERVING_TIMEOUT, max_output=_TETRA_OUTPUT
+            )
+        except JailError as e:
+            logger.debug("tetra %s failed: %s", " ".join(args), e)
+            return None
+        return result.stdout if result.returncode == 0 else None
 
     def _inspect(self, template: str) -> Any:
         """``docker container inspect`` with a JSON ``template``; None if it does not exist."""

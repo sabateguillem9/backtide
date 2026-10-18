@@ -54,6 +54,22 @@ says something changed, and stops it. Design: docs/19-diseno-t04.md, section 3.
   instead of a second rewind. Never deletes a snapshot to make room. Until T13 gives backtide the
   privilege, the production steps say "not configured" and nothing grows.
 
+- **The process sensor** (T07-3, docs/23 section 7, ``process_sensor.py``): started after the
+  black box opens and before the agent's jail is prepared, told about the agent's container
+  right before every start, asked to prove it sees the agent right after, and stopped after
+  the agent. Without it the agent runs anyway (decision 7); with ``[sensor] required`` the
+  agent only runs while the sensor is up, and the sensor's hooks stop it and start it again.
+  Those hooks come from the sensor's thread and never wait for ``agent_lock`` once the service
+  stops (``_sensor_closing``), because ``stop()`` joins that thread while holding the lock.
+
+- **The egress proxy** (T06-4, docs/21 section 9, ``egress.py``): started after the agent's jail
+  is prepared (its network, the CA) and before the agent; **without the proxy's hello the agent
+  does not start** (``agent_start_skipped {reason: proxy_down}``). If it falls, the agent keeps
+  running with no way out, and ``egress.py`` records it, alerts and retries; once it is back its
+  ``back`` hook starts an agent it kept stopped. Stopped after the agent, whatever the agent's
+  stop did: a proxy without its service lets nothing out anyway. Its hook, like the sensor's,
+  never waits for ``agent_lock`` once the service stops (``_egress_closing``).
+
 Synchronous and thread-hostile in the places that matter: ``start()``, ``cycle()`` and
 ``stop()`` are called by one thread (``run()``); ``rewind()`` may come from another one.
 ``agent_lock`` serialises what starts or stops the agent, and the cycle, which skips itself
@@ -82,6 +98,7 @@ from backtide.jail.openclaw import UnrewindableConfig
 from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProblem
 from backtide.service.clock import clock_synced as kernel_clock_synced
 from backtide.service.config import ServiceConfig
+from backtide.service.egress import EgressHooks
 from backtide.service.pause import (
     Holder,
     PauseOutcome,
@@ -92,6 +109,7 @@ from backtide.service.pause import (
     condition_text,
     holders_text,
 )
+from backtide.service.process_sensor import SensorHooks
 from backtide.service.rewind import (
     PendingError,
     PendingRewind,
@@ -140,6 +158,7 @@ SYNC_EVERY = 5.0  # ... and commits the transaction this often if the workspace 
 TRANSIENT_WINDOW = 3600.0  # unconfirmed freezes are counted per hour
 JUMPY_AFTER = 6  # more unconfirmed freezes than this in an hour: confirm over 3 readings
 JUMPY_READINGS = 3
+CONFIRM_WAIT = 15.0  # seconds a start waits for a freeze-to-confirm to end (3 readings, ticks)
 
 _BRIDGED_LOGGERS = "backtide"
 
@@ -223,6 +242,48 @@ class FileWatcher(Protocol):
     def close(self) -> None:
         """Stop for good: drain, write what is pending, close everything."""
         ...
+
+
+class Sensor(Protocol):
+    """The process sensor as the Guardian sees it (``backtide.service.process_sensor``). None
+    of its methods raises: it records and alerts its own failures."""
+
+    @property
+    def required(self) -> bool: ...
+
+    def start(self, hooks: SensorHooks) -> bool:
+        """Bring the sensor up (False if it is not) and start its heartbeat."""
+        ...
+
+    def follow_agent(self) -> None:
+        """Attribute events to the agent's container as it is now."""
+        ...
+
+    def agent_started(self) -> bool:
+        """The agent is ready: whether the sensor sees it (a probe went through)."""
+        ...
+
+    def allows_agent(self) -> bool:
+        """False only if the sensor is required and not up."""
+        ...
+
+    def stop(self, reason: str = ...) -> None: ...
+
+
+class EgressProxy(Protocol):
+    """The egress proxy as the Guardian sees it (``backtide.service.egress.Egress``). None of
+    its methods raises: it records and alerts its own failures."""
+
+    def start(self, hooks: EgressHooks) -> bool:
+        """Bring the proxy up, configured over its channel (False if it is not), and start its
+        watch."""
+        ...
+
+    def allows_agent(self) -> bool:
+        """True only while the proxy is up and configured."""
+        ...
+
+    def stop(self, reason: str = ...) -> None: ...
 
 
 class Violation(Protocol):
@@ -320,6 +381,8 @@ class Guardian:
         grow: VolumeGrower | None = None,
         risk: RiskResponses | None = None,
         prepare_egress: Callable[[], None] | None = None,
+        sensor: Sensor | None = None,
+        egress: EgressProxy | None = None,
     ) -> None:
         """Every collaborator is injected, so the tests use fakes. ``alerts`` is where alerts
         go (an ``AlertQueue`` in production); the caller starts and closes it. ``sample``
@@ -332,8 +395,19 @@ class Guardian:
         not_configured}``). ``risk`` (T08) is closed when the service stops, before ``stop()``
         takes ``agent_lock``: its evidence snapshot (``take_evidence``) needs that lock.
         ``prepare_egress`` (T06-2) makes what the agent's way out needs before its container is
-        made (the proxy's CA); if it raises, the service does not start and no agent is made."""
+        made (the proxy's CA); if it raises, the service does not start and no agent is made.
+        ``sensor`` (T07-3) is the process sensor; without it nothing watches the agent's
+        commands and connections. ``egress`` (T06-4) is the proxy, the agent's only way out;
+        without it the Guardian neither starts nor watches one (the unit tests that do not
+        test it)."""
         self._config = config
+        self._sensor = sensor
+        self._sensor_closing = threading.Event()  # set by the stop: the hooks stop waiting
+        self._sensor_held = False  # the sensor (required) stopped the agent or kept it stopped
+        self._egress = egress
+        self._egress_closing = threading.Event()  # set by the stop: its hook stops waiting
+        self._egress_held = False  # the agent was kept stopped for want of a proxy
+        self._egress_stopped = True  # nothing to stop until _start_egress
         self._risk = risk
         self._prepare_egress = prepare_egress
         self._store = store
@@ -359,6 +433,7 @@ class Guardian:
         self._agent_state = AgentState.STOPPED
         self._state_epoch = 0  # bumped by every change of state: a stale thaw never applies
         self._thaw_to = AgentState.RUNNING  # what a freeze to confirm a condition goes back to
+        self._confirm_freezes = 0  # freezes to confirm made so far (a start that meets one waits)
         self._pause_reasons: set[str] = set()
         # T09: bumped (under freeze_lock) by every freeze the person asks for, also when the
         # pause was open already, so a `seguir` decided before a later `/pausar` never undoes it.
@@ -521,7 +596,9 @@ class Guardian:
         self._recover_store()
         self._reconcile_rewinds()
         self._note_downtime()
+        self._start_sensor()
         self._prepare_jail()
+        self._start_egress()
         if self._space_forbids_start():
             return
         current = self._startup_snapshot()
@@ -550,6 +627,8 @@ class Guardian:
                 )
                 logger.error("cannot stop the agent after a failed boot: %s", stop_error)
                 return
+        self._stop_sensor("boot_failed")
+        self._stop_egress("boot_failed")
         self._stopped = True
         self._watcher_step("close", self._watcher.close)
         logging.getLogger(_BRIDGED_LOGGERS).removeHandler(self._bridge)
@@ -808,6 +887,10 @@ class Guardian:
     def _start_agent(self, reason: str | None = None) -> None:
         """Step 11 (and ``resume()`` with ``reason="resume"``). Never while the person's pause
         is open (T09): a `/pausar` that came in after the decision to start wins."""
+        if not self._sensor_allows_start():
+            return
+        if not self._egress_allows_start():
+            return
         with self.freeze_lock:
             held = "user" in self._pause_reasons
             if not held:
@@ -816,17 +899,59 @@ class Guardian:
         if held:
             self._record("system", "agent_start_skipped", details={"reason": "user_pause"})
             return
+        freezes = self._confirm_freezes_so_far()
         try:
             if not self._jail.exists():  # a pause that had to kill it may have removed it too
                 self._jail.create()
+            self._sensor_follow_agent()
             self._jail.start()
-            self._jail.wait_ready()
+            try:
+                self._jail.wait_ready()
+            except JailError:
+                if not self._ready_after_confirm_freeze(freezes):
+                    raise
         except JailError as error:
             self._agent_did_not_start(error)
             return
         self._advance(AgentState.STARTING, AgentState.RUNNING)
         self._record("system", "agent_start", details={"reason": reason} if reason else None)
+        if not self._sensor_saw_start():
+            return
         self._catch_up_user_pause()
+
+    def _confirm_freezes_so_far(self) -> int:
+        with self.freeze_lock:
+            return self._confirm_freezes
+
+    def _ready_after_confirm_freeze(self, freezes: int) -> bool:
+        """``wait_ready`` failed during a start. If the space thread froze the agent to confirm a
+        condition meanwhile (``freezes`` is how many it had made when the start began) the
+        failure may be that freeze, which ``wait_ready`` cannot tell from a pause: wait up to
+        ``CONFIRM_WAIT`` s for its verdict. A false alarm thaws the agent and ``wait_ready`` is
+        asked once more (True if it is ready); a confirmed condition (a pause reason) or a
+        verdict that does not come leaves the failure as it was. Never waits for a failure with
+        no freeze behind it. Called with ``agent_lock`` held, like ``wait_ready`` itself, and
+        never waits for ``freeze_lock`` for long."""
+        deadline = self._mono() + CONFIRM_WAIT
+        while True:
+            with self.freeze_lock:
+                if self._confirm_freezes == freezes or self._pause_reasons:
+                    return False
+                settled = self._agent_state is not AgentState.FROZEN
+            if settled:
+                break
+            if self._mono() >= deadline:
+                logger.error(
+                    "a freeze to confirm a space condition did not end in %.0f s", CONFIRM_WAIT
+                )
+                return False
+            self._sleep(0.1)
+        logger.warning("the agent was frozen by a space check that was a false alarm: asking again")
+        try:
+            self._jail.wait_ready()
+        except JailError:
+            return False
+        return True
 
     def _catch_up_user_pause(self) -> None:
         """Right after a start: a `/pausar` that came in while `docker start` ran found nothing
@@ -1384,6 +1509,7 @@ class Guardian:
             self._thaw_to = self._agent_state
             self._agent_state = AgentState.FROZEN
             self._state_epoch += 1
+            self._confirm_freezes += 1
             return self._state_epoch
 
     def _confirm(self) -> list[Violation]:
@@ -2134,6 +2260,9 @@ class Guardian:
         self._record(
             "system", "agent_start", details={"reason": "rewind", "request_id": attempt.request_id}
         )
+        if not self._sensor_saw_start():
+            attempt.agent_started = False  # a required sensor did not see it: stopped
+            return
         self._catch_up_user_pause()  # a `/pausar` during the start found nothing to freeze
 
     def _growth_alert(self, grown: GrowResult, event: Event | None) -> None:
@@ -2257,15 +2386,19 @@ class Guardian:
             exc_info = (None, None, None)
         else:
             exc_info = (type(body_error), body_error, body_error.__traceback__)
+        freezes = self._confirm_freezes_so_far()
         try:
             quiesced.__exit__(*exc_info)
         except JailError as error:
             if not attempt.start_requested:
                 raise
-            attempt.start_error = error
-            attempt.problems.append("agent")
-            self._agent_did_not_start(error)
-            return
+            # The agent was started and ``wait_ready`` failed. If that was a freeze to confirm
+            # that turned out a false alarm, the agent is ready now and the start succeeded.
+            if body_error is not None or not self._ready_after_confirm_freeze(freezes):
+                attempt.start_error = error
+                attempt.problems.append("agent")
+                self._agent_did_not_start(error)
+                return
         if attempt.start_requested:
             self._advance(AgentState.STARTING, AgentState.RUNNING)
             attempt.agent_started = True
@@ -2274,6 +2407,9 @@ class Guardian:
                 "agent_start",
                 details={"reason": "rewind", "request_id": attempt.request_id},
             )
+            if not self._sensor_saw_start():
+                attempt.agent_started = False  # a required sensor did not see it: stopped
+                return
             self._catch_up_user_pause()
 
     def _rewind_stop_failed(self, attempt: _RewindAttempt, error: JailError) -> None:
@@ -2309,6 +2445,8 @@ class Guardian:
                 "agent_start",
                 details={"reason": "rewind", "request_id": attempt.request_id},
             )
+            if not self._sensor_saw_start():
+                attempt.agent_started = False
 
     @contextmanager
     def _watcher_suspended(self, target_id: str, attempt: _RewindAttempt) -> Iterator[None]:
@@ -2342,6 +2480,10 @@ class Guardian:
         try:
             if not attempt.want_running or is_space_error(error):
                 return False
+            if not self._egress_allows_start():
+                return False  # held for the proxy: its ``back`` hook starts it
+            if not self._sensor_allows_start():
+                return False  # held for a required sensor: its ``back`` hook starts it
             with self.freeze_lock:
                 reasons = set(self._pause_reasons)
             if not attempt.stopped:
@@ -2808,6 +2950,191 @@ class Guardian:
         self._alert(AlertLevel.WARNING, "Un rebobinado se interrumpió", body, event)
         return event is not None
 
+    # The process sensor (T07-3, docs/23 section 7)
+
+    def _start_sensor(self) -> None:
+        """Boot, after the black box and before the agent's jail: the sensor never raises,
+        and without it the agent starts anyway unless it is required (``_start_agent``)."""
+        if self._sensor is None:
+            return
+        self._sensor_closing.clear()
+        self._sensor_held = False
+        self._sensor.start(
+            SensorHooks(
+                record=self._record,
+                alert=self._alert,
+                agent_running=lambda: self.agent_state is AgentState.RUNNING,
+                lost=self._sensor_lost,
+                back=self._sensor_back,
+            )
+        )
+
+    def _stop_sensor(self, reason: str) -> None:
+        """After the agent: its last commands are in Tetragon's file, read before the stop."""
+        if self._sensor is None:
+            return
+        self._sensor_closing.set()
+        self._sensor.stop(reason)
+
+    def _sensor_follow_agent(self) -> None:
+        """Right before the agent starts: its container may be a new one."""
+        if self._sensor is not None:
+            self._sensor.follow_agent()
+
+    def _sensor_allows_start(self) -> bool:
+        """A required sensor that is not up keeps the agent stopped (decision 7)."""
+        if self._sensor is None or self._sensor.allows_agent():
+            return True
+        self._sensor_held = True
+        event = self._record("system", "agent_start_skipped", details={"reason": "sensor_required"})
+        self._alert(
+            AlertLevel.ERROR,
+            "El agente no arranca sin el sensor de procesos",
+            "El sensor de procesos es obligatorio en esta configuración ([sensor] required) y no "
+            "funciona: el agente no arranca. Arrancará en cuanto el sensor vuelva.",
+            event,
+        )
+        return False
+
+    def _sensor_saw_start(self) -> bool:
+        """Right after the agent got ready: the sensor proves it sees it. A required sensor
+        that does not stops the agent again (False)."""
+        if self._sensor is None:
+            return True
+        if self._sensor.agent_started() or not self._sensor.required:
+            return True
+        self._sensor_held = True
+        stopped = self._stop_agent("sensor_required") is None
+        self._alert(
+            AlertLevel.ERROR,
+            "El agente se ha parado: el sensor no lo ve",
+            "El sensor de procesos es obligatorio y no ha visto al agente al arrancar"
+            + (", así que se ha parado." if stopped else ", y el agente no se ha podido parar.")
+            + " Arrancará en cuanto el sensor vuelva.",
+        )
+        return False
+
+    def _sensor_lock(self) -> bool:
+        """``agent_lock`` for a hook of the sensor's thread, unless the service stops first."""
+        while not self.agent_lock.acquire(timeout=0.2):
+            if self._sensor_closing.is_set():
+                return False
+        if self._sensor_closing.is_set():
+            self.agent_lock.release()
+            return False
+        return True
+
+    def _sensor_lost(self) -> None:
+        """A required sensor fell: the agent stops until it is back (the sensor alerted)."""
+        if not self._sensor_lock():
+            return
+        try:
+            if not self._serving:
+                return
+            try:
+                running = self._jail.is_running()
+            except JailError:
+                running = True  # cannot tell: _stop_agent confirms
+            if not running:
+                return
+            self._sensor_held = True
+            self._stop_agent("sensor_down")
+        finally:
+            self.agent_lock.release()
+
+    def _sensor_back(self) -> None:
+        """A required sensor is back: start the agent it stopped, if nothing else holds it
+        (a pause of the person or of space decides on its own; so does a stopped service)."""
+        if not self._sensor_lock():
+            return
+        try:
+            if not self._serving or not self._sensor_held or self.pause_reasons:
+                return
+            try:
+                running = self._jail.is_running()
+            except JailError:
+                return
+            if running:
+                self._sensor_held = False
+                return
+            if [item for item in self._start_verdict() if not _is_warning(item)]:
+                return  # the space thread pauses it; `backtide seguir` starts it later
+            self._sensor_held = False
+            self._start_agent(reason="sensor_back")
+        finally:
+            self.agent_lock.release()
+
+    # The egress proxy (T06-4, docs/21 section 9)
+
+    def _start_egress(self) -> None:
+        """Boot, after the agent's jail is prepared and before the agent. Never raises: a proxy
+        that does not come up is recorded and alerted by ``egress.py``, and the agent waits."""
+        if self._egress is None:
+            return
+        self._egress_closing.clear()
+        self._egress_held = False
+        self._egress_stopped = False
+        self._egress.start(
+            EgressHooks(record=self._record, alert=self._alert, back=self._egress_back)
+        )
+
+    def _stop_egress(self, reason: str) -> None:
+        """After the agent: the proxy, then its channel. Once per start."""
+        if self._egress is None or self._egress_stopped:
+            return
+        self._egress_stopped = True
+        self._egress_closing.set()
+        self._egress.stop(reason)
+
+    def _egress_allows_start(self) -> bool:
+        """Without the proxy's hello the agent does not start (docs/21, section 9)."""
+        if self._egress is None or self._egress.allows_agent():
+            return True
+        self._egress_held = True
+        event = self._record(
+            "system", "agent_start_skipped", details={"reason": "proxy_down"}, risk=1
+        )
+        self._alert(
+            AlertLevel.ERROR,
+            "El agente no arranca sin el proxy de salida",
+            "Sin el proxy no se puede grabar lo que el agente manda a internet, así que no "
+            "arranca. Arrancará en cuanto el proxy vuelva.",
+            event,
+        )
+        return False
+
+    def _egress_lock(self) -> bool:
+        """``agent_lock`` for the proxy's hook, unless the service stops first."""
+        while not self.agent_lock.acquire(timeout=0.2):
+            if self._egress_closing.is_set():
+                return False
+        if self._egress_closing.is_set():
+            self.agent_lock.release()
+            return False
+        return True
+
+    def _egress_back(self) -> None:
+        """The proxy is up again: start the agent it kept stopped, if nothing else holds it
+        (a pause decides on its own; so does a stopped service)."""
+        if not self._egress_held or not self._egress_lock():
+            return
+        try:
+            if not self._serving or not self._egress_held or self.pause_reasons:
+                return
+            try:
+                running = self._jail.is_running()
+            except JailError:
+                return
+            if running:
+                self._egress_held = False
+                return
+            if [item for item in self._start_verdict() if not _is_warning(item)]:
+                return  # the space thread pauses it; `backtide seguir` starts it later
+            self._egress_held = False
+            self._start_agent(reason="proxy_back")
+        finally:
+            self.agent_lock.release()
+
     # Stop and run
 
     def stop(self) -> None:
@@ -2816,10 +3143,15 @@ class Guardian:
         removed before giving up; if it still runs, ``stop()`` records that, finishes closing
         the watcher and the log, and raises, and calling it again tries the agent once more."""
         self._settle_risk()
+        self._sensor_closing.set()  # the sensor's hooks stop waiting for agent_lock
+        self._egress_closing.set()  # and so does the proxy's
         with self.agent_lock:
             if self._stopped:
                 return
             error = self._stop_agent("service_stop")
+            self._stop_egress("service_stop")  # after the agent, whatever its stop did
+            if error is None:
+                self._stop_sensor("service_stop")  # last: docs/23, agent, proxy, sensor
             if not self._wound_down:
                 self._wound_down = True
                 self._serving = False
@@ -3226,6 +3558,8 @@ __all__ = [
     "RewindOutcome",
     "RewindStatus",
     "Guardian",
+    "EgressProxy",
+    "Sensor",
     "SpaceGate",
     "Violation",
     "halt_agent",

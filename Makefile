@@ -35,9 +35,12 @@ it: ## Integration tests inside the VM (only some: make it IT=tests/integration/
 	@case "$(IT)" in *"'"*) echo "IT cannot contain single quotes: it goes inside sh -c '...'" >&2; exit 2;; esac
 	$(VM_SH) '$(UV_VM) pytest -m integration $(IT)'
 
-ataques: ## Evil-agent battery inside the VM (only some: make ataques ATK="-k nested"; no ' in ATK)
-	@case "$(ATK)" in *"'"*) echo "ATK cannot contain single quotes: it goes inside sh -c '...'" >&2; exit 2;; esac
-	$(VM_SH) '$(UV_VM) pytest -m ataques -q --tb=short tests/attacks $(ATK)'
+# Where `make ataques` looks for scenarios: ATK_PATH=tests/attacks/test_x.py runs one file only.
+ATK_PATH ?= tests/attacks
+
+ataques: ## Evil-agent battery inside the VM (only some: make ataques ATK="-k nested" or ATK_PATH=tests/attacks/test_x.py; no ' in either)
+	@case "$(ATK)$(ATK_PATH)" in *"'"*) echo "ATK and ATK_PATH cannot contain single quotes: they go inside sh -c '...'" >&2; exit 2;; esac
+	$(VM_SH) '$(UV_VM) pytest -m ataques -q --tb=short $(ATK_PATH) $(ATK)'
 
 demo: ## Demo: volume + `backtide vigilar` in front (terminal 1; docs/demo.md)
 	$(VM_SH) '$(DEMO_VM) up'

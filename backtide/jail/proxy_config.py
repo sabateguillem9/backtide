@@ -16,11 +16,14 @@ touches the disk or runs a command, so the Mac unit tests check every option of 
   (read-only). Never the black box, the snapshots, the volume, backtide's config, ``keys/`` or
   the Docker socket. No variable carries a secret: the real keys arrive by the channel (T06-4).
 - ``PYTHONUNBUFFERED=1``, or mitmproxy's own log (an addon's errors) stays in stdout's buffer
-  and never reaches ``docker logs`` (T06-1, P7).
+  and never reaches ``docker logs`` (T06-1, P7). ``BACKTIDE_UID`` is the one uid the proxy lets
+  connect to its channel (backtide's own, root in production).
+- The channel folder is a small tmpfs that backtide mounts as root (``channel_mount_argv``): the
+  proxy writes there, and it must not be able to fill the disk of ``state_dir`` (T06-4).
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from backtide.jail.config import (
@@ -81,6 +84,8 @@ _FIXED_ENV = (
     ("PYTHONNOUSERSITE", "1"),  # nothing from a user site-packages in the writable HOME
 )
 
+CHANNEL_TMPFS_SOURCE = "backtide-proxy-channel"  # the tmpfs's name in mountinfo
+_ADDRESS_RE = re.compile(r"[0-9a-fA-F.:]{2,45}", re.ASCII)
 _DOCKER_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", re.ASCII)
 _SIZE_RE = re.compile(r"[1-9][0-9]{0,9}[kmg]", re.ASCII)
 _CPUS_RE = re.compile(r"(?:[1-9][0-9]{0,2}|0)(?:\.[0-9]{1,2})?", re.ASCII)
@@ -100,10 +105,17 @@ class ProxyJailConfig:
 
     ``uid``/``gid`` are the proxy's: ProxyJail refuses to create or start it when either is
     backtide's (or one of its groups), or the agent's (``agent_uid``/``agent_gid``), unless
-    ``allow_shared_ids`` says so. ``internal_egress`` makes the egress network ``--internal``
-    with an isolated gateway, so nothing can reach the internet. Both are concessions of the
-    VM tests only (no root, and fake servers instead of the internet: docs/21, "En la VM");
-    backtide's own config can set neither."""
+    ``allow_shared_ids`` says so. ``backtide_uid`` is the one uid the proxy lets connect to its
+    channel (backtide's euid; root in production).
+
+    The rest are concessions of the VM tests only (no root, and fake servers instead of the
+    internet: docs/21, "En la VM"); backtide's own config can set none of them:
+    ``internal_egress`` makes the egress network ``--internal`` with an isolated gateway, so
+    nothing can reach the internet; ``egress_neighbours`` are the containers allowed on it
+    besides the proxy (the fake internet); ``test_public_addresses`` are addresses the proxy
+    lets through as if they were public (the fake internet's); ``test_upstream_ca`` is the PEM
+    of the fake internet's CA; and ``channel_tmpfs=False`` leaves the channel folder on the
+    disk (mounting the tmpfs needs root)."""
 
     ca_dir: Path
     channel_dir: Path
@@ -123,8 +135,14 @@ class ProxyJailConfig:
     stop_timeout: int = 10  # seconds docker waits after SIGTERM before SIGKILL
     ready_timeout: float = 30.0  # seconds wait_ready waits by default
     package_dir: Path = PACKAGE_DIR
+    backtide_uid: int = 0
+    channel_size: str = "1m"  # the channel folder's tmpfs: a socket needs next to nothing
     internal_egress: bool = False  # a test-only concession, see the docstring
     allow_shared_ids: bool = False  # a test-only concession, see the docstring
+    egress_neighbours: tuple[str, ...] = ()  # a test-only concession, see the docstring
+    test_public_addresses: tuple[str, ...] = ()  # a test-only concession, see the docstring
+    test_upstream_ca: str | None = field(default=None, repr=False)  # test-only, see above
+    channel_tmpfs: bool = True  # False is a test-only concession, see the docstring
 
     def __post_init__(self) -> None:
         folders = (
@@ -174,11 +192,29 @@ class ProxyJailConfig:
         ):
             if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
                 raise ValueError(f"{label} must be a positive integer, got {number!r}")
+        if isinstance(self.backtide_uid, bool) or not isinstance(self.backtide_uid, int):
+            raise ValueError(f"backtide_uid must be an integer, got {self.backtide_uid!r}")
+        if self.backtide_uid < 0:
+            raise ValueError(f"backtide_uid must not be negative, got {self.backtide_uid!r}")
+        _require_match("channel_size", self.channel_size, _SIZE_RE)
+        for name in self.egress_neighbours:
+            _require_match("egress_neighbours", name, _DOCKER_NAME_RE)
+            if name == self.name:
+                raise ValueError("the proxy is not its own neighbour")
+        for address in self.test_public_addresses:
+            _require_match("test_public_addresses", address, _ADDRESS_RE)
+        if self.test_upstream_ca is not None and (
+            not isinstance(self.test_upstream_ca, str)
+            or "-----BEGIN CERTIFICATE-----" not in self.test_upstream_ca
+            or "PRIVATE KEY" in self.test_upstream_ca
+        ):
+            raise ValueError("test_upstream_ca must be the PEM of a certificate, and only that")
         if self.ready_timeout <= 0:
             raise ValueError(f"ready_timeout must be positive, got {self.ready_timeout!r}")
         for label, flag in (
             ("internal_egress", self.internal_egress),
             ("allow_shared_ids", self.allow_shared_ids),
+            ("channel_tmpfs", self.channel_tmpfs),
         ):
             if not isinstance(flag, bool):
                 raise ValueError(f"{label} must be a bool, got {flag!r}")
@@ -186,8 +222,22 @@ class ProxyJailConfig:
 
 def proxy_env(config: ProxyJailConfig) -> list[tuple[str, str]]:
     """The variables the proxy sees. None is a secret: the keys come by the channel."""
-    del config  # the same for every proxy today
-    return list(_FIXED_ENV)
+    env = [*_FIXED_ENV, ("BACKTIDE_UID", str(config.backtide_uid))]
+    if config.test_public_addresses:
+        env.append(("BACKTIDE_TEST_PUBLIC", ",".join(config.test_public_addresses)))
+    if config.test_upstream_ca is not None:
+        env.append(("BACKTIDE_TEST_UPSTREAM_CA", config.test_upstream_ca))
+    return env
+
+
+def channel_mount_argv(config: ProxyJailConfig) -> list[str]:
+    """``mount`` (as root) of the channel folder's tmpfs: small, the proxy's own, no devices,
+    no set-uid, nothing executable."""
+    options = (
+        f"size={config.channel_size},mode=0700,uid={config.uid},gid={config.gid},"
+        "nosuid,nodev,noexec"
+    )
+    return ["mount", "-t", "tmpfs", "-o", options, CHANNEL_TMPFS_SOURCE, str(config.channel_dir)]
 
 
 def volume_binds(config: ProxyJailConfig) -> list[str]:

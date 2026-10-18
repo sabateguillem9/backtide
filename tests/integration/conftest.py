@@ -420,6 +420,8 @@ class TestEgress:
             "agent_gid": os.getgid(),
             "internal_egress": True,
             "allow_shared_ids": True,
+            "channel_tmpfs": False,  # mounting its tmpfs needs root
+            "backtide_uid": os.getuid(),  # the one uid the proxy lets onto its channel
         }
         return ProxyJailConfig(**(settings | changes))  # type: ignore[arg-type]
 

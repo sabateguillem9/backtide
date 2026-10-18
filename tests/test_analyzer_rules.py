@@ -63,6 +63,21 @@ def test_every_key_in_use() -> None:
     assert parsed.where[1].path == ("counts", "delete")
     assert len(parsed.where[3].globs) == 1
     assert parsed.burst is not None and parsed.burst.sum_path == ("counts", "delete")
+    assert parsed.burst.default == 0  # an event without the field weighs nothing
+
+
+def test_a_sum_may_weigh_events_without_its_field() -> None:
+    text = """
+    [[rule]]
+    id = "both"
+    description = "Sueltos y plegados"
+    risk = 3
+    action = ["delete", "summary"]
+    burst = { count = 100, window = 60, sum = "lasting.delete", default = 1 }
+    """
+    (parsed,) = parse_rules(text).rules
+    assert parsed.burst is not None
+    assert (parsed.burst.sum_path, parsed.burst.default) == (("lasting", "delete"), 1)
 
 
 def test_the_default_rules_load_and_make_sense() -> None:
@@ -126,6 +141,11 @@ def test_the_default_rules_load_and_make_sense() -> None:
         (rule(burst="{ count = 2 }"), "burst"),
         (rule(burst="{ count = 2, window = 5, every = 1 }"), "burst"),
         (rule(burst='{ count = 2, window = 5, sum = "a b" }'), "campo"),
+        (rule(burst="{ count = 2, window = 5, default = 1 }"), "sum"),
+        (rule(burst='{ count = 2, window = 5, sum = "a", default = -1 }'), "default"),
+        (rule(burst='{ count = 2, window = 5, sum = "a", default = true }'), "default"),
+        (rule(burst='{ count = 2, window = 5, sum = "a", default = "1" }'), "default"),
+        (rule(burst='{ count = 2, window = 5, sum = "a", default = inf }'), "default"),
         (GOOD + GOOD, "repetido"),
     ],
 )

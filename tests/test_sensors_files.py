@@ -417,12 +417,34 @@ class TestSummaryBuffer:
         details = buf.build()
         assert details["folded"] == 36
         assert details["counts"] == {"create": 31, "delete": 5}
+        # Spilled deletes: whether they were new is unknown, so they count as lasting (fail
+        # closed: a full queue must not hide a mass deletion from mass-delete-severe).
+        assert details["lasting"] == {"delete": 5}
         assert details["dirs"][0] == {"dir": "big/sub", "count": 30}
         assert {"dir": ".", "count": 1} in details["dirs"]
         assert len(details["sample"]) == 20 and details["sample"][0] == "big/sub/deep/f0"
         assert details["window"]["from"].startswith("2026-10-16T09:00:01")
         assert snapshot_id == S1
         assert not buf  # it starts over
+
+    def test_lasting_deletes_are_the_folded_ones_of_files_from_before(self) -> None:
+        """``lasting.delete``: the folded deletes of files that existed before their window (the
+        rules add them to the loose deletes). A transient one (made and removed in the window)
+        is left out; a spilled one (only counted: beyond the pending cap) is in, since nothing
+        says it was new."""
+        co, buf = Coalescer(), SummaryBuffer()
+        for i in range(3):
+            co.deleted(f"old{i}", is_dir=False, now=at(1), snapshot_id=S1)
+        co.created("tmp", is_dir=False, now=at(1), snapshot_id=S1)
+        co.deleted("tmp", is_dir=False, now=at(1), snapshot_id=S1)
+        records = co.flush(at(2)).records
+        assert sorted(r.transient for r in records) == [False, False, False, True]
+        for record in records:
+            buf.add(record)
+        buf.add_spilled({"delete": 7}, at(3))
+        details = buf.build()
+        assert details["counts"] == {"delete": 11}
+        assert details["lasting"] == {"delete": 10}
 
     def test_one_change_without_a_snapshot_leaves_the_summary_without_one(self) -> None:
         co, buf = Coalescer(), SummaryBuffer()

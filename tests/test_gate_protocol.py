@@ -262,6 +262,7 @@ def test_the_block_risks_are_the_design_ones() -> None:
         "throttled": 1,
         "not_recorded": 2,
         "not_allowed": 1,
+        "undecodable": 2,
     }
 
 

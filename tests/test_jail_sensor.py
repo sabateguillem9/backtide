@@ -4,6 +4,7 @@ The sensor is the most privileged container of the install (docs/23, section 2):
 pin every option of its argv and of its Tetragon settings, and check that verify refuses any
 container that differs. Docker is faked; the sensor's folders are real (tmp_path)."""
 
+import hashlib
 import json
 import os
 import re
@@ -17,10 +18,12 @@ from typing import Any
 import pytest
 
 from backtide.jail import docker
+from backtide.jail import sensor as sensor_jail
 from backtide.jail.docker import JailError
 from backtide.jail.sensor import (
     IMAGE,
     POLICY_FILE,
+    POLICY_SHA256,
     REDACTION_RULES,
     SensorJail,
     SensorJailConfig,
@@ -115,6 +118,8 @@ def test_volume_binds_are_the_four_folders() -> None:
         {"cgroup_rate": "1000"},
         {"cgroup_rate": "1000,1s\nlog-level: debug"},
         {"ready_timeout": 0},
+        {"file_perm": "666"},
+        {"file_perm": "0600"},
     ],
 )
 def test_the_config_refuses_bad_values(change: dict[str, Any]) -> None:
@@ -265,6 +270,27 @@ def test_the_policy_lives_in_deploy_and_is_the_tested_one() -> None:
     assert re.search(r'operator: NotIn\s+values: \["host_ns"\]', text)
     for verb in ("Sigkill", "Override", "NotifyEnforcer"):  # only observe (decision 11)
         assert verb not in text
+
+
+def test_the_policy_is_pinned_by_its_hash() -> None:
+    """T07-2's review: the policy is code loaded into the kernel by a privileged container,
+    so a file changed on the disk is refused instead of loaded."""
+    assert hashlib.sha256(POLICY_FILE.read_bytes()).hexdigest() == POLICY_SHA256
+
+
+def test_a_changed_policy_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    changed = tmp_path / "backtide-connect.yaml"
+    changed.write_text(POLICY_FILE.read_text() + "  # one more line\n")
+    monkeypatch.setattr(sensor_jail, "POLICY_FILE", changed)
+    with pytest.raises(JailError, match="sha256"):
+        policy_text()
+
+
+def test_the_events_file_is_root_only_unless_a_test_says_otherwise() -> None:
+    """The VM tests run without root and must read Tetragon's file: a test-only concession,
+    never in the TOML (like the agent's allow_shared_ids)."""
+    assert sensor_settings(CONFIG)["export-file-perm"] == "600"
+    assert sensor_settings(replace(CONFIG, file_perm="644"))["export-file-perm"] == "644"
 
 
 # --- prepare: the folders and the files -----------------------------------------------------
@@ -615,3 +641,55 @@ def test_verify_with_a_lowered_config() -> None:
     info = _good_info(config)
     info["HostConfig"].update(Memory=512 * 1024**2, MemorySwap=512 * 1024**2, NanoCpus=500_000_000)
     assert sensor_container_problems(config, info, image_env=IMAGE_ENV) == []
+
+
+# --- serving: Tetragon answers and its policy is on (T07-3) ---------------------------------
+
+TETRA = (
+    "exec",
+    "backtide-sensor",
+    "tetra",
+    "--server-address",
+    "unix:///var/run/tetragon/tetragon.sock",
+)
+
+
+def test_serving_needs_the_status_and_the_policy(tmp_path: Path, fake_docker: FakeDocker) -> None:
+    jail = _jail(tmp_path)
+    fake_docker.answer(*TETRA, "status", stdout="Health Status: running\n")
+    fake_docker.answer(
+        *TETRA, "tracingpolicy", "list", stdout="ID NAME STATE\n1 backtide-connect enabled\n"
+    )
+    assert jail.serving() is True
+    assert [call[:6] for call in fake_docker.calls] == [list(TETRA) + ["status"]] + [
+        list(TETRA) + ["tracingpolicy"]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "policies", "code"),
+    [
+        ("Health Status: starting", "1 backtide-connect enabled", 0),
+        ("Health Status: running", "1 backtide-connect error", 0),
+        ("Health Status: running", "", 0),
+        ("Health Status: running", "1 backtide-connect enabled", 1),
+        ("Health Status: not running", "1 backtide-connect enabled", 0),
+        ("Health Status: running", "1 backtide-connect-old enabled", 0),
+        ("Health Status: running", "1 backtide-connect disabled-enabled", 0),
+    ],
+)
+def test_not_serving(
+    tmp_path: Path, fake_docker: FakeDocker, status: str, policies: str, code: int
+) -> None:
+    jail = _jail(tmp_path)
+    fake_docker.answer(*TETRA, "status", stdout=status)
+    fake_docker.answer(*TETRA, "tracingpolicy", "list", stdout=policies, code=code)
+    assert jail.serving() is False
+
+
+def test_serving_never_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        raise JailError("docker exec timed out")
+
+    monkeypatch.setattr(docker, "run", broken)
+    assert _jail(tmp_path).serving() is False

@@ -18,6 +18,9 @@ rules are T08's.
   backtide/jail/sensor.py never turns it on).
 - ``classify`` never raises on an odd shape: what it cannot use is ``Skipped("invalid")``.
   ``classify_oversize`` makes the most of a line too big to parse (see the reader).
+- Every record carries Tetragon's ``exec_id`` (written by Tetragon, not by the agent) and a
+  ``key`` made from it (``event_key``): after a kill -9 the reader reads again the lines after
+  its last saved cursor, and the key in the black box is how it knows which it recorded.
 """
 
 import ipaddress
@@ -69,6 +72,9 @@ _PROTOCOLS = {
 _DOCKER_DNS = (ipaddress.ip_address("127.0.0.11"), 53)
 _THROTTLE_STATES = {"THROTTLE_START": "start", "THROTTLE_STOP": "stop"}
 _TIME_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z", re.ASCII)
+# Tetragon's exec_id: base64 of node, start time and pid. Anything else is no id at all.
+_EXEC_ID_RE = re.compile(r"[A-Za-z0-9+/=_-]{8,128}", re.ASCII)
+_KEYED_ACTIONS = frozenset({"exec", "exit", "connect"})
 
 # Command-line forms ``redact`` does not strike on its own: a value after a flag whose name ends
 # with one of these words (``--pass x``, ``--password "two words"``) and an assignment inside a
@@ -105,6 +111,7 @@ _FLAGS_B = re.compile(_STRING_B.format("flags").encode())
 _FUNCTION_B = re.compile(_STRING_B.format("function_name").encode())
 _SIGNAL_B = re.compile(_STRING_B.format("signal").encode())
 _PID_B = re.compile(rb'"pid"\s*:\s*([0-9]{1,10})\s*[,}]')
+_EXEC_ID_B = re.compile(rb'"exec_id"\s*:\s*"([A-Za-z0-9+/=_-]{8,128})"')
 _INIT_TREE_B = re.compile(rb'"in_init_tree"\s*:\s*(true|false)')
 _TIME_B = re.compile(rb'"time"\s*:\s*"([0-9T:.Z-]{1,40})"')
 _OBJECT_B = r'"{}"\s*:\s*(\{{[^{{}}]{{0,512}}\}})'
@@ -163,6 +170,7 @@ class Record:
     nonce: str | None = None
     preexisting: bool = False
     started: str | None = None
+    key: str | None = None  # event_key(action, details): spots a line read twice
 
 
 @dataclass(frozen=True)
@@ -195,6 +203,22 @@ def new_nonce(kind: str) -> str:
 
 def is_nonce(text: object) -> bool:
     return isinstance(text, str) and _NONCE_RE.fullmatch(text) is not None
+
+
+def event_key(action: str, details: object) -> str | None:
+    """The key of a sensor event, from its action and its details (a Record's, or a recorded
+    event's read back from the black box): ``exec:<exec_id>``, ``exit:<exec_id>`` or
+    ``connect:<exec_id>:<t>`` (a process may connect many times). None without a usable
+    ``exec_id``: such a line is never taken for one already recorded."""
+    if action not in _KEYED_ACTIONS or not isinstance(details, Mapping):
+        return None
+    exec_id = details.get("exec_id")
+    if not isinstance(exec_id, str) or not _EXEC_ID_RE.fullmatch(exec_id):
+        return None
+    if action != "connect":
+        return f"{action}:{exec_id}"
+    t = details.get("t")
+    return f"connect:{exec_id}:{t}" if isinstance(t, str) and t else None
 
 
 def classify(data: Mapping[str, Any], ctx: Context) -> Parsed:
@@ -240,6 +264,9 @@ def classify_oversize(head: bytes, tail: bytes, ctx: Context) -> Parsed:
         "pid": _int_match(_PID_B.search(head)),
         "in_init_tree": init_tree is not None and init_tree.group(1) == b"true",
     }
+    exec_id = _EXEC_ID_B.search(head)
+    if exec_id is not None:
+        process["exec_id"] = exec_id.group(1).decode()
     times = list(_TIME_B.finditer(tail))
     data: dict[str, Any] = {"time": times[-1].group(1).decode() if times else None}
     name = kind.group(1).decode()
@@ -324,6 +351,7 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         "truncated": any(flag.startswith("trunc") for flag in flags),
         "argv_bytes": len(raw_args.encode("utf-8", "surrogatepass")),
         "t": t,
+        "exec_id": _exec_id(process),
     }
     if "dataArgs" in flags and not raw_args:
         # T07-1, P5: past ~320 KiB Tetragon drops the arguments without any flag saying so.
@@ -351,6 +379,7 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         nonce=nonce,
         preexisting=preexisting,
         started=started,
+        key=event_key("exec", details),
     )
 
 
@@ -369,8 +398,10 @@ def _exit(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         "status": _int(body.get("status")) or 0,  # Tetragon leaves out a status of 0
         "container": container[:MIN_PREFIX],
         "t": t,
+        "exec_id": _exec_id(process),
     }
-    return Record(Source.EXEC, "exit", binary, details, binary=binary, time=t)
+    key = event_key("exit", details)
+    return Record(Source.EXEC, "exit", binary, details, binary=binary, time=t, key=key)
 
 
 def _connect(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
@@ -408,8 +439,10 @@ def _connect(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         "binary": binary,
         "container": container[:MIN_PREFIX],
         "t": t,
+        "exec_id": _exec_id(process),
     }
-    return Record(Source.NET, "connect", target, details, binary=binary, time=t)
+    key = event_key("connect", details)
+    return Record(Source.NET, "connect", target, details, binary=binary, time=t, key=key)
 
 
 def _throttle(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
@@ -510,6 +543,11 @@ def _json_object(match: re.Match[bytes] | None) -> dict[str, Any]:
 
 def _int_match(match: re.Match[bytes] | None) -> int | None:
     return int(match.group(1)) if match is not None else None
+
+
+def _exec_id(process: Mapping[str, Any]) -> str | None:
+    exec_id = process.get("exec_id")
+    return exec_id if isinstance(exec_id, str) and _EXEC_ID_RE.fullmatch(exec_id) else None
 
 
 def _time(value: object) -> str | None:

@@ -28,6 +28,7 @@ from pathlib import Path
 from backtide.jail import AgentJail
 from backtide.service.config import ServiceConfig
 from backtide.service.runner import build_guardian, take_lock
+from tests.integration.proxy_kit import test_proxy
 
 
 def main(config_path: Path, target: str, when: str) -> None:
@@ -36,7 +37,9 @@ def main(config_path: Path, target: str, when: str) -> None:
     config = ServiceConfig.from_file(config_path)
     jail = AgentJail(replace(config.jail_config(), allow_shared_ids=True))
     with take_lock(config.lock_file):
-        guardian, alerts, _box = build_guardian(config, jail=jail)
+        guardian, alerts, _box = build_guardian(
+            config, jail=jail, sensor=False, proxy=test_proxy(config)
+        )
         alerts.start()
         guardian.start()
         watcher = guardian._watcher  # noqa: SLF001 - the one seam this test needs

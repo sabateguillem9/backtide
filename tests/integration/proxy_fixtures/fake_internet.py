@@ -50,6 +50,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
         record = {
+            "at": time.time(),  # the same kernel clock as the VM's: T06-4 compares it
             "listener": getattr(CURRENT, "listener", "control"),
             "accept": getattr(CURRENT, "accept", None),
             "sni": getattr(CURRENT, "sni", None),

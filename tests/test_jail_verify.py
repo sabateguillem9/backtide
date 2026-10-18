@@ -345,6 +345,7 @@ PROXY_ENV = [
     "PYTHONDONTWRITEBYTECODE=1",
     "PYTHONSAFEPATH=1",
     "PYTHONNOUSERSITE=1",
+    "BACKTIDE_UID=0",
 ]
 PROXY_GOOD: dict[str, Any] = {
     "Config": {

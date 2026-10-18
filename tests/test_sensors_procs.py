@@ -64,6 +64,7 @@ def test_an_exec_from_docker_exec_is_recorded_as_injected() -> None:
         "truncated": False,
         "argv_bytes": len("vigia-p3-6ea54410b884"),
         "t": "2026-10-17T09:45:23.220119379Z",
+        "exec_id": "NWEyMGM1OWMyMzgzOjQ2NTcxMjIxMjU1NjAxNzoxNjAxNjM3",
     }
 
 
@@ -151,6 +152,7 @@ def test_an_exit_by_signal_is_recorded() -> None:
         "status": 0,
         "container": TARGET_ID[:12],
         "t": "2026-10-17T09:45:23.869638200Z",
+        "exec_id": line("exit_signal")["process_exit"]["process"]["exec_id"],
     }
 
 
@@ -523,3 +525,38 @@ def test_a_huge_line_of_another_container_is_not_the_agents() -> None:
 
 def test_garbage_too_big_to_parse_is_invalid() -> None:
     assert procs.classify_oversize(b"x" * 100, TARGET_ID.encode(), CTX) == Skipped("invalid")
+
+
+# --- the key that spots a line read twice (T07-3) ---------------------------------------------
+
+
+def test_each_kind_has_a_key_made_of_tetragons_exec_id() -> None:
+    """A kill -9 of the service reads again the lines after the last saved cursor: the key,
+    kept in the event's details, is how the reader knows it recorded them already."""
+    exec_rec = record("exec_docker_exec")
+    assert exec_rec.key == "exec:NWEyMGM1OWMyMzgzOjQ2NTcxMjIxMjU1NjAxNzoxNjAxNjM3"
+    exit_rec = record("exit_signal")
+    assert exit_rec.key == f"exit:{exit_rec.details['exec_id']}"
+    connect = record("connect_tcp4")
+    exec_id = line("connect_tcp4")["process_kprobe"]["process"]["exec_id"]
+    assert connect.details["exec_id"] == exec_id
+    assert connect.key == f"connect:{exec_id}:{connect.details['t']}"
+    for rec in (exec_rec, exit_rec, connect):
+        assert procs.event_key(rec.action, rec.details) == rec.key
+
+
+@pytest.mark.parametrize("exec_id", [None, "", 7, "has spaces", "x" * 200, "<script>"])
+def test_without_a_usable_exec_id_there_is_no_key(exec_id: object) -> None:
+    data = line("exec_docker_exec")
+    data["process_exec"]["process"]["exec_id"] = exec_id
+    rec = classify(data, CTX)
+    assert isinstance(rec, Record)
+    assert rec.key is None and rec.details["exec_id"] is None
+    assert procs.event_key("exec", rec.details) is None
+
+
+def test_event_key_ignores_what_is_not_a_sensor_event() -> None:
+    assert procs.event_key("summary", {"exec_id": "abc"}) is None
+    assert procs.event_key("exec", {"exec_id": ["abc"]}) is None
+    assert procs.event_key("connect", {"exec_id": "abcdefgh", "t": 5}) is None
+    assert procs.event_key("exec", "not details") is None  # type: ignore[arg-type]

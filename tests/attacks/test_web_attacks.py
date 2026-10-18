@@ -8,7 +8,8 @@
   shows it, and one click (the confirmation, then the POST) has the real service rewind through
   its real control socket (``SO_PEERCRED`` for real), and the project is back.
 - ``web-desde-la-carcel``: the real web listens on the host's 127.0.0.1:8765 and :8766; the
-  agent, from its jail, tries every address it can think of on those ports and reaches nothing.
+  agent, from its jail, tries every address it can think of on those ports and reaches nothing,
+  neither straight nor by asking its egress proxy (its one neighbour) to take it there.
 """
 
 import html as html_lib
@@ -30,6 +31,7 @@ from fastapi.testclient import TestClient
 from risk_kit import peak, rules_of, summary
 
 from backtide.blackbox import Event
+from backtide.gate.addon import REFUSALS
 from backtide.jail import docker as jail_docker
 from backtide.web import BoxReader, create_app
 from backtide.web.rewind import ControlRewinder
@@ -265,14 +267,29 @@ def test_the_web_rewinds_what_the_agent_deleted(
     )
 
     # Risk (T08): ~120 files deleted in seconds is risk 3: an evidence snapshot and an alert.
+    # OpenClaw's start spends most of the watcher's token bucket, so part of them is folded
+    # into a summary: mass-delete-severe adds the loose ones and the summary's lasting.delete.
     def deleted() -> list[Event]:
         return [e for e in service.events(source="file") if e.seq > seq_before]
+
+    def rating() -> str:
+        events = deleted()
+        loose = sum(1 for e in events if e.action == "delete")
+        folded = [
+            (e.details.get("counts"), e.details.get("lasting"))
+            for e in events
+            if e.action == "summary"
+        ]
+        return (
+            f"{service.diagnosis()}\nafter the wreck: {summary(events)}; {loose} loose "
+            f"deletes, summaries (counts, lasting): {folded}"
+        )
 
     wait_until(
         lambda: peak(deleted()) == 3 and service.events("evidence", "snapshot"),
         30,
         "the rules to rate the deletion and the evidence snapshot",
-        context=service.diagnosis,
+        context=rating,
     )
     wait_until(
         lambda: "Riesgo máximo" in service.log_text(),
@@ -337,6 +354,7 @@ def test_the_web_rewinds_what_the_agent_deleted(
 # -- web-desde-la-carcel --------------------------------------------------------------------------
 
 WEB_PORTS = (8765, 8766)
+PORT_REFUSAL = "HTTP/1.1 403 Forbidden | " + REFUSALS["port"][1].strip()
 
 
 @contextmanager
@@ -406,6 +424,8 @@ class Targets:
     ipv6_tried: int
     bridge: str  # the host's interface of the agent's network (br-<id>)
     bridge_addresses: list[str]
+    proxy: str  # the proxy's address on the agent's network
+    neighbours: list[str]  # the names of everyone on the agent's network but the agent
 
 
 LIMA_HOST = "192.168.5.2"  # host.lima.internal: the Mac, as the VM sees it
@@ -451,6 +471,17 @@ def host_addresses(service: Service) -> Targets:
     container = json.loads(jail_docker.run(["container", "inspect", config.name]).stdout)[0]
     mine = container["NetworkSettings"]["Networks"][config.network]
     own = {mine.get("IPAddress"), mine.get("GlobalIPv6Address")} - {None, ""}
+    # The egress proxy sits on the agent's network (its only way out): with the gateway
+    # isolated, Docker may hand it the subnet's first address, where a gateway would be.
+    proxy_name = service.config.proxy_jail_config().name
+    others = {info["Name"]: info for info in (network.get("Containers") or {}).values()}
+    others.pop(config.name, None)
+    proxy = others[proxy_name]["IPv4Address"].split("/", 1)[0]
+    # A refusal from the proxy's address is the proxy's own only if the host does not hold that
+    # address too: the network's host side has none (isolated gateway), and the VM agrees.
+    options = network.get("Options") or {}
+    assert options.get("com.docker.network.bridge.gateway_mode_ipv4") == "isolated", options
+    assert proxy not in vm_addresses(4), (proxy, vm_addresses(4))
     ipv6 = bool(network.get("EnableIPv6"))
     for pool in network["IPAM"]["Config"] or []:
         subnet = ipaddress.ip_network(pool["Subnet"])
@@ -463,7 +494,15 @@ def host_addresses(service: Service) -> Targets:
     )
     on_bridge = sorted(a for a in found if a.endswith(f"%{bridge}"))
     addresses = sorted(found - own)
-    return Targets(addresses, ipv6, sum(1 for a in addresses if ":" in a), bridge, on_bridge)
+    return Targets(
+        addresses,
+        ipv6,
+        sum(1 for a in addresses if ":" in a),
+        bridge,
+        on_bridge,
+        proxy,
+        sorted(others),
+    )
 
 
 @scenario("web-desde-la-carcel")
@@ -490,9 +529,22 @@ def test_the_agent_cannot_reach_the_web(
         controls = [answers_from_the_host(port) for port in WEB_PORTS]
         assert all(line.startswith("HTTP/1.1 ") for line in controls), controls
         outcome = attack.run_script(
-            service.jail, "web_desde_la_carcel", ",".join(map(str, WEB_PORTS)), *addresses
+            service.jail,
+            "web_desde_la_carcel",
+            ",".join(map(str, WEB_PORTS)),
+            targets.proxy,
+            *addresses,
         )
     assert outcome["control"].startswith("HTTP/1.1 200"), outcome  # the probe works
+    # The agent's one neighbour is the proxy, and the agent's name for it is that address.
+    assert targets.neighbours == [service.config.proxy_jail_config().name], targets
+    assert outcome["proxy"]["resolved"] == [targets.proxy], outcome
+    # Through the proxy: every attempt got the gate's own refusal (the control that the probe
+    # talked to the gate), none went through, and none failed to reach the proxy.
+    assert outcome["via_proxy_attempts"] > 0 and outcome["via_proxy_errors"] == [], outcome
+    # ... and that refusal is the gate's port rule (only 80 and 443 go out), not a gate that
+    # could not decide (no channel, throttled, failed). 80/443 to these addresses: T06-5.
+    assert outcome["via_proxy_refused"] == [PORT_REFUSAL], outcome
     assert outcome["malformed"] == [], outcome  # every target was a real one
     assert outcome["interfaces"] == jail_interfaces, (outcome, own)
     if targets.bridge_addresses and jail_interfaces:
@@ -503,7 +555,9 @@ def test_the_agent_cannot_reach_the_web(
     no_ipv6_in_jail = not jail_interfaces
     attack.check(
         "stopped",
-        outcome["reached"] == [] and outcome["answers"] == [],
+        outcome["reached"] == []
+        and outcome["answers"] == []
+        and outcome["via_proxy_through"] == [],
         f"{outcome['attempts']} intentos de conectar a la web (puertos {WEB_PORTS}, "
         f"{len(outcome['addresses'])} direcciones: su loopback, las del anfitrión, las pasarelas "
         f"y rutas por defecto, el puente de Docker, el Mac de Lima ({LIMA_HOST}) y los nombres "
@@ -520,8 +574,15 @@ def test_the_agent_cannot_reach_the_web(
         + "; la red del agente "
         f"{'tiene' if targets.ipv6_network else 'no tiene'} IPv6) "
         f"y ninguno llega ni recibe una página "
-        f"({', '.join(outcome['errors']) or 'sin errores'}). Control: desde el anfitrión la web "
-        f"contesta ({'nuestra' if ours_a and ours_b else 'otra web ya escuchaba'}: {controls}), y "
-        "la sonda sí conecta a un puerto que el agente abre en su loopback",
+        f"({', '.join(outcome['errors']) or 'sin errores'}; llegó a {outcome['reached'] or 'nada'}"
+        f", contestó {outcome['answers'] or 'nadie'}). Su único vecino es el proxy "
+        f"({targets.proxy}, el que tiene en HTTP_PROXY): en esos puertos no escucha nada "
+        f"({len(outcome['proxy_refused'])} rechazos de su propia pila). Pedírselo al proxy "
+        f"(CONNECT y GET a cada dirección y nombre, {outcome['via_proxy_attempts']} intentos) "
+        f"tampoco: la puerta contesta {outcome['via_proxy_refused']}, y lo que deja pasar: "
+        f"{outcome['via_proxy_through'] or 'nada'}. Control: desde el anfitrión la web "
+        f"contesta ({'nuestra' if ours_a and ours_b else 'otra web ya escuchaba'}: {controls}), "
+        "la sonda sí conecta a un puerto que el agente abre en su loopback, y cada intento por el "
+        "proxy recibe la respuesta de la puerta",
     )
     assert service.stop() == 0

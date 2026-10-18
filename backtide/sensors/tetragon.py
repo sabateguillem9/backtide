@@ -23,6 +23,13 @@ Tetragon, nor Tetragon for it. What it loses it records as lost (``system/sensor
   What does not fit is folded into one ``exec/summary`` or ``net/summary`` every 10 s at most.
 - **Probes** (section 7): ``expect(nonce)`` and ``wait_seen``. An expected probe is consumed
   once and never recorded; ``wait_ready`` is "a probe exec was seen", with a 30 s cap (P13).
+  With ``stale_probes_before``, an unexpected probe older than that moment (one a killed
+  service launched) is only counted.
+- **Read twice** (T07-3): the cursor is saved every 5 s, so after a kill -9 of the service the
+  lines after it are read again. ``already_recorded(since)`` (the keys of the sensor events in
+  the black box newer than the cursor's time, ``procs.event_key``) is asked once, when the
+  reader opens its first file; a line whose key is there is skipped once and counted as
+  ``duplicates``. If it fails, the reader records everything (it may repeat, never lose).
 """
 
 import hashlib
@@ -64,8 +71,9 @@ _SUMMARY_KEYS = 1000  # distinct binaries or targets kept while folding (then "â
 _SEEN_KEPT = 64
 _STAT_NAMES = (
     "lines", "other", "parse_errors", "oversize", "preexisting", "exit", "loopback", "unknown",
-    "invalid", "recorded", "folded", "probes", "lost",
+    "invalid", "recorded", "folded", "probes", "lost", "duplicates", "stale_probes",
 )  # fmt: skip
+MAX_REPLAY_KEYS = 50_000  # keys of recorded events kept to spot a line read twice
 _ERROR_CHARS = 300
 _CURSOR_VERSION = 1
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -202,7 +210,8 @@ class TetragonReader:
     ``agent_id`` is the agent container's full id (None: nothing is the agent's yet);
     ``set_agent`` changes it when the container is created again. ``snapshot_for`` gets an
     event's kernel time and returns the snapshot to rewind to (docs/23, section 4); ``scrub``
-    strikes the exact secrets backtide knows. Thread-safe."""
+    strikes the exact secrets backtide knows. ``already_recorded`` and ``stale_probes_before``:
+    see "Read twice" and "Probes" in the module's docstring. Thread-safe."""
 
     def __init__(
         self,
@@ -212,6 +221,8 @@ class TetragonReader:
         agent_id: str | None = None,
         snapshot_for: Callable[[str | None], str | None] | None = None,
         scrub: Callable[[str], str] | None = None,
+        already_recorded: Callable[[str | None], Iterable[str]] | None = None,
+        stale_probes_before: datetime | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], datetime] = utc_now,
         sleep: Callable[[float], None] = time.sleep,
@@ -221,6 +232,9 @@ class TetragonReader:
         self._recorder = recorder
         self._snapshot_for = snapshot_for
         self._scrub = scrub
+        self._already_recorded = already_recorded
+        self._stale_before = stale_probes_before
+        self._replay: set[str] = set()
         self._wall = wall
         self._sleep = sleep
         self._lock = threading.RLock()
@@ -473,6 +487,7 @@ class TetragonReader:
     def _start(self, listing: list[_File]) -> None:
         """Open the cursor's file at its offset, or the oldest file when there is none."""
         cursor = self._load_cursor()
+        self._load_replay(cursor.time if cursor is not None else None)
         if cursor is not None:
             self._last_time = self._last_time or cursor.time
             for candidate in listing:
@@ -489,6 +504,18 @@ class TetragonReader:
             )
         if listing:
             self._open(listing[0], 0)
+
+    def _load_replay(self, since: str | None) -> None:
+        """The keys of what an earlier run recorded after ``since``: asked once."""
+        lookup, self._already_recorded = self._already_recorded, None
+        if lookup is None:
+            return
+        try:
+            keys = [key for key in lookup(since) if isinstance(key, str)]
+        except Exception as e:  # recorded, never raised: repeating beats losing
+            self._failed("dedupe", e)
+            return
+        self._replay = set(keys[-MAX_REPLAY_KEYS:])
 
     def _open(self, file: _File, offset: int, cursor: _Cursor | None = None) -> bool:
         try:
@@ -681,6 +708,9 @@ class TetragonReader:
         if record.nonce is not None and self._consume(record.nonce):
             self._counts["probes"] += 1
             return
+        if record.nonce is not None and self._is_stale(record.time):
+            self._counts["stale_probes"] += 1
+            return
         if record.preexisting:
             # Tetragon found it running when it started. Recorded only when it began after
             # the last event seen (while the sensor was down); else it is only counted.
@@ -693,6 +723,10 @@ class TetragonReader:
             self._check_lag(record.time)
             if record.time:
                 self._last_time = record.time
+        if record.key is not None and record.key in self._replay:
+            self._replay.discard(record.key)
+            self._counts["duplicates"] += 1
+            return
         snapshot_id = self._snapshot_for(record.time) if self._snapshot_for else None
         kind = Source.NET if record.source is Source.NET else Source.EXEC
         now = self.clock()
@@ -726,6 +760,11 @@ class TetragonReader:
             return False
         self._seen.append(nonce)
         return True
+
+    def _is_stale(self, kernel_time: str | None) -> bool:
+        """A probe from before ``stale_probes_before``: launched by an earlier run."""
+        moment = procs.parse_time(kernel_time)
+        return self._stale_before is not None and moment is not None and moment < self._stale_before
 
     def _expire_nonces(self, now: float) -> None:
         for nonce in [n for n, until in self._expected.items() if until <= now]:

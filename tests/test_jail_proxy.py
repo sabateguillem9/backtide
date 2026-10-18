@@ -9,6 +9,8 @@ mitmproxy image."""
 import json
 import os
 import re
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -122,6 +124,7 @@ def test_create_argv_carries_no_secret(cfg: ProxyJailConfig) -> None:
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONSAFEPATH": "1",
         "PYTHONNOUSERSITE": "1",
+        "BACKTIDE_UID": "0",  # the one uid the proxy lets connect to its channel (T06-4)
     }
 
 
@@ -160,17 +163,43 @@ def test_the_ready_line_is_the_one_main_prints() -> None:
     assert f'READY_LOG_LINE = "{proxy_config.READY_LOG_LINE}"' in main
 
 
-def test_main_refuses_everything_and_imports_nothing_of_the_service() -> None:
+def test_main_imports_nothing_of_the_service() -> None:
     main = (proxy_config.PACKAGE_DIR / "gate" / "main.py").read_text()
     imports = re.findall(r"^(?:from|import) ([\w.]+)", main, flags=re.MULTILINE)
     assert sorted(set(imports)) == [
-        "asyncio", "logging", "mitmproxy", "mitmproxy.tools.dump", "os", "socket",
+        "asyncio", "backtide", "backtide.gate.addon", "backtide.gate.client",
+        "collections.abc", "logging", "mitmproxy", "mitmproxy.tools.dump", "os", "socket",
+        "typing",
     ]  # fmt: skip
     # Only the agent's side may use it (the egress side is reachable from the host).
-    assert "def client_connected" in main and 'AGENT_SIDE_ALIAS = "backtide-proxy"' in main
+    assert 'AGENT_SIDE_ALIAS = "backtide-proxy"' in main
     assert '"connection_strategy": "lazy"' in main
     assert "with_dumper=False" in main
-    assert "master.addons.add(RefuseEverything())" in main
+    assert "master.addons.add(gate, Ready())" in main
+    assert 'int(os.environ["BACKTIDE_UID"])' in main  # no uid, no proxy
+
+
+def test_the_gate_brings_only_the_standard_library_and_backtides_gate() -> None:
+    """In a fresh interpreter: what the proxy's addon and channel import (mitmproxy aside,
+    which they never import) is the standard library, backtide.gate and backtide.blackbox."""
+    script = (
+        "import sys, json\n"
+        "before = set(sys.modules)\n"
+        "import backtide.gate.addon, backtide.gate.client\n"
+        "print(json.dumps(sorted(set(sys.modules) - before)))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, check=True, cwd=proxy_config.PACKAGE_DIR.parent,
+        env={"PYTHONPATH": str(proxy_config.PACKAGE_DIR.parent)},
+    )  # fmt: skip
+    loaded = json.loads(result.stdout)
+    ours = sorted(name for name in loaded if name.split(".")[0] == "backtide")
+    assert ours, result.stderr
+    allowed = ("backtide.gate", "backtide.blackbox", "backtide.snapshots")
+    assert [name for name in ours if name != "backtide" and not name.startswith(allowed)] == []
+    for foreign in ("fastapi", "uvicorn", "jinja2", "mitmproxy", "backtide.service"):
+        assert not any(name == foreign or name.startswith(foreign + ".") for name in loaded)
 
 
 # The egress network
@@ -293,6 +322,7 @@ def local_cfg(tmp_path: Path) -> ProxyJailConfig:
         gid=os.getgid(),
         ready_timeout=5,
         allow_shared_ids=True,  # without root, the proxy's folders can only be this user's
+        channel_tmpfs=False,  # without root, nothing can be mounted
     )
 
 
@@ -572,3 +602,122 @@ def test_create_and_start_refuse_a_package_others_may_change(
     (package / "gate").chmod(0o777)
     with pytest.raises(JailError, match="may be changed by someone"):
         getattr(jail, method)()
+
+
+# T06-4: the test grants, the channel's tmpfs and the agent's network
+
+
+def test_the_test_grants_reach_the_proxy_as_variables(cfg: ProxyJailConfig) -> None:
+    pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+    granted = replace(
+        cfg, backtide_uid=501, test_public_addresses=("172.30.0.9",), test_upstream_ca=pem
+    )
+    env = dict(proxy_config.proxy_env(granted))
+    assert env["BACKTIDE_UID"] == "501"
+    assert env["BACKTIDE_TEST_PUBLIC"] == "172.30.0.9"
+    assert env["BACKTIDE_TEST_UPSTREAM_CA"] == pem
+    assert "BACKTIDE_TEST_PUBLIC" not in dict(proxy_config.proxy_env(cfg))
+    assert pem not in repr(granted)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"test_upstream_ca": "-----BEGIN PRIVATE KEY-----"},
+        {"test_upstream_ca": "not a pem"},
+        {"test_public_addresses": ("10.0.0.1/8",)},
+        {"egress_neighbours": ("bad name!",)},
+        {"egress_neighbours": ("backtide-proxy",)},
+        {"backtide_uid": -1},
+        {"backtide_uid": True},
+        {"channel_size": "lots"},
+        {"channel_tmpfs": "yes"},
+    ],
+)
+def test_the_grants_are_checked(cfg: ProxyJailConfig, changes: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        replace(cfg, **changes)
+
+
+def test_the_channel_tmpfs_is_small_private_and_inert(cfg: ProxyJailConfig) -> None:
+    assert proxy_config.channel_mount_argv(cfg) == [
+        "mount", "-t", "tmpfs", "-o",
+        "size=1m,mode=0700,uid=61001,gid=61001,nosuid,nodev,noexec",
+        "backtide-proxy-channel", str(CHANNEL_DIR),
+    ]  # fmt: skip
+
+
+class FakeMounts:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.mounted = False
+        self.calls: list[list[str]] = []
+
+    def mount(self, argv: list[str]) -> None:
+        self.calls.append(argv)
+        self.mounted = True
+
+    def table(self) -> str:
+        root = "22 1 0:21 / / rw,relatime shared:1 - btrfs /dev/vda2 rw\n"
+        if not self.mounted:
+            return root
+        point = os.path.realpath(self.path).replace(" ", "\\040")
+        return root + f"80 22 0:50 / {point} rw,nosuid shared:2 - tmpfs backtide-proxy-channel rw\n"
+
+
+def test_prepare_channel_mounts_the_tmpfs_once(local_cfg: ProxyJailConfig) -> None:
+    config = replace(local_cfg, channel_tmpfs=True)
+    mounts = FakeMounts(config.channel_dir)
+    jail = ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table)
+    jail.prepare_channel()
+    jail.prepare_channel()
+    assert mounts.calls == [proxy_config.channel_mount_argv(config)]
+
+
+def test_create_and_start_refuse_a_channel_that_is_not_its_tmpfs(
+    local_cfg: ProxyJailConfig, fake_docker: FakeDocker
+) -> None:
+    config = replace(local_cfg, channel_tmpfs=True)
+    mounts = FakeMounts(config.channel_dir)
+    ProxyJail(local_cfg).prepare_channel()  # the folder, without its tmpfs
+    jail = ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table)
+    for step in (jail.create, jail.start):
+        with pytest.raises(JailError, match="not the channel's tmpfs"):
+            step()
+
+
+def test_a_mount_that_does_not_show_up_is_an_error(local_cfg: ProxyJailConfig) -> None:
+    config = replace(local_cfg, channel_tmpfs=True)
+    jail = ProxyJail(config, mount=lambda argv: None, mountinfo=lambda: "")
+    with pytest.raises(JailError, match="still not a tmpfs"):
+        jail.prepare_channel()
+
+
+def test_the_fake_internet_may_share_the_egress_network_only_by_grant(
+    local_cfg: ProxyJailConfig, fake_docker: FakeDocker
+) -> None:
+    egress = dict(GOOD_EGRESS, Containers={"a": {"Name": "fake-internet"}})
+    fake_docker.reply("network", "inspect", Reply(json.dumps(egress)))
+    ProxyJail(local_cfg).prepare_channel()
+    with pytest.raises(JailError, match="others are on it"):
+        ProxyJail(local_cfg).start()
+    ProxyJail(replace(local_cfg, egress_neighbours=("fake-internet",))).start()
+
+
+def test_only_the_agent_and_the_proxy_may_be_on_the_agents_network(
+    jail: ProxyJail, fake_docker: FakeDocker
+) -> None:
+    two = {"a": {"Name": "the-agent"}, "b": {"Name": jail.config.name}}
+    fake_docker.reply("network", "inspect", Reply(json.dumps(two)))
+    jail.check_agent_network("the-agent")
+    fake_docker.reply("network", "inspect", Reply(json.dumps(two | {"c": {"Name": "intruder"}})))
+    with pytest.raises(JailError, match="intruder"):
+        jail.check_agent_network("the-agent")
+
+
+def test_container_id_is_the_full_id(jail: ProxyJail, fake_docker: FakeDocker) -> None:
+    fake_docker.reply("container", "inspect", "--format", "{{.Id}}", Reply("ab" * 32 + "\n"))
+    assert jail.container_id() == "ab" * 32
+    fake_docker.reply("container", "inspect", "--format", "{{.Id}}", Reply("../x\n"))
+    with pytest.raises(JailError):
+        jail.container_id()

@@ -13,13 +13,21 @@ style: synchronous, no state of its own (every method asks Docker or the disk), 
   this config's proxy (verify.proxy_container_problems).
 - The proxy is untrusted once it runs (it parses what the agent sends): its logs are bounded
   and sanitized before they reach a message, as the agent's are.
+- The channel folder is a small tmpfs mounted by backtide (root) in prepare_channel(), so the
+  proxy cannot fill the disk of ``state_dir`` (T06-4); create() and start() refuse a channel
+  folder that is not that tmpfs. Only the VM tests go without it (``channel_tmpfs=False``).
+- ``check_agent_network`` (T06-4): on the agent's network there is nobody but the agent and
+  the proxy.
 """
 
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +38,7 @@ from backtide.jail.proxy_config import (
     EGRESS_LABEL,
     READY_LOG_LINE,
     ProxyJailConfig,
+    channel_mount_argv,
     network_create_argv,
     proxy_create_argv,
 )
@@ -45,13 +54,36 @@ _NO_SUCH_CONTAINER = "No such container"
 _NOT_RUNNING = "is not running"
 _NETWORK_NOT_FOUND = "not found"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+MOUNTINFO = Path("/proc/self/mountinfo")
+MOUNT_TIMEOUT = 30
+
+
+def run_mount(argv: list[str]) -> None:
+    """Run ``mount`` with a fixed argv (backtide runs as root in production)."""
+    result = subprocess.run(
+        argv, capture_output=True, text=True, timeout=MOUNT_TIMEOUT, check=False
+    )
+    if result.returncode != 0:
+        raise JailError(
+            f"cannot mount the channel folder's tmpfs (backtide must run as root): "
+            f"{docker.sanitize(result.stderr.strip())}"
+        )
 
 
 class ProxyJail:
-    """One proxy container, described by a ProxyJailConfig."""
+    """One proxy container, described by a ProxyJailConfig. ``mount`` runs the tmpfs's mount
+    and ``mountinfo`` reads the mount table (both replaced by the unit tests)."""
 
-    def __init__(self, config: ProxyJailConfig) -> None:
+    def __init__(
+        self,
+        config: ProxyJailConfig,
+        *,
+        mount: Callable[[list[str]], None] = run_mount,
+        mountinfo: Callable[[], str] = lambda: MOUNTINFO.read_text(),
+    ) -> None:
         self.config = config
+        self._mount = mount
+        self._mountinfo = mountinfo
 
     # Setup
 
@@ -80,7 +112,8 @@ class ProxyJail:
 
     def prepare_channel(self) -> None:
         """Create the channel folder (0700, the proxy's own: it makes its socket there) or
-        check the existing one. Giving it to another uid needs root (JailError otherwise)."""
+        check the existing one, and mount its tmpfs if it is not mounted yet. Giving it to
+        another uid, and mounting, need root (JailError otherwise)."""
         path = self.config.channel_dir
         try:
             os.mkdir(path, CHANNEL_DIR_MODE)
@@ -88,6 +121,11 @@ class ProxyJail:
             pass
         except OSError as e:
             raise JailError(f"cannot create {path}: {e}") from e
+        if self.config.channel_tmpfs and not self._channel_is_tmpfs():
+            os.close(_open_dir(path))  # a real folder, not a symlink, before mounting on it
+            self._mount(channel_mount_argv(self.config))
+            if not self._channel_is_tmpfs():
+                raise JailError(f"{path} is still not a tmpfs after mounting one on it")
         fd = _open_dir(path)
         try:
             uid, gid = self.config.uid, self.config.gid
@@ -200,6 +238,45 @@ class ProxyJail:
         finally:
             os.close(fd)
 
+    def check_agent_network(self, agent_name: str) -> None:
+        """Nobody is on the agent's network but the agent and the proxy (JailError otherwise):
+        anything else there would be a neighbour the agent reaches without the proxy."""
+        result = docker.run(
+            ["network", "inspect", "--format", "{{json .Containers}}", self.config.agent_network]
+        )
+        try:
+            containers = json.loads(result.stdout) or {}
+        except ValueError as e:
+            raise JailError(f"unexpected output for network {self.config.agent_network}") from e
+        if not isinstance(containers, dict):
+            raise JailError(f"unexpected output for network {self.config.agent_network}")
+        names = sorted(
+            str(entry.get("Name")) if isinstance(entry, dict) else "?"
+            for entry in containers.values()
+        )
+        others = [name for name in names if name not in {agent_name, self.config.name}]
+        if others:
+            raise JailError(
+                f"the agent's network {self.config.agent_network} holds more than the agent and "
+                f"the proxy: {others}. Disconnect them (docker network disconnect)"
+            )
+
+    def container_id(self) -> str:
+        """The running container's full id (its cgroup is named after it)."""
+        result = docker.run(["container", "inspect", "--format", "{{.Id}}", self.config.name])
+        container_id = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise JailError(f"unexpected id for container {self.config.name}")
+        return container_id
+
+    def _channel_is_tmpfs(self) -> bool:
+        target = os.path.realpath(self.config.channel_dir)
+        try:
+            table = self._mountinfo()
+        except OSError as e:
+            raise JailError(f"cannot read the mount table: {e}") from e
+        return any(point == target and fstype == "tmpfs" for point, fstype in _mount_points(table))
+
     # Checks
 
     def _check_ids_not_shared(self) -> None:
@@ -224,6 +301,10 @@ class ProxyJail:
     def _check_mount_sources(self) -> None:
         """``docker -v`` would create a missing source as root and it follows symlinks: every
         source must already be a real directory, holding what it should and nothing more."""
+        if self.config.channel_tmpfs and not self._channel_is_tmpfs():
+            raise JailError(
+                f"{self.config.channel_dir} is not the channel's tmpfs: prepare_channel() first"
+            )
         fd = _open_dir(self.config.channel_dir)
         try:
             self._check_channel(fd)
@@ -296,7 +377,10 @@ class ProxyJail:
         others = sorted(
             str(entry.get("Name")) if isinstance(entry, dict) else str(entry)
             for entry in (containers.values() if isinstance(containers, dict) else [containers])
-            if not (isinstance(entry, dict) and entry.get("Name") == self.config.name)
+            if not (
+                isinstance(entry, dict)
+                and entry.get("Name") in {self.config.name, *self.config.egress_neighbours}
+            )
         )
         if others:
             problems.append(f"others are on it: {others}")
@@ -354,6 +438,25 @@ class ProxyJail:
             max_output=LOGS_MAX_OUTPUT,
         )
         return READY_LOG_LINE in result.stdout or READY_LOG_LINE in result.stderr
+
+
+def _mount_points(table: str) -> list[tuple[str, str]]:
+    """``(mount point, fstype)`` of each line of a mountinfo table (proc(5))."""
+    points = []
+    for line in table.splitlines():
+        before, sep, after = line.partition(" - ")
+        fields = before.split()
+        if not sep or len(fields) < 5 or not after.split():
+            continue
+        points.append((_unescape(fields[4]), after.split()[0]))
+    return points
+
+
+def _unescape(field: str) -> str:
+    """mountinfo writes space, tab, newline and backslash as octal escapes."""
+    for code in ("040", "011", "012", "134"):
+        field = field.replace(f"\\{code}", chr(int(code, 8)))
+    return field
 
 
 def _check_ca_dir(path: Path) -> None:

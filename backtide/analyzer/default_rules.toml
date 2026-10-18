@@ -24,23 +24,28 @@
 # persona tiene que enterarse. Ojo: `rm -rf node_modules` también salta (se afinará con uso real).
 # ---------------------------------------------------------------------------------------------
 
+# Los borrados sueltos y los que el vigilante pliega en un resumen se suman (aquí y en las reglas
+# de una hora): cada `delete` suelto pesa 1 y cada `summary`, sus `lasting.delete` (los plegados
+# que no se sabe que fueran de archivos nuevos; los transitorios no cuentan). El cubo de fichas del vigilante decide qué se pliega, y un agente
+# puede vaciarlo antes con escrituras inocentes: sin sumarlos, 96 sueltos y 33 plegados no
+# llegaban a 100 en ninguna de las dos cuentas.
 [[rule]]
 id = "mass-delete"
 description = "Ha borrado 20 archivos o más en un minuto"
 risk = 2
 source = "file"
-action = "delete"
+action = ["delete", "summary"]
 where = [{ field = "transient", op = "exists", value = false }]
-burst = { count = 20, window = 60 }
+burst = { count = 20, window = 60, sum = "lasting.delete", default = 1 }
 
 [[rule]]
 id = "mass-delete-severe"
 description = "Ha borrado 100 archivos o más en un minuto"
 risk = 3
 source = "file"
-action = "delete"
+action = ["delete", "summary"]
 where = [{ field = "transient", op = "exists", value = false }]
-burst = { count = 100, window = 60 }
+burst = { count = 100, window = 60, sum = "lasting.delete", default = 1 }
 
 # Los borrados `transient` (el archivo se creó y se borró en la misma ventana de 2 s, como los
 # temporales con los que OpenClaw arranca: 68 de 77 borrados medidos en un arranque) no destruyen
@@ -116,18 +121,18 @@ id = "slow-delete"
 description = "Ha borrado 500 archivos o más en una hora"
 risk = 2
 source = "file"
-action = "delete"
+action = ["delete", "summary"]
 where = [{ field = "transient", op = "exists", value = false }]
-burst = { count = 500, window = 3600 }
+burst = { count = 500, window = 3600, sum = "lasting.delete", default = 1 }
 
 [[rule]]
 id = "slow-delete-severe"
 description = "Ha borrado 2.000 archivos o más en una hora"
 risk = 3
 source = "file"
-action = "delete"
+action = ["delete", "summary"]
 where = [{ field = "transient", op = "exists", value = false }]
-burst = { count = 2000, window = 3600 }
+burst = { count = 2000, window = 3600, sum = "lasting.delete", default = 1 }
 
 [[rule]]
 id = "slow-delete-folded-severe"

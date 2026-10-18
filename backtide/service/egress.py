@@ -1,0 +1,394 @@
+"""The egress proxy in the service (T06-4): its container, the channel to it, and its watch.
+
+Design: docs/21-diseno-t06-proxy.md, section 9. The Guardian owns one ``Egress`` and calls it at
+a few points of its life; the watch runs on this module's own thread.
+
+- **Start** (``start``), after the agent's jail is prepared and before the agent: the egress
+  network, the channel folder (its tmpfs) and the container (made if missing, killed first if
+  a dead service left it running: its channel and config are ours to give), nobody but the
+  agent and the proxy on the agent's network, ``docker start``, the ready line, and then the
+  channel: connect (``open_channel``), check who is there (``check_peer``), read the ``hello``
+  and send the config. ``system/proxy_start {version, ...}`` only then. Anything short of that
+  is ``system/proxy_start_failed`` (risk 2) and an alert, and ``allows_agent()`` stays False:
+  **without the proxy's hello the agent does not start**.
+- **Down** (the watch, every ``WATCH_EVERY`` s): the container does not run, the channel closed,
+  or nothing came from the proxy for ``SILENCE_LIMIT`` s, is ``system/proxy_down`` (risk 2) and
+  an alert. The agent keeps running with no way out (it fails closed by the network). A channel
+  that closed while the container runs is reconnected (``system/proxy_up {how: reconnect}``),
+  unless the proxy broke the protocol (it may be compromised); anything else restarts the
+  proxy, at most ``RESTARTS_PER_HOUR`` times an hour, each attempt recorded
+  (``system/proxy_restart``). Once it is up again the Guardian's ``back`` hook runs (it
+  starts an agent that was held for want of a proxy).
+- **Stop** (``stop``): the Guardian stops the agent first; then the proxy (``docker stop``,
+  killed if that fails), then the channel, and ``system/proxy_stop``.
+- Nothing raises out of here into the Guardian: failures are recorded and alerted.
+"""
+
+import logging
+import threading
+import time
+from collections import deque
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from backtide.blackbox import Event
+from backtide.jail import docker
+from backtide.jail.docker import JailError
+from backtide.jail.proxy import ProxyJail
+from backtide.jail.proxy_config import MITMPROXY_VERSION
+from backtide.notify import AlertLevel
+from backtide.service.pause import Ticker
+from backtide.service.proxy_channel import (
+    Budgets,
+    ChannelError,
+    Peer,
+    Policy,
+    ProxyChannel,
+    Record,
+    check_peer,
+    open_channel,
+)
+
+logger = logging.getLogger(__name__)
+
+HELLO_TIMEOUT = 30.0  # docs/21, section 9: "30 s como mucho"
+RECONNECT_TIMEOUT = 5.0
+WATCH_EVERY = 5.0
+SILENCE_LIMIT = 15.0  # three pings missed
+RESTARTS_PER_HOUR = 3
+RESTART_WINDOW = 3600.0
+CONNECT_RETRY = 0.25
+_ERROR_CHARS = 300
+
+
+@dataclass(frozen=True)
+class EgressHooks:
+    """The Guardian's side: its own ``_record`` and ``_alert`` (one door for every event and
+    alert), and ``back``, called once the proxy is up again after a fall."""
+
+    record: Callable[..., Event | None]
+    alert: Callable[..., None]
+    back: Callable[[], None] = lambda: None
+
+
+Connect = Callable[[ProxyJail, float], ProxyChannel]
+
+
+class Egress:
+    """The proxy's container, its channel and its watch, for the Guardian. ``record`` is where
+    the channel appends what the proxy says (the black box, rated). ``thread=False`` (tests)
+    leaves the watch to whoever calls ``check()``."""
+
+    def __init__(
+        self,
+        jail: ProxyJail,
+        *,
+        agent_name: str,
+        policy: Policy,
+        record: Record,
+        limits: Mapping[str, int] | None = None,
+        hello_timeout: float = HELLO_TIMEOUT,
+        thread: bool = True,
+        connect: Connect | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._jail = jail
+        self._agent_name = agent_name
+        self._policy = policy
+        self._box = record
+        self._limits = dict(limits or {})
+        self._hello_timeout = hello_timeout
+        self._thread = thread
+        self._connect = connect or self._open
+        self._mono = monotonic
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._hooks: EgressHooks | None = None
+        self._channel: ProxyChannel | None = None
+        self._ticker: Ticker | None = None
+        self._up = False
+        self._down_since: float | None = None
+        self._restarts: deque[float] = deque()
+        self._out_of_restarts_told: float | None = None
+        self._budget_alert_due = True
+
+    # The Guardian's calls
+
+    @property
+    def up(self) -> bool:
+        return self._up
+
+    def allows_agent(self) -> bool:
+        """The agent may start only while the proxy is up and configured."""
+        return self._up
+
+    def start(self, hooks: EgressHooks) -> bool:
+        """Bring the proxy up and start its watch. False (recorded, alerted) if it is not up."""
+        with self._lock:
+            self._hooks = hooks
+            ok = self._bring_up("boot")
+            if not ok:
+                self._down_since = self._mono()  # recorded as start_failed: the watch retries
+        if self._thread and self._ticker is None:
+            self._ticker = Ticker("backtide-egress", WATCH_EVERY, self.check)
+            self._ticker.start()
+        return ok
+
+    def stop(self, reason: str = "service_stop") -> None:
+        """The watch, then the proxy, then the channel (the agent is stopped already)."""
+        if self._ticker is not None:
+            self._ticker.close()
+            self._ticker = None
+        with self._lock:
+            self._up = False
+            error = self._stop_container()
+            self._close_channel("stop")
+            details: dict[str, Any] = {"reason": reason, "stopped": error is None}
+            if error is not None:
+                details["error"] = _short(error)
+            self._record("proxy_stop", details, risk=0 if error is None else 2)
+
+    def check(self) -> None:
+        """One look of the watch (WATCH_EVERY s on its thread). Never raises."""
+        back = False
+        with self._lock:
+            if self._hooks is None:
+                return
+            try:
+                back = self._check_locked()
+            except Exception as error:
+                logger.exception("the proxy's watch failed")
+                self._record("proxy_watch_failed", {"error": _short(error)}, risk=2)
+        if back and self._hooks is not None:
+            try:
+                self._hooks.back()
+            except Exception:
+                logger.exception("the Guardian's hook for a proxy that is back failed")
+
+    # Watch
+
+    def _problem(self) -> str | None:
+        channel = self._channel
+        try:
+            running = self._jail.is_running()
+        except JailError:
+            running = False
+        if not running:
+            return "not_running"
+        if channel is None:
+            return "no_channel"
+        if channel.closed:
+            return f"channel_{channel.close_reason or 'closed'}"
+        if channel.silent_for() > SILENCE_LIMIT:
+            return "silent"
+        return None
+
+    def _check_locked(self) -> bool:
+        problem = self._problem()
+        if problem is None:
+            return False
+        if self._up or self._down_since is None:
+            self._up = False
+            self._down_since = self._mono()
+            event = self._record("proxy_down", {"problem": problem}, risk=2)
+            self._alert(
+                AlertLevel.ERROR,
+                "El proxy de salida se ha caído",
+                "El agente sigue en marcha, pero sin salida a internet: nada sale sin grabarse. "
+                "backtide intenta volver a levantar el proxy.",
+                event,
+            )
+        # A proxy that broke the protocol may be a compromised one: it is restarted (killed
+        # first), never just given its config again.
+        suspect = problem in ("channel_protocol", "channel_crash")
+        if (problem.startswith("channel") or problem == "no_channel") and not suspect:
+            if self._reconnect():
+                self._came_back("reconnect")
+                return True
+        if not self._may_restart():
+            return False
+        attempt = len(self._restarts)
+        self._record("proxy_restart", {"attempt": attempt, "problem": problem}, risk=1)
+        if self._bring_up("restart"):
+            self._came_back("restart")
+            return True
+        return False
+
+    def _came_back(self, how: str) -> None:
+        down = self._down_since
+        self._down_since = None
+        seconds = None if down is None else round(self._mono() - down, 1)
+        event = self._record("proxy_up", {"how": how, "down_s": seconds})
+        self._alert(
+            AlertLevel.INFO,
+            "El proxy de salida ha vuelto",
+            "El agente vuelve a tener salida a internet, grabada como siempre.",
+            event,
+        )
+
+    def _may_restart(self) -> bool:
+        now = self._mono()
+        while self._restarts and now - self._restarts[0] >= RESTART_WINDOW:
+            self._restarts.popleft()
+        if len(self._restarts) >= RESTARTS_PER_HOUR:
+            if self._out_of_restarts_told is None or now - self._out_of_restarts_told >= 3600:
+                self._out_of_restarts_told = now
+                event = self._record(
+                    "proxy_restart_skipped", {"reason": "too_many", "per_hour": RESTARTS_PER_HOUR},
+                    risk=2,
+                )  # fmt: skip
+                self._alert(
+                    AlertLevel.ERROR,
+                    "El proxy de salida no se levanta",
+                    f"Se ha intentado {RESTARTS_PER_HOUR} veces en una hora. El agente sigue sin "
+                    "salida a internet; se volverá a intentar dentro de un rato.",
+                    event,
+                )
+            return False
+        self._restarts.append(now)
+        return True
+
+    def _reconnect(self) -> bool:
+        """Only the channel was lost and the container runs: connect again."""
+        self._close_channel("reconnect")
+        try:
+            self._channel = self._connect(self._jail, RECONNECT_TIMEOUT)
+        except (ChannelError, JailError) as error:
+            logger.warning("cannot reconnect to the proxy's channel: %s", error)
+            return False
+        self._up = True
+        return True
+
+    # Start and stop
+
+    def _bring_up(self, reason: str) -> bool:
+        """Everything from the network to the config. Records proxy_start or its failure."""
+        self._up = False
+        self._close_channel("restart")
+        step = "prepare"
+        try:
+            self._jail.ensure_network()
+            self._jail.prepare_channel()
+            if not self._jail.exists():
+                self._jail.create()
+            if self._jail.is_running():
+                step = "kill_stale"
+                self._jail.kill()  # its channel and config are ours to give: a fresh start
+            step = "agent_network"
+            self._jail.check_agent_network(self._agent_name)
+            step = "start"
+            self._jail.start()
+            self._jail.wait_ready()
+            step = "channel"
+            self._channel = self._connect(self._jail, self._hello_timeout)
+        except (JailError, ChannelError) as error:
+            self._close_channel("failed")
+            event = self._record(
+                "proxy_start_failed", {"reason": reason, "step": step, "error": _short(error)},
+                risk=2,
+            )  # fmt: skip
+            self._alert(
+                AlertLevel.ERROR,
+                "El proxy de salida no arranca",
+                "Sin el proxy no se graba lo que sale, así que el agente no tiene salida a "
+                "internet (y no arranca si estaba parado). Detalles en el evento.",
+                event,
+            )
+            return False
+        hello = self._channel.hello or {}
+        self._record(
+            "proxy_start",
+            {
+                "reason": reason,
+                "version": hello.get("version"),
+                "mitmproxy": MITMPROXY_VERSION,
+                "image": self._jail.config.image,
+                "providers": [p.name for p in self._policy.providers.items],
+                "allow_hosts": len(self._policy.allow_hosts),
+            },
+        )
+        self._up = True
+        return True
+
+    def _open(self, jail: ProxyJail, timeout: float) -> ProxyChannel:
+        """Connect, check the peer, hello and config, within ``timeout`` (the proxy creates its
+        socket before it prints its ready line, but a restart may race with us)."""
+        deadline = self._mono() + timeout
+        container_id = jail.container_id()
+        while True:
+            try:
+                sock = open_channel(jail.config.channel_dir, proxy_uid=jail.config.uid)
+                try:
+                    self._check_peer(sock, container_id)
+                    channel = ProxyChannel(
+                        sock,
+                        record=self._box,
+                        policy=self._policy,
+                        limits=self._limits,
+                        budgets=Budgets(self._mono()),
+                        on_budget=self._daily_budget_spent,
+                    )
+                    channel.handshake(max(0.5, deadline - self._mono()))
+                except BaseException:
+                    sock.close()
+                    raise
+                channel.start()
+                return channel
+            except ChannelError:
+                if self._mono() >= deadline:
+                    raise
+                self._sleep(CONNECT_RETRY)
+
+    def _check_peer(self, sock: Any, container_id: str) -> Peer:
+        return check_peer(sock, proxy_uid=self._jail.config.uid, container_id=container_id)
+
+    def _stop_container(self) -> JailError | None:
+        try:
+            if not self._jail.is_running():
+                return None
+        except JailError:
+            pass  # cannot tell: stop it anyway
+        try:
+            self._jail.stop()
+            return None
+        except JailError as error:
+            logger.error("cannot stop the proxy, so it is killed: %s", error)
+        try:
+            self._jail.kill()
+        except JailError as error:
+            return error
+        return None
+
+    def _close_channel(self, reason: str) -> None:
+        channel, self._channel = self._channel, None
+        if channel is not None:
+            channel.close(reason)
+
+    def _daily_budget_spent(self) -> None:
+        event = self._record("proxy_budget", {"reason": "daily"}, risk=2)
+        self._alert(
+            AlertLevel.WARNING,
+            "El agente ha agotado sus peticiones del día",
+            "El agente ha hecho el máximo de peticiones a internet de un día: lo que pida ahora "
+            "se rechaza (y se cuenta) hasta que acabe el día.",
+            event,
+        )
+
+    # Records
+
+    def _record(self, action: str, details: dict[str, Any], *, risk: int = 0) -> Event | None:
+        if self._hooks is None:
+            logger.error("a proxy event (%s) came before the Guardian's hooks", action)
+            return None
+        return self._hooks.record("system", action, details=details, risk=risk)
+
+    def _alert(self, level: AlertLevel, title: str, body: str, event: Event | None) -> None:
+        if self._hooks is not None:
+            self._hooks.alert(level, title, body, event)
+
+
+def _short(error: BaseException) -> str:
+    text = docker.sanitize(str(error))
+    return text[:_ERROR_CHARS]

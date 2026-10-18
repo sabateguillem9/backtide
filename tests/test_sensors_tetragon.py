@@ -156,6 +156,8 @@ def make_reader(
         agent_id = change.pop("agent_id", TARGET_ID)
         snapshot_for = change.pop("snapshot_for", None)
         wall = change.pop("wall", lambda: WALL)
+        already_recorded = change.pop("already_recorded", None)
+        stale_probes_before = change.pop("stale_probes_before", None)
         config = ReaderConfig(
             events_dir=tetragon.events,
             cursor_file=tmp_path / "cursor.json",
@@ -166,6 +168,8 @@ def make_reader(
             box,
             agent_id=agent_id,
             snapshot_for=snapshot_for,
+            already_recorded=already_recorded,
+            stale_probes_before=stale_probes_before,
             clock=clock,
             wall=wall,
             sleep=lambda seconds: clock.advance(seconds),
@@ -883,3 +887,102 @@ def test_preexisting_processes_after_a_restart_of_backtide_use_the_cursors_time(
     tetragon.write(_procfs("2026-10-17T09:50:00Z"))
     make_reader().poll()
     assert [e.details.get("preexisting") for e in box.of("exec", "exec")] == [None, True]
+
+
+# --- a kill -9 of the service: read again, recorded once (T07-3) ------------------------------
+
+
+def _keyed_exec(n: int, *, time_: str = "2026-10-17T09:45:23.220119379Z") -> str:
+    """An exec of the agent with its own exec_id (the real ones are unique per process)."""
+    data = copy.deepcopy(fixture("exec_docker_exec"))
+    data["process_exec"]["process"].update(arguments=f"cmd-{n}", exec_id=f"ZXhlY2lk{n:08d}")
+    data["time"] = time_
+    return json.dumps(data)
+
+
+def _recorded_keys(box: Box) -> Callable[[str | None], list[str]]:
+    """What the service hands the reader: the keys of the sensor events in the black box."""
+
+    def keys(since: str | None) -> list[str]:
+        found = [procs.event_key(e.action, e.details) for e in box.events]
+        return [key for key in found if key is not None]
+
+    return keys
+
+
+def test_after_a_kill_the_lines_read_again_are_not_recorded_twice(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """The cursor is saved every 5 s: a kill -9 of the service repeats what came after it."""
+    tetragon.write(_keyed_exec(1), _keyed_exec(2))
+    first = make_reader()
+    first.poll()
+    first.save_cursor()
+    tetragon.write(_keyed_exec(3), _keyed_exec(4))
+    first.poll()  # recorded, but killed before the next cursor
+    first.close()
+    tetragon.write(_keyed_exec(5))  # while the service was down
+    second = make_reader(already_recorded=_recorded_keys(box))
+    second.poll()
+    assert box.argvs() == ["cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5"]
+    assert second.stats()["duplicates"] == 2
+
+
+def test_the_reader_asks_for_the_keys_since_the_cursors_time(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    asked: list[str | None] = []
+
+    def keys(since: str | None) -> list[str]:
+        asked.append(since)
+        return []
+
+    tetragon.write(_keyed_exec(1, time_="2026-10-17T09:45:30.5Z"))
+    make_reader(already_recorded=keys).poll()  # no cursor yet: everything is a candidate
+    first = make_reader()
+    first.poll()
+    first.save_cursor()
+    make_reader(already_recorded=keys).poll()
+    assert asked == [None, "2026-10-17T09:45:30.5Z"]
+
+
+def test_a_failing_lookup_never_loses_an_event(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    def broken(since: str | None) -> list[str]:
+        raise OSError("the black box is busy")
+
+    tetragon.write(_keyed_exec(1))
+    reader = make_reader(already_recorded=broken)
+    reader.poll()
+    assert box.argvs() == ["cmd-1"]
+    (failed,) = box.of("system", "sensor_failed")
+    assert failed.details["stage"] == "dedupe"
+
+
+def test_a_key_seen_again_after_the_replay_is_recorded(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """Each key in the black box stands for one line: it is skipped once, not forever."""
+    tetragon.write(_keyed_exec(1))
+    make_reader().poll()
+    tetragon.write(_keyed_exec(1))  # Tetragon would never repeat an exec_id; still recorded
+    reader = make_reader(already_recorded=_recorded_keys(box))
+    reader.poll()
+    assert box.argvs() == ["cmd-1", "cmd-1"]
+    assert reader.stats()["duplicates"] == 1
+
+
+def test_probes_of_an_earlier_run_are_not_recorded(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """A probe the killed service launched is not expected by the new one: it is not one of
+    the agent's commands either. Only a probe from before this reader started is stale."""
+    old, new = procs.new_nonce("hb"), procs.new_nonce("hb")
+    late = json.loads(exec_line(new))
+    late["time"] = (WALL + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%S.%f000Z")
+    tetragon.write(exec_line(old), json.dumps(late))
+    reader = make_reader(stale_probes_before=WALL)
+    reader.poll()
+    assert box.argvs() == [new]  # unexpected and newer than the reader: recorded, as before
+    assert reader.stats()["stale_probes"] == 1

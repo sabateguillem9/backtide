@@ -263,6 +263,85 @@ def test_folded_deletes_are_counted_from_the_summary() -> None:
     assert "mass-delete-folded-severe" in second.rules
 
 
+def test_a_sum_weighs_an_event_without_its_field_as_its_default() -> None:
+    rules = rules_from(
+        'risk = 3\naction = ["delete", "summary"]\n'
+        'burst = { count = 10, window = 60, sum = "lasting.delete", default = 1 }'
+    )
+    history = History()
+    for i in range(6):
+        result = assess(seen(ts=1000.0 + i), history, rules)
+        assert result.risk == 0 and result.contributions == {"r0": 1.0}
+        history.add(result.contributions, 1000.0 + i)
+    folded = seen("summary", ".", ts=1007.0, lasting={"delete": 4})
+    assert risk_of(folded, rules, history) == 3  # 6 loose and 4 folded
+    assert risk_of(seen("summary", ".", ts=1007.0, lasting={"delete": 3}), rules, history) == 0
+
+
+def test_loose_and_folded_deletes_add_up() -> None:
+    """The watcher's token bucket decides what is folded, and an agent can empty it first (with
+    harmless writes): 96 deletes on their own and 33 folded right after are one mass deletion of
+    129 files, as severe as 129 loose ones (seen in the VM: OpenClaw's start spends most of the
+    bucket, so wiping a project of 129 files minutes later is split like this)."""
+    history = History()
+    for i in range(96):
+        result = assess(seen(ts=1000.0 + i * 0.001), history, DEFAULTS)
+        history.add(result.contributions, 1000.0 + i * 0.001)
+        assert result.risk < 3
+    folded = seen(
+        "summary", ".", ts=1001.0, counts={"delete": 33}, lasting={"delete": 33}, folded=33
+    )
+    result = assess(folded, history, DEFAULTS)
+    assert result.risk == 3
+    assert "mass-delete-severe" in result.rules
+
+
+def test_folded_deletes_of_temporary_files_do_not_add_up() -> None:
+    """In a summary only ``lasting.delete`` counts with the loose deletes: its other deletes may
+    be of files made and removed in the same window (an OpenClaw start)."""
+    history = History()
+    for i in range(96):
+        result = assess(seen(ts=1000.0 + i * 0.001), history, DEFAULTS)
+        history.add(result.contributions, 1000.0 + i * 0.001)
+    folded = seen(
+        "summary", ".", ts=1001.0, counts={"delete": 500}, lasting={"delete": 0}, folded=500
+    )
+    result = assess(folded, history, DEFAULTS)
+    assert result.risk == 2  # mass-delete-folded: 500 folded deletes, some may be temporary
+    assert "mass-delete-severe" not in result.rules
+
+
+def test_an_event_that_adds_nothing_to_a_sum_is_not_part_of_the_burst() -> None:
+    """After 100 deletes, a summary of creates (``lasting.delete`` 0) is not "100 deletes"."""
+    history = History()
+    for i in range(100):
+        result = assess(seen(ts=1000.0 + i * 0.001), history, DEFAULTS)
+        history.add(result.contributions, 1000.0 + i * 0.001)
+    assert result.risk == 3
+    creates = seen(
+        "summary", ".", ts=1001.0, counts={"create": 50}, lasting={"delete": 0}, folded=50
+    )
+    result = assess(creates, history, DEFAULTS)
+    assert not {"mass-delete", "mass-delete-severe"} & set(result.rules)
+    assert result.risk < 3
+
+
+def test_slow_loose_and_folded_deletes_add_up_over_an_hour() -> None:
+    """The same split, slowly: 1.500 loose deletes and 600 folded ones in an hour are 2.100."""
+    history = History()
+    for i in range(1500):
+        ts = 10_000.0 + i * 2.0  # 30 a minute: never the line of a minute
+        result = assess(seen(ts=ts), history, DEFAULTS)
+        history.add(result.contributions, ts)
+        assert result.risk < 3
+    folded = seen(
+        "summary", ".", ts=13_100.0, counts={"delete": 600}, lasting={"delete": 600}, folded=600
+    )
+    result = assess(folded, history, DEFAULTS)
+    assert result.risk == 3
+    assert "slow-delete-severe" in result.rules
+
+
 def test_deletes_of_files_made_in_the_same_window_do_not_count() -> None:
     """A start-up's temporary files (created and deleted within one 2 s window) destroy
     nothing that existed before: measured, 68 of the 77 deletes of an OpenClaw start."""

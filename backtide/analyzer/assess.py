@@ -78,6 +78,8 @@ def assess(event: Observation, history: History, rules: Sequence[Rule]) -> Asses
         if rule.burst is not None:
             weight = _weight(rule, event)
             contributions[rule.id] = weight
+            if weight <= 0:
+                continue  # it adds nothing (a summary without deletes): not part of the burst
             seen = history.total(rule.id, rule.burst.window, event.ts) + weight
             if seen < rule.burst.count:
                 continue
@@ -122,6 +124,8 @@ def _weight(rule: Rule, event: Observation) -> float:
     if burst.sum_path is None:
         return 1.0
     value = _lookup(event.details, burst.sum_path)
+    if value is _MISSING:
+        return burst.default
     return min(float(value), MAX_WEIGHT) if _is_number(value) and value > 0 else 0.0
 
 

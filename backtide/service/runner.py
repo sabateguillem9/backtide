@@ -12,7 +12,8 @@ Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
   If the black box cannot be used, an agent left running by a killed service is stopped before
   the error goes up: no recording, no watching.
 - ``build_guardian``: the real store, jail, file watcher and black box in one ``Guardian``. Every
-  part can be handed in, which is how the VM tests run the real thing without root.
+  part can be handed in, which is how the VM tests run the real thing without root. The process
+  sensor (T07-3, ``build_sensor``) too: the VM tests that do not test it leave it out.
 - ``run_guardian``: SIGTERM, SIGINT and SIGHUP stop the service (and so the agent), never kill
   it half way, and a second signal while it stops is ignored: a stop of the agent takes up to
   ``stop_timeout`` s. The handler only writes a byte to a pipe: ``Event.set`` takes a lock, and
@@ -40,16 +41,24 @@ from backtide.analyzer import (
     parse_rules,
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
+from backtide.blackbox.redact import KnownScrubber
+from backtide.gate.providers import Providers
 from backtide.jail import AgentJail, JailError, ca
+from backtide.jail.proxy import ProxyJail
+from backtide.jail.sensor import SensorJail, SensorJailConfig
 from backtide.notify import AlertQueue, FanOut, LogNotifier, Notifier
 from backtide.sensors.files import FileWatcher, WatcherConfig
+from backtide.sensors.tetragon import TetragonReader
 from backtide.service.bot import Hooks, telegram_parts
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import ControlServer
+from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
 from backtide.service.pause import Holder, make_space_gate, read_holders
+from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
+from backtide.service.proxy_channel import Policy, known_secrets
 from backtide.service.telegram_config import load_telegram
-from backtide.snapshots import SnapshotStore
+from backtide.snapshots import SnapshotStore, utc_now
 from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
 
 logger = logging.getLogger(__name__)
@@ -217,6 +226,9 @@ def build_guardian(
     store: SnapshotStore | None = None,
     space: SpaceGate | None = None,
     grow: VolumeGrower | None = None,
+    sensor: bool = True,
+    sensor_jail: SensorJailConfig | None = None,
+    proxy: ProxyJail | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -229,7 +241,14 @@ def build_guardian(
 
     The emergency growth (T04e-1) gets the configured image and ceiling, if any, and the
     privileged steps ``NOT_CONFIGURED``: until T13 decides how backtide gets that privilege, a
-    growth is recorded as failed at its first step and nothing changes. ``grow`` replaces it."""
+    growth is recorded as failed at its first step and nothing changes. ``grow`` replaces it.
+
+    The process sensor (T07-3) is built from ``[sensor]``; ``sensor=False`` leaves it out and
+    ``sensor_jail`` replaces its container's settings (the VM tests: one Tetragon per VM, and
+    a file the test user can read).
+
+    The egress proxy (T06-4, ``build_egress``) is always there: it is the agent's only way out.
+    ``proxy`` replaces its container (the VM tests: their concessions, docs/21 "En la VM")."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
         rules = load_rules(config)  # a broken file is an error, not a guess
@@ -264,6 +283,10 @@ def build_guardian(
 
     if grow is None:
         grow = make_grower(config)
+    process_sensor = (
+        build_sensor(config, jail, rated_box, store, jail_config=sensor_jail) if sensor else None
+    )
+    egress = build_egress(config, jail, rated_box, proxy=proxy)
     guardian = Guardian(
         config,
         store=store,
@@ -276,9 +299,65 @@ def build_guardian(
         grow=grow,
         risk=responder,
         prepare_egress=lambda: prepare_egress(config),
+        sensor=process_sensor,
+        egress=egress,
     )
     responder.bind(snapshot=guardian.take_evidence, record=rated_box.append)
     return guardian, alerts, box
+
+
+def build_sensor(
+    config: ServiceConfig,
+    agent: AgentJail,
+    box: AssessedBlackBox,
+    store: SnapshotStore,
+    *,
+    jail_config: SensorJailConfig | None = None,
+) -> ProcessSensor:
+    """The process sensor of ``config`` (docs/23): Tetragon's container, and the reader that
+    records the agent's commands and connections through the rules (``box``), each with the
+    snapshot to rewind to, the Gateway token struck and what an earlier run already recorded
+    skipped. Constructed only: the Guardian starts it."""
+    jail_config = jail_config if jail_config is not None else config.sensor_jail_config()
+    try:
+        scrub = KnownScrubber([config.gateway_token.reveal()]).text
+    except ValueError:
+        scrub = None  # a token too short to search for: redact() still runs
+    reader = TetragonReader(
+        config.sensor_reader_config(),
+        box,
+        snapshot_for=SnapshotBefore(lambda: store.snapshots()),
+        scrub=scrub,
+        already_recorded=recorded_keys(box),
+        stale_probes_before=utc_now(),
+    )
+    return ProcessSensor(SensorJail(jail_config), reader, agent, required=config.sensor_required)
+
+
+def build_egress(
+    config: ServiceConfig,
+    agent: AgentJail,
+    box: AssessedBlackBox,
+    *,
+    proxy: ProxyJail | None = None,
+) -> Egress:
+    """The egress proxy of ``config`` (docs/21, section 9): its container, and what backtide lets
+    out through it, the allowed hosts of ``[proxy]``. The channel records through the rules
+    (``box``) and strikes the Gateway token too. The model providers and their keys come in
+    T06-5: until then no host is a provider's, and nothing is swapped. Constructed only: the
+    Guardian starts it. ConfigError for an allowed host the gate cannot use."""
+    proxy = proxy if proxy is not None else ProxyJail(config.proxy_jail_config())
+    settings = config.proxy_settings()
+    policy = Policy(
+        allow_hosts=settings.allow_hosts,
+        providers=Providers([]),
+        secrets=known_secrets([config.gateway_token.reveal()]),
+    )
+    try:
+        policy.allow_list()
+    except ValueError as error:
+        raise ConfigError(f"[proxy] allow_hosts: {error}") from None
+    return Egress(proxy, agent_name=agent.config.name, policy=policy, record=box.append)
 
 
 def prepare_egress(config: ServiceConfig) -> None:
@@ -412,6 +491,9 @@ def serve(
     handle_signals: bool = True,
     store: SnapshotStore | None = None,
     space: SpaceGate | None = None,
+    sensor: bool = True,
+    sensor_jail: SensorJailConfig | None = None,
+    proxy: ProxyJail | None = None,
 ) -> None:
     """What `backtide vigilar` does: take the lock, build the real service and run it until it is
     told to stop, with the control socket of ``backtide rebobinar`` and ``backtide seguir`` open
@@ -436,6 +518,9 @@ def serve(
             watcher_config=watcher_config,
             store=store,
             space=space,
+            sensor=sensor,
+            sensor_jail=sensor_jail,
+            proxy=proxy,
         )
         control: ControlHook = ControlServer(guardian, config.control_socket)
         if telegram is not None:

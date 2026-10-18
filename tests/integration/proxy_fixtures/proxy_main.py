@@ -46,7 +46,7 @@ SETTINGS = {
     "udp_hosts": [],
     "ignore_hosts": [],
     "onboarding": False,
-    "stream_large_bodies": "1m",
+    # No stream_large_bodies: it streams requests too, before the request hook (T06-4).
     "body_size_limit": "16m",
     "termlog_verbosity": "warn",
     "block_global": True,

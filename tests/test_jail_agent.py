@@ -1085,3 +1085,28 @@ def test_log_tail_keeps_the_end_of_long_logs(jail: AgentJail, fake_docker: FakeD
     fake_docker.reply("logs", Reply(stdout="old line\n" * 2000 + "the last line\n"))
     tail = jail.log_tail()
     assert tail.endswith("the last line") and len(tail) <= docker.MESSAGE_LIMIT
+
+
+# The container's id (T07-3: the process sensor attributes events by it)
+
+
+def test_container_id_is_the_full_id(jail: AgentJail, fake_docker: FakeDocker) -> None:
+    full = "ab" * 32
+    fake_docker.reply("container", "inspect", "--format", "{{json .Id}}", Reply(f'"{full}"\n'))
+    assert jail.container_id() == full
+
+
+def test_container_id_of_a_missing_container_is_none(
+    jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    fake_docker.reply("container", "inspect", "--format", "{{json .Id}}", NO_CONTAINER)
+    assert jail.container_id() is None
+
+
+@pytest.mark.parametrize("output", ['"abc"', '"' + "AB" * 32 + '"', "42", "not json"])
+def test_container_id_refuses_anything_but_an_id(
+    jail: AgentJail, fake_docker: FakeDocker, output: str
+) -> None:
+    fake_docker.reply("container", "inspect", "--format", "{{json .Id}}", Reply(output))
+    with pytest.raises(JailError):
+        jail.container_id()

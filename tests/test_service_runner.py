@@ -246,6 +246,52 @@ def test_the_alerts_go_to_the_log_by_default(config: ServiceConfig) -> None:
     assert isinstance(alerts._notifier, LogNotifier)  # noqa: SLF001
 
 
+def test_the_process_sensor_is_wired_from_the_config(config: ServiceConfig) -> None:
+    """T07-3: the real sensor (constructed only: nothing starts until the boot), reading the
+    sensor's folder, attributing to the agent's container and recording through the rules."""
+    from backtide.analyzer import AssessedBlackBox  # noqa: PLC0415
+    from backtide.jail.sensor import SensorJail  # noqa: PLC0415
+    from backtide.service.process_sensor import ProcessSensor  # noqa: PLC0415
+
+    guardian, _, _ = build_guardian(config)
+    sensor = guardian._sensor  # noqa: SLF001
+    assert isinstance(sensor, ProcessSensor)
+    assert sensor.required is False
+    assert isinstance(sensor._jail, SensorJail)  # noqa: SLF001
+    assert sensor._jail.config == config.sensor_jail_config()  # noqa: SLF001
+    assert sensor._jail.config.file_perm == "600"  # noqa: SLF001
+    assert sensor._agent is guardian._jail  # noqa: SLF001
+    reader = sensor._reader  # noqa: SLF001
+    assert reader.config == config.sensor_reader_config()
+    assert isinstance(reader._recorder, AssessedBlackBox)  # noqa: SLF001
+    assert reader._scrub is not None and TOKEN not in reader._scrub(f"x {TOKEN} y")  # noqa: SLF001
+    assert reader._already_recorded is not None  # noqa: SLF001
+    assert reader._snapshot_for is not None  # noqa: SLF001
+
+
+def test_a_required_sensor_is_wired_as_required(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    strict = ServiceConfig(
+        state_dir=state, volume=tmp_path / "vol", gateway_token=Secret(TOKEN),
+        sensor={"required": True},
+    )  # fmt: skip
+    guardian, _, _ = build_guardian(strict)
+    assert guardian._sensor.required is True  # type: ignore[union-attr]  # noqa: SLF001
+
+
+def test_the_vm_tests_can_leave_the_sensor_out_or_lower_it(config: ServiceConfig) -> None:
+    """One privileged Tetragon per VM, and the tests run without root: the ones that do not
+    test the sensor leave it out, and the sensor's own tests make its file readable."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    guardian, _, _ = build_guardian(config, sensor=False)
+    assert guardian._sensor is None  # noqa: SLF001
+    lowered = replace(config.sensor_jail_config(), file_perm="644")
+    guardian, _, _ = build_guardian(config, sensor_jail=lowered)
+    assert guardian._sensor._jail.config.file_perm == "644"  # type: ignore[union-attr]  # noqa: SLF001
+
+
 # --- the run loop ------------------------------------------------------------------------------
 
 
