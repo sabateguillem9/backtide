@@ -110,7 +110,13 @@ def proxy_container_problems(
     problems = _differences("", created, expected)
     problems += _proxy_host_problems(config, host)
     problems += _proxy_env_problems(config, created.get("Env"), image_env)
-    problems += _dns_problems(host)
+    if config.test_dns:
+        # The VM tests' fake resolver (T06-7): exactly the granted one, and nothing else.
+        if list(host.get("Dns") or []) != list(config.test_dns):
+            problems.append(f"HostConfig.Dns is {host.get('Dns')!r}, not the test resolver")
+        problems += _dns_problems({**host, "Dns": None})
+    else:
+        problems += _dns_problems(host)
     problems += _volume_problems(info)
     problems += _proxy_runtime_problems(created, host)
     problems += _proxy_network_problems(config, info)

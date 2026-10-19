@@ -12,7 +12,8 @@ and every key is one the test made (invariant 8).
     internet.remove()                                 # before the service's cleanup
 
 The grants are the tests' concessions of docs/21, "En la VM" (``egress_neighbours``,
-``test_public_addresses``, ``test_upstream_ca``); no config file can set them. service_main.py
+``test_public_addresses``, ``test_upstream_ca``, and since T06-7 ``test_dns``: the fake internet's
+resolver as the proxy's upstream DNS); no config file can set them. service_main.py
 reads them (``proxy_kit.read_grants``) from the JSON file ``--egress-grants`` names.
 """
 
@@ -50,7 +51,26 @@ ANTHROPIC_HOST = "anthropic.fake.test"
 OPENAI_HOST = "openai.fake.test"
 PLAIN_HOST = "plain.fake.test"  # an ordinary allowed host: it answers with what reached it
 OTHER_HOST = "other.fake.test"  # a host of the fake internet that is NOT allowed
-HOSTS = (ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST, OTHER_HOST)
+# T06-7 (login-oauth): the real login hosts, as aliases of the fake internet (with names in its
+# certificate), so the proxy's OAuth rule is what stops a login and not the missing host. Inside
+# the test's internal network only: nothing real is ever contacted (invariant 8).
+OAUTH_LOGIN_HOSTS = (
+    "auth.openai.com",
+    "accounts.google.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "login.microsoftonline.com",
+    "login.microsoft.com",
+    "login.windows.net",
+    "sts.windows.net",
+    "claude.ai",
+    "console.anthropic.com",
+    "platform.claude.com",
+    "api.anthropic.com",
+    "github.com",
+    "openrouter.ai",
+)
+HOSTS = (ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST, OTHER_HOST, *OAUTH_LOGIN_HOSTS)
 REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"  # proxy_fixtures/fake_internet.py
 GRANTS_OPTION = "--egress-grants"
 
@@ -110,6 +130,15 @@ class FakeInternet:
         """TCP connections accepted per listener (counted before TLS)."""
         return self.stats()["accepts"]
 
+    def dns_queries(self) -> list[dict]:
+        """Every query its resolver got (``name``, ``proto``, ``from``): it is the proxy's
+        upstream DNS (``test_dns``), so these are the names the proxy tried to resolve."""
+        return self.stats()["dns"]
+
+    def dns_errors(self) -> dict[str, int]:
+        """How often its resolver failed to read or answer a query (by protocol)."""
+        return self.stats()["dns_errors"]
+
     def remove(self) -> None:
         jail_docker.run(["rm", "--force", "--volumes", self.name], check=False)
 
@@ -123,7 +152,8 @@ def start_fake_internet(service: Service, root: Path) -> FakeInternet:
     for folder in (certs, files, internet):
         folder.mkdir(exist_ok=True)
     ca_key, ca_cert = make_ca(certs, "T06-5 test internet CA", 2048, 30)
-    shutil.copyfile(make_server_cert(certs, ca_key, ca_cert), internet / "server.pem")
+    server_pem = make_server_cert(certs, ca_key, ca_cert, OAUTH_LOGIN_HOSTS)
+    shutil.copyfile(server_pem, internet / "server.pem")
     shutil.copyfile(FIXTURES / "fake_internet.py", files / "fake_internet.py")
     for folder in (files, internet):
         for path in folder.iterdir():
@@ -152,6 +182,7 @@ def start_fake_internet(service: Service, root: Path) -> FakeInternet:
                     "egress_neighbours": [name],
                     "test_public_addresses": [fake.ip],
                     "test_upstream_ca": fake.ca_pem,
+                    "test_dns": [fake.ip],  # its resolver is the proxy's upstream (T06-7)
                 }
             )
         )

@@ -66,6 +66,7 @@ PROXY_ALIAS = "backtide-proxy"
 # proxy): loopback through /etc/hosts, a number glibc reads as 127.0.0.1, and the containers
 # of the agent's own network (Docker's DNS).
 RESOLVING_INWARDS = ("localhost", "2130706433")
+DNS_CANARY_DOMAIN = "dns-canary.test"
 
 
 @dataclass
@@ -112,7 +113,9 @@ def start_lab(
     vm._remove_stale_test_agents()
     names = vm._agent_names(os.getpid())
     container = names[0]
-    hosts = [PLAIN_HOST]
+    # *.dns-canary.test: allowed, but no container answers for it, so the proxy resolves it
+    # through its upstream (the fake resolver): dns-tunel's positive canary.
+    hosts = [PLAIN_HOST, f"*.{DNS_CANARY_DOMAIN}"]
     if inwards:
         hosts += [*RESOLVING_INWARDS, container, f"{container}-px", PROXY_ALIAS]
     real = {ANTHROPIC: made_up_key("anthropic"), OPENAI: made_up_key("openai")}
@@ -630,3 +633,228 @@ def test_a_key_the_provider_echoes_never_reaches_the_agent(attack: Attack, lab: 
     )
     risks = sorted({e.risk for e in echoed()})
     attack.check("risk", risks == [3], f"la clave real en una respuesta lleva riesgo {risks}")
+
+
+# --- inundar-el-proxy --------------------------------------------------------------------------
+
+
+def proxy_state(lab: Lab) -> dict:
+    info = json.loads(jail_docker.run(["container", "inspect", lab.proxy_name]).stdout)[0]
+    return info["State"]
+
+
+def proxy_memory_mib(lab: Lab) -> float | None:
+    done = jail_docker.run(
+        ["stats", "--no-stream", "--format", "{{.MemUsage}}", lab.proxy_name], check=False
+    )
+    used = done.stdout.strip().split("/", 1)[0].strip()
+    for unit, scale in (("GiB", 1024), ("MiB", 1.0), ("GB", 1000), ("MB", 1), ("KiB", 1 / 1024)):
+        if used.endswith(unit):
+            try:
+                return round(float(used[: -len(unit)].strip()) * scale, 1)
+            except ValueError:
+                return None
+    return None
+
+
+@scenario("inundar-el-proxy")
+def test_flooding_the_proxy_does_not_let_anything_out_unrecorded(attack: Attack, lab: Lab) -> None:
+    tag = new_tag()
+    seq = lab.head()
+    outcome = attack.run_script(lab.agent, "inundar_el_proxy", PLAIN_HOST, tag, timeout=300)
+    state = proxy_state(lab)
+    memory = proxy_memory_mib(lab)
+    huge = outcome["huge"]
+    burst = outcome["burst"]
+    # Everything that reached the fake server must have a net/request recorded before it.
+    arrived = {r["path"]: r for r in lab.internet.requests(PLAIN_HOST, f"/{tag}/")}
+    recorded = {e.details["path"]: e for e in lab.tagged(tag, "request")}
+    before_arrival = all(
+        path in recorded and ts(recorded[path]) < request["at"] for path, request in arrived.items()
+    )
+    # The huge bodies and the slow uploads are refused: nothing of them reaches the server.
+    refused_paths = [p for p in arrived if "huge" in p or "slow" in p]
+    blocked = lab.since(seq, "blocked")
+    too_large = [e for e in blocked if e.details.get("reason") == "too_large"]
+    throttled = lab.since(seq, "throttled")
+    report = lab.service.box.verify()
+    attack.check(
+        "stopped",
+        outcome["control"]["status"] == 200
+        and huge["length_status"] == 413
+        and huge["chunked_status"] == 413
+        and refused_paths == []
+        and state["Running"] is True
+        and state.get("OOMKilled") is not True
+        and memory is not None
+        and memory < 1024,  # an unreadable or unknown figure fails: it proves nothing
+        f"conexiones: {outcome['connections']}; cuerpo enorme: {huge}; ráfaga: {burst}; "
+        f"slowloris: {len(outcome['slow']['outcomes'])} túneles; de los cuerpos enormes y lentos "
+        f"no llegó nada al servidor falso ({refused_paths or 'nada'}). El proxy sigue vivo "
+        f"(Running={state['Running']}, OOMKilled={state.get('OOMKilled')}, memoria {memory} MiB de "
+        f"1024). Control tras la inundación: {outcome['control']['status']}",
+    )
+    attack.check(
+        "recorded",
+        before_arrival and len(too_large) >= 2 and len(throttled) >= 1 and report.ok,
+        f"{len(recorded)} net/request grabados antes de que el servidor falso recibiera cada "
+        f"petición; {len(too_large)} net/blocked too_large; {len(throttled)} net/throttled "
+        f"(ráfaga y conexiones de más); la caja negra verifica: {report.ok} "
+        f"({report.problems[:2]})",
+    )
+    budget_events = too_large + throttled
+    attack.check(
+        "risk",
+        {e.risk for e in budget_events} == {1},
+        f"los topes y presupuestos (too_large, throttled) llevan riesgo "
+        f"{sorted({e.risk for e in budget_events})}",
+    )
+
+
+# --- login-oauth -------------------------------------------------------------------------------
+
+# (host, method, path): host-only OAuth hosts (any path) and path-based ones, with the path
+# tricks a lenient server might read (encoding, case, double slashes, a trailing dot).
+OAUTH_TARGETS = [
+    ("auth.openai.com", "GET", "/authorize?client_id=x&redirect_uri=y"),
+    ("auth.openai.com", "POST", "/oauth/token"),
+    ("accounts.google.com", "GET", "/o/oauth2/v2/auth?scope=all"),
+    ("oauth2.googleapis.com", "POST", "/token"),
+    ("www.googleapis.com", "POST", "/oauth2/v4/token"),
+    ("login.microsoftonline.com", "POST", "/common/oauth2/v2.0/token"),
+    ("login.microsoft.com", "POST", "/common/oauth2/v2.0/devicecode"),
+    ("login.windows.net", "POST", "/common/oauth2/token"),
+    ("sts.windows.net", "POST", "/tenant/oauth2/token"),
+    ("claude.ai", "GET", "/oauth/authorize?client_id=x"),
+    ("claude.ai", "GET", "/OAuth/Authorize"),
+    ("claude.ai", "GET", "//oauth//authorize"),
+    ("claude.ai", "GET", "/%6Fauth/authorize"),
+    ("claude.ai", "GET", "/oauth."),
+    ("console.anthropic.com", "POST", "/v1/oauth/token"),
+    ("platform.claude.com", "POST", "/oauth/token"),
+    ("api.anthropic.com", "GET", "/api/oauth/authorize"),
+    ("github.com", "POST", "/login/oauth/access_token"),
+    ("github.com", "POST", "/login/device/code"),
+    ("openrouter.ai", "GET", "/auth?callback_url=https://x"),
+    ("openrouter.ai", "POST", "/api/v1/auth/keys"),
+]
+
+
+@scenario("login-oauth")
+def test_oauth_logins_through_the_proxy_are_refused(attack: Attack, lab: Lab) -> None:
+    tag = new_tag()
+    seq = lab.head()
+    targets = [f"{host}|{method}|{path}" for host, method, path in OAUTH_TARGETS]
+    outcome = attack.run_script(
+        lab.agent, "login_oauth", tag, ANTHROPIC_HOST, lab.fake[ANTHROPIC], *targets
+    )
+    attempts = outcome["attempts"]
+    # The control: a normal model call still passes (else the refusals would prove nothing).
+    assert outcome["control"]["status"] == 200, outcome
+    oauth_hosts = {host for host, _, _ in OAUTH_TARGETS}
+    reached = {host: lab.internet.requests(host) for host in oauth_hosts}
+    not_refused = {key: value for key, value in attempts.items() if value.get("status") != 403}
+    blocked = [e for e in lab.since(seq, "blocked") if e.details.get("reason") == "oauth_login"]
+    attack.check(
+        "stopped",
+        not_refused == {} and all(hits == [] for hits in reached.values()),
+        f"{len(attempts)} intentos de inicio de sesión OAuth y de código de dispositivo por el "
+        f"proxy: todos 403 ({not_refused or 'ninguno pasó'}); a ninguno de los {len(oauth_hosts)} "
+        f"hosts de login llegó nada ({{k: len(v) for k, v in reached.items() if v}}). Control: "
+        f"la llamada normal al modelo sale ({outcome['control']['status']})",
+    )
+    attack.check(
+        "recorded",
+        len(blocked) == len(OAUTH_TARGETS),
+        f"{len(blocked)} net/blocked oauth_login, uno por intento (de {len(OAUTH_TARGETS)})",
+    )
+    attack.check(
+        "risk",
+        {e.risk for e in blocked} == {2},
+        f"oauth_login lleva riesgo {sorted({e.risk for e in blocked})}",
+    )
+
+
+# --- dns-tunel ---------------------------------------------------------------------------------
+
+
+@scenario("dns-tunel")
+def test_no_dns_query_for_an_attacker_name_leaves_the_vm(attack: Attack, lab: Lab) -> None:
+    tag = new_tag()
+    marker = f"t06dns{uuid4().hex[:10]}"
+    canary = f"{marker}-canary.{DNS_CANARY_DOMAIN}"
+    seq = lab.head()
+    before_queries = len(lab.internet.dns_queries())
+    before_errors = lab.internet.dns_errors()
+    outcome = attack.run_script(lab.agent, "dns_tunel", tag, marker, PLAIN_HOST, canary)
+    # The control resolves and reaches the allowed host: the way out still works for it.
+    assert outcome["control"] == 200, outcome
+
+    def named(text: str) -> list[dict]:
+        return [q for q in lab.internet.dns_queries() if text in str(q["name"]).lower()]
+
+    # The positive canary: the proxy resolves an allowed name no container answers for, and its
+    # query must reach the fake resolver. Without it, "no query came" could mean "nothing listened".
+    deadline = time.monotonic() + 15
+    while not named(canary) and time.monotonic() < deadline:
+        time.sleep(0.25)
+    canary_seen = named(canary)
+    errors = lab.internet.dns_errors()
+    new_errors = {proto: errors[proto] - before_errors.get(proto, 0) for proto in errors}
+    through = outcome["through_proxy"]
+    doh = outcome["doh"]
+    direct = outcome["direct"]
+    through_refused = all(status == 403 for status in through.values())
+    doh_refused = all(status == 403 for status in doh.values())
+    # Docker's own resolver (127.0.0.11) may answer locally, but only with an error code (2
+    # SERVFAIL, 3 NXDOMAIN, 5 REFUSED) and no answers. The outside addresses and the proxy must
+    # answer nothing at all.
+    local_errors = ("rcode=2 ancount=0", "rcode=3 ancount=0", "rcode=5 ancount=0")
+    docker_bad = {
+        key: value
+        for key, value in direct.items()
+        if "127.0.0.11" in key and str(value).startswith("rcode=") and value not in local_errors
+    }
+    direct_out = {
+        key: value
+        for key, value in direct.items()
+        if "127.0.0.11" not in key and (str(value).startswith("rcode=") or value == "closed")
+    }
+    marker_queries = [q for q in named(marker) if canary not in str(q["name"]).lower()]
+    new_queries = len(lab.internet.dns_queries()) - before_queries
+    attack.check(
+        "stopped",
+        through_refused
+        and doh_refused
+        and direct_out == {}
+        and docker_bad == {}
+        and outcome["default_route"] is False
+        and marker_queries == []
+        and canary_seen != []
+        and new_errors == {"udp": 0, "tcp": 0},
+        f"por el proxy (CONNECT y http:// a subdominios codificados): {through}; DoH a "
+        f"resolvedores conocidos: {doh}; DNS directo (UDP y TCP al 53, a direcciones de "
+        f"documentación): {direct}; la cárcel no tiene ruta por defecto "
+        f"({not outcome['default_route']}); ninguna dirección de fuera contestó "
+        f"({direct_out or 'ninguna'}) y el DNS de Docker solo contestó con error "
+        f"({docker_bad or 'bien'}). El resolvedor falso (upstream del proxy) no recibió ninguna "
+        f"consulta con el marcador ({len(marker_queries)} de {new_queries} nuevas). Consultas "
+        f"del canario (un nombre permitido que el proxy tiene que resolver por él; hace falta al "
+        f"menos una para que el cero de arriba valga): {len(canary_seen)}, y el agente recibió "
+        f"{outcome['canary']}. Errores del resolvedor "
+        f"falso: {new_errors}. Control: resuelve y alcanza el host permitido "
+        f"({outcome['control']})",
+    )
+    blocked = [e for e in lab.since(seq, "blocked") if e.details.get("reason") == "not_allowed"]
+    expected = len(through) + len(doh)  # every proxy attempt refused by the allowed list
+    attack.check(
+        "recorded",
+        len(blocked) >= expected,
+        f"{len(blocked)} net/blocked not_allowed (se esperaban al menos {expected}: "
+        f"{len(through)} por el proxy y {len(doh)} de DoH)",
+    )
+    attack.check(
+        "risk",
+        {e.risk for e in blocked} == {1},
+        f"not_allowed lleva riesgo {sorted({e.risk for e in blocked})}",
+    )

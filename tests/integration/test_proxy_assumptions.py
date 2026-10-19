@@ -201,14 +201,18 @@ def make_ca(folder: Path, name: str, bits: int, days: int) -> tuple[Path, Path]:
     return key, cert
 
 
-def make_server_cert(folder: Path, ca_key: Path, ca_cert: Path) -> Path:
-    """The fake internet's certificate, for *.fake.test, signed by the test internet CA."""
+def make_server_cert(
+    folder: Path, ca_key: Path, ca_cert: Path, extra_names: tuple[str, ...] = ()
+) -> Path:
+    """The fake internet's certificate, for *.fake.test (and ``extra_names``), signed by the
+    test internet CA."""
     key, csr, cert = folder / "server.key", folder / "server.csr", folder / "server.crt"
     ext = folder / "server.ext"
+    names = ",".join(f"DNS:{name}" for name in ("*.fake.test", "fake.test", *extra_names))
     ext.write_text(
         "basicConstraints = critical,CA:FALSE\nkeyUsage = critical,digitalSignature,"
         "keyEncipherment\nextendedKeyUsage = serverAuth\n"
-        "subjectAltName = DNS:*.fake.test,DNS:fake.test\n"
+        f"subjectAltName = {names}\n"
     )
     openssl(
         "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=fake.test",
@@ -854,6 +858,25 @@ def outcome_of(lab: Lab, host: str) -> tuple[dict, list[dict]]:
     result = run_client(lab, "https", PROXY, host, f"/{host.split('.')[0]}", "POST")
     time.sleep(0.5)
     return result, requests_to(fake_stats(lab), host)
+
+
+def test_mitmproxy_names_body_size_limit_when_it_cuts_a_body() -> None:
+    """T06-7: the gate records a chunked body that mitmproxy cuts at body_size_limit as
+    ``too_large`` by reading the flow's error message (addon._over_body_limit). Pin that text in
+    the pinned image, so an upgrade that rewords it stops here instead of silently dropping the
+    event."""
+    from backtide.gate import addon
+
+    code = (
+        "import inspect, mitmproxy.proxy.layers.http as h; "
+        "s = inspect.getsource(h.HttpStream.check_body_size); "
+        "print([line.strip() for line in s.splitlines() if 'err_msg =' in line])"
+    )
+    shown = docker(
+        "run", "--rm", "--name", unique(CONTAINER_PREFIX), "--network", "none",
+        "--entrypoint", "python3", MITMPROXY_IMAGE, "-c", code, timeout=120,
+    ).stdout  # fmt: skip
+    assert "body exceeds" in shown and addon._BODY_LIMIT_ERROR in shown, shown  # noqa: SLF001
 
 
 def test_p7_a_raising_request_hook_lets_the_request_through(

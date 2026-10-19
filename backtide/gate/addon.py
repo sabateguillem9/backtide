@@ -294,17 +294,27 @@ class Gate:
         # BEFORE the request hook, that is, before backtide has recorded it. The body is read
         # whole (16 MiB at most, ``body_size_limit``), then checked, recorded and only then sent.
         flow.request.stream = False
-        if not self._channel.ready:
-            self._refuse_unrecorded(flow)
-            return
+        body = _may_have_body(flow.request)
         if len(self._waiting) >= self._channel.limits["max_pending"]:
             self._channel.count_throttled()
-            self._answer(flow, "throttled", retry_after=1)
+            if body:
+                # mitmproxy reads (and keeps) the body of a request that already has its answer,
+                # so a 429 would not save the memory: the request is cut instead (T06-7).
+                flow.kill()
+            else:
+                self._answer(flow, "throttled", retry_after=1)
             return
         length = flow.request.headers.get("content-length")
         if length is not None and (not length.strip().isdigit() or int(length) > BODY_LIMIT):
+            # mitmproxy refuses it too (body_size_limit) and never reads its body.
             self._block("too_large", flow, self._flow_fields(flow))
             return
+        if not self._channel.ready:
+            self._refuse_unrecorded(flow)
+            if not body:
+                return
+        # Every request whose body mitmproxy reads holds a place until its request (or error)
+        # hook, the refused ones too: at most max_pending bodies of 16 MiB in memory.
         self._waiting.add(flow.id)
 
     @_guard_request_phase("request")
@@ -390,6 +400,10 @@ class Gate:
             )
         else:
             event = record.request_event(fields, config.scrubber)
+        # Up to max_pending requests wait for their ack at once: each keeps only mitmproxy's raw
+        # body, never a decoded copy of up to 16 MiB as well (T06-7).
+        del fields["body"]
+        body = parts = None
         ack = await self._channel.ask(event)
         if flow.response is not None:
             return  # killed or answered meanwhile
@@ -631,10 +645,19 @@ class Gate:
 
     @_guard_after("error")
     def error(self, flow: Any) -> None:
+        was_waiting = flow.id in self._waiting
         self._waiting.discard(flow.id)
         self._release(flow)
         meta = flow.metadata.get("backtide")
         if not meta:
+            if was_waiting and flow.response is None and _over_body_limit(flow):
+                # A streamed (chunked) body past body_size_limit: mitmproxy answered 413 and
+                # never called request. Nothing went out; the attempt is recorded (T06-7).
+                self._channel.tell(
+                    record.blocked_event(
+                        "too_large", self._flow_fields(flow), self._channel.scrubber
+                    )
+                )
             return
         if flow.response is not None:
             # The answer had started (a client that hangs up once it has it, as OpenAI's do
@@ -681,6 +704,9 @@ class Gate:
         if state is None:
             raise RuntimeError("a WebSocket message before its start")
         message = flow.websocket.messages[-1]
+        # mitmproxy keeps every message in the flow while the WebSocket is open; it forwards
+        # this one from its own reference, so the list can go: a long WebSocket stays small.
+        flow.websocket.messages.clear()
         if message.from_client and not self._channel.ready:
             # No channel, nothing goes out: not even on a WebSocket that was let through.
             self._channel.tell(
@@ -837,6 +863,26 @@ def decode_body(raw: bytes | None, encoding: str | None, limit: int = BODY_LIMIT
             raise Undecodable("undecodable")
         return data
     raise Undecodable("undecodable")
+
+
+def _may_have_body(request: Any) -> bool:
+    """Whether a body may follow the headers. In HTTP/1 only with ``Content-Length`` above 0 or
+    a ``Transfer-Encoding``; in HTTP/2 and 3 a body needs neither, so any request may have one
+    unless its ``Content-Length`` is 0."""
+    length = request.headers.get("content-length")
+    if length is not None and length.strip() == "0":
+        return False
+    if str(request.http_version).upper().startswith(("HTTP/2", "HTTP/3")):
+        return True
+    return length is not None or request.headers.get("transfer-encoding") is not None
+
+
+_BODY_LIMIT_ERROR = "body_size_limit"  # in mitmproxy 12.2.3's message for a body over it
+
+
+def _over_body_limit(flow: Any) -> bool:
+    error = getattr(flow, "error", None)
+    return _BODY_LIMIT_ERROR in str(getattr(error, "msg", "") or "")
 
 
 def _header_pairs(headers: Any) -> list[tuple[str, str]]:

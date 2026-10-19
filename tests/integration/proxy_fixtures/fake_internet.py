@@ -20,9 +20,16 @@ the pinned mitmproxy image. Never contacted from the Mac and never with a real k
   with ``T06-ECHO-HEADER``, an ordinary answer with the key in a response header.
   Each stream ends with the text ``END-OF-ECHO``, so a test sees where it was cut.
 - ``.../responses``: a fake OpenAI Responses API (JSON or SSE).
-- 9000: plain HTTP control, ``GET /stats``: accepts per listener and every request seen.
+- T06-7, a provider whose answers are big: a model request with ``T06-BIG`` in it gets a
+  JSON answer of BIG_ANSWER bytes (with its length), sent slowly over a few seconds, so several
+  are held whole in the proxy at once (its HELD_BUDGET).
+- 53 (UDP and TCP): a resolver that logs every query and answers NXDOMAIN. The VM tests make it
+  the proxy's upstream DNS (``test_dns``, T06-7): any name the proxy resolves that is not a
+  container on its networks lands here, so a test sees which names left (``dns-tunel``).
+- 9000: plain HTTP control, ``GET /stats``: accepts per listener, every request seen and every
+  DNS query.
 
-Prints READY_LINE once all three listen.
+Prints READY_LINE once all of them listen.
 """
 
 import base64
@@ -30,6 +37,7 @@ import json
 import re
 import socket
 import ssl
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,6 +48,12 @@ REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"
 EXEC_MARK = re.compile(r"T06-EXEC:\[\[(.+?)\]\]", re.S)
 ECHO_MARK = re.compile(rb"T06-ECHO-(JSON|SSE|B64|HEADER)")
 ECHO_END = "END-OF-ECHO"
+BIG_MARK = b"T06-BIG"
+BIG_ANSWER = 15 * 1024 * 1024  # under the proxy's body_size_limit (16 MiB)
+BIG_CHUNK = 1024 * 1024
+BIG_PAUSE = 0.4  # seconds between chunks: about 6 s for the whole answer
+DNS_QUERIES: list[dict] = []
+DNS_ERRORS = {"udp": 0, "tcp": 0}  # a resolver that fails must show it, never prove "nothing came"
 
 LOCK = threading.Lock()
 ACCEPTS = {"443": 0, "8443": 0}
@@ -60,8 +74,7 @@ class Handler(BaseHTTPRequestHandler):
         self._serve()
 
     def _serve(self) -> None:
-        length = int(self.headers.get("content-length") or 0)
-        body = self.rfile.read(length) if length else b""
+        body = self._read_body()
         record = {
             "at": time.time(),  # the same kernel clock as the VM's: T06-4 compares it
             "listener": getattr(CURRENT, "listener", "control"),
@@ -80,7 +93,9 @@ class Handler(BaseHTTPRequestHandler):
             REQUESTS.append(record)
         path = self.path.split("?", 1)[0]
         echo = ECHO_MARK.search(body)
-        if echo is not None and path.endswith(("/v1/messages", "/chat/completions")):
+        if BIG_MARK in body and path.endswith("/v1/messages"):
+            self._big()
+        elif echo is not None and path.endswith(("/v1/messages", "/chat/completions")):
             self._echo(echo.group(1).decode(), anthropic=path.endswith("/v1/messages"))
         elif path.endswith("/v1/messages"):
             record["model_turn"] = _turn_summary(_json_or_empty(body))
@@ -92,10 +107,52 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(200, record)
 
+    def _read_body(self) -> bytes:
+        """The whole request body, by Content-Length or chunked. A chunked body left unread would
+        make the socket close with data pending, and the kernel's reset can drop the answer that
+        was already on its way (T06-7: fronting-y-tuneles's honest chunked POST)."""
+        if "chunked" in (self.headers.get("transfer-encoding") or "").lower():
+            body = bytearray()
+            while True:
+                size = int(self.rfile.readline(1024).split(b";", 1)[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
+                        pass  # trailers, if any
+                    return bytes(body)
+                body += self.rfile.read(size)
+                self.rfile.readline(1024)  # the CRLF after each chunk
+        length = int(self.headers.get("content-length") or 0)
+        return self.rfile.read(length) if length else b""
+
     def _control(self) -> None:
         with LOCK:
-            stats = {"accepts": dict(ACCEPTS), "requests": list(REQUESTS)}
+            stats = {
+                "accepts": dict(ACCEPTS),
+                "requests": list(REQUESTS),
+                "dns": list(DNS_QUERIES),
+                "dns_errors": dict(DNS_ERRORS),
+            }
         self._json(200, stats)
+
+    def _big(self) -> None:
+        """A model answer of BIG_ANSWER bytes of JSON, sent slowly."""
+        head = (
+            b'{"type": "message", "role": "assistant", "model": "fake-model", '
+            b'"content": [{"type": "text", "text": "'
+        )
+        tail = b'"}], "stop_reason": "end_turn"}'
+        data = head + b"a" * (BIG_ANSWER - len(head) - len(tail)) + tail
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        try:
+            for start in range(0, len(data), BIG_CHUNK):
+                self.wfile.write(data[start : start + BIG_CHUNK])
+                self.wfile.flush()
+                time.sleep(BIG_PAUSE)
+        except OSError:
+            self.close_connection = True  # the proxy cut it (its budget): nothing more to send
 
     def _json(self, status: int, payload: object) -> None:
         data = json.dumps(payload).encode()
@@ -465,7 +522,74 @@ def _remember_sni(sock: object, name: str | None, context: ssl.SSLContext) -> No
     CURRENT.sni = name
 
 
+def _question_name(packet: bytes) -> str:
+    labels, offset = [], 12
+    while offset < len(packet) and packet[offset] != 0 and len(labels) < 128:
+        size = packet[offset]
+        labels.append(packet[offset + 1 : offset + 1 + size].decode("ascii", "replace"))
+        offset += 1 + size
+    return ".".join(labels)
+
+
+def _nxdomain(packet: bytes) -> bytes:
+    if len(packet) < 12:
+        return b""
+    (ident,) = struct.unpack("!H", packet[:2])
+    end = packet.find(b"\x00", 12)
+    question = packet[12 : end + 5] if end > 0 else b""
+    return struct.pack("!HHHHHH", ident, 0x8183, 1 if question else 0, 0, 0, 0) + question
+
+
+def _log_query(packet: bytes, proto: str, peer: str) -> None:
+    with LOCK:
+        DNS_QUERIES.append(
+            {"at": time.time(), "name": _question_name(packet), "proto": proto, "from": peer}
+        )
+
+
+def _dns_error(proto: str) -> None:
+    with LOCK:
+        DNS_ERRORS[proto] += 1
+
+
+def _serve_dns_udp(sock: socket.socket) -> None:
+    while True:
+        try:
+            packet, peer = sock.recvfrom(4096)
+            _log_query(packet, "udp", peer[0])
+            sock.sendto(_nxdomain(packet), peer)
+        except Exception:  # noqa: BLE001 - counted in /stats, and the loop keeps serving
+            _dns_error("udp")
+
+
+def _serve_dns_tcp(sock: socket.socket) -> None:
+    while True:
+        try:
+            conn, peer = sock.accept()
+        except OSError:
+            _dns_error("tcp")
+            continue
+        with conn:
+            try:
+                conn.settimeout(5)
+                (size,) = struct.unpack("!H", conn.recv(2))
+                packet = conn.recv(size)
+                _log_query(packet, "tcp", peer[0])
+                reply = _nxdomain(packet)
+                conn.sendall(struct.pack("!H", len(reply)) + reply)
+            except Exception:  # noqa: BLE001 - counted in /stats, and the loop keeps serving
+                _dns_error("tcp")
+
+
 def main() -> None:
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("0.0.0.0", 53))  # noqa: S104 - inside the fake internet
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp.bind(("0.0.0.0", 53))  # noqa: S104 - inside the fake internet
+    tcp.listen(16)
+    threading.Thread(target=_serve_dns_udp, args=(udp,), daemon=True).start()
+    threading.Thread(target=_serve_dns_tcp, args=(tcp,), daemon=True).start()
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(SERVER_PEM)
     context.set_alpn_protocols(["http/1.1"])

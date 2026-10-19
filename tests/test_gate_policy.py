@@ -354,6 +354,16 @@ def test_a_different_host_is_a_mismatch(
         ("api.anthropic.com", "/api/oauth/profile"),
         ("github.com", "/login/oauth/access_token"),
         ("github.com", "/login/device/code"),
+        # T06-7: the other ways to the same tokens (Google's older token endpoint, Microsoft's
+        # second login host, OpenRouter's PKCE flow that hands out an API key).
+        ("www.googleapis.com", "/oauth2/v4/token"),
+        ("www.googleapis.com", "//OAuth2/v3/token"),
+        ("login.microsoft.com", "/common/oauth2/v2.0/devicecode"),
+        ("login.windows.net", "/common/oauth2/token"),
+        ("sts.windows.net", "/tenant/oauth2/token"),
+        ("openrouter.ai", "/auth?callback_url=https://x"),
+        ("openrouter.ai", "/api/v1/auth/keys"),
+        ("openrouter.ai.", "/API/v1/./auth/keys"),
     ],
 )
 def test_oauth_logins_are_recognized(host: str, path: str) -> None:
@@ -371,6 +381,9 @@ def test_oauth_logins_are_recognized(host: str, path: str) -> None:
         ("github.com", "/anthropics/claude-code"),
         ("api.openai.com", "/v1/chat/completions"),
         ("example.com", "/oauth/authorize"),
+        ("www.googleapis.com", "/drive/v3/files"),
+        ("openrouter.ai", "/api/v1/chat/completions"),
+        ("openrouter.ai", "/api/v1/authx"),
     ],
 )
 def test_other_requests_are_not_oauth_logins(host: str, path: str) -> None:

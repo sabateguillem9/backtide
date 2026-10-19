@@ -279,6 +279,9 @@ OAUTH_HOSTS = frozenset(
         "accounts.google.com",
         "oauth2.googleapis.com",
         "login.microsoftonline.com",
+        "login.microsoft.com",  # the same logins as login.microsoftonline.com (T06-7)
+        "login.windows.net",  # Azure AD's older login host
+        "sts.windows.net",  # Azure AD's token service
         "login.live.com",
     }
 )
@@ -296,6 +299,11 @@ OAUTH_PATHS = frozenset(
         ("api.anthropic.com", "/v1/oauth"),
         ("github.com", "/login/oauth"),
         ("github.com", "/login/device"),
+        # T06-7: Google's older token endpoints, and OpenRouter's PKCE flow, whose code is
+        # exchanged for an API key that backtide would not control.
+        ("www.googleapis.com", "/oauth2"),
+        ("openrouter.ai", "/auth"),
+        ("openrouter.ai", "/api/v1/auth"),
     }
 )
 _MAX_UNQUOTE_ROUNDS = 3

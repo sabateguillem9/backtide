@@ -427,6 +427,20 @@ def proxy_problems(cfg: ProxyJailConfig, info: dict[str, Any]) -> list[str]:
     return proxy_container_problems(cfg, info, image_env=PROXY_IMAGE_ENV)
 
 
+def test_the_proxy_may_have_the_test_resolver_only_when_granted(
+    proxy_cfg: ProxyJailConfig,
+) -> None:
+    info = changed("HostConfig.Dns", ["172.31.0.9"], PROXY_GOOD)
+    granted = replace(proxy_cfg, test_dns=("172.31.0.9",))
+    assert proxy_problems(granted, info) == []
+    assert any("Dns" in p for p in proxy_problems(proxy_cfg, info))
+    other = changed("HostConfig.Dns", ["192.0.2.53"], PROXY_GOOD)
+    assert any("Dns" in p for p in proxy_problems(granted, other))
+    assert any("Dns" in p for p in proxy_problems(granted, PROXY_GOOD))  # granted, but missing
+    searched = changed("HostConfig.DnsSearch", ["example.com"], info)
+    assert any("DnsSearch" in p for p in proxy_problems(granted, searched))
+
+
 def test_the_proxy_itself_passes(proxy_cfg: ProxyJailConfig) -> None:
     assert proxy_problems(proxy_cfg, PROXY_GOOD) == []
     info = changed("HostConfig.NetworkMode", "backtide-salida-net", PROXY_GOOD)

@@ -632,11 +632,25 @@ def test_the_test_grants_reach_the_proxy_as_variables(cfg: ProxyJailConfig) -> N
         {"backtide_uid": True},
         {"channel_size": "lots"},
         {"channel_tmpfs": "yes"},
+        {"test_dns": ("not an address",)},
+        {"test_dns": ("10.0.0.0/8",)},
+        {"test_dns": "172.30.0.9"},
     ],
 )
 def test_the_grants_are_checked(cfg: ProxyJailConfig, changes: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         replace(cfg, **changes)
+
+
+def test_the_test_resolver_is_the_proxys_upstream_only_when_granted(
+    cfg: ProxyJailConfig,
+) -> None:
+    # T06-7 (dns-tunel): the VM tests give the proxy a fake resolver as its upstream, as T06-1
+    # P5 did, to see every name the proxy resolves. Never in production: no --dns at all.
+    assert "--dns" not in proxy_config.proxy_create_argv(cfg)
+    argv = proxy_config.proxy_create_argv(replace(cfg, test_dns=("172.30.0.9",)))
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--dns"] == ["172.30.0.9"]
+    assert argv.index("--dns") < argv.index("--entrypoint")
 
 
 def test_the_channel_tmpfs_is_small_private_and_inert(cfg: ProxyJailConfig) -> None:

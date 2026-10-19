@@ -129,9 +129,15 @@ class Flow:
     metadata: dict[str, Any] = field(default_factory=dict)
     killed: bool = False
     websocket: WebSocket | None = None
+    error: Any = None
 
     def kill(self) -> None:
         self.killed = True
+
+
+@dataclass
+class FlowError:
+    msg: str
 
 
 # --- a fake channel ------------------------------------------------------------------------------
@@ -625,6 +631,115 @@ def test_only_so_many_requests_wait_at_once() -> None:
     assert status(late) is None
 
 
+def with_body(flow_id: str, size: int = 100) -> Flow:
+    headers = Headers([("Host", "example.com"), ("Content-Length", str(size))])
+    return Flow(id=flow_id, request=Request(headers=headers, raw_content=b"x" * size))
+
+
+def chunked(flow_id: str) -> Flow:
+    headers = Headers([("Host", "example.com"), ("Transfer-Encoding", "chunked")])
+    return Flow(id=flow_id, request=Request(headers=headers))
+
+
+def bodyless(flow_id: str) -> Flow:
+    headers = Headers([("Host", "example.com")])
+    return Flow(id=flow_id, request=Request(method="GET", headers=headers, raw_content=b""))
+
+
+def test_a_request_refused_at_its_headers_still_holds_a_place_while_its_body_is_read() -> None:
+    # mitmproxy reads (and keeps, up to 16 MiB) the body of a request that already has its
+    # answer (T06-7): so a refusal with a body counts among the requests waiting, or 256 of them
+    # would hold 4 GiB in a proxy of 1 GiB.
+    channel = FakeChannel(limits={"max_pending": 2})
+    channel.ready = False  # no channel: every request is a 503
+    gate, _ = make_gate(channel)
+    first, second = with_body("f1"), chunked("f2")
+    gate.requestheaders(first)
+    gate.requestheaders(second)
+    assert [status(first), status(second)] == [503, 503]
+    third = with_body("f3")
+    gate.requestheaders(third)
+    assert third.killed and third.response is None  # cut: answering it would read its body
+    asyncio.run(gate.request(first))  # mitmproxy read the body and calls request: place freed
+    fourth = with_body("f4")
+    gate.requestheaders(fourth)
+    assert not fourth.killed and status(fourth) == 503
+
+
+def test_over_the_pending_limit_a_body_is_cut_and_a_bodyless_request_gets_429() -> None:
+    channel = FakeChannel(limits={"max_pending": 1})
+    gate, _ = make_gate(channel)
+    waiting = with_body("f0")
+    gate.requestheaders(waiting)
+    assert status(waiting) is None
+    cut, plain = with_body("f1"), bodyless("f2")
+    gate.requestheaders(cut)
+    gate.requestheaders(plain)
+    assert cut.killed and cut.response is None
+    assert status(plain) == 429 and not plain.killed
+    assert channel.throttled == 2 and channel.told == []  # counted together, as before
+    gate.error(cut)  # mitmproxy reports the killed flow: nothing to free, nothing recorded
+    assert channel.told == []
+
+
+def test_a_streamed_body_over_the_limit_is_recorded_as_too_large() -> None:
+    # A chunked body has no length to check at its headers: mitmproxy cuts it at
+    # body_size_limit and calls only the error hook (T06-7: it went unrecorded).
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = chunked("big")
+    gate.requestheaders(flow)
+    assert status(flow) is None
+    flow.error = FlowError("Request body exceeds mitmproxy.options.body_size_limit.")
+    gate.error(flow)
+    assert channel.actions() == ["blocked:too_large"]
+    assert channel.told[0]["details"]["host"] == "example.com"
+    assert channel.told[0]["risk"] == 1
+    again = with_body("next")  # its place is free
+    gate.requestheaders(again)
+    assert status(again) is None
+
+
+def test_a_client_that_hangs_up_mid_body_is_not_recorded_as_too_large() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = chunked("gone")
+    gate.requestheaders(flow)
+    flow.error = FlowError("Client disconnected.")
+    gate.error(flow)
+    assert channel.told == []
+
+
+def test_the_decoded_body_is_let_go_before_waiting_for_the_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 32 requests wait for their ack at once: each must hold its raw body only (mitmproxy's),
+    # not a second, decoded copy of up to 16 MiB too (T06-7).
+    freed: list[str] = []
+
+    class Tracked(bytes):
+        def __del__(self) -> None:
+            freed.append("decoded")
+
+    monkeypatch.setattr(addon, "decode_body", lambda raw, encoding: Tracked(raw or b""))
+    seen: list[list[str]] = []
+
+    class Watching(FakeChannel):
+        async def ask(self, event: dict[str, Any]) -> Ack:
+            import gc
+
+            gc.collect()
+            seen.append(list(freed))
+            return await super().ask(event)
+
+    channel = Watching()
+    gate, _ = make_gate(channel)
+    flow = with_body("f1", 4096)
+    send(gate, flow)
+    assert status(flow) is None
+    assert seen == [["decoded"]]
+
+
 # --- a hook that fails ---------------------------------------------------------------------------
 
 
@@ -863,6 +978,23 @@ def test_websocket_messages_are_summarized_and_a_real_key_kills_it() -> None:
     gate.websocket_end(flow)
     assert channel.told[-1]["details"]["close_code"] == 1006
     assert REAL not in json.dumps(channel.told) and "hello there" not in json.dumps(channel.told)
+
+
+def test_websocket_messages_are_not_kept_once_checked() -> None:
+    # mitmproxy keeps every message of a WebSocket in the flow, for as long as it is open: a
+    # long one would fill the proxy's memory (T06-7). The gate forgets each once checked.
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = Flow(websocket=WebSocket())
+    send(gate, flow)
+    gate.websocket_start(flow)
+    for n in range(5):
+        flow.websocket.messages.append(WsMessage(n % 2 == 0, b"x" * 1000))  # type: ignore[union-attr]
+        gate.websocket_message(flow)
+        assert flow.websocket.messages == []  # type: ignore[union-attr]
+    gate.websocket_end(flow)
+    assert channel.told[-1]["details"]["to_server_bytes"] == 3000
+    assert channel.told[-1]["details"]["to_client_messages"] == 2
 
 
 # --- provider-side tools (T06-6) -----------------------------------------------------------------

@@ -60,10 +60,12 @@ def remove_proxy(config: ServiceConfig) -> list[JailError]:
 
 def read_grants(path: Path) -> dict[str, object]:
     """The proxy's test grants written by internet_kit (``--egress-grants``): the fake internet
-    as the one neighbour on the egress network, its address counted as public, and its CA."""
+    as the one neighbour on the egress network, its address counted as public, its CA, and
+    (T06-7) its resolver as the proxy's upstream DNS."""
     data = json.loads(path.read_text())
     return {
         "egress_neighbours": tuple(data["egress_neighbours"]),
         "test_public_addresses": tuple(data["test_public_addresses"]),
         "test_upstream_ca": data["test_upstream_ca"],
+        "test_dns": tuple(data.get("test_dns", ())),
     }

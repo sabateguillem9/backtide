@@ -114,8 +114,10 @@ class ProxyJailConfig:
     nothing can reach the internet; ``egress_neighbours`` are the containers allowed on it
     besides the proxy (the fake internet); ``test_public_addresses`` are addresses the proxy
     lets through as if they were public (the fake internet's); ``test_upstream_ca`` is the PEM
-    of the fake internet's CA; and ``channel_tmpfs=False`` leaves the channel folder on the
-    disk (mounting the tmpfs needs root)."""
+    of the fake internet's CA; ``channel_tmpfs=False`` leaves the channel folder on the
+    disk (mounting the tmpfs needs root); and ``test_dns`` makes a fake resolver the proxy's
+    upstream (``--dns``, as T06-1 P5), so a test sees every name the proxy resolves (T06-7,
+    ``dns-tunel``). In production the proxy has no ``--dns``, and verify.py requires so."""
 
     ca_dir: Path
     channel_dir: Path
@@ -143,6 +145,7 @@ class ProxyJailConfig:
     test_public_addresses: tuple[str, ...] = ()  # a test-only concession, see the docstring
     test_upstream_ca: str | None = field(default=None, repr=False)  # test-only, see above
     channel_tmpfs: bool = True  # False is a test-only concession, see the docstring
+    test_dns: tuple[str, ...] = ()  # a test-only concession, see the docstring
 
     def __post_init__(self) -> None:
         folders = (
@@ -203,6 +206,10 @@ class ProxyJailConfig:
                 raise ValueError("the proxy is not its own neighbour")
         for address in self.test_public_addresses:
             _require_match("test_public_addresses", address, _ADDRESS_RE)
+        if not isinstance(self.test_dns, tuple):
+            raise ValueError(f"test_dns must be a tuple of addresses, got {self.test_dns!r}")
+        for address in self.test_dns:
+            _require_match("test_dns", address, _ADDRESS_RE)
         if self.test_upstream_ca is not None and (
             not isinstance(self.test_upstream_ca, str)
             or "-----BEGIN CERTIFICATE-----" not in self.test_upstream_ca
@@ -289,6 +296,8 @@ def proxy_create_argv(config: ProxyJailConfig) -> list[str]:
         argv += ["--log-opt", f"{name}={value}"]
     for name, value in SYSCTLS.items():
         argv += ["--sysctl", f"{name}={value}"]
+    for address in config.test_dns:  # the VM tests' fake resolver only (T06-7)
+        argv += ["--dns", address]
     for target, options in tmpfs_mounts(config).items():
         argv += ["--tmpfs", f"{target}:{options}"]
     for bind in volume_binds(config):
