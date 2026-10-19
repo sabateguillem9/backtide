@@ -246,7 +246,13 @@ class FileWatcher(Protocol):
 
 # Why a required sensor stops the agent (``agent_stop {reason}``).
 _SENSOR_REASONS = frozenset(
-    {"sensor_down", "sensor_unproven", "sensor_lost_events", "sensor_budget"}
+    {
+        "sensor_down",
+        "sensor_unproven",
+        "sensor_lost_events",
+        "sensor_budget",
+        "sensor_novelty_streak",
+    }
 )
 
 

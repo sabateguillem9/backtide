@@ -25,6 +25,7 @@ from backtide.jail.sensor import (
     POLICY_FILE,
     POLICY_SHA256,
     REDACTION_RULES,
+    REDACTION_TOOL_RULES,
     SensorJail,
     SensorJailConfig,
     policy_text,
@@ -196,12 +197,17 @@ def test_the_field_filters_keep_what_procs_needs() -> None:
 
 def test_each_redaction_line_is_one_json_rule() -> None:
     lines = sensor_settings(CONFIG)["redaction-filters"].splitlines()
-    assert [json.loads(line) for line in lines] == [{"redact": list(r)} for r in REDACTION_RULES]
+    assert [json.loads(line) for line in lines] == [
+        {"redact": list(r)} for r in REDACTION_RULES
+    ] + [{"binary_regex": [b], "redact": list(r)} for b, r in REDACTION_TOOL_RULES]
 
 
-def _tetragon_redact(text: str) -> str:
-    """What Tetragon does with a rule: each capture group of each match becomes *****."""
-    for rules in REDACTION_RULES:
+def _tetragon_redact(text: str, binary: str = "/bin/true") -> str:
+    """What Tetragon does with a rule: each capture group of each match becomes *****. A rule
+    with a binary_regex only applies to a binary it matches."""
+    filters = [*REDACTION_RULES]
+    filters += [rules for regex, rules in REDACTION_TOOL_RULES if re.search(regex, binary)]
+    for rules in filters:
         for rule in rules:
             pattern = re.compile(rule)
 
@@ -253,6 +259,102 @@ def test_the_refined_capture_keeps_the_closing_quote() -> None:
     # A quoted value (--password "two words") is the second barrier's: procs.safe_text.
     for rules in REDACTION_RULES[:2]:
         assert all(rule.endswith(r"""([^\s"']+)""") for rule in rules)
+
+
+# --- T07-5: passwords glued to their flag, and values Tetragon wraps in quotes -----------
+
+_G = "Qx7vR2mK9pLt4ZwB8nHc"  # noqa: S105 - a fake
+_G2 = "Vb6Yc1Df5Gh0JqR2mX9k"  # noqa: S105 - a fake
+
+
+@pytest.mark.parametrize(
+    ("binary", "arguments", "kept"),
+    [
+        ("/usr/bin/mysql", f"-uroot -p{_G} shop", "shop"),
+        ("/usr/bin/mariadb-dump", f'"-p{_G} {_G2}" shop', "shop"),
+        ("/usr/bin/sshpass", f"-p {_G} ssh host.invalid", "ssh host.invalid"),
+        ("/usr/bin/sshpass", f'-p "{_G} {_G2}" ssh host.invalid', "ssh host.invalid"),
+        ("/usr/bin/redis-cli", f"-a{_G} ping", "ping"),
+        ("/usr/bin/mongosh", f"-u a -p {_G} --quiet", "--quiet"),
+        ("/usr/bin/lftp", f"-u alice,{_G} sftp://h.invalid", "sftp://h.invalid"),
+        ("/usr/bin/smbclient", f"//h.invalid/s -U alice%{_G}", "//h.invalid/s"),
+        ("/usr/bin/curl", f"-ualice:{_G} https://x.invalid/", "https://x.invalid/"),
+        ("/usr/bin/env", f'"DB_PASSWORD={_G} {_G2}" run', "run"),
+        ("/bin/true", f'"--password=pass phrase {_G} {_G2}" x', " x"),
+        ("/bin/true", f'"--token={_G} {_G2}" x', " x"),
+        ("/bin/true", f"-bsessionid={_G};csrftoken={_G2} x", " x"),
+        ("/bin/true", f'"-bsessionid={_G}; csrftoken={_G2}" x', " x"),
+        ("/bin/sh", f'-c "mysql -uroot -p{_G} shop; ls /w"', "ls /w"),
+        ("/bin/sh", f"-c \"mysql -p'{_G} {_G2}' shop && echo ok\"", "echo ok"),
+        ("/bin/sh", f'-c "MYSQL_PWD={_G} mysql shop"', "mysql shop"),
+        ("/bin/sh", f'-c "SSHPASS={_G} sshpass -e ssh h.invalid"', "ssh h.invalid"),
+        ("/bin/sh", f'-c "sshpass -p {_G} ssh h.invalid"', "ssh h.invalid"),
+        ("/bin/sh", f'-c "redis-cli -h c.invalid -a {_G} ping | cat"', "| cat"),
+        ("/bin/sh", f'-c "lftp -u alice,{_G} h.invalid; echo done"', "echo done"),
+        ("/bin/sh", f'-c "smbclient //h/s -U alice%{_G} -c ls"', "-c ls"),
+        ("/bin/sh", f'-c "curl -ualice:{_G} https://x.invalid/"', "https://x.invalid/"),
+        ("/usr/bin/openssl", f"enc -pass pass:{_G} -in f", "-in f"),
+        # The review of T07-5: more tools, and values with spaces after user flags.
+        ("/usr/bin/podman", f"login -u me -p {_G} registry.invalid", "registry.invalid"),
+        ("/usr/bin/helm", f"registry login -u me -p {_G} r.invalid", "r.invalid"),
+        ("/usr/bin/ldapsearch", f"-x -D cn=admin -w {_G} -b dc=x", "cn=admin"),
+        ("/usr/bin/sqlcmd", f"-S db.invalid -U sa -P {_G} -Q x", "-Q x"),
+        ("/usr/bin/ipmitool", f"-U admin -P {_G} power status", "power status"),
+        ("/usr/bin/mosquitto_pub", f"-u me -P {_G} -t t", "-t t"),
+        ("/usr/bin/zip", f"-P {_G} out.zip a.txt", "out.zip"),
+        ("/usr/bin/7z", f"a -p{_G} out.7z", "out.7z"),
+        ("/usr/bin/openssl", f"enc -aes-256-cbc -k {_G} -in f", "-in f"),
+        ("/usr/bin/ssh-keygen", f"-t ed25519 -N {_G} -f key", "-f key"),
+        ("/usr/bin/curl", f"-E cert.pem:{_G} https://x.invalid/", "https://x.invalid/"),
+        ("/usr/bin/curl", f'-u "alice:pw {_G}" https://x.invalid/', "https://x.invalid/"),
+        ("/usr/bin/curl", f'"--user=alice:pw {_G}" https://x.invalid/', "https://x.invalid/"),
+        ("/usr/bin/sqlplus", f"scott/{_G}@orcl @run.sql", "@run.sql"),
+        ("/usr/bin/gh", f"secret set T --body {_G}", "secret set"),
+        ("/usr/bin/vault", f"login {_G}", "login"),
+        ("/usr/sbin/htpasswd", f"-nb alice {_G}", "alice"),
+        ("/usr/bin/nmcli", f"dev wifi connect home password {_G}", "connect home"),
+        ("/usr/bin/xfreerdp", f"/v:h /u:me /p:{_G}", "/u:me"),
+        ("/usr/bin/aws", f"configure set aws_secret_access_key {_G}", "configure set"),
+        ("/usr/bin/mysql", f"-e \"CREATE USER u IDENTIFIED BY '{_G}'\"", "CREATE USER"),
+        ("/usr/bin/psql", f"-c \"ALTER USER u WITH PASSWORD '{_G}'\"", "ALTER USER"),
+        ("/bin/sh", f'-c "docker login -u me -p {_G} r.invalid && docker push x"', "push x"),
+        ("/bin/sh", f"-c \"curl -u 'alice:pw {_G}' https://x.invalid/\"", "x.invalid"),
+        ("/bin/sh", f'-c "ldapsearch -x -w {_G} -b dc=x; ls"', "; ls"),
+    ],
+)
+def test_the_redaction_rules_strike_glued_passwords(binary: str, arguments: str, kept: str) -> None:
+    struck = _tetragon_redact(arguments, binary)
+    assert _G not in struck and _G2 not in struck, struck
+    assert kept in struck, struck
+
+
+@pytest.mark.parametrize(
+    ("binary", "arguments"),
+    [
+        ("/usr/bin/ssh", "-p2222 user@host.invalid"),
+        ("/bin/mkdir", "-pmode /w/x"),
+        ("/usr/bin/mysql", '-p "my db"'),
+        ("/bin/sh", '-c "mysql shop; mkdir -pnew /w/x"'),
+        ("/bin/sh", "-c 'git checkout -b x && rm -rf /w'"),
+        ("/bin/sh", '-c "sort -b list; rm -rf /w"'),
+        ("/usr/bin/docker", "run -p 8080:80 nginx"),
+        ("/bin/sh", '-c "docker run -p 8080:80 nginx"'),
+        ("/usr/bin/vault", "login -method=oidc"),
+        ("/usr/bin/zip", "-r out.zip dir"),
+    ],
+)
+def test_the_redaction_rules_leave_ordinary_flags(binary: str, arguments: str) -> None:
+    assert _tetragon_redact(arguments, binary) == arguments
+
+
+def test_every_rule_is_re2_shaped() -> None:
+    """RE2 has no lookaround and no backreference: Tetragon would refuse to start."""
+    rules = [rule for rules in REDACTION_RULES for rule in rules]
+    rules += [rule for _, rules in REDACTION_TOOL_RULES for rule in rules]
+    rules += [binary for binary, _ in REDACTION_TOOL_RULES]
+    for rule in rules:
+        assert not re.search(r"\(\?<?[=!]|\\[1-9]|\(\?P=", rule), rule
+        assert re.compile(rule).groups >= (0 if rule.startswith("(?:^|/)") else 1), rule
 
 
 # --- the connect policy ---------------------------------------------------------------------

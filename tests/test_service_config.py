@@ -667,6 +667,7 @@ def test_the_sensor_defaults_are_the_designs(layout: Path) -> None:
     assert reader.agent_name == config.jail_config().name
     assert (reader.exec_rate, reader.exec_burst, reader.exec_daily) == (20.0, 500, 100_000)
     assert (reader.net_rate, reader.net_burst, reader.net_daily) == (20.0, 200, 50_000)
+    assert config.sensor_novelty_streak == 600.0  # the founder's decision B: 10 minutes
 
 
 def test_the_sensor_options_are_read(layout: Path) -> None:
@@ -675,10 +676,11 @@ def test_the_sensor_options_are_read(layout: Path) -> None:
             layout,
             '[sensor]\nname = "sensor-2"\nrequired = true\nmemory = "2g"\ncpus = "0.5"\n'
             'cgroup_rate = "500,1s"\nexec_rate = 10\nexec_burst = 100\nexec_daily = 1000\n'
-            "net_rate = 5.5\nnet_burst = 50\nnet_daily = 500\n",
+            "net_rate = 5.5\nnet_burst = 50\nnet_daily = 500\nnovelty_streak_minutes = 2.5\n",
         )
     )
     assert config.sensor_required is True
+    assert config.sensor_novelty_streak == 150.0
     jail = config.sensor_jail_config()
     assert (jail.memory, jail.cpus, jail.cgroup_rate) == ("2g", "0.5", "500,1s")
     assert jail.name == config.sensor_reader_config().sensor_name == "sensor-2"
@@ -703,6 +705,15 @@ def test_the_sensor_options_are_read(layout: Path) -> None:
         pytest.param("[sensor]\nnet_daily = -1\n", "net_daily", id="daily-negative"),
         pytest.param("[sensor]\nnet_daily = true\n", "net_daily", id="daily-bool"),
         pytest.param('[sensor]\ntoken = "x"\n', "never hold a key", id="secret"),
+        pytest.param(
+            "[sensor]\nnovelty_streak_minutes = 0.5\n", "novelty_streak", id="streak-short"
+        ),
+        pytest.param(
+            "[sensor]\nnovelty_streak_minutes = true\n", "novelty_streak", id="streak-bool"
+        ),
+        pytest.param(
+            '[sensor]\nnovelty_streak_minutes = "10"\n', "novelty_streak", id="streak-str"
+        ),
         pytest.param('[sensor]\nname = "backtide-agente"\n', "another container", id="agents"),
         pytest.param('[sensor]\nname = "backtide-proxy"\n', "another container", id="proxys"),
         pytest.param('[sensor]\nname = "-x"\n', "sensor", id="bad-name"),

@@ -23,7 +23,10 @@ victim = os.path.join(workdir, "victim")
 with open(victim, "w") as handle:
     handle.write("x\n")
 
-blob = ("a.a-a://" * (64 * 1024 // 8))[: 64 * 1024]  # ~64 KB of the quadratic form
+# ~64 KB of the quadratic form, after a quote: the reader's tail window reaches back to the last
+# quote or line break (at most 64 KiB), so without it only the plain 2.5 KiB window was struck
+# and the hostile part never reached the patterns (T07-5).
+blob = '"' + ("a.a-a://" * (64 * 1024 // 8))[: 64 * 1024 - 1]
 middle = count // 2
 rm_code = None
 for index in range(count):

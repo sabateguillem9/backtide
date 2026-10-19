@@ -23,6 +23,7 @@ rules are T08's.
   its last saved cursor, and the key in the black box is how it knows which it recorded.
 """
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -52,9 +53,13 @@ _TAIL_LEAD = 64
 _TERMINATORS = "\r\n\"'"
 # The lines of a key body right before its END (whose BEGIN may be out of the window). Only
 # those lines: a fake END line cannot wipe the commands before it.
-_PEM_BODY_RE = re.compile(
-    r"(?:[A-Za-z0-9+/=]{1,76}\r?\n)+(?=-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----)"
-)
+# Walked back from each END line, line by line (never a regex over the window: that was
+# quadratic): three or more lines of 40+ base64 characters, the last one maybe shorter. A fake
+# END after a few one-word lines (cd, ls, reboot) strikes nothing.
+_KEY_END_RE = re.compile(r"-----END [A-Z0-9 ]{0,64}PRIVATE KEY(?: BLOCK)?-----")
+_KEY_LINE_RE = re.compile(r"[A-Za-z0-9+/=]{1,76}\r?")
+_KEY_LINE_MIN = 40
+_KEY_LINES = 3
 _SHORT_LIMIT = 64  # a signal name, a timestamp, a protocol
 MIN_PREFIX = 12  # characters of a container id that make an attribution
 
@@ -93,42 +98,238 @@ _KEYED_ACTIONS = frozenset({"exec", "exit", "connect"})
 
 # Command-line forms ``redact`` does not strike on its own: a value after a flag whose name ends
 # with one of these words (``--pass x``, ``--password "two words"``) and an assignment inside a
-# script (``password = 'x'``). Each quantifier is bounded and each name starts after a
-# non-word character, so the scans stay linear on hostile text.
+# script (``password = 'x'``). Each quantifier is bounded or possessive and each name starts
+# after a non-word character, so the scans stay linear on hostile text.
 _SECRET_WORDS = r"(?:password|passwd|pass|pwd|secret|token|api[-_]?key|apikey|auth|cookie)"  # noqa: S105
-_FLAG = rf"(?i)(?<!\S)--?[\w-]*?{_SECRET_WORDS}(?:[ \t]+|=)"
+# A flag starts an element: after a space, at the start, or after a quote (a shell's, or the
+# one Tetragon puts around an element with a space in it).
+_FLAG = rf"(?i)(?<![^\s\"'])--?[\w-]*?{_SECRET_WORDS}(?:[ \t]+|=)"
 # redact.py's sensitive names, for JSON and Python values a cut window leaves unclosed.
 _VALUE_WORDS = (
     r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
     r"|authorization|cookie)"
 )
-# A value that crosses spaces is only taken between quotes: without an opening quote a pattern
-# strikes ONE token, so an ordinary flag (`git checkout -b x`, `sort -b`) never swallows the
-# rest of a command. The closing quote may be missing at the end of the text or of a window
-# (``\Z``): a cut must not leave the inside of a quoted secret.
-_ARGV_PATTERNS = (
-    *(
-        re.compile(pattern)
-        for quote in ('"', "'")
-        for pattern in (
-            # A quoted value is struck whole, with no cap (AWS session tokens are ~1,300
-            # chars; cookies, kilobytes): anchored at the name, so the scan stays linear. An
-            # unclosed quote (the end of the text or of a cut window) strikes to that end.
-            rf"{_FLAG}{quote}(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
-            rf"(?i)(?<![\w.-])[\w.-]*?{_SECRET_WORDS}[\"']?[ \t]*[:=][ \t]*{quote}"
-            rf"(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
-            # curl -b / --cookie "a=b; c=d".
-            rf"(?<!\S)(?:-b|--cookie)(?:[ \t]+|=){quote}(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
-            # "api_key": "… or 'api_key': '…, closed or cut by the end.
-            rf"(?i){quote}[\w.-]*?{_VALUE_WORDS}{quote}\s*:\s*{quote}"
-            rf"(?P<secret>[^{quote}\r\n]+)(?:{quote}|\Z)",
-        )
+# An environment-style assignment the shell reads a password from (MYSQL_PWD=, SSHPASS=,
+# REDISCLI_AUTH=): the words redact leaves out because they are too common in prose.
+_ENV_WORDS = r"(?:pwd|pass|passwd|auth)"
+
+
+def _quoted(quote: str, open_end: bool) -> str:
+    """A quoted value to its closing quote or a line break; ``\\Z`` closes it only at an
+    artificial cut (``open_end``: the end of the head window, or arguments Tetragon cut). A
+    backslash escapes the next character (``\\"`` inside JSON or a shell string)."""
+    end = rf"(?:{quote}|(?=[\r\n]){'|\\Z' if open_end else ''})"
+    return rf"(?P<secret>(?:[^{quote}\\\r\n]|\\[^\r\n]?)++){end}"
+
+
+def _wrapped(open_end: bool) -> str:
+    """The value of an element Tetragon wrapped in double quotes (it has a space): up to the
+    next double quote. Tetragon escapes nothing inside, so a backslash escapes nothing here."""
+    return rf'(?P<secret>[^"\r\n]++)(?:"|(?=[\r\n]){"|\\Z" if open_end else ""})'
+
+
+def _unclosed(quote: str) -> str:
+    """The fallback for a quote that never closes before the real end: up to the next shell
+    separator or line break, so the rest of a short command stays in sight."""
+    return rf"(?P<secret>[^{quote};|&\r\n]+)"
+
+
+def _argv_patterns(open_end: bool) -> tuple[re.Pattern[str], ...]:
+    patterns: list[str] = []
+    for quote in ('"', "'"):
+        for value in (_quoted(quote, open_end), _unclosed(quote)):
+            patterns += [
+                # A quoted value is struck whole, with no cap (AWS session tokens are ~1,300
+                # chars; cookies, kilobytes): anchored at the name, so the scan stays linear.
+                rf"{_FLAG}{quote}{value}",
+                rf"(?i)(?<![\w.-])[\w.-]*?{_SECRET_WORDS}[\"']?[ \t]*[:=][ \t]*{quote}{value}",
+                # curl -b / --cookie "a=b; c=d", and -b"a=b" glued.
+                rf"(?<![^\s\"'])(?:-b(?:[ \t]+|=)?|--cookie(?:[ \t]+|=)){quote}{value}",
+                # "api_key": "… or 'api_key': '…, closed or cut by the end.
+                rf"(?i){quote}[\w.-]*?{_VALUE_WORDS}{quote}\s*:\s*{quote}{value}",
+                # SQL: CREATE USER u IDENTIFIED BY 'x', ALTER USER u WITH PASSWORD 'x'.
+                rf"(?i)\bidentified[ \t]+(?:with[ \t]+\S+[ \t]+)?by[ \t]+(?:password[ \t]+)?"
+                rf"{quote}{value}",
+                rf"(?i)\bpassword[ \t]+{quote}{value}",
+            ]
+    wrapped = _wrapped(open_end)
+    patterns += [
+        # An element Tetragon wrapped in quotes because it has a space: the value runs to the
+        # closing quote ("--password=pass phrase", "--token abc def"). Not a bare NAME=a b:
+        # a script "PGPASSWORD=x psql …" looks the same, and its command must stay in sight
+        # (env "DB_PASSWORD=a b" is the env tool's, below).
+        rf'(?i)(?<!\S)"--?[\w-]*?{_SECRET_WORDS}(?:=|[ \t]+){wrapped}',
+        rf'(?<!\S)"-b(?=[^\s"=;]+=){wrapped}',
+        # Unquoted: one token. A leading quote that never closes is skipped.
+        rf"{_FLAG}[\"']*(?P<secret>[^\s\"']+)",
+        r"(?<![^\s\"'])(?:-b|--cookie)(?:[ \t]+|=)(?P<secret>[^\s\"']+)",
+        # -bsessionid=…: glued, and shaped like a cookie (a name, then =).
+        r"(?<![^\s\"'])-b(?P<secret>[^\s\"'=;]+=[^\s\"']*)",
+        rf"(?i)(?<![\w.-])[\w.-]*?{_ENV_WORDS}=(?P<secret>[^\s&#;,'\"]+)",
+        # openssl's -pass pass:secret, -passin pass:secret.
+        r"(?<![^\s\"'])pass:(?P<secret>[^\s\"']+)",
+        # aws configure set aws_secret_access_key x, npm config set //r/:_authToken x: the
+        # key's name is checked by a lookahead and taken possessively (linear).
+        r"(?i)\bconfig(?:ure)?[ \t]+set[ \t]+(?:-\S*+[ \t]+)*+"
+        r"(?=\S*?(?:secret|token|passw|auth|credential))\S++[ \t]+(?P<secret>[^\s\"']+)",
+        # Three or more lines of 64 base64 characters: the body of a key, even without BEGIN.
+        r"(?<![A-Za-z0-9+/])(?P<secret>(?:[A-Za-z0-9+/]{64}\r?\n){3,}[A-Za-z0-9+/=]{0,64})",
+    ]
+    return tuple(re.compile(pattern) for pattern in patterns)
+
+
+# Both sets: [0] for a text whose end is its real end, [1] for one cut short (the head window,
+# or arguments Tetragon cut: truncArgs), where an unclosed quote closes at the cut.
+_ARGV_PATTERNS = (_argv_patterns(False), _argv_patterns(True))
+
+# --- T07-5: tools that take a password glued to a short flag (``mysql -pS3cr3t``), after a flag
+# only they give that meaning (``sshpass -p``, ``ldapsearch -w``, ``zip -P``) or in a place of
+# their own (``sqlplus user/pass@db``, ``vault login TOKEN``). By the basename of the binary
+# Tetragon reports; inside a script (and behind a wrapper such as sudo), anchored at the tool's
+# name and bounded to its own command (to the next ``;``, ``|``, ``&``, ``)``, backquote or line
+# break outside quotes, at most _SEGMENT characters), so the -p of another command is never
+# taken for a password. A CLOSED list: a tool not here with a password flag of its own that
+# does not name a secret word is a residual (docs/23, T07-5). Mirrored in RE2 by
+# backtide/jail/sensor.py (_TOOLS).
+_SEGMENT = 512
+_SCRIPT_VALUE = r"""(?P<secret>(?:'[^'\r\n]*+'?|"[^"\r\n]*+"?|[^\s"';|&<>()`]++)++)"""
+# How a flag meets its value: glued (-pX), glued or after spaces (-p X), = or spaces.
+_SEPS = {"glued": "", "opt": "[ \t]*", "eq": "(?:=|[ \t]+)"}
+# (flag, separator, what comes before the secret: user, or user and a separator)
+type _FlagSpec = tuple[str, str, str]
+# What comes before a secret is bounded and possessive: an unbounded run that fails at its end
+# would be scanned again from every flag (quadratic on hostile text).
+_USER_COLON = r"[^\s:\"']{1,256}+:"
+# (basename, the subcommand the flags belong to or None, the flags)
+_TOOL_FLAGS: tuple[tuple[str, str | None, tuple[_FlagSpec, ...]], ...] = (
+    (r"(?:mysql|mariadb)[\w-]*+", None, (("-p", "glued", ""),)),
+    (r"sshpass", None, (("-p", "opt", ""),)),
+    (r"(?:redis|valkey|keydb)-cli", None, (("-a", "opt", ""),)),
+    (r"mongo(?:sh|dump|restore|export|import|stat|top|files)?", None, (("-p", "opt", ""),)),
+    (r"lftp", None, (("-u", "opt", r"[^\s,]{0,256}+,"),)),
+    # env "DB_PASSWORD=two words" cmd: here an element wrapped by Tetragon is an assignment.
+    (r"env", None, ((rf"(?i:[\w.-]*?(?:{_SECRET_WORDS}|{_VALUE_WORDS}))=", "glued", ""),)),
+    (
+        r"smbclient|rpcclient|smbget|smbcacls|smbtree",
+        None,
+        (("-U", "opt", r"[^\s%]{0,256}+%"), ("--user", "eq", r"[^\s%]{0,256}+%")),
     ),
-    re.compile(rf"{_FLAG}(?P<secret>[^\s\"']+)"),
-    re.compile(r"(?<!\S)(?:-b|--cookie)(?:[ \t]+|=)(?P<secret>[^\s\"']+)"),
-    # Three or more lines of 64 base64 characters: the body of a key, even without its BEGIN.
-    re.compile(r"(?<![A-Za-z0-9+/])(?P<secret>(?:[A-Za-z0-9+/]{64}\r?\n){3,}[A-Za-z0-9+/=]{0,64})"),
+    (
+        r"curl",
+        None,
+        (
+            ("-u", "opt", _USER_COLON),  # -ualice:pw, -u "alice:pw x"
+            ("--user", "eq", _USER_COLON),
+            ("-U", "opt", _USER_COLON),
+            ("--proxy-user", "eq", _USER_COLON),
+            ("--oauth2-bearer", "eq", ""),
+            ("-E", "opt", _USER_COLON),  # a client certificate's passphrase: cert.pem:pw
+            ("--cert", "eq", _USER_COLON),
+        ),
+    ),
+    # docker login -p: only in the login subcommand (in docker run, -p publishes a port).
+    (r"docker|podman|nerdctl|buildah|skopeo|oras", r"login", (("-p", "opt", ""),)),
+    (r"helm", r"registry[ \t]+login", (("-p", "opt", ""),)),
+    (
+        r"ldap(?:search|add|modify|delete|passwd|whoami|compare|modrdn|exop)",
+        None,
+        (("-w", "opt", ""),),
+    ),  # fmt: skip
+    (r"sqlcmd|bcp|ipmitool|mosquitto_(?:pub|sub|rr)", None, (("-P", "opt", ""),)),
+    (r"zip|unzip|zipcloak", None, (("-P", "opt", ""),)),
+    (r"7z|7za|7zr|7zz", None, (("-p", "glued", ""),)),
+    (r"openssl", None, (("-k", "opt", ""), ("-K", "opt", ""))),
+    (r"ssh-keygen", None, (("-N", "opt", ""), ("-P", "opt", ""))),
+    (
+        r"sqlplus|sqlldr|expdp|impdp|rman",
+        None,
+        (("", "glued", r"[\w$#]{1,128}+/"),),
+    ),  # user/pass@db
+    (r"gh", r"secret[ \t]+set", (("--body", "eq", ""), ("-b", "opt", ""))),
+    (r"vault", None, (("login[ \t]+(?!-)", "glued", ""),)),  # vault login TOKEN
+    # htpasswd -b[c] file user PASS, htpasswd -nb user PASS: the last of them.
+    (r"htpasswd", None, ((r"-[A-Za-z]*b[A-Za-z]*(?:[ \t]+[^\s-]\S*+){1,2}", "opt", ""),)),
+    (r"nmcli", None, ((r"(?:[\w-]+\.)?(?:password|psk|wep-key[0-3])", "opt", ""),)),
+    (
+        r"x?freerdp\d*|wlfreerdp|sdl-freerdp",
+        None,
+        (("/p:", "glued", ""), ("/password:", "glued", "")),
+    ),
 )
+
+
+@dataclass(frozen=True)
+class _Tool:
+    """The patterns of one tool: ``argv`` for its own command line (closed, open), ``script``
+    for its command inside a script. ``subcommand``: the flags only count after it (``docker
+    login``); ``in_script`` matches the tool's name (and subcommand) inside a script."""
+
+    name: re.Pattern[str]
+    subcommand: re.Pattern[str] | None
+    in_script: re.Pattern[str]
+    argv: tuple[tuple[re.Pattern[str], ...], tuple[re.Pattern[str], ...]]
+    script: tuple[re.Pattern[str], ...]
+
+
+def _tool_argv(specs: tuple[_FlagSpec, ...], open_end: bool) -> tuple[re.Pattern[str], ...]:
+    wrapped = _wrapped(open_end)
+    patterns: list[str] = []
+    for flag, how, before in specs:
+        sep = _SEPS[how]
+        # An element Tetragon wrapped in quotes ("-pa b"): the value runs to its close.
+        patterns.append(rf'(?<!\S)"{flag}{sep}{before}{wrapped}')
+        if how != "glued" or before:
+            # The value is an element of its own, wrapped: -p "a b", -u "alice:pw x".
+            spaced = "[ \t]+" if how == "glued" else sep
+            patterns.append(rf'(?<!\S){flag}{spaced}"{before}{wrapped}')
+        patterns.append(rf"(?<!\S){flag}{sep}{before}(?!\[REDACTED\])(?P<secret>\S+)")
+    return tuple(re.compile(pattern) for pattern in patterns)
+
+
+def _tool_script(specs: tuple[_FlagSpec, ...]) -> tuple[re.Pattern[str], ...]:
+    patterns: list[str] = []
+    for flag, how, before in specs:
+        sep = _SEPS[how]
+        # Behind a wrapper (sudo mysql "-ppw x"): an element Tetragon wrapped.
+        patterns.append(rf'(?<!\S)"{flag}{sep}{before}(?P<secret>[^"\r\n]++)')
+        if before:  # curl -u 'alice:pw x': the quote opens before the user
+            spaced = "[ \t]*" if how == "glued" else sep
+            patterns += [
+                rf"""(?<![^\s"']){flag}{spaced}{q}{before}(?P<secret>[^{q}\r\n]++)"""
+                for q in ("'", '"')
+            ]
+        # Never again over a strike already made (its closing quote would open a value).
+        patterns.append(rf"""(?<![^\s"']){flag}{sep}{before}(?!\[REDACTED\]){_SCRIPT_VALUE}""")
+    return tuple(re.compile(pattern) for pattern in patterns)
+
+
+def _make_tool(name: str, subcommand: str | None, specs: tuple[_FlagSpec, ...]) -> _Tool:
+    script_name = rf"(?:{name})" + (rf"[ \t]+(?:{subcommand})" if subcommand else "")
+    return _Tool(
+        re.compile(name),
+        re.compile(rf"[ \t]*(?:{subcommand})(?![\w.-])") if subcommand else None,
+        re.compile(script_name),
+        (_tool_argv(specs, False), _tool_argv(specs, True)),
+        _tool_script(specs),
+    )
+
+
+_TOOLS = tuple(_make_tool(*entry) for entry in _TOOL_FLAGS)
+_SCRIPT_TOOL_RE = re.compile(
+    r"(?<![\w.-])(?:" + "|".join(tool.in_script.pattern for tool in _TOOLS) + r")(?![\w.-])"
+)
+# A tool's command inside a script: quoted strings are skipped whole (a ; inside them does not
+# end it). Matched with an end position, so it never reads more than _SEGMENT characters.
+_SEGMENT_RE = re.compile(r"""(?:[^;|&\r\n)`'"]++|'[^'\r\n]*+'?|"[^"\r\n]*+"?)*+""")
+# A strike that may hide a command (argv_struck_long, risk 1): it holds a shell separator,
+# substitution or redirection, a quote followed by a space (it crossed an element), or it
+# crosses a space and is long or reaches the end of the text. A value of token characters
+# alone, however long (an AWS session token), cannot carry a command.
+_LONG_STRIKE = 64
+_SCRIPT_CHARS = frozenset(";|&$(`\n<>")
+_CROSSED_RE = re.compile(r"[\"'][ \t]|\\\"")
+
+
 # A unit of 1 to 4 characters repeated 16 times or more (padding): folded to one copy and a
 # count. After escaping, so a run of escaped controls (\x01\x01...) folds too.
 _RUN_RE = re.compile(r"(.{1,4}?)\1{15,}", re.DOTALL)
@@ -207,6 +408,9 @@ class Record:
     preexisting: bool = False
     started: str | None = None
     key: str | None = None  # event_key(action, details): spots a line read twice
+    # A digest of the whole command line, for the reader's novelty. Kept in memory only: it is
+    # never part of ``details``, so it never reaches the black box.
+    fingerprint: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -332,7 +536,14 @@ def belongs(process: Mapping[str, Any], ctx: Context) -> bool:
 
 
 def safe_text(
-    text: str, ctx: Context | None = None, limit: int = ARGV_LIMIT, *, scrubbed: str | None = None
+    text: str,
+    ctx: Context | None = None,
+    limit: int = ARGV_LIMIT,
+    *,
+    scrubbed: str | None = None,
+    tool: str | None = None,
+    cut: bool = False,
+    notes: set[str] | None = None,
 ) -> str:
     """Hostile ``text`` made safe to keep: struck, escaped, its runs folded and cut to
     ``limit`` bytes, keeping its head and its tail.
@@ -340,17 +551,26 @@ def safe_text(
     The order matters: strike first (the patterns need the real newlines, and a cut must
     never leave the head of a key), then escape, then fold and cut. The exact secrets backtide
     knows are struck over the whole text, before any window: a cut cannot split them
-    (``scrubbed``: that already done by the caller, so it is not done twice)."""
+    (``scrubbed``: that already done by the caller, so it is not done twice).
+
+    ``tool``: the binary whose command line this is (its own password flags, ``_TOOLS``).
+    ``cut``: Tetragon cut the text short (truncArgs), so its end is not its real end and an
+    unclosed quote closes there. ``notes`` collects ``"long"`` when a strike may have hidden
+    part of a command (``argv_struck_long``)."""
     total = len(text.encode("utf-8", "surrogatepass"))
     if scrubbed is not None:
         text = scrubbed
     elif ctx is not None and ctx.scrub is not None:
         text = ctx.scrub(text)
+    found = _tool_of(tool) if tool else None
     if len(text) > 2 * _WINDOW:
-        head = _cut_head(_strike_patterns(text[: _WINDOW + _MARGIN]), _WINDOW)
-        tail = _cut_tail(_strike_patterns(_tail_window(text)), _WINDOW)
-        return _join(_shown(head), _shown(tail), limit, total)
-    clean = _shown(_strike_patterns(text))
+        # The head window always ends at an artificial cut; the tail ends where the text does.
+        head = _strike_patterns(text[: _WINDOW + _MARGIN], tool=found, open_end=True, notes=notes)
+        tail = _strike_patterns(_tail_window(text), tool=found, open_end=cut, notes=notes)
+        return _join(
+            _shown(_cut_head(head, _WINDOW)), _shown(_cut_tail(tail, _WINDOW)), limit, total
+        )
+    clean = _shown(_strike_patterns(text, tool=found, open_end=cut, notes=notes))
     if len(clean.encode("utf-8")) <= limit:
         return clean
     return _join(clean, clean, limit, total)
@@ -390,8 +610,17 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
     # the scrubber strike the whole text: visible, so it cannot be a quiet way to hide a command.
     scrubbed_args = ctx.scrub(raw_args) if ctx.scrub is not None else raw_args
     struck_whole = scrubbed_args == REDACTED and raw_args.strip() not in ("", REDACTED)
+    notes: set[str] = set()
+    argv = safe_text(
+        raw_args,
+        ctx,
+        scrubbed=scrubbed_args,
+        tool=raw_binary,
+        cut="truncArgs" in flags,
+        notes=notes,
+    )
     details: dict[str, Any] = {
-        "argv": safe_text(raw_args, ctx, scrubbed=scrubbed_args),
+        "argv": argv,
         "cwd": safe_text(_str(process.get("cwd")), ctx),
         "pid": _int(process.get("pid")),
         "uid": _int(process.get("uid")),
@@ -406,6 +635,8 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
     }
     if struck_whole:
         details["argv_struck_whole"] = True
+    if "long" in notes:
+        details["argv_struck_long"] = True  # a strike may hide part of the command
     if "dataArgs" in flags and not raw_args:
         # T07-1, P5: past ~320 KiB Tetragon drops the arguments without any flag saying so.
         details["arguments_lost"] = True
@@ -426,7 +657,7 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         "exec",
         binary,
         details,
-        risk=1 if struck_whole else 0,
+        risk=1 if struck_whole or "long" in notes else 0,
         binary=binary,
         parent=parent_binary,
         time=t,
@@ -434,6 +665,12 @@ def _exec(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         preexisting=preexisting,
         started=started,
         key=event_key("exec", details),
+        # The whole command, for the reader's novelty (an exact repeat, not a shared head):
+        # a digest of the full command line with the known secrets struck, where it ran and
+        # as whom. Never stored.
+        fingerprint=_fingerprint(
+            scrubbed_args, _str(process.get("cwd")), str(_int(process.get("uid")))
+        ),
     )
 
 
@@ -496,7 +733,19 @@ def _connect(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
         "exec_id": _exec_id(process),
     }
     key = event_key("connect", details)
-    return Record(Source.NET, "connect", target, details, binary=binary, time=t, key=key)
+    # For novelty, a connection to a new target is a new command (only an exact repeat is a
+    # repeat).
+    fingerprint = _fingerprint(family, addr.compressed, str(port), details["proto"])
+    return Record(
+        Source.NET,
+        "connect",
+        target,
+        details,
+        binary=binary,
+        time=t,
+        key=key,
+        fingerprint=fingerprint,
+    )
 
 
 def _throttle(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
@@ -512,11 +761,107 @@ def _throttle(body: dict[str, Any], t: str | None, ctx: Context) -> Parsed:
 # --- text -----------------------------------------------------------------------------------
 
 
-def _strike_patterns(text: str) -> str:
-    """Our command-line forms and redact()'s patterns struck (not cut, not escaped)."""
-    for pattern in _ARGV_PATTERNS:
-        text = pattern.sub(_strike, text)
-    return strike_text(text)
+def _fingerprint(*parts: str) -> str:
+    """A sha256 of ``parts``, each one delimited (no two lists of parts give the same text)."""
+    digest = hashlib.sha256()
+    for part in parts:
+        data = part.encode("utf-8", "surrogatepass")
+        digest.update(len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+def _strike_patterns(
+    text: str,
+    *,
+    tool: _Tool | None = None,
+    open_end: bool = False,
+    notes: set[str] | None = None,
+) -> str:
+    """Our command-line forms and redact()'s patterns struck (not cut, not escaped): first the
+    tool's own flags (when the binary is one of _TOOLS), then the tools inside scripts, then
+    the generic forms. ``open_end``: the text ends at an artificial cut."""
+    strike = _striker(notes)
+    # A subcommand (docker login) is looked for at the start: a window that does not start
+    # the command (the tail of a long one) gets the tool's flags only through the scripts.
+    if tool is not None and (tool.subcommand is None or tool.subcommand.match(text)):
+        for pattern in tool.argv[open_end]:
+            text = pattern.sub(strike, text)
+    text = _strike_scripts(text, strike)
+    for pattern in _ARGV_PATTERNS[open_end]:
+        text = pattern.sub(strike, text)
+    return strike_text(text, on_strike=None if notes is None else lambda m: _note(m, notes))
+
+
+def _tool_of(binary: str | None) -> _Tool | None:
+    """The tool whose password flags apply, by the basename of ``binary``."""
+    name = (binary or "").rsplit("/", 1)[-1]
+    return next((tool for tool in _TOOLS if tool.name.fullmatch(name)), None)
+
+
+def _script_tool_of(found: str) -> _Tool | None:
+    """The tool whose name (and subcommand) a script names, as _SCRIPT_TOOL_RE found it."""
+    return next((tool for tool in _TOOLS if tool.in_script.fullmatch(found)), None)
+
+
+def _strike_scripts(text: str, strike: Callable[[re.Match[str]], str]) -> str:
+    """Each tool's password flags inside a script: from the tool's name to the end of its own
+    command (_SEGMENT_RE, at most _SEGMENT characters). Every character belongs to at most one
+    segment, so the work stays linear."""
+    out: list[str] = []
+    done = 0
+    for found in _SCRIPT_TOOL_RE.finditer(text):
+        if found.start() < done:
+            continue
+        tool = _script_tool_of(found.group(0))
+        if tool is None:
+            continue
+        start = found.end()
+        segment = _SEGMENT_RE.match(text, start, min(len(text), start + _SEGMENT))
+        stop = segment.end() if segment is not None else start
+        part = text[start:stop]
+        for pattern in tool.script:
+            part = pattern.sub(strike, part)
+        out += [text[done:start], part]
+        done = stop
+    if not out:
+        return text
+    out.append(text[done:])
+    return "".join(out)
+
+
+def _striker(notes: set[str] | None) -> Callable[[re.Match[str]], str]:
+    if notes is None:
+        return _strike
+
+    def strike(match: re.Match[str]) -> str:
+        _note(match, notes)
+        return _strike(match)
+
+    return strike
+
+
+def _note(match: re.Match[str], notes: set[str]) -> None:
+    """Note a strike that may hide part of a command (see _LONG_STRIKE)."""
+    secret = match.group("secret")
+    if secret == REDACTED or not secret:
+        return
+    spaced = any(char.isspace() for char in secret)
+    reaches_end = match.end("secret") == len(match.string)
+    if (
+        not _SCRIPT_CHARS.isdisjoint(secret)
+        or _CROSSED_RE.search(secret) is not None
+        or (spaced and len(secret) > _LONG_STRIKE)
+        or (spaced and reaches_end)
+    ):
+        notes.add("long")
+
+
+def every_pattern() -> list[re.Pattern[str]]:
+    """Every pattern of this module that runs on hostile text: for the cost tests."""
+    patterns = [*_ARGV_PATTERNS[0], *_ARGV_PATTERNS[1], _KEY_END_RE, _SCRIPT_TOOL_RE]
+    for tool in _TOOLS:
+        patterns += [*tool.argv[0], *tool.argv[1], *tool.script]
+    return patterns
 
 
 def _shown(text: str) -> str:
@@ -536,7 +881,40 @@ def _tail_window(text: str) -> str:
     # Without one within reach, the plain window: dropping it would hide the end of the
     # command, which padding must never do (the cut's token run is still dropped).
     window = text[max(0, stop - _TAIL_LEAD) :] if stop >= 0 else text[start:]
-    return _PEM_BODY_RE.sub(REDACTED + "\n", window)
+    return _strike_key_bodies(window)
+
+
+def _strike_key_bodies(text: str) -> str:
+    """The lines of a key body right before each ``-----END … PRIVATE KEY-----`` (whose BEGIN
+    may be out of the window), struck. Each END walks back at most over the lines since the
+    previous one, so the work stays linear."""
+    out: list[str] = []
+    done = 0
+    for end in _KEY_END_RE.finditer(text):
+        pos = first = end.start()
+        sizes: list[int] = []
+        while pos > done and text[pos - 1] == "\n":
+            low = max(done, pos - 2 - 80)
+            prev = text.rfind("\n", low, pos - 1)
+            if prev < 0 and low > done:
+                break  # longer than any key line
+            line_start = prev + 1 if prev >= 0 else done
+            line = text[line_start : pos - 1]
+            if not _KEY_LINE_RE.fullmatch(line):
+                break
+            size = len(line.rstrip("\r"))
+            if sizes and size < _KEY_LINE_MIN:
+                break  # only the last line of a body may be short
+            sizes.append(size)
+            pos = line_start
+        long_lines = sum(size >= _KEY_LINE_MIN for size in sizes)
+        if long_lines >= _KEY_LINES:
+            out += [text[done:pos], REDACTED + "\n"]
+            done = first
+    if not out:
+        return text
+    out.append(text[done:])
+    return "".join(out)
 
 
 def _cut_head(text: str, size: int) -> str:

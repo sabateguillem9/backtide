@@ -98,7 +98,12 @@ MAX_PROVIDER_MODELS = 32
 _SENSOR_CONTAINER_KEYS = frozenset({"name", "memory", "cpus", "cgroup_rate"})
 _SENSOR_RATES = frozenset({"exec_rate", "net_rate"})
 _SENSOR_COUNTS = frozenset({"exec_burst", "exec_daily", "net_burst", "net_daily"})
-_SENSOR_KEYS = _SENSOR_CONTAINER_KEYS | _SENSOR_RATES | _SENSOR_COUNTS | {"required"}
+# novelty_streak_minutes: the founder's decision B (2026-10-19), see ProcessSensor.
+_SENSOR_KEYS = (
+    _SENSOR_CONTAINER_KEYS | _SENSOR_RATES | _SENSOR_COUNTS | {"required", "novelty_streak_minutes"}
+)
+NOVELTY_STREAK_MINUTES = 10.0
+MIN_NOVELTY_STREAK_MINUTES = 1.0
 # docs/21, section 6: the providers of T06 and their default hosts.
 PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
 MAX_ALLOW_HOSTS = 1000
@@ -278,6 +283,16 @@ class ServiceConfig:
             raise ConfigError(f"unknown [sensor] settings: {', '.join(map(repr, unknown))}")
         if not isinstance(self.sensor.get("required", False), bool):
             raise ConfigError("[sensor] required must be true or false")
+        streak = self.sensor.get("novelty_streak_minutes", NOVELTY_STREAK_MINUTES)
+        if (
+            isinstance(streak, bool)
+            or not isinstance(streak, int | float)
+            or not streak >= MIN_NOVELTY_STREAK_MINUTES
+        ):
+            raise ConfigError(
+                f"[sensor] novelty_streak_minutes must be a number of minutes of at least "
+                f"{MIN_NOVELTY_STREAK_MINUTES:g}, got {streak!r}"
+            )
         if _overlap(config_dir, self.sensor_dir):
             raise ConfigError(
                 f"the agent's config_dir {config_dir} must not be, contain or be inside the "
@@ -372,6 +387,12 @@ class ServiceConfig:
     def sensor_dir(self) -> Path:
         """The process sensor's folder: never mounted into the agent (invariant 1)."""
         return self.state_dir / STATE_SENSOR
+
+    @property
+    def sensor_novelty_streak(self) -> float:
+        """Seconds of command lines folded unseen, with no window free of them, after which a
+        required sensor stops the agent (the founder's decision B, 2026-10-19)."""
+        return float(self.sensor.get("novelty_streak_minutes", NOVELTY_STREAK_MINUTES)) * 60.0
 
     @property
     def sensor_required(self) -> bool:

@@ -193,3 +193,87 @@ def test_restarting_the_service_neither_loses_nor_repeats_events(sensed: Service
     assert [key for key, count in exec_ids.items() if count > 1] == []
     report = service.box.verify()
     assert report.ok, report.problems
+
+
+# --- T07-5: a parallel build under a required sensor ---------------------------------------
+
+# A build inside the agent: tiny C files compiled two at a time by the image's own compiler
+# when it has one (each `cc -c` is cc, cc1 and as: three or four execs), or else a copy of
+# /bin/true named cc run with each file's own command line. Two workers, paced, so the burst
+# stays under the kernel's cut (cgroup-rate: 1,000 exec and exit a second) and only the
+# reader's buckets fill: what a `make -j` does to the sensor. Prints one JSON line.
+BUILD = r"""
+import json, os, shutil, subprocess, sys, threading, time
+workdir, count, marker = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+os.makedirs(workdir, exist_ok=True)
+cc = shutil.which("cc") or shutil.which("gcc")
+mode = "cc"
+if cc is None:
+    mode = "copy"
+    cc = os.path.join(workdir, "cc")
+    shutil.copy("/bin/true", cc)
+    os.chmod(cc, 0o755)
+for i in range(count):
+    with open(os.path.join(workdir, f"f{i}.c"), "w") as handle:
+        handle.write(f"int f{i}(void) {{ return {i}; }}\n")
+failed = []
+def work(part):
+    for i in range(part, count, 2):
+        source = os.path.join(workdir, f"f{i}.c")
+        done = subprocess.run([cc, f"-DMARK_{marker.replace('-', '_')}", "-c", source, "-o",
+                               source[:-2] + ".o"], capture_output=True, timeout=60)
+        if done.returncode:
+            failed.append(i)
+        time.sleep(0.004 if mode == "copy" else 0.0)
+started = time.monotonic()
+workers = [threading.Thread(target=work, args=(part,)) for part in (0, 1)]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join()
+print(json.dumps({"mode": mode, "count": count, "failed": len(failed),
+                  "seconds": round(time.monotonic() - started, 1)}))
+"""
+
+
+def test_a_parallel_build_does_not_stop_a_required_agent(
+    make_real_service: Callable[..., Service],
+) -> None:
+    """T07-5: under `required = true` a normal build drained the novelty bucket, and
+    novelty_lost stopped the agent. The compiler has events of its own in the window: its
+    command lines that do not fit are risk 2 (novelty_lost, blind: false) and an alert, never
+    a stop. Measured here with the real service, Tetragon and OpenClaw."""
+    with sensor_kit.sensed_service(make_real_service, required=True) as service:
+        _started(service)
+        before = sensor_kit.head_seq(service)
+        marker = _marker()
+        count = "1500"
+        done = service.jail.exec(
+            ["python3", "-c", BUILD, f"/workspace/work/build-{marker}", count, marker], timeout=600
+        )
+        assert done.returncode == 0, (done.stdout, done.stderr)
+        outcome = done.stdout.strip().splitlines()[-1]
+        # The summary window (10 s) closes, then at least two heartbeats (30 s each) look.
+        time.sleep(75)
+        events = service.box.events(since_seq=before)
+        stops = [e for e in events if e.action == "agent_stop"]
+        gaps = [e for e in events if e.action == "sensor_gap"]
+        kinds = Counter((str(e.details.get("kind")), e.details.get("blind"), e.risk) for e in gaps)
+        seen = [
+            e for e in gaps if e.details.get("kind") == "novelty_lost" and not e.details["blind"]
+        ]
+        recorded = len([e for e in events if e.source == "exec" and e.action == "exec"])
+        folded = sum(int(e.details.get("folded", 0)) for e in events if e.action == "summary")
+        summaries = [
+            (e.source, e.details.get("counts"), e.details.get("top_binaries"))
+            for e in events
+            if e.action == "summary"
+        ]
+        print(
+            f"RESULT build {outcome} recorded={recorded} folded={folded} gaps={dict(kinds)} "
+            f"stops={[e.details for e in stops]} summaries={summaries}"
+        )
+        assert stops == [], [e.details for e in stops]
+        assert service.jail.is_running()
+        assert seen and all(e.risk == 2 for e in seen), dict(kinds)  # the burst did drain it
+        assert not [e for e in gaps if e.details.get("blind") is True], dict(kinds)

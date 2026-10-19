@@ -21,6 +21,7 @@ from backtide.snapshots import Reason
 pytestmark = pytest.mark.ataques
 
 ACCOUNT_TIMEOUT = 120.0
+SUMMARY_WINDOW = 10.0  # the reader's summary_interval: novelty is counted per window
 
 
 def _marker() -> str:
@@ -72,18 +73,25 @@ def test_secrets_in_argv(attack: Attack, agent, battery_sensor) -> None:
     token = agent.jail.config.gateway_token
     battery_sensor.known([token])  # production: runner.build_sensor's KnownScrubber
     attack.watch(battery_sensor, agent.jail)
-    outcome = attack.run_script(agent, "secretos_en_argv", marker)
+    workdir = f"{CONTAINER_WORK}/secretos-en-argv"
+    outcome = attack.run_script(agent, "secretos_en_argv", marker, workdir)
     both, only_ours = outcome["both"], outcome["backtide_only"]
 
     recorded = attack.recorded_exec(argv=f"secretos-en-argv-{marker}")
-    splits = attack.recorded_exec(argv=f"-{marker}", at_least=15)
+    # 17 with "-<marker>": the first, the Gateway one, the 14 splits and mysql of T07-5.
+    splits = attack.recorded_exec(argv=f"-{marker}", at_least=17)
     splits = [e for e in splits if "split" in str(e.details.get("argv", ""))]
+    # T07-5: the tools with a password glued to their flag ran too (so "not in the box" is
+    # not "not recorded"): the copy named mysql, and the script with sshpass in it.
+    glued = attack.recorded_exec(argv=f"glued-{marker}", binary="*/mysql")
+    script = attack.recorded_exec(argv="sshpass -p", binary="*/sh")
     attack.check(
         "recorded",
-        bool(recorded) and len(splits) == 14,
+        bool(recorded) and len(splits) == 14 and bool(glued) and bool(script),
         f"el sensor grabó el proceso del ataque en {attack.container_short} y los 14 comandos con "
         f"el token del Gateway cortado por el borde de las ventanas ({len(splits)} vistos), con "
-        "sus argumentos tachados",
+        f"sus argumentos tachados; el mysql con -p pegado ({len(glued)}) y el sh -c con sshpass "
+        f"({len(script)}) también: {[e.details.get('argv') for e in glued + script][:2]}",
     )
 
     # The black box: nothing at all, not even 8 characters of the Gateway token.
@@ -129,7 +137,14 @@ def test_hiding_commands(attack: Attack, agent, battery_sensor) -> None:
         ],
         "exec_a": attack.recorded_exec(binary=f"*/execa-{marker}"),
         "bloat": attack.recorded_exec(binary=f"*/bloat-{marker}"),
+        "struck": attack.recorded_exec(binary=f"*/struck-{marker}"),
     }
+    # T07-5: the shell whose strike swallowed the rest of its script says so (risk 1).
+    struck_sh = [
+        e
+        for e in attack.recorded_exec(argv="[REDACTED]", binary="*sh", at_least=99, timeout=3.0)
+        if e.details.get("argv_struck_long") and e.risk >= 1
+    ]
     # The built-in echo runs no program: there is no exec of its own to see.
     echo = attack.recorded_exec(argv=f"esconder-builtin-{marker}", binary="*/echo", timeout=3.0)
 
@@ -160,12 +175,15 @@ def test_hiding_commands(attack: Attack, agent, battery_sensor) -> None:
         and controls_safe
         and bloat_hidden
         and marker in exec_a
-        and echo == [],
+        and echo == []
+        and bool(struck_sh),
         f"grabados, cada uno con su propio binario: {seen} (corrieron: {ran}); argumentos de "
         f"control mostrados escapados={controls_safe}; con el marcador: {by_marker}; argv "
         "enorme con oversize o "
         f"arguments_lost={bloat_hidden}; el echo interno del shell no hace exec propio "
-        f"({len(echo)} vistos)",
+        f"({len(echo)} vistos); el sh -c cuyo tachado se traga el resto del script queda "
+        f"marcado con argv_struck_long y riesgo 1 ({len(struck_sh)}) y su comando real tiene "
+        "su propio exec",
     )
     attack.check(
         "stopped",
@@ -343,12 +361,42 @@ def test_hiding_among_decoys(attack: Attack, agent, battery_sensor) -> None:
     # The shell command after three innocent ones of the same binary: its own command line.
     shell = attack.recorded_exec(argv=f"victim2-{marker}", timeout=20.0)
     folded = _gaps(battery_sensor, attack.since, "argv_folded", "novelty_lost", "throttle")
+    # T07-5: the same padded head as a recorded `sh -c ": '<head>'; true"`, then `rm`: its own
+    # command (only an exact repeat is a repeat), so recorded, or lost at risk 2 with the shell
+    # named in the gap; never passed off as a repeat (argv_folded, risk 1). In a summary
+    # window of its own, after the one above has closed.
+    time.sleep(SUMMARY_WINDOW + 2)
+    second = battery_sensor.box.head()[0]
+    shared_out = attack.run_script(
+        agent, "esconder_entre_senuelos", workdir, marker, "cabeza", timeout=300
+    )
+    shared = [
+        e
+        for e in attack.recorded_exec(argv=f"victim3-{marker}", timeout=20.0)
+        if fnmatch.fnmatch(e.target, "*sh")
+    ]
+    shared_lost: list = []
+    deadline = time.monotonic() + 30.0
+    while not shared and not shared_lost and time.monotonic() < deadline:
+        shared_lost = [
+            g
+            for g in _gaps(battery_sensor, second, "novelty_lost")
+            if g.risk == 2 and any(fnmatch.fnmatch(n, "*sh") for n in g.details.get("names", []))
+        ]
+        time.sleep(1.0)
+    repeats = _gaps(battery_sensor, second, "argv_folded")
     attack.check(
         "recorded",
-        (bool(one_by_one) or listed) and (bool(shell) or bool(folded)),
+        (bool(one_by_one) or listed)
+        and (bool(shell) or bool(folded))
+        and (bool(shared) or bool(shared_lost)),
         f"el rm real entre {outcome['decoys']} señuelos de nombre propio: uno a uno="
         f"{bool(one_by_one)}, en la lista del resumen={listed}; el sh -c con el rm tras tres "
-        f"sh -c true: uno a uno={len(shell)} (o un hueco que lo dice: {len(folded)})",
+        f"sh -c true: uno a uno={len(shell)} (o un hueco que lo dice: {len(folded)}); el sh -c "
+        f"con la misma cabeza de {shared_out['head']} caracteres que uno grabado y un rm al "
+        f"final: uno a uno={len(shared)}, o novelty_lost de riesgo 2 que nombra al shell="
+        f"{len(shared_lost)} (repeticiones argv_folded en ese tramo: "
+        f"{[g.details.get('names') for g in repeats]})",
     )
     attack.check(
         "risk",
@@ -359,7 +407,7 @@ def test_hiding_among_decoys(attack: Attack, agent, battery_sensor) -> None:
     )
     attack.check(
         "stopped",
-        outcome["rm"] == 0 and outcome["shell_rm"] == 0,
+        outcome["rm"] == 0 and outcome["shell_rm"] == 0 and shared_out["shared_rm"] == 0,
         "nada lo impide (el sensor solo observa): el rm borró su archivo y queda grabado igual",
     )
 

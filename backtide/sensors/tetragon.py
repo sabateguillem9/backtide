@@ -51,7 +51,8 @@ import stat
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -83,7 +84,8 @@ _SUMMARY_KEYS = 1000  # distinct binaries or targets kept while folding (then "�
 _SUMMARY_BINARIES = 50  # distinct binaries listed in a summary, the least frequent first
 # Folders of the image the agent cannot write to (it runs without root): their programs go
 # first among the equally rare, so decoys the agent names cannot push them out of the list.
-_SYSTEM_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/opt/")
+SYSTEM_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/opt/")
+_SYSTEM_DIRS = SYSTEM_DIRS
 _SEEN_KEPT = 64
 _STAT_NAMES = (
     "lines", "other", "parse_errors", "oversize", "preexisting", "exit", "loopback", "unknown",
@@ -317,7 +319,7 @@ class TetragonReader:
             kind: DailyBudget(config.novel_daily, config.budget_window)
             for kind in (Source.EXEC, Source.NET)
         }
-        # Per summary window, by command (the binary and a hash of the head of its struck argv):
+        # Per summary window, by command (the binary and a digest of its whole command line):
         # how many went past the bucket. A new command line of a binary already seen is new.
         self._novel_seen: dict[Source, Counter[_Command]] = {
             Source.EXEC: Counter(),
@@ -340,9 +342,22 @@ class TetragonReader:
             Source.EXEC: Counter(),
             Source.NET: Counter(),
         }
+        # Folded commands past _SUMMARY_KEYS distinct ones, by binary (then "…").
+        self._window_overflow: dict[Source, Counter[str]] = {
+            Source.EXEC: Counter(),
+            Source.NET: Counter(),
+        }
         # What the process sensor must hear about (alert, and with required stop the agent):
-        # throttles of the agent's cgroup and windows with novelty lost, since it last asked.
+        # throttles of the agent's cgroup, windows with binaries lost whole (novelty_lost) and
+        # rotated files lost, since it last asked.
         self._blind = Counter[str]()
+        # Binaries whose command lines were folded unseen while they do have events of their
+        # own (a build's many distinct commands), by windows: risk 2 and an alert, never a stop.
+        self._unseen = Counter[str]()
+        # When the current run of windows with unseen command lines began (None: the last
+        # window had none). The founder's decision B: a long run is a blind spot (required).
+        self._unseen_since: float | None = None
+        self._salt = secrets.token_bytes(16)  # the order of names in a gap, unpredictable
         self._folded = {Source.EXEC: _Folded("parents"), Source.NET: _Folded("targets")}
         self._last_summary = now
         self._reported = Counter[str]()
@@ -357,26 +372,31 @@ class TetragonReader:
         self._failing: set[str] = set()
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
-        # Read lock-free by the heartbeat to notice a poll that is taking too long (a flood of
-        # hostile lines): a stuck poll holds the lock, so nothing under it would answer.
+        # Read lock-free by the process sensor's watchdog to notice a poll that is taking too
+        # long (a flood of hostile lines): a stuck poll holds the lock, so nothing under it
+        # would answer. Set inside the lock and cleared only by the poll that set it.
         self.polling_since: float | None = None
-        self.last_progress: float = now
+        self._poll_token: object | None = None
 
     # The agent
 
-    def set_agent(self, agent_id: str | None) -> None:
+    def set_agent(self, agent_id: str | None, *, timeout: float | None = None) -> bool:
         """Whose events to record: a full container id, or None for nobody. The container it
         replaces is still accepted for ``retire_after`` seconds: its lines the reader has not
-        reached yet (it may lag behind a flood) are still the agent's."""
+        reached yet (it may lag behind a flood) are still the agent's. With ``timeout``, False
+        (and nothing changed) if the reader's lock could not be had in time."""
         if agent_id is not None:
             Context(agent_id=agent_id, agent_name=self.config.agent_name)  # validates it
-        with self._lock:
+        with self.held(timeout) as got:
+            if not got:
+                return False
             old = self._agent_id
             if old is not None and old != agent_id:
                 self._retired[old] = self.clock() + self.config.retire_after
             self._retired.pop(agent_id or "", None)
             self._agent_id = agent_id
             self._rebuild_context()
+            return True
 
     def _rebuild_context(self) -> None:
         now = self.clock()
@@ -395,15 +415,19 @@ class TetragonReader:
 
     # Probes
 
-    def expect(self, nonce: str) -> None:
-        """A probe with this nonce is on its way: consume it instead of recording it."""
+    def expect(self, nonce: str, *, timeout: float | None = None) -> bool:
+        """A probe with this nonce is on its way: consume it instead of recording it. With
+        ``timeout``, False if the reader's lock could not be had in time."""
         if not procs.is_nonce(nonce):
             raise ValueError(f"not a probe nonce: {nonce!r:.80}")
-        with self._lock:
+        with self.held(timeout) as got:
+            if not got:
+                return False
             self._expire_nonces(self.clock())
             while len(self._expected) >= self.config.max_nonces:
                 del self._expected[next(iter(self._expected))]
             self._expected[nonce] = self.clock() + self.config.nonce_ttl
+            return True
 
     def seen(self, nonce: str) -> bool:
         with self._lock:
@@ -411,17 +435,35 @@ class TetragonReader:
 
     def wait_seen(self, nonces: str | Iterable[str], timeout: float) -> bool:
         """Poll until one of ``nonces`` went through the sensor, for up to ``timeout``
-        seconds. Works with or without the reader's thread."""
+        seconds. Works with or without the reader's thread. Never waits for the lock longer
+        than what is left: a stuck poll elsewhere makes it give up, not hang."""
         wanted = {nonces} if isinstance(nonces, str) else set(nonces)
         deadline = self.clock() + timeout
         while True:
-            self.poll()
-            if any(self.seen(nonce) for nonce in wanted):
-                return True
+            with self.held(deadline - self.clock()) as got:
+                if got:
+                    self.poll()
+                    if any(nonce in self._seen for nonce in wanted):
+                        return True
             remaining = deadline - self.clock()
             if remaining <= 0:
                 return False
             self._sleep(min(0.1, remaining))
+
+    @contextmanager
+    def held(self, timeout: float | None) -> Iterator[bool]:
+        """The reader's lock, if it can be had within ``timeout`` seconds (True), or not
+        (False): for callers that must not block behind a stuck poll. None waits as long as it
+        takes; a timeout already past only tries."""
+        if timeout is None:
+            got = self._lock.acquire()
+        else:
+            got = self._lock.acquire(timeout=max(0.0, timeout))
+        try:
+            yield got
+        finally:
+            if got:
+                self._lock.release()
 
     # Reading
 
@@ -429,10 +471,10 @@ class TetragonReader:
         """Read what Tetragon added since the last round; returns the number of lines. One poll
         reads for at most ``poll_time_budget`` seconds (the thread loops for the rest), so the
         lock it holds does not keep the heartbeat waiting."""
-        self.polling_since = self.clock()
-        try:
-            with self._lock:
-                now = self.clock()
+        with self._lock:
+            token = self._poll_token = object()
+            self.polling_since = now = self.clock()
+            try:
                 self._expire_nonces(now)
                 if any(until <= now for until in self._retired.values()):
                     self._rebuild_context()
@@ -445,9 +487,9 @@ class TetragonReader:
                     self._failing.discard("read")
                 self._flush(now)
                 return self._counts["lines"] - lines_before
-        finally:
-            self.last_progress = self.clock()
-            self.polling_since = None
+            finally:
+                if self._poll_token is token:
+                    self._poll_token = self.polling_since = None
 
     def blocked(self, seconds: float) -> bool:
         """Whether a poll has been running for at least ``seconds`` (read without the lock): the
@@ -476,11 +518,28 @@ class TetragonReader:
 
     def take_blind_spots(self) -> dict[str, int]:
         """What made the reader blind since the last call: ``throttle`` (the kernel dropped the
-        agent's exec/exit events, cgroup-rate) and ``novelty_lost`` (binaries folded without a
-        single event of theirs recorded). Each was a gap of risk 2 already."""
+        agent's exec/exit events, cgroup-rate), ``novelty_lost`` (binaries folded without a
+        single event of theirs recorded) and ``rotated`` (a file of events lost before it was
+        read). Each was a gap of risk 2 already."""
         with self._lock:
             blind, self._blind = dict(self._blind), Counter()
             return blind
+
+    def unseen_streak(self) -> float:
+        """Seconds since the current run of summary windows with command lines folded unseen
+        (``novelty_lost {blind: false}``) began, with no window free of them; 0 without one."""
+        with self._lock:
+            since = self._unseen_since
+            return 0.0 if since is None else max(0.0, self.clock() - since)
+
+    def take_unseen(self) -> dict[str, int]:
+        """The binaries whose command lines were folded unseen since the last call while they
+        did have events of their own (risk 2 gaps, ``blind: false``), with how many windows:
+        the process sensor alerts, but never stops the agent for them (a parallel build does
+        this)."""
+        with self._lock:
+            unseen, self._unseen = dict(self._unseen), Counter()
+            return unseen
 
     @property
     def preexisting(self) -> int:
@@ -556,7 +615,6 @@ class TetragonReader:
             got = self._read(budget)
             budget -= got
             if got:
-                self.last_progress = self.clock()
                 if self.clock() >= deadline:
                     break  # more to read: the thread polls again, the lock free meanwhile
                 continue
@@ -619,6 +677,7 @@ class TetragonReader:
                     if self._open(candidate, cursor.offset, cursor):
                         return
             # Rotated away unread (or its inode now belongs to another file).
+            self._blind["rotated"] += 1
             self._gap(
                 "rotated",
                 2,
@@ -721,6 +780,7 @@ class TetragonReader:
                 head = self._head(f) or head
             self._pending[f.ino] = (f.size, head)
         if lost:
+            self._blind["rotated"] += 1
             self._gap(
                 "rotated",
                 2,
@@ -876,6 +936,7 @@ class TetragonReader:
                 self._counts["recorded"] += 1
                 if len(self._window_kept[kind]) < _SUMMARY_KEYS:
                     self._window_kept[kind].add(_command(record))
+                if len(self._window_binaries[kind]) < _SUMMARY_KEYS:
                     self._window_binaries[kind].add(record.binary)
             return
         self._folded[kind].add(record, snapshot_id)
@@ -888,7 +949,7 @@ class TetragonReader:
             if command in unseen or len(unseen) < _SUMMARY_KEYS:
                 unseen[command] += 1
             else:
-                unseen[("…", "")] += 1
+                _bump(self._window_overflow[kind], record.binary)
 
     def _novel(self, kind: Source, record: Record, now: float) -> bool:
         """Whether this event, past the bucket, is still one of the first of its command in
@@ -946,6 +1007,9 @@ class TetragonReader:
             self._blind["throttle"] += 1
         self._gap("throttle", 2, **details)
 
+    def _lost_details(self, kind: Source, lost: "Mapping[_Command, int]") -> dict[str, Any]:
+        return _lost_details(kind, lost, self._salt)
+
     def _consume(self, nonce: str) -> bool:
         if self._expected.pop(nonce, None) is None:
             return False
@@ -991,28 +1055,46 @@ class TetragonReader:
             self._record_throttle(now, {"state": "repeated", "since": self._throttle_since})
         if not final and now - self._last_summary < self.config.summary_interval:
             return
-        self._last_summary = now
+        window_start, self._last_summary = self._last_summary, now
+        any_seen = False
         for seen in self._novel_seen.values():
             seen.clear()  # a new summary window: every binary is new again
         for kind, unseen in self._window_unseen.items():
             # Commands recorded later in the window are not lost after all.
             kept = self._window_kept[kind]
-            # A command with no event of its own recorded in the window lost its identity to
-            # a flood (its binary never seen, or a drained bucket or budget turned it away):
-            # risk 2, and the sensor is blind (take_blind_spots). Folds of a command already
-            # recorded are a build's repeats: risk 1 and not blind.
-            blind = {cmd: n for cmd, n in unseen.items() if cmd not in kept}
+            binaries = self._window_binaries[kind]
+            # A command line with no event of its own recorded in the window is lost (risk 2).
+            # When its binary has none either, a flood erased that a program ran at all: the
+            # sensor is blind (take_blind_spots: with required, the agent stops). When the
+            # binary does have events of its own (a build running many distinct commands of
+            # one compiler), it is an alert only (take_unseen). Exact repeats of a recorded
+            # command line are a build's repeats: risk 1.
+            lost = {cmd: n for cmd, n in unseen.items() if cmd not in kept}
+            for binary, n in self._window_overflow[kind].items():
+                lost[(binary, "…")] = lost.get((binary, "…"), 0) + n
+            blind = {cmd: n for cmd, n in lost.items() if cmd[0] not in binaries}
+            seen = {cmd: n for cmd, n in lost.items() if cmd[0] in binaries}
             repeats = self._window_repeats[kind]
             if blind:
                 self._blind["novelty_lost"] += 1
-                self._gap("novelty_lost", 2, **_lost_details(kind, blind))
+                self._gap("novelty_lost", 2, blind=True, **self._lost_details(kind, blind))
+            if seen:
+                any_seen = True
+                for binary in {binary for binary, _ in seen}:
+                    _bump(self._unseen, binary)
+                self._gap("novelty_lost", 2, blind=False, **self._lost_details(kind, seen))
             if repeats:
-                self._gap("argv_folded", 1, **_lost_details(kind, repeats))
+                self._gap("argv_folded", 1, **self._lost_details(kind, repeats))
             unseen.clear()
             kept.clear()
-            self._window_binaries[kind].clear()
+            binaries.clear()
+            self._window_overflow[kind].clear()
             self._window_starved[kind].clear()
             repeats.clear()
+        if not any_seen:
+            self._unseen_since = None
+        elif self._unseen_since is None:
+            self._unseen_since = window_start
         for kind, folded in self._folded.items():
             if folded:
                 snapshot_id = folded.snapshot_id
@@ -1162,9 +1244,11 @@ def wait_ready(
     nonces: list[str] = []
     while True:
         nonce = procs.new_nonce("ready")
-        reader.expect(nonce)
-        nonces.append(nonce)
-        launch(nonce)
+        # Never blocked behind a stuck poll: a reader that cannot even take the nonce in time
+        # is not ready.
+        if reader.expect(nonce, timeout=max(0.0, deadline - reader.clock())):
+            nonces.append(nonce)
+            launch(nonce)
         remaining = deadline - reader.clock()
         if reader.wait_seen(nonces, max(0.0, min(interval, remaining))):
             return reader.clock() - start
@@ -1172,24 +1256,43 @@ def wait_ready(
             raise SensorNotReady(f"the sensor saw no probe in {timeout} s")
 
 
-type _Command = tuple[str, str]  # (binary, hash of the head of its struck argv)
-_ARGV_HEAD = 256
+type _Command = tuple[str, str]  # (binary, digest of its whole command line)
 
 
 def _command(record: Record) -> _Command:
-    """What makes a command distinct for novelty: its binary and the head of its argv (already
-    struck and escaped: no secret goes into the hash)."""
+    """What makes a command distinct for novelty: its binary and its WHOLE command line, so
+    only an exact repeat is a repeat (a shared head is not: T07-5). The digest is procs'
+    ``fingerprint`` (sha256 of the full argv with the known secrets struck, kept in memory
+    only); a record without one (a connection) uses its stored argv."""
+    if record.fingerprint is not None:
+        return record.binary, record.fingerprint
     argv = record.details.get("argv")
-    head = argv[:_ARGV_HEAD] if isinstance(argv, str) else ""
-    return record.binary, hashlib.sha256(head.encode("utf-8", "replace")).hexdigest()[:16]
+    text = argv if isinstance(argv, str) else ""
+    return record.binary, hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
-def _lost_details(kind: Source, lost: Mapping[_Command, int]) -> dict[str, Any]:
+_GAP_NAMES = 20  # binaries named in a novelty gap
+
+
+def _lost_details(kind: Source, lost: Mapping[_Command, int], salt: bytes = b"") -> dict[str, Any]:
+    """What a novelty gap says: how many binaries, command lines and events, and which binaries
+    (up to _GAP_NAMES, the image's programs first: the agent cannot write those; then an order
+    keyed by a secret salt, so its own decoy names cannot be chosen to push a program out of
+    the list). The names are the struck and escaped ones the events already carry; a command
+    line never is."""
+    binaries = {binary for binary, _ in lost}
+
+    def rank(binary: str) -> tuple[bool, bytes]:
+        mixed = hmac.new(salt, binary.encode("utf-8", "replace"), "sha256").digest()
+        return not binary.startswith(_SYSTEM_DIRS), mixed
+
+    names = sorted(binaries, key=rank)
     return {
         "class": kind.value,
-        "binaries": len({binary for binary, _ in lost}),
+        "binaries": len(binaries),
         "commands": len(lost),
         "events": sum(lost.values()),
+        "names": names[:_GAP_NAMES],
     }
 
 

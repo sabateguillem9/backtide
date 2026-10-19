@@ -120,6 +120,113 @@ _SENSITIVE = (
     r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
     r"|authorization|cookie)"
 )
+_FLAG_WORDS = r"(?:password|passwd|pass|pwd|secret|token|api[-_]?key|apikey|auth|cookie)"
+# A script's command up to its end (; | & ) backquote or a line break, quotes skipped whole),
+# lazily, and a value: quoted, or up to the next separator. RE2 is linear: no cap needed.
+_SEGMENT = r"""(?:[^;|&\r\n)`'"]|'[^'\r\n]*'|"[^"\r\n]*")*"""
+_SCRIPT_VALUE = r"""'[^'\r\n]*'?|"[^"\r\n]*"?|[^\s"';|&<>()`]+"""
+# How a flag meets its value: glued (-pX), glued or after spaces (-p X), = or spaces.
+_SEPS = {"glued": "", "opt": r"\s*", "eq": r"(?:=|\s+)"}
+_USER_COLON = r"[^\s:\"']+:"
+# (the binary's name, the subcommand the flags belong to or None, its flags as (flag,
+# separator, what comes before the secret)). Mirrors backtide/sensors/procs.py, _TOOL_FLAGS
+# (RE2: no lookaround, no possessive), and like it a closed list (docs/23, T07-5).
+_TOOLS: tuple[tuple[str, str | None, tuple[tuple[str, str, str], ...]], ...] = (
+    (r"(?:mysql|mariadb)[A-Za-z0-9_-]*", None, (("-p", "glued", ""),)),
+    (r"sshpass", None, (("-p", "opt", ""),)),
+    (r"(?:redis|valkey|keydb)-cli", None, (("-a", "opt", ""),)),
+    (r"mongo(?:sh|dump|restore|export|import|stat|top|files)?", None, (("-p", "opt", ""),)),
+    (r"lftp", None, (("-u", "opt", r"[^\s,\"']*,"),)),
+    (r"env", None, ((rf"(?i:[A-Za-z0-9_.-]*{_FLAG_WORDS})=", "glued", ""),)),
+    (
+        r"(?:smbclient|rpcclient|smbget|smbcacls|smbtree)",
+        None,
+        (("-U", "opt", r"[^\s%\"']*%"), ("--user", "eq", r"[^\s%\"']*%")),
+    ),
+    (
+        r"curl",
+        None,
+        (
+            ("-u", "opt", _USER_COLON),
+            ("--user", "eq", _USER_COLON),
+            ("-U", "opt", _USER_COLON),
+            ("--proxy-user", "eq", _USER_COLON),
+            ("--oauth2-bearer", "eq", ""),
+            ("-E", "opt", _USER_COLON),
+            ("--cert", "eq", _USER_COLON),
+        ),
+    ),
+    (r"(?:docker|podman|nerdctl|buildah|skopeo|oras)", "login", (("-p", "opt", ""),)),
+    (r"helm", r"registry\s+login", (("-p", "opt", ""),)),
+    (
+        r"ldap(?:search|add|modify|delete|passwd|whoami|compare|modrdn|exop)",
+        None,
+        (("-w", "opt", ""),),
+    ),  # fmt: skip
+    (r"(?:sqlcmd|bcp|ipmitool|mosquitto_(?:pub|sub|rr))", None, (("-P", "opt", ""),)),
+    (r"(?:zip|unzip|zipcloak)", None, (("-P", "opt", ""),)),
+    (r"(?:7z|7za|7zr|7zz)", None, (("-p", "glued", ""),)),
+    (r"openssl", None, (("-k", "opt", ""), ("-K", "opt", ""))),
+    (r"ssh-keygen", None, (("-N", "opt", ""), ("-P", "opt", ""))),
+    (r"(?:sqlplus|sqlldr|expdp|impdp|rman)", None, (("", "glued", r"[A-Za-z0-9_$#]+/"),)),
+    (r"gh", r"secret\s+set", (("--body", "eq", ""), ("-b", "opt", ""))),
+    (r"vault", "login", (("", "glued", ""),)),  # vault login TOKEN: the first argument
+    (r"htpasswd", None, ((r"-[A-Za-z]*b[A-Za-z]*(?:\s+[^\s-]\S*){1,2}", r"\s+", ""),)),
+    (r"nmcli", None, ((r"(?:[A-Za-z0-9_-]+\.)?(?:password|psk|wep-key[0-3])", "opt", ""),)),
+    (
+        r"(?:x?freerdp[0-9]*|wlfreerdp|sdl-freerdp)",
+        None,
+        (("/p:", "glued", ""), ("/password:", "glued", "")),
+    ),  # fmt: skip
+)
+
+
+def _sep(how: str) -> str:
+    return _SEPS.get(how, how)
+
+
+def _tool_rules(sub: str | None, specs: tuple[tuple[str, str, str], ...]) -> tuple[str, ...]:
+    """A tool's own rules (its binary_regex): bare, an element Tetragon wrapped ("-pa b"), and
+    a wrapped value of its own after the flag (-p "a b", -u "alice:pw x"). With a subcommand,
+    only after it (docker login -p, not docker run -p)."""
+    lead = rf"^\s*{sub}\s(?:.*\s)?" if sub else r"(?:^|\s)"
+    rules: list[str] = []
+    for flag, how, before in specs:
+        sep = _sep(how)
+        if sub and not flag:  # vault login TOKEN: the first argument after the subcommand
+            rules.append(rf"^\s*{sub}\s+([^\s\"'-][^\s\"']*)")
+            continue
+        rules += [
+            rf'{lead}"?{flag}{sep}{before}([^\s"]+)',
+            rf'{lead}"{flag}{sep}{before}([^"\r\n]+)',
+        ]
+        if how != "glued" or before:
+            spaced = r"\s+" if how == "glued" else sep
+            rules.append(rf'{lead}{flag}{spaced}"{before}([^"\r\n]+)')
+    return tuple(rules)
+
+
+def _script_rules(
+    name: str, sub: str | None, specs: tuple[tuple[str, str, str], ...]
+) -> tuple[str, ...]:
+    """The tool inside a script: from its name (and subcommand) within its own command."""
+    head = rf"(?:^|[^A-Za-z0-9_.-]){name}" + (rf"\s+{sub}" if sub else "")
+    rules: list[str] = []
+    for flag, how, before in specs:
+        sep = _sep(how)
+        rules += [
+            rf"""{head}[\s"'](?:{_SEGMENT}?[\s"'])?{flag}{sep}{before}({_SCRIPT_VALUE})""",
+            rf'{head}\s(?:{_SEGMENT}?\s)?"{flag}{sep}{before}([^"\r\n]+)',
+        ]
+        if before:
+            spaced = r"\s*" if how == "glued" else sep
+            rules += [
+                rf"""{head}\s(?:{_SEGMENT}?\s)?{flag}{spaced}{q}{before}([^{q}\r\n]+)"""
+                for q in ("'", '"')
+            ]
+    return tuple(rules)
+
+
 REDACTION_RULES: tuple[tuple[str, ...], ...] = (
     (
         r"(?i)(?:authorization|x-api-key|api-key|x-goog-api-key|cookie)[\"']?\s*[:=]\s*"
@@ -152,6 +259,35 @@ REDACTION_RULES: tuple[tuple[str, ...], ...] = (
         r"\b(glpat-[A-Za-z0-9_-]{20,})",  # GitLab
         r"\b(ASIA[A-Z0-9]{16})\b",  # AWS temporary
     ),
+    # T07-5: an element Tetragon wrapped in quotes because it has a space runs to its closing
+    # quote ("--password=pass phrase"); a glued curl -b (-bsessionid=…, a name then =);
+    # MYSQL_PWD=, SSHPASS=, REDISCLI_AUTH=; openssl's pass:…
+    (
+        rf'(?i)(?:^|\s)"--?[A-Za-z0-9_-]*{_FLAG_WORDS}(?:=|[ \t]+)([^"\r\n]+)',
+        r'(?:^|\s)"-b([^\s"=;]+=[^"\r\n]*)',
+        r"""(?:^|[\s"'])-b([^\s"'=;]+=[^\s"']*)""",
+        r"""(?i)(?:^|[^A-Za-z0-9_.-])[A-Za-z0-9_.-]*(?:pwd|pass|passwd|auth)=([^\s&#;,"']+)""",
+        r"""(?:^|[\s"'])pass:([^\s"']+)""",
+    ),
+    # T07-5: SQL passwords (IDENTIFIED BY 'x', PASSWORD 'x'); aws/npm config set of a key
+    # whose name says secret, token, password or auth; and curl -u "user:pass with spaces".
+    (
+        r"(?i)\bidentified\s+(?:with\s+\S+\s+)?by\s+(?:password\s+)?'([^'\r\n]*)",
+        r'(?i)\bidentified\s+(?:with\s+\S+\s+)?by\s+(?:password\s+)?"([^"\r\n]*)',
+        r"(?i)\bpassword\s+'([^'\r\n]*)",
+        r'(?i)\bpassword\s+"([^"\r\n]*)',
+        r"(?i)\bconfig(?:ure)?\s+set\s+(?:-\S*\s+)*\S*(?:secret|token|passw|auth|credential)\S*"
+        r"\s+([^\s\"']+)",
+        r'(?:^|\s)"?(?:-u|--user)(?:\s+|=)"[^\s:"]+:([^"\r\n]+)',
+        r'(?:^|\s)"(?:-u|--user)(?:\s+|=)[^\s:"]+:([^"\r\n]+)',
+    ),
+    # T07-5: the tools inside a script: from the tool's name, within its own command (to the
+    # next ; | & ) or line break outside quotes).
+    tuple(rule for name, sub, specs in _TOOLS for rule in _script_rules(name, sub, specs)),
+)
+# T07-5: the same tools when they are the binary itself (Tetragon's binary_regex).
+REDACTION_TOOL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
+    (rf"(?:^|/){name}$", _tool_rules(sub, specs)) for name, sub, specs in _TOOLS
 )
 # Accepted limit (T07 review, finding 5): the Gateway token and the providers' keys are exact
 # values with no shape, and Tetragon only knows patterns. They are not written into conf.d
@@ -273,7 +409,11 @@ def sensor_settings(config: SensorJailConfig) -> dict[str, str]:
         ),
         "cgroup-rate": config.cgroup_rate,
         "redaction-filters": "\n".join(
-            json.dumps({"redact": list(rules)}) for rules in REDACTION_RULES
+            [json.dumps({"redact": list(rules)}) for rules in REDACTION_RULES]
+            + [
+                json.dumps({"binary_regex": [binary], "redact": list(rules)})
+                for binary, rules in REDACTION_TOOL_RULES
+            ]
         ),
         "server-address": SOCKET,
         "health-server-address": "",  # empty: no health port at all

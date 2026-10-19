@@ -39,6 +39,16 @@ calls it at a few points of its life; everything else happens here, on the senso
 - **Stop** (``stop``), after the agent: SIGTERM to Tetragon (it writes what it holds and unloads
   its programs), the reader reads to the end and saves its cursor, the container is removed
   (``system/sensor_stop``). A privileged container is never left behind by a stop.
+- **Stalled reader** (T07-5): a poll that runs for ``reader_stall`` seconds holds the reader's
+  lock, so nothing that needs it can answer. A watchdog thread of its own, which takes neither
+  that lock nor this module's, says it (``system/sensor_gap {kind: reader_stalled}``, risk 2,
+  and an alert, once per stall) and, with ``required``, stops the agent. Everything else here
+  that needs the reader's lock waits for it at most ``heartbeat_timeout`` seconds: a heartbeat
+  that cannot have it skips that beat, ``allows_agent`` says no for a required sensor, and
+  ``follow_agent`` records the failure.
+- **Unseen command lines** (T07-5): a summary window where command lines of a binary that does
+  have events of its own were folded unseen (a parallel build) is risk 2 and an alert once per
+  streak of heartbeats, never a stop: only binaries lost whole are blind.
 - Nothing raises out of here into the Guardian: the sensor is observation, not a barrier.
 """
 
@@ -58,6 +68,7 @@ from backtide.jail.docker import JailError
 from backtide.jail.sensor import IMAGE, TETRAGON_VERSION, SensorJailConfig
 from backtide.notify import AlertLevel
 from backtide.sensors import procs
+from backtide.sensors.tetragon import SYSTEM_DIRS as _SYSTEM_DIRS
 from backtide.sensors.tetragon import SensorNotReady, TetragonReader, wait_ready
 from backtide.snapshots import Snapshot
 
@@ -65,6 +76,12 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL = 30.0  # docs/23, decision 10
 READER_STALL = 60.0  # a poll running this long holds the reader's lock: the reader is blind
+WATCH_INTERVAL = 5.0  # how often the stall watchdog looks
+UNSEEN_REPEAT = 600.0  # unseen command lines are alerted again this often while they last
+# The founder's decision B (2026-10-19): with required, unseen command lines for this long
+# without a window free of them are a blind spot ([sensor] novelty_streak_minutes).
+NOVELTY_STREAK = 600.0
+_UNSEEN_NAMES = 10
 HEARTBEAT_TIMEOUT = 10.0
 MISSES_FOR_DOWN = 3
 RESTARTS_PER_HOUR = 3
@@ -189,6 +206,8 @@ class ProcessSensor:
         restarts_per_hour: int = RESTARTS_PER_HOUR,
         ready_timeout: float | None = None,
         reader_stall: float = READER_STALL,
+        watch_interval: float = WATCH_INTERVAL,
+        novelty_streak: float = NOVELTY_STREAK,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         thread: bool = True,
@@ -205,7 +224,23 @@ class ProcessSensor:
             ready_timeout if ready_timeout is not None else jail.config.ready_timeout
         )
         self._reader_stall = reader_stall
+        self._watch_interval = watch_interval
+        self._novelty_streak = novelty_streak
+        self._streak_said = False  # a novelty_streak gap for the current streak
+        # The watchdog's own state, under its own small lock (never the reader's or ours).
+        self._watch_lock = threading.Lock()
         self._stalled_said = False
+        self._stall_stopped = False
+        self._watch_thread: threading.Thread | None = None
+        self._unseen_since: float | None = None  # a streak of beats with unseen command lines
+        self._unseen_said: float | None = None  # when it was last alerted
+        self._watch_owes = False  # the watchdog stopped the agent: ask for it back
+        # Losses read on a beat skipped for a busy reader, judged on the next one; and how
+        # many beats in a row were skipped.
+        self._pending_grew: dict[str, int] = {}
+        self._pending_failure: JailError | None = None
+        self._skipped = 0
+        self._busy_said = False
         self._clock = clock
         self._sleep = sleep
         self._use_thread = thread
@@ -246,7 +281,15 @@ class ProcessSensor:
         (or up but with its daily budget spent: it cannot say what the agent runs)."""
         if not self._required:
             return True
-        return self._state is SensorState.UP and not self._reader.exhausted_budgets()
+        if self._state is not SensorState.UP:
+            return False
+        with self._reader.held(self._timeout) as got:
+            if not got:
+                # A reader that cannot answer in time (a stuck poll) cannot vouch for the
+                # agent; the heartbeat asks for it back once it answers.
+                self._owes_back = True
+                return False
+            return not self._reader.exhausted_budgets()
 
     # The Guardian's calls
 
@@ -262,6 +305,11 @@ class ProcessSensor:
         if self._use_thread and self._thread is None:
             self._thread = threading.Thread(target=self._run, name="backtide-sensor", daemon=True)
             self._thread.start()
+        if self._use_thread and self._watch_thread is None:
+            self._watch_thread = threading.Thread(
+                target=self._watch_run, name="backtide-sensor-watch", daemon=True
+            )
+            self._watch_thread.start()
         return up
 
     def follow_agent(self) -> None:
@@ -270,9 +318,11 @@ class ProcessSensor:
         with self._lock:
             try:
                 agent_id = self._agent.container_id()
-                if agent_id is not None:
-                    self._reader.set_agent(agent_id)
-            except (JailError, ValueError) as error:
+                if agent_id is not None and not self._reader.set_agent(
+                    agent_id, timeout=self._timeout
+                ):
+                    raise TimeoutError("the reader is busy: its lock could not be had")
+            except (JailError, ValueError, TimeoutError) as error:
                 self._confirmed = False  # not proven for whatever container runs now
                 self._failed("attribution", error, alert=False)
                 return
@@ -316,6 +366,9 @@ class ProcessSensor:
             thread.join(STOP_JOIN)
             if thread.is_alive():
                 logger.error("the sensor's heartbeat did not stop within %s s", STOP_JOIN)
+        watch, self._watch_thread = self._watch_thread, None
+        if watch is not None:
+            watch.join(STOP_JOIN)
         with self._lock:
             if self._state is SensorState.OFF:
                 return
@@ -339,6 +392,7 @@ class ProcessSensor:
     def tick(self) -> None:
         """One heartbeat: check an up sensor, or try to restart a fallen one. The thread calls
         it every ``heartbeat_interval`` seconds. Never raises."""
+        self.watch()  # the watchdog's look too, for callers without its thread (tests)
         after: list[Callable[[], object]] = []
         with self._lock:
             if self._closing.is_set() or self._hooks is None:
@@ -380,6 +434,40 @@ class ProcessSensor:
             logger.exception("the Guardian could not stop the agent for the sensor")
             return False
 
+    def watch(self) -> None:
+        """The stall watchdog: a reader poll running for ``reader_stall`` seconds holds the
+        reader's lock, so nothing that needs it (the heartbeat, ``follow_agent``) can answer.
+        This takes neither that lock nor this module's: the gap and the alert once per stall
+        and, with required, the agent stopped (asked again until it is). Never raises."""
+        hooks = self._hooks
+        if hooks is None or self._closing.is_set() or self._state is SensorState.OFF:
+            return
+        if not self._reader.blocked(self._reader_stall):
+            with self._watch_lock:
+                self._stalled_said = self._stall_stopped = False
+            return
+        with self._watch_lock:
+            say = not self._stalled_said
+            self._stalled_said = True
+            stop = self._required and not self._stall_stopped
+        try:
+            if say:
+                self._say_stalled()
+            if stop:
+                self._confirmed = False
+                stopped = hooks.lost("sensor_lost_events") is not False
+                with self._watch_lock:
+                    self._stall_stopped = stopped
+                # Only once it is stopped: the heartbeat asks for it back once the reader
+                # reads again (marked before, a beat that still saw it running cleared it).
+                self._watch_owes = self._watch_owes or stopped
+        except Exception:
+            logger.exception("the sensor's watchdog could not say or act on a stalled reader")
+
+    def _watch_run(self) -> None:
+        while not self._closing.wait(self._watch_interval):
+            self.watch()
+
     def _run(self) -> None:
         while not self._closing.wait(self._interval):
             try:
@@ -393,13 +481,10 @@ class ProcessSensor:
 
     def _check(self, after: list[Callable[[], object]]) -> None:
         # Lock-free: a poll stuck on a flood of hostile lines holds the reader's lock, so
-        # nothing below (follow_agent, the probe) would answer. Treat it as blind.
+        # nothing below (follow_agent, the probe) would answer. The watchdog says it and, with
+        # required, stops the agent; nothing to prove meanwhile.
         if self._reader.blocked(self._reader_stall):
-            self._say_stalled()
-            if self._required:
-                self._stop_unproven(after, "sensor_lost_events")
             return
-        self._stalled_said = False
         try:
             running = self._jail.is_running()
         except JailError as error:
@@ -410,16 +495,41 @@ class ProcessSensor:
             return
         hooks = self._hooks
         if hooks is None or not hooks.agent_running():
-            if self._owes_back and not self._blind():
+            if (self._owes_back or self._watch_owes) and not self._blind():
                 self._ask_back(after)
             return  # a frozen or stopped agent runs nothing to see
-        self._owes_back = False
+        self._owes_back = self._watch_owes = False
         if running is True:
+            # Docker first, without the reader's lock (docker inspect, docker exec wget):
+            # the reader keeps reading meanwhile. set_agent waits for the lock at most
+            # heartbeat_timeout.
             self.follow_agent()
-            if self._check_budget(after) or self._check_losses(after):
-                return  # required: the agent is being stopped, nothing to probe
-            nonce = procs.new_nonce("hb")
-            self._reader.expect(nonce)
+            # Read now, judged when the reader answers: the counters' baseline has moved, so
+            # what grew is kept until a beat can judge it (never dropped by a skipped one).
+            grew, failure = self._read_losses()
+            for kind, count in grew.items():
+                self._pending_grew[kind] = self._pending_grew.get(kind, 0) + count
+            self._pending_failure = failure or self._pending_failure
+            with self._reader.held(self._timeout) as got:
+                if not got:
+                    # A poll holds the reader's lock: never a wait here. This beat is skipped;
+                    # a run of them is a reader too busy to vouch for anything.
+                    self._skipped_beat(after)
+                    return
+                self._skipped, self._busy_said = 0, False
+                grew, self._pending_grew = self._pending_grew, {}
+                failure, self._pending_failure = self._pending_failure, None
+                blind = self._reader.take_blind_spots()
+                unseen = self._reader.take_unseen()
+                streak = self._reader.unseen_streak()
+                if (
+                    self._check_budget(after)
+                    or self._check_losses(after, grew, failure, blind, unseen)
+                    or self._check_streak(after, streak)
+                ):
+                    return  # required: the agent is being stopped, nothing to probe
+                nonce = procs.new_nonce("hb")
+                self._reader.expect(nonce)
             try:
                 self._launch(nonce)
             except _AgentGone as gone:
@@ -522,16 +632,97 @@ class ProcessSensor:
         self._stop_unproven(after, "sensor_budget")
         return True
 
-    def _check_losses(self, after: list[Callable[[], object]]) -> bool:
+    def _skipped_beat(self, after: list[Callable[[], object]]) -> None:
+        """A heartbeat that could not have the reader's lock in ``heartbeat_timeout``. A poll
+        that slow on every beat (but under ``reader_stall``) would leave the sensor unchecked
+        for good: ``misses_for_down`` of them in a row are ``sensor_gap {kind: reader_busy}``
+        (risk 2) and an alert, once per run, and with required the agent stops."""
+        self._skipped += 1
+        logger.info("the sensor's reader is busy: heartbeat skipped (%d in a row)", self._skipped)
+        if self._skipped < self._misses_for_down:
+            return
+        if not self._busy_said:
+            self._busy_said = True
+            event = self._record(
+                "system",
+                "sensor_gap",
+                self.name,
+                details={"kind": "reader_busy", "skipped": self._skipped},
+                risk=2,
+            )
+            tail = (
+                " Es obligatorio en esta configuración, así que el agente se para."
+                if self._required
+                else " El agente sigue."
+            )
+            self._alert(
+                AlertLevel.ERROR,
+                "El sensor de procesos no da abasto",
+                "El lector del sensor está tan ocupado que varios latidos seguidos no han "
+                "podido comprobarlo: no se sabe si los comandos se graban." + tail,
+                event,
+            )
+        if self._required:
+            self._stop_unproven(after, "sensor_lost_events")
+
+    def _check_streak(self, after: list[Callable[[], object]], streak: float) -> bool:
+        """The founder's decision B (2026-10-19): with required, command lines folded unseen
+        for ``novelty_streak`` seconds with no window free of them (an interpreter hiding its
+        -c behind a drained bucket, or a very long build) are a blind spot:
+        ``sensor_gap {kind: novelty_streak}`` (risk 2) and an alert once per streak, and the
+        agent stops (True). Without required, the repeated alert of _say_unseen is all."""
+        if streak <= 0:
+            self._streak_said = False
+            return False
+        if not self._required or streak < self._novelty_streak:
+            return False
+        if not self._streak_said:
+            self._streak_said = True
+            event = self._record(
+                "system",
+                "sensor_gap",
+                self.name,
+                details={"kind": "novelty_streak", "seconds": round(streak)},
+                risk=2,
+            )
+            self._alert(
+                AlertLevel.ERROR,
+                "El sensor de procesos lleva demasiado tiempo sin ver comandos",
+                f"Durante {round(streak / 60)} min seguidos el agente ha lanzado comandos que "
+                "solo constan en un resumen, sin su línea de órdenes. Es obligatorio en esta "
+                "configuración, así que el agente se para y se vuelve a arrancar después.",
+                event,
+            )
+        self._stop_unproven(after, "sensor_novelty_streak")
+        return True
+
+    def _read_losses(self) -> tuple[dict[str, int], JailError | None]:
+        """Tetragon's loss counters that grew (by docker exec: never under a lock)."""
+        try:
+            return self._losses.check(), None
+        except JailError as error:
+            return {}, error
+
+    def _check_losses(
+        self,
+        after: list[Callable[[], object]],
+        grew: dict[str, int],
+        failure: JailError | None,
+        blind: dict[str, int],
+        unseen: dict[str, int],
+    ) -> bool:
         """What went unseen since the last heartbeat: Tetragon's own losses (recorded here),
         and the reader's blind spots (a throttle of the agent's cgroup, binaries folded
-        without one event of theirs: recorded by the reader). Alerted once per spell and, with
-        required, the agent stopped (True). Unreadable counters are the same with required,
-        and their failure is said again every hour."""
-        blind = self._reader.take_blind_spots()
-        try:
-            grew = self._losses.check()
-        except JailError as error:
+        without one event of theirs, a rotated file lost: recorded by the reader). Alerted
+        once per spell and, with required, the agent stopped (True). Unreadable counters are
+        the same with required, and their failure is said again every hour. Command lines
+        folded unseen of programs that have events of their own (``unseen``) only alert."""
+        if unseen:
+            self._say_unseen(unseen)
+        else:
+            self._unseen_since = None
+        if failure is not None:
+            error = failure
             now = self._clock()
             if self._losses_failing is None or now - self._losses_failing >= RESTART_WINDOW:
                 self._losses_failing = now
@@ -539,7 +730,6 @@ class ProcessSensor:
             if self._required:
                 self._stop_unproven(after, "sensor_lost_events")
                 return True
-            grew = {}
         else:
             self._losses_failing = None
         if not grew and not blind:
@@ -555,9 +745,6 @@ class ProcessSensor:
         return False
 
     def _say_stalled(self) -> None:
-        if self._stalled_said:
-            return
-        self._stalled_said = True
         tail = (
             " Es obligatorio en esta configuración, así que el agente se para."
             if self._required
@@ -589,6 +776,11 @@ class ProcessSensor:
             )
         if blind.get("novelty_lost"):
             what.append("hay programas que solo constan en un resumen, sin un solo evento suyo")
+        if blind.get("rotated"):
+            what.append(
+                "se ha perdido un archivo de eventos de Tetragon antes de leerlo (lo rotó y lo "
+                "borró a tiempo)"
+            )
         tail = (
             " Es obligatorio en esta configuración, así que el agente se para y se vuelve a "
             "arrancar después."
@@ -600,6 +792,37 @@ class ProcessSensor:
             "El sensor de procesos ha dejado de ver comandos",
             "Una avalancha del agente ha cegado al sensor: " + "; ".join(what) + ". Algún "
             "comando puede faltar en la caja negra." + tail,
+        )
+
+    def _say_unseen(self, unseen: dict[str, int]) -> None:
+        """Command lines folded unseen while their program has events of its own (a parallel
+        build, or someone hiding a command behind its own program's events): an alert when a
+        streak of heartbeats starts and again every ``UNSEEN_REPEAT`` seconds while it lasts,
+        naming the programs; never a stop. The gaps (risk 2) are the reader's."""
+        now = self._clock()
+        if self._unseen_since is None:
+            self._unseen_since = now
+        elif self._unseen_said is not None and now - self._unseen_said < UNSEEN_REPEAT:
+            return
+        self._unseen_said = now
+        # Only the image's own programs by name (the agent cannot write those); the agent's
+        # own binaries, whose names it chooses, only by how many: its text never reaches an
+        # alert, and decoys cannot push a program out of it.
+        system = sorted(name for name in unseen if name.startswith(_SYSTEM_DIRS))
+        own = len(unseen) - len(system)
+        parts = system[:_UNSEEN_NAMES]
+        if own:
+            parts.append(f"{own} programa(s) del propio agente")
+        names = ", ".join(parts)
+        minutes = int((now - self._unseen_since) // 60)
+        lasting = f" Dura ya {minutes} min." if minutes else ""
+        self._alert(
+            AlertLevel.WARNING,
+            "El sensor de procesos ha resumido comandos sin verlos",
+            "El agente lanzó tantos comandos distintos que algunos solo constan en un resumen, "
+            f"sin su línea de órdenes ({names}); esos programas sí tienen eventos propios en "
+            "la caja negra. Puede ser una compilación en paralelo, o alguien escondiendo un "
+            f"comando entre los suyos.{lasting} El agente sigue.",
         )
 
     def _record_losses(self, grew: dict[str, int], **more: Any) -> None:

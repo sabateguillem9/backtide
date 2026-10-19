@@ -19,7 +19,10 @@ exec by its binary and nothing else can stand in for it:
   ~600 KiB makes Tetragon drop the arguments (``arguments_lost``) while the binary is still
   attributed from the head of the line;
 - a shell built-in (``echo``), which does NOT exec a program, so it leaves no exec of its own:
-  the test checks there is none and says so, instead of pretending it was hidden.
+  the test checks there is none and says so, instead of pretending it was hidden;
+- (T07-5) a command line whose secret-looking quote swallows the rest of the script for the
+  tachado: ``s='token="';<real command>``. The shell's argv must carry ``argv_struck_long``
+  (risk 1), and the real command, a copy of ``true`` named ``struck-<marker>``, its own exec.
 """
 
 import json
@@ -104,5 +107,10 @@ done["bloat_bytes"] = sum(len(c) for c in chunks)
 
 # 8. A shell built-in: echo runs no program, so there is no exec to see.
 run("builtin_echo", ["sh", "-c", f"echo esconder-builtin-{marker}; :"])
+
+# 9. A strike that swallows the rest of a script: Tetragon wraps the script in quotes, and the
+# quote after token= reaches its closing one.
+struck_path = copy_true(f"struck-{marker}")
+run("struck", ["sh", "-c", f"s='token=\"';{struck_path} struck-{marker} && true"])
 
 print(json.dumps({"workdir": workdir, "marker": marker, "done": done}))

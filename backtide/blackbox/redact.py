@@ -7,7 +7,7 @@ errs on the side of striking too much: a lost word is better than a stored key.
 import html
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NoReturn
 from urllib.parse import quote, quote_plus, unquote, unquote_plus
 
@@ -37,10 +37,10 @@ _TEXT_PATTERNS = (
         r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|.*))",
         re.DOTALL,
     ),
-    # JSON Web Tokens: base64url('{"...') . base64url('{"...') . signature
-    re.compile(
-        r"\b(?P<secret>eyJ[A-Za-z0-9_-]{1,512}+\.eyJ[A-Za-z0-9_-]{1,4096}+\.[A-Za-z0-9_-]{0,2048}+)"
-    ),
+    # JSON Web Tokens: base64url('{"...') . base64url('{"...') . signature. The payload and the
+    # signature run to the end of their run, with no cap (a payload of 5 KiB is still struck);
+    # possessive, and anchored at a bounded header, so the scan stays linear.
+    re.compile(r"\b(?P<secret>eyJ[A-Za-z0-9_-]{1,512}+\.eyJ[A-Za-z0-9_-]++(?:\.[A-Za-z0-9_-]*+)?)"),
     # Header lines with a secret name: "Authorization: Basic ...", "X-Auth-Token: ..."
     re.compile(rf"(?i)(?<![\w-])[\w-]*?{_SENSITIVE_WORDS}[ \t]*:[ \t]*(?P<secret>[^\r\n\"']+)"),
     re.compile(r"(?i)\bbearer\s+(?P<secret>[A-Za-z0-9._~+/-]{8,}=*)"),
@@ -60,8 +60,12 @@ _TEXT_PATTERNS = (
     re.compile(r"(?<![0-9])(?P<secret>[0-9]{5,16}:[A-Za-z0-9_-]{30,})"),  # Telegram bot
     # Credentials inside a URL: scheme://user:password@host
     re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://[^/\s:@]+:(?P<secret>[^/\s@]+)@"),
-    # curl -u user:password, --user user:password
-    re.compile(r"(?<!\S)(?:-u|--user)(?:[ \t]+|=)[^\s:]+:(?P<secret>\S+)"),
+    # curl -u user:password, --user user:password; between quotes, to the closing one
+    # (-u "alice:pass phrase", or the element "--user=alice:pass phrase").
+    re.compile(r"(?<!\S)\"?(?:-u|--user)(?:[ \t]+|=)\"[^\s:\"]+:(?P<secret>[^\"\r\n]+)\""),
+    re.compile(r"(?<!\S)\"(?:-u|--user)(?:[ \t]+|=)[^\s:\"]+:(?P<secret>[^\"\r\n]+)\""),
+    re.compile(r"(?<!\S)(?:-u|--user)(?:[ \t]+|=)'[^\s:']+:(?P<secret>[^'\r\n]+)'"),
+    re.compile(r"(?<!\S)(?:-u|--user)(?:[ \t]+|=)[^\s:]+:(?!\[REDACTED\])(?P<secret>\S+)"),
     # A flag with a secret name and its value after a space: --password hunter2
     re.compile(rf"(?i)(?<!\S)--?[\w-]*?{_SENSITIVE_WORDS}[ \t]+(?P<secret>[^\s'\"]+)"),
     # URL parameters that carry a key or a signature: ?key=AIza..., &sig=...
@@ -134,12 +138,20 @@ def _redact_text(text: str) -> str:
     return _truncate(strike_text(text))
 
 
-def strike_text(text: str) -> str:
+def strike_text(text: str, on_strike: Callable[[re.Match[str]], object] | None = None) -> str:
     """The secret patterns of redact() struck out of ``text``, without cutting it: for callers
-    that cut texts themselves (the process sensor keeps the head and the tail of a command)."""
+    that cut texts themselves (the process sensor keeps the head and the tail of a command).
+    ``on_strike`` sees each match before it is struck (the sensor notes long strikes)."""
     text = _to_valid_utf8(text)
+    strike = _strike_secret
+    if on_strike is not None:
+
+        def strike(match: re.Match[str]) -> str:
+            on_strike(match)
+            return _strike_secret(match)
+
     for pattern in _TEXT_PATTERNS:
-        text = pattern.sub(_strike_secret, text)
+        text = pattern.sub(strike, text)
     return text
 
 

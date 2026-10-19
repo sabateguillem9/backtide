@@ -443,7 +443,22 @@ _redact_mod = _importlib.import_module("backtide.blackbox.redact")
 
 @pytest.mark.parametrize(
     "unit",
-    ["a.", "a-", "-x ", "eyJ-", "token ", "basic ", "Bearer ", "-----BEGIN A", "a\n", "x://"],
+    [
+        "a.",
+        "a-",
+        "-x ",
+        "eyJ-",
+        "token ",
+        "basic ",
+        "Bearer ",
+        "-----BEGIN A",
+        "a\n",
+        "x://",
+        '-u "a:',
+        "-u 'a:",
+        '"--user=a:',
+        "eyJa.eyJa",
+    ],  # fmt: skip
 )
 def test_each_pattern_is_fast_on_70_kib_of_hostile_text(unit: str) -> None:
     hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
@@ -459,3 +474,15 @@ def test_redact_a_half_mib_text_is_quick() -> None:
     start = _time.perf_counter()
     redact(hostile)
     assert _time.perf_counter() - start < 0.5
+
+
+def test_a_jwt_with_a_payload_over_4_kib_is_struck() -> None:
+    """T07-5: the payload was capped at 4096 characters, so a bigger one was not a JWT at all
+    and its head stayed in the (cut) text."""
+    payload = "eyJ" + ("Ab3dE6gH9" * 600)  # 5,403 characters
+    token = f"eyJhbGciOiJIUzI1NiJ9.{payload}.Qx7vR2mK9pLt4ZwB8nHc"
+    struck = redact(f"token {token} done")
+    assert "Ab3dE6gH9Ab3dE6gH9" not in struck and "Qx7vR2mK9pLt4ZwB8nHc" not in struck
+    assert struck.endswith("done")
+    unsigned = redact(f"x eyJhbGciOiJub25lIn0.{payload}. y")  # alg none: an empty signature
+    assert "Ab3dE6gH9Ab3dE6gH9" not in unsigned

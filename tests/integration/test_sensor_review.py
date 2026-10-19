@@ -171,6 +171,68 @@ def test_the_ported_redaction_rules_strike_in_tetragons_own_file(
     assert "keep=visible" in arguments and arguments.endswith("plain-word-kept")
 
 
+def test_the_t07_5_rules_strike_glued_passwords_in_tetragons_own_file(
+    sensor: ReviewSensor, target: Target
+) -> None:
+    """T07-5: the per-tool rules (Tetragon's binary_regex), the tools inside scripts, the
+    values Tetragon wraps in quotes and a glued -b, in Tetragon's own file: binary_regex is
+    accepted by this Tetragon (it would not start otherwise) and applies by the binary."""
+    f = {name: _fake() for name in (
+        "mysql", "mariadb_1", "mariadb_2", "sshpass", "sshpass_q1", "sshpass_q2", "redis",
+        "mongo", "lftp", "smb", "curl", "env_1", "env_2", "qflag_1", "qflag_2", "cookie_1",
+        "cookie_2", "sh_mysql", "sh_pwd", "sh_sshpass", "sh_env", "sh_redis", "podman",
+        "ldap", "zip", "sqlplus", "curl_s1", "curl_s2", "sql",
+    )}  # fmt: skip
+    nonce = f"backtide-review-t075-{secrets.token_hex(6)}"
+    tools = "/tmp/t075"  # noqa: S108 - inside the throwaway target, not on the host
+    names = ("mysql", "mariadb-dump", "sshpass", "redis-cli", "mongosh", "lftp", "smbclient",
+             "curl", "env", "podman", "ldapsearch", "zip", "sqlplus")  # fmt: skip
+    copies = " && ".join(f"cp /bin/true {tools}/{name}" for name in names)
+    done = target.exec("sh", "-c", f"mkdir -p {tools} && {copies}")
+    assert done.returncode == 0, done.stderr
+    runs = [
+        [f"{tools}/mysql", nonce, "-uroot", f"-p{f['mysql']}", "shop"],
+        [f"{tools}/mariadb-dump", nonce, f"-p{f['mariadb_1']} {f['mariadb_2']}", "shop"],
+        [f"{tools}/sshpass", nonce, "-p", f["sshpass"], "ssh", "h.invalid"],
+        [f"{tools}/sshpass", nonce, "-p", f"{f['sshpass_q1']} {f['sshpass_q2']}", "ssh"],
+        [f"{tools}/redis-cli", nonce, f"-a{f['redis']}", "ping"],
+        [f"{tools}/mongosh", nonce, "-u", "admin", "-p", f["mongo"], "--quiet"],
+        [f"{tools}/lftp", nonce, "-u", f"alice,{f['lftp']}", "sftp://h.invalid"],
+        [f"{tools}/smbclient", nonce, "//h.invalid/s", "-U", f"alice%{f['smb']}"],
+        [f"{tools}/curl", nonce, f"-ualice:{f['curl']}", "https://x.invalid/"],
+        [f"{tools}/env", nonce, f"DB_PASSWORD={f['env_1']} {f['env_2']}", "run"],
+        ["/bin/true", nonce, f"--password=pass phrase {f['qflag_1']} {f['qflag_2']}", "x"],
+        ["/bin/true", nonce, f"-bsessionid={f['cookie_1']};csrftoken={f['cookie_2']}", "y"],
+        ["/bin/sh", "-c", f"true {nonce}; mysql -uroot -p{f['sh_mysql']} shop 2>/dev/null; "
+         f"MYSQL_PWD={f['sh_pwd']} true"],
+        ["/bin/sh", "-c", f"true {nonce}; sshpass -p {f['sh_sshpass']} ssh h 2>/dev/null; "
+         f"SSHPASS={f['sh_env']} true; redis-cli -a {f['sh_redis']} ping 2>/dev/null; true"],
+        [f"{tools}/podman", "login", "-u", "me", "-p", f["podman"], nonce],
+        [f"{tools}/ldapsearch", nonce, "-x", "-w", f["ldap"], "-b", "dc=x"],
+        [f"{tools}/zip", nonce, "-P", f["zip"], "out.zip"],
+        [f"{tools}/sqlplus", nonce, f"scott/{f['sqlplus']}@orcl"],
+        [f"{tools}/curl", nonce, "-u", f"alice:{f['curl_s1']} {f['curl_s2']}", "x"],
+        [f"{tools}/mysql", nonce, "-e", f"CREATE USER u IDENTIFIED BY '{f['sql']}'"],
+        # Ordinary flags of other binaries keep their values.
+        ["/bin/true", nonce, "-p2222", "mkdir -pnew", "keep-this-visible"],
+    ]  # fmt: skip
+    for argv in runs:
+        target.exec(*argv)
+    deadline = time.monotonic() + EVENT_TIMEOUT
+    while time.monotonic() < deadline and sensor.text().count(nonce) < len(runs):
+        time.sleep(0.5)
+    time.sleep(2)
+    text = sensor.text() + sensor.logs()
+    lines = [json.loads(raw) for raw in sensor.text().splitlines() if nonce in raw]
+    lines = [line for line in lines if "process_exec" in line]
+    arguments = [line["process_exec"]["process"]["arguments"] for line in lines]
+    leaked = [name for name, value in f.items() if value in text]
+    report("review_t075", {"arguments": arguments, "leaked": leaked})
+    assert len(lines) >= len(runs), arguments
+    assert leaked == [], arguments
+    assert any(a.endswith("keep-this-visible") and "-p2222" in a for a in arguments), arguments
+
+
 def _listening(pid: int) -> list[str]:
     found = []
     for table in ("tcp", "tcp6"):

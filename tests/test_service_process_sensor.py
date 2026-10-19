@@ -7,6 +7,7 @@ while it "sees", a probe launched in the agent shows up in tetragon.log as the r
 
 import copy
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -236,7 +237,7 @@ class World:
             self.sensor.tick()
 
 
-def make_world(tmp_path: Path, *, required: bool = False) -> World:
+def make_world(tmp_path: Path, *, required: bool = False, **sensor: Any) -> World:
     log: list[str] = []
     clock = Clock()
     jail_config = SensorJailConfig(state_dir=tmp_path / "sensor")
@@ -257,7 +258,7 @@ def make_world(tmp_path: Path, *, required: bool = False) -> World:
         required=required,
         clock=clock,
         sleep=clock.sleep,
-        thread=False,
+        **({"thread": False} | sensor),
     )
     return World(sensor, jail, agent, reader, box, clock, log, [], [True], [], [])
 
@@ -884,3 +885,270 @@ def test_a_stalled_reader_without_required_only_alerts(world: World) -> None:
     assert world.lost == []
     titles = [title for _, title, _ in world.alerts]
     assert titles.count("El sensor de procesos va muy por detrás") == 1
+
+
+# --- T07-5: the stall watchdog, unseen command lines, a lost rotated file ------------------
+
+
+class BlockingRecorder:
+    """The reader's black box, whose append waits on an Event: a poll stuck for real."""
+
+    def __init__(self, box: Box) -> None:
+        self.box = box
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def append(self, *args: Any, **kwargs: Any) -> object:
+        self.entered.set()
+        assert self.release.wait(20)
+        return self.box.append(*args, **kwargs)
+
+
+def _stick(world: World) -> tuple[BlockingRecorder, threading.Thread]:
+    """Make the next poll hang in append, holding the reader's lock."""
+    blocking = BlockingRecorder(world.box)
+    world.reader._recorder = blocking
+    world.jail.write_exec("stuck-command")
+    poller = threading.Thread(target=world.reader.poll, daemon=True)
+    poller.start()
+    assert blocking.entered.wait(5)
+    return blocking, poller
+
+
+def test_a_heartbeat_never_hangs_behind_a_stuck_poll(tmp_path: Path) -> None:
+    """T07-5: the heartbeat used to block in set_agent() on the reader's lock, before it
+    looked at blocked() again, so the stall could never be said."""
+    world = make_world(tmp_path, required=True, heartbeat_timeout=0.2)
+    _running(world)
+    blocking, poller = _stick(world)
+    try:
+        beat = threading.Thread(target=world.beat, daemon=True)
+        beat.start()
+        beat.join(5)
+        assert not beat.is_alive(), "the heartbeat hung behind the reader's lock"
+        assert world.sensor.state is SensorState.UP  # a busy reader is not a dead sensor
+        world.clock.sleep(61)  # the poll is now older than reader_stall
+        world.sensor.watch()
+        (gap,) = [e for e in world.box.of("sensor_gap") if e.details["kind"] == "reader_stalled"]
+        assert gap.risk == 2 and world.reasons == ["sensor_lost_events"]
+        world.sensor.watch()  # once per stall
+        assert (
+            len([e for e in world.box.of("sensor_gap") if e.details["kind"] == "reader_stalled"])
+            == 1
+        )
+        assert world.reasons == ["sensor_lost_events"]
+    finally:
+        blocking.release.set()
+        poller.join(5)
+
+
+def test_the_watchdog_thread_says_a_stall_with_no_heartbeat(tmp_path: Path) -> None:
+    """The watchdog has its own thread and takes neither the reader's lock nor the sensor's."""
+    world = make_world(tmp_path, required=True, thread=True, watch_interval=0.05)
+    _running(world)
+    blocking, poller = _stick(world)
+    try:
+        world.clock.sleep(61)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and world.reasons != ["sensor_lost_events"]:
+            time.sleep(0.05)
+        assert world.reasons == ["sensor_lost_events"]
+        assert [e for e in world.box.of("sensor_gap") if e.details["kind"] == "reader_stalled"]
+    finally:
+        blocking.release.set()
+        poller.join(5)
+        world.sensor.stop()
+
+
+def test_follow_agent_and_allows_agent_do_not_hang_behind_a_stuck_poll(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True, heartbeat_timeout=0.2)
+    _running(world)
+    blocking, poller = _stick(world)
+    try:
+        calls = threading.Thread(
+            target=lambda: (world.sensor.follow_agent(), world.sensor.allows_agent()), daemon=True
+        )
+        calls.start()
+        calls.join(5)
+        assert not calls.is_alive()
+        assert world.sensor.allows_agent() is False  # required, and the reader cannot answer
+    finally:
+        blocking.release.set()
+        poller.join(5)
+    assert world.sensor.allows_agent() is True
+
+
+def test_unseen_command_lines_alert_per_streak_and_never_stop(tmp_path: Path) -> None:
+    """T07-5: a parallel build (distinct commands of a binary that has events of its own) is
+    risk 2 and an alert naming the programs, never a stop, also under required. A streak is
+    alerted when it starts and again every 10 minutes while it lasts."""
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    decoy = "/workspace/compilacion-normal-ignorar"
+    unseen = [{"/usr/bin/cc": 1}, {"/usr/bin/cc": 1}, {}, {"/bin/sh": 1, decoy: 1}]
+    world.reader.take_unseen = lambda: unseen.pop(0) if unseen else {"/bin/sh": 1}  # type: ignore[method-assign]
+    world.beat(4)
+    assert world.lost == []
+    bodies = [
+        b
+        for _, t, b in world.alerts
+        if t == "El sensor de procesos ha resumido comandos sin verlos"
+    ]
+    assert len(bodies) == 2 and "/usr/bin/cc" in bodies[0] and "/bin/sh" in bodies[1]
+    # The agent's own binary is only counted: its chosen name never reaches the alert.
+    assert decoy not in bodies[1] and "1 programa(s) del propio agente" in bodies[1]
+    world.beat(19)  # 9.5 more minutes of the same streak: no new alert yet
+    world.beat(1)  # 10 minutes after the last one: said again, with how long it lasts
+    bodies = [
+        b
+        for _, t, b in world.alerts
+        if t == "El sensor de procesos ha resumido comandos sin verlos"
+    ]
+    assert len(bodies) == 3 and "Dura ya" in bodies[2]
+    assert world.lost == [] and world.sensor.allows_agent() is True
+
+
+def test_a_rotated_file_lost_is_blind_and_with_required_stops_the_agent(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.reader.take_blind_spots = lambda: {"rotated": 1}  # type: ignore[method-assign]
+    world.beat(1)
+    assert world.reasons == ["sensor_lost_events"]
+    (body,) = [
+        b for _, t, b in world.alerts if t == "El sensor de procesos ha dejado de ver comandos"
+    ]
+    assert "archivo" in body
+
+
+def test_an_agent_the_watchdog_stopped_is_asked_back_once_the_reader_reads(tmp_path: Path) -> None:
+    """T07-5 review: the debt is marked after `lost` stopped the agent, so a beat that still
+    saw it running cannot clear it."""
+    world = make_world(tmp_path, required=True, heartbeat_timeout=0.2)
+    _running(world)
+    blocking, poller = _stick(world)
+    try:
+        world.clock.sleep(61)
+        world.sensor.watch()
+        assert world.reasons == ["sensor_lost_events"]
+    finally:
+        blocking.release.set()
+        poller.join(5)
+    world.agent_running[0] = False  # the Guardian stopped it
+    world.beat(1)
+    assert world.back == ["back"]
+
+
+def test_a_required_agent_refused_for_a_busy_reader_is_asked_back(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True, heartbeat_timeout=0.2)
+    _running(world)
+    blocking, poller = _stick(world)
+    try:
+        assert world.sensor.allows_agent() is False
+    finally:
+        blocking.release.set()
+        poller.join(5)
+    world.agent_running[0] = False
+    world.beat(1)
+    assert world.back == ["back"]
+
+
+def test_losses_read_on_a_skipped_heartbeat_are_carried_to_the_next(tmp_path: Path) -> None:
+    """T07-5 second review, A: the counters' baseline moves before the reader's lock is
+    taken; a beat skipped for a busy reader must not drop what it read."""
+    world = make_world(tmp_path, heartbeat_timeout=0.2)
+    _running(world)
+    world.jail.lose("queue", 7)
+    held = world.reader.held
+    tries: list[int] = []
+
+    class Busy:
+        def __enter__(self) -> bool:
+            return False
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    def busy_once(timeout: float | None) -> Any:
+        tries.append(1)
+        return Busy() if len(tries) == 2 else held(timeout)  # 1: follow_agent; 2: the beat
+
+    world.reader.held = busy_once  # type: ignore[method-assign]
+    world.beat(1)  # skipped: the reader is busy, but the counters were read
+    assert not [e for e in world.box.of("sensor_gap") if e.details["kind"] == "kernel_lost"]
+    world.beat(1)
+    (gap,) = [e for e in world.box.of("sensor_gap") if e.details["kind"] == "kernel_lost"]
+    assert gap.details["count"] == 7 and gap.risk == 2
+
+
+def test_heartbeats_skipped_in_a_row_are_a_busy_reader(tmp_path: Path) -> None:
+    """A poll slow enough to make every beat give up (10 to 59 s) is never reader_stalled:
+    three skipped beats in a row are sensor_gap reader_busy, risk 2, and with required the
+    agent stops."""
+    world = make_world(tmp_path, required=True, heartbeat_timeout=0.2)
+    _running(world)
+
+    class Busy:
+        def __enter__(self) -> bool:
+            return False
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    world.reader.held = lambda timeout: Busy()  # type: ignore[method-assign]
+    world.beat(2)
+    assert not [e for e in world.box.of("sensor_gap") if e.details["kind"] == "reader_busy"]
+    world.beat(1)
+    (gap,) = [e for e in world.box.of("sensor_gap") if e.details["kind"] == "reader_busy"]
+    assert gap.risk == 2 and gap.details["skipped"] == 3
+    assert world.reasons == ["sensor_lost_events"]
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos no da abasto") == 1
+
+
+# --- The founder's decision B (2026-10-19): a long streak of unseen command lines -----------
+
+
+def test_an_unseen_streak_shorter_than_the_limit_does_not_stop(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    world.reader.unseen_streak = lambda: 9 * 60.0  # type: ignore[method-assign]
+    world.beat(2)
+    assert world.lost == []
+    assert not [e for e in world.box.of("sensor_gap") if e.details["kind"] == "novelty_streak"]
+
+
+def test_an_unseen_streak_of_ten_minutes_stops_a_required_agent(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True)
+    _running(world)
+    streak = [600.0]
+    world.reader.unseen_streak = lambda: streak[0]  # type: ignore[method-assign]
+    world.beat(2)
+    (gap,) = [e for e in world.box.of("sensor_gap") if e.details["kind"] == "novelty_streak"]
+    assert gap.risk == 2 and gap.details["seconds"] >= 600
+    assert world.reasons[0] == "sensor_novelty_streak"
+    titles = [title for _, title, _ in world.alerts]
+    assert titles.count("El sensor de procesos lleva demasiado tiempo sin ver comandos") == 1
+    # A window without unseen command lines resets it; a new streak is said again.
+    streak[0] = 0.0
+    world.beat(1)
+    streak[0] = 600.0
+    world.beat(1)
+    gaps = [e for e in world.box.of("sensor_gap") if e.details["kind"] == "novelty_streak"]
+    assert len(gaps) == 2
+
+
+def test_an_unseen_streak_without_required_never_stops(tmp_path: Path) -> None:
+    world = make_world(tmp_path)
+    _running(world)
+    world.reader.unseen_streak = lambda: 3600.0  # type: ignore[method-assign]
+    world.beat(2)
+    assert world.lost == []
+    assert not [e for e in world.box.of("sensor_gap") if e.details["kind"] == "novelty_streak"]
+
+
+def test_the_streak_limit_is_a_setting(tmp_path: Path) -> None:
+    world = make_world(tmp_path, required=True, novelty_streak=120.0)
+    _running(world)
+    world.reader.unseen_streak = lambda: 120.0  # type: ignore[method-assign]
+    world.beat(1)
+    assert world.reasons == ["sensor_novelty_streak"]

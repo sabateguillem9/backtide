@@ -335,7 +335,13 @@ def build_sensor(
         already_recorded=recorded_keys(box),
         stale_probes_before=utc_now(),
     )
-    return ProcessSensor(SensorJail(jail_config), reader, agent, required=config.sensor_required)
+    return ProcessSensor(
+        SensorJail(jail_config),
+        reader,
+        agent,
+        required=config.sensor_required,
+        novelty_streak=config.sensor_novelty_streak,
+    )
 
 
 def build_egress(

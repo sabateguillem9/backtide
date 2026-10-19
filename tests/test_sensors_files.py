@@ -2104,6 +2104,16 @@ class TestReReview:
         assert rig.ino.is_watching(rig.agent_dir / "work" / "boom")
 
 
+def _still_open(fd: int, device: int, inode: int) -> bool:
+    """Whether ``fd`` is still the descriptor that was opened on (device, inode): a number
+    reused since by someone else for something else does not count."""
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (device, inode)
+
+
 class BtrfsListings:
     """Btrfs fixes the end of a directory listing when the directory is OPENED: a name made
     after the open is never listed through that descriptor, however late it is read. This
@@ -2269,17 +2279,21 @@ class TestListingAfterTheWatch:
     ) -> None:
         """Already watched: it is ``unlisted`` (as when its listing fails), never given back."""
         active: list[bool] = []
+        opened: list[tuple[int, int, int]] = []  # (fd, device, inode) opened during the rescan
 
         def failing(fd: int, rel: bytes, flags: int) -> int:
             if active and rel == b"." and os.fstat(fd).st_ino == work_inode:
                 active.clear()
                 raise OSError(errno.EMFILE, "Too many open files")
-            return inotify.open_beneath(fd, rel, flags)
+            new_fd = inotify.open_beneath(fd, rel, flags)
+            if active:
+                st = os.fstat(new_fd)
+                opened.append((new_fd, st.st_dev, st.st_ino))
+            return new_fd
 
         rig, _ = self.rig(make_rig, monkeypatch, opener=failing)
         work = rig.agent_dir / "work"
         work_inode = work.stat().st_ino
-        before = len(os.listdir("/dev/fd"))
         active.append(True)
         rig.deliver(RawEvent(-1, IN_Q_OVERFLOW, 0, b""))
         eventually(lambda: rig.watcher.stats().rescans == 1)
@@ -2288,7 +2302,12 @@ class TestListingAfterTheWatch:
         assert rig.watcher.report_unwatched()
         assert rig.files("dropped")[-1].details["reasons"] == {"unlisted": 1}
         assert not rig.files("create")  # nothing reported as new from a known folder
-        assert len(os.listdir("/dev/fd")) == before  # no descriptor left behind
+        # No descriptor the rescan opened is left behind. T07-5: this compared the number of
+        # the whole process's descriptors, which any other thread of the test run (one left by
+        # an earlier test) can change between the two counts: it failed once in a full run.
+        # Now only the descriptors this rescan opened are checked, each by what it pointed to.
+        assert opened
+        assert [entry for entry in opened if _still_open(*entry)] == []
 
     def test_a_new_folder_armed_first_by_a_quiet_rescan_still_reports_what_it_holds(
         self, make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
