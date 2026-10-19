@@ -137,6 +137,14 @@ Planned and not present yet: `gate` (the proxy and approvals) and `analyzer` (ri
 
 Each black-box event has an `id`, `ts`, `source` (exec, file, net, llm, gate, snapshot), `action`, `target`, `details`, `risk` (0 to 3), `snapshot_id`, `prev_hash` and `hash`.
 
+## Related work
+
+The closest project to backtide is [nono](https://nono.sh) (Apache-2.0, by the Sigstore team). nono is an excellent, fast, zero-setup capability sandbox: it runs an agent — or, more granularly, each tool the agent calls — under Landlock/seccomp (Linux) or Seatbelt (macOS), injects real credentials so the agent only ever sees a phantom token, filters egress by domain, keeps a hash-chained audit log, and takes per-session filesystem snapshots you can roll back. It runs natively on macOS, Linux and WSL2 with no container or VM.
+
+backtide makes a different trade-off. Where nono reduces an agent's authority from *inside its own process tree and user*, backtide records it *from the outside*: the agent runs in a hardened container with no direct egress, while a separate, higher-privileged service watches every process and connection from the kernel (eBPF/Tetragon), records each command, file, network call and model request into an append-only, hash-chained black box the agent can never reach, and snapshots the whole workspace every two minutes so you can rewind — and un-rewind — to any point. Holding back irreversible or outbound actions *by their content* until you approve them from your phone is the next piece being built (the gate).
+
+nono is the better fit for "give a coding agent least privilege on my laptop"; backtide is built for "record everything from outside, hold back what's irreversible, and rewind." They compose: you can run backtide's container with nono inside it. A hands-on comparison (in Spanish) is in docs/31 (internal note).
+
 ## Contributing and reporting problems
 
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
