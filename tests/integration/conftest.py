@@ -68,6 +68,11 @@ from backtide.jail.proxy import ProxyJail
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.snapshots import SnapshotError, btrfs, grow
 from backtide.snapshots.store import SnapshotStore
+from tests.docker_leaks import (  # noqa: F401 - pytest hooks: the leak guard (docs below)
+    pytest_collection_finish,
+    pytest_sessionfinish,
+    pytest_terminal_summary,
+)
 from tests.integration.service_kit import Service, make_service
 
 GIB = 1024**3
@@ -487,7 +492,7 @@ def _remove_stale_test_agents() -> list[str]:
     stale_containers = [n for n in containers if _is_stale_test_name(n, TEST_CONTAINER_PREFIX)]
     stale_networks = [n for n in networks if _is_stale_test_name(n, TEST_NETWORK_PREFIX)]
     for name in stale_containers:
-        jail_docker.run(["rm", "--force", name])  # a missing container is not an error
+        jail_docker.run(["rm", "--force", "--volumes", name])  # a missing container is not an error
     for name in stale_networks:
         result = jail_docker.run(["network", "rm", name], check=False)
         if result.returncode != 0 and "not found" not in result.stderr:

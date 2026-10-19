@@ -21,6 +21,9 @@ from attack_kit import CANARY_PREFIX, CANARY_VARIABLES, RESULTS, Attack, scenari
 from attack_manifest import Scenario
 from attack_report import Result, format_report
 
+from tests import docker_leaks
+from tests.docker_leaks import pytest_collection_finish, pytest_sessionfinish  # noqa: F401 - hooks
+
 _INTEGRATION = Path(__file__).resolve().parent.parent / "integration"
 
 
@@ -98,11 +101,11 @@ def _first_line(report: pytest.TestReport) -> str:
 
 
 def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
-    if not RESULTS:
-        return
-    terminalreporter.section("agente malvado: resumen")
-    for line in format_report(list(scenarios().values()), RESULTS):
-        terminalreporter.write_line(line)
+    if RESULTS:
+        terminalreporter.section("agente malvado: resumen")
+        for line in format_report(list(scenarios().values()), RESULTS):
+            terminalreporter.write_line(line)
+    docker_leaks.pytest_terminal_summary(terminalreporter, exitstatus, config)  # the leak guard
 
 
 # Fixtures
@@ -151,8 +154,8 @@ def battery_sensor(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
     from sensor_battery import BatterySensor  # noqa: PLC0415 - only the VM battery needs it
 
     sensor = BatterySensor(tmp_path_factory.mktemp("battery-sensor"))
-    sensor.start()
     try:
+        sensor.start()  # inside the try: a start that fails halfway still leaves a container
         yield sensor
     finally:
         sensor.stop()

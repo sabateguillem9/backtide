@@ -42,7 +42,7 @@ def remove_stale_sensors() -> None:
 
 def remove_sensor(name: str) -> None:
     jail_docker.run(["stop", "--time", "10", name], check=False, timeout=STOP_TIMEOUT)
-    jail_docker.run(["rm", "--force", name], check=False)
+    jail_docker.run(["rm", "--force", "--volumes", name], check=False)
 
 
 @contextmanager

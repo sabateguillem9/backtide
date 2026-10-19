@@ -442,7 +442,7 @@ def test_start_stop_and_remove(ready_jail: AgentJail, fake_docker: FakeDocker) -
         ["image", "inspect", "--format", "{{json .Config.Env}}", ready_jail.config.image],
         ["start", "agent-under-test"],
         ["stop", "--time", "30", "agent-under-test"],
-        ["rm", "--force", "agent-under-test"],
+        ["rm", "--force", "--volumes", "agent-under-test"],
     ]
     (stop,) = [call for call in fake_docker.calls if call.args[0] == "stop"]
     assert stop.timeout > ready_jail.config.stop_timeout

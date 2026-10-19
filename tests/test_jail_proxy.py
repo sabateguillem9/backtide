@@ -555,7 +555,7 @@ def test_lifecycle_commands(ready: ProxyJail, fake_docker: FakeDocker) -> None:
     commands = fake_docker.commands()
     assert ["stop", "--time", "10", name] in commands
     assert ["kill", name] in commands
-    assert ["rm", "--force", name] in commands
+    assert ["rm", "--force", "--volumes", name] in commands
     assert ["network", "rm", ready.config.network] in commands
 
 

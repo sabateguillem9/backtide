@@ -564,7 +564,7 @@ def test_stop_and_remove(tmp_path: Path, fake_docker: FakeDocker) -> None:
     jail.remove()
     assert fake_docker.calls == [
         ["stop", "--time", "10", "backtide-sensor"],
-        ["rm", "--force", "backtide-sensor"],
+        ["rm", "--force", "--volumes", "backtide-sensor"],
     ]
 
 

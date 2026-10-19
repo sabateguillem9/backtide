@@ -291,7 +291,7 @@ def _remove_stale_containers() -> None:
             if name.startswith(prefix):
                 pid = name.removeprefix(prefix).partition("-")[0]
                 if not pid.isdigit() or not _is_pytest_alive(int(pid)):
-                    docker("rm", "--force", name)
+                    docker("rm", "--force", "--volumes", name)
 
 
 def _unique(prefix: str) -> str:
@@ -324,7 +324,7 @@ def target(agent_image: str) -> Iterator[Target]:
         ).stdout.strip()  # fmt: skip
         yield Target(name, container_id)
     finally:
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
 
 
 @contextmanager
@@ -365,7 +365,7 @@ def tetragon(
     finally:
         # SIGTERM first, so Tetragon unloads its programs itself; then remove it anyway.
         docker("stop", "--time", "10", name, check=False, timeout=60)
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
         for path in events.iterdir():  # root's files in our directory: we may unlink them
             path.unlink()
 

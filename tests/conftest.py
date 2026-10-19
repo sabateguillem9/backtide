@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+pytest_plugins = ["pytester"]
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(

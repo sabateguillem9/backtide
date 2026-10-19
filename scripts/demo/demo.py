@@ -60,6 +60,12 @@ STOP_TIMEOUT = 120.0
 PULL_TIMEOUT = 1800.0  # the first pull of the pinned OpenClaw image is about 1.3 GB
 CONTAINER = "backtide-demo-agent"
 NETWORK = "backtide-demo-net"
+# The names from before the rename to backtide: a demo of those days left them behind.
+OLD_CONTAINER = "vigia-demo-agent"
+OLD_NETWORK = "vigia-demo-net"
+# The demo's config does not name its egress proxy, so it runs under the default names.
+PROXY_CONTAINER = "backtide-proxy"
+PROXY_NETWORK = "backtide-salida-net"
 PROCESS_MARK = b"scripts.demo.demo"  # what the service's /proc/<pid>/cmdline contains
 PROJECT = "/workspace/work/proyecto"  # inside the agent: the folder the demo creates and deletes
 SNAPSHOT_WAIT = 90.0  # a cycle, the sync and the snapshot, on a loaded VM
@@ -332,12 +338,15 @@ def service_pid(paths: Paths) -> int | None:
 
 
 def remove_agent() -> None:
-    """Remove the demo container, then its network: a stopped container still holds the btrfs
-    in its own mount namespace, which would make the umount fail. Missing ones are fine."""
-    run(["docker", "rm", "--force", CONTAINER])
+    """Remove the demo containers (the agent, its proxy and the old pre-rename agent), then
+    their networks: a stopped container still holds the btrfs in its own mount namespace, which
+    would make the umount fail. ``-v``: their anonymous volumes go too. Missing ones are fine."""
+    for container in (CONTAINER, PROXY_CONTAINER, OLD_CONTAINER):
+        run(["docker", "rm", "--force", "--volumes", container])
     networks = run(["docker", "network", "ls", "--format", "{{.Name}}"]).stdout.split()
-    if NETWORK in networks:
-        run(["docker", "network", "rm", NETWORK])
+    for network in (NETWORK, PROXY_NETWORK, OLD_NETWORK):
+        if network in networks:
+            run(["docker", "network", "rm", network])
 
 
 def stop_service(paths: Paths) -> None:

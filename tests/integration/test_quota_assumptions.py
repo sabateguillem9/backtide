@@ -1304,7 +1304,7 @@ def test_docker_relabel_at_start_fails_past_the_cap_only_for_files_labeled_other
         uncapped = throwaway_container(agent_image, names[3], agent_dir)
     finally:
         for name in names:
-            jail_docker.run(["rm", "--force", name], check=False)
+            jail_docker.run(["rm", "--force", "--volumes", name], check=False)
     labels = {selinux_label(agent_dir), selinux_label(agent_dir / "small" / "f1")}
     report(
         record_property,

@@ -273,7 +273,7 @@ def proxy_argv(lab_root: Path, name: str, agent_net: str, egress_net: str, *, al
 
 def remove_all(containers: list[str], networks: list[str]) -> None:
     for name in reversed(containers):
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
     for name in reversed(networks):
         docker("network", "rm", name, check=False)
 
@@ -531,7 +531,7 @@ def test_p2_dhparam_is_needed_in_a_read_only_confdir(
             outcome = f"does not start: {str(error)[-600:]}"
         report(record_property, "only mitmproxy-ca.pem in a read-only /ca", outcome)
     finally:
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
     assert outcome.startswith("does not start"), outcome
     assert "Read-only file system: '/ca/mitmproxy-dhparam.pem'" in outcome, outcome
 
@@ -631,7 +631,7 @@ def test_p3_selinux_refuses_container_t_a_host_socket(
         control, seen = connect_from(lab, name, lab.channel_dir / "control.sock")
         container_id = inspect(name)["Id"]
     finally:
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
     assert control == {"ok": True, "reply": "ack"}, control
     assert seen.line == "hello"
     assert (seen.uid, seen.gid) == (PROXY_UID, PROXY_UID)
@@ -682,7 +682,7 @@ def test_p3_plan_b_the_host_connects_to_a_socket_of_the_proxy(
         container_id = inspect(name)["Id"]
         label = os.getxattr(folder, "security.selinux").decode().rstrip("\0")
     finally:
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
     report(record_property, "plan B peer", f"uid {seen.uid}, cgroup {seen.cgroup}, {label}")
     assert reply == b"ack\n"
     assert json.loads(logs[-1]) == {"ok": True, "line": "hello"}
@@ -778,7 +778,7 @@ def test_p5_with_a_dns_option_docker_forwards_inside_the_internal_network(
         resolved = run_client(lab, "resolve", f"exfil-{marker}.example.com", container=name)
         direct = run_client(lab, "dns", lab.dns_ip, f"direct-{marker}.example", container=name)
     finally:
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
     assert not resolved["ok"]  # NXDOMAIN from the fake resolver
     assert direct == {"ok": True, "rcode": 3}, direct
     time.sleep(0.5)
@@ -841,7 +841,7 @@ def test_p6_control_eager_connects_before_the_hook(lab: Lab) -> None:
         wait_for_line(name, PROXY_READY)
         result = run_client(lab, "https", "backtide-proxy-eager:8080", "eager.fake.test", "/eager")
     finally:
-        docker("rm", "--force", name, check=False)
+        docker("rm", "--force", "--volumes", name, check=False)
     assert result["ok"] and result["status"] == 200, result
     before, _ = accepts_seen_by_the_hook(result)
     assert result["body"]["accept"] <= before
@@ -1045,7 +1045,7 @@ def openclaw_container(files: OpenClawFiles, *, gateway: bool) -> Iterator[OpenC
             AgentJail(config).wait_ready()
         yield OpenClaw(name=config.name, fake_key=files.fake_key)
     finally:
-        docker("rm", "--force", config.name, check=False)
+        docker("rm", "--force", "--volumes", config.name, check=False)
 
 
 def openclaw_turn(

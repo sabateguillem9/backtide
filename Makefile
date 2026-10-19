@@ -15,7 +15,7 @@ DEMO_WEB_CONFIG = $$HOME/backtide-demo-run/backtide.toml
 DEMO_WEB_PORT = 8766
 
 .PHONY: help test lint fmt it ataques demo demo-crear demo-archivos demo-borrar demo-instantaneas \
-	demo-rebobinar demo-parar demo-web web-demo vm-up vm-shell vm-down vm-delete
+	demo-rebobinar demo-parar demo-web web-demo vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -61,7 +61,7 @@ demo-rebobinar: ## Demo: rewind (ID=<snapshot>, default the one demo-crear left;
 	@case "$(ID)" in *[!0-9A-Za-z._-]*) echo "ID has odd characters: copy it from make demo-instantaneas" >&2; exit 2;; esac
 	$(VM_SH) '$(DEMO_VM) rebobinar $(ID) $(if $(SI),--si)'
 
-demo-parar: ## Demo: stop everything, unmount and delete the demo volume
+demo-parar: ## Demo: stop everything, unmount and delete the demo volume (also the old vigia-demo-* names)
 	$(VM_SH) '$(DEMO_VM) parar'
 
 demo-web: ## Demo: the web of the running demo, in the VM (open the link on the Mac; docs/demo.md)
@@ -93,6 +93,13 @@ vm-up: ## Create (first time) and start the dev VM
 
 vm-shell: ## Open a shell inside the VM
 	limactl shell --workdir "$(CURDIR)" $(VM)
+
+vm-estado: ## VM: contenedores con su CPU y memoria, restos de Docker, montajes btrfs y los 5 procesos que más CPU gastan
+	$(VM_SH) 'sh scripts/vm-estado.sh'
+
+vm-limpiar: ## VM: borra solo restos nuestros (backtide-*, vigia-demo-*, volúmenes sin usar); no toca imágenes. FORZAR=1 si hay pytest en marcha
+	@case "$(FORZAR)" in ""|1) ;; *) echo "FORZAR solo puede valer 1" >&2; exit 2;; esac
+	$(VM_SH) 'FORZAR=$(FORZAR) sh scripts/vm-limpiar.sh'
 
 vm-down: ## Stop the VM
 	limactl stop $(VM)

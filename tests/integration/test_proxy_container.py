@@ -146,7 +146,7 @@ def fake(proxy: ProxyJail) -> Iterator[Fake]:
         info = json.loads(docker.run(["container", "inspect", name]).stdout)[0]
         yield Fake(name, info["NetworkSettings"]["Networks"][proxy.config.network]["IPAddress"])
     finally:
-        docker.run(["rm", "--force", name], check=False)
+        docker.run(["rm", "--force", "--volumes", name], check=False)
 
 
 def in_proxy(proxy: ProxyJail, *argv: str) -> str:
@@ -195,7 +195,7 @@ def test_start_refuses_a_proxy_that_is_not_the_one_of_its_config(proxy: ProxyJai
             other.start()
         assert inspect(other.config.name)["State"]["Running"] is False
     finally:
-        docker.run(["rm", "--force", other.config.name], check=False)
+        docker.run(["rm", "--force", "--volumes", other.config.name], check=False)
 
 
 # The proxy's container, seen from inside

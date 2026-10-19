@@ -530,7 +530,7 @@ def test_start_refuses_a_container_that_is_not_the_jail(
         state = _inspect_container(name)["State"]
         assert state["Running"] is False and state["StartedAt"].startswith("0001-")
     finally:
-        docker.run(["rm", "--force", name])
+        docker.run(["rm", "--force", "--volumes", name])
 
 
 def test_leftovers_of_a_killed_run_are_removed(running_agent, agent_leftovers) -> None:
@@ -552,7 +552,7 @@ def test_leftovers_of_a_killed_run_are_removed(running_agent, agent_leftovers) -
         assert live[0] in names and live[1] in networks
         assert running_agent.name in names
     finally:
-        docker.run(["rm", "--force", stale[0], live[0]])
+        docker.run(["rm", "--force", "--volumes", stale[0], live[0]])
         for network in (stale[1], live[1]):
             docker.run(["network", "rm", network], check=False)
 

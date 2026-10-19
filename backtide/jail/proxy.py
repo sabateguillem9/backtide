@@ -179,7 +179,7 @@ class ProxyJail:
 
     def remove(self) -> None:
         """Remove the container, running or not. A missing container is not an error."""
-        docker.run(["rm", "--force", self.config.name])
+        docker.run(["rm", "--force", "--volumes", self.config.name])
 
     def exists(self) -> bool:
         return self._state() is not None

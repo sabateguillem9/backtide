@@ -111,7 +111,7 @@ class FakeInternet:
         return self.stats()["accepts"]
 
     def remove(self) -> None:
-        jail_docker.run(["rm", "--force", self.name], check=False)
+        jail_docker.run(["rm", "--force", "--volumes", self.name], check=False)
 
 
 def start_fake_internet(service: Service, root: Path) -> FakeInternet:

@@ -248,7 +248,7 @@ def gate(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gate]:
         if egress is not None:
             egress.stop("test_end")
         for name in containers:
-            docker("rm", "--force", name, check=False)
+            docker("rm", "--force", "--volumes", name, check=False)
         jail.remove()
         jail.remove_network()
         docker("network", "rm", agent_net, check=False)
