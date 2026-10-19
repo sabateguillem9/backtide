@@ -29,18 +29,19 @@ Developed and tested against OpenClaw, on Linux with Docker and Btrfs.
 | Disk quota for the agent, so it cannot fill the volume; the quota follows the folder across rewinds | Works |
 | File watcher (inotify) that records file changes in the black box | Works |
 | Service (`backtide vigilar`): snapshots every 2 minutes while there is activity, freezes the agent when space runs low, `backtide seguir` to resume | Works |
-| Read-only web view of the black box and the snapshots, on `127.0.0.1` | Works |
-| Attack battery: scripted "evil agent" scenarios that run inside the VM | Partly; some scenarios are still pending |
-| Rewind from the web | In progress |
-| Outbound proxy (mitmproxy): record and, later, hold what leaves the machine | In progress; designed, not enforcing anything yet |
-| Process and connection sensor (Tetragon, eBPF) | Not working yet |
-| Telegram alerts and approvals | Not working yet |
-| Risk rules, the approval gate, spend cap, installer | Not started |
+| Web view on `127.0.0.1`: live feed, history with filters, snapshots, and rewind with a confirmation step | Works |
+| Outbound proxy (mitmproxy): the agent's only way out. Every request is recorded in the black box before it leaves; with no recording, nothing leaves. The agent only ever sees a fake API key; the proxy swaps in the real one. Private addresses, OAuth logins, provider-side tools and unknown destinations are refused | Works |
+| Process and connection sensor (Tetragon, eBPF): every command and connection of the agent, recorded from the kernel; losses are reported, never silent | Works |
+| Risk rules: each event gets a level from 0 to 3; risk 3 takes an evidence snapshot and alerts | Works |
+| Telegram: alerts with Pause and Rewind buttons, `/pausar`, `/seguir`, `/estado` | Works against a fake Bot API; not yet tested with a real bot |
+| Attack battery: scripted "evil agent" scenarios that run inside the VM | 50+ scenarios, all passing; a few are still pending |
+| The approval gate: hold irreversible actions by their content until you approve them from your phone | In progress (next) |
+| Spend cap, installer (Linux, then Mac), any agent beyond OpenClaw | Designed or planned |
 
 Two consequences of that table:
 
-- Today the agent has **no** internet access at all. The only way out is meant to be the proxy, and the proxy is not finished.
-- Nothing yet stops an irreversible action outside your machine. backtide can restore the agent's folder. It cannot take back an email, a payment or a deleted cloud database.
+- The agent reaches the internet only through the proxy, and only to the hosts you allow (its model provider by default). Everything it sends is recorded first.
+- Nothing yet *holds* an irreversible action for your approval: that is the gate, in progress. Within the allowed hosts, a request goes out once it is recorded. backtide can restore the agent's folder; it cannot take back an email, a payment or a deleted cloud database.
 
 The plan is in docs/08-plan-de-desarrollo.md (internal note) and the tasks are in docs/backlog.md (internal note). Most design documents are written in Spanish.
 
