@@ -7,17 +7,23 @@ query, a JSON body or a urlencoded form, so the method name decides, never the H
 
 - SEND: ``chat.postMessage``, ``chat.postEphemeral``, ``chat.scheduleMessage``,
   ``chat.meMessage``, ``files.completeUploadExternal`` (recipients: ``channel``,
-  ``channel_id`` or ``channels``), the legacy ``files.upload``, and a POST to an incoming
-  webhook (recipient: ``webhook:T…/B…``, never its secret).
+  ``channel_id`` or ``channels``), the legacy ``files.upload``, a POST to an incoming
+  webhook (recipient: ``webhook:T…/B…``, never its secret), and the upload of a file's bytes to
+  ``files.slack.com/upload/v1/...`` (no recipient yet, so never trusted: an injected prompt
+  could hand the agent an upload URL of an attacker's workspace).
 - CHANGE: ``chat.update``, ``chat.delete`` (held outside the trusted channels), reactions,
   pins, bookmarks, topics, joining a channel.
 - DELETE: ``files.delete``. ADMIN (risk 3): inviting, kicking, creating, archiving or renaming
   channels, ``admin.*``, making a file public.
 - READ (passes): ``auth.test``, ``conversations.list/history/info/replies/members/open``, the
-  ``users.*`` reads, ``team.info``, ``files.info/list``, Socket Mode's ``apps.connections.open``,
-  ``files.getUploadURLExternal`` and the upload to ``files.slack.com`` (it reaches no one until
-  ``files.completeUploadExternal``). Web pages on ``slack.com`` (outside ``/api``) by ``GET``.
+  ``users.*`` reads, ``team.info``, ``files.info/list``, Socket Mode's ``apps.connections.open``
+  and ``files.getUploadURLExternal`` (the upload itself is held). Web pages on ``slack.com``
+  (outside ``/api``) and file downloads by ``GET``.
 - Anything else: UNKNOWN.
+
+What is shown of a message is what Slack shows: its ``blocks`` (``text`` is then only the
+notification's fallback), else its ``text``, and its legacy ``attachments``. Every parameter but
+the token is searched for secrets at any depth.
 """
 
 import hashlib
@@ -32,19 +38,26 @@ from backtide.gate.translate.base import (
     Attachment,
     Context,
     Effect,
+    FormPart,
     Note,
     Reading,
     RequestView,
     Shape,
     Unreadable,
     account_id,
+    attachment,
+    content_type,
     credential,
+    data_has_secret,
     decode_utf8,
     first_lines,
     has_secret,
+    has_secret_in,
     json_object,
     media_type,
+    nested_text,
     opt_clean,
+    parse_multipart,
     parse_pairs,
     rpc_params,
     semantic_canonical,
@@ -95,6 +108,7 @@ _PASS = {
     "files.getuploadurlexternal": Note.UPLOAD_STEP,
 }
 _DELETES = frozenset({"chat.delete", "chat.deletescheduledmessage"})
+_SHOWN_KEYS = frozenset({"title", "pretext", "text", "value"})  # in blocks and attachments
 
 
 def claims(view: RequestView, context: Context) -> bool:
@@ -110,7 +124,7 @@ def read(view: RequestView, context: Context) -> Reading:
     if view.host == WEBHOOK_HOST:
         return _webhook(view, context, segments, query)
     if view.host == FILES_HOST:
-        return _files_host(view, segments)
+        return _files_host(view, context, segments)
     if not segments or segments[0].lower() != "api":
         if view.method in READ_METHODS and not view.body:
             return Reading(NAME, "web_page", Effect.READ, Shape.SLACK, WAIT_DEFAULT)
@@ -174,17 +188,14 @@ def _web_api(
         text = params.get("initial_comment")
     if text is not None and not isinstance(text, str):
         raise Unreadable
-    if text is None and params.get("blocks") is not None:
-        text = "[blocks]"
     attachments = _files(params, files, context)
     notes = [Note.DELETES_MESSAGE] if method in _DELETES else []
-    secret = any(
-        isinstance(value, str) and name != "token" and has_secret(value, scrub)
-        for name, value in params.items()
+    fields = {name: value for name, value in params.items() if name != "token"}
+    secret = has_secret_in(fields, scrub) or any(
+        data_has_secret(part.data, scrub) for part in files
     )
     if secret:
         notes.append(Note.SECRET_SEEN)
-    fields = {name: value for name, value in params.items() if name != "token"}
     entries = [[item.name, item.type, item.size, None] for item in attachments]
     for part in files:
         entries.append([part.filename, part.type, len(part.data), _digest(part.data)])
@@ -196,7 +207,7 @@ def _web_api(
         wait_s=WAIT_DEFAULT,
         account=account,
         recipients=recipients,
-        first_lines=first_lines(text, scrub),
+        first_lines=first_lines(shown_text(text, params), scrub),
         target=_target(params, context),
         attachments=attachments,
         secret_seen=secret,
@@ -212,6 +223,20 @@ def _web_api(
             files=entries,
         ),  # fmt: skip
     )
+
+
+def shown_text(text: str | None, message: dict[str, Any]) -> str | None:
+    """What the recipient reads of a message: its blocks (else its text), then its legacy
+    attachments' texts."""
+    blocks = message.get("blocks")
+    shown = []
+    if blocks is not None:
+        shown.append(nested_text(blocks, _SHOWN_KEYS) or "[blocks]")
+    elif text is not None:
+        shown.append(text)
+    if message.get("attachments") is not None:
+        shown.append(nested_text(message["attachments"], _SHOWN_KEYS) or "[attachments]")
+    return "\n".join(shown) or None
 
 
 def _digest(data: bytes) -> str:
@@ -300,14 +325,13 @@ def _webhook(view: RequestView, context: Context, segments: tuple[str, ...], que
         text = payload.get("text")
         if text is not None and not isinstance(text, str):
             raise Unreadable
-        if text is None and payload.get("blocks") is not None:
-            text = "[blocks]"
+        shown = shown_text(text, payload)
     except Unreadable as error:
         return unknown(
             NAME, Shape.SLACK, WAIT_DEFAULT, error.note, account=account, path_credential=True
         )
     recipient = f"webhook:{segments[1]}/{segments[2]}"
-    secret = any(isinstance(v, str) and has_secret(v, context.scrub) for v in payload.values())
+    secret = has_secret_in(payload, context.scrub)
     return Reading(
         translator=NAME,
         operation="webhook",
@@ -316,7 +340,7 @@ def _webhook(view: RequestView, context: Context, segments: tuple[str, ...], que
         wait_s=WAIT_DEFAULT,
         account=account,
         recipients=(recipient,),
-        first_lines=first_lines(text, context.scrub),
+        first_lines=first_lines(shown, context.scrub),
         secret_seen=secret,
         path_credential=True,
         notes=(Note.WEBHOOK, Note.SECRET_SEEN) if secret else (Note.WEBHOOK,),
@@ -332,20 +356,62 @@ def _webhook(view: RequestView, context: Context, segments: tuple[str, ...], que
     )
 
 
-def _files_host(view: RequestView, segments: tuple[str, ...]) -> Reading:
-    """``files.slack.com``: the upload step of ``files.getUploadURLExternal`` (it reaches no one
-    until ``files.completeUploadExternal``), and downloads."""
+def _files_host(view: RequestView, context: Context, segments: tuple[str, ...]) -> Reading:
+    """``files.slack.com``: downloads, and the upload of a file's bytes to the URL that
+    ``files.getUploadURLExternal`` gave. The upload is a SEND: that URL may be of a workspace
+    that is not the owner's, and the bytes are already out. Its recipient is not known yet
+    (``files.completeUploadExternal`` names it), so it is never trusted."""
     if view.method in READ_METHODS and not view.body:
         return Reading(
             NAME, "file_download", Effect.READ, Shape.SLACK, WAIT_DEFAULT, notes=(Note.DOWNLOAD,)
         )
-    if view.method == "POST" and segments[:2] == ("upload", "v1"):
-        return Reading(
-            NAME,
-            "file_upload_step",
-            Effect.READ,
-            Shape.SLACK,
-            WAIT_DEFAULT,
-            notes=(Note.UPLOAD_STEP,),
-        )
-    return unknown(NAME, Shape.SLACK, WAIT_DEFAULT)
+    if view.method != "POST" or segments[:2] != ("upload", "v1"):
+        return unknown(NAME, Shape.SLACK, WAIT_DEFAULT)
+    try:
+        account = _account(view, context, {})
+        return _upload(view, context, segments, account)
+    except Unreadable as error:
+        return unknown(NAME, Shape.SLACK, WAIT_DEFAULT, error.note)
+
+
+def _upload(
+    view: RequestView, context: Context, segments: tuple[str, ...], account: str | None
+) -> Reading:
+    scrub = context.scrub
+    if media_type(view.headers) == "multipart/form-data":
+        parts = parse_multipart(content_type(view.headers) or "", view.body)
+    else:  # the bytes as they are (what @slack/web-api sends)
+        parts = [FormPart("file", None, media_type(view.headers), view.body)]
+    if len(parts) > MAX_ATTACHMENTS:
+        raise Unreadable(Note.TOO_MANY_ATTACHMENTS)
+    shown = []
+    entries = []
+    secret = False
+    for part in parts:
+        item, entry = attachment(part.filename, part.type, part.data, scrub)
+        shown.append(item)
+        entries.append(entry)
+        secret |= bool(part.filename and has_secret(part.filename, scrub))
+        secret |= data_has_secret(part.data, scrub)
+    return Reading(
+        translator=NAME,
+        operation="file_upload",
+        effect=Effect.SEND,
+        shape=Shape.SLACK,
+        wait_s=WAIT_DEFAULT,
+        account=account,
+        target="a file upload (its channel is named later)",
+        attachments=tuple(shown),
+        secret_seen=secret,
+        notes=(Note.SECRET_SEEN,) if secret else (),
+        canonical=semantic_canonical(
+            translator=NAME,
+            host=view.host,
+            port=view.port,
+            operation="file_upload",
+            account=account,
+            recipients=(),
+            fields={"path": "/".join(segments)},
+            files=entries,
+        ),  # fmt: skip
+    )

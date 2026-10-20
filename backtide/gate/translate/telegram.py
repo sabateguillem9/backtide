@@ -7,11 +7,13 @@ is a send. Long polling (``getUpdates``) and the rest of ``get*`` are reads.
 
 - SEND: the ``send*`` methods of the table (recipient: ``chat_id``).
 - FORWARD: ``forwardMessage(s)`` and ``copyMessage(s)``: existing content, never batched.
-- CHANGE: ``editMessage*``, ``deleteMessage(s)`` (docs/32, section 8: held outside the trusted
-  chats), reactions, pins, stopping a poll or a live location.
-- ADMIN (risk 3): ``setWebhook``, ``logOut``, ``close`` and the administration of chats.
-- READ (passes): ``get*``, ``sendChatAction``, ``answerCallbackQuery``, ``deleteWebhook``,
-  ``setMyCommands``, ``deleteMyCommands`` and file downloads (``GET /file/bot<token>/...``).
+- CHANGE: ``editMessage*``, reactions, pins, stopping a poll or a live location, and an
+  ``answerCallbackQuery`` with a ``text`` or a ``url`` (it shows them to whoever pressed).
+- DELETE (risk 3, never trusted or batched): ``deleteMessage(s)``.
+- ADMIN (risk 3): ``setWebhook``, ``logOut``, ``close``, the administration of chats, and the
+  bot's public texts: ``setMyCommands``, ``setMyName``, ``setMyDescription``...
+- READ (passes): ``get*``, ``sendChatAction``, a bare ``answerCallbackQuery``, ``deleteWebhook``,
+  ``deleteMyCommands`` and file downloads (``GET /file/bot<token>/...``).
 - Anything else: UNKNOWN.
 """
 
@@ -33,8 +35,10 @@ from backtide.gate.translate.base import (
     Unreadable,
     account_id,
     attachment,
+    data_has_secret,
     first_lines,
     has_secret,
+    has_secret_in,
     opt_clean,
     rpc_params,
     semantic_canonical,
@@ -62,9 +66,9 @@ _SEND = _SEND_TEXT | _SEND_FILES | _SEND_OTHER
 _FORWARD = frozenset({"forwardmessage", "forwardmessages", "copymessage", "copymessages"})
 _CHANGE = frozenset(
     {"editmessagetext", "editmessagecaption", "editmessagemedia", "editmessagereplymarkup",
-     "editmessagelivelocation", "stopmessagelivelocation", "stoppoll", "deletemessage",
-     "deletemessages", "setmessagereaction", "pinchatmessage", "unpinchatmessage",
-     "unpinallchatmessages", "editmessagechecklist"}
+     "editmessagelivelocation", "stopmessagelivelocation", "stoppoll", "setmessagereaction",
+     "pinchatmessage", "unpinchatmessage", "unpinallchatmessages", "editmessagechecklist",
+     "answercallbackquery"}
 )  # fmt: skip
 _DELETES = frozenset({"deletemessage", "deletemessages"})
 _ADMIN = frozenset(
@@ -77,15 +81,16 @@ _ADMIN = frozenset(
      "setchattitle", "setchatdescription", "leavechat", "setchatstickerset",
      "deletechatstickerset", "createforumtopic", "editforumtopic", "closeforumtopic",
      "reopenforumtopic", "deleteforumtopic", "setmyname", "setmydescription",
-     "setmyshortdescription", "setmydefaultadministratorrights", "setchatmenubutton"}
+     "setmyshortdescription", "setmydefaultadministratorrights", "setchatmenubutton",
+     "setmycommands"}
 )  # fmt: skip
 _PASS = {
     "sendchataction": Note.TYPING,
-    "answercallbackquery": Note.BOT_SETUP,
+    "answercallbackquery": Note.BOT_SETUP,  # only without text or url (see read)
     "deletewebhook": Note.BOT_SETUP,
-    "setmycommands": Note.BOT_SETUP,
     "deletemycommands": Note.BOT_SETUP,
 }
+_CALLBACK_SHOWS = ("text", "url")
 _TEXT_PARAMS = ("text", "caption", "question")
 
 
@@ -137,6 +142,13 @@ def read(view: RequestView, context: Context) -> Reading:
     method = segments[1].lower()
     if view.method not in ("GET", "POST"):
         return _unknown(account, Note.NOT_IN_TABLE)
+    if method == "answercallbackquery":
+        try:
+            params, files = rpc_params(view, query)
+            if any(name in params for name in _CALLBACK_SHOWS) or files:
+                return _reading(view, context, method, Effect.CHANGE, account, params, files)
+        except Unreadable as error:
+            return _unknown(account, error.note)
     if method.startswith("get") or method in _PASS:
         if view.method == "GET" and view.body:
             return _unknown(account, Note.UNPARSED)
@@ -178,6 +190,8 @@ def _effect(method: str) -> Effect | None:
         return Effect.SEND
     if method in _FORWARD:
         return Effect.FORWARD
+    if method in _DELETES:
+        return Effect.DELETE
     if method in _CHANGE:
         return Effect.CHANGE
     if method in _ADMIN:
@@ -212,6 +226,8 @@ def _reading(
         target = f"from chat {source}"[:TARGET_CHARS]
     if method in _DELETES:
         notes.append(Note.DELETES_MESSAGE)
+    if method == "answercallbackquery" and isinstance(params.get("url"), str):
+        target = opt_clean(f"opens {params['url']}", scrub, TARGET_CHARS)
     text = _text(params, method)
     if text is not None and not isinstance(text, str):
         raise Unreadable
@@ -219,17 +235,16 @@ def _reading(
         raise Unreadable(Note.TOO_MANY_ATTACHMENTS)
     shown = []
     entries = []
-    secret = text is not None and has_secret(text, scrub)
+    # Every parameter at any depth: the text, but also a keyboard's buttons and their URLs
+    # (``reply_markup``), a poll's options, a media group's captions.
+    secret = has_secret_in(params, scrub)
     for part in files:
         item, entry = attachment(part.filename or part.name, part.type, part.data, scrub)
         shown.append(item)
         entries.append(entry)
         if part.filename and has_secret(part.filename, scrub):
             secret = True
-        if _texty(part.data) and has_secret(part.data.decode("utf-8"), scrub):
-            secret = True
-    for name, value in params.items():
-        if name not in _TEXT_PARAMS and isinstance(value, str) and has_secret(value, scrub):
+        if data_has_secret(part.data, scrub):
             secret = True
     if secret:
         notes.append(Note.SECRET_SEEN)
@@ -277,14 +292,3 @@ def _text(params: dict[str, Any], method: str) -> object:
                 if isinstance(item, dict) and isinstance(item.get("caption"), str):
                     return item["caption"]
     return None
-
-
-def _texty(data: bytes) -> bool:
-    """A small file that is UTF-8 text: searched for secrets (a key sent as a document)."""
-    if len(data) > 1024 * 1024:
-        return False
-    try:
-        data.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return True

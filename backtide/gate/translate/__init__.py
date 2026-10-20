@@ -6,7 +6,9 @@
 knows the request (the gate's plain rules apply: reads pass, writes are held), and otherwise
 always a ``Reading``: a translator that fails, or a request past the common checks (a method
 override header, a body still encoded, trailers, too large), gives ``Effect.UNKNOWN``, which
-the gate holds. It never raises for anything the agent sends.
+the gate holds. It never raises for anything the agent sends. A read that a body carries (a
+search by POST, a "harmless" write) is held when the body is over 64 KiB, and held with risk 3
+when it carries a secret (``base.guard_read``).
 """
 
 import logging
@@ -34,6 +36,7 @@ from backtide.gate.translate.base import (
     RequestView,
     Shape,
     common_refusal,
+    guard_read,
     unknown,
 )
 
@@ -105,6 +108,5 @@ def translate(view: RequestView, context: Context) -> Reading | None:
     except Exception as error:  # a bug, or input no check foresaw: held, never let through
         logger.error("the %s translator failed (%s): held", name, type(error).__name__)
         return unknown(name, shape, wait, Note.TRANSLATOR_FAILED)
-    if reading.effect is Effect.READ and reading.secret_seen:
-        return unknown(name, shape, wait, Note.SECRET_SEEN)  # never a read with a secret
-    return reading
+    # A read carried by a body passes only small and without a secret (never a read with one).
+    return guard_read(view, reading, context.scrub)

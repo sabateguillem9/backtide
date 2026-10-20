@@ -1,16 +1,17 @@
 """The translators' catalogue (docs/32, section 15): requests in the shape each client really
 sends, and the effect and recipients each one must give. The rule that matters most: NO write
 in the catalogue is ever read as ``Effect.READ`` (which passes without asking). The few writes
-the founder let pass (drafts, one message's labels, "typing...", bot commands, opening a DM, an
-upload step that reaches no one: docs/32, decision 12) are marked ``harmless``, and listed by
-name so a new one cannot slip in unnoticed.
+the founder let pass (one message's labels, "typing...", a bare callback answer, deleteWebhook,
+opening a DM, asking for an upload URL: docs/32, decision 12) are marked ``harmless``, and listed
+by name so a new one cannot slip in unnoticed. Drafts pass too, but only in the owner's own
+accounts (``OWNER_DRAFTS``).
 """
 
 from dataclasses import dataclass
 
 import pytest
 
-from backtide.gate.translate import Effect, RequestView, has_translator, translate
+from backtide.gate.translate import Context, Effect, RequestView, has_translator, translate
 from backtide.gate.translate.base import Shape
 from tests.gate_translate_kit import (
     BOT_PATH,
@@ -209,7 +210,13 @@ CATALOGUE = [
         CHANGE,
         ("42",),
     ),
-    Case("tg-delete", tg("deleteMessage", {"chat_id": 42, "message_id": 3}), CHANGE, ("42",)),
+    Case("tg-delete", tg("deleteMessage", {"chat_id": 42, "message_id": 3}), DELETE, ("42",)),
+    Case(
+        "tg-delete-many",
+        tg("deleteMessages", {"chat_id": 42, "message_ids": [3, 4]}),
+        DELETE,
+        ("42",),
+    ),
     Case("tg-set-webhook", tg("setWebhook", {"url": "https://evil.example/hook"}), ADMIN),
     Case("tg-logout", tg("logOut"), ADMIN),
     Case("tg-ban", tg("banChatMember", {"chat_id": -100, "user_id": 5}), ADMIN),
@@ -233,7 +240,12 @@ CATALOGUE = [
         "tg-typing", tg("sendChatAction", {"chat_id": 9, "action": "typing"}), READ, harmless=True
     ),
     Case("tg-callback", tg("answerCallbackQuery", {"callback_query_id": "1"}), READ, harmless=True),
-    Case("tg-commands", tg("setMyCommands", {"commands": []}), READ, harmless=True),
+    Case("tg-commands", tg("setMyCommands", {"commands": []}), ADMIN),
+    Case(
+        "tg-callback-text",
+        tg("answerCallbackQuery", {"callback_query_id": "1", "text": "hecho"}),
+        CHANGE,
+    ),
     Case("tg-delete-webhook", tg("deleteWebhook"), READ, harmless=True),
     # --- Gmail (gog: POST .../messages/send with {"raw": base64url}) --------------------------
     Case(
@@ -301,14 +313,12 @@ CATALOGUE = [
     Case(
         "gm-draft-create",
         _gmail("POST", f"{G}/drafts", {"message": {"raw": "eA"}}),
-        READ,
-        harmless=True,
+        CHANGE,
     ),
     Case(
         "gm-draft-update",
         _gmail("PUT", f"{G}/drafts/r-1", {"message": {"raw": "eA"}}),
-        READ,
-        harmless=True,
+        CHANGE,
     ),
     Case(
         "gm-label-one",
@@ -381,14 +391,23 @@ CATALOGUE = [
     Case("gr-drive-write", _graph("POST", f"{M}/drive/root/children", {"name": "x"}), UNKNOWN),
     Case("gr-list", _graph("GET", f"{M}/messages?$top=5"), READ, write=False),
     Case("gr-drive-read", _graph("GET", f"{M}/drive/root/children"), READ, write=False),
-    Case("gr-draft", _graph("POST", f"{M}/messages", {"subject": "x"}), READ, harmless=True),
+    Case("gr-draft", _graph("POST", f"{M}/messages", {"subject": "x"}), CHANGE),
     Case(
         "gr-draft-edit",
         _graph("PATCH", f"{M}/messages/AAMk1", {"isRead": True}),
-        READ,
-        harmless=True,
+        CHANGE,
     ),
-    Case("gr-create-reply", _graph("POST", f"{M}/messages/AAMk1/createReply"), READ, harmless=True),
+    Case("gr-create-reply", _graph("POST", f"{M}/messages/AAMk1/createReply"), CHANGE),
+    Case(
+        "gr-attachment-add",
+        _graph("POST", f"{M}/messages/AAMk1/attachments", {"name": "a.txt"}),
+        CHANGE,
+    ),
+    Case(
+        "gr-attachment-delete",
+        _graph("DELETE", f"{M}/messages/AAMk1/attachments/AAMkA"),
+        DELETE,
+    ),
     # --- Slack (@slack/web-api: POST JSON or form; the Web API also takes GET) ----------------
     Case(
         "sl-post",
@@ -489,8 +508,7 @@ CATALOGUE = [
     Case(
         "sl-upload-step",
         request("POST", "files.slack.com", "/upload/v1/ABC123", body=b"abc"),
-        READ,
-        harmless=True,
+        SEND,
     ),
     Case("sl-open-dm", _slack("conversations.open", {"users": "U1"}), READ, harmless=True),
     # --- Discord (OpenClaw's REST client on undici) --------------------------------------------
@@ -541,7 +559,32 @@ CATALOGUE = [
         CHANGE,
         ("111",),
     ),
-    Case("dc-delete", _discord("DELETE", f"{D}/channels/111/messages/9"), CHANGE, ("111",)),
+    Case("dc-delete", _discord("DELETE", f"{D}/channels/111/messages/9"), DELETE, ("111",)),
+    Case(
+        "dc-webhook-message-delete",
+        request("DELETE", "discord.com", "/api/webhooks/222/tok/messages/9"),
+        DELETE,
+    ),
+    Case(
+        "dc-forum-post",
+        _discord(
+            "POST",
+            f"{D}/channels/111/threads",
+            {"name": "Tema", "message": {"content": "hola"}},
+        ),
+        SEND,
+        ("111",),
+    ),
+    Case(
+        "dc-forward",
+        _discord(
+            "POST",
+            f"{D}/channels/111/messages",
+            {"message_reference": {"type": 1, "message_id": "9", "channel_id": "222"}},
+        ),
+        FORWARD,
+        ("111",),
+    ),
     Case(
         "dc-react",
         _discord("PUT", f"{D}/channels/111/messages/9/reactions/x/@me"),
@@ -678,19 +721,22 @@ CATALOGUE = [
 HARMLESS = {
     "tg-typing",
     "tg-callback",
-    "tg-commands",
     "tg-delete-webhook",
-    "gm-draft-create",
-    "gm-draft-update",
     "gm-label-one",
-    "gr-draft",
-    "gr-draft-edit",
-    "gr-create-reply",
     "sl-upload-url",
-    "sl-upload-step",
     "sl-open-dm",
     "dc-typing",
     "dc-open-dm",
+}
+# Drafts pass only in the owner's own accounts (``Context.owner_accounts``): without them they
+# are held as changes, since a draft in an attacker's mailbox is data out (docs/32, decision 12).
+OWNER_DRAFTS = {
+    "gm-draft-create",
+    "gm-draft-update",
+    "gr-draft",
+    "gr-draft-edit",
+    "gr-create-reply",
+    "gr-attachment-add",
 }
 IDS = [case.id for case in CATALOGUE]
 
@@ -732,6 +778,15 @@ def test_only_the_founders_harmless_writes_pass() -> None:
     passing_writes = {c.id for c in CATALOGUE if c.write and read(c.view).effect is Effect.READ}
     assert passing_writes == HARMLESS
     assert {c.id for c in CATALOGUE if c.harmless} == HARMLESS
+
+
+def test_with_the_owners_accounts_only_the_drafts_pass_as_well() -> None:
+    accounts = frozenset(
+        account for c in CATALOGUE if (account := read(c.view).account) is not None
+    )
+    owner = Context(CTX.key, owner_accounts=accounts)
+    passing = {c.id for c in CATALOGUE if c.write and read(c.view, owner).effect is Effect.READ}
+    assert passing == HARMLESS | OWNER_DRAFTS
 
 
 def test_risk_follows_the_effect() -> None:

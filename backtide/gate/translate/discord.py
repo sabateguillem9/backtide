@@ -2,16 +2,23 @@
 OpenClaw's own REST client uses it (docs/32, section 3). Pure.
 
 - SEND: ``POST /channels/{id}/messages`` (JSON, or multipart with ``payload_json`` and
-  ``files[n]``), ``POST /webhooks/{id}/{token}`` (recipient ``webhook:{id}``, never the token)
-  and ``POST /interactions/{id}/{token}/callback`` (answers whoever used a command).
-- FORWARD: ``crosspost`` (publishes a message to the channels that follow it).
-- CHANGE: ``PATCH`` and ``DELETE`` of a message (held outside the trusted channels), reactions,
-  pins, threads, and a webhook's own messages.
-- DELETE (risk 3): ``bulk-delete``, deleting a channel or a webhook. ADMIN (risk 3): webhooks,
-  invites, permissions, channel settings and anything that changes a guild.
+  ``files[n]``), ``POST /webhooks/{id}/{token}`` (recipient ``webhook:{id}``, never the token),
+  ``POST /interactions/{id}/{token}/callback`` (answers whoever used a command), and starting a
+  thread (``POST /channels/{id}/threads``, a forum post with its first ``message``, or
+  ``.../messages/{id}/threads``): its name and message are read by the whole channel.
+- FORWARD: ``crosspost`` (publishes a message to the channels that follow it), and a message
+  whose ``message_reference.type`` is 1 (a forward of an existing message).
+- CHANGE: ``PATCH`` of a message (held outside the trusted channels), reactions, pins, and a
+  webhook's own messages.
+- DELETE (risk 3, never trusted or batched): ``DELETE`` of a message (also a webhook's),
+  ``bulk-delete``, deleting a channel or a webhook. ADMIN (risk 3): webhooks, invites,
+  permissions, channel settings and anything that changes a guild.
 - READ (passes): ``GET`` and ``HEAD``, ``POST /channels/{id}/typing`` and
   ``POST /users/@me/channels`` (opening a direct message sends nothing).
 - Anything else: UNKNOWN.
+
+What is shown of a message is its ``content``, its embeds' texts and its poll; the whole message
+(components, poll, embeds...) is searched for secrets at any depth.
 """
 
 import re
@@ -33,10 +40,13 @@ from backtide.gate.translate.base import (
     attachment,
     content_type,
     credential,
+    data_has_secret,
     first_lines,
     has_secret,
+    has_secret_in,
     json_object,
     media_type,
+    nested_text,
     parse_multipart,
     parse_pairs,
     semantic_canonical,
@@ -60,6 +70,11 @@ _MESSAGE_FIELDS = frozenset(
      "message_reference", "components", "sticker_ids", "attachments", "flags", "poll",
      "username", "avatar_url", "thread_name", "applied_tags"}
 )  # fmt: skip
+_THREAD_FIELDS = frozenset(
+    {"name", "auto_archive_duration", "rate_limit_per_user", "message", "applied_tags", "type",
+     "invitable"}
+)  # fmt: skip
+_SHOWN_KEYS = frozenset({"title", "description", "name", "value", "text"})  # embeds and polls
 
 
 def claims(view: RequestView, context: Context) -> bool:
@@ -143,7 +158,7 @@ def _bot_path(
             )
         if len(tail) == 2 and method == "DELETE" and not view.body:
             return _plain(
-                Effect.CHANGE,
+                Effect.DELETE,
                 "delete_message",
                 account,
                 (channel,),
@@ -155,11 +170,11 @@ def _bot_path(
         if tail[2:3] == ("reactions",) and method in ("PUT", "DELETE") and not view.body:
             return _plain(Effect.CHANGE, "reaction", account, (channel,), target)
         if tail[2:] == ("threads",) and method == "POST":
-            return _plain(Effect.CHANGE, "start_thread", account, (channel,), target)
+            return _message(view, context, "start_thread", Effect.SEND, account, (channel,), target)
     if tail[:1] == ("pins",) and method in ("PUT", "DELETE") and not view.body:
         return _plain(Effect.CHANGE, "pin", account, (channel,))
     if tail == ("threads",) and method == "POST":
-        return _plain(Effect.CHANGE, "start_thread", account, (channel,))
+        return _message(view, context, "start_thread", Effect.SEND, account, (channel,), None)
     if tail == () and method == "DELETE":
         return _plain(Effect.DELETE, "delete_channel", account, (channel,))
     if (
@@ -233,7 +248,7 @@ def _token_path(
             )
         if not view.body:
             return _plain(
-                Effect.CHANGE,
+                Effect.DELETE,
                 "delete_webhook_message",
                 account,
                 recipient,
@@ -282,29 +297,40 @@ def _message(
 ) -> Reading:
     payload, files = _payload(view)
     query = parse_pairs(view.path.partition("?")[2])  # wait, thread_id: part of what it does
+    heading: object = None
     if operation == "interaction_callback":
-        data = payload.get("data")
-        content = data.get("content") if isinstance(data, dict) else None
-    else:
-        unknown_fields = set(payload) - _MESSAGE_FIELDS
-        if unknown_fields:
+        message = payload.get("data")
+        if not isinstance(message, dict):
+            message = {}
+    elif operation == "start_thread":
+        if not set(payload) <= _THREAD_FIELDS:
             raise Unreadable(Note.NOT_IN_TABLE)
-        content = payload.get("content")
+        heading = payload.get("name")
+        message = payload.get("message") or {}
+        if not isinstance(message, dict) or not set(message) <= _MESSAGE_FIELDS:
+            raise Unreadable(Note.NOT_IN_TABLE)
+    else:
+        if not set(payload) <= _MESSAGE_FIELDS:
+            raise Unreadable(Note.NOT_IN_TABLE)
+        message = payload
+    content = message.get("content")
     if content is not None and not isinstance(content, str):
         raise Unreadable
-    if content is None and payload.get("embeds"):
-        content = "[embeds]"
+    if heading is not None and not isinstance(heading, str):
+        raise Unreadable
+    if operation == "create_message":
+        effect, target = _forward(message, effect, target)
     scrub = context.scrub
     shown = []
     entries = []
-    secret = content is not None and has_secret(content, scrub)
+    secret = has_secret_in(payload, scrub)  # everything: embeds, components, poll, names...
     for part in files:
         item, entry = attachment(part.filename or part.name, part.type, part.data, scrub)
         shown.append(item)
         entries.append(entry)
         if part.filename and has_secret(part.filename, scrub):
             secret = True
-        if len(part.data) <= 1024 * 1024 and has_secret(part.data.decode("utf-8", "ignore"), scrub):
+        if data_has_secret(part.data, scrub):
             secret = True
     fields = {name: value for name, value in payload.items() if name not in _VOLATILE}
     fields["?query"] = query
@@ -316,7 +342,7 @@ def _message(
         wait_s=WAIT_DISCORD,
         account=account,
         recipients=recipients,
-        first_lines=first_lines(content, scrub),
+        first_lines=first_lines(_shown(heading, content, message), scrub),
         target=target,
         attachments=tuple(shown),
         secret_seen=secret,
@@ -333,6 +359,38 @@ def _message(
             files=entries,
         ),  # fmt: skip
     )
+
+
+def _shown(heading: str | None, content: str | None, message: dict[str, Any]) -> str | None:
+    """What the channel reads: a thread's name, the content, the embeds' texts and the poll."""
+    shown = [heading, content]
+    for name in ("embeds", "poll"):
+        if message.get(name):
+            shown.append(nested_text(message[name], _SHOWN_KEYS) or f"[{name}]")
+    return "\n".join(text for text in shown if text) or None
+
+
+def _forward(
+    message: dict[str, Any], effect: Effect, target: str | None
+) -> tuple[Effect, str | None]:
+    """A message whose ``message_reference`` has ``type`` 1 forwards an existing message (0, or
+    none, is a reply). Any other type is Unreadable."""
+    reference = message.get("message_reference")
+    if reference is None:
+        return effect, target
+    if not isinstance(reference, dict):
+        raise Unreadable
+    kind = reference.get("type", 0)
+    if type(kind) is not int or kind not in (0, 1):
+        raise Unreadable(Note.NOT_IN_TABLE)
+    if kind == 0:
+        return effect, target
+    item = reference.get("message_id")
+    source = reference.get("channel_id")
+    item_id = item if isinstance(item, str) and _ID_RE.fullmatch(item) else None
+    source_id = source if isinstance(source, str) and _ID_RE.fullmatch(source) else None
+    shown = f"message {item_id or '?'}" + (f" from channel {source_id}" if source_id else "")
+    return Effect.FORWARD, shown
 
 
 def _payload(view: RequestView) -> tuple[dict[str, Any], list[FormPart]]:

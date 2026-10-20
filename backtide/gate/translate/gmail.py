@@ -13,10 +13,13 @@ too), as ``gog gmail send`` uses it: ``POST /gmail/v1/users/me/messages/send`` w
   ``watch`` and ``stop``.
 - UNKNOWN: ``drafts/send`` (the content is a saved draft) and resumable uploads, which cannot
   be seen; ``/batch``; anything not in the table.
-- READ (passes): ``GET`` and ``HEAD``; creating and changing drafts (they reach no one); one
-  message's or thread's labels (``modify``).
+- READ (passes): ``GET`` and ``HEAD``; one message's or thread's labels (``modify``); and
+  creating and changing drafts, but only in the owner's own accounts (``Context.owner_accounts``).
+  In any other account a draft is a CHANGE (held): an injected prompt could hand the agent an
+  attacker's token, and a draft in the attacker's mailbox is data out (docs/32, decision 12).
 """
 
+from dataclasses import replace
 from email import message_from_bytes
 from email.policy import compat32
 from typing import Any
@@ -39,6 +42,7 @@ from backtide.gate.translate.base import (
     b64url_decode,
     content_type,
     credential,
+    data_has_secret,
     first_lines,
     has_secret,
     json_object,
@@ -128,11 +132,12 @@ def _classify(
             account=account,
             target=f"draft {draft}" if draft else "a saved draft",
         )
+    draft = Effect.READ if account in context.owner_accounts else Effect.CHANGE
     if tail == ("drafts",) and method == "POST":
-        return _plain(Effect.READ, "drafts.create", account, Note.DRAFT)
+        return _plain(draft, "drafts.create", account, Note.DRAFT)
     if len(tail) == 2 and tail[0] == "drafts":
         if method == "PUT":
-            return _plain(Effect.READ, "drafts.update", account, Note.DRAFT)
+            return _plain(draft, "drafts.update", account, Note.DRAFT)
         if method == "DELETE" and not view.body:
             return _plain(Effect.DELETE, "drafts.delete", account, target=f"draft {item}")
     if upload:
@@ -297,14 +302,16 @@ def mail_reading(
     scrub = context.scrub
     shown = []
     entries = []
-    secret = any(has_secret(text, scrub) for text in (mail.subject, mail.text) if text)
-    for name, kind, data in mail.attachments:
+    secret = any(has_secret(text, scrub) for text in (mail.subject, *mail.texts) if text)
+    for name, kind, data, inline in mail.attachments:
         item, entry = attachment(name, kind, data, scrub)
+        if inline:
+            item = replace(item, name=f"(inline {item.type or 'part'})")
         shown.append(item)
         entries.append(entry)
         if name and has_secret(name, scrub):
             secret = True
-        if len(data) <= 1024 * 1024 and has_secret(data.decode("utf-8", "ignore"), scrub):
+        if data_has_secret(data, scrub):
             secret = True
     notes = []
     if mail.international:

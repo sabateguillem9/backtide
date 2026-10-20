@@ -15,7 +15,11 @@ Rules for all of them (docs/32, section 8):
   (``scrub_known`` then the patterns), cut, and never decide anything. Decisions come from the
   connection's host, the canonical path and the named recipient fields.
 - ``Effect.READ`` means "passes without asking": reads, and the few harmless writes the founder
-  listed (docs/32, decision 12: drafts, single label changes, "typing...", bot commands).
+  listed (docs/32, decision 12: single label changes, "typing...", deleteWebhook, and drafts in
+  the owner's own accounts only). A READ that a body carries is held when the body is over
+  MAX_READ_BODY or carries a secret (``guard_read``).
+- Secrets are searched in everything a request carries, whole and at any depth (nested blocks,
+  embeds, keyboards, every MIME part, every file): a scan is never cut short.
 
 ``Reading.canonical`` holds what the semantic fingerprint hashes (docs/32, decision 2): account,
 all recipients, the whole text (long values as their SHA-256) and each attachment's name, type
@@ -30,8 +34,9 @@ import hashlib
 import hmac
 import json
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
@@ -39,8 +44,9 @@ from email.policy import compat32
 from email.utils import getaddresses
 from enum import StrEnum
 from html import unescape
+from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, unquote_plus
 
 from backtide.blackbox.redact import KnownScrubber, strike_text
 from backtide.gate.policy import is_ip, normalize_host
@@ -55,7 +61,12 @@ MAX_PARTS = 64  # MIME parts walked, and multipart form fields
 MAX_BOUNDARIES = 32  # nested multiparts in a mail (counted before parsing)
 MAX_RECIPIENTS = 64
 MAX_ATTACHMENTS = 32
-SECRET_SCAN_CHARS = 1024 * 1024  # how much of a text is searched for secrets
+# A text is searched for secrets whole (about 0.2 s per MiB); one longer than this is taken as
+# carrying one (fail closed). Every text a translator reads is within MAX_BODY.
+SECRET_SCAN_CHARS = MAX_BODY
+MAX_HTML_COMPARE = 1024 * 1024  # a mail's HTML compared with its plain text (see parse_mail)
+MAX_READ_BODY = 64 * 1024  # a read by POST (or another write method) carries at most this
+URL_CHARS = 2048  # a URL in a read's body longer than this is held (docs/32, decision 1)
 
 # What is shown, in characters, after striking.
 SUBJECT_CHARS = 200
@@ -88,6 +99,7 @@ _HOLD_SAFE_RE = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
 _B64URL_RE = re.compile(r"[A-Za-z0-9_-]*={0,2}", re.ASCII)
 _B64_RE = re.compile(r"[A-Za-z0-9+/\r\n]*={0,2}[\r\n]*", re.ASCII)
 _TAG_RE = re.compile(r"<[^<>]{0,2048}>")
+_ACCOUNT_RE = re.compile(r"[0-9a-f]{16}", re.ASCII)
 
 
 class Effect(StrEnum):
@@ -140,6 +152,8 @@ class Note(StrEnum):
     REMOTE_ACTIONS = "remote_actions"  # a read API asked to act on pages or call a webhook
     GRAPHQL_QUERY = "graphql_query"
     GRAPHQL_MUTATION = "graphql_mutation"
+    ALTERNATIVE_DIFFERS = "alternative_differs"  # a mail's HTML says other than its plain text
+    LONG_URL = "long_url"  # a read whose body carries a URL over URL_CHARS
     SECRET_SEEN = "secret_seen"  # noqa: S105 (a note, not a secret): striking removed a secret from what it carries
 
 
@@ -259,18 +273,28 @@ class RequestView:
 class Context:
     """What a translator needs besides the request. ``key``: the channel's per-connection key
     (32 random bytes, never recorded), for the account's HMAC. ``read_endpoints``: the extra
-    ``[gate] read_endpoints`` as ``host/path`` (see ``read_post.check_read_endpoint``)."""
+    ``[gate] read_endpoints`` as ``host/path`` (see ``read_post.check_read_endpoint``).
+    ``owner_accounts``: the ``account`` ids (``account_id`` with this ``key``) of the owner's own
+    mailboxes: only there do drafts pass without asking (docs/32, decision 12)."""
 
     key: bytes
     scrub: KnownScrubber = field(default_factory=lambda: KnownScrubber(()))
     read_endpoints: frozenset[str] = frozenset()
+    owner_accounts: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, bytes) or len(self.key) < 16:
             raise ValueError("the gate's key must be 16+ bytes")
+        if not all(
+            isinstance(item, str) and _ACCOUNT_RE.fullmatch(item) for item in self.owner_accounts
+        ):
+            raise ValueError("an owner account is the 16 hex of its account id")
 
     def __repr__(self) -> str:
-        return f"Context({len(self.read_endpoints)} read endpoints)"
+        return (
+            f"Context({len(self.read_endpoints)} read endpoints, "
+            f"{len(self.owner_accounts)} owner accounts)"
+        )
 
 
 class Unreadable(Exception):
@@ -534,11 +558,15 @@ def rpc_params(view: RequestView, query: str) -> tuple[dict[str, Any], list[Form
             body[part.name] = {"file": part.filename or part.name}
     else:
         raise Unreadable
+    if len(body) > MAX_PARAMS:
+        raise Unreadable(Note.TOO_LARGE)
     for name, value in body.items():
         folded = name.casefold()
         if folded in params:
             raise Unreadable(Note.DUPLICATE)
         params[folded] = value
+    if len(params) > MAX_PARAMS:
+        raise Unreadable(Note.TOO_LARGE)
     return params, files
 
 
@@ -564,9 +592,106 @@ def opt_clean(text: str | None, scrub: KnownScrubber, limit: int) -> str | None:
 
 
 def has_secret(text: str, scrub: KnownScrubber) -> bool:
-    """Whether striking would remove anything from the first SECRET_SCAN_CHARS of ``text``."""
-    window = text[:SECRET_SCAN_CHARS]
-    return scrub.text(window) != window or strike_text(window) != window
+    """Whether striking would remove anything from ``text``, searched whole. A text over
+    SECRET_SCAN_CHARS is taken as carrying a secret: a scan is never cut short."""
+    if len(text) > SECRET_SCAN_CHARS:
+        return True
+    return scrub.text(text) != text or strike_text(text) != text
+
+
+def data_has_secret(data: bytes, scrub: KnownScrubber) -> bool:
+    """Whether a file's content carries a secret: its UTF-8 text (undecodable bytes dropped,
+    so a key appended to an image is still found), searched whole."""
+    return has_secret(data.decode("utf-8", "ignore"), scrub)
+
+
+def has_secret_in(value: Any, scrub: KnownScrubber) -> bool:
+    """Whether a parsed JSON value carries a secret at any depth: its texts (keys and values, one
+    per line, so a secret alone in a field is found) and its JSON (where a secret NAME next to
+    its value shows: ``{"password": "..."}`` nested in a message). Bounded by MAX_NODES."""
+    texts: list[str] = []
+    stack: list[Any] = [value]
+    nodes = 0
+    while stack:
+        item = stack.pop()
+        nodes += 1
+        if nodes > MAX_NODES:
+            return True  # too large to search: taken as carrying one
+        if isinstance(item, str):
+            texts.append(item)
+        elif isinstance(item, dict):
+            for key, inner in item.items():
+                texts.append(str(key))
+                stack.append(inner)
+        elif isinstance(item, list | tuple):
+            stack.extend(item)
+    if has_secret("\n".join(texts), scrub):
+        return True
+    try:
+        dumped = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError):
+        return True
+    return has_secret(dumped, scrub)
+
+
+def body_has_secret(body: bytes, scrub: KnownScrubber) -> bool:
+    """Whether a request body carries a secret: as it came, %-decoded (a form) and, when it is
+    JSON, with its escapes read (``\\u0073k-...``)."""
+    text = body.decode("utf-8", "replace")
+    if has_secret(text, scrub) or has_secret(unquote_plus(text), scrub):
+        return True
+    try:
+        parsed = strict_json(body)
+    except Unreadable:
+        return False
+    return has_secret_in(parsed, scrub)
+
+
+def nested_text(value: object, keys: frozenset[str]) -> str | None:
+    """The texts under ``keys`` at any depth of a message's nested parts (Slack blocks, Discord
+    embeds), in order, one per line: what the recipient reads there. A JSON text (a form field)
+    is read first; one that is not JSON is shown as it is. Bounded by MAX_NODES."""
+    if isinstance(value, str):
+        try:
+            value = strict_json(value)
+        except Unreadable:
+            return value or None
+    found: list[str] = []
+    stack: list[tuple[bool, object]] = [(False, value)]  # (a text to show, the item)
+    nodes = 0
+    while stack:
+        shown_text, item = stack.pop()
+        nodes += 1
+        if nodes > MAX_NODES:
+            raise Unreadable(Note.TOO_LARGE)
+        if shown_text:
+            found.append(str(item))
+        elif isinstance(item, dict):
+            for key, inner in reversed(list(item.items())):
+                stack.append((key in keys and isinstance(inner, str), inner))
+        elif isinstance(item, list):
+            stack.extend((False, inner) for inner in reversed(item))
+    shown = "\n".join(text for text in found if text.strip())
+    return shown or None
+
+
+def guard_read(view: RequestView, reading: Reading, scrub: KnownScrubber) -> Reading:
+    """A read carried by a body (a POST to a read API, a "harmless" write) passes only when its
+    body is small and carries no secret: an agent told to "search" with a key in the query, or
+    to label a message with one, would otherwise hand it out without asking. Over MAX_READ_BODY
+    it is UNKNOWN (held); with a secret, UNKNOWN with risk 3."""
+    if reading.effect is not Effect.READ or (view.method in READ_METHODS and not view.body):
+        return reading
+    held = (reading.translator, reading.shape, reading.wait_s)
+    options: dict[str, Any] = {
+        "account": reading.account,
+        "path_credential": reading.path_credential,
+    }
+    if len(view.body) > MAX_READ_BODY:
+        return unknown(*held, Note.TOO_LARGE, **options)
+    if reading.secret_seen or body_has_secret(view.body, scrub):
+        return replace(unknown(*held, Note.SECRET_SEEN, **options), secret_seen=True)
+    return reading
 
 
 def first_lines(text: str | None, scrub: KnownScrubber) -> str | None:
@@ -646,17 +771,86 @@ def _utf8_header(value: str) -> str:
     return text
 
 
+_FOLD_RE = re.compile(r"\r?\n[ \t]")
+# One entry of an address list, as plainly as it can be written: an address, or a display name
+# (a quoted string without escapes, or a phrase without specials) and an address in angles.
+_ADDRESS = r"[^\s\"<>(),;:\\\[\]@]+@[^\s\"<>(),;:\\\[\]@]+"
+_NAME = r"\"[^\"\\]*\"|[^\"<>(),;:\\\[\]@]*?"  # quoted without escapes, or a plain phrase
+_ENTRY_RE = re.compile(
+    rf"\s*(?:(?P<bare>{_ADDRESS})|(?P<name>{_NAME})\s*<(?P<angle>{_ADDRESS})>)\s*"
+)
+_ENCODED_SPECIALS = frozenset('@<>,;:"\\()[]')
+
+
+def _plain_entries(text: str) -> list[str]:
+    """The addresses of an address header read with the plainest grammar, or Unreadable: no
+    comments, groups, escapes, nested quotes or route addresses, and no encoded word that
+    decodes into a special character. The standard library has read such headers otherwise in
+    some versions (CVE-2023-27043): ``parse_addresses`` keeps a header only when both agree."""
+    entries: list[str] = []
+    current: list[str] = []
+    quoted = False
+    for char in text:
+        if char == '"':
+            quoted = not quoted
+        if char == "," and not quoted:
+            entries.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if quoted:
+        raise Unreadable(Note.BAD_ADDRESS)
+    entries.append("".join(current))
+    found: list[str] = []
+    for entry in entries:
+        match = _ENTRY_RE.fullmatch(entry)
+        if match is None:
+            raise Unreadable(Note.BAD_ADDRESS)
+        name = match.group("name")
+        if name and "=?" in name and _encoded_special(name):
+            raise Unreadable(Note.BAD_ADDRESS)
+        found.append(match.group("bare") or match.group("angle"))
+    return found
+
+
+def _encoded_special(name: str) -> bool:
+    """Whether an encoded word in a display name decodes into a special character (an ``@``,
+    a comma, a quote...), which a reader that decodes it would take for part of an address."""
+    try:
+        chunks = decode_header(name.strip('"'))
+    except (ValueError, LookupError, binascii.Error):
+        return True
+    for chunk, charset in chunks:
+        if isinstance(chunk, bytes):
+            if charset is None:
+                continue  # plain text between encoded words, already checked
+            try:
+                chunk = chunk.decode(charset, "replace")
+            except LookupError:
+                return True
+        if any(char in _ENCODED_SPECIALS for char in chunk):
+            return True
+    return False
+
+
 def parse_addresses(values: Iterable[str]) -> tuple[list[str], bool]:
     """(the addresses of address headers, normalized; whether any is international). Only the
     address counts, never the display name: ``"ana@x.com" <evil@y.com>`` is ``evil@y.com``.
-    Unreadable when the standard library cannot read them strictly."""
+    Unreadable when the standard library cannot read them strictly, or when it and the plainest
+    grammar (``_plain_entries``) do not find the same addresses."""
     found: list[str] = []
     international = False
     for value in values:
-        text = _utf8_header(value)
+        text = _FOLD_RE.sub(" ", _utf8_header(value))
         if not text.strip():
             continue
-        for _name, address in getaddresses([text]):
+        if "\r" in text or "\n" in text:
+            raise Unreadable(Note.BAD_ADDRESS)
+        plain = _plain_entries(text)
+        parsed = [address for _name, address in getaddresses([text])]
+        if parsed != plain:
+            raise Unreadable(Note.BAD_ADDRESS)
+        for address in parsed:
             normalized = normalize_email(address) if address else None
             if normalized is None:
                 raise Unreadable(Note.BAD_ADDRESS)
@@ -677,7 +871,8 @@ class Mail:
     reply_to: tuple[str, ...]
     subject: str | None  # decoded, NOT struck yet
     text: str | None  # the first text part (or HTML made text), decoded, NOT struck yet
-    attachments: tuple[tuple[str | None, str | None, bytes], ...]  # name, type, content
+    texts: tuple[str, ...]  # the text and HTML parts shown, whole: what is searched for secrets
+    attachments: tuple[tuple[str | None, str | None, bytes, bool], ...]  # name, type, data, inline
     international: bool
     canonical: dict[str, Any]  # headers and parts, without Date, Message-ID or boundaries
 
@@ -690,7 +885,14 @@ _VOLATILE_HEADERS = frozenset({"date", "message-id"})
 def parse_mail(data: bytes) -> Mail:
     """An RFC 822 message (what gog builds), with the standard library, strictly and bounded:
     each address header at most once, no ``Resent-*`` (which a server might send to), no
-    defects, at most MAX_PARTS parts and MAX_ATTACHMENTS attachments."""
+    defects, at most MAX_PARTS parts and MAX_ATTACHMENTS attachments.
+
+    What the person sees must be what the recipient gets: the first ``text/plain`` part is the
+    text, and the first ``text/html`` part its alternative. Any other part (a second text, an
+    inline image) is an attachment, named "(inline <type>)" when it has no name. When both a
+    plain text and an HTML exist and the HTML says something else (other words, or a link or an
+    image the text does not carry), the mail is Unreadable with ``ALTERNATIVE_DIFFERS``: most
+    clients show the HTML, so the first lines would not be what the recipient reads."""
     if len(data) > MAX_MIME:
         raise Unreadable(Note.TOO_LARGE)
     if data.lower().count(b"boundary") > MAX_BOUNDARIES:
@@ -713,7 +915,7 @@ def parse_mail(data: bytes) -> Mail:
         raise Unreadable(Note.BAD_ADDRESS)
     text: str | None = None
     html: str | None = None
-    attachments: list[tuple[str | None, str | None, bytes]] = []
+    attachments: list[tuple[str | None, str | None, bytes, bool]] = []
     parts_canonical: list[list[Any]] = []
     walked = 0
     for part in message.walk():
@@ -733,14 +935,19 @@ def parse_mail(data: bytes) -> Mail:
         filename = part.get_filename()
         disposition = part.get_content_disposition()
         kind = part.get_content_type()
-        if filename is not None or disposition == "attachment":
-            attachments.append((filename, kind, payload))
-            if len(attachments) > MAX_ATTACHMENTS:
-                raise Unreadable(Note.TOO_MANY_ATTACHMENTS)
-        elif kind == "text/plain" and text is None:
-            text = _decode_part(part, payload)
-        elif kind == "text/html" and html is None:
-            html = _decode_part(part, payload)
+        if filename is None and disposition != "attachment":
+            if kind == "text/plain" and text is None:
+                text = _decode_part(part, payload)
+                continue
+            if kind == "text/html" and html is None:
+                html = _decode_part(part, payload)
+                continue
+        attachments.append((filename, kind, payload, filename is None))
+        if len(attachments) > MAX_ATTACHMENTS:
+            raise Unreadable(Note.TOO_MANY_ATTACHMENTS)
+    texts = tuple(item for item in (text, html) if item is not None)
+    if text is not None and html is not None and _alternative_differs(text, html):
+        raise Unreadable(Note.ALTERNATIVE_DIFFERS)
     if text is None and html is not None:
         text = html_text(html)
     return Mail(
@@ -749,10 +956,62 @@ def parse_mail(data: bytes) -> Mail:
         reply_to=tuple(reply_to),
         subject=_subject(raw.get("subject", [None])[0]),
         text=text,
+        texts=texts,
         attachments=tuple(attachments),
         international=international or reply_international or sender_international,
         canonical={"parts": parts_canonical},
     )
+
+
+_URL_ATTRIBUTES = frozenset(
+    {"href", "src", "srcset", "action", "formaction", "background", "poster", "data", "cite"}
+)
+_WORD_RE = re.compile(r"\w+")
+
+
+class _HtmlWords(HTMLParser):
+    """What an HTML part puts before the recipient: its text (comments too: Outlook shows
+    conditional ones) and the URLs of its links and images. Scripts and styles are not shown."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.texts: list[str] = []
+        self._hidden = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in ("script", "style"):
+            self._hidden += 1
+        self.texts.extend(value for name, value in attrs if name in _URL_ATTRIBUTES and value)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.texts.extend(value for name, value in attrs if name in _URL_ATTRIBUTES and value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style") and self._hidden:
+            self._hidden -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden:
+            self.texts.append(data)
+
+    def handle_comment(self, data: str) -> None:
+        self.texts.append(data)
+
+
+def _alternative_differs(text: str, html: str) -> bool:
+    """Whether an HTML alternative says something its plain text does not: the words of the
+    HTML (its text and its links' and images' URLs) against the plain text's, as multisets,
+    ignoring case, spacing and punctuation. Bounded: an HTML over MAX_HTML_COMPARE is not read."""
+    if len(html) > MAX_HTML_COMPARE:
+        raise Unreadable(Note.TOO_LARGE)
+    parser = _HtmlWords()
+    try:
+        parser.feed(html)
+        parser.close()
+    except (AssertionError, ValueError):  # what HTMLParser raises on input it cannot take
+        raise Unreadable from None
+    words = Counter(_WORD_RE.findall(" ".join(parser.texts).casefold()))
+    return words != Counter(_WORD_RE.findall(text.casefold()))
 
 
 def _raw_headers(part: Message) -> dict[str, list[str]]:

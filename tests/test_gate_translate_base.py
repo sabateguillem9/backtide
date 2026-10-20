@@ -150,7 +150,8 @@ def test_messages_to_the_owner_are_trusted_with_any_bot() -> None:
     assert all_trusted(
         read(tg("editMessageText", {"chat_id": 42, "message_id": 1, "text": "y"})), OWNER
     )
-    assert all_trusted(read(tg("deleteMessage", {"chat_id": 42, "message_id": 1})), OWNER)
+    # A deletion is never trusted, not even in the owner's chat (docs/32, section 9).
+    assert not all_trusted(read(tg("deleteMessage", {"chat_id": 42, "message_id": 1})), OWNER)
 
 
 def test_trust_never_covers_other_recipients_effects_or_secrets() -> None:

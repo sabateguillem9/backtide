@@ -9,12 +9,14 @@ mail paths are those under ``sendMail``, ``messages``, ``mailFolders`` and ``mai
   existing message).
 - UNKNOWN: ``.../messages/{id}/send``, ``reply`` and ``replyAll`` (the recipients or the content
   are not in the request), ``$batch``, and anything not in the table.
-- DELETE (risk 3): ``DELETE`` of a message or a folder, ``permanentDelete``, and a ``move`` to
-  ``deleteditems``. CHANGE: other moves, copies and folders.
+- DELETE (risk 3): ``DELETE`` of a message, an attachment or a folder, ``permanentDelete``, and
+  a ``move`` to ``deleteditems``. CHANGE: other moves, copies and folders.
 - ADMIN (risk 3): ``messageRules`` and ``mailboxSettings``.
-- READ (passes): ``GET`` and ``HEAD``; creating and changing drafts (``POST messages``,
-  ``createReply``, ``createReplyAll``, ``createForward``, ``PATCH`` of a message, draft
-  attachments). Other Graph APIs (files, Teams...) by ``GET``.
+- READ (passes): ``GET`` and ``HEAD``. Other Graph APIs (files, Teams...) by ``GET``.
+- Drafts (``POST messages``, ``createReply``, ``createReplyAll``, ``createForward``, ``PATCH`` of
+  a message, ``POST`` of an attachment): READ only in the owner's own accounts
+  (``Context.owner_accounts``), CHANGE (held) in any other: a draft in an attacker's mailbox is
+  data out (docs/32, decision 12).
 """
 
 import json
@@ -38,8 +40,10 @@ from backtide.gate.translate.base import (
     attachment,
     b64_decode,
     credential,
+    data_has_secret,
     first_lines,
     has_secret,
+    has_secret_in,
     html_text,
     json_object,
     media_type,
@@ -156,22 +160,26 @@ def _classify(
         if method in ("POST", "PATCH"):
             return _plain(Effect.CHANGE, "mailFolders", account)
         return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, account=account)
+    draft = Effect.READ if account in context.owner_accounts else Effect.CHANGE
     if tail == () and method == "POST":
-        return _plain(Effect.READ, "messages.create", account, Note.DRAFT)
+        return _plain(draft, "messages.create", account, Note.DRAFT)
     index = len(raw) - len(tail)
     item = safe_id(raw[index]) if tail and index < len(raw) else None
     target = f"message {item}" if item else None
     if len(tail) == 1 and method == "PATCH":
-        return _plain(Effect.READ, "messages.update", account, Note.DRAFT, target=target)
+        return _plain(draft, "messages.update", account, Note.DRAFT, target=target)
     if len(tail) == 1 and method == "DELETE" and not view.body:
         return _plain(Effect.DELETE, "messages.delete", account, target=target)
-    if len(tail) >= 2 and tail[1] == "attachments" and method in ("POST", "DELETE"):
-        return _plain(Effect.READ, "messages.attachments", account, Note.DRAFT, target=target)
+    if tail[1:] == ("attachments",) and method == "POST":
+        # It cannot tell a draft from a sent message: an attachment is a draft's only there.
+        return _plain(draft, "messages.attachments.add", account, Note.DRAFT, target=target)
+    if len(tail) == 3 and tail[1] == "attachments" and method == "DELETE" and not view.body:
+        return _plain(Effect.DELETE, "messages.attachments.delete", account, target=target)
     if len(tail) != 2 or method != "POST":
         return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, account=account, target=target)
     action = tail[1]
     if action in _DRAFT_ACTIONS:
-        return _plain(Effect.READ, f"messages.{action}", account, Note.DRAFT, target=target)
+        return _plain(draft, f"messages.{action}", account, Note.DRAFT, target=target)
     if action in _UNSEEN_ACTIONS:
         return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, Note.CONTENT_UNSEEN, account=account,
                        target=target or "a saved message")  # fmt: skip
@@ -286,7 +294,9 @@ def _mail(
     if text is None and isinstance(extra.get("comment"), str):
         text = extra["comment"]
     scrub = context.scrub
-    secret = any(has_secret(item, scrub) for item in (subject, text) if item)
+    # Everything but the files' bytes, at any depth (the whole HTML too, not only what is shown).
+    unfiled = {key: value for key, value in message.items() if key != "attachments"}
+    secret = has_secret_in(unfiled, scrub) or has_secret_in(extra, scrub)
     shown = []
     entries = []
     attachments = message.get("attachments") or []
@@ -301,8 +311,10 @@ def _mail(
         entries.append(entry)
         if name and has_secret(name, scrub):
             secret = True
-        if data is not None and len(data) <= 1024 * 1024:
-            secret |= has_secret(data.decode("utf-8", "ignore"), scrub)
+        if isinstance(item, dict):
+            secret |= has_secret_in({k: v for k, v in item.items() if k != "contentbytes"}, scrub)
+        if data is not None:
+            secret |= data_has_secret(data, scrub)
     fields = {key: value for key, value in message.items() if key != "attachments"}
     fields.update(extra)
     notes = []
