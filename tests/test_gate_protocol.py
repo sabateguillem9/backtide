@@ -680,3 +680,27 @@ def test_the_gate_carries_the_credential_bytes_and_the_body_secret() -> None:
     ):
         with pytest.raises(ProtocolError):
             encode(request(1, net_request(), facts() | bad), Sender.PROXY)
+
+
+def test_the_gate_carries_the_override_the_trailers_and_the_credential_id() -> None:
+    """Security review of T10-4, A1 and M1: what a batch must not cover, and whose token."""
+    sent = facts(override="DELETE", trailers=True, credential_id="c" * 64)
+    back = roundtrip(request(1, net_request(), sent), Sender.PROXY)
+    assert (back["gate"]["override"], back["gate"]["trailers"]) == ("DELETE", True)
+    assert back["gate"]["credential_id"] == "c" * 64
+    assert (
+        roundtrip(request(1, net_request(), facts(override="?")), Sender.PROXY)["gate"]["override"]
+        == "?"
+    )
+    for bad in (
+        {"override": "delete"},  # upper case only, as base.override_of gives it
+        {"override": "DEL ETE"},
+        {"override": ""},
+        {"override": 1},
+        {"trailers": 1},
+        {"credential_id": "C" * 64},
+        {"credential_id": "c" * 63},
+        {"credential_id": 7},
+    ):
+        with pytest.raises(ProtocolError):
+            encode(request(1, net_request(), facts() | bad), Sender.PROXY)

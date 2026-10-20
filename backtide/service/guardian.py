@@ -3142,7 +3142,12 @@ class Guardian:
         self._egress_held = False
         self._egress_stopped = False
         self._egress.start(
-            EgressHooks(record=self._record, alert=self._alert, back=self._egress_back)
+            EgressHooks(
+                record=self._record,
+                alert=self._alert,
+                back=self._egress_back,
+                frozen=self._approvals_frozen,
+            )
         )
 
     def _stop_egress(self, reason: str) -> None:
@@ -3236,6 +3241,7 @@ class Guardian:
             rejected = self._egress.reject_holds(by)
         except Exception:  # a pause or a rewind never fails for this; the hold expires anyway
             logger.exception("rejecting the held requests failed (%s)", by)
+            self._egress.end_batches(by)  # the batches end all the same (review of T10-4, B4)
             return
         if rejected:
             logger.info("%d held requests rejected (%s)", rejected, by)

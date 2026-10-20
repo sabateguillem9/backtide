@@ -35,7 +35,10 @@ black box; the book only keeps the state:
   ``offers`` says which batches it may make, and ``batch_for`` which rule covers a request.
   Never a deletion, an administration, a forward, the unknown, risk 3, a secret seen, a cut or
   doubtful reading, a platform that fetches a URL or an inline message (decision 8 and the
-  review of T10-3), nor a request of another account. At most ``max_batches`` at a time.
+  review of T10-3), nor a request of another account. Since the security review of T10-4: never
+  an override header nor trailers (A1); a write without a translator is bound to the HMAC of
+  its credential headers (M1); a recipient batch covers a Reply-To only among its recipients
+  (M2); and every batch keeps its scheme and port (B3). At most ``max_batches`` at a time.
 - **What a restart loses only gave leave** (holds, preapprovals, rejections, batches):
   ``close_all`` and ``end_batches`` end it all, failing closed. What must last (what was held,
   who approved, what expired) is in the black box; ``stale_holds`` finds the holds a killed
@@ -231,28 +234,44 @@ _STAR_RE = re.compile(
 @dataclass(frozen=True)
 class Scope:
     """What a request is, for the batches: fields the proxy reads strictly (the translator the
-    path chose, the account's HMAC, the effect from its table, the recipients from named
-    fields; or the method, the connection's host and the route). ``batchable``: it may make or
+    path chose, the account's HMAC, the effect from its table, the recipients and the Reply-To
+    from named fields; or the method, the connection's host, the route and the HMAC of its
+    credential headers), and the connection's scheme and port. ``batchable``: it may make or
     ride a batch at all."""
 
     translator: str | None = None
     account: str | None = None
     effect: str | None = None
     recipients: frozenset[str] = frozenset()
+    reply_to: frozenset[str] = frozenset()  # where the answers go (review of T10-4, M2)
     method: str | None = None
     host: str | None = None
     route: str | None = None
+    credential: str | None = None  # fingerprint.credential_id: whose token (review, M1)
+    scheme: str | None = None  # an https batch never covers http (review, B3)
+    port: int | None = None
     batchable: bool = False
 
 
-def reading_scope(reading: Mapping[str, Any], *, risk: int = 2) -> Scope:
+def reading_scope(
+    reading: Mapping[str, Any],
+    *,
+    risk: int = 2,
+    scheme: str | None = None,
+    port: int | None = None,
+    batchable: bool = True,
+) -> Scope:
     """The scope of a checked reading (``protocol.check_reading``). ``risk``: the hold's own,
-    when it is one (a URL that carried a secret makes it 3 whatever the reading says)."""
+    when it is one (a URL that carried a secret makes it 3 whatever the reading says).
+    ``batchable`` False: the request has an override header or trailers (review of T10-4,
+    A1)."""
     recipients = reading.get("recipients") or []
+    reply_to = reading.get("reply_to") or []
     account = reading.get("account")
     notes = set(reading.get("notes") or [])
     batchable = (
-        reading.get("effect") in BATCH_EFFECTS
+        batchable
+        and reading.get("effect") in BATCH_EFFECTS
         and reading.get("risk") == 2
         and risk == 2
         and reading.get("secret_seen") is False
@@ -267,18 +286,42 @@ def reading_scope(reading: Mapping[str, Any], *, risk: int = 2) -> Scope:
         account=account if isinstance(account, str) else None,
         effect=str(reading.get("effect")),
         recipients=frozenset(str(item) for item in recipients),
+        reply_to=frozenset(str(item) for item in reply_to),
+        scheme=scheme,
+        port=port,
         batchable=batchable,
     )
 
 
-def plain_scope(method: str, host: str, path: str, *, risk: int, reason: str) -> Scope:
+def plain_scope(
+    method: str,
+    host: str,
+    path: str,
+    *,
+    risk: int,
+    reason: str,
+    scheme: str | None = None,
+    port: int | None = None,
+    credential: str | None = None,
+    credentials_struck: bool = False,
+) -> Scope:
     """The scope of a request no translator read: only a plain write (``reason`` "write", risk
-    2: no secret seen) by POST, PUT or PATCH may make or ride a batch."""
+    2: no secret seen, no override header nor trailers) by POST, PUT or PATCH, whose credential
+    headers are known (``credential``) and, toward a host off the allowed list, carry nothing
+    the redaction recognises (``credentials_struck``, which the caller only sets then: review
+    of T10-4, M1), may make or ride a batch."""
     return Scope(
         method=method,
         host=host.lower(),
         route=route_of(path),
-        batchable=reason == "write" and risk == 2 and method in BATCH_METHODS,
+        credential=credential,
+        scheme=scheme,
+        port=port,
+        batchable=reason == "write"
+        and risk == 2
+        and method in BATCH_METHODS
+        and credential is not None
+        and not credentials_struck,
     )
 
 
@@ -303,20 +346,26 @@ class BatchRule:
     uses: int = 0
 
     def covers(self, scope: Scope) -> bool:
-        """Whether ``scope`` rides this rule: the same translator and account (or method, host
-        and route), and, for a recipient batch, every recipient in it."""
+        """Whether ``scope`` rides this rule: the same scheme and port, the same translator and
+        account (or method, host, route and credential headers), and, for a recipient batch,
+        every recipient and every Reply-To in it."""
         mine = self.scope
-        if not scope.batchable:
+        if not scope.batchable or (scope.scheme, scope.port) != (mine.scheme, mine.port):
             return False
-        if mine.translator is None:  # a write without a translator
-            return (scope.translator, scope.method, scope.host, scope.route) == (
-                None, mine.method, mine.host, mine.route,
+        if mine.translator is None:  # a write without a translator, with the same token
+            return (scope.translator, scope.method, scope.host, scope.route, scope.credential) == (
+                None, mine.method, mine.host, mine.route, mine.credential,
             )  # fmt: skip
         if (scope.translator, scope.account) != (mine.translator, mine.account):
             return False
         if self.kind is BatchKind.KIND:
             return scope.effect == mine.effect
-        return scope.effect in BATCH_EFFECTS and scope.recipients <= mine.recipients
+        # Every recipient, and every address the answers go to, is one the person named.
+        return (
+            scope.effect in BATCH_EFFECTS
+            and scope.recipients <= mine.recipients
+            and scope.reply_to <= mine.recipients
+        )
 
 
 def _new_batch_id() -> str:
@@ -601,13 +650,15 @@ class HoldBook:
 
     def offers(self, hold: Hold) -> tuple[BatchKind, ...]:
         """The batches ``hold`` may make: none for what may never ride one (decision 8); the
-        recipient batch only for a translated request to 1 to 5 recipients."""
+        recipient batch only for a translated request to 1 to 5 recipients whose answers go
+        to them too (a Reply-To elsewhere: review of T10-4, M2)."""
         scope = hold.scope
         if scope is None or not scope.batchable:
             return ()
         if scope.translator is None:
             return (BatchKind.KIND,)
-        if 1 <= len(scope.recipients) <= MAX_BATCH_RECIPIENTS:
+        to_them = scope.reply_to <= scope.recipients
+        if 1 <= len(scope.recipients) <= MAX_BATCH_RECIPIENTS and to_them:
             return (BatchKind.RECIPIENT, BatchKind.KIND)
         return (BatchKind.KIND,)
 
@@ -624,7 +675,8 @@ class HoldBook:
         scope = hold.scope
         if kind is BatchKind.KIND and scope.translator is not None:
             scope = Scope(translator=scope.translator, account=scope.account,
-                          effect=scope.effect, batchable=True)  # fmt: skip
+                          effect=scope.effect, scheme=scope.scheme, port=scope.port,
+                          batchable=True)  # fmt: skip
         for rule in self._batches.values():
             if rule.kind is kind and rule.scope == scope:
                 return rule

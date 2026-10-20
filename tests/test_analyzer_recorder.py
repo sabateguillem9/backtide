@@ -57,6 +57,14 @@ description = "Borra el disco"
 risk = 3
 source = "exec"
 target = "wipe*"
+
+[[rule]]
+id = "paste"
+description = "Manda algo a un sitio de pegado"
+risk = 1
+source = "gate"
+action = "held"
+target = "*paste*"
 """
 )
 
@@ -445,9 +453,18 @@ def test_the_services_own_events_alert_for_themselves(rig: Rig) -> None:
     assert (rig.snapshot_calls, rig.sink.alerts) == (0, [])
 
 
-def test_a_held_request_gets_its_evidence_snapshot_but_no_generic_alert(rig: Rig) -> None:
+@pytest.fixture
+def desk_rig(raw: BlackBox) -> Iterator[Rig]:
+    """The rig with the Telegram hold desk on (``quiet_holds``)."""
+    rig = Rig(raw, quiet_holds=True)
+    yield rig
+    rig.responder.close(WAIT)
+
+
+def test_a_held_request_gets_its_evidence_snapshot_but_no_generic_alert(desk_rig: Rig) -> None:
     """T10-4 (docs/32, section 5): the hold's own notice in Telegram, with its buttons, is the
     alert; the evidence snapshot still happens, and other events still alert."""
+    rig = desk_rig
     held = rig.box.append(Source.GATE, "held", "https://x", details={"hold_id": "h-1"}, risk=3)
     wait_until(lambda: bool(rig.events(source="snapshot", action="evidence")))
     rig.settle()
@@ -459,11 +476,30 @@ def test_a_held_request_gets_its_evidence_snapshot_but_no_generic_alert(rig: Rig
     assert alert.event_seq == other.seq
 
 
-def test_a_held_request_says_nothing_either_while_the_service_stops(rig: Rig) -> None:
+def test_a_held_request_says_nothing_either_while_the_service_stops(desk_rig: Rig) -> None:
+    rig = desk_rig
     rig.responder.close(WAIT)
     rig.box.append(Source.GATE, "held", "https://x", details={"hold_id": "h-1"}, risk=3)
     rig.responder.flush_held()
     assert rig.sink.alerts == []
+
+
+def test_without_the_hold_desk_a_held_request_of_risk_3_alerts(rig: Rig) -> None:
+    """Security review of T10-4, M4: without Telegram nobody else tells the person."""
+    held = rig.box.append(Source.GATE, "held", "https://x", details={"hold_id": "h-1"}, risk=3)
+    (alert,) = rig.sink.wait_for(1)
+    assert alert.event_seq == held.seq and "gate/held" in alert.title
+
+
+def test_a_rule_that_matches_a_held_request_still_alerts_with_the_desk_on(desk_rig: Rig) -> None:
+    """M4: the hold's notice silences the generic alert, never a rule of the person's that
+    matched the same event."""
+    rig = desk_rig
+    held = rig.box.append(
+        Source.GATE, "held", "https://paste.example/x", details={"hold_id": "h-1"}, risk=3
+    )
+    (alert,) = rig.sink.wait_for(1)
+    assert alert.event_seq == held.seq and held.details["risk_rules"] == ["paste"]
 
 
 def test_an_agent_event_whose_risk_comes_from_the_caller_is_answered_too(rig: Rig) -> None:

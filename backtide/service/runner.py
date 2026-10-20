@@ -283,7 +283,9 @@ def build_guardian(
     alerts = AlertQueue(notifier if notifier is not None else LogNotifier())
     # The rules sit in front of the black box (T08): the Guardian and the watcher record through
     # it, and an event of risk 3 gets an evidence snapshot and an alert.
-    responder = RiskResponder(alerts)
+    # With the Telegram hold desk, a held request's own notice is its alert (T10-4 and its
+    # review, M4); without it, the generic alert says so.
+    responder = RiskResponder(alerts, quiet_holds=hold_watch is not None)
     rated_box = AssessedBlackBox(box, rules, responder)
     watcher = FileWatcher(
         jail.config.agent_dir, rated_box, workspace_id=store.workspace_id, config=watcher_config

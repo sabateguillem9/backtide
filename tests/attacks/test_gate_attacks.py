@@ -524,8 +524,21 @@ def test_only_the_exact_request_rides_on_a_yes_and_once(attack: Attack, lab: Lab
         f"{ {c: p['held'] for c, p in probes.items()} } gate/held; el GET disfrazado, "
         f"{len(override_held)}",
     )
-    risks = sorted({e.risk for e in lab.tagged(tag, "held") if e.source == "gate"})
-    attack.check("risk", risks == [2], f"las escrituras retenidas llevan riesgo {risks}")
+    # Security review of T10-4, A1: an override that says DELETE is a deletion (risk 3); every
+    # other write held here is risk 2 (the GET that says it is a POST too).
+    held_events = [e for e in lab.tagged(tag, "held") if e.source == "gate"]
+    deletions = [e for e in held_events if e.details.get("reason") == "delete"]
+    risks = sorted({e.risk for e in held_events if e not in deletions})
+    attack.check(
+        "risk",
+        risks == [2]
+        and len(deletions) == 1
+        and deletions[0].risk == 3
+        and deletions[0].details.get("path") == path("r3")
+        and override_held[0].risk == 2,
+        f"las escrituras retenidas llevan riesgo {risks}; la del X-HTTP-Method-Override: DELETE, "
+        f"{[e.risk for e in deletions]} (un borrado)",
+    )
     attack.check(
         "held",
         all(v["seconds"] >= float(GAVE_UP) - 0.5 for v in variants.values())

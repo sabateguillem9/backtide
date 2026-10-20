@@ -142,8 +142,10 @@ DECISION_REASONS = frozenset({"rejected", "expired", "paused", "hold_full"})
 HOLD_LEFT_WHY = frozenset({"client_left", "waited", "no_slot"})
 _GATE_KEYS = frozenset(
     {"fp", "url_struck", "url_bytes", "websocket", "exact_read", "wait_hint_s", "headers_struck",
-     "header_bytes", "credential_bytes", "credentials_struck", "body_struck", "reading"}
+     "header_bytes", "credential_bytes", "credentials_struck", "body_struck", "reading",
+     "override", "trailers", "credential_id"}
 )  # fmt: skip
+_OVERRIDE_RE = re.compile(r"[A-Z]{1,16}|\?", re.ASCII)  # base.override_of
 
 _REQUEST_KEYS = frozenset(
     {"flow_id", "method", "scheme", "host", "port", "path", "http_version", "server_ip",
@@ -358,6 +360,9 @@ def gate(
     credentials_struck: bool = False,
     body_struck: bool = False,
     reading: Mapping[str, Any] | None = None,
+    override: str | None = None,
+    trailers: bool = False,
+    credential_id: str | None = None,
 ) -> dict[str, Any]:
     """The facts of a ``net/request`` that backtide decides on (docs/32, section 6): its
     fingerprint (64 hex; the semantic one when a translator read it, decision 2), whether the
@@ -370,13 +375,18 @@ def gate(
     allowed list: review of T10-3, H1), whether its body carries a secret (a write without a
     translator: risk 3), how long its client waits (the translator's ``wait_s``; None: 90 s)
     and the translator's ``reading`` (``Reading.summary()``, fitted: ``fit_reading``), or
-    None."""
+    None. Since the security review of T10-4: what its override headers say (``override``:
+    None, a method, or "?"; ``base.override_of``), whether it has trailers, and who it acts as
+    (``credential_id``: ``fingerprint.credential_id`` of its credential headers), so a batch
+    never covers an override, trailers nor another token (A1, M1)."""
     facts = {"fp": fp, "url_struck": url_struck, "url_bytes": url_bytes, "websocket": websocket,
              "exact_read": exact_read, "wait_hint_s": wait_hint_s,
              "headers_struck": headers_struck, "header_bytes": header_bytes,
              "credential_bytes": credential_bytes, "credentials_struck": credentials_struck,
              "body_struck": body_struck,
-             "reading": None if reading is None else dict(reading)}  # fmt: skip
+             "reading": None if reading is None else dict(reading),
+             "override": override, "trailers": trailers,
+             "credential_id": credential_id}  # fmt: skip
     return _check_gate(facts)
 
 
@@ -646,9 +656,20 @@ def _check_gate(value: object) -> dict[str, Any]:
         "headers_struck",
         "credentials_struck",
         "body_struck",
+        "trailers",
     ):
         if type(value[name]) is not bool:
             raise ProtocolError(f"request.gate.{name}: not a boolean")
+    override = value["override"]
+    if override is not None and (
+        not isinstance(override, str) or not _OVERRIDE_RE.fullmatch(override)
+    ):
+        raise ProtocolError("request.gate.override: not a method")
+    credential = value["credential_id"]
+    if credential is not None and (
+        not isinstance(credential, str) or not _FP_RE.fullmatch(credential)
+    ):
+        raise ProtocolError("request.gate.credential_id: not a digest")
     hint = value["wait_hint_s"]
     reading = value["reading"]
     return {
@@ -668,6 +689,9 @@ def _check_gate(value: object) -> dict[str, Any]:
         if hint is None
         else _int(hint, "request.gate.wait_hint_s", 1, MAX_WAIT_HINT_S),
         "reading": None if reading is None else check_reading(reading),
+        "override": override,
+        "trailers": value["trailers"],
+        "credential_id": credential,
     }
 
 

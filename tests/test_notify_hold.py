@@ -5,6 +5,7 @@ answered "cerrada" after; "Ver"; the batches' two taps; the notice budget and it
 /retenidas and /lotes. The real gate behind the actions is in test_service_proxy_channel.py and,
 with the real agent, in the VM (tests/attacks/test_hold_telegram_attacks.py)."""
 
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -107,11 +108,11 @@ def test_the_agents_texts_are_cut() -> None:
     }))  # fmt: skip
     lines = agent_part(text)
     assert len(text) < 2000
-    assert lines[0].startswith(f"{AGENT}Para: 0@ejemplo.com") and lines[0].endswith(" y 59 más")
+    assert lines[0].startswith(f"{AGENT}Para: 0＠ejemplo․com") and lines[0].endswith(" y 59 más")
     subject = next(line for line in lines if line.startswith(f"{AGENT}Asunto: "))
     assert len(subject) <= len(AGENT) + len("Asunto: ") + 200
     assert sum(1 for line in lines if line == f"{AGENT}linea") <= 3
-    assert lines[-1].endswith("y 4 más") and "f0.pdf (117 KB)" in lines[-1]
+    assert lines[-1].endswith("y 4 más") and "f0․pdf (117 KB)" in lines[-1]
 
 
 def test_a_secret_in_the_agents_text_is_struck_again() -> None:
@@ -132,7 +133,7 @@ def test_without_a_translator_the_request_is_the_agents() -> None:
     text = hold_text(notice(reading=None, reason="delete", method="DELETE",
                             host="api.fake.test", path="/v1/buckets/b1"))  # fmt: skip
     assert our_part(text)[1] == "Sin traductor: un borrado (DELETE) que backtide no sabe leer"
-    assert agent_part(text) == [f"{AGENT}DELETE api.fake.test/v1/buckets/b1"]
+    assert agent_part(text) == [f"{AGENT}DELETE api․fake․test/v1/buckets/b1"]
 
 
 def test_the_countdown() -> None:
@@ -150,8 +151,8 @@ def test_view_shows_every_recipient_the_attachments_and_the_excerpt() -> None:
     text = view_text(notice(), details)
     lines = agent_part(text)
     assert all(line.startswith(AGENT) for line in lines)
-    assert "8@x.example" in text and "y " not in lines[1]  # every recipient
-    assert f"{AGENT}Adjunto: f.pdf · application/pdf · 2 KB" in lines
+    assert "8＠x․example" in text and "y " not in lines[1]  # every recipient
+    assert f"{AGENT}Adjunto: f․pdf · application/pdf · 2 KB" in lines
     assert f"{AGENT}linea 1" in lines and "/seguir" not in text
     assert any("solo guarda los primeros 2 KiB" in line for line in lines)
 
@@ -257,8 +258,20 @@ class Rig:
         before = time.monotonic()
         self.desk.held(notice(**changes))
         found = self.fake.wait_call("sendMessage", after=before)
-        time.sleep(0.1)  # the desk binds the buttons once the answer reaches it
+        self.bound(found)
         return found
+
+    def bound(self, call: Call) -> None:
+        """Wait until every button of ``call`` is bound to its message: the desk binds them
+        once the Bot API's answer reaches it, and a press before that is "wrong message"."""
+        tokens = [data for _, data in buttons(call)]
+        deadline = time.monotonic() + WAIT
+        while not all(
+            (found := self.book.peek(token)) is not None and found.message_id == call.message_id
+            for token in tokens
+        ):
+            assert time.monotonic() < deadline, "the buttons were never bound"
+            time.sleep(0.01)
 
     def press(self, call: Call, label: str, **who: Any) -> None:
         data = dict(buttons(call))[label]
@@ -269,9 +282,26 @@ class Rig:
             "editMessageText", lambda c: c.params.get("message_id") == call.message_id
         )
 
-    def answer(self, after: float) -> str:
-        found = self.fake.wait_call("answerCallbackQuery", after=after)
-        return str(found.params.get("text"))
+    def press_answered(self, call: Call, label: str, **who: Any) -> str:
+        """Press, and the text of the answer to THIS press. The bot answers each press of the
+        owner exactly once, but through its outbox (a thread of its own): on a slow machine an
+        earlier answer can arrive late, so every earlier press must have been answered first
+        (this waits for that too) and the answer is told by its position, not its time."""
+        answers = self.fake.sent("answerCallbackQuery")
+        seen = len(answers)
+        self.press(call, label, **who)
+        deadline = time.monotonic() + WAIT
+        while len(answers := self.fake.sent("answerCallbackQuery")) <= seen:
+            assert time.monotonic() < deadline, "the press was never answered"
+            time.sleep(0.01)
+        return str(answers[seen].params.get("text"))
+
+    def answered(self, count: int) -> None:
+        """Wait until ``count`` presses have been answered."""
+        deadline = time.monotonic() + WAIT
+        while len(self.fake.sent("answerCallbackQuery")) < count:
+            assert time.monotonic() < deadline, "a press was never answered"
+            time.sleep(0.01)
 
     def settle(self) -> None:
         last = self.fake.next_update_id
@@ -325,7 +355,7 @@ def test_approve_goes_through_the_actions_once_and_the_message_says_how_it_ended
     rig: Rig,
 ) -> None:
     call = rig.notice()
-    rig.press(call, "Aprobar")
+    assert rig.press_answered(call, "Aprobar") == "Aprobando…"
     rig.actions.wait()
     assert rig.actions.asked == [("decide", HOLD, "approve")]
     edit = rig.edit_of(call)
@@ -333,12 +363,8 @@ def test_approve_goes_through_the_actions_once_and_the_message_says_how_it_ended
     assert edit.params["text"].endswith("Resultado: aprobada desde Telegram: salió una sola vez.")
     assert edit.params["reply_markup"] == {"inline_keyboard": []}
     # Pressed again, replayed, or "Rechazar" after it: nothing is asked; it says how it ended.
-    before = time.monotonic()
-    rig.press(call, "Aprobar")
-    assert "ya está cerrada: aprobada" in rig.answer(before)
-    before = time.monotonic()
-    rig.press(call, "Rechazar")
-    assert "ya está cerrada: aprobada" in rig.answer(before)
+    assert "ya está cerrada: aprobada" in rig.press_answered(call, "Aprobar")
+    assert "ya está cerrada: aprobada" in rig.press_answered(call, "Rechazar")
     rig.settle()
     assert rig.actions.asked == [("decide", HOLD, "approve")]
     assert [r[1]["reason"] for r in rig.actions.records] == ["used_button", "used_button"]
@@ -382,9 +408,7 @@ def test_a_decision_elsewhere_edits_the_notice_and_uses_its_buttons_up(rig: Rig)
     rig.desk.closed(HOLD, "rejected", "pause")  # /pausar, the terminal or the web
     edit = rig.edit_of(call)
     assert edit.params["text"].endswith("Resultado: rechazada al pausar el agente. No salió.")
-    before = time.monotonic()
-    rig.press(call, "Aprobar")
-    assert "ya está cerrada: rechazada" in rig.answer(before)
+    assert "ya está cerrada: rechazada" in rig.press_answered(call, "Aprobar")
     rig.settle()
     assert rig.actions.asked == []
 
@@ -393,17 +417,13 @@ def test_an_expired_hold_says_so(rig: Rig) -> None:
     call = rig.notice()
     rig.desk.closed(HOLD, "expired", "timeout")
     assert "nadie respondió en 5 minutos" in rig.edit_of(call).params["text"]
-    before = time.monotonic()
-    rig.press(call, "Rechazar")
-    assert "caducada" in rig.answer(before)
+    assert "caducada" in rig.press_answered(call, "Rechazar")
 
 
 def test_buttons_expire_with_the_hold(rig: Rig) -> None:
     call = rig.notice(expires_in_s=1)
     time.sleep(1.2)
-    before = time.monotonic()
-    rig.press(call, "Aprobar")
-    assert "caducado" in rig.answer(before)
+    assert "caducado" in rig.press_answered(call, "Aprobar")
     rig.settle()
     assert rig.actions.asked == []
 
@@ -438,7 +458,7 @@ def test_a_batch_takes_two_taps(rig: Rig) -> None:
     before = time.monotonic()
     rig.press(call, "Todo a este destinatario (sesión)")
     question = rig.fake.wait_call("sendMessage", after=before)
-    time.sleep(0.1)  # bound once the answer reaches the desk
+    rig.bound(question)
     assert "¿Crear un lote?" in question.params["text"] and rig.actions.asked == []
     assert [label for label, _ in buttons(question)] == ["Sí, crear el lote", "Cancelar"]
     rig.press(question, "Sí, crear el lote")
@@ -453,7 +473,7 @@ def test_a_batch_cancelled_is_not_made(rig: Rig) -> None:
     before = time.monotonic()
     rig.press(call, "Envíos de Telegram, 1 h")
     question = rig.fake.wait_call("sendMessage", after=before)
-    time.sleep(0.1)  # bound once the answer reaches the desk
+    rig.bound(question)
     rig.press(question, "Cancelar")
     rig.fake.wait_call("sendMessage", lambda c: "No se ha creado" in c.params.get("text", ""))
     rig.press(question, "Sí, crear el lote")
@@ -487,7 +507,7 @@ def test_retenidas_sends_the_open_holds_again_with_their_buttons(rig: Rig) -> No
     rig.actions.pending = [notice(hold_id=f"h-{n:012x}", expires_in_s=200) for n in range(12)]
     rig.fake.push_message("/retenidas")
     head = rig.fake.wait_call("sendMessage", lambda c: "Hay 12 retenidas" in c.params["text"])
-    assert "las 10 más antiguas" in head.params["text"]
+    assert "primero las de más riesgo" in head.params["text"]
     deadline = time.monotonic() + WAIT
     while len([c for c in rig.fake.sent() if c.params["text"].startswith("⏸")]) < 10:
         assert time.monotonic() < deadline
@@ -495,6 +515,7 @@ def test_retenidas_sends_the_open_holds_again_with_their_buttons(rig: Rig) -> No
     rig.settle()
     notices = [c for c in rig.fake.sent() if c.params["text"].startswith("⏸")]
     assert len(notices) == 10 and "en 4 min" in notices[0].params["text"]
+    rig.bound(notices[3])
     rig.press(notices[3], "Aprobar")
     rig.actions.wait()
     assert rig.actions.asked == [("decide", "h-000000000003", "approve")]
@@ -514,7 +535,7 @@ def test_lotes_lists_the_batches_and_revokes_one(rig: Rig) -> None:
     ]  # fmt: skip
     rig.fake.push_message("/lotes")
     listing = rig.fake.wait_call("sendMessage", lambda c: "Lotes activos" in c.params["text"])
-    time.sleep(0.1)
+    rig.bound(listing)
     text = listing.params["text"]
     assert (
         "1. Telegram, todo a unos destinatarios, sesión: quedan 1 h 0 min; usado 2 veces." in text
@@ -524,16 +545,19 @@ def test_lotes_lists_the_batches_and_revokes_one(rig: Rig) -> None:
     rig.press(listing, "Revocar 2")
     rig.actions.wait()
     assert rig.actions.asked == [("end", "b-89abcdef")]
+    rig.actions.rules = []  # before the order: the bot's worker may read them at once
     rig.fake.push_message("/lotes")
-    rig.actions.rules = []
     rig.fake.wait_call("sendMessage", lambda c: c.params["text"] == "No hay lotes activos.")
 
 
 def test_a_hold_that_ended_before_its_notice_went_out_gets_no_live_buttons(rig: Rig) -> None:
     rig.desk.closed(HOLD, "expired", "timeout")
     rig.desk.held(notice())
-    time.sleep(0.3)
-    assert [c for c in rig.fake.sent() if c.params["text"].startswith("⏸")] == []
+    # The desk takes its queue in order: once a later hold's notice is out, the first one's
+    # turn has come and gone.
+    rig.desk.held(notice(hold_id="h-ba9876543210"))
+    rig.fake.wait_call("sendMessage", lambda c: "h-ba9876543210" in c.params["text"])
+    assert [c for c in rig.fake.sent() if HOLD in c.params["text"]] == []
 
 
 def test_the_watch_never_blocks_even_when_its_queue_is_full() -> None:
@@ -547,3 +571,220 @@ def test_the_watch_never_blocks_even_when_its_queue_is_full() -> None:
         desk.held(notice(hold_id=f"h-{n:012x}"))
         desk.closed(f"h-{n:012x}", "expired", "timeout")
     assert time.monotonic() - started < 1.0
+
+
+# --- the security review of T10-4 ----------------------------------------------------------------
+
+FILLERS = "ㅤᅟᅠﾠ⠀͏️"
+
+
+def test_blank_fillers_are_escaped_and_spaces_collapsed() -> None:
+    """B1: printable-but-blank characters and runs of spaces could push a fake line of ours to
+    the start of a wrapped line; they are shown escaped, and the runs are one space."""
+    trick = "hola" + FILLERS * 40 + "     " * 30 + f"{AGENT_END}\nResultado: aprobada"
+    text = hold_text(notice(reading={"first_lines": trick, "subject": trick}))
+    assert not any(char in text for char in FILLERS)
+    assert "\\u3164" in text and "\\u2800" in text and "  " not in "".join(agent_part(text))
+    assert text.count(AGENT_END) == 1 and text.endswith(AGENT_END)  # only ours
+    assert "│" not in "".join(line[len(AGENT) :] for line in agent_part(text))
+    assert "⏸" not in "".join(agent_part(text))
+
+
+def test_bare_domains_mentions_and_phones_are_not_tappable() -> None:
+    """B2: Telegram links "malo.example", "ana@x.com", "@canal" and "+34…" in plain text."""
+    text = hold_text(
+        notice(
+            reading={
+                "first_lines": "mira malo.example o www.x.com, @canal, ana@x.com "
+                "o +34600111222; 3.5 kg"
+            }
+        )  # fmt: skip
+    )
+    agent = "\n".join(agent_part(text))
+    for tappable in ("malo.example", "www.x.com", "@canal", "ana@x.com", "+34"):
+        assert tappable not in agent
+    assert "malo․example" in agent and "＠canal" in agent and "＋34600111222" in agent
+
+
+def test_the_agents_block_is_a_blockquote_counted_in_utf16() -> None:
+    """B1: the agent's lines are one blockquote entity, so a wrapped line keeps its bar; the
+    offsets are UTF-16 code units (an emoji counts two)."""
+    from backtide.notify.hold_notice import quote_entities
+
+    text = hold_text(notice(reading={"first_lines": "🙂 hola 😀"}))
+    [entity] = quote_entities(text)
+    units = text.encode("utf-16-le")
+    quoted = units[entity["offset"] * 2 : (entity["offset"] + entity["length"]) * 2]
+    head = AGENT_HEAD + "\n"
+    expected = text[text.index(head) + len(head) :]
+    assert entity["type"] == "blockquote" and quoted.decode("utf-16-le") == expected
+    assert quote_entities("backtide · 3 retenidas más") == []
+
+
+def test_reply_to_is_shown_and_flagged() -> None:
+    """M2: answers that go elsewhere are our note in the notice and in the batch question."""
+    reading = {"reply_to": ["x@malo.example"], "recipients": ["ana@ejemplo.com"]}
+    text = hold_text(notice(reading=reading))
+    assert any("las respuestas irían" in line for line in our_part(text))
+    assert f"{AGENT}Responder a: x＠malo․example" in agent_part(text)
+    question = batch_question(notice(reading=reading), "kind")
+    assert f"{AGENT}Responder a: x＠malo․example" in agent_part(question)
+    same = hold_text(notice(reading={"reply_to": ["556"]}))
+    assert not any("las respuestas" in line for line in our_part(same))
+
+
+class Recorder:
+    """A Bot API that answers at once and keeps every call."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.fail = fail
+
+    def call(self, method: str, params: dict[str, Any], **_: Any) -> Any:
+        from backtide.notify.telegram_api import TelegramError
+
+        self.calls.append((method, params))
+        if self.fail:
+            raise TelegramError("down")
+        return {"message_id": len(self.calls)}
+
+    def texts(self) -> list[str]:
+        return [params["text"] for method, params in self.calls if method == "sendMessage"]
+
+
+class Tick:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def sync_desk(api: Recorder, clock: Tick) -> HoldDesk:
+    """A desk whose queue the test drains by hand (no thread)."""
+    return HoldDesk(api, OWNER, ButtonBook(clock=clock), FakeActions(), clock=clock,  # type: ignore[arg-type]
+                    summary_every=0.0)  # fmt: skip
+
+
+def drain(desk: HoldDesk) -> None:
+    while not desk._queue.empty():  # noqa: SLF001
+        item = desk._queue.get_nowait()  # noqa: SLF001
+        if item and item[0] == "held":
+            desk._on_held(item[1])  # noqa: SLF001
+        elif item and item[0] == "closed":
+            desk._on_closed(*item[1:])  # noqa: SLF001
+        desk._tell_summary()  # noqa: SLF001
+
+
+def test_the_countdown_and_the_buttons_count_from_when_the_notice_goes_out() -> None:
+    """B5: a notice queued at 300 s and sent 200 s later says 2 min, and its buttons live
+    100 s, not 300."""
+    api, clock = Recorder(), Tick()
+    desk = sync_desk(api, clock)
+    desk.held(notice(expires_in_s=300))
+    clock.now += 200
+    drain(desk)
+    [text] = api.texts()
+    assert "Si no respondes en 2 min, se rechaza." in text
+    approve = api.calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    button = desk._book.peek(approve)  # noqa: SLF001
+    assert button is not None and button.expires == clock.now + 100
+    desk.held(notice(hold_id="h-111111111111", expires_in_s=30))
+    clock.now += 31
+    drain(desk)
+    assert len(api.texts()) == 1  # expired before it went out: nothing to press
+
+
+def test_risk_3_has_a_budget_of_its_own_and_the_summary_counts_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M3 and M4: ten low-risk holds never hide one of risk 3; past its own budget, the
+    summary says how many of risk 3 it has, and the log (the bridge) says it went unannounced."""
+    api, clock = Recorder(), Tick()
+    desk = sync_desk(api, clock)
+    for n in range(10):
+        desk.held(notice(hold_id=f"h-{n:012x}"))
+    desk.held(notice(hold_id="h-333333333333", risk=3, batches=[]))
+    drain(desk)
+    notices = [text for text in api.texts() if text.startswith("⏸")]
+    assert len(notices) == 7 and "riesgo 3 · h-333333333333" in notices[-1]
+    with caplog.at_level(logging.WARNING, logger="backtide.holds"):
+        for n in range(7):
+            desk.held(notice(hold_id=f"h-3{n:011x}", risk=3, batches=[]))
+        drain(desk)
+    summaries = [params["text"] for _, params in api.calls if "retenidas más" in params["text"]]
+    assert summaries[-1].startswith("backtide · 6 retenidas más sin aviso propio, 2 de riesgo 3")
+    assert [r.name for r in caplog.records].count("backtide.holds") == 2
+    assert "h-3" in caplog.records[-1].getMessage()
+
+
+def test_a_risk_3_notice_telegram_did_not_take_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M4: Telegram down, or the desk's queue full: the bridge hears of it."""
+    api, clock = Recorder(fail=True), Tick()
+    desk = sync_desk(api, clock)
+    with caplog.at_level(logging.WARNING, logger="backtide.holds"):
+        desk.held(notice(risk=3, batches=[]))
+        drain(desk)
+        desk.held(notice(hold_id="h-222222222222"))  # risk 2: no warning of its own
+        drain(desk)
+    assert [r.getMessage() for r in caplog.records if r.name == "backtide.holds"] == [
+        f"a held request of risk 3 ({HOLD}) got no Telegram notice of its own "
+        "(telegram_failed): see it with /retenidas or `backtide retenidas`"
+    ]
+    full = sync_desk(Recorder(), clock)
+    for n in range(300):
+        full.held(notice(hold_id=f"h-{n:012x}"))
+    with caplog.at_level(logging.WARNING, logger="backtide.holds"):
+        full.held(notice(hold_id="h-999999999999", risk=3, batches=[]))
+    assert "queue_full" in caplog.records[-1].getMessage()
+
+
+def test_retenidas_sends_the_riskiest_first(rig: Rig) -> None:
+    """M3: a risk 3 behind eleven low-risk holds is among the ten /retenidas sends, first."""
+    rig.actions.pending = [notice(hold_id=f"h-{n:012x}", expires_in_s=200) for n in range(11)]
+    rig.actions.pending.append(
+        notice(hold_id="h-333333333333", risk=3, batches=[], expires_in_s=200)
+    )
+    rig.fake.push_message("/retenidas")
+    first = rig.fake.wait_call("sendMessage", lambda c: c.params["text"].startswith("⏸"))
+    assert "riesgo 3 · h-333333333333" in first.params["text"]
+
+
+def test_a_notice_carries_its_blockquote_and_its_edit_too(rig: Rig) -> None:
+    call = rig.notice()
+    [entity] = call.params["entities"]
+    assert entity["type"] == "blockquote" and "parse_mode" not in call.params
+    rig.press(call, "Rechazar")
+    edit = rig.edit_of(call)
+    assert edit.params["entities"] == call.params["entities"]
+
+
+def test_a_confirmation_refused_by_the_rate_limit_is_not_used_up(rig: Rig) -> None:
+    """Review of T10-4: "Sí, crear el lote" pressed past the rate limit does nothing, and is
+    still there to press once the limit allows it."""
+    call = rig.notice()
+    before = time.monotonic()
+    rig.press_answered(call, "Todo a este destinatario (sesión)")
+    question = rig.fake.wait_call("sendMessage", after=before)
+    rig.bound(question)
+    rig.bot._limit = RateLimit(1, 3600)  # noqa: SLF001
+    rig.bot._limit.allow()  # noqa: SLF001 - used up
+    assert "Demasiadas órdenes" in rig.press_answered(question, "Sí, crear el lote")
+    rig.settle()
+    assert rig.actions.asked == []
+    rig.bot._limit = RateLimit(100, 0.01)  # noqa: SLF001
+    rig.press(question, "Sí, crear el lote")
+    rig.actions.wait()
+    assert rig.actions.asked == [("batch", HOLD, "recipient")]
+
+
+def test_printable_escapes_blank_fillers_and_inert_keeps_t09_alerts_as_they_were() -> None:
+    """B1 in ``printable`` (every message); B2 only in the agent's text of a notice."""
+    from backtide.notify.text import agent_text, inert, printable
+
+    assert printable("aㅤb⠀c\td\x1b") == "a\\u3164b\\u2800c\\td\\x1b"
+    assert printable("\U000e0041") == "\\U000e0041"  # a tag character
+    assert inert("ver informe.pdf en a@b.c") == "ver informe.pdf en a@b.c"
+    assert agent_text("a  b   c │└⏸", "│└⏸") == "a b c \\u2502\\u2514\\u23f8"

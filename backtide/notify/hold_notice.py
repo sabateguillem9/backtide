@@ -47,11 +47,16 @@ from typing import Any, Protocol
 from backtide.gate.phrase import action, api_name, note_texts
 from backtide.notify.buttons import CONFIRM_TTL, Action, Button, ButtonBook
 from backtide.notify.telegram_api import BotApi, TelegramError
-from backtide.notify.text import inert
+from backtide.notify.text import agent_text
 
 delivery_logger = logging.getLogger("backtide.notify.telegram")
+# Not under backtide.notify: a held request of risk 3 that gets no notice of its own must reach
+# the log bridge, which makes it an alert (security review of T10-4, M4).
+unannounced_logger = logging.getLogger("backtide.holds")
 
 NOTICES_PER_MINUTE = 6  # docs/32, section 11 and decision 9
+# Risk 3 has a budget of its own: a flood of low-risk holds never hides one (review, M3).
+RISK3_PER_MINUTE = 6
 SUMMARY_EVERY = 5.0  # seconds between two edits of the summary
 MAX_TEXT = 4000
 MAX_LISTED = 10  # /retenidas sends at most this many notices
@@ -67,6 +72,8 @@ VIEW_RECIPIENTS = 64
 AGENT = "│ "
 AGENT_HEAD = "Lo que pide el agente (texto suyo, no de backtide):"
 AGENT_END = "└ fin del texto del agente"
+# The notice's frame: escaped in the agent's text, so it can never draw one (review, B1).
+MARKERS = "│└⏸"
 REASONS = {
     "delete": "un borrado (DELETE) que backtide no sabe leer",
     "write": "una escritura que backtide no sabe leer",
@@ -79,6 +86,8 @@ REASONS = {
     "credentials_long": "una lectura con credenciales demasiado largas",
     "read_budget": "una lectura que pasa del presupuesto de lecturas a hosts desconocidos",
     "draft_open": "un cambio en un borrador cuyo envío está retenido",
+    "override": "una petición con una cabecera que cambia su método o su ruta "
+    "(X-HTTP-Method-Override y parecidas)",
 }
 BY = {"telegram": "desde Telegram", "cli": "desde la terminal", "web": "desde la web"}
 EXPIRED = {
@@ -114,7 +123,9 @@ class HoldActions(Protocol):
 
 
 def _inert(text: object) -> str:
-    return inert(str(text))  # the alerts' own rule (T09): one for every message
+    # T09's rule (inert), plus the review of T10-4: runs of spaces collapsed, domains, "@" and
+    # phone numbers untappable, and our frame characters escaped.
+    return agent_text(str(text), MARKERS)
 
 
 def _one_line(text: object, limit: int = LINE_CHARS) -> str:
@@ -216,6 +227,8 @@ def hold_text(notice: Mapping[str, Any]) -> str:
     """The notice of a held request: ours first, the agent's apart and marked."""
     risk = notice.get("risk")
     what, notes = _what(notice)
+    if _replies_elsewhere(notice.get("reading")):
+        notes = [*notes, "las respuestas irían a una dirección que no es la del destinatario"]
     ours = [
         f"⏸ backtide · RETENIDA · riesgo {risk if risk in (2, 3) else '?'} · "
         f"{notice.get('hold_id')}",
@@ -226,6 +239,41 @@ def hold_text(notice: Mapping[str, Any]) -> str:
     ours.append(_countdown(notice.get("expires_in_s")))
     text = "\n".join(ours) + "\n\n" + _block(_agent_lines(notice))
     return _fit(text)
+
+
+def _replies_elsewhere(reading: object) -> bool:
+    """A Reply-To that is not among the recipients (review of T10-4, M2)."""
+    if not isinstance(reading, Mapping):
+        return False
+    reply_to = {str(item) for item in reading.get("reply_to") or []}
+    return not reply_to <= {str(item) for item in reading.get("recipients") or []}
+
+
+def quote_entities(text: str) -> list[dict[str, Any]]:
+    """The agent's block of ``text`` as a Telegram ``blockquote`` entity (security review of
+    T10-4, B1): every line Telegram wraps inside it still shows the quote's bar, so a long
+    line of the agent's cannot look like one of ours. Offsets in UTF-16 code units, as the Bot
+    API counts them; no ``parse_mode``, so nothing the agent writes is markup."""
+    head = AGENT_HEAD + "\n"
+    start, end = text.find(head), text.rfind(AGENT_END)
+    if start < 0 or end < 0:
+        return []
+    start += len(head)
+    end += len(AGENT_END)
+    if end <= start:
+        return []
+    return [{"type": "blockquote", "offset": _utf16(text[:start]),
+             "length": _utf16(text[start:end])}]  # fmt: skip
+
+
+def _quoted(text: str) -> dict[str, Any]:
+    """``entities`` for a message with the agent's block, else nothing."""
+    entities = quote_entities(text)
+    return {"entities": entities} if entities else {}
+
+
+def _utf16(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _fit(text: str) -> str:
@@ -345,6 +393,8 @@ def batch_question(notice: Mapping[str, Any], kind: str) -> str:
                 f"más vuelven a preguntar. {NEVER}"
             )
             agent = ["Destinatarios: " + _recipients(reading.get("recipients") or [])]
+            if reading.get("reply_to"):
+                agent.append("Responder a: " + _recipients(reading["reply_to"]))
         else:
             what = "envío" if reading.get("effect") == "send" else "cambio"
             ours = (
@@ -353,6 +403,8 @@ def batch_question(notice: Mapping[str, Any], kind: str) -> str:
                 f"destinatario. {NEVER}"
             )
             agent = ["Ahora va a: " + _recipients(reading.get("recipients") or [])]
+            if reading.get("reply_to"):
+                agent.append("Responder a: " + _recipients(reading["reply_to"]))
     else:
         method = notice.get("method")
         ours = (
@@ -396,11 +448,14 @@ def batches_text(rules: Sequence[Mapping[str, Any]]) -> str:
     return _fit(text)
 
 
-def summary_text(count: int) -> str:
+def summary_text(count: int, risk3: int = 0) -> str:
+    """The summary of the holds past the budget, saying how many are of risk 3 (review of
+    T10-4, M3): /retenidas sends those first."""
+    serious = f", {risk3} de riesgo 3" if risk3 > 0 else ""
     return (
-        f"backtide · {count} retenidas más sin aviso propio: el agente pide demasiadas cosas "
-        "seguidas (como mucho mando 6 avisos por minuto). Míralas con /retenidas. Si no "
-        "esperabas tantas, pausa al agente."
+        f"backtide · {count} retenidas más sin aviso propio{serious}: el agente pide demasiadas "
+        "cosas seguidas (como mucho mando 6 avisos por minuto). Míralas con /retenidas, que "
+        "manda primero las de más riesgo. Si no esperabas tantas, pausa al agente."
     )
 
 
@@ -418,6 +473,31 @@ def _message_id(result: Any) -> int | None:
         if type(found) is int:
             return found
     return None
+
+
+def _seconds(value: object) -> float:
+    return float(value) if type(value) is int and value > 0 else 0.0
+
+
+def _risk_of(notice: Mapping[str, Any]) -> int:
+    risk = notice.get("risk")
+    return risk if type(risk) is int else 0
+
+
+def _risk3(notice: Mapping[str, Any]) -> bool:
+    return _risk_of(notice) >= 3
+
+
+def _unannounced(notice: Mapping[str, Any], why: str) -> None:
+    """A held request of risk 3 that gets no notice of its own: logged where the log bridge
+    makes it an alert (review of T10-4, M4). The hold id is ours (``h-`` and hex)."""
+    hold_id = str(notice.get("hold_id"))[:16]
+    unannounced_logger.warning(
+        "a held request of risk 3 (%s) got no Telegram notice of its own (%s): "
+        "see it with /retenidas or `backtide retenidas`",
+        hold_id,
+        why,
+    )
 
 
 # --- the desk ------------------------------------------------------------------------------------
@@ -452,20 +532,28 @@ class HoldDesk:
         # hold id -> how it ended and who ended it
         self._closed: OrderedDict[str, tuple[str, str | None]] = OrderedDict()
         self._sent: deque[float] = deque()
+        self._sent3: deque[float] = deque()  # the notices of risk 3: a budget of their own
         self._unannounced = 0  # holds without a notice since the summary began
+        self._unannounced3 = 0  # of them, of risk 3
         self._summary_id: int | None = None
         self._summary_token: str | None = None  # its "Pausar"
         self._summary_since = float("-inf")
         self._summary_shown = 0
+        self._summary_shown3 = 0
         self._summary_edited = float("-inf")
         self._lost = 0
+        self._lost3 = 0
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
     # The HoldWatch: never blocks, never raises
 
     def held(self, notice: Mapping[str, Any]) -> None:
-        self._put(("held", dict(notice)))
+        item = dict(notice)
+        # When it ends, on our clock: the countdown and the buttons' life are worked out from
+        # this when the notice actually goes out, not from when it was queued (review, B5).
+        item["deadline"] = self._clock() + _seconds(item.get("expires_in_s"))
+        self._put(("held", item))
 
     def closed(self, hold_id: str, status: str, by: str | None) -> None:
         try:
@@ -479,8 +567,12 @@ class HoldDesk:
         try:
             self._queue.put_nowait(item)
         except queue.Full:
+            serious = item[0] == "held" and _risk3(item[1])
             with self._lock:
                 self._lost += 1  # told in the summary; the holds are in /retenidas anyway
+                self._lost3 += serious
+            if serious:
+                _unannounced(item[1], "queue_full")
 
     # Life
 
@@ -520,17 +612,27 @@ class HoldDesk:
 
     def _on_held(self, notice: dict[str, Any]) -> None:
         hold_id = str(notice.get("hold_id"))
+        serious = _risk3(notice)
         with self._lock:
             self._notices[hold_id] = notice
             while len(self._notices) > MAX_TRACKED:
                 self._notices.popitem(last=False)
             now = self._clock()
-            while self._sent and now - self._sent[0] >= 60.0:
-                self._sent.popleft()
-            if len(self._sent) >= self._per_minute:
+            # Risk 3 has its own budget: low-risk holds never use it up (review, M3).
+            sent, limit = (self._sent3, RISK3_PER_MINUTE) if serious else (
+                self._sent, self._per_minute)  # fmt: skip
+            while sent and now - sent[0] >= 60.0:
+                sent.popleft()
+            over = len(sent) >= limit
+            if over:
                 self._unannounced += 1
-                return
-            self._sent.append(now)
+                self._unannounced3 += serious
+            else:
+                sent.append(now)
+        if over:
+            if serious:
+                _unannounced(notice, "budget")
+            return
         self.send_notice(notice)
 
     def _on_closed(self, hold_id: str, status: str, by: str | None) -> None:
@@ -551,7 +653,9 @@ class HoldDesk:
         ``summary_every`` s)."""
         with self._lock:
             lost, self._lost = self._lost, 0
+            lost3, self._lost3 = self._lost3, 0
             self._unannounced += lost
+            self._unannounced3 += lost3
             now = self._clock()
             if self._unannounced <= self._summary_shown:
                 return
@@ -560,19 +664,20 @@ class HoldDesk:
             fresh = self._summary_id is not None and now - self._summary_since < 60.0
             if not fresh:  # a new summary counts only what the last one did not show
                 self._unannounced -= self._summary_shown
+                self._unannounced3 -= self._summary_shown3
                 self._summary_id, self._summary_token, self._summary_since = None, None, now
-            count = self._unannounced
+            count, count3 = self._unannounced, self._unannounced3
             message_id, token = self._summary_id, self._summary_token
             self._summary_edited = now
-            self._summary_shown = count
+            self._summary_shown, self._summary_shown3 = count, count3
         if message_id is not None and token is not None:
-            self._edit(message_id, summary_text(count), keyboard([[("Pausar", token)]]))
+            self._edit(message_id, summary_text(count, count3), keyboard([[("Pausar", token)]]))
             return
         token = self._book.issue(Action.PAUSE)
         markup = keyboard([[("Pausar", token)]])
         sent = self._call(
             "sendMessage",
-            {"chat_id": self._chat_id, "text": summary_text(count), "reply_markup": markup},
+            {"chat_id": self._chat_id, "text": summary_text(count, count3), "reply_markup": markup},
         )
         found = _message_id(sent)
         if found is None:
@@ -590,7 +695,11 @@ class HoldDesk:
         with self._lock:
             if hold_id in self._closed:
                 return
-        ttl = float(max(1, notice.get("expires_in_s") or 0))
+        left = self._left(notice)
+        if left <= 0:
+            return  # it expires now: its end edits nothing, and no button would work
+        notice = {**notice, "expires_in_s": left}
+        ttl = float(left)
         approve = self._book.issue(Action.APPROVE, ttl=ttl, hold_id=hold_id)
         reject = self._book.issue(Action.REJECT, ttl=ttl, hold_id=hold_id)
         view = self._book.issue(Action.VIEW, ttl=ttl, hold_id=hold_id)
@@ -613,11 +722,14 @@ class HoldDesk:
                 "text": text,
                 "reply_markup": keyboard(rows),
                 "link_preview_options": {"is_disabled": True},
-            },
+            }
+            | _quoted(text),
         )
         message_id = _message_id(sent)
         if message_id is None:
             self._book.forget(tokens)
+            if _risk3(notice):
+                _unannounced(notice, "telegram_failed")
             return
         self._book.bind(tokens, message_id)
         with self._lock:
@@ -637,7 +749,8 @@ class HoldDesk:
                 "text": text,
                 "reply_markup": markup if markup is not None else {"inline_keyboard": []},
                 "link_preview_options": {"is_disabled": True},
-            },
+            }
+            | _quoted(text),
         )
 
     def _call(self, method: str, params: dict[str, Any]) -> Any:
@@ -648,11 +761,12 @@ class HoldDesk:
             return None
 
     def _send(self, text: str, rows: list[list[tuple[str, str]]] | None = None) -> int | None:
+        fitted = _fit(text)
         params: dict[str, Any] = {
             "chat_id": self._chat_id,
-            "text": _fit(text),
+            "text": fitted,
             "link_preview_options": {"is_disabled": True},
-        }
+        } | _quoted(fitted)
         if rows:
             params["reply_markup"] = keyboard(rows)
         return _message_id(self._call("sendMessage", params))
@@ -688,6 +802,14 @@ class HoldDesk:
                 return f"Esa retención ya está cerrada: {retired_note(ended[0])}."
         return message
 
+    def _left(self, notice: Mapping[str, Any]) -> int:
+        """Whole seconds left of the hold, now (``deadline``; the count it came with if it
+        has none)."""
+        deadline = notice.get("deadline")
+        if isinstance(deadline, int | float):
+            return max(0, math.ceil(deadline - self._clock()))
+        return int(_seconds(notice.get("expires_in_s")))
+
     def _notice_of(self, hold_id: str) -> dict[str, Any] | None:
         with self._lock:
             found = self._notices.get(hold_id)
@@ -708,8 +830,10 @@ class HoldDesk:
             return "Esa retención ya no está abierta."
         if kind not in (notice.get("batches") or []):
             return "Esta petición no puede abrir ese lote."
-        left = notice.get("expires_in_s")
-        ttl = min(CONFIRM_TTL, float(left)) if type(left) is int and left > 0 else CONFIRM_TTL
+        left = self._left(notice)
+        if left <= 0:
+            return "Esa retención ya no está abierta."
+        ttl = min(CONFIRM_TTL, float(left))
         cancel = self._book.issue(Action.BATCH_CANCEL, ttl=ttl, single_use=True, hold_id=hold_id)
         confirm = self._book.issue(
             Action.BATCH_CONFIRM, ttl=ttl, single_use=True, group=cancel, hold_id=hold_id, kind=kind
@@ -728,16 +852,23 @@ class HoldDesk:
         pending = self._actions.pending_holds()
         if not pending:
             return "No hay ninguna petición retenida."
+        # The riskiest first, the oldest first within each risk (review of T10-4, M3): a risk 3
+        # behind ten low-risk ones is never left out.
+        pending = sorted(pending, key=lambda summary: -_risk_of(summary))
         shown = pending[:MAX_LISTED]
         more = len(pending) - len(shown)
         head = f"Hay {len(pending)} retenidas abiertas; te las mando con sus botones."
         if more > 0:
-            head += f" Van las {len(shown)} más antiguas; el resto, con `backtide retenidas`."
+            head += (
+                f" Van {len(shown)}: primero las de más riesgo y, dentro, las más antiguas; el "
+                "resto, con `backtide retenidas`."
+            )
         self._send(head)
+        now = self._clock()
         for summary in shown:
             hold_id = str(summary.get("hold_id"))
             notice = self._notice_of(hold_id) or dict(summary)
-            notice["expires_in_s"] = summary.get("expires_in_s")
+            notice["deadline"] = now + _seconds(summary.get("expires_in_s"))
             self.send_notice(notice)
         return None
 

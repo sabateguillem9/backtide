@@ -565,8 +565,11 @@ def delete_event(path: str = "/v1/buckets/b1", flow_id: str = "f1") -> dict[str,
     return request_event(path=path, method="DELETE", flow_id=flow_id)
 
 
+TOKEN_ID = "c" * 64  # the credential_id the proxy sends (fingerprint.credential_id)
+
+
 def write_facts(fp: str = DELETE_FP, **changes: Any) -> dict[str, Any]:
-    return facts(fp, exact_read=False, **changes)
+    return facts(fp, exact_read=False, **({"credential_id": TOKEN_ID} | changes))
 
 
 class Gated:
@@ -1509,3 +1512,95 @@ def test_a_plain_write_batch_by_method_host_and_route(batched: tuple[Gated, Watc
     assert (rule.details["method"], rule.details["host"], rule.details["route"]) == (
         "POST", "example.com", "/v1/items/*/notes"
     )  # fmt: skip
+
+
+# --- the security review of T10-4 ----------------------------------------------------------------
+
+
+def plain_batch(gated: Gated, host: str = "example.com") -> str:
+    """A "POST a este host y ruta, 1 h" batch, made from a held POST."""
+    event = request_event(host, path="/v1/items/12/notes", method="POST", flow_id="f1")
+    hold_id = gated.ask(event, write_facts(("1" if host == "example.com" else "2") * 64))["hold_id"]
+    outcome = make_batch(gated, hold_id, "kind")
+    assert str(outcome.status) == "created"
+    return str(outcome.rule_id)
+
+
+def post(gated: Gated, n: int, *, headers: list[list[str]] | None = None, scheme: str = "https",
+         port: int = 443, host: str = "example.com", **gate: Any) -> dict[str, Any]:  # fmt: skip
+    event = request_event(host, path=f"/v1/items/{n}/notes", method="POST", flow_id=f"f{n}",
+                          headers=headers or [], scheme=scheme, port=port)  # fmt: skip
+    return gated.ask(event, write_facts(f"{n + 100:064x}", **gate))
+
+
+def test_a_disguised_delete_never_rides_a_batch(batched: tuple[Gated, Watched]) -> None:
+    """A1: a POST with X-HTTP-Method-Override: DELETE is a deletion (risk 3), never batched;
+    an override name the recording keeps but the proxy did not report counts, unread."""
+    gated, watch = batched
+    plain_batch(gated)
+    assert post(gated, 2)["verdict"] == "allow"  # the batch works
+    override = [["X-HTTP-Method-Override", "DELETE"]]
+    ack = post(gated, 3, headers=override, override="DELETE")
+    assert ack["verdict"] == "hold"
+    held = gated.gate_events("held")[-1]
+    assert (held.risk, held.details["reason"]) == (3, "delete")
+    assert watch.held_notices[-1]["batches"] == []
+    unreported = post(gated, 4, headers=[["X-Original-URL", "/admin"]])
+    assert unreported["verdict"] == "hold" and gated.gate_events("held")[-1].risk == 3
+    assert post(gated, 5, override="PUT")["verdict"] == "hold"
+    assert gated.gate_events("held")[-1].details["reason"] == "override"
+    assert post(gated, 6, trailers=True)["verdict"] == "hold"
+
+
+def test_a_plain_batch_is_bound_to_its_token_scheme_and_port(
+    batched: tuple[Gated, Watched],
+) -> None:
+    """M1 and B3: another token, a token the redaction recognises, http or another port ask
+    again."""
+    gated, _ = batched
+    plain_batch(gated)
+    assert post(gated, 2, credential_id="d" * 64)["verdict"] == "hold"
+    assert post(gated, 4, scheme="http", port=80)["verdict"] == "hold"
+    assert post(gated, 5)["verdict"] == "allow"
+    # A token the redaction recognises (every "Bearer …"): the agent's own toward a listed API,
+    # so the batch (bound to it) covers it; toward a host off the list, never.
+    assert post(gated, 3, credentials_struck=True)["verdict"] == "allow"
+    plain_batch(gated, "unlisted.test")
+    assert post(gated, 6, host="unlisted.test")["verdict"] == "allow"
+    assert post(gated, 7, host="unlisted.test", credentials_struck=True)["verdict"] == "hold"
+
+
+def test_no_batch_is_used_while_the_agent_is_frozen(box: BlackBox) -> None:
+    """B4: as an approval, a batch lets nothing pass while the person's pause is open or a
+    rewind runs, even before reject_open ended it."""
+    frozen = {"now": False}
+    watch = Watched()
+    gated = Gated(box, watch=watch, policy=policy(unknown_hosts="hold"),
+                  frozen=lambda: frozen["now"])  # fmt: skip
+    try:
+        plain_batch(gated)
+        frozen["now"] = True
+        assert post(gated, 2)["verdict"] == "hold"
+        frozen["now"] = False
+        assert post(gated, 3)["verdict"] == "allow"
+    finally:
+        gated.channel.close()
+
+
+def test_the_batches_end_even_if_rejecting_the_holds_fails(
+    batched: tuple[Gated, Watched], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B4: a pause whose rejection breaks half way still ends every batch."""
+    gated, _ = batched
+    rule_id = plain_batch(gated)
+
+    def broken() -> list[Any]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(gated.channel._book, "reject_open", broken)  # noqa: SLF001
+    with pytest.raises(RuntimeError):
+        gated.channel.reject_open("pause")
+    assert gated.channel.batches() == []
+    [end] = gated.gate_events("batch_rule_end")
+    assert end.details == {"rule_id": rule_id, "why": "pause", "uses": 0}
+    assert post(gated, 2)["verdict"] == "hold"

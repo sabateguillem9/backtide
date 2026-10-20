@@ -1596,8 +1596,10 @@ def test_every_net_request_carries_its_gate_facts() -> None:
     facts = facts_of(Flow(request=Request(method="GET", path="/v1/items?page=2")))
     assert set(facts) == {"fp", "url_struck", "url_bytes", "websocket", "exact_read",
                           "wait_hint_s", "headers_struck", "header_bytes", "credential_bytes",
-                          "credentials_struck", "body_struck", "reading"}  # fmt: skip
+                          "credentials_struck", "body_struck", "reading", "override",
+                          "trailers", "credential_id"}  # fmt: skip
     assert facts["reading"] is None and facts["credential_bytes"] == 0  # no translator here
+    assert facts["override"] is None and facts["trailers"] is False
     assert facts["headers_struck"] is False
     assert facts["header_bytes"] == len("Host") + len("example.com")
     assert facts["exact_read"] is True and facts["url_struck"] is False
@@ -1697,6 +1699,44 @@ def test_a_get_with_a_method_override_is_not_a_read(override: str) -> None:
 def test_a_get_with_trailers_is_not_a_read() -> None:
     request = get_with(trailers=Headers([("X-Checksum", "1")]))
     assert facts_of(Flow(request=request))["exact_read"] is False
+
+
+@pytest.mark.parametrize(
+    ("headers", "override"),
+    [
+        ((("X-HTTP-Method-Override", "delete"),), "DELETE"),
+        ((("X-Method-Override", " PATCH "),), "PATCH"),
+        ((("X-HTTP-Method", "DELETE"), ("X-HTTP-Method-Override", "DELETE")), "DELETE"),
+        ((("X-HTTP-Method", "DELETE"), ("X-HTTP-Method-Override", "PUT")), "?"),  # two verbs
+        ((("X-Original-URL", "/admin/delete"),), "?"),  # a path
+        ((("X-HTTP-Method-Override", "DEL ETE"),), "?"),  # not a method
+    ],
+)
+def test_what_the_override_headers_say(headers: tuple[tuple[str, str], ...], override: str) -> None:
+    """Security review of T10-4, A1: backtide must know an override says DELETE (risk 3, no
+    batch); a path, two methods or something else is unreadable ("?")."""
+    facts = facts_of(Flow(request=get_with(*headers)))
+    assert facts["override"] == override and facts["exact_read"] is False
+
+
+def test_trailers_are_told() -> None:
+    facts = facts_of(Flow(request=get_with(trailers=Headers([("X-Checksum", "1")]))))
+    assert facts["trailers"] is True
+
+
+def test_the_credential_id_tells_one_token_from_another() -> None:
+    """Review of T10-4, M1: a batch without a translator is bound to the credential headers;
+    the proxy sends their HMAC under the connection's key, never the token."""
+
+    def credential(*headers: tuple[str, str]) -> str:
+        return str(facts_of(Flow(request=get_with(*headers)))["credential_id"])
+
+    mine = credential(("Authorization", "Bearer token-uno"))
+    assert len(mine) == 64 and "token-uno" not in mine
+    assert mine == credential(("Authorization", "Bearer token-uno"), ("User-Agent", "x"))
+    assert mine != credential(("Authorization", "Bearer token-dos"))
+    assert mine != credential(("Authorization", "Bearer token-uno"), ("Cookie", "s=1"))
+    assert credential() != mine  # none at all is a credential id too
 
 
 def test_the_fingerprint_counts_the_headers_and_the_trailers() -> None:

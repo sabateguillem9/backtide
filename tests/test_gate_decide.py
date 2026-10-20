@@ -291,3 +291,50 @@ def test_a_plain_read_ignores_a_batch() -> None:
     assert verdict(replace(READ, url_bytes=MAX_READ_URL + 1, batch="b-0123abcd"))[0] is (
         Verdict.HOLD
     )
+
+
+# --- the security review of T10-4 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "GET", "PATCH"])
+def test_an_override_that_says_delete_is_a_delete_and_never_rides_a_batch(method: str) -> None:
+    """A1: ``POST`` with ``X-HTTP-Method-Override: DELETE`` is a DELETE to many servers."""
+    disguised = replace(WRITE, method=method, override="DELETE", batch="b-0123abcd")
+    assert verdict(disguised) == (Verdict.HOLD, "delete", 3)
+
+
+@pytest.mark.parametrize(
+    ("override", "risk"), [("?", 3), ("PURGE", 3), ("MOVE", 3), ("PUT", 2), ("POST", 2)]
+)
+def test_any_other_override_is_held_and_never_rides_a_batch(override: str, risk: int) -> None:
+    """A1: a path, an unreadable value or another verb than the plain writes is risk 3."""
+    assert verdict(replace(WRITE, override=override, batch="b-0123abcd")) == (
+        Verdict.HOLD, "override", risk
+    )  # fmt: skip
+    assert verdict(replace(WRITE, override=override, body_struck=True))[2] == 3
+
+
+def test_trailers_never_ride_a_batch() -> None:
+    assert verdict(replace(WRITE, trailers=True, batch="b-0123abcd")) == (Verdict.HOLD, "write", 2)
+
+
+def test_a_recognisable_token_rides_a_batch_only_toward_a_listed_api() -> None:
+    """M1: the redaction strikes every ``Bearer …``; toward a listed API it is the agent's own
+    token (T10-3, H1, and the batch is bound to it); toward any other host, never batched."""
+    stray = replace(WRITE, credentials_struck=True, batch="b-0123abcd", allowed=False)
+    assert verdict(stray) == (Verdict.HOLD, "write", 2)
+    own = replace(WRITE, credentials_struck=True, batch="b-0123abcd", allowed=True)
+    assert verdict(own) == (Verdict.PASS, "batch", 0)
+
+
+def test_a_translated_request_with_an_override_or_trailers_never_passes() -> None:
+    """A1: the translators read them as UNKNOWN; even a reading that said otherwise is held,
+    with risk 3 when the override says DELETE or cannot be read."""
+    covered = replace(TG_SEND, reading=ReadingFacts(Effect.SEND, 2, trusted=True,
+                                                    batch="b-0123abcd"))  # fmt: skip
+    assert verdict(replace(covered, override="DELETE")) == (Verdict.HOLD, "send", 3)
+    assert verdict(replace(covered, override="?")) == (Verdict.HOLD, "send", 3)
+    assert verdict(replace(covered, override="POST")) == (Verdict.HOLD, "send", 2)
+    assert verdict(replace(covered, trailers=True)) == (Verdict.HOLD, "send", 2)
+    read = replace(TG_SEND, reading=ReadingFacts(Effect.READ, 0))
+    assert verdict(replace(read, override="DELETE")) == (Verdict.HOLD, "read", 3)

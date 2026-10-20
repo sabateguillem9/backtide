@@ -91,6 +91,31 @@ OVERRIDE_HEADERS = frozenset(
     {"x-http-method-override", "x-method-override", "x-http-method", "x-original-method",
      "x-original-url", "x-rewrite-url", "x-forwarded-prefix"}
 )  # fmt: skip
+# The override headers that name a method (the rest name a path).
+METHOD_OVERRIDE_HEADERS = frozenset(
+    {"x-http-method-override", "x-method-override", "x-http-method", "x-original-method"}
+)
+UNKNOWN_OVERRIDE = "?"
+_VERB_RE = re.compile(r"[A-Z]{1,16}", re.ASCII)
+
+
+def override_of(headers: Iterable[tuple[str, str]]) -> str | None:
+    """What a request's override headers say (security review of T10-4, A1): None when it has
+    none, the one method they name (upper case, ``DELETE``), or ``UNKNOWN_OVERRIDE`` when they
+    name a path, more than one method, or something that is not a method: the gate cannot tell
+    what the server will do then, so it fails closed."""
+    found = [(str(name).strip().lower(), str(value)) for name, value in headers
+             if str(name).strip().lower() in OVERRIDE_HEADERS]  # fmt: skip
+    if not found:
+        return None
+    if any(name not in METHOD_OVERRIDE_HEADERS for name, _ in found):
+        return UNKNOWN_OVERRIDE
+    verbs = {value.strip().upper() for _, value in found}
+    if len(verbs) != 1:
+        return UNKNOWN_OVERRIDE
+    verb = verbs.pop()
+    return verb if _VERB_RE.fullmatch(verb) else UNKNOWN_OVERRIDE
+
 
 _SEGMENT_RE = re.compile(r"[A-Za-z0-9_~:@+$=!-][A-Za-z0-9._~:@+$=!-]*", re.ASCII)
 _MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}")

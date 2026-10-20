@@ -103,6 +103,7 @@ from backtide.gate.protocol import BLOCK_RISK, LineReader, ProtocolError, Sender
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import (
     OVERRIDE_HEADERS,
+    UNKNOWN_OVERRIDE,
     Effect,
     Note,
     Reading,
@@ -383,9 +384,13 @@ class ProxyChannel:
         book: HoldBook | None = None,
         read_budget: ReadBudget | None = None,
         watch: HoldWatch | None = None,
+        frozen: Callable[[], bool] | None = None,
     ) -> None:
         self._sock = sock
         self._watch = watch
+        # Whether the agent is paused or being rewound (the Guardian's): no batch is used then,
+        # as no approval is given (security review of T10-4, B4).
+        self._frozen: Callable[[], bool] = frozen if frozen is not None else lambda: False
         self._record = record
         self._policy = policy
         self._allow = policy.allow_list()
@@ -620,21 +625,24 @@ class ProxyChannel:
         headers = details.get("headers")
         headers = headers if isinstance(headers, dict) else {}
         overridden = any(str(name).strip().lower() in OVERRIDE_HEADERS for name in headers)
+        # What the proxy read of the override headers; a name the recording keeps that the
+        # proxy did not report still counts, unread (security review of T10-4, A1).
+        override = gate["override"]
+        if override is None and overridden:
+            override = UNKNOWN_OVERRIDE
         headers_struck_here = any(
             isinstance(value, str) and self._scrub.text(value) != value
             for value in headers.values()
         ) or any(self._scrub.text(str(name)) != str(name) for name in headers)  # a name too
         reading = gate["reading"]
         method = str(details.get("method", ""))
-        # A batch is looked up only when no hold of this fingerprint is open: the request then
-        # joins it, so the waiting one and this one never both go out (T10-4).
-        scope: Scope | None = None
-        if self._book.live(fp) is None:
-            if reading is not None:
-                scope = reading_scope(reading)
-            elif isinstance(path, str) and isinstance(host, str):
-                scope = plain_scope(method, host, path, risk=2, reason="write")
-        rule = None if scope is None else self._book.batch_for(scope)
+        # A batch is looked up only when no hold of this fingerprint is open (the request then
+        # joins it, so the waiting one and this one never both go out: T10-4) and never while
+        # the agent is paused or being rewound, as an approval (security review of T10-4, B4).
+        scope = self._scope(details, gate, override, risk=2, reason="write", allowed=allowed)
+        rule = None
+        if scope is not None and self._book.live(fp) is None and not self._frozen():
+            rule = self._book.batch_for(scope)
         facts = Facts(
             method=method,
             exact_read=gate["exact_read"] and not overridden,
@@ -652,6 +660,8 @@ class ProxyChannel:
             body_struck=gate["body_struck"],
             reading=None if reading is None else self._reading_facts(reading, rule),
             batch=None if reading is not None or rule is None else rule.rule_id,
+            override=override,
+            trailers=gate["trailers"],
         )
         decision = decide(facts, unknown_hosts=self._policy.unknown_hosts)
         if decision.verdict is Verdict.PASS and decision.reason == "read" and not allowed:
@@ -701,6 +711,43 @@ class ProxyChannel:
             batch=None if rule is None else rule.rule_id,
         )
 
+    def _scope(
+        self,
+        details: Mapping[str, Any],
+        gate: Mapping[str, Any],
+        override: str | None,
+        *,
+        risk: int,
+        reason: str,
+        allowed: bool,
+    ) -> Scope | None:
+        """What the request is, for the batches (``holds.Scope``): from its reading, or from
+        its method, host, route and credential headers; with the connection's scheme and port.
+        Nothing with an override header or trailers is batchable, nor a plain write whose
+        credential headers carry a token the redaction recognises toward a host off the allowed
+        list (security review of T10-4, A1 and M1; toward a listed API that token is the
+        agent's own, as for the reads of T10-3, H1)."""
+        scheme = details.get("scheme") if isinstance(details.get("scheme"), str) else None
+        port = details.get("port") if type(details.get("port")) is int else None
+        batchable = override is None and not gate["trailers"]
+        reading = gate["reading"]
+        if reading is not None:
+            return reading_scope(reading, risk=risk, scheme=scheme, port=port, batchable=batchable)
+        path, host = details.get("path"), details.get("host")
+        if not (isinstance(path, str) and isinstance(host, str)):
+            return None
+        return plain_scope(
+            str(details.get("method", "")),
+            host,
+            path,
+            risk=risk,
+            reason=reason if batchable else "override",
+            scheme=scheme,
+            port=port,
+            credential=gate["credential_id"],
+            credentials_struck=gate["credentials_struck"] and not allowed,
+        )
+
     def _hold(
         self, request_id: int, event: dict[str, Any], gate: dict[str, Any], risk: int, reason: str
     ) -> dict[str, Any]:
@@ -713,13 +760,16 @@ class ProxyChannel:
             self._book.join(hold, event)
         else:
             draft = None if reading is None else _draft_key(reading)
-            details = event["details"]
-            if reading is not None:
-                scope = reading_scope(reading, risk=risk)
-            else:
-                method_, host_ = str(details.get("method", "")), str(details.get("host", ""))
-                path_ = str(details.get("path", ""))
-                scope = plain_scope(method_, host_, path_, risk=risk, reason=reason)
+            override = gate["override"]
+            headers = event["details"].get("headers")
+            if override is None and isinstance(headers, dict):
+                if any(str(name).strip().lower() in OVERRIDE_HEADERS for name in headers):
+                    override = UNKNOWN_OVERRIDE
+            host_ = event["details"].get("host")
+            allowed = isinstance(host_, str) and self._allow.allows(host_)
+            scope = self._scope(
+                event["details"], gate, override, risk=risk, reason=reason, allowed=allowed
+            )
             hold = self._book.open(
                 fp, risk=risk, reason=reason, event=event, draft=draft, scope=scope
             )
@@ -917,17 +967,31 @@ class ProxyChannel:
         with self._gate_lock:
             if self.closed:
                 return 0
-            holds = self._book.reject_open()
-            reason = "paused" if by == "pause" else "rejected"
-            for hold in holds:
-                self._gate_event("rejected", hold, {"by": by}, risk=1)
-                if hold.connected:
-                    self._tell_decision(protocol.decision(hold.hold_id, "deny", reason=reason))
-                self._tell_closed(hold, "rejected", by)
-            # A batch is leave too: a pause or a rewind ends every one (T10-4).
-            for rule in self._book.end_batches():
-                self._batch_ended(rule, by)
+            try:
+                holds = self._book.reject_open()
+                reason = "paused" if by == "pause" else "rejected"
+                for hold in holds:
+                    self._gate_event("rejected", hold, {"by": by}, risk=1)
+                    if hold.connected:
+                        self._tell_decision(protocol.decision(hold.hold_id, "deny", reason=reason))
+                    self._tell_closed(hold, "rejected", by)
+            finally:
+                # A batch is leave too: a pause or a rewind ends every one (T10-4), even when
+                # rejecting the holds failed half way (security review of T10-4, B4).
+                self.end_batches(by)
             return len(holds)
+
+    def end_batches(self, why: str) -> int:
+        """End every batch rule now (``gate/batch_rule_end {why}``). Never raises for a rule
+        whose end cannot be recorded: it is gone all the same."""
+        with self._gate_lock:
+            ended = self._book.end_batches()
+            for rule in ended:
+                try:
+                    self._batch_ended(rule, why)
+                except Exception:
+                    logger.exception("recording the end of a batch rule failed")
+            return len(ended)
 
     def tick(self) -> None:
         """The holds whose 5 min are over, and the flood count (every TICK_EVERY s)."""

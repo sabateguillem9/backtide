@@ -16,6 +16,7 @@ from backtide.service.holds import (
     BatchRule,
     HoldBook,
     HoldTimings,
+    Scope,
     State,
     plain_scope,
     reading_scope,
@@ -538,9 +539,18 @@ def test_a_use_is_counted() -> None:
     assert rule.uses == 1
 
 
+TOKEN_ID, OTHER_TOKEN_ID = "c" * 64, "d" * 64  # fingerprint.credential_id of two tokens
+
+
+def plain(method: str, path: str, host: str = "api.fake.test", **changes: object) -> Scope:
+    options: dict[str, object] = {"risk": 2, "reason": "write", "scheme": "https", "port": 443,
+                                  "credential": TOKEN_ID} | changes  # fmt: skip
+    return plain_scope(method, host, path, **options)  # type: ignore[arg-type]
+
+
 def plain_hold(book: HoldBook, method: str, path: str, *, fp: str = FP, risk: int = 2,
                reason: str = "write"):  # fmt: skip
-    scope = plain_scope(method, "api.fake.test", path, risk=risk, reason=reason)
+    scope = plain(method, path, risk=risk, reason=reason)
     hold = book.open(fp, risk=risk, reason=reason, event=EVENT, scope=scope)
     assert hold is not None
     book.recorded(hold, 10)
@@ -554,9 +564,8 @@ def test_a_write_without_translator_offers_only_its_kind_by_method_host_and_rout
     rule = book.add_batch(hold, BatchKind.KIND)
     assert isinstance(rule, BatchRule)
 
-    def covered(method: str, path: str, host: str = "api.fake.test") -> bool:
-        scope = plain_scope(method, host, path, risk=2, reason="write")
-        return book.batch_for(scope) is rule
+    def covered(method: str, path: str, host: str = "api.fake.test", **changes: object) -> bool:
+        return book.batch_for(plain(method, path, host, **changes)) is rule
 
     assert covered("POST", "/v1/items/99/notes?b=7&draft=0")
     assert not covered("POST", "/v1/items/99/notes?b=7")  # other parameter names
@@ -564,6 +573,15 @@ def test_a_write_without_translator_offers_only_its_kind_by_method_host_and_rout
     assert not covered("PUT", "/v1/items/99/notes?b=7&draft=0")
     assert not covered("POST", "/v1/items/99/notes?b=7&draft=0", host="other.fake.test")
     assert not covered("POST", "/v1/users/99/notes?b=7&draft=0")
+    # Security review of T10-4: another token (M1), a token the redaction recognises (M1),
+    # unknown credentials, plain http or another port (B3), an override header (A1).
+    path = "/v1/items/99/notes?b=7&draft=0"
+    assert not covered("POST", path, credential=OTHER_TOKEN_ID)
+    assert not covered("POST", path, credentials_struck=True)
+    assert not covered("POST", path, credential=None)
+    assert not covered("POST", path, scheme="http", port=80)
+    assert not covered("POST", path, port=8443)
+    assert not covered("POST", path, reason="override")
 
 
 def test_routes_star_numbers_long_hex_and_uuids() -> None:
@@ -589,3 +607,53 @@ def test_no_batch_for_deletions_secrets_odd_methods_or_guarded_reads(
 def test_a_hold_without_a_scope_offers_none() -> None:
     book, _ = make()
     assert book.offers(held(book)) == ()
+
+
+# --- the security review of T10-4 ----------------------------------------------------------------
+
+
+def test_a_recipient_batch_never_covers_answers_that_go_elsewhere() -> None:
+    """M2: "todo a ana" must not cover a mail to ana whose Reply-To is someone else."""
+    book, _ = make()
+    rule = book.add_batch(held_reading(book), BatchKind.RECIPIENT)
+    assert isinstance(rule, BatchRule)
+    assert book.batch_for(reading_scope(reading(reply_to=["556"]))) is rule
+    assert book.batch_for(reading_scope(reading(reply_to=["x@malo.example"]))) is None
+    # A hold whose answers go elsewhere offers no recipient batch (the kind one says "to
+    # anyone" already, and the question shows the Reply-To).
+    elsewhere = held_reading(book, fp=OTHER, reply_to=["x@malo.example"])
+    assert book.offers(elsewhere) == (BatchKind.KIND,)
+
+
+def test_a_batch_is_bound_to_its_scheme_and_port() -> None:
+    """B3: an https batch never covers http (nor another port), for both kinds."""
+    book, _ = make()
+    scope = reading_scope(reading(), scheme="https", port=443)
+    hold = book.open(FP, risk=2, reason="send", event=EVENT, scope=scope)
+    assert hold is not None
+    book.recorded(hold, 10)
+    rule = book.add_batch(hold, BatchKind.KIND)
+    assert isinstance(rule, BatchRule) and (rule.scope.scheme, rule.scope.port) == ("https", 443)
+    assert book.batch_for(reading_scope(reading(), scheme="https", port=443)) is rule
+    assert book.batch_for(reading_scope(reading(), scheme="http", port=80)) is None
+    assert book.batch_for(reading_scope(reading(), scheme="https", port=8443)) is None
+
+
+def test_an_override_or_trailers_make_a_reading_unbatchable() -> None:
+    """A1: ``reading_scope(batchable=False)`` for a request with either."""
+    book, _ = make()
+    rule = book.add_batch(held_reading(book), BatchKind.RECIPIENT)
+    assert isinstance(rule, BatchRule)
+    assert book.batch_for(reading_scope(reading(), batchable=False)) is None
+    hold = book.open(OTHER, risk=2, reason="send", event=EVENT,
+                     scope=reading_scope(reading(), batchable=False))  # fmt: skip
+    assert hold is not None and book.offers(hold) == ()
+
+
+def test_a_plain_write_with_a_recognisable_token_or_unknown_credentials_offers_none() -> None:
+    """M1: the batch would let that token (a secret, maybe not the agent's) out again."""
+    book, _ = make()
+    for n, changes in enumerate(({"credentials_struck": True}, {"credential": None})):
+        scope = plain("POST", "/v1/x", **changes)
+        hold = book.open(f"{n:064x}", risk=2, reason="write", event=EVENT, scope=scope)
+        assert hold is not None and book.offers(hold) == ()

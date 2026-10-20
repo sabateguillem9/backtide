@@ -41,6 +41,7 @@ KEY_BYTES = 32
 SHORT = 16  # characters of a fingerprint kept in the black box
 _EXACT = b"backtide-fp-v2"
 _SEMANTIC = b"backtide-fp-v2-semantic"
+_CREDENTIALS = b"backtide-credentials-v1"
 # Headers that do not count: each one either says nothing to the server about what to do or as
 # whom (it changes with every attempt or every client version, and the same request sent again
 # must stay the same request), or it only frames the message, whose bytes count already.
@@ -114,6 +115,17 @@ def fingerprint(
             hashlib.sha256(content).digest(),
         )
     )
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def credential_id(key: bytes, credentials: Iterable[tuple[str, str]]) -> str:
+    """Who a request acts as, 64 hex characters: an HMAC of its credential headers
+    (``Authorization``, ``Cookie``, ``PRIVATE-TOKEN``...; the same names and values the
+    fingerprint hashes), under its own tag. A batch rule without a translator is bound to it,
+    so another token never rides it (security review of T10-4, M1). Never recorded."""
+    if not isinstance(key, bytes) or len(key) != KEY_BYTES:
+        raise ValueError("a fingerprint key is 32 bytes")
+    message = _field(_CREDENTIALS) + _field(_headers_digest(credentials))
     return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 

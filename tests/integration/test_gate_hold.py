@@ -464,7 +464,8 @@ def test_a_get_with_a_method_override_is_held(lab: Lab) -> None:
     result = lab.ask("GET", path, timeout=2, headers={"X-HTTP-Method-Override": "DELETE"})
     assert result["ok"] is False, result
     held = lab.held(path)
-    assert held.details["reason"] == "write"
+    # Security review of T10-4, A1: an override that says DELETE is a deletion (risk 3).
+    assert (held.details["reason"], held.risk) == ("delete", 3)
     assert lab.decide(held.details["hold_id"], "reject")["outcome"] == "rejected"
     assert lab.arrived(path) == []
 

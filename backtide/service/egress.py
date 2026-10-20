@@ -90,6 +90,9 @@ class EgressHooks:
     record: Callable[..., Event | None]
     alert: Callable[..., None]
     back: Callable[[], None] = lambda: None
+    # Whether the agent is paused or being rewound: then no batch rule lets anything pass, as
+    # no approval is given (security review of T10-4, B4).
+    frozen: Callable[[], bool] = lambda: False
 
 
 Connect = Callable[[ProxyJail, float], ProxyChannel]
@@ -262,7 +265,25 @@ class Egress:
             return channel.reject_open(by)
         except Exception:
             logger.exception("rejecting the held requests failed")
+            self.end_batches(by)  # all the same (reject_open ends them in a finally, too)
             return 0
+
+    def end_batches(self, by: str) -> int:
+        """End every batch rule (a pause or a rewind whose rejection failed). Never raises."""
+        channel = self._channel
+        if channel is None or channel.closed:
+            return 0
+        try:
+            return channel.end_batches(by)
+        except Exception:
+            logger.exception("ending the batch rules failed")
+            return 0
+
+    def _frozen(self) -> bool:
+        """The Guardian's ``frozen`` (False before ``start``): read by the channel under its
+        gate lock, so it never blocks."""
+        hooks = self._hooks
+        return hooks is not None and hooks.frozen()
 
     # New keys (T12e)
 
@@ -486,6 +507,7 @@ class Egress:
                         timings=self._timings,
                         read_budget=self._read_budget,
                         watch=self._watch,
+                        frozen=self._frozen,
                     )
                     channel.handshake(max(0.5, deadline - self._mono()))
                 except BaseException:

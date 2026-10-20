@@ -86,6 +86,11 @@ HOLD_ANSWERS = {
     Action.BATCH_CONFIRM: "Creando el lote…",
     Action.BATCH_END: "Revocando el lote…",
 }
+# Presses that count against the command rate limit: saying yes or asking for more. Saying no
+# (Rechazar, Cancelar, Revocar), "Pausar" and a rewind's "Sí" or "Cancelar" never do.
+RATE_LIMITED = frozenset(
+    {Action.NOTICE, Action.APPROVE, Action.VIEW, Action.BATCH, Action.BATCH_CONFIRM}
+)
 REFUSED_TEXT = {
     Refused.UNKNOWN: "Este botón ya no vale (es de antes de reiniciar backtide, o no es nuestro).",
     Refused.EXPIRED: "Este botón ha caducado.",
@@ -446,6 +451,15 @@ class TelegramBot:
             self._ignore("not_owner", "callback_query", chat_id, from_id)
             return  # not even answered
         query_id = query.get("id")
+        # The rate limit comes BEFORE the button is taken: a press it refuses must not use up a
+        # single-use button ("Sí, crear el lote"), so pressing again later still works.
+        peeked = self._book.peek(query.get("data"))
+        if (
+            peeked is not None
+            and peeked.action in RATE_LIMITED
+            and not self._allowed(chat_id, from_id, query_id)
+        ):
+            return
         button = self._book.take(query.get("data"), message.get("message_id"))
         if isinstance(button, Refused):
             self._ignore(str(button), "callback_query", chat_id, from_id)
@@ -459,9 +473,7 @@ class TelegramBot:
             self._answer(query_id, "")
             self._reply(text)
             return
-        if button.action is Action.NOTICE:
-            if not self._allowed(chat_id, from_id, query_id):
-                return
+        if button.action is Action.NOTICE:  # rate limited above
             self._answer(query_id, "")
             self._submit(lambda: self._ask_to_confirm(button))
             return
@@ -486,13 +498,11 @@ class TelegramBot:
 
     def _on_hold_button(self, button: Button, query_id: Any, chat_id: Any, from_id: Any) -> None:
         """A held request's button (T10-4). Saying no (Rechazar, Cancelar, Revocar) is never
-        rate limited; saying yes or asking for more is, like a command."""
+        rate limited; saying yes or asking for more is, like a command (``RATE_LIMITED``,
+        checked in ``_on_button`` before the button is taken)."""
         desk = self._desk
         if desk is None:
             self._answer(query_id, REFUSED_TEXT[Refused.UNKNOWN])
-            return
-        cheap = button.action in (Action.REJECT, Action.BATCH_CANCEL, Action.BATCH_END)
-        if not cheap and not self._allowed(chat_id, from_id, query_id):
             return
         self._answer(query_id, HOLD_ANSWERS.get(button.action, ""))
         self._submit(lambda: self._reply_if(desk.press(button)))

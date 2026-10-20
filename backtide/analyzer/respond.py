@@ -22,8 +22,12 @@ Design: docs/27-diseno-t08-reglas.md, section "Qué pasa con el riesgo 3".
   straight away without a snapshot: the agent is already stopped or the service is not up.
 - Alerts carry no secrets (``redact``) and quote a path the agent chose only escaped and cut.
 - **A held request** (``gate/held`` of risk 3, T10-4) gets its evidence snapshot like any other
-  event, but no alert from here: its own notice in Telegram, with "Aprobar" and "Rechazar", is
-  the alert (docs/32, section 5), and a second one would only add fatigue.
+  event, but no alert from here when the Telegram hold desk is on (``quiet_holds``): its own
+  notice, with "Aprobar" and "Rechazar", is the alert (docs/32, section 5), and a second one
+  would only add fatigue. Without the desk it alerts like any other event, and so does one that
+  a rule of the person's matched too: that rule's alert is not the hold's to silence. When the
+  desk cannot send a notice of risk 3 (its budget, its queue, Telegram down) it logs a warning,
+  which the log bridge makes an alert (security review of T10-4, M4).
 """
 
 import logging
@@ -46,7 +50,10 @@ ALERT_EVERY = 60.0  # seconds between two alerts for the same rule
 RETRY_AFTER = 10.0  # after a snapshot that failed, before trying another
 MAX_KEYS = 512  # rules (or source/action pairs) remembered for the alert throttle
 EXCERPT_CHARS = 100
-QUIET = "gate/held"  # its key: answered with a snapshot, never with this alert (T10-4)
+HELD = "gate/held"
+# The key of a held request while the hold desk is on: answered with a snapshot, never with this
+# alert (T10-4). Not a source/action, so a gate/held alerted without the desk never matches it.
+QUIET = "quiet:gate/held"
 
 
 @dataclass
@@ -75,8 +82,10 @@ class RiskResponder:
         evidence_per_day: int = EVIDENCE_PER_DAY,
         alert_every: float = ALERT_EVERY,
         retry_after: float = RETRY_AFTER,
+        quiet_holds: bool = False,
     ) -> None:
         self._alerts = alerts
+        self._quiet_holds = quiet_holds  # a hold desk tells of each gate/held (T10-4)
         self._clock = clock
         self._evidence_every = evidence_every
         self._evidence_per_day = evidence_per_day
@@ -150,7 +159,12 @@ class RiskResponder:
     def note(self, event: Event, rules: tuple[str, ...], description: str) -> None:
         """An event of risk 3 was recorded. Never blocks, never raises."""
         own = f"{event.source}/{event.action}"
-        key = QUIET if own == QUIET else rules[0] if rules else own
+        if rules:
+            key = rules[0]  # a rule of the person's matched it: never silenced (review, M4)
+        elif own == HELD and self._quiet_holds:
+            key = QUIET
+        else:
+            key = own
         try:
             with self._cond:
                 if self._closing:

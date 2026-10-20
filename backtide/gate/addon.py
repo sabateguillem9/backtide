@@ -58,7 +58,7 @@ from backtide.gate import protocol, record
 from backtide.gate.client import Ack, Channel, GateConfig, Slot
 from backtide.gate.decide import READ_METHODS
 from backtide.gate.echo import KeyEcho, KeyScanner, SseGuard
-from backtide.gate.fingerprint import fingerprint
+from backtide.gate.fingerprint import credential_id, fingerprint
 from backtide.gate.policy import (
     host_mismatch,
     is_ip,
@@ -80,6 +80,7 @@ from backtide.gate.translate.base import (
     RequestView,
     Shape,
     body_has_secret,
+    override_of,
     unknown,
 )
 
@@ -573,6 +574,11 @@ class Gate:
             body_struck=reading is None and bool(body) and body_has_secret(body, config.scrubber),
             wait_hint_s=None if reading is None else reading.wait_s,
             reading=None if reading is None else _wire_reading(reading),
+            # Security review of T10-4: what a batch must not cover (A1) and whose token it is
+            # (M1, never recorded: only backtide's memory compares it).
+            override=override_of(headers),
+            trailers=bool(trailers),
+            credential_id=credential_id(config.fp_key, credentials),
         )
 
     @staticmethod

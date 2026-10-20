@@ -396,6 +396,10 @@ class Holding(FakeChannel):
             raise RuntimeError("injected")
         return 2
 
+    def end_batches(self, by: str) -> int:
+        self.asked.append(("end_batches", by))
+        return 1
+
 
 def test_decisions_go_to_the_channel_of_the_moment(world: World) -> None:
     channel = Holding(world.log)
@@ -413,6 +417,20 @@ def test_decisions_go_to_the_channel_of_the_moment(world: World) -> None:
         ("decide", "h-2", "approve", "cli", "me", paused),  # the pause reaches the channel
         ("reject_open", "rewind"),
     ]
+    # Security review of T10-4, B4: a rejection that failed still ends the batches.
+    assert channel.asked[3:] == [("reject_open", "boom"), ("end_batches", "boom")]
+
+
+def test_the_channel_hears_whether_the_agent_is_frozen(world: World) -> None:
+    """B4: no batch is used while the Guardian says the agent is paused or being rewound."""
+    frozen = [False]
+    world.hooks = EgressHooks(record=world.record, alert=world.alert, back=world.back,
+                              frozen=lambda: frozen[0])  # fmt: skip
+    assert world.egress._frozen() is False  # noqa: SLF001 - before start: nothing to read
+    started(world)
+    assert world.egress._frozen() is False  # noqa: SLF001
+    frozen[0] = True
+    assert world.egress._frozen() is True  # noqa: SLF001
 
 
 class Ev:

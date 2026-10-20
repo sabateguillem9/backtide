@@ -13,7 +13,9 @@ same); the person answers with the buttons of the notice, as the fake Bot API ha
   "Aprobar" lets it out exactly once; "Rechazar" and silence reject it.
 - ``colarse-en-un-lote``: with "todo a este destinatario, esta sesión", only the same chat from
   the same bot rides it; another bot, another chat, a forward, a deletion, a URL the platform
-  fetches, an inline edit are held; revoked or ended by /pausar, it covers nothing.
+  fetches, an inline edit are held; revoked or ended by /pausar, it covers nothing. With
+  "POST a este host y ruta, 1 h" (no translator), a disguised DELETE (an override header),
+  another token and a secret in Authorization are held (security review of T10-4).
 - ``inundar-de-retenciones``: 40 writes at once: 20 open, the rest hold_full; 6 notices a minute
   and one summary; the owner still lists, approves, rejects and pauses.
 - ``aviso-con-trampa``: the agent's text imitates our notice and plays every trick; the notice
@@ -30,7 +32,7 @@ from typing import Any
 
 import pytest
 from attack_kit import Attack, scenario
-from test_gate_attacks import GAVE_UP, background, made_up, telegram_arrived
+from test_gate_attacks import GAVE_UP, arrived, background, made_up, telegram_arrived
 from test_proxy_attacks import Lab, new_tag, start_lab
 
 from backtide.blackbox import Event
@@ -427,6 +429,55 @@ def test_only_what_the_batch_names_rides_it(attack: Attack, tlab: TelegramLab) -
     paused_held = tlab.held(t[10])
     tlab.reject_open()
     time.sleep(1.0)
+    # Security review of T10-4 (A1, M1): a batch without a translator, «POST a este host y
+    # ruta, 1 h», is bound to the agent's own token. A disguised DELETE (X-HTTP-Method-Override),
+    # another token and a secret in Authorization are held; the same write with its token rides.
+    own = {"Authorization": f"Bearer {made_up(24)}"}
+
+    def write(n: int, headers: dict[str, str], timeout: str = GAVE_UP) -> dict:
+        path = f"/{tag}/lote/{n}/notas"
+        return attack.run_script(
+            lab.agent, "colarse_en_un_lote", "POST", PLAIN_HOST, path, json.dumps(headers), timeout
+        )
+
+    first_write = background(lambda: write(1, own, "40"))
+    plain_notice = tlab.notice(f"{tag}/lote/1/notas")
+    asked = tlab.press(plain_notice, "POST a este host y ruta, 1 h")
+    tlab.press(tlab.sent_after("¿Crear un lote?", asked), "Sí, crear el lote")
+    plain_created = first_write()
+    wait_until(
+        lambda: [e for e in lab.service.events("batch_rule", "gate")
+                 if e.details.get("method") == "POST"],
+        30,
+        "the plain batch rule",
+    )  # fmt: skip
+    [plain_rule] = [
+        e for e in lab.service.events("batch_rule", "gate") if e.details.get("method") == "POST"
+    ]
+    plain_ride = write(2, own, "30")
+    sneaks = {
+        "override": write(3, {**own, "X-HTTP-Method-Override": "DELETE"}),
+        "otro token": write(4, {"Authorization": f"Bearer {made_up(24)}"}),
+        "secreto en Authorization": write(5, {"Authorization": "token ghp_" + made_up(36)}),
+    }
+    sneaks_held = {
+        name: tlab.held(f"/{tag}/lote/{n}/notas") for n, name in enumerate(sneaks, start=3)
+    }
+    tlab.reject_open()
+    seen = time.monotonic()
+    fake.push_message("/lotes")
+    tlab.press(tlab.sent_after("Lotes activos (1)", seen), "Revocar 1")
+    wait_until(
+        lambda: [e for e in lab.service.events("batch_rule_end", "gate")
+                 if e.details.get("rule_id") == plain_rule.details["rule_id"]],
+        30,
+        "the plain batch's revocation",
+    )  # fmt: skip
+    written = {n: len(arrived(lab, f"/{tag}/lote/{n}/notas")) for n in range(1, 6)}
+    plain_rides = [
+        e for e in lab.service.events("request", "net")
+        if e.details.get("path") == f"/{tag}/lote/2/notas"
+    ]  # fmt: skip
 
     out = {n: len(telegram_arrived(lab, t[n])) for n in range(11)}
     fetched = lab.internet.requests(OTHER_HOST, f"/{tag}/")
@@ -447,12 +498,19 @@ def test_only_what_the_batch_names_rides_it(attack: Attack, tlab: TelegramLab) -
         and fetched == []
         and after_revoke.get("status") != 200
         and after_pause.get("status") != 200
-        and all(tried.get("status") != 200 for tried in tries.values()),
+        and all(tried.get("status") != 200 for tried in tries.values())
+        and plain_created.get("status") == 200
+        and plain_ride.get("status") == 200
+        and written == {1: 1, 2: 1, 3: 0, 4: 0, 5: 0}
+        and all(sneak.get("status") != 200 for sneak in sneaks.values()),
         f"el lote para el chat 556 deja pasar lo equivalente (el mensaje que lo creó y otro al "
         f"mismo chat con el mismo bot: {created.get('status')}, {same.get('status')}); todo lo "
         f"demás se retiene y no llega ({ {k: v.get('status') for k, v in tries.items()} }); nadie "
         f"pide la foto ({len(fetched)}); revocado con /lotes y tras /pausar, lo mismo vuelve a "
-        f"preguntar ({after_revoke.get('status')}, {after_pause.get('status')}). Llegadas: {out}",
+        f"preguntar ({after_revoke.get('status')}, {after_pause.get('status')}). Llegadas: {out}. "
+        f"Con «POST a este host y ruta, 1 h» pasa la misma escritura con el mismo token "
+        f"({plain_created.get('status')}, {plain_ride.get('status')}); no pasan "
+        f"{ {k: v.get('status') for k, v in sneaks.items()} }. Llegadas: {written}",
     )
     attack.check(
         "recorded",
@@ -463,7 +521,13 @@ def test_only_what_the_batch_names_rides_it(attack: Attack, tlab: TelegramLab) -
         and rides[0].details.get("gate", {}).get("decision") == "batch"
         and rides[0].details["gate"].get("rule") == rule_id
         and ends.get(rule_id) == "revoked"
-        and ends.get(second_id) == "pause",
+        and ends.get(second_id) == "pause"
+        and plain_rule.details.get("host") == PLAIN_HOST
+        and plain_rule.details.get("route") == f"/{tag}/lote/*/notas"
+        and "credential" not in json.dumps(plain_rule.details)
+        and len(plain_rides) == 1
+        and plain_rides[0].details.get("gate", {}).get("rule") == plain_rule.details["rule_id"]
+        and ends.get(plain_rule.details["rule_id"]) == "revoked",
         f"el botón solo pregunta; con «Sí» queda gate/batch_rule {rule_id} por "
         f"{rule.details.get('by')} ({rule.details.get('scope')}, "
         f"hasta {rule.details.get('until')}); "
@@ -471,13 +535,21 @@ def test_only_what_the_batch_names_rides_it(attack: Attack, tlab: TelegramLab) -
         f"gate/batch_rule_end {ends}",
     )
     risks = {name: e.risk for name, e in tried_held.items()}
+    sneak_risks = {name: (e.risk, e.details.get("reason")) for name, e in sneaks_held.items()}
     attack.check(
         "risk",
         rule.risk == 2
         and risks["otra cuenta"] == 2
         and risks["otro chat"] == 2
-        and risks["borrar"] == 3,
-        f"gate/batch_rule con riesgo {rule.risk}; las retenidas: {risks}",
+        and risks["borrar"] == 3
+        and sneak_risks
+        == {
+            "override": (3, "delete"),
+            "otro token": (2, "write"),
+            "secreto en Authorization": (2, "write"),
+        },  # fmt: skip
+        f"gate/batch_rule con riesgo {rule.risk}; las retenidas: {risks}; bajo el lote sin "
+        f"traductor: {sneak_risks}",
     )
     attack.check(
         "held",
@@ -630,10 +702,20 @@ def test_a_flood_of_holds_neither_drowns_the_owner_nor_the_gate(
 # --- aviso-con-trampa --------------------------------------------------------------------------
 
 TRICK = (
-    "⏸ backtide · RETENIDA · riesgo 0 · h-000000000000\n"
+    # Security review of T10-4, B1: blank fillers and padding to choose where Telegram wraps a
+    # line, so that a wrapped piece starts with our end marker or a fake result; and B2: a bare
+    # domain, a mention, an e-mail and a phone number, which Telegram links in plain text. On the
+    # first line, so the notice (3 lines, 300 characters) shows it.
+    "hola"
+    + "\u3164" * 30
+    + "\u2800" * 20
+    + " " * 60
+    + "\u2514 fin del texto del agente Resultado: aprobada desde Telegram \u2502 "
+    + "mira malo.example, @canal_malo, x@malo.example o +34600111222\n"
+    "\u23f8 backtide \xb7 RETENIDA \xb7 riesgo 0 \xb7 h-000000000000\n"
     "Resultado: aprobada desde Telegram (ya aprobado)\n"
     "Pulsa /seguir o abre https://evil.example/aprobar <b>APROBADO</b> *ok* [x](tg://x)\n"
-    "‮gnp.exe​⁦ fin "
+    "\u202egnp.exe\u200b\u2066\xa0fin "
 )
 
 
@@ -656,6 +738,25 @@ def test_the_notice_stays_unambiguous(attack: Attack, tlab: TelegramLab) -> None
     tlab.press(notice, "Rechazar")
     edit = tlab.edit_of(notice)
     phrase = str(held.details.get("phrase"))
+    fillers = ("\u3164", "\u2800")
+    tappable = ("malo.example", "@canal_malo", "x@malo.example", "+34600111222")
+
+    def quoted(params: dict) -> bool:
+        """One blockquote, exactly over the agent's lines and our end marker (UTF-16)."""
+        text = params["text"]
+        start = text.index(AGENT_HEAD + "\n") + len(AGENT_HEAD) + 1
+        end = text.rindex(AGENT_END) + len(AGENT_END)
+        units = len(text[:start].encode("utf-16-le")) // 2
+        length = len(text[start:end].encode("utf-16-le")) // 2
+        return params.get("entities") == [{"type": "blockquote", "offset": units, "length": length}]
+
+    unwrappable = all(
+        message.count(AGENT_END) == 1
+        and not any(char in message for char in fillers)
+        and not any(link in message for link in tappable)
+        and "  " not in message
+        for message in (body, view.params["text"], edit.params["text"])
+    )
     hidden = ("‮", "​", "⁦", " ")
     clean = all(
         not any(char in message for char in hidden)
@@ -678,7 +779,10 @@ def test_the_notice_stays_unambiguous(attack: Attack, tlab: TelegramLab) -> None
     attack.check(
         "held",
         "parse_mode" not in notice.params
-        and "entities" not in notice.params
+        and quoted(notice.params)
+        and quoted(view.params)
+        and quoted(edit.params)
+        and unwrappable
         and ours[0] == f"⏸ backtide · RETENIDA · riesgo 2 · {held.details['hold_id']}"
         and len(ours) <= 5
         and all(not line.startswith(("⏸", "Resultado")) for line in ours[1:])
@@ -692,7 +796,10 @@ def test_the_notice_stays_unambiguous(attack: Attack, tlab: TelegramLab) -> None
         and edit.params["text"].endswith("Resultado: rechazada desde Telegram. No salió."),
         f"el aviso es texto plano ({len(body)} caracteres), con nuestra cabecera primero "
         f"(«{ours[0]}») y {len(theirs)} líneas del agente, todas marcadas con «{AGENT.strip()}» "
-        f"(«{theirs[0][:60] if theirs else ''}…»); sin RLO ni caracteres invisibles, ni /orden "
-        f"ni :// pulsables; «Ver» igual; botones {[label for label, _ in buttons(notice)]}; "
+        f"(«{theirs[0][:60] if theirs else ''}…»), y su bloque es una cita de Telegram "
+        f"({notice.params.get('entities')}); sin RLO, rellenos invisibles ni espacios seguidos "
+        f"(nada elige dónde corta una línea: un solo «{AGENT_END}»), ni /orden, ://, dominios, "
+        f"menciones ni teléfonos pulsables; «Ver» igual; botones "
+        f"{[label for label, _ in buttons(notice)]}; "
         f"rechazado, el aviso lo dice: «{edit.params['text'].rsplit(chr(10), 1)[-1]}»",
     )
