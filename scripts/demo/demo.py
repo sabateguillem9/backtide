@@ -43,7 +43,8 @@ from typing import Any
 
 import backtide.cli as cli
 from backtide.blackbox import BlackBox, BlackBoxError, Event, load_key
-from backtide.jail import IMAGE, AgentJail
+from backtide.jail import IMAGE, AgentJail, proxy_config
+from backtide.jail.proxy import ProxyJail
 from backtide.service.config import ServiceConfig
 from backtide.service.offline import rewind_without_service
 from backtide.snapshots import SnapshotError, SnapshotStore, btrfs
@@ -66,7 +67,10 @@ OLD_NETWORK = "vigia-demo-net"
 # The demo's config does not name its egress proxy, so it runs under the default names.
 PROXY_CONTAINER = "backtide-proxy"
 PROXY_NETWORK = "backtide-salida-net"
-PROCESS_MARK = b"scripts.demo.demo"  # what the service's /proc/<pid>/cmdline contains
+# `make probar FALSO=1` (scripts/demo/probar.py): the test's fake internet on that network.
+FAKE_INTERNET = "backtide-probar-internet"
+FAKE_INTERNET_FOLDER = "internet-falso"  # its files, inside the demo's folder
+PROCESS_MARK = b"scripts.demo."  # in the service's /proc/<pid>/cmdline: demo.py or probar.py
 PROJECT = "/workspace/work/proyecto"  # inside the agent: the folder the demo creates and deletes
 SNAPSHOT_WAIT = 90.0  # a cycle, the sync and the snapshot, on a loaded VM
 FEED_INTERVAL = 1.0
@@ -276,11 +280,35 @@ def sudo_qgroup_limit(path: Path, limit: int | None) -> None:
 # -- The concession: the real `backtide` command, with what a non-root VM user needs --------------
 
 
+def dev_proxy(config: ServiceConfig, **grants: Any) -> ProxyJail:
+    """The production egress proxy of ``config`` with the concessions the VM tests use
+    (tests/integration/proxy_kit.py): the VM user's ids, the channel folder on the disk (its
+    tmpfs needs root to mount) and a copy of backtide's package next to the state (SELinux's
+    ``:z`` cannot relabel the Lima mount where the repository lives). ``grants`` are the fake
+    internet's (``make probar FALSO=1``); without them the proxy goes out to the real internet."""
+    package = config.state_dir.parent / f"{config.state_dir.name}-code" / "backtide"
+    if not package.exists():
+        package.parent.mkdir(mode=0o700, exist_ok=True)
+        shutil.copytree(
+            proxy_config.PACKAGE_DIR,
+            package,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    settings = replace(
+        config.proxy_jail_config(),
+        package_dir=package,
+        allow_shared_ids=True,
+        channel_tmpfs=False,
+        **grants,
+    )
+    return ProxyJail(settings)
+
+
 def serve_without_root(config: ServiceConfig, **options: Any) -> None:
     from backtide.service import runner
 
     jail = AgentJail(replace(config.jail_config(), allow_shared_ids=True))
-    runner.serve(config, jail=jail, **options)
+    runner.serve(config, jail=jail, proxy=dev_proxy(config), **options)
 
 
 _production_rewind = rewind_without_service
@@ -291,9 +319,10 @@ def rewind_without_root(config: ServiceConfig, snapshot_id: str, **options: Any)
     return _production_rewind(config, snapshot_id, jail=jail, **options)
 
 
-def run_backtide(*argv: str) -> int:
-    """`backtide <argv>` as it is, in this process, with the concessions installed."""
-    cli.serve = serve_without_root  # type: ignore[attr-defined]
+def run_backtide(*argv: str, serve: Any = serve_without_root) -> int:
+    """`backtide <argv>` as it is, in this process, with the concessions installed (``serve``:
+    the one `backtide vigilar` runs; probar.py hands its own)."""
+    cli.serve = serve  # type: ignore[attr-defined]
     cli.rewind_without_service = rewind_without_root  # type: ignore[attr-defined]
     btrfs.set_qgroup_limit = sudo_qgroup_limit  # type: ignore[assignment]  # looked up at call
     return cli.main(list(argv))
@@ -341,7 +370,7 @@ def remove_agent() -> None:
     """Remove the demo containers (the agent, its proxy and the old pre-rename agent), then
     their networks: a stopped container still holds the btrfs in its own mount namespace, which
     would make the umount fail. ``-v``: their anonymous volumes go too. Missing ones are fine."""
-    for container in (CONTAINER, PROXY_CONTAINER, OLD_CONTAINER):
+    for container in (CONTAINER, PROXY_CONTAINER, OLD_CONTAINER, FAKE_INTERNET):
         run(["docker", "rm", "--force", "--volumes", container])
     networks = run(["docker", "network", "ls", "--format", "{{.Name}}"]).stdout.split()
     for network in (NETWORK, PROXY_NETWORK, OLD_NETWORK):
@@ -378,7 +407,20 @@ def teardown(paths: Paths) -> None:
     if paths.base.exists():
         if mount_at(paths.mnt) is not None:  # never delete a folder with a volume still in it
             raise DemoError(f"{paths.mnt} sigue montado: no se borra {paths.base}")
+        _make_writable(paths.base / FAKE_INTERNET_FOLDER)
         shutil.rmtree(paths.base)
+
+
+def _make_writable(folder: Path) -> None:
+    """The fake internet's folders (`make probar FALSO=1`) are read-only (0555) for its
+    container: ours to write again, so ``rmtree`` can remove them (never following a link)."""
+    if folder.is_symlink() or not folder.is_dir():
+        return
+    for directory, subdirs, _ in os.walk(folder):
+        os.chmod(directory, 0o700)
+        for name in subdirs:
+            if not os.path.islink(os.path.join(directory, name)):
+                os.chmod(os.path.join(directory, name), 0o700)
 
 
 def render_config(paths: Paths, uid: int, gid: int) -> str:
@@ -403,7 +445,12 @@ def render_config(paths: Paths, uid: int, gid: int) -> str:
     )
 
 
-def create_volume(paths: Paths) -> None:
+def create_volume(
+    paths: Paths, render: Any = None, *, telegram: bool = True, image_size: int = IMAGE_SIZE
+) -> None:
+    """The demo's volume, state and config (``render(paths, uid, gid)``, by default the
+    demo's own ``render_config``; probar.py hands its own), and the founder's bot unless
+    ``telegram`` is false (`make probar FALSO=1`: nothing may reach the real Telegram)."""
     mkfs = shutil.which("mkfs.btrfs")
     if mkfs is None:
         raise DemoError("falta mkfs.btrfs: btrfs-progs debe estar instalado en la VM")
@@ -413,7 +460,7 @@ def create_volume(paths: Paths) -> None:
     )
     paths.mnt.mkdir(mode=0o700)
     with open(paths.image, "xb") as image:  # x: never reuse or overwrite an existing file
-        image.truncate(IMAGE_SIZE)
+        image.truncate(image_size)
     run([mkfs, "-q", "-L", "backtide-demo", "-O", "squota", str(paths.image)])
     sudo("mount", "-o", MOUNT_OPTIONS, str(paths.image), str(paths.mnt))
     try:
@@ -427,9 +474,10 @@ def create_volume(paths: Paths) -> None:
         token = paths.state / "gateway.token"
         token.write_text(secrets.token_urlsafe(32) + "\n")
         token.chmod(0o600)
-        paths.config.write_text(render_config(paths, os.getuid(), os.getgid()))
+        paths.config.write_text((render or render_config)(paths, os.getuid(), os.getgid()))
         paths.config.chmod(0o600)
-        copy_telegram(paths)
+        if telegram:
+            copy_telegram(paths)
     except BaseException:
         teardown(paths)  # leave nothing mounted behind
         raise
@@ -591,14 +639,16 @@ def command_instantaneas(paths: Paths) -> int:
     return code
 
 
-def command_rebobinar(paths: Paths, snapshot: str | None, *, yes: bool) -> int:
+def command_rebobinar(
+    paths: Paths, snapshot: str | None, *, yes: bool, target_name: str = "demo-rebobinar"
+) -> int:
     target = snapshot or saved_id(paths.before_file)
     if target is None:
         raise DemoError(
-            "di la instantánea: make demo-rebobinar ID=<id> (mira make demo-instantaneas)"
+            f"di la instantánea: make {target_name} ID=<id> (mira la lista de instantáneas)"
         )
     real_stdout = sys.stdout
-    sys.stdout = _UndoHint(real_stdout)  # type: ignore[assignment]
+    sys.stdout = _UndoHint(real_stdout, target_name)  # type: ignore[assignment]
     try:
         return run_backtide(
             "rebobinar", "--config", str(paths.config), target, *(["--si"] if yes else [])
@@ -611,11 +661,12 @@ class _UndoHint:
     """Wraps stdout so `Para deshacer: backtide rebobinar <id>` reads as the demo's own command.
     Everything else, the question included, goes through as it is."""
 
-    def __init__(self, stream: Any) -> None:
+    def __init__(self, stream: Any, target_name: str = "demo-rebobinar") -> None:
         self._stream = stream
+        self._target = target_name
 
     def write(self, text: str) -> int:
-        return self._stream.write(text.replace("backtide rebobinar ", "make demo-rebobinar ID="))
+        return self._stream.write(text.replace("backtide rebobinar ", f"make {self._target} ID="))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
@@ -640,7 +691,7 @@ def describe(event: Event) -> str | None:
     return f"{when}  sistema     {event.action:<15} {target}".rstrip()
 
 
-def feed_black_box(paths: Paths, stop: threading.Event) -> None:
+def feed_black_box(paths: Paths, stop: threading.Event, show: Any = None) -> None:
     """Print what the black box records, as it happens, until ``stop``. Read-only: it opens the
     database the way the tests do and never writes to it. A failure here only ends the view,
     never the service, and says so."""
@@ -664,7 +715,7 @@ def feed_black_box(paths: Paths, stop: threading.Event) -> None:
             for event in box.events():
                 if event.seq > last:
                     last = event.seq
-                    line = describe(event)
+                    line = (show or describe)(event)
                     if line is not None:
                         print(line, flush=True)
     except BlackBoxError as error:
@@ -690,6 +741,12 @@ def build_parser() -> argparse.ArgumentParser:
         "snapshot", metavar="instantánea", nargs="?", help="por defecto, la que dejó `crear`"
     )
     rewind.add_argument("--si", action="store_true", help="no pedir confirmación")
+    rewind.add_argument(
+        "--orden",
+        choices=("demo-rebobinar", "probar-rebobinar"),
+        default="demo-rebobinar",
+        help="la orden de make que sale en «Para deshacer»",
+    )
     commands.add_parser("parar", help="para todo, desmonta el volumen y borra la demo")
     return parser
 
@@ -712,7 +769,7 @@ def main(argv: list[str] | None = None) -> int:
                 return command_instantaneas(paths)
             case "rebobinar":
                 require_demo_mount(paths)
-                return command_rebobinar(paths, args.snapshot, yes=args.si)
+                return command_rebobinar(paths, args.snapshot, yes=args.si, target_name=args.orden)
             case "parar":
                 require_dev_vm_user_with_sudo()
                 teardown(paths)

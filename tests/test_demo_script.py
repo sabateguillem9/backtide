@@ -150,7 +150,7 @@ def test_a_linked_bot_file_is_refused(tmp_path: Path) -> None:
         demo.copy_telegram(_paths_with_state(tmp_path), link)
 
 
-def test_stopping_the_demo_also_removes_the_old_names_and_the_proxy(
+def test_stopping_the_demo_also_removes_the_old_names_the_proxy_and_the_fake_internet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[list[str]] = []
@@ -166,6 +166,11 @@ def test_stopping_the_demo_also_removes_the_old_names_and_the_proxy(
 
     removed_containers = {c[-1] for c in commands if c[:2] == ["docker", "rm"]}
     removed_networks = {c[-1] for c in commands if c[:3] == ["docker", "network", "rm"]}
-    assert removed_containers == {demo.CONTAINER, demo.PROXY_CONTAINER, demo.OLD_CONTAINER}
+    assert removed_containers == {
+        demo.CONTAINER,
+        demo.PROXY_CONTAINER,
+        demo.OLD_CONTAINER,
+        demo.FAKE_INTERNET,
+    }
     assert removed_networks == {demo.OLD_NETWORK, demo.PROXY_NETWORK}  # not someone-elses-net
     assert all("--volumes" in c for c in commands if c[:2] == ["docker", "rm"])

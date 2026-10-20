@@ -31,6 +31,7 @@ from urllib.parse import quote
 
 from backtide.jail import docker as jail_docker
 from backtide.jail import proxy_config
+from backtide.service.config import ServiceConfig
 from tests.integration.proxy_kit import test_proxy
 from tests.integration.service_kit import Service
 from tests.integration.test_proxy_assumptions import (
@@ -154,6 +155,15 @@ class FakeInternet:
 def start_fake_internet(service: Service, root: Path) -> FakeInternet:
     """Make the service's egress network (as its proxy will find it) and start the fake
     internet on it. The service must not be running yet."""
+    return start_fake_internet_for(service.config, root)
+
+
+def start_fake_internet_for(
+    config: ServiceConfig, root: Path, name: str | None = None
+) -> FakeInternet:
+    """``start_fake_internet`` for a service's ``config``, named ``name`` (by default a unique
+    name under the tests' cleanup prefix). `make probar FALSO=1` (scripts/demo/probar.py) uses
+    it with a fixed name that `make probar-parar` removes."""
     root.mkdir(mode=0o755, exist_ok=True)
     root.chmod(0o755)
     certs, files, internet = root / "certs", root / "t06", root / "internet"
@@ -169,9 +179,9 @@ def start_fake_internet(service: Service, root: Path) -> FakeInternet:
         for path in folder.iterdir():
             path.chmod(0o444)
         folder.chmod(0o555)
-    proxy = test_proxy(service.config)
+    proxy = test_proxy(config)
     proxy.ensure_network()
-    name = unique(CONTAINER_PREFIX)
+    name = name or unique(CONTAINER_PREFIX)
     argv = hardened(name, FAKE_UID) + ["--network", proxy.config.network]
     for host in HOSTS:
         argv += ["--network-alias", host]

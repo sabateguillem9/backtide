@@ -13,9 +13,14 @@ DEMO_VM = $(UV_VM) python -m scripts.demo.demo
 # apart from the Mac's own `make web-demo`, so both can be open at once (Lima forwards the VM's).
 DEMO_WEB_CONFIG = $$HOME/backtide-demo-run/backtide.toml
 DEMO_WEB_PORT = 8766
+# The founder's hands-on test (docs/probar.md): the real OpenClaw thinking with Claude. It lives
+# where the demo lives (same folder, config path and web port), so the two never run together.
+PROBAR_VM = $(UV_VM) python -m scripts.demo.probar
+MODEL ?= claude-sonnet-5-5
 
 .PHONY: help test lint fmt it ataques demo demo-crear demo-archivos demo-borrar demo-instantaneas \
-	demo-rebobinar demo-parar demo-web web-demo vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
+	demo-rebobinar demo-parar demo-web web-demo probar probar-web probar-pedir probar-instantaneas \
+	probar-rebobinar probar-parar vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -69,6 +74,32 @@ demo-web: ## Demo: the web of the running demo, in the VM (open the link on the 
 	@if lsof -nP -iTCP:$(DEMO_WEB_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
 	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --rebobinar --aprobar'
+
+probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5), en primer plano (terminal 1; docs/probar.md)
+	@case "$(MODEL)" in ""|*[!0-9A-Za-z._:/@+-]*) echo "MODEL tiene caracteres raros" >&2; exit 2;; esac
+	@case "$(FALSO)" in ""|1) ;; *) echo "FALSO solo puede valer 1" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) up --modelo $(MODEL) $(if $(FALSO),--internet-falso)'
+
+probar-web: ## Prueba real: la web con Ajustes, aprobar y rebobinar (abre el enlace en el Mac; docs/probar.md)
+	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
+	@if lsof -nP -iTCP:$(DEMO_WEB_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
+	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay prueba en marcha: lanza antes make probar (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --ajustes --aprobar --rebobinar'
+
+probar-pedir: ## Prueba real: un mensaje al agente y su respuesta (MSG="...")
+	@test -n "$$MSG" || { echo 'Di qué le pides: make probar-pedir MSG="..."' >&2; exit 2; }
+	@m=$$(printf '%s' "$$MSG" | base64 | tr -d '\n'); \
+	$(VM_SH) '$(PROBAR_VM) pedir '"$$m"
+
+probar-instantaneas: ## Prueba real: lista las instantáneas
+	$(VM_SH) '$(PROBAR_VM) instantaneas'
+
+probar-rebobinar: ## Prueba real: rebobina (ID=<instantánea>; SI=1 salta la pregunta)
+	@case "$(ID)" in ""|*[!0-9A-Za-z._-]*) echo "Di la instantánea: make probar-rebobinar ID=<id> (mira make probar-instantaneas)" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) rebobinar $(ID) $(if $(SI),--si)'
+
+probar-parar: ## Prueba real: para todo, desmonta y borra el volumen (y la clave que pusiste en Ajustes)
+	$(VM_SH) '$(DEMO_VM) parar'
 
 web-demo: ## Web demo on the Mac, no VM: made-up black box and snapshots + the web; Ctrl-C stops (docs/demo.md)
 	@dir=$$(mktemp -d "$${TMPDIR:-/tmp}/backtide-web-demo.XXXXXX") || exit 1; \
