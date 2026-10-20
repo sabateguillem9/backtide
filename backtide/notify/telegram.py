@@ -32,16 +32,24 @@ from the agent (a file name) cannot become markup, and control characters are es
 
 import logging
 import queue
-import re
 import threading
 import time
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from backtide.blackbox import redact
 from backtide.notify import Alert, AlertLevel
-from backtide.notify.buttons import CONFIRM_TTL, Action, Button, ButtonBook, RateLimit, Refused
+from backtide.notify.buttons import (
+    CONFIRM_TTL,
+    HOLD_ACTIONS,
+    Action,
+    Button,
+    ButtonBook,
+    RateLimit,
+    Refused,
+)
+from backtide.notify.hold_notice import HoldDesk
 from backtide.notify.telegram_api import BotApi, TelegramError
+from backtide.notify.text import inert, printable
 
 # Bridged into the black box (``backtide.*``): polling problems are worth recording.
 logger = logging.getLogger("backtide.telegram")
@@ -64,11 +72,20 @@ HELP = (
     "Órdenes:\n"
     "/pausar: congela al agente al momento, desde fuera.\n"
     "/seguir: lo reanuda.\n"
-    "/estado: cómo está el agente.\n\n"
+    "/estado: cómo está el agente.\n"
+    "/retenidas: las peticiones que esperan tu sí, con sus botones.\n"
+    "/lotes: los lotes de aprobación activos, para revocarlos.\n\n"
     "En cada aviso, «Pausar» congela al agente y «Rebobinar» devuelve su carpeta a la "
     "instantánea de antes del aviso (antes te enseña qué se deshace y qué no, y te pide "
-    "confirmación)."
+    "confirmación). En cada petición retenida, «Aprobar» la deja salir una vez, «Rechazar» la "
+    "para y «Ver» te enseña lo que guarda la caja negra; si no respondes, se rechaza sola."
 )
+HOLD_ANSWERS = {
+    Action.APPROVE: "Aprobando…",
+    Action.REJECT: "Rechazando…",
+    Action.BATCH_CONFIRM: "Creando el lote…",
+    Action.BATCH_END: "Revocando el lote…",
+}
 REFUSED_TEXT = {
     Refused.UNKNOWN: "Este botón ya no vale (es de antes de reiniciar backtide, o no es nuestro).",
     Refused.EXPIRED: "Este botón ha caducado.",
@@ -125,28 +142,6 @@ def alert_text(alert: Alert) -> str:
     if len(body) > room:
         body = body[: max(room - 1, 0)] + "…"
     return head + body + cited
-
-
-_COMMAND_OR_LINK = re.compile(r"(?<![\w/])/(?=[A-Za-z])|://")
-
-
-def inert(text: str) -> str:
-    """``printable(redact(text))`` with every ``/word`` and ``://`` made untappable: Telegram
-    finds commands and links even in plain text, and an alert can quote a file name the agent
-    chose ("Pulsa /seguir para confirmar", "https://..."). The slash becomes U+2215."""
-    return _COMMAND_OR_LINK.sub(
-        lambda found: "∕" if found.group(0) == "/" else ":∕∕", printable(redact(text))
-    )
-
-
-def printable(text: str) -> str:
-    """``text`` with every control or invisible-formatting character escaped, keeping line
-    breaks: alerts quote names the agent chose, and an RLO or a zero-width space could make a
-    message say something else."""
-    return "\n".join(
-        "".join(char if char.isprintable() else repr(char)[1:-1] for char in line)
-        for line in str(text).split("\n")
-    )
 
 
 def _keyboard(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
@@ -241,9 +236,11 @@ class TelegramBot:
         monotonic: Callable[[], float] = time.monotonic,
         max_command_age: float = MAX_COMMAND_AGE,
         limit: RateLimit | None = None,
+        desk: HoldDesk | None = None,
     ) -> None:
         if type(chat_id) is not int:
             raise TypeError("chat_id must be an int")
+        self._desk = desk
         self._api = api
         self._chat_id = chat_id
         self._book = book
@@ -272,6 +269,8 @@ class TelegramBot:
     def start(self) -> None:
         if self._threads:
             return
+        if self._desk is not None:
+            self._desk.start()
         for name, target in (
             ("backtide-telegram", self._poll_loop),
             ("backtide-telegram-work", self._work_loop),
@@ -296,6 +295,8 @@ class TelegramBot:
             thread.join(max(0.0, deadline - self._mono()))
         if poll is not None:
             poll.join(min(0.2, max(0.0, deadline - self._mono())))  # it acts on nothing now
+        if self._desk is not None:
+            self._desk.close(max(0.1, deadline - self._mono()))
         self._confirm_handled()
 
     def _confirm_handled(self) -> None:
@@ -424,6 +425,14 @@ class TelegramBot:
                 mark = self._actions.pause_mark()
                 self._submit(lambda: self._resume(mark, date))
             return
+        if command in ("retenidas", "lotes"):
+            desk = self._desk
+            if desk is None:
+                self._reply("Sin el bot completo no hay peticiones retenidas que enseñar aquí.")
+            elif self._allowed(chat_id, from_id):
+                listing = desk.list_holds if command == "retenidas" else desk.list_batches
+                self._submit(lambda: self._reply_if(listing()))
+            return
         self._reply(HELP)
 
     # Buttons
@@ -440,7 +449,10 @@ class TelegramBot:
         button = self._book.take(query.get("data"), message.get("message_id"))
         if isinstance(button, Refused):
             self._ignore(str(button), "callback_query", chat_id, from_id)
-            self._answer(query_id, REFUSED_TEXT[button])
+            self._answer(query_id, self._refused_text(button, query.get("data")))
+            return
+        if button.action in HOLD_ACTIONS:
+            self._on_hold_button(button, query_id, chat_id, from_id)
             return
         if button.action is Action.PAUSE:
             text = self._actions.pause()
@@ -461,6 +473,33 @@ class TelegramBot:
             return
         self._answer(query_id, "Cancelado.")
         self._reply("No se ha rebobinado nada.")
+
+    def _refused_text(self, refused: Refused, data: Any) -> str:
+        """Why a press did nothing; for a held request's button, how its hold ended."""
+        found = self._book.peek(data) if refused in (Refused.USED, Refused.EXPIRED) else None
+        if found is not None and found.hold_id is not None:
+            if found.note is not None:
+                return f"Esa retención ya está cerrada: {found.note}."
+            if refused is Refused.EXPIRED:
+                return "Esa retención ha caducado: se rechazó."
+        return REFUSED_TEXT[refused]
+
+    def _on_hold_button(self, button: Button, query_id: Any, chat_id: Any, from_id: Any) -> None:
+        """A held request's button (T10-4). Saying no (Rechazar, Cancelar, Revocar) is never
+        rate limited; saying yes or asking for more is, like a command."""
+        desk = self._desk
+        if desk is None:
+            self._answer(query_id, REFUSED_TEXT[Refused.UNKNOWN])
+            return
+        cheap = button.action in (Action.REJECT, Action.BATCH_CANCEL, Action.BATCH_END)
+        if not cheap and not self._allowed(chat_id, from_id, query_id):
+            return
+        self._answer(query_id, HOLD_ANSWERS.get(button.action, ""))
+        self._submit(lambda: self._reply_if(desk.press(button)))
+
+    def _reply_if(self, text: str | None) -> None:
+        if text:
+            self._reply(text)
 
     def _resume(self, mark: int | None, date: float) -> None:
         if self._clock() - date > self._max_age:

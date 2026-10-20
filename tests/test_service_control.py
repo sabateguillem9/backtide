@@ -1035,6 +1035,24 @@ def test_a_guardian_that_raises_approves_nothing(
 def test_the_client_refuses_a_verdict_that_is_not_one(folder: Path) -> None:
     with pytest.raises(ValueError):
         ask_decide(folder / "control.sock", HOLD, "maybe")
+    with pytest.raises(ValueError):
+        ask_decide(folder / "control.sock", HOLD, "approve", via="agent")
+
+
+def test_the_bot_inside_the_service_decides_as_telegram(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    """T10-4: the Telegram buttons go through the same door, ``via: telegram``, which only a
+    process that is the service itself may claim."""
+
+    def inside(sock: socket.socket) -> tuple[int, int, int]:
+        return os.getpid(), ME, 0
+
+    guardian.hold_status = HoldStatus.RELEASED
+    reply = ask_decide(make_server(peer=inside).path, HOLD, "approve", via="telegram", peer=me)
+    assert reply["outcome"] == "released"
+    assert guardian.decisions == [(HOLD, "approve", "telegram",
+                                   f"telegram (uid {ME}, pid {os.getpid()})")]  # fmt: skip
 
 
 def test_the_held_requests_are_listed_struck_and_checked(

@@ -445,6 +445,27 @@ def test_the_services_own_events_alert_for_themselves(rig: Rig) -> None:
     assert (rig.snapshot_calls, rig.sink.alerts) == (0, [])
 
 
+def test_a_held_request_gets_its_evidence_snapshot_but_no_generic_alert(rig: Rig) -> None:
+    """T10-4 (docs/32, section 5): the hold's own notice in Telegram, with its buttons, is the
+    alert; the evidence snapshot still happens, and other events still alert."""
+    held = rig.box.append(Source.GATE, "held", "https://x", details={"hold_id": "h-1"}, risk=3)
+    wait_until(lambda: bool(rig.events(source="snapshot", action="evidence")))
+    rig.settle()
+    assert rig.snapshot_calls == 1 and rig.sink.alerts == []
+    (linked,) = rig.events(source="snapshot", action="evidence")
+    assert linked.details["event_seq"] == held.seq
+    other = rig.box.append(Source.NET, "blocked", "https://y", risk=3)
+    (alert,) = rig.sink.wait_for(1)
+    assert alert.event_seq == other.seq
+
+
+def test_a_held_request_says_nothing_either_while_the_service_stops(rig: Rig) -> None:
+    rig.responder.close(WAIT)
+    rig.box.append(Source.GATE, "held", "https://x", details={"hold_id": "h-1"}, risk=3)
+    rig.responder.flush_held()
+    assert rig.sink.alerts == []
+
+
 def test_an_agent_event_whose_risk_comes_from_the_caller_is_answered_too(rig: Rig) -> None:
     event = rig.box.append(Source.NET, "blocked", "https://x", risk=3)
     (alert,) = rig.sink.wait_for(1)

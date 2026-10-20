@@ -11,6 +11,12 @@ this server-side book, with:
   pressing either uses both;
 - a bounded size: the oldest entries go first, so a flood of alerts cannot grow it.
 
+The held requests (T10-4, docs/32 section 11) have their buttons here too: "Aprobar",
+"Rechazar", "Ver" and the batches, each bound to its ``hold_id`` and living as long as the hold.
+When a hold ends (whoever ended it), ``retire_hold`` uses all of them up with a ``note`` that
+says how ("aprobada", "caducada"...), so a late or replayed press answers that; ``peek`` reads a
+button without using it. A batch's confirmation is a single-use pair like a rewind's.
+
 The book is in memory: after a restart of the service every old button answers "caducado".
 Forged data (anything that is not a token we issued) is just an unknown token. Thread-safe.
 """
@@ -33,6 +39,18 @@ class Action(StrEnum):
     NOTICE = "notice"  # show the fixed notice of a rewind and ask for confirmation
     CONFIRM = "confirm"  # rewind
     CANCEL = "cancel"
+    # Held requests (T10-4)
+    APPROVE = "approve"
+    REJECT = "reject"
+    VIEW = "view"  # the whole of what the black box keeps of it; never used up by a press
+    BATCH = "batch"  # ask to confirm a batch of ``kind``
+    BATCH_CONFIRM = "batch_confirm"
+    BATCH_CANCEL = "batch_cancel"
+    BATCH_END = "batch_end"  # revoke the batch rule ``rule_id`` (/lotes)
+
+
+HOLD_ACTIONS = frozenset({Action.APPROVE, Action.REJECT, Action.VIEW, Action.BATCH,
+                          Action.BATCH_CONFIRM, Action.BATCH_CANCEL, Action.BATCH_END})  # fmt: skip
 
 
 class Refused(StrEnum):
@@ -51,6 +69,10 @@ class Button:
     group: str
     message_id: int | None = None
     used: bool = False
+    hold_id: str | None = None  # a held request's button (T10-4)
+    kind: str | None = None  # a batch's kind
+    rule_id: str | None = None  # a batch rule's id (/lotes)
+    note: str | None = None  # how its hold ended, once ``retire_hold`` used it up
 
 
 class ButtonBook:
@@ -74,15 +96,34 @@ class ButtonBook:
         ttl: float = ALERT_TTL,
         single_use: bool = False,
         group: str | None = None,
+        hold_id: str | None = None,
+        kind: str | None = None,
+        rule_id: str | None = None,
     ) -> str:
         """A new token for ``action``. Buttons of one ``group`` are used up together."""
         token = secrets.token_urlsafe(18)
         with self._lock:
             self._make_room()
             self._buttons[token] = Button(
-                action, snapshot_id, self._clock() + ttl, single_use, group or token
-            )
+                action, snapshot_id, self._clock() + ttl, single_use, group or token,
+                hold_id=hold_id, kind=kind, rule_id=rule_id,
+            )  # fmt: skip
         return token
+
+    def peek(self, token: object) -> Button | None:
+        """The button behind ``token``, without using it (to say why a press was refused)."""
+        if not isinstance(token, str):
+            return None
+        with self._lock:
+            return self._buttons.get(token)
+
+    def retire_hold(self, hold_id: str, note: str) -> None:
+        """The hold ``hold_id`` ended: every button of it is used up, saying ``note``."""
+        with self._lock:
+            for button in self._buttons.values():
+                if button.hold_id == hold_id and not button.used:
+                    button.used = True
+                    button.note = note
 
     def bind(self, tokens: list[str], message_id: int) -> None:
         """The message the buttons ``tokens`` were sent on: only a press there counts."""

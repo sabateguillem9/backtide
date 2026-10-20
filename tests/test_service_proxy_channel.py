@@ -1244,3 +1244,268 @@ def test_an_inline_message_edit_is_never_trusted(translated: Gated) -> None:
     assert reading is not None
     gate = facts("2" * 64, reading=protocol.fit_reading(reading.summary()))
     assert translated.ask(request_event("api.telegram.org", path=path), gate)["verdict"] == "hold"
+
+
+# --- batches and the watch (T10-4, docs/32 sections 10 and 11) -----------------------------------
+
+OTHER_BOT = "bot987654321:" + "ZZyyXXwwVVuuTTssRRqqPPooNNmmLLkkJ"
+
+
+def telegram_call(
+    chat: str, text: str = "hola", n: int = 1, *, bot: str = BOT, method: str = "sendMessage",
+    extra: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:  # fmt: skip
+    """Like ``telegram_send``, with another bot (another account) or another method."""
+    from backtide.gate.translate import Context, RequestView, translate
+
+    path = f"/{bot}/{method}?chat_id={chat}&text={text}{extra}"
+    view = RequestView(method="GET", host="api.telegram.org", port=443, path=path)
+    reading = translate(view, Context(key=bytes(32)))
+    assert reading is not None
+    event = request_event("api.telegram.org", path=path, flow_id=f"f{n}")
+    return event, facts(f"{n:064x}", reading=protocol.fit_reading(reading.summary()))
+
+
+class Watched:
+    """A ``HoldWatch`` that takes note."""
+
+    def __init__(self) -> None:
+        self.held_notices: list[dict[str, Any]] = []
+        self.endings: list[tuple[str, str, str | None]] = []
+
+    def held(self, notice: Any) -> None:
+        self.held_notices.append(dict(notice))
+
+    def closed(self, hold_id: str, status: str, by: str | None) -> None:
+        self.endings.append((hold_id, status, by))
+
+
+@pytest.fixture
+def batched(box: BlackBox) -> Iterator[tuple[Gated, Watched]]:
+    from backtide.gate.translate.base import normalize_trusted
+
+    watch = Watched()
+    made = Gated(box, watch=watch, policy=policy(
+        unknown_hosts="hold", trusted=(normalize_trusted("telegram", OWNER),)
+    ))  # fmt: skip
+    try:
+        yield made, watch
+    finally:
+        made.channel.close()
+
+
+def make_batch(gated: Gated, hold_id: str, kind: str, **options: Any) -> Any:
+    return gated.channel.create_batch(
+        hold_id, kind, by="telegram", requested_by="telegram (pid 1)", **options
+    )
+
+
+def test_the_watch_hears_of_each_hold_with_what_its_notice_shows(
+    batched: tuple[Gated, Watched],
+) -> None:
+    gated, watch = batched
+    ack = gated.ask(*telegram_call("556", "hola ana"))
+    [notice] = watch.held_notices
+    assert notice["hold_id"] == ack["hold_id"] and notice["risk"] == 2
+    assert notice["phrase"] == "Telegram: enviar un mensaje al chat 556: «hola ana»"
+    assert notice["reading"]["recipients"] == ["556"]
+    assert notice["batches"] == ["recipient", "kind"]
+    assert notice["seq"] == gated.gate_events("held")[0].seq
+    assert notice["expires_in_s"] == 300 and BOT.split(":")[1] not in json.dumps(notice)
+    gated.ask(*telegram_call("556", "hola ana", n=1))  # a retry joins: no new notice
+    assert len(watch.held_notices) == 1
+    deleted = gated.ask(delete_event(), write_facts())
+    assert watch.held_notices[-1]["hold_id"] == deleted["hold_id"]
+    assert watch.held_notices[-1]["batches"] == []  # a DELETE never makes a batch
+
+
+def test_the_watch_hears_how_each_hold_ends(batched: tuple[Gated, Watched]) -> None:
+    gated, watch = batched
+    first = gated.ask(*telegram_call("556", n=1))["hold_id"]
+    second = gated.ask(*telegram_call("557", n=2))["hold_id"]
+    third = gated.ask(*telegram_call("558", n=3))["hold_id"]
+    fourth = gated.ask(*telegram_call("559", n=4))["hold_id"]
+    assert gated.decide(first) == "released"
+    gated.proxy.send(protocol.released(first))
+    gated.until(lambda: gated.channel._book.get(first) is None)  # noqa: SLF001
+    gated.proxy.send(protocol.hold_left(second, "waited"))
+    gated.until(lambda: gated.channel._book.get(second).connected == 0)  # noqa: SLF001
+    assert gated.decide(second) == "preapproved"
+    assert gated.decide(third, "reject") == "rejected"
+    gated.channel.reject_open("pause")
+    assert watch.endings == [
+        (first, "released", "cli"), (second, "preapproved", "cli"), (third, "rejected", "cli"),
+        (fourth, "rejected", "pause"),
+    ]  # fmt: skip
+    fifth = gated.ask(*telegram_call("560", n=5))["hold_id"]
+    gated.clock.now += 301
+    gated.channel.tick()
+    sixth = gated.ask(*telegram_call("561", n=6))["hold_id"]
+    gated.channel.close("stop")
+    assert watch.endings[-2:] == [(fifth, "expired", "timeout"), (sixth, "expired", "restart")]
+
+
+def test_a_watch_that_fails_never_breaks_the_gate(box: BlackBox) -> None:
+    class Broken:
+        def held(self, notice: Any) -> None:
+            raise RuntimeError("boom")
+
+        def closed(self, hold_id: str, status: str, by: str | None) -> None:
+            raise RuntimeError("boom")
+
+    gated = Gated(box, watch=Broken())
+    try:
+        hold_id = gated.ask(delete_event(), write_facts())["hold_id"]
+        assert gated.decide(hold_id) == "released"
+    finally:
+        gated.channel.close()
+
+
+def test_a_recipient_batch_approves_its_hold_and_lets_what_it_covers_pass(
+    batched: tuple[Gated, Watched],
+) -> None:
+    gated, watch = batched
+    hold_id = gated.ask(*telegram_call("556", "uno", n=1))["hold_id"]
+    outcome = make_batch(gated, hold_id, "recipient")
+    assert str(outcome.status) == "created" and str(outcome.hold) == "released"
+    assert outcome.rule_id is not None and "Sale ahora" in outcome.message
+    [rule] = gated.gate_events("batch_rule")
+    [approved] = gated.gate_events("approved")
+    assert rule.risk == 2 and rule.seq < approved.seq
+    assert rule.details["rule_id"] == outcome.rule_id and rule.details["scope"] == "recipient"
+    assert rule.details["recipients"] == ["556"] and rule.details["translator"] == "telegram"
+    assert rule.details["hold_id"] == hold_id and rule.details["by"] == "telegram"
+    assert "account" not in rule.details and rule.details["until"]
+    assert gated.proxy.receive_type("decision")["verdict"] == "allow"
+    assert watch.endings == [(hold_id, "released", "telegram")]
+    # Another message to the same chat from the same bot: it rides the batch.
+    ack = gated.ask(*telegram_call("556", "dos", n=2))
+    assert ack["verdict"] == "allow"
+    request = gated.requests()[-1]
+    assert request.details["gate"] == {"decision": "batch", "rule": outcome.rule_id,
+                                       "translator": "telegram", "operation": "sendmessage",
+                                       "effect": "send"}  # fmt: skip
+    # Nothing else does: another chat, another bot, a forward, a deletion, a URL to fetch.
+    for n, call in enumerate([
+        telegram_call("557", "tres"),
+        telegram_call("556", "cuatro", bot=OTHER_BOT),
+        telegram_call("556", "x", method="forwardMessage", extra="&from_chat_id=1&message_id=2"),
+        telegram_call("556", "x", method="deleteMessage", extra="&message_id=2"),
+        telegram_call("556", "mira https://other.fake.test/x"),
+    ], start=10):  # fmt: skip
+        event, gate = call
+        gate = facts(f"{n:064x}", reading=gate["reading"])
+        assert gated.ask(event, gate)["verdict"] == "hold", call[0]["details"]["path"]
+    [summary] = gated.channel.batches()
+    assert summary["uses"] == 1 and summary["recipients"] == ["556"]
+    assert summary["left_s"] == 12 * 3600
+
+
+def test_a_batch_never_lets_a_request_whose_own_hold_is_open_go_twice(
+    batched: tuple[Gated, Watched],
+) -> None:
+    gated, _ = batched
+    first = gated.ask(*telegram_call("556", "uno", n=1))["hold_id"]
+    waiting = gated.ask(*telegram_call("556", "dos", n=2))["hold_id"]
+    make_batch(gated, first, "recipient")
+    again = gated.ask(*telegram_call("556", "dos", n=2))  # its retry: it joins its hold
+    assert again["verdict"] == "hold" and again["hold_id"] == waiting
+
+
+def test_a_kind_batch_covers_the_effect_for_an_hour_to_anyone(
+    batched: tuple[Gated, Watched],
+) -> None:
+    gated, _ = batched
+    hold_id = gated.ask(*telegram_call("556", n=1))["hold_id"]
+    outcome = make_batch(gated, hold_id, "kind")
+    assert str(outcome.status) == "created"
+    assert gated.ask(*telegram_call("999", "otro", n=2))["verdict"] == "allow"
+    gated.clock.now += 3601
+    gated.channel.tick()
+    [end] = gated.gate_events("batch_rule_end")
+    assert end.details == {"rule_id": outcome.rule_id, "why": "expired", "uses": 1}
+    assert end.risk == 0
+    assert gated.ask(*telegram_call("999", "tres", n=3))["verdict"] == "hold"
+
+
+def test_a_pause_a_revocation_and_the_end_of_the_channel_end_the_batches(
+    batched: tuple[Gated, Watched],
+) -> None:
+    gated, _ = batched
+    first = make_batch(gated, gated.ask(*telegram_call("556", n=1))["hold_id"], "recipient")
+    second = make_batch(gated, gated.ask(*telegram_call("557", n=2))["hold_id"], "recipient")
+    assert gated.channel.end_batch(first.rule_id, by="telegram") is True
+    assert gated.channel.end_batch(first.rule_id, by="telegram") is False
+    gated.channel.reject_open("pause")
+    third = make_batch(gated, gated.ask(*telegram_call("558", n=3))["hold_id"], "recipient")
+    gated.channel.close("restart")
+    ends = [(e.details["rule_id"], e.details["why"]) for e in gated.gate_events("batch_rule_end")]
+    assert ends == [(first.rule_id, "revoked"), (second.rule_id, "pause"),
+                    (third.rule_id, "proxy_restart")]  # fmt: skip
+
+
+def test_a_hold_of_risk_3_offers_no_batch_even_if_its_reading_would(
+    batched: tuple[Gated, Watched],
+) -> None:
+    """Its URL carried a secret only backtide knows: the hold is risk 3, so no batch buttons."""
+    gated, watch = batched
+    event, gate = telegram_call("556", n=1)
+    gate = facts(f"{1:064x}", reading=gate["reading"], url_struck=True)
+    ack = gated.ask(event, gate)
+    assert ack["verdict"] == "hold"
+    assert watch.held_notices[-1]["risk"] == 3 and watch.held_notices[-1]["batches"] == []
+    assert str(make_batch(gated, ack["hold_id"], "recipient").status) == "not_batchable"
+
+
+def test_no_batch_for_what_may_never_ride_one_nor_while_paused(
+    batched: tuple[Gated, Watched],
+) -> None:
+    gated, _ = batched
+    deleted = gated.ask(delete_event(), write_facts())["hold_id"]
+    assert str(make_batch(gated, deleted, "kind").status) == "not_batchable"
+    sent = gated.ask(*telegram_call("556", n=1))["hold_id"]
+    paused = make_batch(gated, sent, "recipient", frozen=lambda: True)
+    assert str(paused.status) == "paused" and gated.gate_events("batch_rule") == []
+    assert [p["hold_id"] for p in gated.channel.pending()] == [deleted, sent]
+    assert str(make_batch(gated, "h-000000000000", "kind").status) == "unknown"
+    with pytest.raises(ValueError):
+        gated.channel.create_batch(sent, "kind", by="agent", requested_by="x")
+    with pytest.raises(ValueError):
+        gated.channel.create_batch(sent, "everything", by="cli", requested_by="x")
+
+
+def test_a_batch_that_cannot_be_recorded_is_not_made(box: BlackBox) -> None:
+    records: list[str] = []
+
+    def record(source: str, action: str, target: str, **kw: Any) -> Event:
+        records.append(action)
+        if action == "batch_rule":
+            raise BlackBoxError("disk full")
+        return box.append(source, action, target, **kw)
+
+    gated = Gated(box, policy=policy(unknown_hosts="hold"))
+    gated.channel._record = record  # noqa: SLF001
+    try:
+        hold_id = gated.ask(*telegram_call("556", n=1))["hold_id"]
+        outcome = make_batch(gated, hold_id, "recipient")
+        assert str(outcome.status) == "failed" and gated.channel.batches() == []
+        assert [p["hold_id"] for p in gated.channel.pending()] == [hold_id]
+    finally:
+        gated.channel.close()
+
+
+def test_a_plain_write_batch_by_method_host_and_route(batched: tuple[Gated, Watched]) -> None:
+    gated, _ = batched
+
+    def post(path: str, n: int) -> dict[str, Any]:
+        event = request_event(path=path, method="POST", flow_id=f"f{n}")
+        return gated.ask(event, write_facts(f"{n:064x}"))
+
+    hold_id = post("/v1/items/12/notes", 1)["hold_id"]
+    assert str(make_batch(gated, hold_id, "kind").status) == "created"
+    assert post("/v1/items/99/notes", 2)["verdict"] == "allow"
+    assert post("/v1/items/99/other", 3)["verdict"] == "hold"
+    [rule] = gated.gate_events("batch_rule")
+    assert (rule.details["method"], rule.details["host"], rule.details["route"]) == (
+        "POST", "example.com", "/v1/items/*/notes"
+    )  # fmt: skip

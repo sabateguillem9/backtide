@@ -9,7 +9,19 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from backtide.service.holds import HoldBook, HoldTimings, State, stale_holds
+from backtide.service.holds import (
+    BATCH_ID_RE,
+    BatchKind,
+    BatchRefused,
+    BatchRule,
+    HoldBook,
+    HoldTimings,
+    State,
+    plain_scope,
+    reading_scope,
+    route_of,
+    stale_holds,
+)
 
 FP, OTHER = "a" * 64, "b" * 64
 EVENT = {"source": "net", "action": "request", "target": "https://api.fake.test/x", "risk": 0,
@@ -348,3 +360,232 @@ def test_a_rejected_or_spent_draft_hold_no_longer_counts() -> None:
     book.recorded(again, 11)
     book.preapprove(again)
     assert book.spend(OTHER) is again and not book.draft_open(DRAFT)
+
+
+# --- batches (T10-4, docs/32 section 10) ---------------------------------------------------------
+
+ACCOUNT, OTHER_ACCOUNT = "0123456789abcdef", "fedcba9876543210"
+
+
+def reading(**changes: object) -> dict[str, object]:
+    """A checked reading (``protocol.check_reading``'s shape, the fields the batches look at)."""
+    base: dict[str, object] = {
+        "translator": "telegram", "operation": "sendmessage", "effect": "send",
+        "account": ACCOUNT, "recipients": ["556"], "notes": [], "secret_seen": False,
+        "cut": False, "draft": None, "risk": 2,
+    }  # fmt: skip
+    return base | changes
+
+
+def held_reading(book: HoldBook, fp: str = FP, **changes: object):
+    scope = reading_scope(reading(**changes))
+    hold = book.open(fp, risk=2, reason="send", event=EVENT, scope=scope)
+    assert hold is not None
+    book.recorded(hold, 10)
+    return hold
+
+
+def test_a_send_to_one_recipient_offers_both_batches() -> None:
+    book, _ = make()
+    assert book.offers(held_reading(book)) == (BatchKind.RECIPIENT, BatchKind.KIND)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"effect": "delete", "risk": 3},
+        {"effect": "admin", "risk": 3},
+        {"effect": "forward"},
+        {"effect": "unknown"},
+        {"effect": "read", "risk": 0},
+        {"risk": 3},
+        {"secret_seen": True, "risk": 3},
+        {"secret_seen": True},  # whatever the risk said
+        {"notes": ["deletes_message"]},
+        {"notes": ["fetches_url"]},
+        {"notes": ["inline_message"]},
+        {"notes": ["secret_seen"]},
+        {"notes": ["content_unseen"]},
+        {"notes": ["duplicate"]},
+        {"notes": ["idn_domain"]},
+        {"cut": True},
+        {"account": None},
+        {"recipients": []},
+        {"draft": "d" * 32},
+    ],
+)
+def test_what_may_never_ride_a_batch_offers_none(changes: dict[str, object]) -> None:
+    """Decision 8 and the review: deletions, administration, forwards, the unknown, risk 3, a
+    secret seen, a platform that fetches a URL, an inline message, a doubtful reading."""
+    book, _ = make()
+    hold = held_reading(book, **changes)
+    assert book.offers(hold) == ()
+    assert book.add_batch(hold, BatchKind.KIND) is BatchRefused.NOT_BATCHABLE
+    assert book.add_batch(hold, BatchKind.RECIPIENT) is BatchRefused.NOT_BATCHABLE
+    assert book.batches() == []
+
+
+def test_more_than_five_recipients_offer_only_the_kind_batch() -> None:
+    book, _ = make()
+    hold = held_reading(book, recipients=[str(n) for n in range(6)])
+    assert book.offers(hold) == (BatchKind.KIND,)
+
+
+def test_a_recipient_batch_covers_that_recipient_from_that_account_only() -> None:
+    book, _ = make()
+    hold = held_reading(book)
+    rule = book.add_batch(hold, BatchKind.RECIPIENT)
+    assert isinstance(rule, BatchRule) and BATCH_ID_RE.fullmatch(rule.rule_id)
+    assert rule.hold_id == hold.hold_id and book.batches() == [rule]
+
+    def covered(**changes: object) -> bool:
+        return book.batch_for(reading_scope(reading(**changes))) is rule
+
+    assert covered()
+    assert covered(text="otro texto", operation="sendphoto")  # another message to the same chat
+    assert covered(effect="change", operation="editmessagetext")
+    assert not covered(recipients=["557"])  # another chat
+    assert not covered(recipients=["556", "557"])  # one more: every recipient must be in it
+    assert not covered(account=OTHER_ACCOUNT)  # the same chat, another bot
+    assert not covered(account=None)
+    assert not covered(translator="slack")
+    assert not covered(effect="forward")
+    assert not covered(effect="delete", risk=3)
+    assert not covered(notes=["fetches_url"])
+    assert not covered(notes=["deletes_message"])
+    assert not covered(notes=["inline_message"])
+    assert not covered(secret_seen=True, risk=3)
+    assert not covered(cut=True)
+
+
+def test_a_kind_batch_covers_that_effect_from_that_account_to_anyone_for_an_hour() -> None:
+    book, clock = make()
+    rule = book.add_batch(held_reading(book), BatchKind.KIND)
+    assert isinstance(rule, BatchRule)
+    assert book.batch_for(reading_scope(reading(recipients=["999", "998"]))) is rule
+    assert book.batch_for(reading_scope(reading(effect="change"))) is None
+    assert book.batch_for(reading_scope(reading(account=OTHER_ACCOUNT))) is None
+    assert book.batch_for(reading_scope(reading(translator="discord"))) is None
+    assert rule.until_at == "2026-10-20T13:00:00Z"
+    clock.now += 3599
+    assert book.batch_for(reading_scope(reading())) is rule and book.due_batches() == []
+    clock.now += 2
+    assert book.batch_for(reading_scope(reading())) is None
+    assert book.due_batches() == [rule]  # once: the caller records gate/batch_rule_end
+    assert book.due_batches() == [] and book.batches() == []
+
+
+def test_a_recipient_batch_lasts_a_session_of_12_h_at_most() -> None:
+    book, clock = make()
+    rule = book.add_batch(held_reading(book), BatchKind.RECIPIENT)
+    assert isinstance(rule, BatchRule) and rule.until_at == "2026-10-21T00:00:00Z"
+    clock.now += 12 * 3600 - 1
+    assert book.due_batches() == []
+    clock.now += 2
+    assert book.due_batches() == [rule]
+
+
+def test_at_most_10_batches_and_a_lapsed_one_makes_room() -> None:
+    book, clock = make()
+    rules = []
+    for n in range(10):
+        rule = book.add_batch(held_reading(book, fp=f"{n:064x}", recipients=[f"{n}"]),
+                              BatchKind.RECIPIENT)  # fmt: skip
+        assert isinstance(rule, BatchRule)
+        rules.append(rule)
+    eleventh = held_reading(book, fp="e" * 64, recipients=["11"])
+    assert book.add_batch(eleventh, BatchKind.KIND) is BatchRefused.FULL
+    assert book.end_batch(rules[0].rule_id) is rules[0]
+    assert book.end_batch(rules[0].rule_id) is None  # once
+    assert isinstance(book.add_batch(eleventh, BatchKind.KIND), BatchRule)
+
+
+def test_the_same_batch_twice_is_the_same_rule() -> None:
+    book, _ = make()
+    first = book.add_batch(held_reading(book), BatchKind.RECIPIENT)
+    second = book.add_batch(held_reading(book, fp=OTHER), BatchKind.RECIPIENT)
+    assert first is second and book.batches() == [first]
+
+
+def test_only_an_open_hold_makes_a_batch() -> None:
+    book, _ = make()
+    hold = held_reading(book)
+    book.reject(hold.hold_id)
+    assert book.add_batch(hold, BatchKind.RECIPIENT) is BatchRefused.NOT_OPEN
+    other = held_reading(book, fp=OTHER)
+    book.approve(other.hold_id)
+    book.release(other)
+    assert book.add_batch(other, BatchKind.RECIPIENT) is BatchRefused.NOT_OPEN
+
+
+def test_ending_every_batch_and_dropping_one_not_recorded() -> None:
+    book, _ = make()
+    first = book.add_batch(held_reading(book), BatchKind.RECIPIENT)
+    second = book.add_batch(held_reading(book, fp=OTHER), BatchKind.KIND)
+    assert isinstance(first, BatchRule) and isinstance(second, BatchRule)
+    book.drop_batch(second)  # its gate/batch_rule could not be recorded: it never was
+    assert book.batches() == [first]
+    assert book.end_batches() == [first] and book.batches() == []
+    assert book.batch_for(reading_scope(reading())) is None
+
+
+def test_a_use_is_counted() -> None:
+    book, _ = make()
+    rule = book.add_batch(held_reading(book), BatchKind.RECIPIENT)
+    assert isinstance(rule, BatchRule)
+    book.batch_for(reading_scope(reading()), use=True)
+    book.batch_for(reading_scope(reading()))
+    assert rule.uses == 1
+
+
+def plain_hold(book: HoldBook, method: str, path: str, *, fp: str = FP, risk: int = 2,
+               reason: str = "write"):  # fmt: skip
+    scope = plain_scope(method, "api.fake.test", path, risk=risk, reason=reason)
+    hold = book.open(fp, risk=risk, reason=reason, event=EVENT, scope=scope)
+    assert hold is not None
+    book.recorded(hold, 10)
+    return hold
+
+
+def test_a_write_without_translator_offers_only_its_kind_by_method_host_and_route() -> None:
+    book, _ = make()
+    hold = plain_hold(book, "POST", "/v1/items/1234/notes?draft=1&b=2")
+    assert book.offers(hold) == (BatchKind.KIND,)
+    rule = book.add_batch(hold, BatchKind.KIND)
+    assert isinstance(rule, BatchRule)
+
+    def covered(method: str, path: str, host: str = "api.fake.test") -> bool:
+        scope = plain_scope(method, host, path, risk=2, reason="write")
+        return book.batch_for(scope) is rule
+
+    assert covered("POST", "/v1/items/99/notes?b=7&draft=0")
+    assert not covered("POST", "/v1/items/99/notes?b=7")  # other parameter names
+    assert not covered("POST", "/v1/items/99/notes?b=7&draft=0&to=x")
+    assert not covered("PUT", "/v1/items/99/notes?b=7&draft=0")
+    assert not covered("POST", "/v1/items/99/notes?b=7&draft=0", host="other.fake.test")
+    assert not covered("POST", "/v1/users/99/notes?b=7&draft=0")
+
+
+def test_routes_star_numbers_long_hex_and_uuids() -> None:
+    assert route_of("/v1/a/123/b/0123456789abcdef0123/c/550e8400-e29b-41d4-a716-446655440000/d")\
+        == "/v1/a/*/b/*/c/*/d"  # fmt: skip
+    assert route_of("/x/abc?z=1&a=2&a=3") == "/x/abc?a&z"
+    assert route_of("/x/cafe") == "/x/cafe"  # short hex is a name
+
+
+@pytest.mark.parametrize(
+    ("method", "risk", "reason"),
+    [("DELETE", 3, "delete"), ("POST", 3, "write"), ("PROPFIND", 2, "write"),
+     ("GET", 2, "url_long"), ("POST", 2, "read_budget")],
+)  # fmt: skip
+def test_no_batch_for_deletions_secrets_odd_methods_or_guarded_reads(
+    method: str, risk: int, reason: str
+) -> None:
+    book, _ = make()
+    hold = plain_hold(book, method, "/x", risk=risk, reason=reason)
+    assert book.offers(hold) == ()
+
+
+def test_a_hold_without_a_scope_offers_none() -> None:
+    book, _ = make()
+    assert book.offers(held(book)) == ()

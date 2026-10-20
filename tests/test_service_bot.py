@@ -13,7 +13,7 @@ import pytest
 from backtide.blackbox import BlackBox, BlackBoxError, create_key
 from backtide.service.bot import GuardianActions, Hooks, TelegramParts, telegram_parts
 from backtide.service.config import Secret, ServiceConfig
-from backtide.service.control import ControlOutcomeUnknown, ControlUnavailable
+from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
 from backtide.service.pause import PauseOutcome, PauseStatus, ResumeOutcome, ResumeStatus
 from backtide.service.telegram_config import TelegramSettings
 from backtide.snapshots import Snapshot
@@ -37,6 +37,25 @@ class FakeGuardian:
     def resume(self, *, requested_by: str, pause_mark: int | None = None) -> ResumeOutcome:
         self.asked.append(f"resume:{requested_by}:{pause_mark}")
         return ResumeOutcome(ResumeStatus.RESUMED, "El agente sigue donde estaba.")
+
+    holds: list[dict[str, Any]] = field(default_factory=list)
+    rules: list[dict[str, Any]] = field(default_factory=list)
+
+    def pending_holds(self) -> list[dict[str, Any]]:
+        return list(self.holds)
+
+    def batches(self) -> list[dict[str, Any]]:
+        return list(self.rules)
+
+    def create_batch(self, hold_id: str, kind: str, *, via: str, requested_by: str) -> Any:
+        from backtide.service.holds import BatchOutcome, BatchStatus, HoldStatus
+
+        self.asked.append(f"batch:{hold_id}:{kind}:{via}:{requested_by}")
+        return BatchOutcome(BatchStatus.CREATED, hold_id, "b-01234567", HoldStatus.RELEASED)
+
+    def end_batch(self, rule_id: str, *, via: str) -> bool:
+        self.asked.append(f"end:{rule_id}:{via}")
+        return rule_id == "b-01234567"
 
 
 @dataclass
@@ -154,6 +173,63 @@ def test_status_says_the_state_the_pauses_and_the_newest_snapshot(box: BlackBox)
     assert "Agente: congelado." in text
     assert "la has pedido tú" in text
     assert "hace 3 min" in text
+    assert "Peticiones retenidas: 0 (/retenidas). Lotes activos: 0 (/lotes)." in text
+
+
+# --- the held requests (T10-4) ---------------------------------------------------------------
+
+
+def test_a_decision_goes_through_the_control_socket_as_telegram(box: BlackBox) -> None:
+    asked: list[tuple[Any, ...]] = []
+
+    def ask_decision(path: Path, hold_id: str, verdict: str, **options: Any) -> dict[str, Any]:
+        asked.append((path, hold_id, verdict, options["via"]))
+        return {"ok": True, "outcome": "released", "message": "Aprobada: sale ahora."}
+
+    guardian = FakeGuardian()
+    actions = GuardianActions(Path("/state/control.sock"), ask_decision=ask_decision, tz=UTC)
+    actions.bind(guardian, box, FakeStore([]))  # type: ignore[arg-type]
+    assert actions.decide("h-0123456789ab", "approve") == ("released", "Aprobada: sale ahora.")
+    assert asked == [(Path("/state/control.sock"), "h-0123456789ab", "approve", "telegram")]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ControlUnavailable("x"), ControlOutcomeUnknown("no se sabe"), ControlError("mal")],
+)
+def test_a_decision_that_cannot_be_asked_says_so(box: BlackBox, error: Exception) -> None:
+    def ask_decision(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise error
+
+    actions = GuardianActions(Path("/s.sock"), ask_decision=ask_decision, tz=UTC)
+    outcome, message = actions.decide("h-0123456789ab", "reject")
+    assert outcome == "failed" and message
+
+
+def test_batches_go_to_the_guardian_as_telegram(box: BlackBox) -> None:
+    actions, guardian = actions_with(box, [])
+    status, message = actions.create_batch("h-0123456789ab", "recipient")
+    assert status == "created" and "Lote creado" in message
+    assert guardian.asked[-1].startswith("batch:h-0123456789ab:recipient:telegram:telegram (")
+    assert "revocado" in actions.end_batch("b-01234567")
+    assert "ya no está activo" in actions.end_batch("b-99999999")
+
+
+def test_held_details_are_read_back_from_the_black_box(box: BlackBox) -> None:
+    actions, _ = actions_with(box, [])
+    other = box.append("net", "request", "https://x", details={"a": 1}, risk=0)
+    held = box.append("gate", "held", "https://x", details={"hold_id": "h-1", "body": {}}, risk=2)
+    assert actions.held_details(held.seq) == {"hold_id": "h-1", "body": {}}
+    assert actions.held_details(other.seq) is None  # not a gate/held
+    assert actions.held_details(held.seq + 5) is None and actions.held_details(0) is None
+
+
+def test_before_bind_the_held_requests_say_backtide_is_starting() -> None:
+    actions = GuardianActions(Path("/s.sock"), tz=UTC)
+    assert actions.create_batch("h-0123456789ab", "kind")[0] == "failed"
+    assert "arrancando" in actions.end_batch("b-01234567")
+    assert actions.batches() == [] and actions.pending_holds() == []
+    assert actions.held_details(3) is None
 
 
 def test_record_writes_to_the_black_box_and_logs_a_failure(

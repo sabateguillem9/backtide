@@ -804,6 +804,7 @@ def ask_decide(
     hold_id: str,
     verdict: str,
     *,
+    via: str | None = None,
     wait: float = WAIT_FOR_SERVICE,
     reply_timeout: float = REPLY_TIMEOUT * 6,
     peer: PeerCredentials = peer_credentials,
@@ -811,13 +812,19 @@ def ask_decide(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to approve or reject the held request ``hold_id`` (`backtide
-    aprobar` / `rechazar`). Returns its reply, checked: ``ok``, ``outcome`` (a ``HoldStatus`` or
-    "refused") and ``message``. ValueError for a verdict that is not one (nothing sent)."""
+    aprobar` / `rechazar`; ``via="telegram"`` from the bot inside the service, T10-4). Returns
+    its reply, checked: ``ok``, ``outcome`` (a ``HoldStatus`` or "refused") and ``message``.
+    ValueError for a verdict or a ``via`` that is not one (nothing sent)."""
     if verdict not in DECIDE_VERDICTS:
         raise ValueError("verdict is approve or reject")
+    if via is not None and via not in REQUESTERS:
+        raise ValueError("via is cli, web or telegram")
+    request: dict[str, Any] = {"cmd": "decide", "hold_id": hold_id, "verdict": verdict}
+    if via is not None:
+        request["via"] = via
     raw = _ask(
         Path(path),
-        {"cmd": "decide", "hold_id": hold_id, "verdict": verdict},
+        request,
         what="la decisión",
         wait=wait,
         reply_timeout=reply_timeout,

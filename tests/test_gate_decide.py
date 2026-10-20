@@ -241,3 +241,53 @@ def test_a_translated_read_caps_its_credential_headers_too() -> None:
     assert verdict(replace(read, credential_bytes=MAX_READ_CREDENTIALS + 1)) == (
         Verdict.HOLD, "credentials_long", 2
     )  # fmt: skip
+
+
+# --- batches (T10-4, docs/32 section 10) -----------------------------------------------------
+
+
+@pytest.mark.parametrize("effect", [Effect.SEND, Effect.CHANGE])
+def test_a_send_or_a_change_a_batch_covers_passes(effect: Effect) -> None:
+    covered = replace(TG_SEND, reading=ReadingFacts(effect, 2, batch="b-0123abcd"))
+    assert verdict(covered) == (Verdict.PASS, "batch", 0)
+
+
+@pytest.mark.parametrize(
+    ("effect", "risk"),
+    [(Effect.FORWARD, 2), (Effect.DELETE, 3), (Effect.ADMIN, 3), (Effect.UNKNOWN, 2),
+     (Effect.SEND, 3)],
+)  # fmt: skip
+def test_a_batch_never_lets_a_forward_a_deletion_the_unknown_or_risk_3_pass(
+    effect: Effect, risk: int
+) -> None:
+    """Decision 8: even if the book said a rule covers it (it never does), these are held."""
+    facts = replace(TG_SEND, reading=ReadingFacts(effect, risk, batch="b-0123abcd"))
+    assert verdict(facts)[0] is Verdict.HOLD
+
+
+def test_a_batch_never_covers_a_secret_struck_from_the_url_or_a_header() -> None:
+    covered = replace(TG_SEND, reading=ReadingFacts(Effect.SEND, 2, batch="b-0123abcd"))
+    assert verdict(replace(covered, url_struck=True)) == (Verdict.HOLD, "send", 3)
+    assert verdict(replace(covered, headers_struck=True)) == (Verdict.HOLD, "send", 3)
+
+
+def test_a_batch_comes_after_a_rejection_and_before_holding() -> None:
+    covered = replace(TG_SEND, reading=ReadingFacts(Effect.SEND, 2, batch="b-0123abcd"))
+    assert verdict(replace(covered, rejected=True)) == (Verdict.REJECT, "gate_rejected", 0)
+    draft = replace(covered, reading=ReadingFacts(Effect.CHANGE, 2, draft_open=True,
+                                                  batch="b-0123abcd"))  # fmt: skip
+    assert verdict(draft)[1] == "draft_open"
+
+
+def test_a_plain_write_a_batch_covers_passes_but_never_a_delete_or_a_secret() -> None:
+    assert verdict(replace(WRITE, batch="b-0123abcd")) == (Verdict.PASS, "batch", 0)
+    for changes in ({"method": "DELETE"}, {"body_struck": True}, {"url_struck": True},
+                    {"headers_struck": True}):  # fmt: skip
+        assert verdict(replace(WRITE, batch="b-0123abcd", **changes))[0] is Verdict.HOLD
+
+
+def test_a_plain_read_ignores_a_batch() -> None:
+    """A batch is for writes: a guarded read stays held."""
+    assert verdict(replace(READ, url_bytes=MAX_READ_URL + 1, batch="b-0123abcd"))[0] is (
+        Verdict.HOLD
+    )

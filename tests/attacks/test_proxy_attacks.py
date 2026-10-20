@@ -114,13 +114,16 @@ def start_lab(
     hold_timings: tuple[str, ...] = HOLD_TIMINGS,
     unknown_hosts: str = "hold",
     trusted_chat: str | None = None,
+    telegram_toml: str | None = None,
 ) -> Lab:
     """A started service with its fake internet. With ``inwards``, the allowed list also holds
     names that resolve to private addresses (ssrf-por-el-proxy: the fixed rule must still say
     no). ``hold_timings`` are the gate's shortened times (test_gate_attacks.py uses its own).
     ``unknown_hosts`` is ``[gate] unknown_hosts``: ``"hold"`` (the default since T10-3: reads to
     any host pass, writes are held) or ``"deny"`` (the strict mode, T06's allowed list).
-    ``trusted_chat``: a Telegram chat in ``[gate] trusted`` (the owner's, in un-get-que-envia)."""
+    ``trusted_chat``: a Telegram chat in ``[gate] trusted`` (the owner's, in un-get-que-envia).
+    ``telegram_toml``: the bot's ``telegram.toml`` (T10-4: pointed at a fake Bot API on the VM's
+    127.0.0.1; the owner's chat in it is trusted by the gate too)."""
     vm._require_agent_image()
     vm._remove_stale_test_agents()
     names = vm._agent_names(os.getpid())
@@ -142,6 +145,10 @@ def start_lab(
         + gate_toml(unknown_hosts, trusted_chat),
         real_keys=real,
     )
+    if telegram_toml is not None:
+        path = service.config.state_dir / "telegram.toml"
+        path.write_text(telegram_toml)
+        path.chmod(0o600)
     internet: FakeInternet | None = None
     try:
         internet = start_fake_internet(service, tmp_path_factory.mktemp("t06-5-internet"))

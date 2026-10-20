@@ -10,10 +10,16 @@ socket. Built in ``runner.serve`` when ``<state_dir>/telegram.toml`` exists.
   event: rewinding to it undoes what the event is about.
 - ``record`` writes ``system/<action>`` to the black box (it redacts); if that fails it is
   logged at ERROR, which the log bridge turns into an alert.
+- The held requests (T10-4, ``backtide.notify.hold_notice``): ``decide`` goes through the
+  control socket, ``via: "telegram"``, like `backtide aprobar` (the socket checks that only the
+  service itself claims ``telegram``); a batch, ``batches`` and ``end_batch`` go to the Guardian,
+  which refuses them while the agent is paused or rewound; ``held_details`` reads the
+  ``gate/held`` of a hold back from the black box ("Ver").
 - Every text goes out redacted; none quotes the agent.
 """
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
@@ -22,6 +28,7 @@ from typing import Any, Protocol
 
 from backtide.blackbox import BlackBox, BlackBoxError, redact
 from backtide.notify.buttons import ButtonBook
+from backtide.notify.hold_notice import HoldDesk
 from backtide.notify.telegram import TelegramBot, TelegramNotifier
 from backtide.notify.telegram_api import BotApi
 from backtide.service.config import ServiceConfig
@@ -29,8 +36,10 @@ from backtide.service.control import (
     ControlError,
     ControlOutcomeUnknown,
     ControlUnavailable,
+    ask_decide,
     ask_rewind,
 )
+from backtide.service.holds import BatchOutcome
 from backtide.service.notice import ago, rewind_notice
 from backtide.service.pause import PauseOutcome, ResumeOutcome
 from backtide.service.telegram_config import TelegramSettings
@@ -68,12 +77,23 @@ class _Guardian(Protocol):
 
     def resume(self, *, requested_by: str, pause_mark: int | None = None) -> ResumeOutcome: ...
 
+    def pending_holds(self) -> list[dict[str, Any]]: ...
+
+    def create_batch(
+        self, hold_id: str, kind: str, *, via: str, requested_by: str
+    ) -> BatchOutcome: ...
+
+    def batches(self) -> list[dict[str, Any]]: ...
+
+    def end_batch(self, rule_id: str, *, via: str) -> bool: ...
+
 
 class _Snapshots(Protocol):
     def snapshots(self) -> list[Snapshot]: ...
 
 
 AskRewind = Callable[..., dict[str, Any]]
+AskDecide = Callable[..., dict[str, Any]]
 
 
 class GuardianActions:
@@ -86,11 +106,13 @@ class GuardianActions:
         control_socket: Path,
         *,
         ask: AskRewind = ask_rewind,
+        ask_decision: AskDecide = ask_decide,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         tz: tzinfo | None = None,
     ) -> None:
         self._socket = control_socket
         self._ask = ask
+        self._ask_decision = ask_decision
         self._now = now
         self._tz = tz if tz is not None else (datetime.now().astimezone().tzinfo or UTC)
         self._guardian: _Guardian | None = None
@@ -135,6 +157,9 @@ class GuardianActions:
             )
         else:
             lines.append("No hay instantáneas (o no se pueden leer).")
+        holds, batches = len(self._guardian.pending_holds()), len(self._guardian.batches())
+        lines.append(f"Peticiones retenidas: {holds} (/retenidas). Lotes activos: {batches} "
+                     "(/lotes).")  # fmt: skip
         return "\n".join(lines)
 
     def rewind(self, snapshot_id: str) -> str:
@@ -173,6 +198,60 @@ class GuardianActions:
             return None
         before = [snap for snap in self._snapshots() if snap.taken_at <= moment]
         return before[-1].id if before else None
+
+    # HoldActions (T10-4)
+
+    def decide(self, hold_id: str, verdict: str) -> tuple[str, str]:
+        try:
+            reply = self._ask_decision(
+                self._socket, hold_id, verdict, via=REQUESTER, wait=REWIND_WAIT
+            )
+        except ControlUnavailable:
+            return "failed", "El servicio no contesta en su socket de control: no se ha decidido."
+        except ControlOutcomeUnknown as error:
+            return "failed", redact(str(error))
+        except (ControlError, ValueError) as error:
+            return "failed", redact(f"No se ha podido pedir la decisión: {error}")
+        return str(reply["outcome"]), redact(str(reply["message"]))
+
+    def create_batch(self, hold_id: str, kind: str) -> tuple[str, str]:
+        if self._guardian is None:
+            return "failed", "backtide está arrancando: prueba otra vez en unos segundos."
+        requested_by = f"{REQUESTER} (el bot, pid {os.getpid()})"
+        try:
+            outcome = self._guardian.create_batch(
+                hold_id, kind, via=REQUESTER, requested_by=requested_by
+            )
+        except ValueError:
+            return "failed", "Ese lote no existe."
+        return str(outcome.status), redact(outcome.message)
+
+    def end_batch(self, rule_id: str) -> str:
+        if self._guardian is None:
+            return "backtide está arrancando: prueba otra vez en unos segundos."
+        if self._guardian.end_batch(rule_id, via=REQUESTER):
+            return "Lote revocado: lo que cubría vuelve a preguntar."
+        return "Ese lote ya no está activo (caducó, se revocó o backtide se reinició)."
+
+    def batches(self) -> list[dict[str, Any]]:
+        return [] if self._guardian is None else self._guardian.batches()
+
+    def pending_holds(self) -> list[dict[str, Any]]:
+        return [] if self._guardian is None else self._guardian.pending_holds()
+
+    def held_details(self, seq: int) -> dict[str, Any] | None:
+        if self._box is None or seq < 1:
+            return None
+        try:
+            found = self._box.events(since_seq=seq - 1, limit=1)
+        except BlackBoxError as error:
+            logger.warning("cannot read a held request back from the black box: %s", error)
+            return None
+        if not found or found[0].seq != seq or (found[0].source, found[0].action) != (
+            "gate", "held"
+        ):  # fmt: skip
+            return None
+        return dict(found[0].details)
 
     def record(self, action: str, details: dict[str, Any], risk: int) -> None:
         if self._box is None:
@@ -238,11 +317,13 @@ class Hooks:
 @dataclass(frozen=True)
 class TelegramParts:
     """The notifier the alert queue delivers to, the actions to ``bind`` once the Guardian
-    exists, and the bot to run as a hook next to the control socket."""
+    exists, the bot to run as a hook next to the control socket (it runs the desk too), and the
+    desk the egress tells about its held requests."""
 
     notifier: TelegramNotifier
     actions: GuardianActions
     bot: TelegramBot
+    desk: HoldDesk  # the gate's HoldWatch: the notices of the held requests (T10-4)
 
 
 def telegram_parts(config: ServiceConfig, settings: TelegramSettings) -> TelegramParts:
@@ -251,5 +332,6 @@ def telegram_parts(config: ServiceConfig, settings: TelegramSettings) -> Telegra
     book = ButtonBook()
     actions = GuardianActions(config.control_socket)
     notifier = TelegramNotifier(api, settings.chat_id, book, actions)
-    bot = TelegramBot(api, settings.chat_id, book, actions)
-    return TelegramParts(notifier, actions, bot)
+    desk = HoldDesk(api, settings.chat_id, book, actions)
+    bot = TelegramBot(api, settings.chat_id, book, actions, desk=desk)
+    return TelegramParts(notifier, actions, bot, desk)

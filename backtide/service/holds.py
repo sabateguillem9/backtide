@@ -27,19 +27,29 @@ black box; the book only keeps the state:
   translator and draft reference, never the token). While one is open, releasing or preapproved,
   ``draft_open`` says so, and the gate holds any change to that draft: the text the person
   approves must not change before it goes out (docs/32, decision 12).
-- **What a restart loses only gave leave** (holds, preapprovals, rejections): ``close_all`` ends
-  it all, failing closed. What must last (what was held, who approved, what expired) is in the
-  black box; ``stale_holds`` finds the holds a killed backtide left open there.
+- **Batches** (T10-4, docs/32 section 10): a rule that lets more than one request pass, made
+  from an open hold the person approves with it: "todo a este destinatario, esta sesión"
+  (``RECIPIENT``: translator, account and recipients; 12 h at most) or "este tipo de acción, 1 h"
+  (``KIND``: translator, account and effect; without a translator, method, host and route).
+  Each hold carries its ``Scope`` (fields the proxy reads strictly, never the agent's texts);
+  ``offers`` says which batches it may make, and ``batch_for`` which rule covers a request.
+  Never a deletion, an administration, a forward, the unknown, risk 3, a secret seen, a cut or
+  doubtful reading, a platform that fetches a URL or an inline message (decision 8 and the
+  review of T10-3), nor a request of another account. At most ``max_batches`` at a time.
+- **What a restart loses only gave leave** (holds, preapprovals, rejections, batches):
+  ``close_all`` and ``end_batches`` end it all, failing closed. What must last (what was held,
+  who approved, what expired) is in the black box; ``stale_holds`` finds the holds a killed
+  backtide left open there.
 """
 
 import re
 import secrets
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from backtide.snapshots import utc_now
 
@@ -48,6 +58,7 @@ from backtide.snapshots import utc_now
 DraftKey = tuple[str, str]
 
 HOLD_ID_RE = re.compile(r"h-[0-9a-f]{12}", re.ASCII)
+BATCH_ID_RE = re.compile(r"b-[0-9a-f]{8}", re.ASCII)
 STALE_WINDOW = timedelta(minutes=15)  # what a restart looks back at (docs/32, section 6)
 CLOSING = frozenset({"approved", "rejected", "expired"})
 EXPIRY_MARGIN = 2.0  # seconds: backtide looks at the holds every second (proxy_channel's tick)
@@ -64,6 +75,9 @@ class HoldTimings:
     retry_after: int = 30  # the Retry-After of "pending"
     max_open: int = 20
     flood_every: float = 10.0
+    batch_session: float = 12 * 3600.0  # "esta sesión": 12 h at most (decision 9)
+    batch_hour: float = 3600.0  # "este tipo de acción, 1 h"
+    max_batches: int = 10
 
 
 class State(StrEnum):
@@ -119,6 +133,196 @@ class HoldOutcome:
         return HOLD_MESSAGES[self.status]
 
 
+class HoldWatch(Protocol):
+    """Who is told about the holds as they come and go (T10-4: the Telegram notice). Called
+    with the channel's gate lock held, so it only takes note and never blocks nor raises."""
+
+    def held(self, notice: Mapping[str, Any]) -> None:
+        """A new hold, recorded: ``ProxyChannel._notice`` (struck)."""
+        ...
+
+    def closed(self, hold_id: str, status: str, by: str | None) -> None:
+        """A hold ended: ``status`` is "released", "preapproved", "rejected" or "expired";
+        ``by`` who or what ended it (cli, web, telegram, pause, rewind, timeout, restart...)."""
+        ...
+
+
+# Batches (T10-4, docs/32 section 10)
+
+
+class BatchKind(StrEnum):
+    RECIPIENT = "recipient"  # "todo a este destinatario, esta sesión"
+    KIND = "kind"  # "este tipo de acción, 1 h"
+
+
+class BatchRefused(StrEnum):
+    NOT_OPEN = "not_open"  # no open hold with that id (decided, expired, being released)
+    NOT_BATCHABLE = "not_batchable"  # that hold may not make that batch (decision 8)
+    FULL = "full"  # max_batches are active
+
+
+class BatchStatus(StrEnum):
+    """What asking for a batch did."""
+
+    CREATED = "created"  # recorded; the hold it came from is approved with it
+    NOT_BATCHABLE = "not_batchable"
+    FULL = "full"
+    UNKNOWN = "unknown"  # no open hold with that id
+    PAUSED = "paused"  # the agent is paused or being rewound: nothing is approved meanwhile
+    FAILED = "failed"  # it could not be recorded, so it was not made
+
+
+BATCH_MESSAGES = {
+    BatchStatus.CREATED: "Lote creado. Esta petición queda aprobada.",
+    BatchStatus.NOT_BATCHABLE: (
+        "Esta petición no puede abrir un lote (un borrado, un reenvío, algo de riesgo 3, algo "
+        "que no se ve entero o que hace descargar una dirección): se decide una a una."
+    ),
+    BatchStatus.FULL: (
+        "Ya hay 10 lotes activos: revoca alguno con /lotes antes de crear otro. La petición "
+        "sigue retenida."
+    ),
+    BatchStatus.UNKNOWN: (
+        "Esa retención ya no está abierta (decidida, caducada o tras un reinicio): no se crea "
+        "ningún lote."
+    ),
+    BatchStatus.PAUSED: (
+        "El agente está pausado o se está rebobinando, así que no se aprueba nada ni se crea "
+        "ningún lote. La petición sigue retenida."
+    ),
+    BatchStatus.FAILED: (
+        "No se ha podido grabar el lote en la caja negra, así que no se crea: la petición sigue "
+        "retenida."
+    ),
+}
+
+
+@dataclass(frozen=True)
+class BatchOutcome:
+    status: BatchStatus
+    hold_id: str
+    rule_id: str | None = None
+    hold: HoldStatus | None = None  # what approving the hold did, once the batch is made
+
+    @property
+    def message(self) -> str:
+        text = BATCH_MESSAGES[self.status]
+        if self.hold is HoldStatus.RELEASED:
+            text += " Sale ahora, una sola vez."
+        elif self.hold is HoldStatus.PREAPPROVED:
+            text += " El agente ya no esperaba: si la repite en 10 minutos, sale una vez."
+        return text
+
+
+BATCH_EFFECTS = frozenset({"send", "change"})
+# The notes a batchable reading may carry: our fixed texts that say nothing doubtful. Anything
+# else (a deletion, a URL the platform fetches, an inline message, a secret, content unseen, a
+# duplicate, an IDN domain, a size cap...) keeps it out of every batch.
+BATCH_NOTES = frozenset({"webhook", "interaction"})
+BATCH_METHODS = frozenset({"POST", "PUT", "PATCH"})  # a write without a translator
+MAX_BATCH_RECIPIENTS = 5  # the most a "todo a este destinatario" names (the alert shows 5)
+_STAR_RE = re.compile(
+    r"\d+|[0-9a-fA-F]{16,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}",
+    re.ASCII,
+)
+
+
+@dataclass(frozen=True)
+class Scope:
+    """What a request is, for the batches: fields the proxy reads strictly (the translator the
+    path chose, the account's HMAC, the effect from its table, the recipients from named
+    fields; or the method, the connection's host and the route). ``batchable``: it may make or
+    ride a batch at all."""
+
+    translator: str | None = None
+    account: str | None = None
+    effect: str | None = None
+    recipients: frozenset[str] = frozenset()
+    method: str | None = None
+    host: str | None = None
+    route: str | None = None
+    batchable: bool = False
+
+
+def reading_scope(reading: Mapping[str, Any], *, risk: int = 2) -> Scope:
+    """The scope of a checked reading (``protocol.check_reading``). ``risk``: the hold's own,
+    when it is one (a URL that carried a secret makes it 3 whatever the reading says)."""
+    recipients = reading.get("recipients") or []
+    account = reading.get("account")
+    notes = set(reading.get("notes") or [])
+    batchable = (
+        reading.get("effect") in BATCH_EFFECTS
+        and reading.get("risk") == 2
+        and risk == 2
+        and reading.get("secret_seen") is False
+        and reading.get("cut") is False
+        and reading.get("draft") is None
+        and isinstance(account, str)
+        and bool(recipients)
+        and notes <= BATCH_NOTES
+    )
+    return Scope(
+        translator=str(reading.get("translator")),
+        account=account if isinstance(account, str) else None,
+        effect=str(reading.get("effect")),
+        recipients=frozenset(str(item) for item in recipients),
+        batchable=batchable,
+    )
+
+
+def plain_scope(method: str, host: str, path: str, *, risk: int, reason: str) -> Scope:
+    """The scope of a request no translator read: only a plain write (``reason`` "write", risk
+    2: no secret seen) by POST, PUT or PATCH may make or ride a batch."""
+    return Scope(
+        method=method,
+        host=host.lower(),
+        route=route_of(path),
+        batchable=reason == "write" and risk == 2 and method in BATCH_METHODS,
+    )
+
+
+def route_of(path: str) -> str:
+    """A path with its numeric, long hexadecimal and UUID segments as ``*``, and the sorted
+    names of its query's parameters (docs/32, section 10)."""
+    route, _, query = path.partition("?")
+    segments = ["*" if _STAR_RE.fullmatch(segment) else segment for segment in route.split("/")]
+    names = sorted({part.partition("=")[0] for part in query.split("&") if part})
+    return "/".join(segments) + ("?" + "&".join(names) if names else "")
+
+
+@dataclass(eq=False)
+class BatchRule:
+    rule_id: str
+    kind: BatchKind
+    scope: Scope
+    hold_id: str  # the hold it was made from
+    created: float
+    until: float
+    until_at: str  # the same moment on the wall clock, for the black box
+    uses: int = 0
+
+    def covers(self, scope: Scope) -> bool:
+        """Whether ``scope`` rides this rule: the same translator and account (or method, host
+        and route), and, for a recipient batch, every recipient in it."""
+        mine = self.scope
+        if not scope.batchable:
+            return False
+        if mine.translator is None:  # a write without a translator
+            return (scope.translator, scope.method, scope.host, scope.route) == (
+                None, mine.method, mine.host, mine.route,
+            )  # fmt: skip
+        if (scope.translator, scope.account) != (mine.translator, mine.account):
+            return False
+        if self.kind is BatchKind.KIND:
+            return scope.effect == mine.effect
+        return scope.effect in BATCH_EFFECTS and scope.recipients <= mine.recipients
+
+
+def _new_batch_id() -> str:
+    return f"b-{secrets.token_hex(4)}"
+
+
 @dataclass(eq=False)
 class Hold:
     hold_id: str
@@ -136,6 +340,8 @@ class Hold:
     frozen: bool = False  # a pause or a rewind came while it was releasing: no preapproval
     draft: DraftKey | None = None  # the saved draft it sends or changes (T10-3)
     phrase: str | None = None  # what its translator says it does (backtide.gate.phrase)
+    scope: Scope | None = None  # what it is, for the batches (T10-4)
+    reading: dict[str, Any] | None = None  # its reading as gate/held recorded it, for the notice
 
     @property
     def live(self) -> bool:
@@ -158,11 +364,14 @@ class HoldBook:
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], datetime] = utc_now,
         new_id: Callable[[], str] = _new_id,
+        new_batch_id: Callable[[], str] = _new_batch_id,
     ) -> None:
         self.timings = timings if timings is not None else HoldTimings()
         self._clock = clock
         self._wall = wall
         self._new_id = new_id
+        self._new_batch_id = new_batch_id
+        self._batches: dict[str, BatchRule] = {}  # by rule id, in the order they were made
         self._holds: dict[str, Hold] = {}  # by hold id, in the order they were made
         self._by_fp: dict[str, Hold] = {}  # the open, releasing or preapproved hold of each fp
         self._rejected: dict[str, float] = {}  # fp -> until when it is refused without asking
@@ -232,6 +441,7 @@ class HoldBook:
         reason: str,
         event: dict[str, Any],
         draft: DraftKey | None = None,
+        scope: Scope | None = None,
     ) -> Hold | None:
         """A new hold for ``fp`` (not yet recorded: ``recorded`` or ``discard``), or None when
         ``max_open`` are open already (counted for the next ``gate/flood``)."""
@@ -254,6 +464,7 @@ class HoldBook:
             expires=now + self.timings.life,
             expires_at=_iso(self._wall() + timedelta(seconds=self.timings.life)),
             draft=draft,
+            scope=scope,
         )
         self._holds[hold_id] = hold
         self._by_fp[fp] = hold
@@ -385,6 +596,103 @@ class HoldBook:
         count, window = self._full, max(1, int(now - since))
         self._full, self._full_since, self._last_flood = 0, None, now
         return count, window
+
+    # Batches (T10-4)
+
+    def offers(self, hold: Hold) -> tuple[BatchKind, ...]:
+        """The batches ``hold`` may make: none for what may never ride one (decision 8); the
+        recipient batch only for a translated request to 1 to 5 recipients."""
+        scope = hold.scope
+        if scope is None or not scope.batchable:
+            return ()
+        if scope.translator is None:
+            return (BatchKind.KIND,)
+        if 1 <= len(scope.recipients) <= MAX_BATCH_RECIPIENTS:
+            return (BatchKind.RECIPIENT, BatchKind.KIND)
+        return (BatchKind.KIND,)
+
+    def add_batch(self, hold: Hold, kind: BatchKind) -> BatchRule | BatchRefused:
+        """A new rule of ``kind`` made from the open ``hold`` (not yet recorded:
+        ``drop_batch`` if its gate/batch_rule cannot be). The same rule again is the one there
+        is."""
+        if self._holds.get(hold.hold_id) is not hold or hold.state is not State.OPEN:
+            return BatchRefused.NOT_OPEN
+        if kind not in self.offers(hold) or hold.scope is None:
+            return BatchRefused.NOT_BATCHABLE
+        now = self._clock()
+        self._lapse(now)
+        scope = hold.scope
+        if kind is BatchKind.KIND and scope.translator is not None:
+            scope = Scope(translator=scope.translator, account=scope.account,
+                          effect=scope.effect, batchable=True)  # fmt: skip
+        for rule in self._batches.values():
+            if rule.kind is kind and rule.scope == scope:
+                return rule
+        if len(self._batches) >= self.timings.max_batches:
+            return BatchRefused.FULL
+        timings = self.timings
+        life = timings.batch_session if kind is BatchKind.RECIPIENT else timings.batch_hour
+        rule_id = self._new_batch_id()
+        while rule_id in self._batches:
+            rule_id = self._new_batch_id()
+        rule = BatchRule(
+            rule_id=rule_id,
+            kind=kind,
+            scope=scope,
+            hold_id=hold.hold_id,
+            created=now,
+            until=now + life,
+            until_at=_iso(self._wall() + timedelta(seconds=life)),
+        )
+        self._batches[rule_id] = rule
+        return rule
+
+    def drop_batch(self, rule: BatchRule) -> None:
+        """Its gate/batch_rule could not be recorded: it never was."""
+        if self._batches.get(rule.rule_id) is rule:
+            del self._batches[rule.rule_id]
+
+    def batch_for(self, scope: Scope, *, use: bool = False) -> BatchRule | None:
+        """The active rule that covers ``scope``, if any (``use``: count one more use)."""
+        if not scope.batchable:
+            return None
+        now = self._clock()
+        for rule in self._batches.values():
+            if now < rule.until and rule.covers(scope):
+                if use:
+                    rule.uses += 1
+                return rule
+        return None
+
+    def batches(self) -> list[BatchRule]:
+        """The active rules, oldest first."""
+        now = self._clock()
+        return [rule for rule in self._batches.values() if now < rule.until]
+
+    def end_batch(self, rule_id: str) -> BatchRule | None:
+        """Revoke a rule (``/lotes``). None if there is no such active rule."""
+        rule = self._batches.get(rule_id)
+        if rule is None or self._clock() >= rule.until:
+            return None
+        del self._batches[rule_id]
+        return rule
+
+    def due_batches(self) -> list[BatchRule]:
+        """The rules whose time is over, removed (the caller records gate/batch_rule_end)."""
+        return self._lapse(self._clock())
+
+    def end_batches(self) -> list[BatchRule]:
+        """Every rule ends: a pause, a rewind, or the end of the channel (they were tied to
+        this connection's key, and so is the account's HMAC)."""
+        ended = list(self._batches.values())
+        self._batches.clear()
+        return ended
+
+    def _lapse(self, now: float) -> list[BatchRule]:
+        lapsed = [rule for rule in self._batches.values() if now >= rule.until]
+        for rule in lapsed:
+            del self._batches[rule.rule_id]
+        return lapsed
 
     # Helpers
 

@@ -99,7 +99,7 @@ from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProbl
 from backtide.service.clock import clock_synced as kernel_clock_synced
 from backtide.service.config import ServiceConfig
 from backtide.service.egress import EgressHooks
-from backtide.service.holds import HoldOutcome, HoldStatus
+from backtide.service.holds import BatchOutcome, BatchStatus, HoldOutcome, HoldStatus
 from backtide.service.pause import (
     Holder,
     PauseOutcome,
@@ -317,6 +317,26 @@ class EgressProxy(Protocol):
 
     def reject_holds(self, by: str) -> int:
         """Reject every open hold (a pause or a rewind, decision 7 of docs/32)."""
+        ...
+
+    def create_batch(
+        self,
+        hold_id: str,
+        kind: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> BatchOutcome:
+        """Make a batch rule from an open hold and approve it (T10-4)."""
+        ...
+
+    def batches(self) -> list[dict[str, Any]]:
+        """The active batch rules."""
+        ...
+
+    def end_batch(self, rule_id: str, *, by: str) -> bool:
+        """Revoke a batch rule."""
         ...
 
 
@@ -3152,6 +3172,44 @@ class Guardian:
         except Exception:
             logger.exception("deciding on a held request failed")
             return HoldOutcome(HoldStatus.FAILED, hold_id)
+
+    def create_batch(self, hold_id: str, kind: str, *, via: str, requested_by: str) -> BatchOutcome:
+        """A batch rule made from the open hold ``hold_id`` (T10-4: "todo a este destinatario,
+        esta sesión" or "este tipo de acción, 1 h"), which it approves. Like ``decide_hold``:
+        nothing while the person's pause is open or a rewind runs. Never raises."""
+        if self._egress is None or not self._serving:
+            return BatchOutcome(BatchStatus.UNKNOWN, hold_id)
+        try:
+            return self._egress.create_batch(
+                hold_id,
+                kind,
+                by=via,
+                requested_by=str(requested_by)[:MAX_REQUESTER_CHARS],
+                frozen=self._approvals_frozen,
+            )
+        except Exception:
+            logger.exception("making a batch rule failed")
+            return BatchOutcome(BatchStatus.FAILED, hold_id)
+
+    def batches(self) -> list[dict[str, Any]]:
+        """The active batch rules (``/lotes``). Never raises."""
+        if self._egress is None or not self._serving:
+            return []
+        try:
+            return self._egress.batches()
+        except Exception:
+            logger.exception("listing the batch rules failed")
+            return []
+
+    def end_batch(self, rule_id: str, *, via: str) -> bool:
+        """Revoke a batch rule (``/lotes``). Never raises."""
+        if self._egress is None or not self._serving:
+            return False
+        try:
+            return self._egress.end_batch(rule_id, by=via)
+        except Exception:
+            logger.exception("revoking a batch rule failed")
+            return False
 
     def _approvals_frozen(self) -> bool:
         """Nothing is approved while the person's pause is open or a rewind runs (security

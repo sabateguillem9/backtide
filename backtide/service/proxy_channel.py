@@ -66,6 +66,13 @@ remembers of its fingerprint. Every ``gate`` event is written here, never by the
   ``[gate] trusted``: by default the owner's Telegram chat) passes; the rest is held with its
   reading and the sentence that tells it (``gate/held {reading, phrase}``). A change to a draft
   whose sending is held or preapproved is held (``HoldBook.draft_open``).
+- **Batches and the watch** (T10-4, docs/32 sections 10 and 11): a request a batch rule covers
+  (``HoldBook.batch_for``; never while a hold of its fingerprint is open, so a yes is never
+  spent twice) passes, recorded as its ``net/request`` with ``gate {decision: batch, rule}``.
+  ``create_batch`` makes a rule from an open hold (``gate/batch_rule``, risk 2) and approves
+  that hold with it; ``end_batch`` revokes one, and time, a pause, a rewind or the end of the
+  channel end them (``gate/batch_rule_end {why}``). ``watch`` (the Telegram notice) is told of
+  every hold recorded and of every hold that ends, whoever ended it.
 
 The config is never logged: ``protocol.describe`` names the providers and counts the hosts.
 """
@@ -104,7 +111,22 @@ from backtide.gate.translate.base import (
     all_trusted,
 )
 from backtide.sensors.files import DailyBudget, TokenBucket
-from backtide.service.holds import Hold, HoldBook, HoldOutcome, HoldStatus, HoldTimings
+from backtide.service.holds import (
+    BatchKind,
+    BatchOutcome,
+    BatchRefused,
+    BatchRule,
+    BatchStatus,
+    Hold,
+    HoldBook,
+    HoldOutcome,
+    HoldStatus,
+    HoldTimings,
+    HoldWatch,
+    Scope,
+    plain_scope,
+    reading_scope,
+)
 from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES, ReadBudget
 
 logger = logging.getLogger(__name__)
@@ -360,8 +382,10 @@ class ProxyChannel:
         timings: HoldTimings | None = None,
         book: HoldBook | None = None,
         read_budget: ReadBudget | None = None,
+        watch: HoldWatch | None = None,
     ) -> None:
         self._sock = sock
+        self._watch = watch
         self._record = record
         self._policy = policy
         self._allow = policy.allow_list()
@@ -601,8 +625,18 @@ class ProxyChannel:
             for value in headers.values()
         ) or any(self._scrub.text(str(name)) != str(name) for name in headers)  # a name too
         reading = gate["reading"]
+        method = str(details.get("method", ""))
+        # A batch is looked up only when no hold of this fingerprint is open: the request then
+        # joins it, so the waiting one and this one never both go out (T10-4).
+        scope: Scope | None = None
+        if self._book.live(fp) is None:
+            if reading is not None:
+                scope = reading_scope(reading)
+            elif isinstance(path, str) and isinstance(host, str):
+                scope = plain_scope(method, host, path, risk=2, reason="write")
+        rule = None if scope is None else self._book.batch_for(scope)
         facts = Facts(
-            method=str(details.get("method", "")),
+            method=method,
             exact_read=gate["exact_read"] and not overridden,
             has_body=not (type(size) is int and size == 0),  # unknown: a body (fails closed)
             url_bytes=gate["url_bytes"],
@@ -616,7 +650,8 @@ class ProxyChannel:
             credential_bytes=gate["credential_bytes"],
             credentials_struck=gate["credentials_struck"],
             body_struck=gate["body_struck"],
-            reading=None if reading is None else self._reading_facts(reading),
+            reading=None if reading is None else self._reading_facts(reading, rule),
+            batch=None if reading is not None or rule is None else rule.rule_id,
         )
         decision = decide(facts, unknown_hosts=self._policy.unknown_hosts)
         if decision.verdict is Verdict.PASS and decision.reason == "read" and not allowed:
@@ -631,6 +666,9 @@ class ProxyChannel:
             note: dict[str, Any] = {"decision": decision.reason}
             if reading is not None:
                 note |= {key: reading[key] for key in ("translator", "operation", "effect")}
+            if decision.reason == "batch" and rule is not None and scope is not None:
+                self._book.batch_for(scope, use=True)
+                note["rule"] = rule.rule_id
             if decision.reason == "preapproved":
                 hold = self._book.spend(fp)
                 if hold is None:  # cannot be: preapproved() said so under this same lock
@@ -644,10 +682,13 @@ class ProxyChannel:
             return self._let_out(request_id, event, note)
         return self._hold(request_id, event, gate, decision.risk, decision.reason)
 
-    def _reading_facts(self, reading: Mapping[str, Any]) -> ReadingFacts:
+    def _reading_facts(
+        self, reading: Mapping[str, Any], rule: BatchRule | None = None
+    ) -> ReadingFacts:
         """What decide.py needs of a checked reading: its effect and risk, whether all its
-        recipients are trusted (never a cut one: a recipient may be missing) and whether it
-        changes a draft whose sending is held or preapproved."""
+        recipients are trusted (never a cut one: a recipient may be missing), whether it
+        changes a draft whose sending is held or preapproved, and the batch rule that covers
+        it (``rule``, looked up by the caller)."""
         effect = Effect(reading["effect"])
         trusted = not reading["cut"] and all_trusted(_as_reading(reading), self._policy.trusted)
         key = _draft_key(reading)
@@ -657,6 +698,7 @@ class ProxyChannel:
             risk=reading["risk"],
             trusted=trusted,
             draft_open=changes_draft and key is not None and self._book.draft_open(key),
+            batch=None if rule is None else rule.rule_id,
         )
 
     def _hold(
@@ -671,7 +713,16 @@ class ProxyChannel:
             self._book.join(hold, event)
         else:
             draft = None if reading is None else _draft_key(reading)
-            hold = self._book.open(fp, risk=risk, reason=reason, event=event, draft=draft)
+            details = event["details"]
+            if reading is not None:
+                scope = reading_scope(reading, risk=risk)
+            else:
+                method_, host_ = str(details.get("method", "")), str(details.get("host", ""))
+                path_ = str(details.get("path", ""))
+                scope = plain_scope(method_, host_, path_, risk=risk, reason=reason)
+            hold = self._book.open(
+                fp, risk=risk, reason=reason, event=event, draft=draft, scope=scope
+            )
             if hold is None:  # too many open: counted in the next gate/flood
                 return protocol.ack(request_id, "deny", reason="hold_full")
             extra: dict[str, Any] = {"reason": reason, "expires_at": hold.expires_at}
@@ -683,6 +734,9 @@ class ProxyChannel:
                 self._book.discard(hold)
                 return protocol.ack(request_id, "deny", reason="not_recorded")
             self._book.recorded(hold, stored.seq)
+            if reading is not None:
+                hold.reading = _recorded_reading(reading)
+            self._tell_held(hold)
         if hold.seq is None:  # cannot be: a hold is only kept once its gate/held is stored
             return protocol.ack(request_id, "deny", reason="not_recorded")
         return protocol.ack(
@@ -744,6 +798,7 @@ class ProxyChannel:
                 self._gate_event("rejected", hold, who, risk=1)  # a no is good unrecorded too
                 if hold.connected:
                     self._tell_decision(protocol.decision(hold_id, "deny", reason="rejected"))
+                self._tell_closed(hold, "rejected", by)
                 return HoldOutcome(HoldStatus.REJECTED, hold_id)
             hold = self._book.approve(hold_id)
             if hold is None:
@@ -751,20 +806,99 @@ class ProxyChannel:
             # Under the lock reject_open takes too: a pause that came first is seen here.
             if frozen is not None and frozen():
                 return HoldOutcome(HoldStatus.PAUSED, hold_id)  # still open, nothing recorded
-            if self._gate_event("approved", hold, who, risk=1) is None:
-                return HoldOutcome(HoldStatus.FAILED, hold_id)  # still open: nothing went out
-            if hold.connected:
-                # Recorded BEFORE it goes out, as every request: its net/request, then allow.
-                note = {"decision": "approved", "hold_id": hold_id, "by": by}
-                stored = self._append(hold.event, {"gate": note})
-                if stored is not None:
-                    self._book.release(hold)
-                    self._tell_decision(protocol.decision(hold_id, "allow", seq=stored.seq))
-                    return HoldOutcome(HoldStatus.RELEASED, hold_id)
-            # Nobody waits (or its net/request could not be recorded): the next identical
-            # request passes once, recorded then, within 10 min.
-            self._book.preapprove(hold)
-            return HoldOutcome(HoldStatus.PREAPPROVED, hold_id)
+            return self._approve(hold, who)
+
+    def _approve(self, hold: Hold, who: Mapping[str, Any]) -> HoldOutcome:
+        """Approve the open ``hold`` (under the gate lock): ``gate/approved``, then, with the
+        request still connected, its net/request BEFORE ``decision allow``; else a
+        preapproval."""
+        hold_id, by = hold.hold_id, str(who["by"])
+        if self._gate_event("approved", hold, who, risk=1) is None:
+            return HoldOutcome(HoldStatus.FAILED, hold_id)  # still open: nothing went out
+        if hold.connected:
+            # Recorded BEFORE it goes out, as every request: its net/request, then allow.
+            note = {"decision": "approved", "hold_id": hold_id, "by": by}
+            stored = self._append(hold.event, {"gate": note})
+            if stored is not None:
+                self._book.release(hold)
+                self._tell_decision(protocol.decision(hold_id, "allow", seq=stored.seq))
+                self._tell_closed(hold, "released", by)
+                return HoldOutcome(HoldStatus.RELEASED, hold_id)
+        # Nobody waits (or its net/request could not be recorded): the next identical
+        # request passes once, recorded then, within 10 min.
+        self._book.preapprove(hold)
+        self._tell_closed(hold, "preapproved", by)
+        return HoldOutcome(HoldStatus.PREAPPROVED, hold_id)
+
+    # Batches (T10-4)
+
+    def create_batch(
+        self,
+        hold_id: str,
+        kind: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> BatchOutcome:
+        """Make a batch rule of ``kind`` ("recipient" or "kind") from the open hold
+        ``hold_id`` and approve that hold with it: ``gate/batch_rule`` first, then the yes as
+        ``decide`` gives it. Nothing while the agent is paused or rewound (``frozen``). Never
+        raises for a hold that is not there."""
+        if by not in DECIDERS:
+            raise ValueError("by is cli, web or telegram")
+        batch_kind = BatchKind(kind)
+        who = {"by": by, "requested_by": str(requested_by)[:MAX_REQUESTER_CHARS]}
+        with self._gate_lock:
+            if self.closed:
+                return BatchOutcome(BatchStatus.UNKNOWN, hold_id)
+            self._tick_locked()
+            hold = self._book.approve(hold_id)
+            if hold is None:
+                return BatchOutcome(BatchStatus.UNKNOWN, hold_id)
+            if frozen is not None and frozen():
+                return BatchOutcome(BatchStatus.PAUSED, hold_id)
+            made = self._book.add_batch(hold, batch_kind)
+            if isinstance(made, BatchRefused):
+                status = {BatchRefused.FULL: BatchStatus.FULL,
+                          BatchRefused.NOT_OPEN: BatchStatus.UNKNOWN}.get(
+                              made, BatchStatus.NOT_BATCHABLE)  # fmt: skip
+                return BatchOutcome(status, hold_id)
+            if made.hold_id == hold_id:  # a new rule (an equal one already there is not recorded)
+                own = {"rule_id": made.rule_id, "scope": str(made.kind),
+                       "until": made.until_at, **who} | _rule_fields(made)  # fmt: skip
+                if self._gate_event("batch_rule", hold, own, risk=2) is None:
+                    self._book.drop_batch(made)
+                    return BatchOutcome(BatchStatus.FAILED, hold_id)
+            outcome = self._approve(hold, who)
+            return BatchOutcome(BatchStatus.CREATED, hold_id, made.rule_id, outcome.status)
+
+    def batches(self) -> list[dict[str, Any]]:
+        """The active batch rules, oldest first: what ``/lotes`` shows."""
+        with self._gate_lock:
+            if self.closed:
+                return []
+            self._tick_locked()
+            now = self._mono()
+            return [self._scrub(_rule_summary(rule, now)) for rule in self._book.batches()]
+
+    def end_batch(self, rule_id: str, *, by: str) -> bool:
+        """Revoke the batch rule ``rule_id`` (``gate/batch_rule_end {why: revoked}``). False
+        if there is no such active rule."""
+        with self._gate_lock:
+            if self.closed:
+                return False
+            rule = self._book.end_batch(rule_id)
+            if rule is None:
+                return False
+            self._batch_ended(rule, "revoked", by=by)
+            return True
+
+    def _batch_ended(self, rule: BatchRule, why: str, *, by: str | None = None) -> None:
+        own: dict[str, Any] = {"rule_id": rule.rule_id, "why": why, "uses": rule.uses}
+        if by is not None:
+            own["by"] = by
+        self._record_gate("batch_rule_end", rule.rule_id, own, risk=0)
 
     def pending(self) -> list[dict[str, Any]]:
         """The holds waiting for the person, oldest first: what the person needs to decide
@@ -789,6 +923,10 @@ class ProxyChannel:
                 self._gate_event("rejected", hold, {"by": by}, risk=1)
                 if hold.connected:
                     self._tell_decision(protocol.decision(hold.hold_id, "deny", reason=reason))
+                self._tell_closed(hold, "rejected", by)
+            # A batch is leave too: a pause or a rewind ends every one (T10-4).
+            for rule in self._book.end_batches():
+                self._batch_ended(rule, by)
             return len(holds)
 
     def tick(self) -> None:
@@ -802,6 +940,9 @@ class ProxyChannel:
             self._gate_event("expired", hold, {"why": "timeout"}, risk=2)
             if hold.connected:
                 self._tell_decision(protocol.decision(hold.hold_id, "deny", reason="expired"))
+            self._tell_closed(hold, "expired", "timeout")
+        for rule in self._book.due_batches():
+            self._batch_ended(rule, "expired")
         flood = self._book.flood()
         if flood is not None:
             count, window = flood
@@ -824,6 +965,34 @@ class ProxyChannel:
             self._holds_ended = True
             for hold in self._book.close_all():
                 self._gate_event("expired", hold, {"why": why}, risk=2)
+                self._tell_closed(hold, "expired", why)
+            for rule in self._book.end_batches():
+                self._batch_ended(rule, why)
+
+    def _tell_held(self, hold: Hold) -> None:
+        if self._watch is None:
+            return
+        try:
+            self._watch.held(self._scrub(self._notice(hold)))
+        except Exception:  # the hold stands; only its notice is missing
+            logger.exception("telling about a held request failed")
+
+    def _tell_closed(self, hold: Hold, status: str, by: str | None) -> None:
+        if self._watch is None:
+            return
+        try:
+            self._watch.closed(hold.hold_id, status, by)
+        except Exception:
+            logger.exception("telling about the end of a held request failed")
+
+    def _notice(self, hold: Hold) -> dict[str, Any]:
+        """What the notice of ``hold`` shows (T10-4): its summary, the reading as recorded,
+        the gate/held's seq ("Ver" reads the excerpt there) and the batches it may make."""
+        return _summary(hold, self._mono()) | {
+            "seq": hold.seq,
+            "reading": hold.reading,
+            "batches": [str(kind) for kind in self._book.offers(hold)],
+        }
 
     def _tell_decision(self, message: dict[str, Any]) -> None:
         try:
@@ -989,6 +1158,24 @@ def _recorded_reading(reading: Mapping[str, Any]) -> dict[str, Any]:
     the struck texts and the attachments; not the account's HMAC (it is of this connection's
     key, worthless after it) nor the proxy's mechanics (wait, shape)."""
     return {key: reading[key] for key in _RECORDED_READING}
+
+
+def _rule_fields(rule: BatchRule) -> dict[str, Any]:
+    """What a batch rule covers, for the black box and ``/lotes``: never the account's HMAC
+    (it is of this connection's key)."""
+    scope = rule.scope
+    if scope.translator is None:
+        return {"method": scope.method, "host": scope.host, "route": scope.route}
+    fields: dict[str, Any] = {"translator": scope.translator, "effect": scope.effect}
+    if rule.kind is BatchKind.RECIPIENT:
+        fields["recipients"] = sorted(scope.recipients)
+    return fields
+
+
+def _rule_summary(rule: BatchRule, now: float) -> dict[str, Any]:
+    return {"rule_id": rule.rule_id, "scope": str(rule.kind), "hold_id": rule.hold_id,
+            "until": rule.until_at, "left_s": max(0, int(rule.until - now)),
+            "uses": rule.uses} | _rule_fields(rule)  # fmt: skip
 
 
 def _summary(hold: Hold, now: float) -> dict[str, Any]:

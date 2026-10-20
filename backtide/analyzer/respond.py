@@ -21,6 +21,9 @@ Design: docs/27-diseno-t08-reglas.md, section "Qué pasa con el riesgo 3".
 - After ``close()`` (the service is stopping) or before the thread exists, a note is alerted
   straight away without a snapshot: the agent is already stopped or the service is not up.
 - Alerts carry no secrets (``redact``) and quote a path the agent chose only escaped and cut.
+- **A held request** (``gate/held`` of risk 3, T10-4) gets its evidence snapshot like any other
+  event, but no alert from here: its own notice in Telegram, with "Aprobar" and "Rechazar", is
+  the alert (docs/32, section 5), and a second one would only add fatigue.
 """
 
 import logging
@@ -43,6 +46,7 @@ ALERT_EVERY = 60.0  # seconds between two alerts for the same rule
 RETRY_AFTER = 10.0  # after a snapshot that failed, before trying another
 MAX_KEYS = 512  # rules (or source/action pairs) remembered for the alert throttle
 EXCERPT_CHARS = 100
+QUIET = "gate/held"  # its key: answered with a snapshot, never with this alert (T10-4)
 
 
 @dataclass
@@ -145,7 +149,8 @@ class RiskResponder:
 
     def note(self, event: Event, rules: tuple[str, ...], description: str) -> None:
         """An event of risk 3 was recorded. Never blocks, never raises."""
-        key = rules[0] if rules else f"{event.source}/{event.action}"
+        own = f"{event.source}/{event.action}"
+        key = QUIET if own == QUIET else rules[0] if rules else own
         try:
             with self._cond:
                 if self._closing:
@@ -273,6 +278,8 @@ class RiskResponder:
 
     def _tell(self, key: str, pending: _Pending, snapshot_id: str | None, why: str | None) -> None:
         """Alert now, or hold the alert back if this rule alerted less than a minute ago."""
+        if key == QUIET:
+            return  # the hold's own notice is its alert
         now = self._clock()
         with self._tell_lock:
             last = self._last_alert.get(key)

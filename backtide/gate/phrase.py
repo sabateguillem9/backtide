@@ -60,19 +60,38 @@ _QUOTES = str.maketrans(
 _BRACKETS = str.maketrans({"(": "[", ")": "]", "（": "[", "）": "]"})
 
 
+def api_name(translator: str) -> str:
+    """The API's name in our words ("Telegram", "Gmail"...), never the agent's."""
+    return _API.get(translator, "Una API")
+
+
+def action(reading: Mapping[str, Any]) -> str:
+    """ "<API>: <qué hace>", only our words (T10-4's notice puts the agent's apart)."""
+    translator = str(reading.get("translator", ""))
+    effect = str(reading.get("effect", "unknown"))
+    if effect == "unknown":
+        what = "una petición que backtide no entiende"
+    else:
+        noun = ("un correo" if translator in _MAIL else "un mensaje") if effect in (
+            "send", "forward"
+        ) else ""  # fmt: skip
+        what = " ".join(part for part in (_VERBS.get(effect, "cambiar"), noun) if part)
+    return f"{api_name(translator)}: {what}"
+
+
+def note_texts(reading: Mapping[str, Any]) -> list[str]:
+    """The reading's notes in our words (our fixed texts, never the agent's)."""
+    texts = [_NOTES[note] for note in reading.get("notes") or [] if note in _NOTES]
+    if reading.get("cut"):
+        texts.append("resumida: era demasiado larga")
+    return list(dict.fromkeys(texts))
+
+
 def describe(reading: Mapping[str, Any]) -> str:
     """One line: "<API>: <qué hace> <a quién>: «<asunto o primeras líneas>» (<notas>)"."""
     translator = str(reading.get("translator", ""))
-    effect = str(reading.get("effect", "unknown"))
-    api = _API.get(translator, translator or "Una API")
-    mail = translator in _MAIL
     operation = reading.get("target")
-    if effect == "unknown":
-        action = "una petición que backtide no entiende"
-    else:
-        what = ("un correo" if mail else "un mensaje") if effect in ("send", "forward") else ""
-        action = " ".join(part for part in (_VERBS.get(effect, effect), what) if part)
-    parts = [f"{api}: {action}"]
+    parts = [action(reading)]
     recipients = _recipients(translator, reading.get("recipients") or [])
     if recipients:
         parts.append(recipients)
@@ -86,9 +105,7 @@ def describe(reading: Mapping[str, Any]) -> str:
     attachments = reading.get("attachments") or []
     if attachments:
         extra.append("1 adjunto" if len(attachments) == 1 else f"{len(attachments)} adjuntos")
-    extra += [_NOTES[note] for note in reading.get("notes") or [] if note in _NOTES]
-    if reading.get("cut"):
-        extra.append("resumida: era demasiado larga")
+    extra += note_texts(reading)
     if extra:
         sentence += f" ({'; '.join(dict.fromkeys(extra))})"
     return sentence[:MAX_CHARS]

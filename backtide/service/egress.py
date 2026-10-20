@@ -22,10 +22,12 @@ a few points of its life; the watch runs on this module's own thread.
 - **Stop** (``stop``): the Guardian stops the agent first; then the proxy (``docker stop``,
   killed if that fails), then the channel, and ``system/proxy_stop``.
 - **Held requests** (T10-2, docs/32 section 6): ``decide``, ``pending`` and ``reject_holds`` go to
-  the channel of the moment (its ``HoldBook``); with no channel there is nothing held. At the
-  first ``start``, the holds a backtide that died left open in the black box (``gate/held`` of
-  the last 15 min with no end) are closed with ``gate/expired {why: restart}``: the proxy that
-  held them refused them when it lost its channel.
+  the channel of the moment (its ``HoldBook``), and so do the batches (T10-4: ``create_batch``,
+  ``batches``, ``end_batch``); every channel tells ``watch`` (the Telegram notice) of its
+  holds; with no channel there is nothing held. At the first ``start``, the holds a backtide
+  that died left open in the black box (``gate/held`` of the last 15 min with no end) are
+  closed with ``gate/expired {why: restart}``: the proxy that held them refused them when it
+  lost its channel.
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
 """
 
@@ -46,9 +48,12 @@ from backtide.jail.proxy_config import MITMPROXY_VERSION
 from backtide.notify import AlertLevel
 from backtide.service.holds import (
     STALE_WINDOW,
+    BatchOutcome,
+    BatchStatus,
     HoldOutcome,
     HoldStatus,
     HoldTimings,
+    HoldWatch,
     stale_holds,
 )
 from backtide.service.pause import Ticker
@@ -112,8 +117,10 @@ class Egress:
         sleep: Callable[[float], None] = time.sleep,
         timings: HoldTimings | None = None,
         history: History | None = None,
+        watch: HoldWatch | None = None,
     ) -> None:
         self._jail = jail
+        self._watch = watch
         self._agent_name = agent_name
         self._policy = policy
         self._box = record
@@ -221,6 +228,30 @@ class Egress:
     def pending(self) -> list[dict[str, Any]]:
         channel = self._channel
         return [] if channel is None or channel.closed else channel.pending()
+
+    def create_batch(
+        self,
+        hold_id: str,
+        kind: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> BatchOutcome:
+        """Make a batch rule from an open hold and approve it (``ProxyChannel.create_batch``,
+        T10-4). Without a channel there is no hold: UNKNOWN."""
+        channel = self._channel
+        if channel is None or channel.closed:
+            return BatchOutcome(BatchStatus.UNKNOWN, hold_id)
+        return channel.create_batch(hold_id, kind, by=by, requested_by=requested_by, frozen=frozen)
+
+    def batches(self) -> list[dict[str, Any]]:
+        channel = self._channel
+        return [] if channel is None or channel.closed else channel.batches()
+
+    def end_batch(self, rule_id: str, *, by: str) -> bool:
+        channel = self._channel
+        return False if channel is None or channel.closed else channel.end_batch(rule_id, by=by)
 
     def reject_holds(self, by: str) -> int:
         """A pause or a rewind rejects every open hold (decision 7). Never raises."""
@@ -454,6 +485,7 @@ class Egress:
                         on_budget=self._daily_budget_spent,
                         timings=self._timings,
                         read_budget=self._read_budget,
+                        watch=self._watch,
                     )
                     channel.handshake(max(0.5, deadline - self._mono()))
                 except BaseException:

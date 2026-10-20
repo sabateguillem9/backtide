@@ -55,7 +55,7 @@ from backtide.service.config import ConfigError, ServiceConfig, read_provider_ke
 from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
-from backtide.service.holds import HoldTimings
+from backtide.service.holds import HoldTimings, HoldWatch
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
 from backtide.service.proxy_channel import Policy, known_secrets
@@ -235,6 +235,7 @@ def build_guardian(
     hold_timings: HoldTimings | None = None,
     on_egress: Callable[[Egress], None] | None = None,
     scrub: LiveScrub | None = None,
+    hold_watch: HoldWatch | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -257,7 +258,8 @@ def build_guardian(
     ``proxy`` replaces its container (the VM tests: their concessions, docs/21 "En la VM"), and
     ``hold_timings`` the gate's times (the VM tests shorten its 5 min and 90 s, T10-2).
     ``on_egress`` is handed the egress once it is built (``serve``: the Settings page hands it
-    the providers' new keys, T12e). ``scrub`` is the process sensor's list of secrets to strike,
+    the providers' new keys, T12e), and ``hold_watch`` is told about its held requests (the
+    Telegram notice, T10-4). ``scrub`` is the process sensor's list of secrets to strike,
     filled here and kept by ``serve`` to refresh it when a key changes."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
@@ -298,7 +300,9 @@ def build_guardian(
         if sensor
         else None
     )
-    egress = build_egress(config, jail, rated_box, proxy=proxy, timings=hold_timings)
+    egress = build_egress(
+        config, jail, rated_box, proxy=proxy, timings=hold_timings, watch=hold_watch
+    )
     if on_egress is not None:
         on_egress(egress)
     guardian = Guardian(
@@ -369,6 +373,7 @@ def build_egress(
     *,
     proxy: ProxyJail | None = None,
     timings: HoldTimings | None = None,
+    watch: HoldWatch | None = None,
 ) -> Egress:
     """The egress proxy of ``config`` (docs/21, section 9): its container, and what backtide lets
     out through it, the allowed hosts of ``[proxy]`` and the model providers' hosts. The channel
@@ -388,6 +393,7 @@ def build_egress(
         record=box.append,
         timings=timings,
         history=box.events,
+        watch=watch,
     )
 
 
@@ -618,6 +624,7 @@ def serve(
             hold_timings=hold_timings,
             on_egress=built.append,
             scrub=sensor_secrets,
+            hold_watch=None if telegram is None else telegram.desk,
         )
         # The Settings page (T12e): `backtide web --ajustes` asks through this same socket.
         (egress,) = built
