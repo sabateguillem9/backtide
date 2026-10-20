@@ -190,6 +190,98 @@ def test_path_struck_says_whether_recording_the_url_struck_something(
     assert record.path_struck(path, KNOWN) is struck
 
 
+# Credentials the translators know in a URL path (Telegram, Discord, Slack): new every run.
+BOT_TOKEN = "7123456789:AA" + _random(33)
+WEBHOOK_TOKEN = _random(68)
+INTERACTION_TOKEN = "aW50ZXJhY3Rpb246" + _random(150)
+HOOK_SECRET = _random(24)
+PATH_SECRETS = [BOT_TOKEN, WEBHOOK_TOKEN, INTERACTION_TOKEN, HOOK_SECRET]
+
+
+@pytest.mark.parametrize(
+    ("path", "kept"),
+    [
+        (f"/bot{BOT_TOKEN}/sendMessage?chat_id=5", f"/bot{REDACTED}/sendMessage?chat_id=5"),
+        (f"/file/bot{BOT_TOKEN}/photos/file_1.jpg", f"/file/bot{REDACTED}/photos/file_1.jpg"),
+        (f"/api/webhooks/1234567890123456789/{WEBHOOK_TOKEN}",
+         f"/api/webhooks/1234567890123456789/{REDACTED}"),
+        (f"/api/v10/webhooks/42/{WEBHOOK_TOKEN}?wait=true&thread_id=9",
+         f"/api/v10/webhooks/42/{REDACTED}?wait=true&thread_id=9"),
+        (f"/api/webhooks/42/{WEBHOOK_TOKEN}/slack", f"/api/webhooks/42/{REDACTED}/slack"),
+        (f"/api/webhooks/42/{WEBHOOK_TOKEN}/github", f"/api/webhooks/42/{REDACTED}/github"),
+        (f"/api/v10/webhooks/42/{WEBHOOK_TOKEN}/messages/77",
+         f"/api/v10/webhooks/42/{REDACTED}/messages/77"),
+        (f"/api/v10/interactions/42/{INTERACTION_TOKEN}/callback",
+         f"/api/v10/interactions/42/{REDACTED}/callback"),
+        (f"/api/v10/webhooks/42/{INTERACTION_TOKEN}/messages/@original",
+         f"/api/v10/webhooks/42/{REDACTED}/messages/@original"),
+        (f"/services/T0123ABCD/B0456EFGH/{HOOK_SECRET}",
+         f"/services/T0123ABCD/B0456EFGH/{REDACTED}"),
+        (f"/workflows/T0123ABCD/A0456EFGH/1234567890/{HOOK_SECRET}",
+         f"/workflows/T0123ABCD/{REDACTED}"),
+        (f"/triggers/T0123ABCD/1234567890123/{HOOK_SECRET}", f"/triggers/T0123ABCD/{REDACTED}"),
+    ],
+)  # fmt: skip
+def test_credentials_in_the_path_are_struck_and_the_ids_kept(path: str, kept: str) -> None:
+    event = request_event(flow(path=path), KNOWN)
+    assert event["details"]["path"] == kept
+    assert event["target"] == f"https://api.example.com{kept}"
+    assert record.path_struck(path, KNOWN) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Doubled, encoded, twice-encoded or backslashed slashes; any letter case.
+        f"//api//webhooks//42//{WEBHOOK_TOKEN}",
+        f"/api%2Fwebhooks%2F42%2F{WEBHOOK_TOKEN}",
+        f"/api%252Fwebhooks%252F42%252F{WEBHOOK_TOKEN}",
+        f"/api\\webhooks\\42\\{WEBHOOK_TOKEN}",
+        f"/api%5Cwebhooks%5C42%5C{WEBHOOK_TOKEN}",
+        f"/API/WEBHOOKS/42/{WEBHOOK_TOKEN}",
+        f"/api/v10/Interactions/42/{INTERACTION_TOKEN}/Callback",
+        # Escaped letters, where a server reads them back.
+        f"/api/%77ebhooks/42/{WEBHOOK_TOKEN}",
+        f"/api/webhooks/42/{quote(WEBHOOK_TOKEN, safe='')}",
+        "/api/webhooks/42/" + "".join(f"%{ord(c):02X}" for c in WEBHOOK_TOKEN),
+        f"/bot{BOT_TOKEN.replace(':', '%3A')}/getMe",
+        f"/bot{BOT_TOKEN.replace(':', '%253a')}/getMe",
+        f"/BOT{BOT_TOKEN}/GETME",
+        f"//services//T0123ABCD//B0456EFGH//{HOOK_SECRET}",
+        f"/services%2FT0123ABCD%2FB0456EFGH%2F{HOOK_SECRET}",
+        f"/SERVICES/t0123abcd/b0456efgh/{HOOK_SECRET}",
+        f"/%73ervices/T0123ABCD/B0456EFGH/{HOOK_SECRET}",
+        "/services/T0123ABCD/B0456EFGH/" + "".join(f"%{ord(c):02x}" for c in HOOK_SECRET),
+        # In the query, too: the agent hands the webhook to another service.
+        f"/forward?to=https%3A%2F%2Fhooks.slack.com%2Fservices%2FT0123ABCD%2FB0456EFGH%2F{HOOK_SECRET}",
+        f"/forward?to=https://discord.com/api/webhooks/42/{WEBHOOK_TOKEN}",
+    ],
+)
+def test_path_credentials_are_struck_in_hostile_spellings(path: str) -> None:
+    event = request_event(flow(path=path), KNOWN)
+    text = json.dumps(event).lower()
+    for secret in PATH_SECRETS:
+        for form in (secret, quote(secret, safe=""), secret.replace(":", "%3a")):
+            assert form.lower() not in text
+        assert secret.lower() not in unquote(unquote(text))
+    assert record.path_struck(path, KNOWN) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v10/webhooks/1234567890123456789",  # the webhook itself: the bot's token is a header
+        "/api/v1/webhooks/123/deliveries",
+        "/services/translate/v2?q=hola",
+        "/files/my%20report%2Fdraft.txt",
+        "/a%2Fb\\c",
+    ],
+)
+def test_paths_that_only_look_like_a_credential_are_kept_whole(path: str) -> None:
+    assert request_event(flow(path=path), KNOWN)["details"]["path"] == path
+    assert record.path_struck(path, KNOWN) is False
+
+
 def test_a_get_has_no_excerpt_and_neither_has_a_binary_body() -> None:
     get = request_event(flow(method="GET", body=b"q=1"), KNOWN)["details"]["body"]
     assert get == {"size": 3, "type": "application/json"}

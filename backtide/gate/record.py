@@ -23,9 +23,9 @@ Every builder returns an event checked by ``protocol.validate_event``.
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
-from urllib.parse import unquote_plus
+from urllib.parse import unquote, unquote_plus
 
-from backtide.blackbox.redact import KnownScrubber, redact
+from backtide.blackbox.redact import REDACTED, KnownScrubber, redact
 from backtide.gate.policy import normalize_host
 from backtide.gate.protocol import BLOCK_RISK, event_risk, validate_event
 
@@ -178,15 +178,31 @@ def _path(path: object, scrub: KnownScrubber, *, strike: bool = True) -> str:
             name, equals, value = part.partition("=")
             decoded = {unquote_plus(name): unquote_plus(value)}
             if strike and equals and (redact(decoded) != decoded or scrub(decoded) != decoded):
-                value = "[REDACTED]"
+                value = REDACTED
             kept.append(f"{name}{equals}{value}")
         if len(parts) > _MAX_PARAMS:
             kept.append(f"[{len(parts) - _MAX_PARAMS} params dropped]")
         window = f"{base}?{'&'.join(kept)}"
     struck = redact(scrub.text(window)) if strike else window
+    if strike:
+        head, mark, tail = struck.partition("?")
+        if _shows_once_decoded(head):
+            struck = f"/{REDACTED}{mark}{tail}"
     if len(text) > _LIMIT_PATH + _MARGIN:
         struck = struck[:-_MARGIN]  # as in _strike
     return _cut(struck, _LIMIT_PATH)
+
+
+def _shows_once_decoded(head: str) -> bool:
+    """Whether a secret pattern shows in the (struck) path once read as a server may read it:
+    %xx decoded once or twice, a backslash as a slash ("/bot123%3AAA…", "/%77ebhooks/…"). Its
+    place in the raw text cannot be pinned down, so the caller strikes the whole path (as
+    scrub_known does)."""
+    once = unquote(head)
+    for decoded in {once, unquote(once), once.replace("\\", "/")} - {head}:
+        if redact(decoded) != decoded:
+            return True
+    return False
 
 
 def path_struck(path: object, secrets: Secrets) -> bool:

@@ -27,6 +27,13 @@ _SECRET_NAME_RE = re.compile(rf"[\w.-]*?{_SENSITIVE_WORDS}")
 _PAIR_NAME_KEYS = frozenset({"name", "key", "header"})
 _PAIR_VALUE_KEYS = frozenset({"value", "values"})
 
+# Credentials that live in a URL path (the translators of T10-3 know these forms). Between the
+# segments, any run of slashes, backslashes (also JSON's "\/") or their %-escapes; a token
+# may be %-escaped. Only the token is struck: the ids around it stay readable.
+_PATH_SEP = r"(?:[\\/]|%2f|%5c)++"
+_PATH_CHAR = r"(?:[a-z0-9_.~-]|%[0-9a-f]{2})"
+_PATH_REST = r"[^?#\s\"'<>]"
+
 # Each pattern marks the part to strike with the group "secret". Order matters: whole
 # blocks first, then header lines, then single tokens, then name/value pairs. A name is
 # matched from its first character (the lookbehinds), which also keeps the scans linear.
@@ -58,6 +65,22 @@ _TEXT_PATTERNS = (
     re.compile(r"\b(?P<secret>xox[abprs]-[A-Za-z0-9-]{10,})"),  # Slack
     re.compile(r"\b(?P<secret>(?:AKIA|ASIA)[A-Z0-9]{16})\b"),  # AWS access key id
     re.compile(r"(?<![0-9])(?P<secret>[0-9]{5,16}:[A-Za-z0-9_-]{30,})"),  # Telegram bot
+    # Discord: /webhooks/{id}/{token}[/...] and /interactions/{id}/{token}/callback (also an
+    # interaction's /webhooks/{app_id}/{token}/...). Its tokens are 68+ characters; 20 keeps
+    # "/webhooks/1/deliveries" readable.
+    re.compile(
+        rf"(?i)(?:webhooks|interactions){_PATH_SEP}(?:[0-9]|%3[0-9]){{1,20}}+{_PATH_SEP}"
+        rf"(?P<secret>{_PATH_CHAR}{{20,}}+)"
+    ),
+    # Slack's incoming webhooks: /services/T…/B…/<secret>, /workflows/T…/... and /triggers/T…/...
+    # Everything after the team (after B… too, for services) goes, if one of its next four
+    # segments starts with 16 letters and digits, as the secret does: "/services/translate/v2"
+    # stays.
+    re.compile(
+        rf"(?i)(?:services|workflows|triggers){_PATH_SEP}[TE][A-Z0-9]{{1,31}}+{_PATH_SEP}"
+        rf"(?:B[A-Z0-9]{{1,31}}+{_PATH_SEP})?"
+        rf"(?P<secret>(?:[^?#\s\"'<>/\\%]{{0,40}}+{_PATH_SEP}){{0,3}}?[a-z0-9]{{16}}{_PATH_REST}*+)"
+    ),
     # Credentials inside a URL: scheme://user:password@host
     re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://[^/\s:@]+:(?P<secret>[^/\s@]+)@"),
     # curl -u user:password, --user user:password; between quotes, to the closing one

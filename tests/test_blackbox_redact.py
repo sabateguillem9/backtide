@@ -304,6 +304,106 @@ def test_keys_that_collide_once_cut_are_all_kept() -> None:
     assert all(len(key.encode()) <= MAX_TEXT_BYTES for key in result)
 
 
+# --- credentials in a URL path (Discord and Slack webhooks) -------------------------------------
+
+# Test values with the real shapes: a Discord webhook token is 68 characters, an interaction
+# token is longer, a Slack webhook secret is 24 letters and digits.
+DISCORD_TOKEN = ("Dq7-Kz_" + "a1B2c3D4e5F6g7H8i9J0" * 4)[:68]
+INTERACTION_TOKEN = "aW50ZXJhY3Rpb246" + "Mk9pQ2xVbXpYRjR0N2c" * 8
+SLACK_HOOK = "Xy7Bq2Lm9Pw4Rt6Zk3Nc8Vd1"
+SLACK_TRIGGER = "0f3a" + "9c2e7b1d" * 3 + "5a6b"
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (f"https://discord.com/api/webhooks/1234567890123456789/{DISCORD_TOKEN}", DISCORD_TOKEN),
+        (f"/api/v10/webhooks/1234567890123456789/{DISCORD_TOKEN}?wait=true", DISCORD_TOKEN),
+        (f"https://discordapp.com/api/webhooks/42/{DISCORD_TOKEN}/slack", DISCORD_TOKEN),
+        (f"/api/webhooks/42/{DISCORD_TOKEN}/github?thread_id=9", DISCORD_TOKEN),
+        (f"/api/v9/webhooks/42/{DISCORD_TOKEN}/messages/1122334455", DISCORD_TOKEN),
+        (f"/api/v10/interactions/42/{INTERACTION_TOKEN}/callback", INTERACTION_TOKEN),
+        (f"/api/v10/webhooks/42/{INTERACTION_TOKEN}/messages/@original", INTERACTION_TOKEN),
+        (f"curl -X POST https://discord.com/api/webhooks/42/{DISCORD_TOKEN} -d x", DISCORD_TOKEN),
+        (f'{{"url": "https:\\/\\/discord.com\\/api\\/webhooks\\/42\\/{DISCORD_TOKEN}"}}',
+         DISCORD_TOKEN),
+        (f"https://hooks.slack.com/services/T0123ABCD/B0456EFGH/{SLACK_HOOK}", SLACK_HOOK),
+        (f"https://hooks.slack.com/workflows/T0123ABCD/A0456EFGH/1234567890/{SLACK_HOOK}",
+         SLACK_HOOK),
+        (f"https://hooks.slack.com/triggers/T0123ABCD/1234567890123/{SLACK_TRIGGER}",
+         SLACK_TRIGGER),
+        (f"https://hooks.slack.com/triggers/E0123ABCD/1234567890123/{SLACK_TRIGGER}",
+         SLACK_TRIGGER),
+        (f"SLACK_URL=https://hooks.slack.com/services/T0123ABCD/B0456EFGH/{SLACK_HOOK} ./run",
+         SLACK_HOOK),
+    ],
+)  # fmt: skip
+def test_credentials_in_a_url_path_are_struck(text: str, secret: str) -> None:
+    result = redact(text)
+    assert secret not in result
+    assert REDACTED in result
+    assert redact(result) == result
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        # Doubled, encoded or backslashed slashes, and any letter case.
+        (f"//api//webhooks//42//{DISCORD_TOKEN}", DISCORD_TOKEN),
+        (f"/api%2Fwebhooks%2f42%2F{DISCORD_TOKEN}", DISCORD_TOKEN),
+        (f"/api\\webhooks\\42\\{DISCORD_TOKEN}", DISCORD_TOKEN),
+        (f"/API/V10/WEBHOOKS/42/{DISCORD_TOKEN}", DISCORD_TOKEN),
+        (f"/api/Interactions/42/{INTERACTION_TOKEN}/CALLBACK", INTERACTION_TOKEN),
+        (f"/api/webhooks/%34%32/{DISCORD_TOKEN}", DISCORD_TOKEN),  # an escaped id
+        (f"/api/webhooks/42/{DISCORD_TOKEN}/slack", DISCORD_TOKEN),
+        (f"//services//T0123ABCD//B0456EFGH//{SLACK_HOOK}", SLACK_HOOK),
+        (f"/services%2FT0123ABCD%2fB0456EFGH%2F{SLACK_HOOK}", SLACK_HOOK),
+        (f"/SERVICES/t0123abcd/b0456efgh/{SLACK_HOOK}", SLACK_HOOK),
+        (f"/services/T0123ABCD/B0456EFGH/{SLACK_HOOK.lower()}", SLACK_HOOK.lower()),
+        (f"/services/T0123ABCD/{SLACK_HOOK}", SLACK_HOOK),  # no B…: the rest goes anyway
+        (f"/services/T0123ABCD/B0456EFGH/x/{SLACK_HOOK}", SLACK_HOOK),
+    ],
+)
+def test_path_credentials_are_struck_in_hostile_spellings(text: str, secret: str) -> None:
+    result = redact(text)
+    assert secret not in result
+    assert secret.lower() not in result.lower()
+    assert redact(result) == result
+
+
+def test_a_path_credential_loses_only_its_token_and_the_ids_stay() -> None:
+    assert redact(f"/api/v10/webhooks/1234567890123456789/{DISCORD_TOKEN}/messages/77?wait=1") == (
+        f"/api/v10/webhooks/1234567890123456789/{REDACTED}/messages/77?wait=1"
+    )
+    assert redact(f"/api/v10/interactions/42/{INTERACTION_TOKEN}/callback") == (
+        f"/api/v10/interactions/42/{REDACTED}/callback"
+    )
+    assert redact(f"/services/T0123ABCD/B0456EFGH/{SLACK_HOOK}?x=1") == (
+        f"/services/T0123ABCD/B0456EFGH/{REDACTED}?x=1"
+    )
+    # Workflows and triggers vary in shape: everything after the team goes.
+    assert redact(f"/triggers/T0123ABCD/1234567890123/{SLACK_TRIGGER}") == (
+        f"/triggers/T0123ABCD/{REDACTED}"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/repos/ana/app/hooks/12345/deliveries",
+        "/api/v1/webhooks/123/deliveries",
+        "/api/v10/webhooks/1234567890123456789",  # the webhook itself, with the bot's token
+        "/api/v10/interactions/42/short/callback",
+        "/services/translate/v2?q=hola",
+        "/api/v1/namespaces/default/services/my-service/proxy",
+        "/services/T0123ABCD/B0456EFGH/short",
+        "https://hooks.slack.com/services/",
+    ],
+)
+def test_paths_that_only_look_like_a_webhook_are_left_alone(text: str) -> None:
+    assert redact(text) == text
+
+
 # --- scrub_known: the secrets backtide knows, wherever they show up -----------------------------
 
 KNOWN = "kn0wnS3cret-" + "Q7w8E9r0T1y2U3i4O5p6"
@@ -458,6 +558,12 @@ _redact_mod = _importlib.import_module("backtide.blackbox.redact")
         "-u 'a:",
         '"--user=a:',
         "eyJa.eyJa",
+        "webhooks/1/",
+        "webhooks/1/a",
+        "%2f",
+        "services/T1/",
+        "services/T1/B1/a",
+        "triggers/E1/a/",
     ],  # fmt: skip
 )
 def test_each_pattern_is_fast_on_70_kib_of_hostile_text(unit: str) -> None:
