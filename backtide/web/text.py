@@ -71,6 +71,22 @@ def visible(value: object, limit: int | None = None, *, keep_newlines: bool = Fa
     return Markup("".join(pieces))  # noqa: S704 - every piece above is escaped or ours
 
 
+def visible_middle(value: object, limit: int) -> Markup:
+    """``visible`` for an address or an id: cut in the middle when longer than ``limit``,
+    keeping its end (an address's domain) and saying how many characters were left out with a
+    marker of ours (``<span class="cut">…(190)…</span>``), never in the agent's text: the
+    start alone of ``ana@ejemplo.com.<190 characters>.malo.io`` would read as
+    ``ana@ejemplo.com`` (final review of T10, finding 4)."""
+    text = value if isinstance(value, str) else str(value)
+    if len(text) <= limit:
+        return visible(text)
+    head = limit // 3
+    tail = limit - head
+    left_out = len(text) - head - tail
+    mark = Markup('<span class="cut">…({})…</span>').format(left_out)
+    return visible(text[:head]) + mark + visible(text[-tail:])
+
+
 def _marker(char: str, times: str) -> str:
     name = unicodedata.name(char, "") or unicodedata.category(char)
     return _MARK.format(title=escape(name.lower()), code=ord(char), times=times)

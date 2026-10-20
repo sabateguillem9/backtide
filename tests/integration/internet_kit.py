@@ -74,7 +74,11 @@ OAUTH_LOGIN_HOSTS = (
 # agent sends there. The fake internet answers it (with what reached it): a fake Bot API inside
 # the test's internal network, never Telegram (invariant 8).
 TELEGRAM_HOST = "api.telegram.org"
-HOSTS = (ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST, OTHER_HOST, TELEGRAM_HOST, *OAUTH_LOGIN_HOSTS)
+# The final review of T10 (confiar-sin-querer): Gmail's API host, so the gate's Gmail translator
+# reads the agent's mails there. A fake too, inside the test's network (invariant 8).
+GMAIL_HOST = "gmail.googleapis.com"
+HOSTS = (ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST, OTHER_HOST, TELEGRAM_HOST, GMAIL_HOST,
+         *OAUTH_LOGIN_HOSTS)  # fmt: skip
 REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"  # proxy_fixtures/fake_internet.py
 GRANTS_OPTION = "--egress-grants"
 
@@ -156,7 +160,9 @@ def start_fake_internet(service: Service, root: Path) -> FakeInternet:
     for folder in (certs, files, internet):
         folder.mkdir(exist_ok=True)
     ca_key, ca_cert = make_ca(certs, "T06-5 test internet CA", 2048, 30)
-    server_pem = make_server_cert(certs, ca_key, ca_cert, (TELEGRAM_HOST, *OAUTH_LOGIN_HOSTS))
+    server_pem = make_server_cert(
+        certs, ca_key, ca_cert, (TELEGRAM_HOST, GMAIL_HOST, *OAUTH_LOGIN_HOSTS)
+    )
     shutil.copyfile(server_pem, internet / "server.pem")
     shutil.copyfile(FIXTURES / "fake_internet.py", files / "fake_internet.py")
     for folder in (files, internet):

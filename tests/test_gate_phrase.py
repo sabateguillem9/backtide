@@ -80,3 +80,17 @@ def test_a_fetched_url_and_an_inline_message_are_noted() -> None:
     )
     inline = reading(effect="change", recipients=["inline:AgAA"], notes=["inline_message"])
     assert "puede estar en cualquier chat" in describe(inline)
+
+
+def test_a_long_recipient_is_cut_in_the_middle_keeping_its_domain() -> None:
+    """Final review of T10, finding 4: ``ana@ejemplo.com.<190>.malo.io`` must not read as
+    ``ana@ejemplo.com``; the end stays and the cut says how much is missing."""
+    from backtide.gate.phrase import RECIPIENT_CHARS, cut_middle
+
+    long = "ana@ejemplo.com." + "x" * 190 + ".malo.io"
+    shown = cut_middle(long)
+    assert shown.startswith("ana@ejemplo.com.") and shown.endswith("x.malo.io")
+    assert f"…({len(long) - RECIPIENT_CHARS})…" in shown
+    assert cut_middle("ana@ejemplo.com") == "ana@ejemplo.com"
+    said = describe(reading(translator="gmail", recipients=[long], first_lines=None))
+    assert said.endswith(".malo.io") and "…(" in said

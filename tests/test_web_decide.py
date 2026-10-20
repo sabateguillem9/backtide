@@ -317,6 +317,131 @@ def test_what_may_not_be_trusted_is_not_offered(web: TestClient, fake: FakeAppro
     assert fake.calls == []
 
 
+# -- the final review of T10 -------------------------------------------------------------------
+
+LONG = "ana@ejemplo.com." + "x" * 190 + ".malo.io"
+
+
+def test_a_long_address_is_cut_in_the_middle_with_our_mark_and_its_domain_apart(
+    tmp_path: Path, fake: FakeApprover
+) -> None:
+    """Finding 4: the start of a long address would read as another one. The end (its domain)
+    stays, the cut is marked by us, and the confirmation names each domain in our words."""
+    mail = hold()["view"] | {"translator": "gmail", "recipients": [LONG],
+                             "reply_to": ["ana@ejemplo.com"]}  # fmt: skip
+    fake.listed = [hold(view=mail, trustable=False)]
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    web = new_client(tmp_path, approver=fake, clock=lambda: NOW)
+    for path in ("/peticiones", f"{DECIDE}?id={HOLD}&v=aprobar"):
+        page = web.get(path).text
+        assert re.search(r'<span class="cut">…\(\d+\)…</span>[^<]*\.malo\.io', page), path
+        assert "ana@ejemplo.com.xxxx" in page and "x" * 150 not in page, path
+    said = text_of(web.get(f"{DECIDE}?id={HOLD}&v=aprobar").text)
+    domains = said[said.index("Dominio de cada dirección") : said.index("Lo que pide el agente")]
+    assert "malo.io" in domains and "ejemplo.com" in domains
+
+
+def test_the_confirmation_shows_reply_to_and_attachments_as_the_list_does(
+    tmp_path: Path, fake: FakeApprover
+) -> None:
+    """Finding 8: the page where the person says yes shows what the list shows."""
+    view = hold()["view"] | {"translator": "gmail", "recipients": ["ana@ejemplo.com"],
+                             "reply_to": ["otro@malo.example"],
+                             "attachments": [{"name": "factura.pdf", "size": 10}]}  # fmt: skip
+    fake.listed = [hold(view=view, trustable=False)]
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    web = new_client(tmp_path, approver=fake, clock=lambda: NOW)
+    said = text_of(web.get(f"{DECIDE}?id={HOLD}&v=aprobar").text)
+    agent = said[said.index("Lo que pide el agente") :]
+    assert "Responder a: otro@malo.example" in agent and "Adjuntos: factura.pdf" in agent
+
+
+def test_mail_and_an_at_name_say_why_they_cannot_be_trusted(
+    tmp_path: Path, fake: FakeApprover
+) -> None:
+    """Findings 2 and 9: no "aprobar y confiar" for mail (until the owner's accounts exist)
+    nor for a Telegram @name; the list says why in a few words."""
+    mail = hold()["view"] | {"translator": "gmail", "recipients": ["ana@ejemplo.com"]}
+    name = hold()["view"] | {"recipients": ["@canal_publico"]}
+    fake.listed = [hold(view=mail, trustable=False), hold(OTHER, view=name, trustable=False)]
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    web = new_client(tmp_path, approver=fake, clock=lambda: NOW)
+    page = web.get("/peticiones").text
+    assert "v=confiar" not in page
+    assert 'data-trust-off="mail"' in page and 'data-trust-off="name"' in page
+    assert "aún no con correo" in text_of(page) and "no con un @nombre" in text_of(page)
+
+
+@pytest.mark.parametrize(
+    ("chat", "note"), [("-1001234567890", "channel"), ("-4242", "group"), ("556", None)]
+)
+def test_trusting_a_group_or_a_channel_says_who_reads_it(
+    tmp_path: Path, fake: FakeApprover, chat: str, note: str | None
+) -> None:
+    """Finding 9: a negative id is a group, -100... a supergroup or a channel."""
+    fake.listed = [hold(view=hold()["view"] | {"recipients": [chat]})]
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    web = new_client(tmp_path, approver=fake, clock=lambda: NOW)
+    page = web.get(f"{DECIDE}?id={HOLD}&v=confiar").text
+    if note is None:
+        assert "data-trust-note" not in page
+    else:
+        assert f'data-trust-note="{note}"' in page and "lo leen todos" in text_of(page)
+
+
+def test_trusting_says_how_many_other_holds_to_that_recipient_are_decided_apart(
+    tmp_path: Path, fake: FakeApprover
+) -> None:
+    """Finding 1, option (a): the other holds to the newly trusted recipient stay open and are
+    decided one by one; the confirmation says how many there are."""
+    third = "h-00000000000c"
+    fake.listed = [hold(), hold(OTHER, trustable=False), hold(third)]
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    web = new_client(tmp_path, approver=fake, clock=lambda: NOW)
+    page = web.get(f"{DECIDE}?id={HOLD}&v=confiar").text
+    assert 'data-others="2"' in page and "Hay 2 retenida(s) más" in text_of(page)
+    fake.listed = [hold()]
+    assert "data-others" not in web.get(f"{DECIDE}?id={HOLD}&v=confiar").text
+
+
+def test_a_list_from_the_black_box_that_may_miss_holds_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 7: without --aprobar the list reads the newest BOX_ROWS rows of the black box;
+    when even the oldest of them is within the 15 minutes a hold may wait, older holds may be
+    missing, and the page says "puede que haya más"."""
+    monkeypatch.setattr("backtide.web.approve.BOX_ROWS", 5)
+    monkeypatch.setattr("backtide.web.app.BOX_ROWS", 5)
+    box = new_box(tmp_path)
+    box.append("gate", "held", "https://example.com/y", risk=2,
+               details={"hold_id": HOLD, "reason": "write", "expires_at": "2026-10-16T10:05:00Z",
+                        "method": "POST", "host": "example.com", "path": "/y"})  # fmt: skip
+    for n in range(3):
+        box.append("file", "create", f"work/{n}.md")
+    web = new_client(tmp_path, clock=lambda: NOW)
+    assert "data-partial" not in web.get("/peticiones").text, "every row was read"
+    for n in range(3):
+        box.append("file", "create", f"work/mas-{n}.md")
+    page = web.get("/peticiones").text
+    assert "data-partial" in page and "Puede que haya más" in text_of(page)
+    assert "example.com/y" not in text_of(page), "the hold is past what was read"
+
+
+def test_box_partial_needs_a_full_read_whose_oldest_row_is_recent() -> None:
+    from backtide.blackbox import Event, Source
+    from backtide.web.approve import BOX_ROWS, box_partial
+
+    def rows(ts: str, count: int) -> list[Event]:
+        return [Event(seq=i + 1, ts=ts, source=Source.FILE, action="create", target="x",
+                      details={}, risk=0, snapshot_id=None, prev_hash="", hash="")
+                for i in range(count)]  # fmt: skip
+
+    recent, old = "2026-10-16T10:00:00.000000Z", "2026-10-16T09:00:00.000000Z"
+    assert box_partial(rows(recent, BOX_ROWS), NOW)
+    assert not box_partial(rows(recent, BOX_ROWS - 1), NOW)
+    assert not box_partial(rows(old, BOX_ROWS), NOW)
+
+
 def test_batches_and_trusted_recipients_are_listed_and_ended(
     web: TestClient, fake: FakeApprover
 ) -> None:

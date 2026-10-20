@@ -17,6 +17,9 @@ These entries live here, apart from the TOML:
   ``gate/trust_removed``).
 - **Fails closed**: a file that cannot be read gives no trust at all (it only ever adds leave),
   is logged, and is never overwritten: adding is refused until a person looks at it.
+- **Recorded before it is used** (final review of T10, finding 6): ``prepare`` makes the entry,
+  the caller records ``gate/trust_added``, and only then ``commit`` saves it and the gate uses
+  it; if saving fails the caller records ``gate/trust_failed`` and nothing is trusted.
 - At most ``MAX_TRUSTED`` entries. Thread-safe; ``entries()`` never blocks on a write.
 """
 
@@ -31,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from backtide.gate.translate.base import Trusted, normalize_trusted
+from backtide.gate.translate.base import MAIL_TRANSLATORS, Trusted, normalize_trusted
 from backtide.service.config import ConfigError, _read_file
 from backtide.service.settings import SettingsError, write_private
 from backtide.snapshots import utc_now
@@ -124,6 +127,13 @@ class TrustStore:
         with self._lock:
             self._list = entries
             self._entries = tuple(dict.fromkeys(e.trusted for e in entries))
+        mail = sum(1 for e in entries if e.translator in MAIL_TRANSLATORS)
+        if mail:  # final review of T10, finding 2: no owner accounts yet, so they trust nothing
+            logger.warning(
+                "%d trusted mail recipient(s) of the web are not used until the owner's mail "
+                "accounts are configured",
+                mail,
+            )
 
     def _fail(self, why: str) -> None:
         logger.error("the trusted recipients of the web are not used: %s", why)
@@ -150,28 +160,31 @@ class TrustStore:
     def add(
         self, translator: str, recipient: str, *, by: str, hold_id: str | None = None
     ) -> tuple[TrustEntry, bool]:
-        """``(entry, new)``: the entry of ``recipient`` for ``translator``, added and saved now
-        (``new``) or the one there already. TrustError if the list is full, unreadable or cannot
-        be written (then nothing changed); ValueError for a recipient that could never match."""
+        """``prepare`` and, for a new entry, ``commit``: one step, for what records nothing."""
+        entry, new = self.prepare(translator, recipient, by=by, hold_id=hold_id)
+        if new:
+            self.commit(entry)
+        return entry, new
+
+    def prepare(
+        self, translator: str, recipient: str, *, by: str, hold_id: str | None = None
+    ) -> tuple[TrustEntry, bool]:
+        """``(entry, new)``: the entry of ``recipient`` for ``translator`` that ``commit``
+        would save (``new``), or the one there already. Nothing is saved nor used yet: the
+        caller records ``gate/trust_added`` first, and only then commits (final review of T10,
+        finding 6). TrustError if the list is full or unreadable; ValueError for a recipient
+        that could never match."""
         if translator not in TRUSTABLE_TRANSLATORS:
             raise ValueError("that translator has no trusted recipients")
         normalized = normalize_trusted(translator, recipient)
         if not _BY_RE.fullmatch(by):
             raise ValueError("by is a short word")
         with self._lock:
-            if self._broken:
-                raise TrustError(
-                    "La lista de destinatarios de confianza no se pudo leer al arrancar: no se "
-                    "añade nada hasta que alguien mire trusted.json."
-                )
+            self._readable()
             for entry in self._list:
                 if entry.trusted == normalized:
                     return entry, False
-            if len(self._list) >= self._limit:
-                raise TrustError(
-                    f"Ya hay {self._limit} destinatarios de confianza añadidos desde la web: "
-                    "quita alguno antes de añadir otro."
-                )
+            self._room()
             trust_id = self._new_id()
             while any(e.trust_id == trust_id for e in self._list):
                 trust_id = self._new_id()
@@ -183,8 +196,34 @@ class TrustStore:
                 by=by,
                 hold_id=hold_id,
             )
-            self._save([*self._list, entry])
             return entry, True
+
+    def commit(self, entry: TrustEntry) -> None:
+        """Save ``entry`` (from ``prepare``) and only then use it. TrustError, with nothing
+        changed, if the list became unreadable or full, or the file cannot be written; an
+        entry for the same recipient or with the same id that is there already is left as is."""
+        with self._lock:
+            self._readable()
+            if any(e.trusted == entry.trusted or e.trust_id == entry.trust_id for e in self._list):
+                return
+            self._room()
+            self._save([*self._list, entry])
+
+    def _readable(self) -> None:
+        """TrustError (under the lock) when the file could not be used at start."""
+        if self._broken:
+            raise TrustError(
+                "La lista de destinatarios de confianza no se pudo leer al arrancar: no se "
+                "añade nada hasta que alguien mire trusted.json."
+            )
+
+    def _room(self) -> None:
+        """TrustError (under the lock) when the list is full."""
+        if len(self._list) >= self._limit:
+            raise TrustError(
+                f"Ya hay {self._limit} destinatarios de confianza añadidos desde la web: "
+                "quita alguno antes de añadir otro."
+            )
 
     def remove(self, trust_id: str) -> TrustEntry | None:
         """Remove ``trust_id`` and save. None if there is no such entry; TrustError if the file

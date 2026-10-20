@@ -166,8 +166,31 @@ def test_trust_never_covers_other_recipients_effects_or_secrets() -> None:
     ]
     for view in cases:
         assert not all_trusted(read(view), OWNER), view.path
-    assert all_trusted(read(gmail_send(mail(to='"X" <ANA@example.com>'))), OWNER)
-    assert not all_trusted(read(gmail_send(mail(to="a.na@example.com"))), OWNER)
+    ana = read(gmail_send(mail(to='"X" <ANA@example.com>')))
+    assert all_trusted(ana, OWNER, frozenset({str(ana.account)}))
+    other = read(gmail_send(mail(to="a.na@example.com")))
+    assert not all_trusted(other, OWNER, frozenset({str(other.account)}))
+
+
+def test_a_trusted_mail_recipient_needs_one_of_the_owners_accounts() -> None:
+    """Final review of T10, finding 2: a trusted address says who reads, not who writes. A mail
+    to Ana from any other account (an attacker's token) is not trusted; with no owner account
+    configured (today: approved decision 4 is still to do), no mail recipient is."""
+    ana = read(gmail_send(mail(to="ana@example.com")))
+    assert ana.account is not None
+    assert not all_trusted(ana, OWNER), "no owner accounts: mail trust is off"
+    assert not all_trusted(ana, OWNER, frozenset({"0" * 16})), "another account"
+    assert all_trusted(ana, OWNER, frozenset({ana.account}))
+
+
+def test_every_reply_to_must_be_trusted_too() -> None:
+    """Final review of T10, finding 3: the answers go to Reply-To; like BatchRule.covers."""
+    owner = frozenset({str(read(gmail_send(mail())).account)})
+    elsewhere = read(gmail_send(mail(to="ana@example.com", reply_to="malo@example.net")))
+    assert elsewhere.reply_to == ("malo@example.net",)
+    assert not all_trusted(elsewhere, OWNER, owner)
+    to_ana = read(gmail_send(mail(to="ana@example.com", reply_to="Ana@Example.com")))
+    assert all_trusted(to_ana, OWNER, owner)
 
 
 def test_a_trusted_recipient_only_counts_for_its_translator() -> None:

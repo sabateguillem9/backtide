@@ -1306,19 +1306,33 @@ def normalize_trusted(translator: str, recipient: str) -> Trusted:
     raise ValueError("trusted recipients are for gmail, graph_mail, telegram, slack or discord")
 
 
-def all_trusted(reading: Reading, trusted: Iterable[Trusted]) -> bool:
+MAIL_TRANSLATORS = frozenset({"gmail", "graph_mail"})
+
+
+def all_trusted(
+    reading: Reading, trusted: Iterable[Trusted], owner_accounts: frozenset[str] = frozenset()
+) -> bool:
     """Whether a reading goes to trusted recipients only (docs/32, section 9): a send or a
-    change, with at least one recipient, every one of them trusted for its translator, and
-    no secret struck from it. Never a forward, a deletion, an administration or the unknown;
+    change, with at least one recipient, every one of them trusted for its translator (and
+    every ``Reply-To`` too: the answers go there; final review of T10, finding 3), and no
+    secret struck from it. Never a forward, a deletion, an administration or the unknown;
     never one that makes the platform fetch a URL or edits an inline message (review of T10-3,
-    M3 and H2); and a Slack channel only by its id (M4)."""
+    M3 and H2); and a Slack channel only by its id (M4).
+
+    A mail recipient is trusted only from one of the owner's own accounts (``owner_accounts``,
+    the ``account`` ids of the owner's mailboxes): a trusted address says who reads it, not who
+    writes, and a mail to Ana from an attacker's account would pass too (final review of T10,
+    finding 2). Until those accounts are configured (approved decision 4) the set is empty and
+    no mail recipient is trusted at all."""
     if reading.effect not in (Effect.SEND, Effect.CHANGE) or not reading.recipients:
         return False
     if reading.secret_seen or _UNTRUSTABLE & set(reading.notes):
+        return False
+    if reading.translator in MAIL_TRANSLATORS and reading.account not in owner_accounts:
         return False
     allowed = {item.recipient for item in trusted if item.translator == reading.translator}
     if reading.translator == "slack" and not all(
         _SLACK_ID_RE.fullmatch(recipient) for recipient in reading.recipients
     ):
         return False
-    return all(recipient in allowed for recipient in reading.recipients)
+    return all(recipient in allowed for recipient in (*reading.recipients, *reading.reply_to))

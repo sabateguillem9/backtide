@@ -343,3 +343,21 @@ def test_the_egress_policy_gates_unknown_hosts_and_trusts_the_owners_chat(layout
     settings.chmod(0o600)
     policy = egress_policy(config, config.model_providers())
     assert [(t.translator, t.recipient) for t in policy.trusted] == [("telegram", "4242")]
+
+
+def test_a_trusted_mail_recipient_is_said_to_be_inactive(
+    layout: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Final review of T10, finding 2: until the owner's mail accounts exist (approved decision
+    4), a mail address in ``[gate] trusted`` trusts nothing (``all_trusted``); the log says so
+    at start instead of letting the person believe those mails pass."""
+    from backtide.service.runner import egress_policy
+
+    write_key(layout, "anthropic", REAL_ANTHROPIC)
+    write_key(layout, "groq", REAL_OPENAI)
+    gate = '\n[gate]\ntrusted = [{translator = "gmail", email = "ana@ejemplo.com"}]\n'
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS + gate))
+    with caplog.at_level("WARNING", logger="backtide.service.runner"):
+        policy = egress_policy(config, config.model_providers())
+    assert [(t.translator, t.recipient) for t in policy.trusted] == [("gmail", "ana@ejemplo.com")]
+    assert "1 mail recipient(s) are not used" in caplog.text

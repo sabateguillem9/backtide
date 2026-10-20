@@ -119,7 +119,7 @@ class DemoApprover:
         self._lock = threading.Lock()
         self._decided: set[str] = set()
         self._trusted: list[dict[str, Any]] = [
-            {"trust_id": "t-0a1b2c3d", "translator": "gmail", "recipient": "luis@ejemplo.com",
+            {"trust_id": "t-0a1b2c3d", "translator": "telegram", "recipient": "556677",
              "added_at": _now(), "by": "web"},
         ]  # fmt: skip
         self._batches: list[dict[str, Any]] = [
@@ -167,7 +167,7 @@ class DemoApprover:
                 return {"ok": False, "outcome": "not_trustable", "message": DEMO_DECIDED,
                         "hold": None}  # fmt: skip
             self._decided.add(hold_id)
-            translator = "gmail" if found.get("kind") == "email" else "telegram"
+            translator = str(found.get("translator") or "telegram")
             self._trusted.append(
                 {
                     "trust_id": f"t-{len(self._trusted):08x}",

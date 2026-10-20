@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 MAX_CHARS = 400
+RECIPIENT_CHARS = 120  # a recipient longer than this is shown cut in the middle (cut_middle)
 _SHOWN_RECIPIENTS = 3
 _API = {
     "telegram": "Telegram",
@@ -111,10 +112,23 @@ def describe(reading: Mapping[str, Any]) -> str:
     return sentence[:MAX_CHARS]
 
 
+def cut_middle(text: str, limit: int = RECIPIENT_CHARS) -> str:
+    """``text`` cut in the middle when it is longer than ``limit``, saying how many characters
+    were left out: ``ana@ejemplo.com.…(190)….malo.io``. Two thirds of it are the end, which is
+    what tells an address apart (its domain): cutting only the end would show the start of
+    ``ana@ejemplo.com.<190 characters>.malo.io`` as if it were ``ana@ejemplo.com`` (final
+    review of T10, finding 4). A normalized address never has "…" nor parentheses."""
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    tail = limit - head
+    return f"{text[:head]}…({len(text) - head - tail})…{text[-tail:]}"
+
+
 def _recipients(translator: str, recipients: Sequence[Any]) -> str:
     if not recipients:
         return ""
-    shown = ", ".join(_line(str(item)) for item in recipients[:_SHOWN_RECIPIENTS])
+    shown = ", ".join(cut_middle(_line(str(item))) for item in recipients[:_SHOWN_RECIPIENTS])
     more = len(recipients) - _SHOWN_RECIPIENTS
     if more > 0:
         shown += f" y {more} más"

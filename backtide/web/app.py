@@ -75,10 +75,13 @@ from backtide.web.approve import (
     TrustView,
     batch_views,
     box_holds,
+    box_partial,
     detail_of,
     held_event,
     held_request,
     id_fits,
+    same_recipient,
+    trust_note,
     trust_views,
 )
 from backtide.web.ask import MAX_QUESTION, answer
@@ -111,7 +114,7 @@ from backtide.web.settings import (
     views,
 )
 from backtide.web.state import STATE_ACTIONS, AgentStatus, read_status
-from backtide.web.text import visible
+from backtide.web.text import visible, visible_middle
 from backtide.web.tide import WINDOW, build_tide
 
 logger = logging.getLogger(__name__)
@@ -350,6 +353,9 @@ def create_app(
             "run_name": run_name,
             # Whether the holds' buttons work (T10-5): "ready", or why not. Asked when drawn.
             "approvals_state": lambda: str(_approvals()),
+            # The list read from the black box may miss older holds (finding 7).
+            "holds_partial": lambda: box_cache.get("partial") is True,
+            "vis_mid": visible_middle,
             "api": api_name,
         }
 
@@ -535,6 +541,7 @@ def create_app(
         can be read."""
         if _approvals() is Availability.READY and approver is not None:
             raw = approver.holds()
+            box_cache["partial"] = False
         else:
             reader = roster.main.reader
             head = reader.head_seq()
@@ -545,6 +552,7 @@ def create_app(
                     cached = (head, rows)
                     box_cache["rows"] = cached
             raw = box_holds(cached[1], now)
+            box_cache["partial"] = box_partial(cached[1], now)
         found = [held_request(item, now=now) for item in raw if isinstance(item, dict)]
         return [request for request in found if request is not None]
 
@@ -1102,7 +1110,8 @@ def create_app(
     def _hold_view(
         request: Request, t: Translator, status: int, view: str, **values: Any
     ) -> Response:
-        for name in ("hold", "batch", "trust", "outcome", "message", "reason", "verb", "hold_out"):
+        for name in ("hold", "batch", "trust", "outcome", "message", "reason", "verb", "hold_out",
+                     "trust_note", "others"):  # fmt: skip
             values.setdefault(name, None)
         return _page(
             "hold_step.html", request, status=status, active="holds", t=t, view=view, **values
@@ -1191,12 +1200,17 @@ def create_app(
             return _hold_refused(request, t, 200, f"hold.off.{state}")
         values: dict[str, Any] = {"verb": verb, "csrf": access.csrf}
         if verb in (APPROVE, REJECT, TRUST):
-            hold = _find_hold(subject)
+            listed, _now, failed = _requests()
+            found = [] if failed or not listed else listed
+            hold = next((r for r in found if r.id == subject), None)
             if hold is None:
                 return _hold_refused(request, t, 200, "hold.err.unknown")
             if verb == TRUST and not hold.trustable:
                 return _hold_refused(request, t, 200, "hold.err.not_trustable")
             values["hold"] = hold
+            if verb == TRUST:  # our notes: who reads it, and what is still held (final review)
+                values["trust_note"] = trust_note(hold)
+                values["others"] = same_recipient(hold, found)
             values["now"] = clock()
             ticket = decision_tickets.issue(verb, subject, until=hold.expires_at)
         else:

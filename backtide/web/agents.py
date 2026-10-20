@@ -171,6 +171,11 @@ class PendingRequest:
     waiting: bool = False
     batches: tuple[str, ...] = ()
     trustable: bool = False
+    # Final review of T10: which API it is (``translator``, for our notes on the trust
+    # confirmation) and, when it may not make a trusted recipient for a reason worth saying,
+    # which one (``trust_off``: "mail", "name").
+    translator: str = ""
+    trust_off: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not SLUG.fullmatch(self.id):
@@ -179,6 +184,15 @@ class PendingRequest:
             raise RosterError("a request's risk is 0 to 3")
         if self.expires_at <= self.held_at:
             raise RosterError("a request expires after it was held")
+
+    @property
+    def domains(self) -> tuple[str, ...]:
+        """The domain of every address it names (recipients and Reply-To), each once: shown
+        apart, in our words, so a long address cannot hide where it goes (finding 4)."""
+        found = (
+            item.rpartition("@")[2] for item in (*self.recipients, *self.reply_to) if "@" in item
+        )
+        return tuple(dict.fromkeys(domain for domain in found if domain))
 
     @property
     def what(self) -> str:
@@ -230,6 +244,8 @@ def request_from(data: Mapping[str, Any]) -> PendingRequest:
             request=str(data.get("request", ""))[:600],
             trustable=data.get("trustable") is True,
             batches=tuple(b for b in data.get("batches", []) if b in ("recipient", "kind")),
+            translator=str(data.get("translator", ""))[:20],
+            trust_off=str(data.get("trust_off", ""))[:20],
         )
     except (KeyError, TypeError, ValueError) as error:
         if isinstance(error, RosterError):

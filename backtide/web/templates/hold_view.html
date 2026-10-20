@@ -20,8 +20,8 @@
     <div class="req-agent">
       <p class="req-agent-head">{{ t('hold.agent') }}</p>
       <p><span class="muted">{{ t('hold.request') }}</span> <span class="name">{{ vis(detail.request, 2200) }}</span></p>
-      {% if detail.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in detail.recipients %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
-      {% if detail.reply_to %}<p><span class="muted">{{ t('hold.reply_to') }}</span> {% for rc in detail.reply_to %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      {% if detail.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in detail.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      {% if detail.reply_to %}<p><span class="muted">{{ t('hold.reply_to') }}</span> {% for rc in detail.reply_to %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
       {% if detail.sender %}<p><span class="muted">{{ t('hold.from') }}</span> <span class="name">{{ vis(detail.sender, 200) }}</span></p>{% endif %}
       {% if detail.subject %}<p><span class="muted">{{ t('hold.subject') }}</span> <span class="name">{{ vis(detail.subject, 200) }}</span></p>{% endif %}
       {% if detail.lines %}<p class="req-lines"><span class="name">{{ vis(detail.lines, 300) }}</span></p>{% endif %}

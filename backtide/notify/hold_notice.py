@@ -44,7 +44,7 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
-from backtide.gate.phrase import action, api_name, note_texts
+from backtide.gate.phrase import action, api_name, cut_middle, note_texts
 from backtide.notify.buttons import CONFIRM_TTL, Action, Button, ButtonBook
 from backtide.notify.telegram_api import BotApi, TelegramError
 from backtide.notify.text import agent_text
@@ -128,10 +128,13 @@ def _inert(text: object) -> str:
     return agent_text(str(text), MARKERS)
 
 
+def _flat(text: object) -> str:
+    return " / ".join(piece.strip() for piece in str(text).splitlines() if piece.strip())
+
+
 def _one_line(text: object, limit: int = LINE_CHARS) -> str:
     """The agent's text on one line: struck, inert and cut."""
-    flat = " / ".join(piece.strip() for piece in str(text).splitlines() if piece.strip())
-    return _cut(_inert(flat), limit)
+    return _cut(_inert(_flat(text)), limit)
 
 
 def _cut(text: str, limit: int) -> str:
@@ -167,7 +170,9 @@ def _size(size: object) -> str:
 
 
 def _recipients(recipients: Sequence[Any], shown: int = SHOWN_RECIPIENTS) -> str:
-    names = [_one_line(item, 120) for item in recipients[:shown]]
+    # Cut in the middle, keeping the end (an address's domain), before it is made inert
+    # (final review of T10, finding 4).
+    names = [_inert(cut_middle(_flat(item))) for item in recipients[:shown]]
     more = len(recipients) - shown
     return ", ".join(names) + (f" y {more} más" if more > 0 else "")
 

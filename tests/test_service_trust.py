@@ -20,7 +20,15 @@ from typing import Any
 import pytest
 
 from backtide.blackbox import BlackBox
-from backtide.service.holds import Hold, HoldTimings, Scope, TrustStatus, trust_target
+from backtide.gate import protocol
+from backtide.service.holds import (
+    TRUST_RECIPIENT_CHARS,
+    Hold,
+    HoldTimings,
+    Scope,
+    TrustStatus,
+    trust_target,
+)
 from backtide.service.trust import STATE_TRUST, TrustError, TrustStore
 from tests.test_service_proxy_channel import (  # noqa: F401 - box is a fixture
     OTHER_BOT,
@@ -146,10 +154,15 @@ def reading(**changes: Any) -> dict[str, Any]:
 def test_a_send_to_one_recipient_may_be_trusted() -> None:
     assert trust_target(hold_with(reading())) == ("telegram", "556")
     assert trust_target(hold_with(reading(effect="change"))) == ("telegram", "556")
-    email = reading(
-        translator="gmail", recipients=["ana@ejemplo.com"], reply_to=["ana@ejemplo.com"]
-    )
-    assert trust_target(hold_with(email)) == ("gmail", "ana@ejemplo.com")
+    # A group (negative id) or a supergroup or channel (-100...): trustable, and the web says
+    # in our words that everyone in it reads it (final review of T10, finding 9).
+    assert trust_target(hold_with(reading(recipients=["-1001234567890"]))) == (
+        "telegram", "-1001234567890"
+    )  # fmt: skip
+    slack = reading(translator="slack", recipients=["C0123ABCD9"])
+    assert trust_target(hold_with(slack)) == ("slack", "C0123ABCD9")
+    longest = reading(translator="discord", recipients=["1" * TRUST_RECIPIENT_CHARS])
+    assert trust_target(hold_with(longest)) == ("discord", "1" * TRUST_RECIPIENT_CHARS)
 
 
 @pytest.mark.parametrize(
@@ -173,6 +186,12 @@ def test_a_send_to_one_recipient_may_be_trusted() -> None:
         hold_with(reading(translator="slack", recipients=["#general"])),
         hold_with(reading(translator="gmail", recipients=["ana@x.com"], reply_to=["malo@x.com"])),
         hold_with(reading(translator="read_post")),
+        # Final review of T10: no mail recipient until the owner's accounts exist (finding 2),
+        # nothing too long to read whole (finding 4), no Telegram @name (finding 9).
+        hold_with(reading(translator="gmail", recipients=["ana@x.com"], reply_to=["ana@x.com"])),
+        hold_with(reading(translator="graph_mail", recipients=["ana@x.com"])),
+        hold_with(reading(translator="discord", recipients=["1" * (TRUST_RECIPIENT_CHARS + 1)])),
+        hold_with(reading(recipients=["@canal_publico"])),
     ],
 )
 def test_what_is_never_trusted(hold: Hold) -> None:
@@ -261,6 +280,81 @@ def test_a_trust_that_cannot_be_saved_approves_nothing(
     assert outcome.status is TrustStatus.FAILED and outcome.hold is None
     assert gated.gate_events("approved") == [] and gated.gate_events("trust_added") == []
     assert [h["hold_id"] for h in gated.channel.pending()] == [hold_id]
+
+
+def test_a_trust_is_recorded_before_it_is_saved_and_used(
+    trusting: tuple[Gated, TrustStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final review of T10, finding 6: two phases. ``gate/trust_added`` comes first; if saving
+    then fails, ``gate/trust_failed`` says so, nothing is trusted and the hold stays open."""
+    gated, store = trusting
+    hold_id = gated.ask(*telegram_call("556", "uno", n=1))["hold_id"]
+    seen: list[list[str]] = []
+
+    def cannot_write(*_args: Any, **_kwargs: Any) -> None:
+        seen.append([e.action for e in gated.gate_events()])
+        raise OSError("disk full")
+
+    monkeypatch.setattr("backtide.service.trust.write_private", cannot_write)
+    outcome = trust(gated, hold_id)
+    assert outcome.status is TrustStatus.FAILED and outcome.hold is None
+    assert seen == [["held", "trust_added"]], "recorded before the file is written"
+    [added] = gated.gate_events("trust_added")
+    [failed] = gated.gate_events("trust_failed")
+    assert failed.details["trust_id"] == added.details["trust_id"] and added.seq < failed.seq
+    assert failed.details["why"] == "not_saved" and failed.details["by"] == "web"
+    assert store.entries() == () and gated.gate_events("approved") == []
+    assert [h["hold_id"] for h in gated.channel.pending()] == [hold_id]
+    assert gated.ask(*telegram_call("556", "dos", n=2))["verdict"] == "hold", "never used"
+    monkeypatch.undo()
+    assert trust(gated, hold_id).status is TrustStatus.TRUSTED
+    assert [(t.translator, t.recipient) for t in store.entries()] == [("telegram", "556")]
+
+
+def test_a_trust_that_cannot_be_recorded_is_never_saved(box: BlackBox, folder: Path) -> None:  # noqa: F811
+    from backtide.gate.translate.base import normalize_trusted
+    from tests.test_service_proxy_channel import Failing
+
+    store = TrustStore(folder)
+    owner = (normalize_trusted("telegram", OWNER),)
+    gated = Gated(box, trust=store, record=Failing(box, "trust_added"),
+                  policy=policy(unknown_hosts="hold", trusted=owner))  # fmt: skip
+    try:
+        hold_id = gated.ask(*telegram_call("556", "uno", n=1))["hold_id"]
+        assert trust(gated, hold_id).status is TrustStatus.FAILED
+        assert gated.gate_events("approved") == []
+        assert store.entries() == () and not (folder / STATE_TRUST).exists()
+    finally:
+        gated.channel.close()
+
+
+def test_other_holds_to_a_newly_trusted_recipient_are_decided_on_their_own(
+    trusting: tuple[Gated, TrustStore],
+) -> None:
+    """Final review of T10, finding 1: two messages to 556 are held; "aprobar y confiar" on the
+    first. The second one's retry (same fingerprint) joins its own hold instead of passing as
+    trusted: it goes out only if that hold is approved, and never twice. A new message to 556
+    passes."""
+    gated, _store = trusting
+    first = gated.ask(*telegram_call("556", "uno", n=1))["hold_id"]
+    second = gated.ask(*telegram_call("556", "dos", n=2))
+    gated.proxy.send(protocol.hold_left(second["hold_id"], "waited"))  # its client gave up
+    gated.until(lambda: len([h for h in gated.channel.pending() if not h["waiting"]]) == 1)
+    assert trust(gated, first).status is TrustStatus.TRUSTED
+    gated.proxy.receive_type("decision")
+    retry = gated.ask(*telegram_call("556", "dos", n=2))
+    assert retry["verdict"] == "hold" and retry["hold_id"] == second["hold_id"]
+    assert len(gated.gate_events("held")) == 2, "it joined: no new hold"
+    sent = [e.details["path"] for e in gated.requests()]
+    assert not any("text=dos" in path for path in sent), "nothing of the second went out"
+    assert [h["hold_id"] for h in gated.channel.pending()] == [second["hold_id"]]
+    new = gated.ask(*telegram_call("556", "tres", n=3))
+    assert new["verdict"] == "allow"
+    assert gated.requests()[-1].details["gate"]["decision"] == "trusted"
+    # The second one is decided apart: approved, it goes out once.
+    assert gated.decide(second["hold_id"]) == "released"
+    gated.proxy.receive_type("decision")
+    assert sum("text=dos" in e.details["path"] for e in gated.requests()) == 1
 
 
 def test_trust_is_per_api_and_survives_another_bot(trusting: tuple[Gated, TrustStore]) -> None:

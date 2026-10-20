@@ -110,3 +110,16 @@ def test_enclosing_marks_count_too() -> None:
 def test_two_towers_are_two_markers() -> None:
     html = str(visible("a" + "́" * 9 + "b" + "̀" * 9))
     assert html.count('class="esc"') == 2
+
+
+def test_visible_middle_keeps_the_end_and_marks_the_cut_as_ours() -> None:
+    """Final review of T10, finding 4: an address is cut in the middle, keeping its domain,
+    with a marker the agent's text cannot be (a span of ours)."""
+    from backtide.web.text import visible_middle
+
+    long = "ana@ejemplo.com." + "x" * 190 + ".malo.io"
+    shown = str(visible_middle(long, 120))
+    assert shown.startswith("ana@ejemplo.com.") and shown.endswith(".malo.io")
+    assert f'<span class="cut">…({len(long) - 120})…</span>' in shown
+    assert str(visible_middle("a<b@x.io", 120)) == "a&lt;b@x.io"
+    assert "&lt;" in str(visible_middle("<" * 200 + "@x.io", 20)), "both ends escaped"

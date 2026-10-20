@@ -37,6 +37,7 @@ from typing import Any, Protocol
 
 from backtide.blackbox import Event, Source
 from backtide.gate.phrase import action, note_texts
+from backtide.gate.protocol import MAX_RECIPIENT_CHARS
 from backtide.service.control import (
     ControlError,
     PeerCredentials,
@@ -224,7 +225,7 @@ def held_request(
         }
         ours = action(reading)
         notes = tuple(note_texts(reading))
-        recipients = _texts(view.get("recipients"))
+        recipients = _texts(view.get("recipients"), MAX_RECIPIENT_CHARS)
         total = view.get("recipients_total")
         more = max(0, total - len(recipients)) if type(total) is int else 0
         subject = _text(view.get("subject"), 200)
@@ -237,10 +238,12 @@ def held_request(
             for item in (view.get("attachments") or [])[:SHOWN_RECIPIENTS]
             if isinstance(item, Mapping)
         )
-        reply_to = _texts(view.get("reply_to"))
+        reply_to = _texts(view.get("reply_to"), MAX_RECIPIENT_CHARS)
+        translator = view.get("translator") if isinstance(view.get("translator"), str) else ""
+        trust_off = _trust_off(translator, view.get("effect"), recipients)
     else:
         ours, notes, recipients, more = "", (), (), 0
-        subject = lines = ""
+        subject = lines = translator = trust_off = ""
         attachments, reply_to = (), ()
         request = " ".join(
             part
@@ -277,6 +280,47 @@ def held_request(
         waiting=raw.get("waiting") is True,
         batches=batches,
         trustable=raw.get("trustable") is True,
+        translator=translator[:20],
+        trust_off=trust_off,
+    )
+
+
+def _trust_off(translator: str, effect: object, recipients: Sequence[str]) -> str:
+    """Why "aprobar y confiar" is not offered, when it is worth a word (final review of T10):
+    "mail" (finding 2: not until the owner's accounts exist) or "name" (finding 9: a Telegram
+    chat by its @name is a public channel or group, and a name can pass to another chat)."""
+    if effect not in ("send", "change"):
+        return ""
+    if translator in _MAIL:
+        return "mail"
+    if translator == "telegram" and len(recipients) == 1 and recipients[0].startswith("@"):
+        return "name"
+    return ""
+
+
+def trust_note(hold: PendingRequest) -> str:
+    """Our note on who reads a Telegram chat the person is about to trust (finding 9): "group"
+    for a group (a negative id), "channel" for a supergroup or a channel (-100...); "" for a
+    person's chat or another API."""
+    if hold.translator != "telegram" or len(hold.recipients) != 1:
+        return ""
+    chat = hold.recipients[0]
+    if chat.startswith("-100"):
+        return "channel"
+    return "group" if chat.startswith("-") else ""
+
+
+def same_recipient(hold: PendingRequest, others: Sequence[PendingRequest]) -> int:
+    """How many other open holds name the recipient that trusting ``hold`` would trust: they
+    are decided apart (final review of T10, finding 1)."""
+    if len(hold.recipients) != 1:
+        return 0
+    return sum(
+        1
+        for other in others
+        if other.id != hold.id
+        and other.translator == hold.translator
+        and hold.recipients[0] in other.recipients
     )
 
 
@@ -318,6 +362,16 @@ def box_holds(events: Sequence[Event], now: datetime) -> list[dict[str, Any]]:
             }
         )
     return list(reversed(found))
+
+
+def box_partial(events: Sequence[Event], now: datetime) -> bool:
+    """Whether ``box_holds`` may have missed holds (final review of T10, finding 7): it read
+    ``BOX_ROWS`` rows (by primary key: the box has no index by source) and the oldest of them is
+    newer than the 15 minutes a hold may still wait. The page then says "puede que haya más"."""
+    if len(events) < BOX_ROWS:
+        return False
+    oldest = _moment(events[-1].ts)
+    return oldest is None or oldest > now - STALE_WINDOW
 
 
 def _box_view(reading: object) -> dict[str, Any] | None:
@@ -389,8 +443,8 @@ def detail_of(event: Event) -> Detail:
             )
             if p
         ),
-        recipients=_texts(reading.get("recipients"), 200, 64),
-        reply_to=_texts(reading.get("reply_to"), 200, 64),
+        recipients=_texts(reading.get("recipients"), MAX_RECIPIENT_CHARS, 64),
+        reply_to=_texts(reading.get("reply_to"), MAX_RECIPIENT_CHARS, 64),
         sender=_text(reading.get("sender"), 200),
         subject=_text(reading.get("subject"), 200),
         lines=_text(reading.get("first_lines"), MAX_TEXT),
@@ -431,7 +485,7 @@ def batch_views(raw: Sequence[Mapping[str, Any]]) -> list[BatchView]:
                 scope="recipient" if item.get("scope") == "recipient" else "kind",
                 translator=translator if isinstance(translator, str) else None,
                 effect=_text(item.get("effect"), 16) or None,
-                recipients=_texts(item.get("recipients")),
+                recipients=_texts(item.get("recipients"), MAX_RECIPIENT_CHARS),
                 request=" ".join(
                     p
                     for p in (
@@ -469,7 +523,7 @@ def trust_views(raw: Sequence[Mapping[str, Any]]) -> list[TrustView]:
             TrustView(
                 trust_id=trust_id,
                 translator=_text(translator, 20),
-                recipient=_text(recipient, 200),
+                recipient=_text(recipient, MAX_RECIPIENT_CHARS),
                 added_at=_moment(item.get("added_at")),
                 by=_text(item.get("by"), 16),
             )
@@ -545,6 +599,9 @@ __all__ = [
     "detail_of",
     "held_event",
     "held_request",
+    "box_partial",
     "id_fits",
+    "same_recipient",
+    "trust_note",
     "trust_views",
 ]

@@ -141,6 +141,15 @@ def test_the_countdown() -> None:
     assert "en 40 s" in hold_text(notice(expires_in_s=40))
 
 
+def test_a_long_recipient_keeps_its_domain_in_the_notice() -> None:
+    """Final review of T10, finding 4: cut in the middle, the domain stays."""
+    long = "ana@ejemplo.com." + "x" * 190 + ".malo.io"
+    reading = notice()["reading"] | {"translator": "gmail", "recipients": [long]}
+    text = hold_text(notice(reading=reading))
+    [to] = [line for line in text.split("\n") if "Para:" in line]
+    assert "…(" in to and to.endswith("malo․io"), to  # "." made untappable
+
+
 def test_view_shows_every_recipient_the_attachments_and_the_excerpt() -> None:
     details = {
         "method": "POST", "host": "gmail.googleapis.com", "path": "/gmail/v1/users/me/send",

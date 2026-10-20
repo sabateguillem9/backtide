@@ -118,8 +118,8 @@ def box(tmp_path: Path) -> Iterator[BlackBox]:
 
 def make_channel(box: BlackBox, **options: Any) -> tuple[ProxyChannel, Proxy]:
     ours, theirs = socket.socketpair()
-    channel = ProxyChannel(ours, record=box.append, policy=options.pop("policy", policy()),
-                           **options)  # fmt: skip
+    channel = ProxyChannel(ours, record=options.pop("record", box.append),
+                           policy=options.pop("policy", policy()), **options)  # fmt: skip
     return channel, Proxy(theirs)
 
 

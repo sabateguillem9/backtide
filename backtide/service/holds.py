@@ -812,8 +812,13 @@ class HoldBook:
 # to exactly one recipient (and its answers to it), that may ride a batch (no override header nor
 # trailers, no secret, no cut, no draft, an account), with none of the reading's notes: so never
 # an inline message, a URL the platform fetches, a webhook, a deletion, IDN, a duplicate...
+# Final review of T10: never a mail recipient (finding 2: until the owner's accounts exist,
+# approved decision 4, a trusted address would pass from any account), never a recipient over
+# TRUST_RECIPIENT_CHARS (finding 4: one the person cannot read whole), and never a Telegram
+# chat by its @name (finding 9: a public channel or group, and a name can pass to another chat).
 TRUST_EFFECTS = frozenset({"send", "change"})
-TRUST_TRANSLATORS = frozenset({"gmail", "graph_mail", "telegram", "slack", "discord"})
+TRUST_TRANSLATORS = frozenset({"telegram", "slack", "discord"})
+TRUST_RECIPIENT_CHARS = 100
 
 
 def trust_target(hold: Hold) -> tuple[str, str] | None:
@@ -834,7 +839,9 @@ def trust_target(hold: Hold) -> tuple[str, str] | None:
         or reading.get("notes")
         or len(recipients) != 1
         or not isinstance(recipients[0], str)
+        or len(recipients[0]) > TRUST_RECIPIENT_CHARS
         or not reply_to <= {recipients[0]}
+        or (translator == "telegram" and recipients[0].startswith("@"))
     ):
         return None
     try:

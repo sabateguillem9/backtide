@@ -99,7 +99,13 @@ from backtide.gate.decide import UNKNOWN_HOSTS, Facts, ReadingFacts, Verdict, de
 from backtide.gate.fingerprint import new_key, short
 from backtide.gate.phrase import describe
 from backtide.gate.policy import ALLOWED_PORTS, AllowList
-from backtide.gate.protocol import BLOCK_RISK, LineReader, ProtocolError, Sender
+from backtide.gate.protocol import (
+    BLOCK_RISK,
+    MAX_RECIPIENT_CHARS,
+    LineReader,
+    ProtocolError,
+    Sender,
+)
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import (
     OVERRIDE_HEADERS,
@@ -648,8 +654,12 @@ class ProxyChannel:
         # joins it, so the waiting one and this one never both go out: T10-4) and never while
         # the agent is paused or being rewound, as an approval (security review of T10-4, B4).
         scope = self._scope(details, gate, override, risk=2, reason="write", allowed=allowed)
+        # The same holds for trust (final review of T10, finding 1): a retry of a request that
+        # is held joins its hold even when its recipient was trusted meanwhile, so the hold is
+        # decided on its own and the black box never says both "held" and "out".
+        joins = self._book.live(fp) is not None
         rule = None
-        if scope is not None and self._book.live(fp) is None and not self._frozen():
+        if scope is not None and not joins and not self._frozen():
             rule = self._book.batch_for(scope)
         facts = Facts(
             method=method,
@@ -666,7 +676,7 @@ class ProxyChannel:
             credential_bytes=gate["credential_bytes"],
             credentials_struck=gate["credentials_struck"],
             body_struck=gate["body_struck"],
-            reading=None if reading is None else self._reading_facts(reading, rule),
+            reading=None if reading is None else self._reading_facts(reading, rule, joins=joins),
             batch=None if reading is not None or rule is None else rule.rule_id,
             override=override,
             trailers=gate["trailers"],
@@ -701,14 +711,18 @@ class ProxyChannel:
         return self._hold(request_id, event, gate, decision.risk, decision.reason)
 
     def _reading_facts(
-        self, reading: Mapping[str, Any], rule: BatchRule | None = None
+        self, reading: Mapping[str, Any], rule: BatchRule | None = None, *, joins: bool = False
     ) -> ReadingFacts:
         """What decide.py needs of a checked reading: its effect and risk, whether all its
-        recipients are trusted (never a cut one: a recipient may be missing), whether it
-        changes a draft whose sending is held or preapproved, and the batch rule that covers
-        it (``rule``, looked up by the caller)."""
+        recipients are trusted (never a cut one: a recipient may be missing; never one that
+        ``joins`` an open hold of its fingerprint), whether it changes a draft whose sending is
+        held or preapproved, and the batch rule that covers it (``rule``, looked up by the
+        caller). No owner account is configured yet (docs/32, approved decision 4), so a
+        mail recipient is never trusted here (final review of T10, finding 2)."""
         effect = Effect(reading["effect"])
-        trusted = not reading["cut"] and all_trusted(_as_reading(reading), self._trusted())
+        trusted = (
+            not joins and not reading["cut"] and all_trusted(_as_reading(reading), self._trusted())
+        )
         key = _draft_key(reading)
         changes_draft = key is not None and effect in (Effect.READ, Effect.CHANGE)
         return ReadingFacts(
@@ -998,8 +1012,8 @@ class ProxyChannel:
         requested_by: str,
         frozen: Callable[[], bool] | None = None,
     ) -> TrustOutcome:
-        """Trust the one recipient of the open hold ``hold_id`` from now on (``TrustStore``,
-        saved, and ``gate/trust_added`` recorded) and approve that hold, as ``decide`` does.
+        """Trust the one recipient of the open hold ``hold_id`` from now on (``gate/trust_added``
+        recorded, then saved in the ``TrustStore``) and approve that hold, as ``decide`` does.
         Only for what ``holds.trust_target`` allows; nothing while the agent is paused or
         rewound. Never raises for a hold that is not there."""
         if by not in DECIDERS:
@@ -1019,20 +1033,25 @@ class ProxyChannel:
                 return TrustOutcome(TrustStatus.NOT_TRUSTABLE, hold_id)
             translator, recipient = target
             try:
-                entry, new = self._trust.add(translator, recipient, by=by, hold_id=hold_id)
+                entry, new = self._trust.prepare(translator, recipient, by=by, hold_id=hold_id)
             except TrustError as error:
                 return TrustOutcome(TrustStatus.FAILED, hold_id, detail=str(error))
             except ValueError:
                 return TrustOutcome(TrustStatus.NOT_TRUSTABLE, hold_id)
             if new:
+                # Two phases (final review of T10, finding 6): recorded first, then saved and
+                # used; a trust that could not be saved is recorded as failed and never used.
                 own = {"trust_id": entry.trust_id, "translator": translator,
                        "recipient": recipient, **who}  # fmt: skip
                 if self._gate_event("trust_added", hold, own, risk=2) is None:
-                    try:
-                        self._trust.remove(entry.trust_id)
-                    except TrustError:
-                        logger.error("a trusted recipient that could not be recorded stays")
-                    return TrustOutcome(TrustStatus.FAILED, hold_id)
+                    return TrustOutcome(TrustStatus.FAILED, hold_id)  # nothing saved nor used
+                try:
+                    self._trust.commit(entry)
+                except TrustError as error:
+                    failed = {"trust_id": entry.trust_id, "why": "not_saved", **who}
+                    if self._gate_event("trust_failed", hold, failed, risk=2) is None:
+                        logger.error("a trust that could not be saved could not be recorded")
+                    return TrustOutcome(TrustStatus.FAILED, hold_id, detail=str(error))
             outcome = self._approve(hold, who)
             return TrustOutcome(TrustStatus.TRUSTED, hold_id, entry.trust_id, outcome.status)
 
@@ -1266,6 +1285,7 @@ def _as_reading(reading: Mapping[str, Any]) -> Reading:
         wait_s=reading["wait_s"],
         account=reading["account"],
         recipients=tuple(reading["recipients"]),
+        reply_to=tuple(reading["reply_to"]),
         secret_seen=reading["secret_seen"],
         notes=tuple(Note(note) for note in reading["notes"]),
     )
@@ -1355,8 +1375,10 @@ def _view(reading: Mapping[str, Any] | None) -> dict[str, Any] | None:
     def cut(value: object, limit: int) -> str | None:
         return str(value)[:limit] if value else None
 
-    recipients = [str(item)[:200] for item in reading.get("recipients") or []]
-    reply_to = [str(item)[:200] for item in reading.get("reply_to") or []]
+    # Whole (a checked recipient is at most MAX_RECIPIENT_CHARS): the web cuts them in the
+    # middle, keeping the domain, and marks the cut (final review of T10, finding 4).
+    recipients = [str(item)[:MAX_RECIPIENT_CHARS] for item in reading.get("recipients") or []]
+    reply_to = [str(item)[:MAX_RECIPIENT_CHARS] for item in reading.get("reply_to") or []]
     attachments = [
         {"name": str(item.get("name") or "")[:100], "size": item.get("size")}
         for item in reading.get("attachments") or []

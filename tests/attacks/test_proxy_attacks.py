@@ -116,6 +116,7 @@ def start_lab(
     trusted_chat: str | None = None,
     telegram_toml: str | None = None,
     agent_memory: str = "2g",
+    trusted_mail: str | None = None,
 ) -> Lab:
     """A started service with its fake internet. With ``inwards``, the allowed list also holds
     names that resolve to private addresses (ssrf-por-el-proxy: the fixed rule must still say
@@ -125,7 +126,9 @@ def start_lab(
     ``trusted_chat``: a Telegram chat in ``[gate] trusted`` (the owner's, in un-get-que-envia).
     ``telegram_toml``: the bot's ``telegram.toml`` (T10-4: pointed at a fake Bot API on the VM's
     127.0.0.1; the owner's chat in it is trusted by the gate too). ``agent_memory``: the agent's
-    memory (T10-5's test_openclaw_telegram.py runs a second OpenClaw Gateway inside it)."""
+    memory (T10-5's test_openclaw_telegram.py runs a second OpenClaw Gateway inside it).
+    ``trusted_mail``: a Gmail address in ``[gate] trusted`` too (confiar-sin-querer: it must
+    trust nothing until the owner's mail accounts exist)."""
     vm._require_agent_image()
     vm._remove_stale_test_agents()
     names = vm._agent_names(os.getpid())
@@ -144,7 +147,7 @@ def start_lab(
         names,
         proxy_toml=f"allow_hosts = {json.dumps(hosts)}\n"
         + provider_toml()
-        + gate_toml(unknown_hosts, trusted_chat),
+        + gate_toml(unknown_hosts, trusted_chat, trusted_mail),
         real_keys=real,
         agent_memory=agent_memory,
     )
@@ -164,11 +167,16 @@ def start_lab(
     return Lab(service, internet, real)
 
 
-def gate_toml(unknown_hosts: str, trusted_chat: str | None) -> str:
+def gate_toml(unknown_hosts: str, trusted_chat: str | None, trusted_mail: str | None = None) -> str:
     """``[gate]`` (T10-3), after ``[proxy]`` and its providers."""
     text = f'\n[gate]\nunknown_hosts = "{unknown_hosts}"\n'
+    trusted = []
     if trusted_chat is not None:
-        text += f'trusted = [{{translator = "telegram", chat = "{trusted_chat}"}}]\n'
+        trusted.append(f'{{translator = "telegram", chat = "{trusted_chat}"}}')
+    if trusted_mail is not None:
+        trusted.append(f'{{translator = "gmail", email = "{trusted_mail}"}}')
+    if trusted:
+        text += f"trusted = [{', '.join(trusted)}]\n"
     return text
 
 

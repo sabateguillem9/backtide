@@ -97,6 +97,10 @@ ES: dict[str, str] = {
     "why.read_budget": "pasa del presupuesto de lecturas a hosts desconocidos.",
     "wait.view": "Ver",
     "wait.trust": "Aprobar y confiar",
+    "wait.trust_off.mail": "Confiar: aún no con correo (falta saber qué cuentas son tuyas).",
+    "wait.trust_off.name": "Confiar: no con un @nombre (es un canal o grupo público).",
+    "wait.partial": "Puede que haya más: esta lista sale de lo último de la caja negra. "
+    "Míralas en Telegram o con `backtide retenidas`.",
     "wait.off.disabled": "Para decidir desde aquí, lanza `backtide web --aprobar` con el usuario "
     "del servicio. Mientras, usa Telegram o `backtide aprobar`.",
     "wait.off.no_service": "Para decidir desde aquí, el servicio tiene que estar en marcha.",
@@ -110,6 +114,7 @@ ES: dict[str, str] = {
     "hold.to": "Para:",
     "hold.more": "y {n} más",
     "hold.reply_to": "Responder a:",
+    "hold.domains": "Dominio de cada dirección (lo dice backtide):",
     "hold.from": "De:",
     "hold.subject": "Asunto:",
     "hold.attachments": "Adjuntos:",
@@ -160,6 +165,12 @@ ES: dict[str, str] = {
     "hold.confirm.confiar.warning": "Nunca entran un borrado, un reenvío, algo de riesgo 3, varios "
     "destinatarios a la vez ni algo que haga descargar una dirección: eso sigue preguntando.",
     "hold.confirm.confiar.box": "Sí, confío en este destinatario a partir de ahora.",
+    "hold.confirm.confiar.group": "Es un grupo: lo que se le envíe lo leen todos sus "
+    "miembros, no una sola persona.",
+    "hold.confirm.confiar.channel": "Es un supergrupo o un canal: lo que se le envíe lo leen "
+    "todos sus miembros o suscriptores, no una sola persona.",
+    "hold.confirm.confiar.others": "Hay {n} retenida(s) más a este destinatario: no se aprueban "
+    "con esta, se deciden aparte.",
     "hold.confirm.revocar.note": "Lo que cubría vuelve a preguntar desde ya.",
     "hold.confirm.olvidar.note": "Lo que vaya a este destinatario vuelve a preguntar desde ya.",
     "hold.confirm.aprobar.yes": "Sí, aprobar",
@@ -680,6 +691,10 @@ EN: dict[str, str] = {
     "why.read_budget": "it goes past the budget of reads to unknown hosts.",
     "wait.view": "View",
     "wait.trust": "Approve and trust",
+    "wait.trust_off.mail": "Trust: not yet for mail (which accounts are yours is not known).",
+    "wait.trust_off.name": "Trust: not for an @name (it is a public channel or group).",
+    "wait.partial": "There may be more: this list comes from the latest of the black box. "
+    "See them in Telegram or with `backtide retenidas`.",
     "wait.off.disabled": "To decide from here, start `backtide web --aprobar` as the service's "
     "user. Meanwhile, use Telegram or `backtide aprobar`.",
     "wait.off.no_service": "To decide from here, the service has to be running.",
@@ -693,6 +708,7 @@ EN: dict[str, str] = {
     "hold.to": "To:",
     "hold.more": "and {n} more",
     "hold.reply_to": "Reply to:",
+    "hold.domains": "The domain of each address (backtide says it):",
     "hold.from": "From:",
     "hold.subject": "Subject:",
     "hold.attachments": "Attachments:",
@@ -743,6 +759,12 @@ EN: dict[str, str] = {
     "hold.confirm.confiar.warning": "A deletion, a forward, anything of risk 3, several recipients "
     "at once or anything that makes the platform fetch an address never ride it: those still ask.",
     "hold.confirm.confiar.box": "Yes, I trust this recipient from now on.",
+    "hold.confirm.confiar.group": "It is a group: what is sent to it is read by all its "
+    "members, not by one person.",
+    "hold.confirm.confiar.channel": "It is a supergroup or a channel: what is sent to it is read "
+    "by all its members or subscribers, not by one person.",
+    "hold.confirm.confiar.others": "There are {n} more held to this recipient: they are not "
+    "approved with this one, they are decided apart.",
     "hold.confirm.revocar.note": "What it covered asks again from now on.",
     "hold.confirm.olvidar.note": "What goes to this recipient asks again from now on.",
     "hold.confirm.aprobar.yes": "Yes, approve",

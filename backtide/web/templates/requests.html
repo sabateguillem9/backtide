@@ -6,7 +6,8 @@
    pide el agente", every piece through vis(): escaped, invisible characters made visible,
    cut. The buttons are links to a confirmation page (GET, it changes nothing) only when this
    web may decide (`backtide web --aprobar`, "ready"); else they are drawn disabled with a note
-   on how to turn them on. #}
+   on how to turn them on. Addresses are cut in the middle with our marker (vis_mid), keeping the
+   domain; a list read from the black box that may miss older holds says so (holds_partial). #}
 {% set approvals = approvals_state() %}
 <div class="waiting-head">
   <h2 id="waiting-title"><span class="waiting-mark" aria-hidden="true"></span>{{ t('wait.title') }}</h2>
@@ -16,9 +17,11 @@
 <p class="note is-stale">{{ t('wait.unreadable') }}</p>
 {% elif not requests %}
 <p class="note">{{ t('wait.none') }}</p>
+{% if holds_partial() %}<p class="note is-stale" data-partial>{{ t.code('wait.partial') }}</p>{% endif %}
 {% else %}
 <p class="note">{{ t('wait.lede') }}</p>
 {% if stale %}<p class="note is-stale">{{ t('wait.stale') }}</p>{% endif %}
+{% if holds_partial() %}<p class="note is-stale" data-partial>{{ t.code('wait.partial') }}</p>{% endif %}
 <ol class="requests">
   {% for r in requests %}
   {% set who = roster.get(r.agent) %}
@@ -29,8 +32,8 @@
     {% if r.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ r.notes | join('; ') }}.</span></p>{% endif %}
     <div class="req-agent">
       <p class="req-agent-head">{{ t('hold.agent') }}</p>
-      {% if r.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in r.recipients %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}{% if r.more_recipients %} <span class="muted">{{ t('hold.more', n=r.more_recipients) }}</span>{% endif %}</p>{% endif %}
-      {% if r.reply_to %}<p><span class="muted">{{ t('hold.reply_to') }}</span> {% for rc in r.reply_to %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      {% if r.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in r.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}{% if r.more_recipients %} <span class="muted">{{ t('hold.more', n=r.more_recipients) }}</span>{% endif %}</p>{% endif %}
+      {% if r.reply_to %}<p><span class="muted">{{ t('hold.reply_to') }}</span> {% for rc in r.reply_to %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
       {% if r.subject %}<p><span class="muted">{{ t('hold.subject') }}</span> <span class="name">{{ vis(r.subject, 200) }}</span></p>{% endif %}
       {% if r.lines %}<p class="req-lines"><span class="name">{{ vis(r.lines, 300) }}</span></p>{% endif %}
       {% if r.attachments %}<p><span class="muted">{{ t('hold.attachments') }}</span> {% for a in r.attachments %}<span class="name">{{ vis(a, 100) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
@@ -50,7 +53,7 @@
       {% if approvals == 'ready' %}
       <a class="req-yes" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=aprobar"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('wait.approve') }}</span></a>
       <a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=rechazar">{{ t('wait.reject') }}</a>
-      {% if r.trustable %}<a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=confiar">{{ t('wait.trust') }}</a>{% endif %}
+      {% if r.trustable %}<a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=confiar">{{ t('wait.trust') }}</a>{% elif r.trust_off %}<span class="req-soon" data-trust-off="{{ r.trust_off }}">{{ t('wait.trust_off.' ~ r.trust_off) }}</span>{% endif %}
       {% else %}
       <button class="req-yes" type="button" disabled aria-describedby="soon-{{ r.id }}"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('wait.approve') }}</span></button>
       <button class="req-no" type="button" disabled aria-describedby="soon-{{ r.id }}">{{ t('wait.reject') }}</button>

@@ -43,6 +43,7 @@ from backtide.analyzer import (
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
 from backtide.gate.providers import Providers
+from backtide.gate.translate.base import MAIL_TRANSLATORS
 from backtide.jail import AgentJail, JailError, ca
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
@@ -414,6 +415,15 @@ def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
     settings = config.proxy_settings()
     telegram = load_telegram(config.state_dir)
     gate = config.gate_settings(owner_chat=None if telegram is None else telegram.chat_id)
+    mail = sum(1 for item in gate.trusted if item.translator in MAIL_TRANSLATORS)
+    if mail:
+        # Final review of T10, finding 2: a trusted mail address needs the owner's own account
+        # (approved decision 4, still to do); until then it trusts nothing. Said, not refused.
+        logger.warning(
+            "[gate] trusted: %d mail recipient(s) are not used until the owner's mail accounts "
+            "are configured (docs/32, section 9): those mails are held",
+            mail,
+        )
     policy = Policy(
         allow_hosts=settings.allow_hosts,
         providers=providers,

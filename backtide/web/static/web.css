@@ -188,6 +188,8 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 .name::before { content: "\201C"; }
 .name::after { content: "\201D"; }
 .esc { font-size: 0.78em; font-weight: 500; letter-spacing: 0.04em; color: var(--ink); border-bottom: var(--stroke-hairline) solid var(--ink); padding: 0 1px; margin: 0 1px; white-space: nowrap; }
+/* Our mark where an address was cut in the middle (final review of T10): never the agent's text. */
+.cut { font-size: 0.78em; font-weight: 500; color: var(--ink); white-space: nowrap; padding: 0 1px; }
 .line.mark { align-items: center; }
 .line.mark .when { padding-top: 0; }
 .line.mark .dot { width: 7px; height: 7px; margin-top: 0; background: var(--agent, var(--ink)); border: 0; outline: 0; }

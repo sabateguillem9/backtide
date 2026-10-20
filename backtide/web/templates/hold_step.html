@@ -2,8 +2,10 @@
    ticket bound to that verb and that id), its result, or why not now. Plain forms, no
    JavaScript needed: the POST is a normal navigation, which carries our Origin
    (Referrer-Policy: same-origin). The hold is shown as on the panel: our words first, the
-   agent's apart and marked. "Aprobar y confiar" says exactly what it trusts, for how long and
-   how to undo it, and needs its box ticked. #}
+   agent's apart and marked, with the same fields as the list (Reply-To, attachments) and the
+   domain of each address apart, in our words. "Aprobar y confiar" says exactly what it trusts,
+   for how long and how to undo it, who reads a group or a channel, how many other holds to that
+   recipient are still decided one by one, and needs its box ticked. #}
 {% extends "base.html" %}
 {% block title %}{{ t('holds.title') }}{% endblock %}
 {% block main %}
@@ -17,24 +19,29 @@
       <p class="hold-id"><span class="sid">{{ hold.id }}</span> · <span class="dot dot-{{ hold.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ hold.risk) }} · {{ t('wait.left') }} <span class="num">{{ countdown(hold.left(now)) }}</span></p>
       {% if hold.action %}<p class="req-what" lang="es">{{ hold.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
       {% if hold.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ hold.notes | join('; ') }}.</span></p>{% endif %}
+      {% if hold.domains %}<p class="req-notes"><span class="muted">{{ t('hold.domains') }}</span> {% for d in hold.domains %}<span class="name">{{ vis_mid(d, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
       <div class="req-agent">
         <p class="req-agent-head">{{ t('hold.agent') }}</p>
-        {% if hold.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in hold.recipients %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}{% if hold.more_recipients %} <span class="muted">{{ t('hold.more', n=hold.more_recipients) }}</span>{% endif %}</p>{% endif %}
+        {% if hold.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in hold.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}{% if hold.more_recipients %} <span class="muted">{{ t('hold.more', n=hold.more_recipients) }}</span>{% endif %}</p>{% endif %}
+        {% if hold.reply_to %}<p><span class="muted">{{ t('hold.reply_to') }}</span> {% for rc in hold.reply_to %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
         {% if hold.subject %}<p><span class="muted">{{ t('hold.subject') }}</span> <span class="name">{{ vis(hold.subject, 200) }}</span></p>{% endif %}
         {% if hold.lines %}<p class="req-lines"><span class="name">{{ vis(hold.lines, 300) }}</span></p>{% endif %}
+        {% if hold.attachments %}<p><span class="muted">{{ t('hold.attachments') }}</span> {% for a in hold.attachments %}<span class="name">{{ vis(a, 100) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
         {% if hold.request %}<p class="req-lines"><span class="name">{{ vis(hold.request, 400) }}</span></p>{% endif %}
       </div>
       <p><a class="settings-back" href="{{ base }}/peticiones/ver?id={{ hold.id | urlencode }}">{{ t('wait.view') }}</a></p>
     </div>
     {% elif batch %}
     <p class="hold-rule-what">{{ t('holds.batch.' ~ batch.scope) }}{% if batch.translator %} · <span lang="es">{{ api(batch.translator) }}</span>{% endif %}</p>
-    {% if batch.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in batch.recipients %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+    {% if batch.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in batch.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
     {% if batch.request %}<p><span class="name">{{ vis(batch.request, 300) }}</span></p>{% endif %}
     {% elif trust %}
-    <p class="hold-rule-what"><span lang="es">{{ api(trust.translator) }}</span> · <span class="name">{{ vis(trust.recipient, 200) }}</span></p>
+    <p class="hold-rule-what"><span lang="es">{{ api(trust.translator) }}</span> · <span class="name">{{ vis_mid(trust.recipient, 120) }}</span></p>
     {% endif %}
     <p class="note">{{ t('hold.confirm.' ~ verb ~ '.note') }}</p>
-    {% if verb == 'confiar' %}<p class="settings-warning"><span class="dot dot-2" aria-hidden="true"></span><span>{{ t('hold.confirm.confiar.warning') }}</span></p>{% endif %}
+    {% if verb == 'confiar' %}<p class="settings-warning"><span class="dot dot-2" aria-hidden="true"></span><span>{{ t('hold.confirm.confiar.warning') }}</span></p>
+    {% if trust_note %}<p class="settings-warning" data-trust-note="{{ trust_note }}"><span class="dot dot-2" aria-hidden="true"></span><span>{{ t('hold.confirm.confiar.' ~ trust_note) }}</span></p>{% endif %}
+    {% if others %}<p class="note" data-others="{{ others }}">{{ t('hold.confirm.confiar.others', n=others) }}</p>{% endif %}{% endif %}
     <form class="settings-form" method="post" action="{{ base }}/peticiones/decidir">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="ticket" value="{{ ticket }}">
