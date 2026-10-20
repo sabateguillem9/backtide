@@ -5,7 +5,6 @@ deletions, and address headers that two parsers could read differently."""
 
 import base64
 import json
-import time
 from dataclasses import replace
 from email.message import EmailMessage
 from email.policy import SMTP
@@ -36,6 +35,7 @@ from tests.gate_translate_kit import (
     scrubbed,
     tg,
 )
+from tests.scaling import assert_linear, best_time
 
 SECRET = "sk-" + "a" * 40  # a key the strike patterns know
 G = "/gmail/v1/users/me"
@@ -334,29 +334,42 @@ def test_a_secret_past_one_mib_of_an_attachment_is_seen_in_every_translator() ->
     assert not clean.secret_seen
 
 
-def _timed(view: RequestView) -> Effect:
-    start = time.monotonic()
-    reading = read(view)
-    assert time.monotonic() - start < 3.0, view.host
-    return reading.effect
+GROWTH = 8  # each body against one this many times smaller (tests/scaling.py)
+SCANS = 6  # the most a read may cost, in whole-body secret scans of the largest body
 
 
-def test_scanning_whole_bodies_near_the_caps_stays_fast() -> None:
-    data = b"a " * (1024 * 1024)  # 2 MiB: 2.7 MiB in base64, within the MIME cap
+def _near_the_caps(part: int) -> list[RequestView]:
+    """A mail, a Discord upload and a Slack message with bodies near the caps, ``1/part`` of it."""
+    data = b"a " * (1024 * 1024 // part)  # 2 MiB: 2.7 MiB in base64, within the MIME cap
     attached = mail(attachments=(("big.txt", "text/plain", data),))
-    assert _timed(gmail_send(attached)) is Effect.SEND
     header, body = multipart(
         [
             ("payload_json", None, "application/json", b'{"content":"x"}'),
-            ("files[0]", "big.txt", "text/plain", b"a " * (2 * 1024 * 1024 - 1024)),
+            ("files[0]", "big.txt", "text/plain", b"a " * ((2 * 1024 * 1024 - 1024) // part)),
         ]
     )
     dc = request(
         "POST", "discord.com", f"{D}/channels/1/messages", body=body, headers=(header, DISCORD_AUTH)
     )
-    assert _timed(dc) is Effect.SEND
-    long_text = {"channel": "C1", "blocks": [{"text": {"text": "a " * (2 * 1024 * 1024)}}]}
-    assert _timed(_slack("chat.postMessage", long_text)) is Effect.SEND
+    long_text = {"channel": "C1", "blocks": [{"text": {"text": "a " * (2 * 1024 * 1024 // part)}}]}
+    return [gmail_send(attached), dc, _slack("chat.postMessage", long_text)]
+
+
+def test_scanning_whole_bodies_near_the_caps_stays_fast() -> None:
+    """Measured against this machine, not in seconds: the cost grows with the body (not faster)
+    and stays within a few secret scans of a 4 MiB text, the largest body here."""
+    from backtide.blackbox.redact import KnownScrubber
+
+    text = "a " * (2 * 1024 * 1024 // GROWTH)
+    scan = best_time(lambda: has_secret(text, KnownScrubber(())), 3) * GROWTH
+    effects: list[Effect] = []
+    for small, large in zip(_near_the_caps(GROWTH), _near_the_caps(1), strict=True):
+        took = assert_linear(
+            lambda view: effects.append(read(view).effect),
+            small, large, GROWTH, floor=0.05, cap=60.0, label=large.host,
+        )  # fmt: skip
+        assert took < SCANS * scan, f"{large.host}: {took:.2f}s, {took / scan:.1f} scans of 4 MiB"
+    assert len(effects) >= 6 and set(effects) == {Effect.SEND}
 
 
 @pytest.mark.parametrize(

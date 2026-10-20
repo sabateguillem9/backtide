@@ -102,20 +102,14 @@ def raw(tmp_path: Path) -> Iterator[BlackBox]:
 class Rig:
     """Everything wired the way ``build_guardian`` does it, with fakes for the Guardian."""
 
-    def __init__(
-        self,
-        raw: BlackBox,
-        *,
-        responder_clock: Callable[[], float] | None = None,
-        **limits: Any,
-    ) -> None:
+    def __init__(self, raw: BlackBox, **limits: Any) -> None:
         self.raw = raw
         self.clock = Clock()
         self.sink = Sink()
         self.snapshots: list[str] = []
         self.snapshot_calls = 0
         self.snapshot_result: Callable[[], str | None] = self._next_snapshot
-        self.responder = RiskResponder(self.sink, clock=responder_clock or self.clock, **limits)
+        self.responder = RiskResponder(self.sink, clock=self.clock, **limits)
         self.box = AssessedBlackBox(raw, RULES, self.responder, clock=self.clock)
         self.responder.bind(snapshot=self._snapshot, record=self.box.append)
 
@@ -305,18 +299,40 @@ def test_alerts_for_one_rule_are_throttled_and_say_how_many_they_stand_for(rig: 
     assert "Son 9 eventos" in second.body and "el último, el" in second.body
 
 
+def held_back(responder: RiskResponder) -> int:
+    """How many events the responder holds back, waiting for their minute to be over."""
+    with responder._tell_lock:  # noqa: SLF001
+        return sum(pending.count for pending in responder._held.values())  # noqa: SLF001
+
+
+def wait_until(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + WAIT
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.005)
+
+
 def test_a_decoy_cannot_use_up_the_minute_to_hide_the_damage(raw: BlackBox) -> None:
     """Some junk files deleted to make the rule alert, then the real files half a minute later:
-    the second alert must come, and in time, not only if the agent keeps going."""
-    rig = Rig(raw, responder_clock=time.monotonic, alert_every=0.4)
-    rig.clock.now = 1000.0
+    the second alert must come, and in time, not only if the agent keeps going.
+
+    The clock is the test's, so the whole damage falls inside the minute however slow the
+    machine is. The minute is short (0.4 s) because the thread waits for it in real time: it
+    sleeps what the clock says is left, wakes, and finds the minute over once the test moves
+    the clock, with no event to wake it."""
+    rig = Rig(raw, alert_every=0.4)  # the responder reads the test's clock too
     try:
         delete_burst(rig, 3)  # the decoy
         rig.sink.wait_for(1)
-        delete_burst(rig, 500, 100)  # the damage, inside the minute
-        (_, held) = rig.sink.wait_for(2)  # no more events: the thread sends it when due
-        assert "Son 500 eventos" in held.body
-        assert "work/599" in held.body  # the latest one is cited
+        rig.clock.now += 0.2  # half the minute later
+        delete_burst(rig, 500, 100)  # the damage
+        wait_until(lambda: held_back(rig.responder) == 500)  # all of it answered: held back
+        assert len(rig.sink.alerts) == 1
+        rig.clock.now += 0.3  # the minute is over, and no more events come
+        alerts = rig.sink.wait_for(2)  # the thread sends it when due, by itself
+        assert len(alerts) == 2
+        assert "Son 500 eventos" in alerts[1].body
+        assert "work/599" in alerts[1].body  # the latest one is cited
     finally:
         rig.responder.close(WAIT)
 

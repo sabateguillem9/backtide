@@ -6,6 +6,7 @@ the ``vigia-p*`` markers): they are evidence, not code."""
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from backtide.blackbox.model import Source
 from backtide.blackbox.redact import redact
 from backtide.sensors import procs
 from backtide.sensors.procs import Context, Record, Skipped, Throttle, classify
+from tests.scaling import assert_linear
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tetragon"
 # The test container of T07-1 (its full id is in the THROTTLE lines' cgroup) and OpenClaw's.
@@ -780,18 +782,24 @@ def test_a_cookie_bigger_than_four_kib_is_struck_whole(size: int) -> None:
     assert "Zr4Mw8Nt3Vb6" not in argv_of(f"--cookie {cookie.replace(' ', '')} https://x/")
 
 
+HOSTILE_SIZE = 70 * 1024  # characters of hostile text the patterns are measured on
+GROWTH = 8  # the hostile text against one this many times shorter (tests/scaling.py)
+
+
+def _hostile(unit: str, size: int) -> str:
+    return (unit * (size // len(unit) + 1))[:size]
+
+
 @pytest.mark.parametrize(
     "unit", ["a.", "a-", "-x ", "eyJ-", "token ", "pass=", '"a', "a b ", "a\n", "x://"]
 )
 def test_no_argv_pattern_is_quadratic(unit: str) -> None:
-    import time  # noqa: PLC0415
-
-    hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
+    small, hostile = _hostile(unit, HOSTILE_SIZE // GROWTH), _hostile(unit, HOSTILE_SIZE)
     for pattern in procs.every_pattern():
-        start = time.perf_counter()
-        pattern.search(hostile)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 0.05, f"{pattern.pattern[:40]!r} took {elapsed:.3f}s on {unit!r}"
+        assert_linear(
+            pattern.search, small, hostile, GROWTH, floor=0.01, cap=1.0,
+            label=f"{pattern.pattern[:40]!r} on {unit!r}",
+        )  # fmt: skip
 
 
 def test_safe_text_on_a_half_mib_hostile_argv_is_quick() -> None:
@@ -1027,23 +1035,36 @@ def test_a_real_key_body_before_its_end_is_still_struck() -> None:
     ],
 )  # fmt: skip
 def test_the_t07_5_patterns_are_linear(unit: str) -> None:
-    import time  # noqa: PLC0415
-
-    hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
+    small, hostile = _hostile(unit, HOSTILE_SIZE // GROWTH), _hostile(unit, HOSTILE_SIZE)
     for binary in (
         "/usr/bin/mysql", "/usr/bin/sshpass", "/usr/bin/lftp", "/bin/sh", "/usr/bin/curl",
         "/usr/bin/smbclient", "/usr/sbin/htpasswd", "/usr/bin/sqlplus", "/usr/bin/docker",
     ):  # fmt: skip
-        start = time.perf_counter()
-        procs._strike_patterns(hostile, tool=procs._tool_of(binary), open_end=True)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 0.05 * 4, f"{binary} took {elapsed:.3f}s on {unit!r}"
+        tool = procs._tool_of(binary)
+        assert_linear(
+            lambda text, tool=tool: procs._strike_patterns(text, tool=tool, open_end=True),
+            small, hostile, GROWTH, floor=0.01, cap=2.0, label=f"{binary} on {unit!r}",
+        )  # fmt: skip
     for pattern in procs.every_pattern():
-        start = time.perf_counter()
-        pattern.sub("", hostile)
-        procs._strike_key_bodies(hostile)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 0.05, f"{pattern.pattern[:50]!r} took {elapsed:.3f}s on {unit!r}"
+        assert_linear(
+            lambda text, pattern=pattern: pattern.sub("", text),
+            small, hostile, GROWTH, floor=0.01, cap=1.0,
+            label=f"{pattern.pattern[:50]!r} on {unit!r}",
+        )  # fmt: skip
+    assert_linear(
+        procs._strike_key_bodies, small, hostile, GROWTH, floor=0.01, cap=1.0, label=repr(unit)
+    )
+
+
+def test_the_linearity_check_catches_a_quadratic_pattern() -> None:
+    """What the check above stands on: a pattern that rescans the rest of the text from every
+    start fails it, on any machine, and a linear one passes."""
+    quadratic = re.compile(r"a[^x]*x")  # "a a a ...": from each "a", to the end, no "x"
+    small, large = _hostile("a ", 32 * 1024 // GROWTH), _hostile("a ", 32 * 1024)
+    with pytest.raises(AssertionError, match="is not linear"):
+        assert_linear(quadratic.search, small, large, GROWTH, floor=0.01, cap=30.0, label="q")
+    linear = re.compile(r"a[^x ]*x")  # the same, stopped by the space
+    assert_linear(linear.search, small, large, GROWTH, floor=0.0, cap=1.0, label="l")
 
 
 # --- T07-5 review: more tools, values with spaces, connections ------------------------------

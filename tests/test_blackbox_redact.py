@@ -5,6 +5,7 @@ import pytest
 
 from backtide.blackbox import REDACTED, redact
 from backtide.blackbox.redact import MAX_TEXT_BYTES, KnownScrubber, scrub_known
+from tests.scaling import assert_linear
 
 LEAKED = "s3cr3tVALUE-0123456789abcdefXYZ"
 
@@ -576,10 +577,11 @@ def test_each_pattern_is_fast_on_70_kib_of_hostile_text(unit: str) -> None:
 
 
 def test_redact_a_half_mib_text_is_quick() -> None:
-    hostile = ("https://a.a.a.a" * (512 * 1024 // 14))[: 512 * 1024]
-    start = _time.perf_counter()
-    redact(hostile)
-    assert _time.perf_counter() - start < 0.5
+    def hostile(size: int) -> str:
+        return ("https://a.a.a.a" * (size // 14 + 1))[:size]
+
+    small, large = hostile(64 * 1024), hostile(512 * 1024)
+    assert_linear(redact, small, large, 8, floor=0.01, cap=2.0, label="redact")
 
 
 def test_a_jwt_with_a_payload_over_4_kib_is_struck() -> None:
