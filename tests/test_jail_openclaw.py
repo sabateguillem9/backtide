@@ -1,4 +1,4 @@
-"""check_rewindable: docs/20-openclaw-autorizacion-y-rebobinado.md, section 8, rules 1-11.
+"""check_rewindable: docs/20-openclaw-autorizacion-y-rebobinado.md, section 8, rules 1-12.
 
 Each rule has at least one config that passes and one that fails. A failing config must name
 the offending path, so the log (English) and the user notice (Spanish) point at the exact key.
@@ -41,6 +41,7 @@ def telegram(**extra: Any) -> Config:
         "dmPolicy": "allowlist",
         "allowFrom": ["123456789"],
         "groupPolicy": "disabled",
+        "commands": {"native": False},
         **extra,
     }
 
@@ -533,6 +534,72 @@ def test_rule11_imap_without_an_enabled_flag_is_refused_and_a_disabled_one_passe
     base["plugins"]["entries"]["imap"] = {"config": {}}
     assert paths(base) == ["plugins.entries.imap"]
     base["plugins"]["entries"]["imap"] = {"enabled": False, "config": {}}
+    check_rewindable(base)
+
+
+# Rule 12: no native command menu (T10-5: setMyCommands is an admin call the gate holds at risk 3)
+
+
+def test_rule12_native_false_passes(base: Config) -> None:
+    config = with_telegram(base)
+    assert config["channels"]["telegram"]["commands"] == {"native": False}
+    check_rewindable(config)
+
+
+def test_rule12_the_root_must_write_it(base: Config) -> None:
+    config = with_telegram(base)
+    del config["channels"]["telegram"]["commands"]
+    (problem,) = problems_in(config)
+    assert problem.path == "channels.telegram.commands.native"
+    assert "setMyCommands" in problem.why  # the message says why, not only what
+    config["channels"]["telegram"]["commands"] = {"nativeSkills": False}
+    assert paths(config) == ["channels.telegram.commands.native"]
+
+
+@pytest.mark.parametrize("value", [True, "auto", "false", 0, None])
+def test_rule12_only_a_boolean_false_passes(base: Config, value: object) -> None:
+    config = with_telegram(base, commands={"native": value})
+    assert paths(config) == ["channels.telegram.commands.native"]
+
+
+def test_rule12_commands_must_be_an_object(base: Config) -> None:
+    assert paths(with_telegram(base, commands=False)) == ["channels.telegram.commands"]
+
+
+def test_rule12_an_account_without_commands_inherits_the_root(base: Config) -> None:
+    check_rewindable(with_telegram(base, accounts={"work": {}}))
+
+
+def test_rule12_an_account_with_its_own_commands_replaces_the_root_ones(base: Config) -> None:
+    # OpenClaw merges account and root with a shallow spread: an account `commands` object
+    # (even an empty one) replaces the root's, so native falls back to OpenClaw's default (on).
+    for commands in ({}, {"nativeSkills": False}):
+        config = with_telegram(base, accounts={"work": {"commands": commands}})
+        assert paths(config) == ["channels.telegram.accounts.work.commands.native"]
+
+
+@pytest.mark.parametrize("value", [True, "auto"])
+def test_rule12_an_account_may_not_turn_it_on(base: Config, value: object) -> None:
+    config = with_telegram(base, accounts={"work": {"commands": {"native": value}}})
+    assert paths(config) == ["channels.telegram.accounts.work.commands.native"]
+
+
+def test_rule12_an_account_may_say_false_itself(base: Config) -> None:
+    check_rewindable(with_telegram(base, accounts={"work": {"commands": {"native": False}}}))
+
+
+def test_rule12_custom_commands_are_registered_even_with_native_off(base: Config) -> None:
+    root = with_telegram(base, customCommands=[{"command": "x", "description": "y"}])
+    assert paths(root) == ["channels.telegram.customCommands"]
+    account = with_telegram(
+        base, accounts={"a": {"customCommands": [{"command": "x", "description": "y"}]}}
+    )
+    assert paths(account) == ["channels.telegram.accounts.a.customCommands"]
+    check_rewindable(with_telegram(base, customCommands=[]))
+
+
+def test_rule12_without_a_telegram_channel_there_is_nothing_to_check(base: Config) -> None:
+    assert "channels" not in base
     check_rewindable(base)
 
 

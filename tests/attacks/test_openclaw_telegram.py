@@ -77,6 +77,7 @@ base.channels = {
     dmPolicy: "allowlist",
     allowFrom: [owner],
     groupPolicy: "disabled",
+    commands: { native: false },
   },
 };
 fs.mkdirSync(work + "/state", { recursive: true });
@@ -304,6 +305,14 @@ def measure(lab: Lab, figures: dict[str, Any]) -> None:
     figures["gateway_polling_after_s"] = round(time.monotonic() - started, 1)
     time.sleep(5)
     figures["startup"] = summary(lab, start_seq)
+    # check_rewindable rule 12: with channels.telegram.commands.native false OpenClaw no longer
+    # publishes its command menu, so the start raises no risk-3 notice (it only clears the menu).
+    startup = figures["startup"]
+    assert startup["holds"] == [], startup["holds"]
+    methods = [r["tg_method"].lower() for r in bot.requests()]
+    figures["startup_methods"] = sorted(set(methods))
+    assert "setmycommands" not in methods, methods
+    assert not [k for k in startup["telegram_passed"] if k.lower().startswith("setmycommands")]
 
     # 1. Replies to the owner pass (a few, for the baseline and the fatigue count).
     latencies = []

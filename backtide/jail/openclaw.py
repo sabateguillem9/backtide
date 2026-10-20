@@ -8,7 +8,8 @@ OpenClaw, could also create it itself. So every authorization must come from ope
 which is read-only. ``check_rewindable`` enforces that on the config backtide writes.
 
 The rules, with their sources in OpenClaw 2026.9.8, are docs/20-openclaw-autorizacion-y-
-rebobinado.md, section 8 (numbered the same here). Where OpenClaw's default is the unsafe
+rebobinado.md, section 8 (numbered the same here). Rule 12 is not about rewinding but about the
+gate's notices: OpenClaw's Telegram command menu (T10-5). Where OpenClaw's default is the unsafe
 choice (``dmPolicy`` is "pairing" when absent), the key must be written. The check never
 repeats a value of the config in its messages: only paths, so no secret can reach a log.
 """
@@ -159,7 +160,7 @@ def problems_in(config: dict[str, Any]) -> list[RewindProblem]:
     if not isinstance(config, dict):
         return [RewindProblem("<config>", "the config must be a JSON object")]
     found = _Findings()
-    _channels(config, found)  # rules 1-4
+    _channels(config, found)  # rules 1-4 and 12
     _exec(config, found)  # rule 5
     _oauth(config, found)  # rule 6
     for path, value in _walk(config, ""):  # rule 7
@@ -257,7 +258,7 @@ def _channels(config: dict[str, Any], found: _Findings) -> None:
 def _telegram_scope(
     scope: dict[str, Any], path: str, root: dict[str, Any] | None, found: _Findings
 ) -> None:
-    """Check the root of channels.telegram or one of its accounts (rules 2, 3 and 4)."""
+    """Check the root of channels.telegram or one of its accounts (rules 2, 3, 4 and 12)."""
     if root is None:  # channels.telegram itself
         policy = _dm_policy(scope, path, found, required=True)
         allow = scope.get("allowFrom")
@@ -272,6 +273,7 @@ def _telegram_scope(
     for direct_path, direct in _children(scope, "direct", path, found):
         _direct_chat(direct, direct_path, policy, allow, found)
     _groups(scope, path, found)
+    _command_menu(scope, path, root is None, found)
 
 
 _EMPTY_ALLOW = (
@@ -369,6 +371,43 @@ def _topics(scope: dict[str, Any], path: str, found: _Findings) -> None:
     for topic_path, topic in _children(scope, "topics", path, found):
         if "allowFrom" in topic:
             _ids(topic["allowFrom"], f"{topic_path}.allowFrom", found)
+
+
+# Rule 12: the Telegram command menu
+#
+# At every start OpenClaw publishes its command menu with setMyCommands (OpenClaw 2026.9.8,
+# extensions/telegram/src/bot-native-command-menu.ts). The gate holds that call as a bot
+# administration action at risk 3 (docs/32, section 18, default decision 12): one notice per
+# start, retried every ~12 s. With ``commands.native: false`` and no ``customCommands`` the list is
+# empty and OpenClaw only clears the menu (deleteMyCommands, which passes). The setting is read as
+# account.commands.native, else the global ``commands.native``, else on (Telegram's auto default).
+# An account is its own config spread over the root one, SHALLOWLY (account-config.ts,
+# mergeAccountConfig): an account without ``commands`` inherits the root's, but one that has a
+# ``commands`` object, even an empty one, replaces it and falls back to the default (on).
+
+
+def _command_menu(scope: dict[str, Any], path: str, is_root: bool, found: _Findings) -> None:
+    if scope.get("customCommands"):
+        found.add(
+            f"{path}.customCommands",
+            "must be empty: custom commands are published with setMyCommands even when native "
+            "commands are off, and the gate holds that call (risk 3, one notice per start)",
+        )
+    if not is_root and "commands" not in scope:
+        return  # inherits the root's, which is checked on its own
+    where = f"{path}.commands"
+    commands = scope.get("commands")
+    if commands is not None and not isinstance(commands, dict):
+        found.add(where, "must be an object")
+        return
+    if (commands or {}).get("native") is not False:
+        found.add(
+            f"{where}.native",
+            "must be written as false: OpenClaw publishes its command menu with setMyCommands at "
+            "every start, which the gate holds as a bot administration action (risk 3, one notice "
+            "per start, retried every few seconds)"
+            + ("" if is_root else "; an account with its own commands object does not inherit it"),
+        )
 
 
 # Rule 5: exec approvals

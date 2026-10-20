@@ -163,7 +163,12 @@ def test_openclaw_accepts_the_config_that_check_rewindable_accepts(running_agent
 
     Run against a copy: the mounted config stays untouched."""
     config = openclaw_config(running_agent.jail.config)
-    telegram = {"dmPolicy": "allowlist", "allowFrom": ["123456789"], "groupPolicy": "disabled"}
+    telegram = {
+        "dmPolicy": "allowlist",
+        "allowFrom": ["123456789"],
+        "groupPolicy": "disabled",
+        "commands": {"native": False},  # rule 12; the real OpenClaw must accept the key too
+    }
     config["channels"] = {"telegram": telegram}
     check_rewindable(config)
     validated = _validate_copy(running_agent, config)
