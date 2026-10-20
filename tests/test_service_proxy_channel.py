@@ -842,11 +842,16 @@ def test_the_pending_holds_say_what_the_person_decides_on(gated: Gated) -> None:
     hold_id = gated.ask(delete_event(), write_facts())["hold_id"]
     gated.clock.now += 60
     [pending] = gated.channel.pending()
+    [held] = gated.gate_events("held")
     assert pending == {
         "hold_id": hold_id, "risk": 3, "reason": "delete", "phrase": None, "method": "DELETE",
         "host": "example.com", "path": "/v1/buckets/b1",
         "target": "https://example.com/v1/buckets/b1", "expires_in_s": 240, "waiting": True,
+        # T10-5: what the web shows of it (no reading: a plain DELETE)
+        "seq": held.seq, "held_at": pending["held_at"], "expires_at": held.details["expires_at"],
+        "batches": [], "trustable": False, "view": None,
     }  # fmt: skip
+    assert pending["held_at"].endswith("Z") and pending["held_at"] < pending["expires_at"]
 
 
 def test_a_twin_does_not_change_what_is_recorded_when_the_waiting_one_goes(gated: Gated) -> None:

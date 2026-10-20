@@ -1,0 +1,45 @@
+{# "Ver" (T10-5): a held request as the black box keeps it, the 2 KiB excerpt included. Our
+   words first; everything the agent wrote is in its own marked block, every piece through
+   vis() (escaped, invisible characters made visible): a fake header, a "ya aprobado" or HTML
+   of the agent's reads as what it is. It changes nothing. #}
+{% extends "base.html" %}
+{% block title %}{{ t('holds.title') }}{% endblock %}
+{% block main %}
+<main class="settings holds">
+  <h1>{{ t('hold.view.title') }}</h1>
+  <section class="settings-step" aria-labelledby="hold-view-title">
+    <h2 id="hold-view-title"><span class="sid">{{ hold_id }}</span> · <span class="dot dot-{{ risk }}" aria-hidden="true"></span>{{ t('risk.' ~ risk) }}</h2>
+    {% if hold %}
+    {% if hold.action %}<p class="req-what" lang="es">{{ hold.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
+    {% if hold.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ hold.notes | join('; ') }}.</span></p>{% endif %}
+    <p class="muted">{{ t('wait.left') }} <span class="num">{{ countdown(hold.left(now)) }}</span></p>
+    {% else %}
+    <p class="note">{{ t('hold.view.closed') }}</p>
+    {% endif %}
+    {% if detail %}
+    <div class="req-agent">
+      <p class="req-agent-head">{{ t('hold.agent') }}</p>
+      <p><span class="muted">{{ t('hold.request') }}</span> <span class="name">{{ vis(detail.request, 2200) }}</span></p>
+      {% if detail.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in detail.recipients %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      {% if detail.reply_to %}<p><span class="muted">{{ t('hold.reply_to') }}</span> {% for rc in detail.reply_to %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      {% if detail.sender %}<p><span class="muted">{{ t('hold.from') }}</span> <span class="name">{{ vis(detail.sender, 200) }}</span></p>{% endif %}
+      {% if detail.subject %}<p><span class="muted">{{ t('hold.subject') }}</span> <span class="name">{{ vis(detail.subject, 200) }}</span></p>{% endif %}
+      {% if detail.lines %}<p class="req-lines"><span class="name">{{ vis(detail.lines, 300) }}</span></p>{% endif %}
+      {% if detail.target %}<p><span class="muted">{{ t('hold.target') }}</span> <span class="name">{{ vis(detail.target, 200) }}</span></p>{% endif %}
+      {% for name, kind, size in detail.attachments %}<p><span class="muted">{{ t('hold.attachment') }}</span> <span class="name">{{ vis(name, 100) }}</span> · <span class="name">{{ vis(kind, 80) }}</span> · {{ size if size is number else '?' }} B</p>{% endfor %}
+      {% if detail.excerpt %}
+      <p class="muted">{{ t('hold.excerpt') }}</p>
+      <pre class="req-excerpt">{{ vis(detail.excerpt, 2048, keep_newlines=True) }}</pre>
+      {% if detail.excerpt_cut %}<p class="muted">{{ t('hold.excerpt.cut') }}</p>{% endif %}
+      {% elif detail.body_size %}
+      <p class="muted">{{ t('hold.excerpt.none') }}</p>
+      {% endif %}
+      <p class="req-agent-end">{{ t('hold.agent.end') }}</p>
+    </div>
+    {% else %}
+    <p class="note">{{ t('hold.view.unreadable') }}</p>
+    {% endif %}
+    <p class="settings-actions"><a class="settings-back" href="{{ base }}/peticiones">{{ t('holds.back') }}</a></p>
+  </section>
+</main>
+{% endblock %}

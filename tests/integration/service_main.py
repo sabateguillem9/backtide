@@ -14,9 +14,10 @@ concession the reader needs without root.
 With ``--egress-grants <file.json>`` (T06-5, tests/integration/internet_kit.py) the proxy gets the
 grants that let it use the test's fake internet on its egress network.
 
-With ``--hold-timings <life>,<wait>,<preapproval>,<remember>`` (T10-2) the gate's times are
-shortened, in seconds (5 min, 90 s, 10 min and 10 min in production): no config file can set
-them, so a scenario does not wait 5 minutes for a hold to expire.
+With ``--hold-timings <life>,<wait>,<preapproval>,<remember>[,<telegram_retry_after>]`` (T10-2)
+the gate's times are shortened, in seconds (5 min, 90 s, 10 min and 10 min in production): no
+config file can set them, so a scenario does not wait 5 minutes for a hold to expire. The fifth
+(T10-5) is the Retry-After of Telegram's "pending".
 
     python -m tests.integration.service_main <config.toml> [--with-sensor]
         [--egress-grants <file.json>] [--hold-timings <life>,<wait>,<preapproval>,<remember>]
@@ -39,8 +40,14 @@ HOLD_TIMINGS = "--hold-timings"
 
 
 def hold_timings(text: str) -> HoldTimings:
-    life, wait, preapproval, remember = (float(part) for part in text.split(","))
-    return HoldTimings(life=life, wait=wait, preapproval=preapproval, remember=remember)
+    """``life,wait,preapproval,remember`` and, optionally, Telegram's ``retry_after`` (T10-5:
+    test_openclaw_telegram.py measures OpenClaw with the long one and the short one)."""
+    parts = text.split(",")
+    life, wait, preapproval, remember = (float(part) for part in parts[:4])
+    timings = HoldTimings(life=life, wait=wait, preapproval=preapproval, remember=remember)
+    if len(parts) == 5:
+        timings = replace(timings, telegram_retry_after=int(parts[4]))
+    return timings
 
 
 def serve_without_root(

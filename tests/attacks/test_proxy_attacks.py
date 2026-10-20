@@ -115,6 +115,7 @@ def start_lab(
     unknown_hosts: str = "hold",
     trusted_chat: str | None = None,
     telegram_toml: str | None = None,
+    agent_memory: str = "2g",
 ) -> Lab:
     """A started service with its fake internet. With ``inwards``, the allowed list also holds
     names that resolve to private addresses (ssrf-por-el-proxy: the fixed rule must still say
@@ -123,7 +124,8 @@ def start_lab(
     any host pass, writes are held) or ``"deny"`` (the strict mode, T06's allowed list).
     ``trusted_chat``: a Telegram chat in ``[gate] trusted`` (the owner's, in un-get-que-envia).
     ``telegram_toml``: the bot's ``telegram.toml`` (T10-4: pointed at a fake Bot API on the VM's
-    127.0.0.1; the owner's chat in it is trusted by the gate too)."""
+    127.0.0.1; the owner's chat in it is trusted by the gate too). ``agent_memory``: the agent's
+    memory (T10-5's test_openclaw_telegram.py runs a second OpenClaw Gateway inside it)."""
     vm._require_agent_image()
     vm._remove_stale_test_agents()
     names = vm._agent_names(os.getpid())
@@ -144,6 +146,7 @@ def start_lab(
         + provider_toml()
         + gate_toml(unknown_hosts, trusted_chat),
         real_keys=real,
+        agent_memory=agent_memory,
     )
     if telegram_toml is not None:
         path = service.config.state_dir / "telegram.toml"
@@ -667,6 +670,13 @@ def test_the_provider_is_not_made_to_reach_other_hosts(attack: Attack, lab: Lab)
     )
     risks = sorted({e.risk for e in blocked.values()})
     attack.check("risk", risks == [2], f"los rechazos llevan riesgo {risks}")
+    held = lab.tagged(tag, "held")
+    attack.check(
+        "held",
+        held == [] and len(blocked) == len(PROVIDER_REFUSALS),
+        f"se rechazan al momento, sin retener ni preguntar (docs/32, decisión por defecto 2): "
+        f"{len(held)} gate/held, {len(blocked)} net/blocked",
+    )
 
 
 # --- eco-de-la-clave (T06-6) ---------------------------------------------------------------------

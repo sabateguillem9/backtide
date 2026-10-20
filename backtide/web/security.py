@@ -7,18 +7,21 @@ program on this machine that listens on a port of its own (cookies ignore ports)
   * the ``Host`` header must be exactly ``127.0.0.1:<port>`` (not ``localhost``: that name can
     also resolve to ``::1``, where another program may be listening): a page on ``evil.example``
     that re-points its name at 127.0.0.1 (DNS rebinding) arrives with ITS name in ``Host``;
-  * only GET, except the paths that change something: ``POST /instantaneas/rebobinar`` (T12b)
-    and, only when `backtide web --ajustes` turned the Settings page on, ``POST
-    /ajustes/guardar`` (T12e: a key set or removed). A POST anywhere else, and any other method,
-    is a 405, so without ``--ajustes`` there is not even a door to knock on;
+  * only GET, except the paths that change something: ``POST /instantaneas/rebobinar`` (T12b);
+    only when `backtide web --ajustes` turned the Settings page on, ``POST /ajustes/guardar``
+    (T12e: a key set or removed); and only with `backtide web --aprobar`, ``POST
+    /peticiones/decidir`` (T10-5: approve, reject, "aprobar y confiar", revoke a batch, take a
+    trusted recipient out). A POST anywhere else, and any other method, is a 405, so without
+    ``--ajustes`` or ``--aprobar`` there is not even a door to knock on;
   * every such POST must come from our own page: exactly one ``Origin``, ours (every browser
     sends it on a POST), ``Sec-Fetch-Site: same-origin`` when the browser sends it (anything
     else, even ``none``, is refused), a plain form body (``application/x-www-form-urlencoded``: no
     ``text/plain`` or multipart tricks) with a ``Content-Length`` of at most ``MAX_FORM_BYTES``
     (no chunked bodies). Behind that the app still wants the session cookie (never the link
     token), the session's CSRF token from the form, and a one-time confirmation ticket for that
-    very snapshot (``backtide.web.rewind.Tickets``) or that very change of that very key
-    (``backtide.web.settings.SettingTickets``);
+    very snapshot (``backtide.web.rewind.Tickets``), that very change of that very key
+    (``backtide.web.settings.SettingTickets``) or that very decision on that very hold, batch or
+    recipient (``backtide.web.approve.DecisionTickets``);
   * a browser ``Origin`` that is not ours is refused, and so is any request the browser says is
     ``same-site`` or ``cross-site`` unless it is a top-level navigation (``Sec-Fetch-Mode:
     navigate``): the stream and the fragments are only ever fetched from our own pages;
@@ -80,6 +83,9 @@ ALLOWED_METHODS = frozenset({"GET"})
 POST_PATH = "/instantaneas/rebobinar"
 SETTINGS_PATH = "/ajustes"
 SETTINGS_POST_PATH = "/ajustes/guardar"
+# The held requests (T10-5): their page, and the POST that decides, only with --aprobar.
+HOLDS_PATH = "/peticiones"
+DECIDE_PATH = "/peticiones/decidir"
 MAX_FORM_BYTES = 2048
 FORM_TYPE = "application/x-www-form-urlencoded"
 

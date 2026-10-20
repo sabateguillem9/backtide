@@ -33,12 +33,16 @@ from backtide.service.control import (
     ControlServer,
     ControlUnavailable,
     ask_decide,
+    ask_end_batch,
     ask_holds,
+    ask_list,
     ask_resume,
     ask_rewind,
+    ask_trust,
+    ask_untrust,
     peer_credentials,
 )
-from backtide.service.holds import HoldOutcome, HoldStatus
+from backtide.service.holds import HoldOutcome, HoldStatus, TrustOutcome, TrustStatus
 from backtide.service.pause import ResumeOutcome, ResumeStatus
 from backtide.service.rewind import RewindOutcome, RewindStatus
 from backtide.snapshots import Snapshot
@@ -111,6 +115,39 @@ class FakeGuardian:
         if self.error is not None:
             raise self.error
         return self.holds
+
+    # T10-5: the web's holds page
+
+    trust_status = TrustStatus.TRUSTED
+    untrust_result: bool | None = True
+    end_batch_result = True
+
+    def trust_hold(self, hold_id: str, *, via: str, requested_by: str) -> TrustOutcome:
+        self.decisions.append((hold_id, "trust", via, requested_by))
+        if self.error is not None:
+            raise self.error
+        hold = HoldStatus.RELEASED if self.trust_status is TrustStatus.TRUSTED else None
+        return TrustOutcome(self.trust_status, hold_id, "t-0a1b2c3d", hold)
+
+    def trusted(self) -> list[dict[str, Any]]:
+        if self.error is not None:
+            raise self.error
+        return [
+            {"trust_id": "t-0a1b2c3d", "translator": "gmail", "recipient": "ana@ejemplo.com",
+             "added_at": "2026-10-20T10:00:00Z", "by": "web", "hold_id": HOLD},
+            {"trust_id": "bad", "translator": "gmail"},
+        ]  # fmt: skip
+
+    def untrust(self, trust_id: str, *, via: str, requested_by: str) -> bool | None:
+        self.decisions.append((trust_id, "untrust", via, requested_by))
+        return self.untrust_result
+
+    def batches(self) -> list[dict[str, Any]]:
+        return [{"rule_id": "b-01234567", "scope": "kind", "uses": 2}, {"rule_id": "x"}]
+
+    def end_batch(self, rule_id: str, *, via: str) -> bool:
+        self.decisions.append((rule_id, "end_batch", via, ""))
+        return self.end_batch_result
 
 
 @pytest.fixture
@@ -1074,3 +1111,82 @@ def test_a_listing_that_fails_is_an_error(
     guardian.error = RuntimeError("boom")
     with pytest.raises(ControlError):
         ask_holds(make_server().path, peer=me)
+
+
+# --- T10-5: the web's holds page (trust, lists, revoking) ---------------------------------------
+
+
+def test_aprobar_y_confiar_goes_to_the_guardian_from_the_web_only(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    server = make_server()
+    reply = ask_trust(server.path, HOLD, peer=me)
+    assert (reply["ok"], reply["outcome"], reply["hold"]) == (True, "trusted", "released")
+    assert guardian.decisions == [(HOLD, "trust", "web", f"web (uid {ME}, pid 4242)")]
+    for line in (
+        {"cmd": "trust", "hold_id": HOLD, "via": "cli"},
+        {"cmd": "trust", "hold_id": HOLD, "via": "telegram"},
+        {"cmd": "trust", "hold_id": HOLD},
+        {"cmd": "trust", "hold_id": "h-XYZ", "via": "web"},
+        {"cmd": "trust", "hold_id": HOLD, "via": "web", "recipient": "x@malo.example"},
+    ):
+        refused = talk(server, json.dumps(line).encode() + b"\n")
+        assert refused["outcome"] == "refused", line
+    assert len(guardian.decisions) == 1, "a refused request never reaches the Guardian"
+
+
+@pytest.mark.parametrize("status", [TrustStatus.NOT_TRUSTABLE, TrustStatus.PAUSED,
+                                    TrustStatus.UNKNOWN, TrustStatus.FAILED])  # fmt: skip
+def test_a_trust_that_is_not_given_says_why(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian, status: TrustStatus
+) -> None:
+    guardian.trust_status = status
+    reply = ask_trust(make_server().path, HOLD, peer=me)
+    assert (reply["ok"], reply["outcome"], reply["hold"]) == (False, str(status), None)
+
+
+def test_the_lists_keep_only_entries_with_their_id(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    server = make_server()
+    assert [t["trust_id"] for t in ask_list(server.path, "trusted", peer=me)] == ["t-0a1b2c3d"]
+    assert [b["rule_id"] for b in ask_list(server.path, "batches", peer=me)] == ["b-01234567"]
+    with pytest.raises(ValueError):
+        ask_list(server.path, "holds", peer=me)
+    refused = talk(server, json.dumps({"cmd": "trusted", "x": 1}).encode() + b"\n")
+    assert refused["outcome"] == "refused"
+
+
+@pytest.mark.parametrize(("result", "outcome"), [(True, "removed"), (False, "unknown"),
+                                                  (None, "failed")])  # fmt: skip
+def test_a_trusted_recipient_is_taken_out(
+    make_server: Callable[..., ControlServer],
+    guardian: FakeGuardian,
+    result: bool | None,
+    outcome: str,
+) -> None:
+    guardian.untrust_result = result
+    reply = ask_untrust(make_server().path, "t-0a1b2c3d", via="web", peer=me)
+    assert (reply["ok"], reply["outcome"]) == (result is True, outcome)
+    assert guardian.decisions == [("t-0a1b2c3d", "untrust", "web", f"web (uid {ME}, pid 4242)")]
+
+
+def test_a_batch_is_revoked_from_the_web_or_the_terminal(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    server = make_server()
+    assert ask_end_batch(server.path, "b-01234567", via="web", peer=me)["outcome"] == "ended"
+    guardian.end_batch_result = False
+    assert ask_end_batch(server.path, "b-01234567", peer=me)["outcome"] == "unknown"
+    for line in (
+        {"cmd": "end_batch", "rule_id": "b-01234567", "via": "telegram"},
+        {"cmd": "end_batch", "rule_id": "nope"},
+        {"cmd": "untrust", "trust_id": "t-0a1b2c3d", "via": "telegram"},
+        {"cmd": "untrust", "trust_id": "t-XYZ"},
+    ):
+        assert talk(server, json.dumps(line).encode() + b"\n")["outcome"] == "refused", line
+    assert [d[:3] for d in guardian.decisions] == [
+        ("b-01234567", "end_batch", "web"), ("b-01234567", "end_batch", "cli"),
+    ]  # fmt: skip
+    with pytest.raises(ValueError):
+        ask_end_batch(server.path, "b-01234567", via="telegram", peer=me)

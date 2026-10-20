@@ -54,6 +54,8 @@ from backtide.service.holds import (
     HoldStatus,
     HoldTimings,
     HoldWatch,
+    TrustOutcome,
+    TrustStatus,
     stale_holds,
 )
 from backtide.service.pause import Ticker
@@ -68,6 +70,7 @@ from backtide.service.proxy_channel import (
     open_channel,
 )
 from backtide.service.read_budget import ReadBudget
+from backtide.service.trust import TrustError, TrustStore
 from backtide.snapshots import utc_now
 
 logger = logging.getLogger(__name__)
@@ -121,9 +124,13 @@ class Egress:
         timings: HoldTimings | None = None,
         history: History | None = None,
         watch: HoldWatch | None = None,
+        trust: TrustStore | None = None,
     ) -> None:
         self._jail = jail
         self._watch = watch
+        # The recipients trusted from the web (T10-5): one list for the service, handed to every
+        # channel, so a proxy restart keeps them (they live in <state_dir>/trusted.json).
+        self._trust = trust
         self._agent_name = agent_name
         self._policy = policy
         self._box = record
@@ -255,6 +262,46 @@ class Egress:
     def end_batch(self, rule_id: str, *, by: str) -> bool:
         channel = self._channel
         return False if channel is None or channel.closed else channel.end_batch(rule_id, by=by)
+
+    # Trusted recipients from the web (T10-5, decision 9)
+
+    def trust(
+        self,
+        hold_id: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> TrustOutcome:
+        """Trust the recipient of an open hold and approve it (``ProxyChannel.trust``). Without
+        a channel there is no hold: UNKNOWN."""
+        channel = self._channel
+        if channel is None or channel.closed:
+            return TrustOutcome(TrustStatus.UNKNOWN, hold_id)
+        return channel.trust(hold_id, by=by, requested_by=requested_by, frozen=frozen)
+
+    def trusted(self) -> list[dict[str, Any]]:
+        """The recipients trusted from the web, oldest first."""
+        return [] if self._trust is None else self._trust.listing()
+
+    def untrust(self, trust_id: str, *, by: str, requested_by: str) -> bool | None:
+        """Stop trusting ``trust_id``: True when removed (and ``gate/trust_removed`` recorded),
+        False when there is no such entry, None when the list could not be saved (it is still
+        trusted). Never raises."""
+        if self._trust is None:
+            return False
+        try:
+            entry = self._trust.remove(trust_id)
+        except TrustError:
+            return None
+        if entry is None:
+            return False
+        if self._hooks is not None:
+            details = {"trust_id": entry.trust_id, "translator": entry.translator,
+                       "recipient": entry.recipient, "by": by,
+                       "requested_by": str(requested_by)[:120]}  # fmt: skip
+            self._hooks.record("gate", "trust_removed", entry.recipient, details=details, risk=1)
+        return True
 
     def reject_holds(self, by: str) -> int:
         """A pause or a rewind rejects every open hold (decision 7). Never raises."""
@@ -508,6 +555,7 @@ class Egress:
                         read_budget=self._read_budget,
                         watch=self._watch,
                         frozen=self._frozen,
+                        trust=self._trust,
                     )
                     channel.handshake(max(0.5, deadline - self._mono()))
                 except BaseException:

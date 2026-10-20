@@ -99,7 +99,14 @@ from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProbl
 from backtide.service.clock import clock_synced as kernel_clock_synced
 from backtide.service.config import ServiceConfig
 from backtide.service.egress import EgressHooks
-from backtide.service.holds import BatchOutcome, BatchStatus, HoldOutcome, HoldStatus
+from backtide.service.holds import (
+    BatchOutcome,
+    BatchStatus,
+    HoldOutcome,
+    HoldStatus,
+    TrustOutcome,
+    TrustStatus,
+)
 from backtide.service.pause import (
     Holder,
     PauseOutcome,
@@ -337,6 +344,25 @@ class EgressProxy(Protocol):
 
     def end_batch(self, rule_id: str, *, by: str) -> bool:
         """Revoke a batch rule."""
+        ...
+
+    def trust(
+        self,
+        hold_id: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> TrustOutcome:
+        """Trust the recipient of an open hold and approve it (T10-5)."""
+        ...
+
+    def trusted(self) -> list[dict[str, Any]]:
+        """The recipients trusted from the web."""
+        ...
+
+    def untrust(self, trust_id: str, *, by: str, requested_by: str) -> bool | None:
+        """Stop trusting a recipient."""
         ...
 
 
@@ -3215,6 +3241,47 @@ class Guardian:
         except Exception:
             logger.exception("revoking a batch rule failed")
             return False
+
+    def trust_hold(self, hold_id: str, *, via: str, requested_by: str) -> TrustOutcome:
+        """ "Aprobar y confiar en este destinatario" (T10-5, decision 9: only the web asks):
+        the hold's one recipient trusted from now on, and the hold approved. Like
+        ``decide_hold``: nothing while the person's pause is open or a rewind runs. Never
+        raises."""
+        if self._egress is None or not self._serving:
+            return TrustOutcome(TrustStatus.UNKNOWN, hold_id)
+        try:
+            return self._egress.trust(
+                hold_id,
+                by=via,
+                requested_by=str(requested_by)[:MAX_REQUESTER_CHARS],
+                frozen=self._approvals_frozen,
+            )
+        except Exception:
+            logger.exception("trusting a recipient failed")
+            return TrustOutcome(TrustStatus.FAILED, hold_id)
+
+    def trusted(self) -> list[dict[str, Any]]:
+        """The recipients trusted from the web. Never raises."""
+        if self._egress is None:
+            return []
+        try:
+            return self._egress.trusted()
+        except Exception:
+            logger.exception("listing the trusted recipients failed")
+            return []
+
+    def untrust(self, trust_id: str, *, via: str, requested_by: str) -> bool | None:
+        """Stop trusting a recipient (True), no such entry (False), or it could not be saved
+        (None). Never raises."""
+        if self._egress is None:
+            return False
+        try:
+            return self._egress.untrust(
+                trust_id, by=via, requested_by=str(requested_by)[:MAX_REQUESTER_CHARS]
+            )
+        except Exception:
+            logger.exception("removing a trusted recipient failed")
+            return None
 
     def _approvals_frozen(self) -> bool:
         """Nothing is approved while the person's pause is open or a rewind runs (security

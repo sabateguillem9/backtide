@@ -1,0 +1,56 @@
+{# The held requests (T10-5): what waits (requests.html, as on the panel), the active batches
+   and the recipients trusted from here, each with its way out. The lists come from the service
+   and only with `backtide web --aprobar`; their texts that the agent once chose (recipients,
+   hosts, routes) are shown as names. #}
+{% extends "base.html" %}
+{% block title %}{{ t('holds.title') }}{% endblock %}
+{% block main %}
+<main class="holds">
+  <h1>{{ t('holds.title') }}</h1>
+  <p class="lede">{{ t('holds.lede') }}</p>
+  <section class="waiting" id="waiting" aria-labelledby="waiting-title">
+    <div class="waiting-in">{% include "requests.html" %}</div>
+  </section>
+  <section class="holds-list" aria-labelledby="batches-title">
+    <h2 class="section-title" id="batches-title">{{ t('holds.batches') }}</h2>
+    {% if batches is none %}
+    <p class="note">{{ t.code('holds.lists.off') }}</p>
+    {% elif not batches %}
+    <p class="note">{{ t('holds.batches.none') }}</p>
+    {% else %}
+    <p class="note">{{ t('holds.batches.lede') }}</p>
+    <ul class="hold-rules">
+      {% for b in batches %}
+      <li class="hold-rule">
+        <p class="hold-rule-what">{{ t('holds.batch.' ~ b.scope) }}{% if b.translator %} · <span lang="es">{{ api(b.translator) }}</span>{% endif %}</p>
+        {% if b.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in b.recipients %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+        {% if b.request %}<p><span class="name">{{ vis(b.request, 300) }}</span></p>{% endif %}
+        <p class="muted">{% if b.until %}{{ t('holds.until', when=stamp(b.until)) }} · {% endif %}{{ t('holds.uses', n=b.uses) }}</p>
+        <p><a class="req-no" href="{{ base }}/peticiones/decidir?id={{ b.rule_id | urlencode }}&amp;v=revocar">{{ t('holds.revoke') }}</a></p>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  <section class="holds-list" aria-labelledby="trusted-title">
+    <h2 class="section-title" id="trusted-title">{{ t('holds.trusted') }}</h2>
+    {% if trusted is none %}
+    <p class="note">{{ t.code('holds.lists.off') }}</p>
+    {% elif not trusted %}
+    <p class="note">{{ t('holds.trusted.none') }}</p>
+    {% else %}
+    <p class="note">{{ t('holds.trusted.lede') }}</p>
+    <ul class="hold-rules">
+      {% for x in trusted %}
+      <li class="hold-rule">
+        <p class="hold-rule-what"><span lang="es">{{ api(x.translator) }}</span> · <span class="name">{{ vis(x.recipient, 200) }}</span></p>
+        <p class="muted">{% if x.added_at %}{{ t('holds.added', when=stamp(x.added_at)) }}{% endif %}</p>
+        <p><a class="req-no" href="{{ base }}/peticiones/decidir?id={{ x.trust_id | urlencode }}&amp;v=olvidar">{{ t('holds.forget') }}</a></p>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    <p class="note">{{ t.code('holds.trusted.toml') }}</p>
+  </section>
+</main>
+{% endblock %}

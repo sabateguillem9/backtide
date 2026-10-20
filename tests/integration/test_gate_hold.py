@@ -568,10 +568,11 @@ def test_a_send_to_another_chat_is_held_with_its_sentence_and_telegrams_429(lab:
     path = f"/{BOT}/sendMessage"
     pending = lab.ask("POST", path, body=body, host=TELEGRAM)
     assert pending["ok"] and pending["status"] == 429, pending
-    assert pending["retry_after"] == "30" and pending["elapsed"] >= WAIT - 1
+    # Telegram's "pending" asks for a short wait (T10-5): OpenClaw stops its whole bot that long.
+    assert pending["retry_after"] == "2" and pending["elapsed"] >= WAIT - 1
     answer = json.loads(pending["body"])
     assert (answer["ok"], answer["error_code"]) == (False, 429)
-    assert answer["parameters"] == {"retry_after": 30}
+    assert answer["parameters"] == {"retry_after": 2}
     [held] = [e for e in lab.box.events(source="gate", action="held")
               if e.details.get("reading", {}).get("first_lines") == text]  # fmt: skip
     assert (held.risk, held.details["reason"]) == (2, "send")

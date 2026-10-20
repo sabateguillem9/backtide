@@ -13,7 +13,10 @@ thing it can change is the agent's workspace, and only by asking the service (T1
 confirmation page (GET, the fixed notice and a one-time ticket) and then a POST from it. The
 other thing it can change, only with `backtide web --ajustes` (T12e), is a key of the Settings
 page ("Ajustes"), again by asking the service: a confirmation page per change and a POST from it
-(``backtide.web.settings``). Every other route answers GET only.
+(``backtide.web.settings``). The third, only with `backtide web --aprobar` (T10-5), is a decision
+on a held request of the gate (approve, reject, "aprobar y confiar", revoke a batch, take a
+trusted recipient out), again by asking the service: a confirmation page per decision and a POST
+from it (``backtide.web.approve``). Every other route answers GET only.
 """
 
 import asyncio
@@ -38,6 +41,7 @@ from markupsafe import Markup
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backtide.blackbox import Event, Source
+from backtide.gate.phrase import api_name
 from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
 from backtide.service.notice import rewind_notice
 from backtide.snapshots import Snapshot, SnapshotError
@@ -59,6 +63,24 @@ from backtide.web.agents import (
     started,
     summarise,
 )
+from backtide.web.approve import (
+    APPROVE,
+    BOX_ROWS,
+    REJECT,
+    REVOKE,
+    TRUST,
+    Approver,
+    BatchView,
+    DecisionTickets,
+    TrustView,
+    batch_views,
+    box_holds,
+    detail_of,
+    held_event,
+    held_request,
+    id_fits,
+    trust_views,
+)
 from backtide.web.ask import MAX_QUESTION, answer
 from backtide.web.i18n import LANGUAGES, Translator, negotiate
 from backtide.web.narrate import Line, Name, Narrator, line_for, safe_sentence, sentence
@@ -66,6 +88,8 @@ from backtide.web.reader import BoxReader, BoxUnavailable
 from backtide.web.rewind import Availability, Redeemed, Rewinder, Tickets
 from backtide.web.security import (
     COOKIE_NAME,
+    DECIDE_PATH,
+    HOLDS_PATH,
     LANG_COOKIE,
     MAX_FORM_BYTES,
     POST_PATH,
@@ -105,6 +129,9 @@ SNAPSHOT_FALLBACK = 200
 MAX_ACTION_CHARS = 64
 RANGES = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}
 FORM_FIELDS = ("csrf", "id", "ticket")  # the rewind's form: these, once each, and nothing else
+# The decisions' form (T10-5): these always; ``confirmo`` ticked for "aprobar y confiar".
+DECIDE_FIELDS = ("csrf", "id", "v", "ticket")
+DECIDE_OPTIONAL = ("confirmo",)
 MAX_FIELD_CHARS = 128
 # The Settings page's form (T12e): these always; ``valor`` (and ``chat`` for Telegram) to set a key;
 # ``confirmo`` when it replaces one that is set. A pasted key may bring spaces around it.
@@ -145,6 +172,7 @@ def create_app(
     others: Sequence[AgentSource] = (),
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
     settings: SettingsClient | None = None,
+    approver: Approver | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
     keepalive: float = KEEPALIVE,
@@ -164,7 +192,10 @@ def create_app(
     (the demo's today, T17's later). ``pending`` lists the gate's requests waiting for a yes
     (the demo's today, T10's later): the page shows them, and cannot answer them. ``settings``
     asks the service about the keys (T12e, ``backtide.web.settings``); its POST path exists
-    only when it is enabled (`backtide web --ajustes`)."""
+    only when it is enabled (`backtide web --ajustes`). ``approver`` asks the service about the
+    held requests (T10-5, ``backtide.web.approve``): without ``pending`` the page lists the real
+    ones (from the service with `backtide web --aprobar`, else from the black box), and the
+    POST that decides exists only when it is enabled."""
     access = Access(token or make_token(), session)
     prefix = prefix or make_prefix()
     base = f"/s/{prefix}"
@@ -317,6 +348,9 @@ def create_app(
             "agent_name": agent_name,
             "countdown": countdown,
             "run_name": run_name,
+            # Whether the holds' buttons work (T10-5): "ready", or why not. Asked when drawn.
+            "approvals_state": lambda: str(_approvals()),
+            "api": api_name,
         }
 
     def _page(
@@ -469,17 +503,56 @@ def create_app(
             return summary
 
     def _requests() -> tuple[list[PendingRequest] | None, datetime, bool]:
-        """The gate's requests still waiting (None: nothing lists them yet, that is T10), when,
-        and whether the list could NOT be read (then it is empty here, and the page says so
-        instead of "nothing waits")."""
+        """The gate's requests still waiting, when, and whether the list could NOT be read
+        (then it is empty here, and the page says so instead of "nothing waits"). The demo's
+        come from ``pending``; the real ones from the service or the black box (T10-5)."""
         now = clock()
-        if pending is None:
-            return None, now, False
         try:
-            return live_requests(list(pending()), roster, now), now, False
+            listed = list(pending()) if pending is not None else _held(now)
+            return live_requests(listed, roster, now), now, False
         except Exception:  # a page, not a 500: the log says why, the page says it is unknown
             logger.exception("the pending requests cannot be listed")
             return [], now, True
+
+    # -- the held requests (T10-5) --------------------------------------------------------
+
+    decision_tickets = DecisionTickets(clock)
+    box_cache: dict[str, Any] = {}
+    box_lock = threading.Lock()
+
+    def _approvals() -> Availability:
+        if approver is None:
+            return Availability.DISABLED  # as `backtide web` without --aprobar
+        try:
+            return approver.availability()
+        except Exception:  # never a 500 for a disabled button; the log says why
+            logger.exception("cannot tell whether the service can be asked about the holds")
+            return Availability.OFF
+
+    def _held(now: datetime) -> list[PendingRequest]:
+        """The main agent's holds: from the service when this web may decide (``--aprobar``),
+        else rebuilt from its black box (read again only when it moved). Raises when neither
+        can be read."""
+        if _approvals() is Availability.READY and approver is not None:
+            raw = approver.holds()
+        else:
+            reader = roster.main.reader
+            head = reader.head_seq()
+            with box_lock:
+                cached = box_cache.get("rows")
+                if cached is None or cached[0] != head:
+                    rows = reader.events(newest_first=True, limit=BOX_ROWS)
+                    cached = (head, rows)
+                    box_cache["rows"] = cached
+            raw = box_holds(cached[1], now)
+        found = [held_request(item, now=now) for item in raw if isinstance(item, dict)]
+        return [request for request in found if request is not None]
+
+    def _find_hold(hold_id: str) -> PendingRequest | None:
+        requests, _now, failed = _requests()
+        if failed or not requests:
+            return None
+        return next((r for r in requests if r.id == hold_id), None)
 
     def _cards(requests: Sequence[PendingRequest] | None, now: datetime) -> list[Card]:
         return [card(a, _summary(a), requests or (), now) for a in roster]
@@ -1024,6 +1097,187 @@ def create_app(
     if settings_on:
         app.post(SETTINGS_POST_PATH, dependencies=[Depends(require_session)])(settings_save)
 
+    # -- the held requests (T10-5) ---------------------------------------------------------
+
+    def _hold_view(
+        request: Request, t: Translator, status: int, view: str, **values: Any
+    ) -> Response:
+        for name in ("hold", "batch", "trust", "outcome", "message", "reason", "verb", "hold_out"):
+            values.setdefault(name, None)
+        return _page(
+            "hold_step.html", request, status=status, active="holds", t=t, view=view, **values
+        )
+
+    def _hold_refused(request: Request, t: Translator, status: int, reason: str) -> Response:
+        return _hold_view(request, t, status, "refused", reason=reason)
+
+    def _lists() -> tuple[list[BatchView] | None, list[TrustView] | None]:
+        """The active batches and the recipients trusted from here, from the service (None:
+        not asked, or it could not say)."""
+        if _approvals() is not Availability.READY or approver is None:
+            return None, None
+        try:
+            batches = batch_views(approver.batches())
+        except ControlError as error:
+            logger.warning("the batches cannot be listed: %s", error)
+            batches = None
+        try:
+            trusted = trust_views(approver.trusted())
+        except ControlError as error:
+            logger.warning("the trusted recipients cannot be listed: %s", error)
+            trusted = None
+        return batches, trusted
+
+    @app.get(HOLDS_PATH, dependencies=protected)
+    def holds_page(request: Request) -> Response:
+        t = Translator(_language(request)[0])
+        requests, now, failed = _requests()
+        batches, trusted = _lists()
+        return _page(
+            "holds.html",
+            request,
+            active="holds",
+            t=t,
+            requests=requests,
+            stale=failed,
+            now=now,
+            batches=batches,
+            trusted=trusted,
+        )
+
+    @app.get(HOLDS_PATH + "/ver", dependencies=protected)
+    def hold_detail(request: Request) -> Response:
+        """ "Ver": the hold as the black box keeps it (the 2 KiB excerpt, every recipient and
+        attachment). Reads only; the agent's text is shown as the agent's."""
+        t = Translator(_language(request)[0])
+        hold_id = request.query_params.get("id", "")
+        if not id_fits(APPROVE, hold_id):
+            return _hold_refused(request, t, 404, "hold.err.unknown")
+        listed = _find_hold(hold_id)
+        event = None
+        try:
+            if listed is not None and listed.seq is not None:
+                rows = roster.main.reader.events(since_seq=listed.seq - 1, limit=1)
+                event = held_event(rows, hold_id)
+            if event is None:
+                rows = roster.main.reader.events(newest_first=True, limit=BOX_ROWS)
+                event = held_event(rows, hold_id)
+        except BoxUnavailable:
+            event = None
+        if event is None and listed is None:
+            return _hold_refused(request, t, 404, "hold.err.unknown")
+        return _page(
+            "hold_view.html",
+            request,
+            active="holds",
+            t=t,
+            hold=listed,
+            detail=None if event is None else detail_of(event),
+            risk=listed.risk if listed is not None else (event.risk if event else 0),
+            hold_id=hold_id,
+            now=clock(),
+        )
+
+    @app.get(DECIDE_PATH, dependencies=protected)
+    def decide_confirm(request: Request) -> Response:
+        """The confirmation of one decision: what it is, and a form with a ticket bound to that
+        verb and that id. It changes nothing, and it is the only way to get a ticket."""
+        t = Translator(_language(request)[0])
+        verb, subject = request.query_params.get("v", ""), request.query_params.get("id", "")
+        if not id_fits(verb, subject):
+            return _hold_refused(request, t, 200, "hold.err.form")
+        state = _approvals()
+        if state is not Availability.READY:
+            return _hold_refused(request, t, 200, f"hold.off.{state}")
+        values: dict[str, Any] = {"verb": verb, "csrf": access.csrf}
+        if verb in (APPROVE, REJECT, TRUST):
+            hold = _find_hold(subject)
+            if hold is None:
+                return _hold_refused(request, t, 200, "hold.err.unknown")
+            if verb == TRUST and not hold.trustable:
+                return _hold_refused(request, t, 200, "hold.err.not_trustable")
+            values["hold"] = hold
+            values["now"] = clock()
+            ticket = decision_tickets.issue(verb, subject, until=hold.expires_at)
+        else:
+            batches, trusted = _lists()
+            if verb == REVOKE:
+                found = next((b for b in batches or [] if b.rule_id == subject), None)
+                values["batch"] = found
+            else:
+                found = next((x for x in trusted or [] if x.trust_id == subject), None)
+                values["trust"] = found
+            if found is None:
+                return _hold_refused(request, t, 200, "hold.err.unknown")
+            ticket = decision_tickets.issue(verb, subject)
+        return _hold_view(request, t, 200, "confirm", ticket=ticket, subject=subject, **values)
+
+    async def decide(request: Request) -> Response:
+        """A decision. The Guard already checked where it comes from and its size (and that
+        this web may decide at all)."""
+        t = Translator(_language(request)[0])
+        form = await _read_form(request, DECIDE_FIELDS, DECIDE_OPTIONAL)
+        if form is None or not id_fits(form["v"], form["id"]):
+            return _hold_refused(request, t, 400, "hold.err.form")
+        verb, subject = form["v"], form["id"]
+        if not access.csrf_is(form["csrf"]):
+            logger.warning("a decision from the web was refused: wrong form token")
+            return _hold_refused(request, t, 403, "hold.err.form")
+        redeemed = decision_tickets.redeem(form["ticket"], verb, subject)
+        if redeemed is Redeemed.SPENT:
+            return _hold_refused(request, t, 400, "hold.err.used")
+        if redeemed is not Redeemed.OK:
+            return _hold_refused(request, t, 400, "hold.err.expired")
+        if verb == TRUST and form.get("confirmo") != "si":
+            return _hold_refused(request, t, 400, "hold.err.confirm")
+        if verb != TRUST and "confirmo" in form:
+            return _hold_refused(request, t, 400, "hold.err.form")
+        state = await asyncio.to_thread(_approvals)
+        if state is not Availability.READY or approver is None:
+            return _hold_refused(request, t, 503, f"hold.off.{state}")
+        client = approver
+
+        def run() -> tuple[str, dict[str, Any] | None]:
+            try:
+                if verb in (APPROVE, REJECT):
+                    verdict = "approve" if verb == APPROVE else "reject"
+                    return "asked", client.decide(subject, verdict)
+                if verb == TRUST:
+                    return "asked", client.trust(subject)
+                if verb == REVOKE:
+                    return "asked", client.end_batch(subject)
+                return "asked", client.untrust(subject)
+            except ControlUnavailable:
+                return "no_service", None
+            except ControlOutcomeUnknown as error:
+                logger.warning("a decision from the web has no known outcome: %s", error)
+                return "unknown_outcome", None
+            except ControlError as error:
+                logger.error("a decision from the web was not sent: %s", error)
+                return "untrusted", None
+
+        what, reply = await asyncio.to_thread(run)
+        if reply is None:
+            status = 503 if what == "no_service" else 200
+            return _hold_view(request, t, status, "result", verb=verb, outcome=what)
+        status = 400 if reply["outcome"] == "refused" else 200
+        return _hold_view(
+            request,
+            t,
+            status,
+            "result",
+            verb=verb,
+            outcome=str(reply["outcome"]),
+            message=str(reply["message"]),
+            hold_out=reply.get("hold"),
+        )
+
+    # The POST exists only with `backtide web --aprobar` (decision 10): without it, neither the
+    # Guard nor the app has a door for it.
+    approvals_on = approver is not None and getattr(approver, "enabled", False) is True
+    if approvals_on:
+        app.post(DECIDE_PATH, dependencies=[Depends(require_session)])(decide)
+
     # -- the stream ------------------------------------------------------------------------
 
     async def _stream(
@@ -1200,7 +1454,11 @@ def create_app(
                 yield b": keepalive\n\n"
             await asyncio.sleep(poll_interval)
 
-    post_paths = (POST_PATH, SETTINGS_POST_PATH) if settings_on else (POST_PATH,)
+    post_paths = (POST_PATH,)
+    if settings_on:
+        post_paths += (SETTINGS_POST_PATH,)
+    if approvals_on:
+        post_paths += (DECIDE_PATH,)
     return Guard(app, port=port, prefix=prefix, post_paths=post_paths)
 
 

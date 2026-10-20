@@ -7,10 +7,11 @@ keep their old addresses (``/ahora``, ``/historia``...) and it is the only one t
 with its own black box, through ``create_app(others=...)``; T17 will hand the real list over the
 same way. Every agent is read the same way as the main one: a ``BoxReader``, nothing else.
 
-The gate's approval requests (T10) do not exist yet. ``PendingRequest`` is the shape the control
-room draws, and ``create_app(pending=...)`` the place they come in: the demo reads made-up ones
-from a file of its own; until T10 the real web has none and says so. The page shows them with
-Approve and Reject buttons that are disabled: deciding is T10's, with its own reviewed path.
+The gate's held requests (T10): ``PendingRequest`` is the shape the control room draws. The real
+web builds them from the service's list (``backtide web --aprobar``) or from the black box
+(``backtide.web.approve``); the demo reads made-up ones from a file of its own
+(``create_app(pending=...)``). Deciding goes through ``backtide.web.approve`` and its POST, only
+with ``--aprobar``.
 
 Everything an agent chose (a target, a subject line) is a ``Name`` here: the templates make it
 visible and escaped, in its own isolated span (``backtide.web.narrate.sentence``).
@@ -153,6 +154,23 @@ class PendingRequest:
     held_at: datetime
     expires_at: datetime
     detail: str = ""
+    # T10-5: a hold of the real gate (``backtide.web.approve.held_request``). ``action`` and
+    # ``notes`` are OUR words (backtide.gate.phrase); the rest is the agent's, cut and shown as
+    # such. ``seq`` is its gate/held ("Ver"); ``waiting``, whether the agent waits connected;
+    # ``batches`` and ``trustable``, what the person may make of it.
+    action: str = ""
+    notes: tuple[str, ...] = ()
+    recipients: tuple[str, ...] = ()
+    more_recipients: int = 0
+    reply_to: tuple[str, ...] = ()
+    subject: str = ""
+    lines: str = ""
+    attachments: tuple[str, ...] = ()
+    request: str = ""
+    seq: int | None = None
+    waiting: bool = False
+    batches: tuple[str, ...] = ()
+    trustable: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not SLUG.fullmatch(self.id):
@@ -202,6 +220,16 @@ def request_from(data: Mapping[str, Any]) -> PendingRequest:
             risk=risk,
             held_at=held,
             expires_at=expires,
+            action=str(data.get("action", ""))[:200],
+            notes=tuple(str(n)[:200] for n in data.get("notes", []) if isinstance(n, str)),
+            recipients=tuple(
+                str(r)[:200] for r in data.get("recipients", []) if isinstance(r, str)
+            )[:5],
+            subject=str(data.get("subject", ""))[:200],
+            lines=str(data.get("lines", ""))[:300],
+            request=str(data.get("request", ""))[:600],
+            trustable=data.get("trustable") is True,
+            batches=tuple(b for b in data.get("batches", []) if b in ("recipient", "kind")),
         )
     except (KeyError, TypeError, ValueError) as error:
         if isinstance(error, RosterError):

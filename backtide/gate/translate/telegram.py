@@ -65,6 +65,19 @@ _CHAT_NUMBER_RE = re.compile(r"[+-]?[0-9]{1,20}", re.ASCII)
 _CHAT_NAME_RE = re.compile(r"@[A-Za-z0-9_]{1,64}", re.ASCII)
 
 _SEND_TEXT = frozenset({"sendmessage"})
+# OpenClaw's control calls give up sooner than its sends: 15 s, and 10 s a reaction
+# (extensions/telegram/src/request-timeouts.ts, measured in T10-5). The gate waits less, so the
+# held request hears "pending" and not a cut connection.
+_CONTROL_WAIT = {
+    "setmycommands": 10,
+    "setwebhook": 10,
+    "deletemessage": 10,
+    "deletemessages": 10,
+    "editmessagetext": 10,
+    "editforumtopic": 10,
+    "pinchatmessage": 10,
+    "setmessagereaction": 5,
+}
 _SEND_FILES = frozenset(
     {"sendphoto", "senddocument", "sendvideo", "sendaudio", "sendvoice", "sendanimation",
      "sendvideonote", "sendmediagroup", "sendsticker", "sendpaidmedia"}
@@ -299,6 +312,7 @@ def _reading(
     wait = WAIT_TELEGRAM_FILES if method in _SEND_FILES or files else WAIT_TELEGRAM
     if method == "editmessagemedia":
         wait = WAIT_TELEGRAM_FILES
+    wait = min(wait, _CONTROL_WAIT.get(method, wait))
     return Reading(
         translator=NAME,
         operation=method,

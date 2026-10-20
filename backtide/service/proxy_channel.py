@@ -125,10 +125,14 @@ from backtide.service.holds import (
     HoldTimings,
     HoldWatch,
     Scope,
+    TrustOutcome,
+    TrustStatus,
     plain_scope,
     reading_scope,
+    trust_target,
 )
 from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES, ReadBudget
+from backtide.service.trust import TrustError, TrustStore
 
 logger = logging.getLogger(__name__)
 
@@ -385,9 +389,13 @@ class ProxyChannel:
         read_budget: ReadBudget | None = None,
         watch: HoldWatch | None = None,
         frozen: Callable[[], bool] | None = None,
+        trust: TrustStore | None = None,
     ) -> None:
         self._sock = sock
         self._watch = watch
+        # The recipients the person trusted from the web (T10-5, decision 9): with [gate]
+        # trusted, what a send to trusted recipients only is compared with.
+        self._trust = trust
         # Whether the agent is paused or being rewound (the Guardian's): no batch is used then,
         # as no approval is given (security review of T10-4, B4).
         self._frozen: Callable[[], bool] = frozen if frozen is not None else lambda: False
@@ -700,7 +708,7 @@ class ProxyChannel:
         changes a draft whose sending is held or preapproved, and the batch rule that covers
         it (``rule``, looked up by the caller)."""
         effect = Effect(reading["effect"])
-        trusted = not reading["cut"] and all_trusted(_as_reading(reading), self._policy.trusted)
+        trusted = not reading["cut"] and all_trusted(_as_reading(reading), self._trusted())
         key = _draft_key(reading)
         changes_draft = key is not None and effect in (Effect.READ, Effect.CHANGE)
         return ReadingFacts(
@@ -710,6 +718,11 @@ class ProxyChannel:
             draft_open=changes_draft and key is not None and self._book.draft_open(key),
             batch=None if rule is None else rule.rule_id,
         )
+
+    def _trusted(self) -> tuple[Trusted, ...]:
+        """``[gate] trusted`` and the recipients trusted from the web (T10-5)."""
+        extra = () if self._trust is None else self._trust.entries()
+        return (*self._policy.trusted, *extra)
 
     def _scope(
         self,
@@ -795,7 +808,7 @@ class ProxyChannel:
             seq=hold.seq,
             hold_id=hold.hold_id,
             wait_ms=self._book.wait_ms(hold, _wait_hint(gate)),
-            retry_after=self._book.timings.retry_after,
+            retry_after=_retry_after(self._book.timings, reading),
         )
 
     def _let_out(
@@ -952,13 +965,76 @@ class ProxyChannel:
 
     def pending(self) -> list[dict[str, Any]]:
         """The holds waiting for the person, oldest first: what the person needs to decide
-        (the request as it was recorded, struck), never its body."""
+        (the request as it was recorded, struck), never its body. Since T10-5 also what the
+        web shows (``_web_fields``: the gate/held's seq, when, the reading cut short, which
+        batches it may make and whether it may make a trusted recipient)."""
         with self._gate_lock:
             if self.closed:
                 return []
             self._tick_locked()
             now = self._mono()
-            return [_summary(hold, now) for hold in self._book.pending()]
+            return [
+                self._scrub(_summary(hold, now) | self._web_fields(hold))
+                for hold in self._book.pending()
+            ]
+
+    def _web_fields(self, hold: Hold) -> dict[str, Any]:
+        return {
+            "seq": hold.seq,
+            "held_at": hold.held_at,
+            "expires_at": hold.expires_at,
+            "batches": [str(kind) for kind in self._book.offers(hold)],
+            "trustable": trust_target(hold) is not None,
+            "view": _view(hold.reading),
+        }
+
+    # "Aprobar y confiar en este destinatario" (T10-5, decision 9)
+
+    def trust(
+        self,
+        hold_id: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> TrustOutcome:
+        """Trust the one recipient of the open hold ``hold_id`` from now on (``TrustStore``,
+        saved, and ``gate/trust_added`` recorded) and approve that hold, as ``decide`` does.
+        Only for what ``holds.trust_target`` allows; nothing while the agent is paused or
+        rewound. Never raises for a hold that is not there."""
+        if by not in DECIDERS:
+            raise ValueError("by is cli, web or telegram")
+        who = {"by": by, "requested_by": str(requested_by)[:MAX_REQUESTER_CHARS]}
+        with self._gate_lock:
+            if self.closed:
+                return TrustOutcome(TrustStatus.UNKNOWN, hold_id)
+            self._tick_locked()
+            hold = self._book.approve(hold_id)
+            if hold is None:
+                return TrustOutcome(TrustStatus.UNKNOWN, hold_id)
+            if frozen is not None and frozen():
+                return TrustOutcome(TrustStatus.PAUSED, hold_id)
+            target = trust_target(hold)
+            if target is None or self._trust is None:
+                return TrustOutcome(TrustStatus.NOT_TRUSTABLE, hold_id)
+            translator, recipient = target
+            try:
+                entry, new = self._trust.add(translator, recipient, by=by, hold_id=hold_id)
+            except TrustError as error:
+                return TrustOutcome(TrustStatus.FAILED, hold_id, detail=str(error))
+            except ValueError:
+                return TrustOutcome(TrustStatus.NOT_TRUSTABLE, hold_id)
+            if new:
+                own = {"trust_id": entry.trust_id, "translator": translator,
+                       "recipient": recipient, **who}  # fmt: skip
+                if self._gate_event("trust_added", hold, own, risk=2) is None:
+                    try:
+                        self._trust.remove(entry.trust_id)
+                    except TrustError:
+                        logger.error("a trusted recipient that could not be recorded stays")
+                    return TrustOutcome(TrustStatus.FAILED, hold_id)
+            outcome = self._approve(hold, who)
+            return TrustOutcome(TrustStatus.TRUSTED, hold_id, entry.trust_id, outcome.status)
 
     def reject_open(self, by: str) -> int:
         """A pause (``by="pause"``) or a rewind (``"rewind"``): every open hold is rejected
@@ -1203,6 +1279,14 @@ def _wait_hint(gate: Mapping[str, Any]) -> int | None:
     return min(known) if known else None
 
 
+def _retry_after(timings: HoldTimings, reading: Mapping[str, Any] | None) -> int:
+    """The Retry-After of "pending": shorter for Telegram (T10-5, docs/32 section 16), whose
+    OpenClaw channel stops the whole bot for that long."""
+    if reading is not None and reading.get("translator") == "telegram":
+        return min(timings.retry_after, timings.telegram_retry_after)
+    return timings.retry_after
+
+
 def _draft_key(reading: Mapping[str, Any]) -> tuple[str, str] | None:
     """A draft by its translator and its ``draft`` (already a digest of the mailbox and the
     draft's id, ``base.draft_ref``), never by the token that acts: a refreshed token is the same
@@ -1255,6 +1339,42 @@ def _summary(hold: Hold, now: float) -> dict[str, Any]:
         "target": hold.event.get("target"),
         "expires_in_s": max(0, int(hold.expires - now)),
         "waiting": hold.connected > 0,
+    }
+
+
+VIEW_RECIPIENTS = 5
+VIEW_ATTACHMENTS = 5
+
+
+def _view(reading: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """What the web shows of a recorded reading, cut short (the control socket's reply has a
+    size): the agent's texts stay the agent's (the web marks and escapes them)."""
+    if reading is None:
+        return None
+
+    def cut(value: object, limit: int) -> str | None:
+        return str(value)[:limit] if value else None
+
+    recipients = [str(item)[:200] for item in reading.get("recipients") or []]
+    reply_to = [str(item)[:200] for item in reading.get("reply_to") or []]
+    attachments = [
+        {"name": str(item.get("name") or "")[:100], "size": item.get("size")}
+        for item in reading.get("attachments") or []
+        if isinstance(item, Mapping)
+    ]
+    return {
+        "translator": reading.get("translator"),
+        "effect": reading.get("effect"),
+        "notes": list(reading.get("notes") or []),
+        "cut": reading.get("cut") is True,
+        "recipients": recipients[:VIEW_RECIPIENTS],
+        "recipients_total": len(recipients),
+        "reply_to": reply_to[:VIEW_RECIPIENTS],
+        "subject": cut(reading.get("subject"), 200),
+        "first_lines": cut(reading.get("first_lines"), 300),
+        "target": cut(reading.get("target"), 200),
+        "attachments": attachments[:VIEW_ATTACHMENTS],
+        "attachments_total": len(attachments),
     }
 
 

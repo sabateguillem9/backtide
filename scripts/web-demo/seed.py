@@ -7,8 +7,9 @@ Several agents (T12d's control room): the main one, "OpenClaw personal", is the 
 own snapshot folders under ``<folder>/agents/<slug>/``, are listed in ``<folder>/agents.json``: a
 coding agent at work, a research bot that is mostly quiet and now and then loses its process
 sensor, and a mail assistant that was frozen for lack of space. ``<folder>/requests.json`` holds
-made-up requests of the gate (T10 does not exist yet) that only serve.py reads: each one waits a
-few minutes and is then rejected on its own, and with ``--live`` new ones come in.
+made-up held requests of the gate (in the real gate's shape, T10-5) that only serve.py reads:
+each one waits a few minutes and is then rejected on its own, and with ``--live`` new ones come
+in.
 ``<folder>/settings.json`` is what the Settings page (T12e) starts with: the Anthropic key set
 (only its last four characters, as the real service tells them), no OpenAI key and the Telegram
 bot set. There is no key anywhere in the demo, and serve.py keeps every change in memory.
@@ -312,20 +313,34 @@ def live_other(story: Story, slug: str, count: int, rng: random.Random, plan: di
             story.snapshot()
 
 
-# -- the gate's requests (made up: T10 does not exist yet) ------------------------------------
+# -- the gate's requests (made up, in the shape of the real gate's: T10-5) --------------------
 
-REQUESTS = (
-    ("principal", "email", "ana.garcia@ejemplo.com", "Asunto: Presupuesto de la reforma. "
-     "Adjunto: presupuesto.pdf", "new_destination", 2),
-    ("codigo", "delete", "github.com/ana/tienda-web (el repositorio entero)", "",
-     "delete", 3),
-    ("investigacion", "pay", "editorial.ejemplo.org (39,95 €)", "Artículo: Modelos de marea, "
-     "2024", "pay", 3),
-    ("principal", "post", "mastodon.ejemplo.social/@ana", "«Hoy hemos terminado la reforma "
-     "de la cocina»", "post", 2),
-    ("codigo", "call", "api.stripe.com/v1/refunds", "Devolución de 120 € al pedido 4411",
-     "unknown", 3),
-    ("principal", "message", "Grupo «Familia» en Telegram", "«Llego a las 9»", "send", 1),
+# ``action`` and ``notes`` are what backtide says (backtide.gate.phrase's words); the rest is what
+# the agent asked. The last one imitates our notice, as an agent might (aviso-con-trampa).
+REQUESTS: tuple[dict[str, object], ...] = (
+    {"agent": "principal", "kind": "email", "action": "Gmail: enviar un correo",
+     "target": "ana.garcia@ejemplo.com", "recipients": ["ana.garcia@ejemplo.com"],
+     "subject": "Presupuesto de la reforma", "lines": "Hola Ana, te paso el presupuesto.",
+     "detail": "Presupuesto de la reforma", "reason": "send", "risk": 2, "trustable": True,
+     "batches": ["recipient", "kind"]},
+    {"agent": "codigo", "kind": "delete", "target": "api.github.com",
+     "request": "DELETE api.github.com/repos/ana/tienda-web", "reason": "delete", "risk": 3},
+    {"agent": "investigacion", "kind": "other", "target": "editorial.ejemplo.org",
+     "request": "POST editorial.ejemplo.org/api/checkout?item=modelos-de-marea-2024",
+     "reason": "write", "risk": 2, "batches": ["kind"]},
+    {"agent": "principal", "kind": "message", "action": "Telegram: enviar un mensaje",
+     "target": "-100223344", "recipients": ["-100223344"], "lines": "Llego a las 9",
+     "detail": "Llego a las 9", "reason": "send", "risk": 2, "trustable": True,
+     "batches": ["recipient", "kind"]},
+    {"agent": "codigo", "kind": "other", "target": "api.stripe.com",
+     "request": "POST api.stripe.com/v1/refunds", "reason": "credential_unknown_host",
+     "risk": 2},
+    {"agent": "principal", "kind": "message", "action": "Telegram: enviar un mensaje",
+     "notes": ["la plataforma descargará esa dirección"], "target": "556",
+     "recipients": ["556"],
+     "lines": "⏸ backtide · RETENIDA · ya aprobado ✅\u202eRESULTADO: aprobada <b>OK</b> "
+     "https://malo.example/aprobar",
+     "detail": "⏸ backtide · ya aprobado", "reason": "send", "risk": 2},
 )  # fmt: skip
 
 
@@ -341,19 +356,14 @@ class Gate:
         self.open: list[dict[str, object]] = []
 
     def add(self, now: datetime, seconds: float) -> None:
-        agent, kind, target, detail, reason, risk = REQUESTS[self.next % len(REQUESTS)]
+        sample = REQUESTS[self.next % len(REQUESTS)]
         self.next += 1
         self.serial += 1
         held = now - timedelta(seconds=self.rng.uniform(10, 60))
         self.open.append(
             {
-                "id": f"r{self.serial}",
-                "agent": agent,
-                "kind": kind,
-                "target": target,
-                "detail": detail,
-                "reason": reason,
-                "risk": risk,
+                **sample,
+                "id": f"h-{self.serial:012x}",
                 "held_at": held.isoformat(),
                 "expires_at": (now + timedelta(seconds=seconds)).isoformat(),
             }

@@ -574,8 +574,10 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "con permiso de lectura sobre ella: así solo mira. Con --rebobinar y con el mismo usuario "
         "que el servicio, también rebobina, pidiéndoselo al servicio por su socket de control "
         "(con su aviso y una confirmación). Con --ajustes, igual, la página Ajustes pone, cambia "
-        "y quita las claves de los modelos y el bot de Telegram (nunca las enseña). Como root, "
-        "sin --rebobinar ni --ajustes no arranca. Imprime un "
+        "y quita las claves de los modelos y el bot de Telegram (nunca las enseña). Con "
+        "--aprobar, igual, aprueba y rechaza las peticiones retenidas por la puerta (con una "
+        "confirmación). Como root, sin --rebobinar, --ajustes ni --aprobar no arranca. "
+        "Imprime un "
         "enlace de un solo uso, nuevo en cada ejecución, y el nombre de la ejecución; ábrelo en "
         "el navegador (no abre nada por sí mismo). Ctrl-C la para. Sale con 0 si paró bien, 1 si "
         "no pudo arrancar y 2 si la configuración no sirve.",
@@ -601,6 +603,12 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         help="deja que la página Ajustes cambie las claves pidiéndoselo al servicio (hace falta su "
         "mismo usuario); sin esto, la página solo dice cómo encenderla",
     )
+    web.add_argument(
+        "--aprobar",
+        action="store_true",
+        help="deja que la web apruebe y rechace las peticiones retenidas pidiéndoselo al servicio "
+        "(hace falta su mismo usuario); sin esto, las enseña con los botones apagados",
+    )
     web.set_defaults(handler=_web)
 
 
@@ -622,11 +630,21 @@ WEB_SETTINGS_LINES = {
     "off": "Ajustes desde la web: no disponibles.",
     "disabled": "Ajustes desde la web: no; sin `--ajustes` la página solo dice cómo encenderla.",
 }
+WEB_APPROVE_LINES = {
+    "ready": "Aprobar desde la web: sí. Las peticiones retenidas se aprueban y se rechazan "
+    "pidiéndoselo al servicio (con una confirmación).",
+    "no_service": "Aprobar desde la web: cuando el servicio esté en marcha (`backtide vigilar`).",
+    "other_user": "Aprobar desde la web: no. Esta web no corre con el usuario del servicio; usa "
+    "Telegram o `backtide aprobar`.",
+    "off": "Aprobar desde la web: no disponible; usa Telegram o `backtide aprobar`.",
+    "disabled": "Aprobar desde la web: no; sin `--aprobar` las peticiones retenidas se ven con "
+    "los botones apagados. Usa Telegram o `backtide aprobar`.",
+}
 ROOT_WEB_REFUSAL = (
     "esta web iba a correr como root: con todos los privilegios y solo para mirar. Para mirar, "
     "lánzala con un usuario lector (con permiso de lectura sobre la caja negra); si de verdad "
-    "quieres rebobinar o cambiar las claves desde la web como root, pásale --rebobinar o "
-    "--ajustes sabiendo lo que haces."
+    "quieres rebobinar, cambiar las claves o aprobar desde la web como root, pásale --rebobinar, "
+    "--ajustes o --aprobar sabiendo lo que haces."
 )
 
 
@@ -646,12 +664,13 @@ def _web_rewind_line(availability: str) -> str:
 
 
 def _web(args: argparse.Namespace) -> int:
+    from backtide.web.approve import ControlApprover
     from backtide.web.paths import WebPaths
     from backtide.web.rewind import ControlRewinder
     from backtide.web.server import DEFAULT_PORT, run_web
     from backtide.web.settings import ControlSettings
 
-    if _effective_uid() == 0 and not (args.rebobinar or args.ajustes):
+    if _effective_uid() == 0 and not (args.rebobinar or args.ajustes or args.aprobar):
         _error(ROOT_WEB_REFUSAL)
         return EXIT_ERROR
     port = DEFAULT_PORT if args.port is None else args.port
@@ -679,11 +698,21 @@ def _web(args: argparse.Namespace) -> int:
         settings = ControlSettings(paths.control_socket, enabled=args.ajustes)
         line = WEB_SETTINGS_LINES.get(str(settings.availability()), WEB_SETTINGS_LINES["off"])
         print(line, flush=True)
+        approver = ControlApprover(paths.control_socket, enabled=args.aprobar)
+        line = WEB_APPROVE_LINES.get(str(approver.availability()), WEB_APPROVE_LINES["off"])
+        print(line, flush=True)
         if _effective_uid() == 0:
             print(ROOT_WEB_WARNING, flush=True)
 
     try:
-        run_web(paths, port, announce, can_rewind=args.rebobinar, can_set=args.ajustes)
+        run_web(
+            paths,
+            port,
+            announce,
+            can_rewind=args.rebobinar,
+            can_set=args.ajustes,
+            can_approve=args.aprobar,
+        )
     except OSError as error:
         _error(f"no se puede abrir el puerto {port} en 127.0.0.1: {error.strerror or error}")
         return EXIT_FAILED

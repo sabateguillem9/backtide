@@ -49,6 +49,7 @@ import uvicorn
 from backtide.snapshots import Snapshot, SnapshotStore
 from backtide.web.agents import AgentSource, PendingRequest
 from backtide.web.app import create_app
+from backtide.web.approve import Approver, ControlApprover
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import ControlRewinder
@@ -127,7 +128,9 @@ def run_web(
     snapshots: Callable[[], list[Snapshot]] | None = None,
     can_rewind: bool = False,
     can_set: bool = False,
+    can_approve: bool = False,
     settings: SettingsClient | None = None,
+    approver: Approver | None = None,
     agent_name: str | None = None,
     others: Sequence[AgentSource] = (),
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
@@ -139,7 +142,10 @@ def run_web(
     (scripts/web-demo/serve.py: there is no btrfs there). ``can_rewind`` is `--rebobinar`:
     without it the rewind buttons stay disabled whoever runs the web. ``can_set`` is `--ajustes`
     (T12e): without it the Settings page only says how to turn it on, and its POST does not
-    exist; ``settings`` replaces the control socket's client (the Mac's demo). ``agent_name``,
+    exist; ``settings`` replaces the control socket's client (the Mac's demo). ``can_approve`` is
+    `--aprobar` (T10-5): without it the held requests are listed from the black box with their
+    buttons disabled, and the POST that decides does not exist; ``approver`` replaces the
+    control socket's client (the demo). ``agent_name``,
     ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
     requests) are only given by the demo today: T17 and T10 will fill them for real."""
     sock = bind(port)
@@ -159,6 +165,7 @@ def run_web(
         snapshots=snapshots or from_volume,
         rewinder=ControlRewinder(paths.control_socket, enabled=can_rewind),
         settings=settings or ControlSettings(paths.control_socket, enabled=can_set),
+        approver=approver or ControlApprover(paths.control_socket, enabled=can_approve),
         agent_name=agent_name,
         others=others,
         pending=pending,

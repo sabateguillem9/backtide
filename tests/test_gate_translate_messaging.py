@@ -345,3 +345,23 @@ def test_a_discord_webhook_keeps_its_token_out_and_its_thread_in() -> None:
     assert plain.recipients == ("webhook:222",) and plain.path_credential
     assert "tOkEn" not in repr(plain)
     assert plain.canonical != thread.canonical
+
+
+@pytest.mark.parametrize(
+    ("method", "wait"),
+    [
+        ("setMyCommands", 10),
+        ("setWebhook", 10),
+        ("deleteMessage", 10),
+        ("editMessageText", 10),
+        ("pinChatMessage", 10),
+        ("setMessageReaction", 5),
+        ("sendMessage", 50),
+    ],
+)
+def test_telegrams_control_calls_wait_less_than_openclaw_does(method: str, wait: int) -> None:
+    """T10-5, measured with the real OpenClaw: its control calls give up after 15 s (10 s a
+    reaction; extensions/telegram/src/request-timeouts.ts), so a hold that waited 50 s found
+    nobody and the person saw a notice OpenClaw no longer waited for. The gate waits less."""
+    reading = read(tg(method, {"chat_id": 42, "commands": [], "message_id": 7, "text": "x"}))
+    assert reading.wait_s == wait, reading

@@ -54,6 +54,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 
+from backtide.gate.translate.base import normalize_trusted
 from backtide.snapshots import utc_now
 
 # translator and draft (``base.draft_ref``: a digest of the mailbox and the draft's id, so a
@@ -76,6 +77,10 @@ class HoldTimings:
     preapproval: float = 600.0  # a yes with nobody waiting
     remember: float = 600.0  # a rejection or an expiry
     retry_after: int = 30  # the Retry-After of "pending"
+    # The retry_after of Telegram's "pending" (T10-5, docs/32 section 16): OpenClaw's Telegram
+    # channel stops EVERY call of the bot for retry_after s after a 429 (its flood gate), the
+    # owner's replies too; a short one keeps that stall short, and the held send still waits.
+    telegram_retry_after: int = 2
     max_open: int = 20
     flood_every: float = 10.0
     batch_session: float = 12 * 3600.0  # "esta sesión": 12 h at most (decision 9)
@@ -134,6 +139,49 @@ class HoldOutcome:
     @property
     def message(self) -> str:
         return HOLD_MESSAGES[self.status]
+
+
+class TrustStatus(StrEnum):
+    """What "aprobar y confiar en este destinatario" did (T10-5, decision 9)."""
+
+    TRUSTED = "trusted"  # the recipient is trusted now (or was), and the hold approved with it
+    NOT_TRUSTABLE = "not_trustable"  # that hold may not make a trusted recipient
+    UNKNOWN = "unknown"  # no open hold with that id
+    PAUSED = "paused"  # the agent is paused or being rewound: nothing is approved meanwhile
+    FAILED = "failed"  # the list could not be saved, or the change not recorded: nothing changed
+
+
+TRUST_MESSAGES = {
+    TrustStatus.TRUSTED: "Destinatario de confianza añadido: desde ahora, lo que vaya solo a él "
+    "pasa sin preguntar. Se quita desde la web.",
+    TrustStatus.NOT_TRUSTABLE: (
+        "Esta petición no puede añadir un destinatario de confianza (un borrado, un reenvío, "
+        "algo de riesgo 3, varios destinatarios, algo que no se ve entero o que hace descargar "
+        "una dirección): se decide una a una. No ha cambiado nada."
+    ),
+    TrustStatus.UNKNOWN: HOLD_MESSAGES[HoldStatus.UNKNOWN],
+    TrustStatus.PAUSED: HOLD_MESSAGES[HoldStatus.PAUSED],
+    TrustStatus.FAILED: (
+        "No se ha podido guardar o grabar el destinatario de confianza, así que no se añade ni "
+        "se aprueba: la petición sigue retenida."
+    ),
+}
+
+
+@dataclass(frozen=True)
+class TrustOutcome:
+    status: TrustStatus
+    hold_id: str
+    trust_id: str | None = None
+    hold: HoldStatus | None = None  # what approving the hold did, once it is trusted
+    detail: str | None = None  # why the list refused it (Spanish; never a recipient)
+
+    @property
+    def message(self) -> str:
+        text = self.detail or TRUST_MESSAGES[self.status]
+        if self.hold is not None:
+            text += " " + HOLD_MESSAGES[self.hold]
+        return text
 
 
 class HoldWatch(Protocol):
@@ -382,6 +430,7 @@ class Hold:
     created: float
     expires: float
     expires_at: str  # the same moment on the wall clock, for the black box
+    held_at: str = ""  # when it was held, on the wall clock (the web's countdown, T10-5)
     seq: int | None = None  # its gate/held
     connected: int = 0
     state: State = State.OPEN
@@ -512,6 +561,7 @@ class HoldBook:
             created=now,
             expires=now + self.timings.life,
             expires_at=_iso(self._wall() + timedelta(seconds=self.timings.life)),
+            held_at=_iso(self._wall()),
             draft=draft,
             scope=scope,
         )
@@ -756,6 +806,44 @@ class HoldBook:
     def _end(self, hold: Hold) -> None:
         self._drop(hold)
         self._rejected[hold.fp] = self._clock() + self.timings.remember
+
+
+# "Aprobar y confiar en este destinatario" (T10-5, decision 9): a send or a change, of risk 2,
+# to exactly one recipient (and its answers to it), that may ride a batch (no override header nor
+# trailers, no secret, no cut, no draft, an account), with none of the reading's notes: so never
+# an inline message, a URL the platform fetches, a webhook, a deletion, IDN, a duplicate...
+TRUST_EFFECTS = frozenset({"send", "change"})
+TRUST_TRANSLATORS = frozenset({"gmail", "graph_mail", "telegram", "slack", "discord"})
+
+
+def trust_target(hold: Hold) -> tuple[str, str] | None:
+    """``(translator, recipient)`` that "aprobar y confiar" would trust from ``hold``, from its
+    strict fields (never the agent's text), or None when it may not: docs/32, decision 9."""
+    reading, scope = hold.reading, hold.scope
+    if reading is None or scope is None or not scope.batchable or hold.risk != 2:
+        return None
+    translator = reading.get("translator")
+    recipients = list(reading.get("recipients") or [])
+    reply_to = {str(item) for item in reading.get("reply_to") or []}
+    if (
+        translator not in TRUST_TRANSLATORS
+        or reading.get("effect") not in TRUST_EFFECTS
+        or reading.get("secret_seen") is not False
+        or reading.get("cut") is not False
+        or reading.get("draft") is not None
+        or reading.get("notes")
+        or len(recipients) != 1
+        or not isinstance(recipients[0], str)
+        or not reply_to <= {recipients[0]}
+    ):
+        return None
+    try:
+        normalized = normalize_trusted(str(translator), recipients[0])
+    except ValueError:
+        return None
+    if normalized.recipient != recipients[0]:
+        return None  # the translator normalizes the same way: anything else is doubtful
+    return normalized.translator, normalized.recipient
 
 
 def stale_holds(events: Iterable[tuple[str, str, datetime]], *, now: datetime) -> list[str]:

@@ -27,6 +27,10 @@ The server (inside the service):
   (plus ``chat_id`` for ``telegram``, and ``via``) and ``{"cmd": "clear_secret", "kind": ...}``
   (plus ``via``). A value is checked and written by the service; it is never logged, never put
   in a refusal and never sent back.
+  The web's holds page (T10-5, docs/32 section 11 and decision 9): ``{"cmd": "trust",
+  "hold_id": ..., "via": "web"}`` ("aprobar y confiar en este destinatario": only ``web``),
+  ``{"cmd": "untrust", "trust_id": ...}`` and ``{"cmd": "end_batch", "rule_id": ...}`` (plus
+  ``via``: ``cli`` or ``web``), and the lists ``{"cmd": "trusted"}`` and ``{"cmd": "batches"}``.
   Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
   not a snapshot id) is refused WITHOUT calling the Guardian.
 - One thread per connection (``socketserver``), at most ``MAX_CONNECTIONS`` at a time, so a
@@ -57,12 +61,20 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from backtide.blackbox import redact
-from backtide.service.holds import HOLD_ID_RE, HoldOutcome, HoldStatus
+from backtide.service.holds import (
+    BATCH_ID_RE,
+    HOLD_ID_RE,
+    HoldOutcome,
+    HoldStatus,
+    TrustOutcome,
+    TrustStatus,
+)
 from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
+from backtide.service.trust import TRUST_ID_RE
 from backtide.snapshots import Snapshot
 
 logger = logging.getLogger(__name__)
@@ -109,6 +121,15 @@ HOLD_EXIT_CODES = {
     REFUSED: 2,
 }
 MAX_LISTED_HOLDS = 100
+# T10-5: the web lists the holds with what it shows of each (``ProxyChannel._web_fields``), the
+# batches and the trusted recipients. Lists may be bigger than a decision's reply.
+MAX_LIST_REPLY_BYTES = 1024 * 1024
+# "Aprobar y confiar" only from the web (decision 9); removing a trusted recipient or revoking a
+# batch, from the web or the terminal (the bot revokes in its own process, T10-4).
+TRUST_REQUESTERS = frozenset({"web"})
+UNTRUST_REQUESTERS = frozenset({"cli", "web"})
+TRUST_OUTCOMES = frozenset({*(str(status) for status in TrustStatus), REFUSED})
+LIST_OUTCOMES = frozenset({"removed", "ended", "unknown", "failed", REFUSED})
 # The Settings page (T12e): who may ask (not the bot: a key is never set from a chat), what a
 # change can answer, and how long a value may be (the service checks its shape).
 SETTINGS_REQUESTERS = frozenset({"cli", "web"})
@@ -142,6 +163,16 @@ class RewindService(Protocol):
     ) -> HoldOutcome: ...
 
     def pending_holds(self) -> list[dict[str, Any]]: ...
+
+    def trust_hold(self, hold_id: str, *, via: str, requested_by: str) -> TrustOutcome: ...
+
+    def trusted(self) -> list[dict[str, Any]]: ...
+
+    def untrust(self, trust_id: str, *, via: str, requested_by: str) -> bool | None: ...
+
+    def batches(self) -> list[dict[str, Any]]: ...
+
+    def end_batch(self, rule_id: str, *, via: str) -> bool: ...
 
 
 class SettingsService(Protocol):
@@ -340,6 +371,14 @@ class ControlServer:
             return self._decide(request, pid, uid)
         if command == "holds":
             return self._holds(request)
+        if command == "trust":
+            return self._trust(request, pid, uid)
+        if command == "untrust":
+            return self._untrust(request, pid, uid)
+        if command == "end_batch":
+            return self._end_batch(request, pid, uid)
+        if command in ("trusted", "batches"):
+            return self._listing(request)
         if command in ("secrets", "set_secret", "clear_secret"):
             return self._settings_command(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
@@ -455,6 +494,92 @@ class ControlServer:
             return {"ok": False, "outcome": "failed", "holds": [],
                     "message": "No se han podido leer las peticiones retenidas."}  # fmt: skip
         return {"ok": True, "outcome": "listed", "holds": redact(holds), "message": ""}
+
+    # T10-5: the web's holds page (docs/32, section 11 and decision 9)
+
+    def _trust(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        if set(request) != {"cmd", "hold_id", "via"}:
+            raise _BadRequest("«Aprobar y confiar» lleva `cmd`, `hold_id` y `via`, y nada más.")
+        via, hold_id = request["via"], request["hold_id"]
+        if not isinstance(via, str) or via not in TRUST_REQUESTERS:
+            raise _BadRequest("Un destinatario de confianza solo se añade desde la web.")
+        if not isinstance(hold_id, str) or not HOLD_ID_RE.fullmatch(hold_id):
+            raise _BadRequest("Eso no es el identificador de una petición retenida (h-…).")
+        try:
+            outcome = self._guardian.trust_hold(
+                hold_id, via=via, requested_by=f"{via} (uid {uid}, pid {pid})"
+            )
+        except Exception:  # the Guardian should not raise; if it does, nothing changed
+            logger.exception("trusting the recipient of %s raised instead of answering", hold_id)
+            outcome = TrustOutcome(TrustStatus.FAILED, hold_id)
+        return {
+            "ok": outcome.status is TrustStatus.TRUSTED,
+            "outcome": str(outcome.status),
+            "message": outcome.message,
+            "hold_id": hold_id,
+            "hold": None if outcome.hold is None else str(outcome.hold),
+        }
+
+    def _untrust(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        if set(request) - {"via"} != {"cmd", "trust_id"}:
+            raise _BadRequest("Quitar la confianza lleva `cmd`, `trust_id` y quizá `via`.")
+        via, trust_id = request.get("via", "cli"), request["trust_id"]
+        if not isinstance(via, str) or via not in UNTRUST_REQUESTERS:
+            raise _BadRequest("La confianza se quita desde la web o la terminal.")
+        if not isinstance(trust_id, str) or not TRUST_ID_RE.fullmatch(trust_id):
+            raise _BadRequest("Eso no es el identificador de un destinatario de confianza (t-…).")
+        try:
+            done = self._guardian.untrust(
+                trust_id, via=via, requested_by=f"{via} (uid {uid}, pid {pid})"
+            )
+        except Exception:
+            logger.exception("removing the trusted recipient %s raised", trust_id)
+            done = None
+        if done is None:
+            outcome, message = (
+                "failed",
+                ("No se ha podido guardar el cambio: ese destinatario sigue siendo de confianza."),
+            )
+        elif done:
+            outcome, message = (
+                "removed",
+                ("Ya no es de confianza: lo que vaya a ese destinatario vuelve a preguntar."),
+            )
+        else:
+            outcome, message = "unknown", "Ese destinatario ya no estaba en la lista."
+        return {"ok": done is True, "outcome": outcome, "message": message}
+
+    def _end_batch(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        if set(request) - {"via"} != {"cmd", "rule_id"}:
+            raise _BadRequest("Revocar un lote lleva `cmd`, `rule_id` y quizá `via`.")
+        via, rule_id = request.get("via", "cli"), request["rule_id"]
+        if not isinstance(via, str) or via not in UNTRUST_REQUESTERS:
+            raise _BadRequest("Por aquí un lote se revoca desde la web o la terminal.")
+        if not isinstance(rule_id, str) or not BATCH_ID_RE.fullmatch(rule_id):
+            raise _BadRequest("Eso no es el identificador de un lote (b-…).")
+        try:
+            done = self._guardian.end_batch(rule_id, via=via)
+        except Exception:
+            logger.exception("revoking the batch %s raised", rule_id)
+            done = False
+        if done:
+            return {"ok": True, "outcome": "ended",
+                    "message": "Lote revocado: lo que cubría vuelve a preguntar."}  # fmt: skip
+        return {"ok": False, "outcome": "unknown",
+                "message": "Ese lote ya no está activo (caducó, se revocó o backtide se "
+                "reinició)."}  # fmt: skip
+
+    def _listing(self, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una lista lleva `cmd` y nada más.")
+        command = request["cmd"]
+        try:
+            items = self._guardian.trusted() if command == "trusted" else self._guardian.batches()
+        except Exception:
+            logger.exception("listing %s raised instead of answering", command)
+            return {"ok": False, "outcome": "failed", "items": [],
+                    "message": "No se ha podido leer la lista."}  # fmt: skip
+        return {"ok": True, "outcome": "listed", "items": redact(items), "message": ""}
 
     def _resume(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         if set(request) != {"cmd"}:
@@ -866,6 +991,7 @@ def ask_holds(
         peer=peer,
         sleep=sleep,
         monotonic=monotonic,
+        max_reply=MAX_LIST_REPLY_BYTES,
     )
     reply = _json_or_none(raw)
     if not isinstance(reply, dict) or not isinstance(reply.get("holds"), list):
@@ -881,6 +1007,158 @@ def ask_holds(
             continue
         holds.append(item)
     return holds
+
+
+def ask_trust(
+    path: Path,
+    hold_id: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """ "Aprobar y confiar en este destinatario" from the web (T10-5): the reply, checked:
+    ``ok``, ``outcome`` (a ``TrustStatus`` or "refused"), ``message`` and ``hold`` (what
+    approving did: a ``HoldStatus`` or None)."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "trust", "hold_id": hold_id, "via": "web"},
+        what="la decisión",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in TRUST_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si se ha aprobado ni si el "
+            "destinatario es de confianza: mira la caja negra."
+        )
+    hold = reply.get("hold")
+    statuses = {str(status) for status in HoldStatus}
+    return {
+        "ok": reply["ok"],
+        "outcome": reply["outcome"],
+        "message": reply["message"],
+        "hold": hold if hold in statuses else None,
+    }
+
+
+def _ask_change(
+    path: Path,
+    request: dict[str, Any],
+    *,
+    wait: float,
+    peer: PeerCredentials,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> dict[str, Any]:
+    raw = _ask(
+        Path(path),
+        request,
+        what="el cambio",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in LIST_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si ha cambiado: mira la "
+            "caja negra."
+        )
+    return {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
+
+
+def ask_untrust(
+    path: Path,
+    trust_id: str,
+    *,
+    via: str = "cli",
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Stop trusting the recipient ``trust_id`` (T10-5). ValueError for a ``via`` that cannot
+    ask (nothing sent)."""
+    if via not in UNTRUST_REQUESTERS:
+        raise ValueError("via is cli or web")
+    request = {"cmd": "untrust", "trust_id": trust_id, "via": via}
+    return _ask_change(path, request, wait=wait, peer=peer, sleep=sleep, monotonic=monotonic)
+
+
+def ask_end_batch(
+    path: Path,
+    rule_id: str,
+    *,
+    via: str = "cli",
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Revoke the batch ``rule_id`` (T10-5, the web; T10-4's bot does it in its process)."""
+    if via not in UNTRUST_REQUESTERS:
+        raise ValueError("via is cli or web")
+    request = {"cmd": "end_batch", "rule_id": rule_id, "via": via}
+    return _ask_change(path, request, wait=wait, peer=peer, sleep=sleep, monotonic=monotonic)
+
+
+def ask_list(
+    path: Path,
+    what: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> list[dict[str, Any]]:
+    """``what`` is "trusted" (the recipients trusted from the web) or "batches" (the active
+    batch rules): each item a dict with its id (``trust_id`` t-…, ``rule_id`` b-…); anything
+    else is dropped. ControlError if the reply makes no sense or the list could not be read."""
+    if what not in ("trusted", "batches"):
+        raise ValueError("what is trusted or batches")
+    raw = _ask(
+        Path(path),
+        {"cmd": what},
+        what="la lista",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+        max_reply=MAX_LIST_REPLY_BYTES,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict) or not isinstance(reply.get("items"), list):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    if reply.get("ok") is not True:
+        message = reply.get("message")
+        raise ControlError(message if isinstance(message, str) else "No se ha podido listar.")
+    key, pattern = ("trust_id", TRUST_ID_RE) if what == "trusted" else ("rule_id", BATCH_ID_RE)
+    return [
+        item
+        for item in reply["items"][:MAX_LISTED_HOLDS]
+        if isinstance(item, dict)
+        and isinstance(item.get(key), str)
+        and pattern.fullmatch(item[key])
+    ]
 
 
 def ask_secrets(
@@ -1025,9 +1303,11 @@ def _ask(
     peer: PeerCredentials,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    max_reply: int = MAX_REPLY_BYTES,
 ) -> bytes:
     """One conversation: connect (retrying while nobody answers), send ``request``, read the
-    whole reply. ``what`` names the request in the messages ("el rebobinado")."""
+    whole reply (``max_reply`` bytes at most). ``what`` names the request in the messages ("el
+    rebobinado")."""
     deadline = monotonic() + wait
     while True:
         try:
@@ -1045,7 +1325,7 @@ def _ask(
             sock.sendall(data)
             sock.shutdown(socket.SHUT_WR)
             sock.settimeout(reply_timeout)
-            return _read_all(sock)
+            return _read_all(sock, max_reply)
         except TimeoutError:
             raise ControlOutcomeUnknown(
                 f"El servicio no ha contestado a tiempo. {what.capitalize()} puede seguir en "
@@ -1096,9 +1376,9 @@ def _connect(path: Path, peer: PeerCredentials) -> socket.socket:
     return sock
 
 
-def _read_all(sock: socket.socket) -> bytes:
+def _read_all(sock: socket.socket, limit: int = MAX_REPLY_BYTES) -> bytes:
     data = b""
-    while len(data) <= MAX_REPLY_BYTES:
+    while len(data) <= limit:
         chunk = sock.recv(65536)
         if not chunk:
             return data

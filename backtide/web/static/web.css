@@ -433,7 +433,22 @@ a.dot-button { text-decoration: none; }
 .q-3 { transform: scaleX(0.3); } .q-4 { transform: scaleX(0.4); } .q-5 { transform: scaleX(0.5); }
 .q-6 { transform: scaleX(0.6); } .q-7 { transform: scaleX(0.7); } .q-8 { transform: scaleX(0.8); }
 .q-9 { transform: scaleX(0.9); } .q-10 { transform: none; }
-/* Approve and Reject: drawn, disabled, and saying why (T10 wires them) */
+/* T10-5: the agent's part of a held request, apart and marked as its own; the lists */
+.req-notes { margin: var(--space-1) 0 0; font-size: 14px; color: var(--ink-soft); }
+.req-agent { margin-top: var(--space-3); padding: var(--space-2) 0 var(--space-2) var(--space-4); border-left: var(--stroke-tide) solid var(--ink-muted); font-size: 15px; color: var(--ink-soft); overflow-wrap: anywhere; }
+.req-agent p { margin: var(--space-1) 0 0; }
+.req-agent .req-agent-head, .req-agent .req-agent-end { margin: 0; font-size: 13px; letter-spacing: 0.04em; color: var(--ink-muted); }
+.req-agent .req-agent-end { margin-top: var(--space-2); }
+.req-excerpt { margin: var(--space-2) 0 0; max-height: 24rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
+a.req-yes, a.req-no { text-decoration: none; }
+a.req-no { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.holds-list { margin-top: var(--space-8); }
+.hold-rules { list-style: none; margin: var(--space-4) 0 0; padding: 0; display: grid; gap: var(--space-4); }
+.hold-rule { border-top: var(--stroke-hairline) solid var(--ink-muted); padding-top: var(--space-3); }
+.hold-rule p { margin: var(--space-1) 0 0; }
+.hold-rule-what { font-weight: 500; color: var(--ink); }
+.hold-one { margin-top: var(--space-4); }
+/* Approve and Reject: links with --aprobar, else drawn disabled saying why */
 .req-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-6); margin-top: auto; padding-top: var(--space-4); }
 .req-yes, .req-no { display: inline-flex; align-items: center; gap: var(--space-3); min-height: var(--size-target); padding: 0; font: inherit; font-size: 15px; font-weight: 500; color: var(--ink); background: none; border: 0; }
 .req-no { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }

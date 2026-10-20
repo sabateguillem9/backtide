@@ -26,8 +26,14 @@ the pinned mitmproxy image. Never contacted from the Mac and never with a real k
 - 53 (UDP and TCP): a resolver that logs every query and answers NXDOMAIN. The VM tests make it
   the proxy's upstream DNS (``test_dns``, T06-7): any name the proxy resolves that is not a
   container on its networks lands here, so a test sees which names left (``dns-tunel``).
+- T10-5, a fake Telegram Bot API for OpenClaw's own Telegram channel: on ``api.telegram.org``,
+  a bot whose token starts with ``FAKE_BOT_ID:`` is answered like the real Bot API (``getMe``,
+  ``getUpdates`` by long polling from what the test pushes, ``sendMessage`` with a new message,
+  ``true`` for the rest). Every other token still gets "what reached it" (T10-3's tests). Each
+  call is also kept in ``telegram`` (method, chat, text, when), for the test.
 - 9000: plain HTTP control, ``GET /stats``: accepts per listener, every request seen and every
-  DNS query.
+  DNS query (and the fake bot's calls). ``POST /tg/push`` with an update (JSON, without
+  ``update_id``) hands it to the fake bot's next ``getUpdates``.
 
 Prints READY_LINE once all of them listen.
 """
@@ -58,6 +64,15 @@ DNS_ERRORS = {"udp": 0, "tcp": 0}  # a resolver that fails must show it, never p
 LOCK = threading.Lock()
 ACCEPTS = {"443": 0, "8443": 0}
 REQUESTS: list[dict] = []
+# T10-5: the fake Bot API of OpenClaw's Telegram channel (never Telegram: invariant 8).
+TELEGRAM_HOST = "api.telegram.org"
+FAKE_BOT_ID = "7100000001"
+TG_PATH = re.compile(r"/bot(\d+):([^/]+)/([A-Za-z]+)$")
+TG_POLL_MAX = 20.0  # seconds a getUpdates waits at most
+TG_CALLS: list[dict] = []
+TG_UPDATES: list[dict] = []
+TG_COND = threading.Condition(LOCK)
+TG_NEXT = {"update": 5000, "message": 900}
 CURRENT = threading.local()  # the connection a handler thread is serving
 
 
@@ -97,11 +112,19 @@ class Handler(BaseHTTPRequestHandler):
             "body_size": len(body),
         }
         if record["listener"] == "control":
+            if self.command == "POST" and self.path == "/tg/push":
+                self._tg_push(body)
+                return
             self._control()
             return
         with LOCK:
             REQUESTS.append(record)
         path = self.path.split("?", 1)[0]
+        bot = TG_PATH.fullmatch(path)
+        host = (record["host"] or "").split(":")[0]
+        if host == TELEGRAM_HOST and bot is not None and bot.group(1) == FAKE_BOT_ID:
+            self._telegram(bot.group(3), body, record)
+            return
         echo = ECHO_MARK.search(body)
         if BIG_MARK in body and path.endswith("/v1/messages"):
             self._big()
@@ -141,8 +164,63 @@ class Handler(BaseHTTPRequestHandler):
                 "requests": list(REQUESTS),
                 "dns": list(DNS_QUERIES),
                 "dns_errors": dict(DNS_ERRORS),
+                "telegram": list(TG_CALLS),
             }
         self._json(200, stats)
+
+    # The fake Bot API (T10-5)
+
+    def _tg_push(self, body: bytes) -> None:
+        update = _json_or_empty(body)
+        with TG_COND:
+            update_id = TG_NEXT["update"]
+            TG_NEXT["update"] += 1
+            TG_UPDATES.append({"update_id": update_id, **update})
+            TG_COND.notify_all()
+        self._json(200, {"ok": True, "update_id": update_id})
+
+    def _telegram(self, method: str, body: bytes, record: dict) -> None:
+        params = _tg_params(self.path, self.headers.get("content-type") or "", body)
+        name = method.lower()
+        call = {
+            "at": time.time(),
+            "method": method,
+            "chat_id": str(params.get("chat_id", "")),
+            "text": str(params.get("text", ""))[:500],
+        }
+        record["tg_method"] = method
+        if name == "getupdates":
+            self._tg_ok(_tg_updates(params))
+            return
+        with LOCK:
+            TG_CALLS.append(call)
+        if name == "getme":
+            self._tg_ok({"id": int(FAKE_BOT_ID), "is_bot": True, "first_name": "T10 fake bot",
+                         "username": "t10_fake_bot", "can_join_groups": False,
+                         "can_read_all_group_messages": False,
+                         "supports_inline_queries": False})  # fmt: skip
+        elif name in ("getmycommands",):
+            self._tg_ok([])
+        elif name == "getwebhookinfo":
+            self._tg_ok({"url": "", "has_custom_certificate": False, "pending_update_count": 0})
+        elif name == "getchat":
+            self._tg_ok({"id": _tg_int(params.get("chat_id")), "type": "private"})
+        elif name.startswith("send") and name != "sendchataction":
+            with LOCK:
+                TG_NEXT["message"] += 1
+                message_id = TG_NEXT["message"]
+            chat = {"id": _tg_int(params.get("chat_id")), "type": "private", "first_name": "x"}
+            message = {"message_id": message_id, "date": int(time.time()), "chat": chat,
+                       "from": {"id": int(FAKE_BOT_ID), "is_bot": True,
+                                "first_name": "T10 fake bot"},
+                       "text": str(params.get("text", ""))}  # fmt: skip
+            call["message_id"] = message_id
+            self._tg_ok(message)
+        else:
+            self._tg_ok(True)
+
+    def _tg_ok(self, result: object) -> None:
+        self._json(200, {"ok": True, "result": result})
 
     def _big(self) -> None:
         """A model answer of BIG_ANSWER bytes of JSON, sent slowly."""
@@ -482,6 +560,40 @@ def _exec_asked(request: dict) -> str | None:
                 if found:
                     return found.group(1)
     return None
+
+
+def _tg_params(path: str, content_type: str, body: bytes) -> dict:
+    """The Bot API's parameters, from the query, a form or a JSON body (multipart: ignored)."""
+    from urllib.parse import parse_qsl
+
+    params: dict = dict(parse_qsl(path.partition("?")[2]))
+    kind = content_type.split(";")[0].strip().lower()
+    if kind == "application/json":
+        params.update(_json_or_empty(body))
+    elif kind == "application/x-www-form-urlencoded":
+        params.update(parse_qsl(body.decode("utf-8", "replace")))
+    return params
+
+
+def _tg_int(value: object) -> int:
+    try:
+        return int(str(value))
+    except ValueError:
+        return 0
+
+
+def _tg_updates(params: dict) -> list[dict]:
+    """Long polling: the pushed updates from ``offset`` on, waiting up to ``timeout`` s."""
+    offset = _tg_int(params.get("offset", 0))
+    wait = min(float(_tg_int(params.get("timeout", 0))), TG_POLL_MAX)
+    deadline = time.monotonic() + wait
+    with TG_COND:
+        while True:
+            ready = [u for u in TG_UPDATES if u["update_id"] >= offset]
+            left = deadline - time.monotonic()
+            if ready or left <= 0:
+                return ready[:100]
+            TG_COND.wait(left)
 
 
 def _json_or_empty(body: bytes) -> dict:

@@ -1,13 +1,18 @@
-{# The requests waiting for a yes: a fragment of panel.html, sent again by the stream when the
-   list changes. ``stale``: the list could not be read now (the last one read stays, said so). What the agent chose (the target, the detail) goes through say(): escaped,
-   made visible, in its own isolated span. The buttons are disabled on purpose (T10). #}
+{# The requests waiting for a yes: a fragment of panel.html (sent again by the stream when the
+   list changes) and of holds.html. ``stale``: the list could not be read now (the last one read
+   stays, said so). Two voices that never mix (T10-5, docs/32 section 11): OURS (what it does,
+   in backtide.gate.phrase's words, our notes, the risk, the clock, the buttons) and the
+   AGENT'S (recipients, subject, first lines, the request), in a block of its own headed "lo que
+   pide el agente", every piece through vis(): escaped, invisible characters made visible,
+   cut. The buttons are links to a confirmation page (GET, it changes nothing) only when this
+   web may decide (`backtide web --aprobar`, "ready"); else they are drawn disabled with a note
+   on how to turn them on. #}
+{% set approvals = approvals_state() %}
 <div class="waiting-head">
   <h2 id="waiting-title"><span class="waiting-mark" aria-hidden="true"></span>{{ t('wait.title') }}</h2>
   {% if requests %}<span class="waiting-count num">{{ requests | length }}</span>{% endif %}
 </div>
-{% if requests is none %}
-<p class="note">{{ t('wait.none.t10') }}</p>
-{% elif stale and not requests %}
+{% if stale and not requests %}
 <p class="note is-stale">{{ t('wait.unreadable') }}</p>
 {% elif not requests %}
 <p class="note">{{ t('wait.none') }}</p>
@@ -19,8 +24,22 @@
   {% set who = roster.get(r.agent) %}
   <li class="req a-{{ who.colour }} risk-{{ r.risk }}" id="req-{{ r.id }}">
     <p class="req-who"><a href="{{ who.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(who), 48) }}</span></a> <span class="muted">· {{ t('wait.held') }} <time data-ago datetime="{{ r.held_at.isoformat() }}">{{ age(r.held_at) }}</time></span></p>
+    {% if r.action or r.request %}
+    {% if r.action %}<p class="req-what" lang="es">{{ r.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
+    {% if r.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ r.notes | join('; ') }}.</span></p>{% endif %}
+    <div class="req-agent">
+      <p class="req-agent-head">{{ t('hold.agent') }}</p>
+      {% if r.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in r.recipients %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}{% if r.more_recipients %} <span class="muted">{{ t('hold.more', n=r.more_recipients) }}</span>{% endif %}</p>{% endif %}
+      {% if r.reply_to %}<p><span class="muted">{{ t('hold.reply_to') }}</span> {% for rc in r.reply_to %}<span class="name">{{ vis(rc, 200) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      {% if r.subject %}<p><span class="muted">{{ t('hold.subject') }}</span> <span class="name">{{ vis(r.subject, 200) }}</span></p>{% endif %}
+      {% if r.lines %}<p class="req-lines"><span class="name">{{ vis(r.lines, 300) }}</span></p>{% endif %}
+      {% if r.attachments %}<p><span class="muted">{{ t('hold.attachments') }}</span> {% for a in r.attachments %}<span class="name">{{ vis(a, 100) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+      {% if r.request %}<p class="req-lines"><span class="name">{{ vis(r.request, 400) }}</span></p>{% endif %}
+    </div>
+    {% else %}
     <p class="req-what">{{ say('req.' ~ r.what, target=r.target_name) }}</p>
     {% if r.detail_name %}<p class="req-detail">{{ say('req.detail', detail=r.detail_name) }}</p>{% endif %}
+    {% endif %}
     <p class="req-why"><span class="muted">{{ t('wait.why') }}</span> {{ t('why.' ~ r.reason) if t.has('why.' ~ r.reason) else t('why.unknown') }}</p>
     <p class="req-risk risk-word"><span class="dot dot-{{ r.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ r.risk) }}</p>
     <div class="req-clock" data-held="{{ r.held_at.isoformat() }}" data-deadline="{{ r.expires_at.isoformat() }}" data-done="{{ t('wait.expired') }}">
@@ -28,9 +47,16 @@
       <span class="req-bar" aria-hidden="true"><span class="req-fill q-{{ (r.fraction_left(now) * 10) | round | int }}"></span></span>
     </div>
     <div class="req-actions">
+      {% if approvals == 'ready' %}
+      <a class="req-yes" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=aprobar"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('wait.approve') }}</span></a>
+      <a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=rechazar">{{ t('wait.reject') }}</a>
+      {% if r.trustable %}<a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=confiar">{{ t('wait.trust') }}</a>{% endif %}
+      {% else %}
       <button class="req-yes" type="button" disabled aria-describedby="soon-{{ r.id }}"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('wait.approve') }}</span></button>
       <button class="req-no" type="button" disabled aria-describedby="soon-{{ r.id }}">{{ t('wait.reject') }}</button>
-      <span class="req-soon" id="soon-{{ r.id }}">{{ t('wait.soon') }}</span>
+      {% endif %}
+      {% if who.main %}<a class="req-no" href="{{ base }}/peticiones/ver?id={{ r.id | urlencode }}">{{ t('wait.view') }}</a>{% endif %}
+      {% if approvals != 'ready' %}<span class="req-soon" id="soon-{{ r.id }}">{{ t.code('wait.off.' ~ approvals) if t.has('wait.off.' ~ approvals) else t.code('wait.off.off') }}</span>{% endif %}
     </div>
   </li>
   {% endfor %}

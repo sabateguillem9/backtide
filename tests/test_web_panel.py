@@ -125,7 +125,7 @@ def test_one_real_agent_is_one_card_and_the_gate_is_announced(tmp_path: Path) ->
     html = new_client(tmp_path).get("/panel").text
     assert html.count('class="card a-') == 1
     assert "Tu agente" in text_of(html)
-    assert "Llega con T10" in text_of(html), "no requests yet: the page says when they come"
+    assert "Nada espera tu sí ahora mismo." in text_of(html), "the real gate's list: empty"
     assert "req-yes" not in html
     # one agent: its sections stay in the navigation, as before
     assert f'href="{PREFIX_PATH}/ahora"' in html and f'href="{PREFIX_PATH}/historia"' in html
@@ -176,16 +176,19 @@ def test_the_requests_say_what_why_how_serious_and_how_long(room: TestClient) ->
     assert waiting.index('id="req-r1"') < waiting.index('id="req-r2"'), "first to run out on top"
 
 
-def test_approve_and_reject_are_inert(room: TestClient) -> None:
+def test_approve_and_reject_are_inert_without_aprobar(room: TestClient) -> None:
+    """Without `backtide web --aprobar` (decision 10) the buttons are drawn disabled, with a note
+    on how to turn them on (T10-5); there is no form and nothing that posts."""
     html = room.get("/panel").text
     waiting = html[html.index('id="waiting"') : html.index('class="room"')]
     assert "<form" not in waiting
     assert not re.search(r"hx-(post|put|patch|delete|get)|formaction|action=", waiting)
+    assert "/peticiones/decidir" not in waiting
     buttons = re.findall(r"<button[^>]*>", waiting)
     assert len(buttons) == 4, "two requests, two buttons each"
     for button in buttons:
         assert ' type="button"' in button and " disabled" in button, button
-    assert text_of(waiting).count("Llega con T10") == 2
+    assert text_of(waiting).count("backtide web --aprobar") == 2
 
 
 def test_no_route_takes_anything_but_get_except_the_rewind(tmp_path: Path) -> None:
@@ -241,7 +244,7 @@ def test_the_room_in_english(room: TestClient) -> None:
     text = text_of(room.get("/panel", headers={"accept-language": "en"}).text)
     assert "Control room" in text and "Waiting for your yes" in text
     assert "Wants to send an email to ana@ejemplo.com" in text
-    assert "Arrives with T10" in text and "events today" in text
+    assert "backtide web --aprobar" in text and "events today" in text
 
 
 # -- each agent's own pages ------------------------------------------------------------------------

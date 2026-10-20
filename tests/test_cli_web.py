@@ -248,6 +248,32 @@ def test_settings_are_off_unless_asked_for(
     assert "Ajustes desde la web: cuando el servicio esté en marcha" in out
 
 
+def test_approvals_are_off_unless_asked_for(
+    capsys, config_file: Path, recorded: BlackBox, monkeypatch
+) -> None:
+    """T10-5 (decision 10): `--aprobar` lets the web approve and reject held requests, like
+    `--rebobinar` the rewind; without it they are listed with their buttons off."""
+    import backtide.cli as cli_module
+
+    seen: list[dict] = []
+
+    def fake(paths: WebPaths, port: int, announce, **options) -> None:
+        seen.append(options)
+        announce("http://x", "a-b-c")
+
+    monkeypatch.setattr(server_module, "run_web", fake)
+    code, out, _ = run(capsys, "web", "--config", config_file)
+    assert code == 0 and seen[-1]["can_approve"] is False
+    assert "Aprobar desde la web: no; sin `--aprobar`" in out
+    code, out, _ = run(capsys, "web", "--config", config_file, "--aprobar")
+    assert code == 0 and seen[-1]["can_approve"] is True
+    assert seen[-1]["can_set"] is False and seen[-1]["can_rewind"] is False
+    assert "Aprobar desde la web: cuando el servicio esté en marcha" in out
+    monkeypatch.setattr(cli_module, "_effective_uid", lambda: 0)
+    code, out, _ = run(capsys, "web", "--config", config_file, "--aprobar")
+    assert code == 0 and "Ojo: esta web corre como root" in out
+
+
 def test_a_root_web_with_only_ajustes_starts_and_warns(
     capsys, config_file: Path, recorded: BlackBox, monkeypatch
 ) -> None:

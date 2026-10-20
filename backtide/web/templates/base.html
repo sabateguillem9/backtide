@@ -32,6 +32,7 @@
     <a href="{{ here.base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}{% if active == key %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     {% endfor %}
     {% endif %}
+    <a href="{{ base }}/peticiones"{% if active == 'holds' %} aria-current="page"{% endif %}>{{ t('nav.holds') }}{% if active == 'holds' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     <a href="{{ base }}/ajustes"{% if active == 'settings' %} aria-current="page"{% endif %}>{{ t('nav.settings') }}{% if active == 'settings' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
   </nav>
   {% endif %}

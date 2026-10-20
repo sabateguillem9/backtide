@@ -61,6 +61,7 @@ from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recor
 from backtide.service.proxy_channel import Policy, known_secrets
 from backtide.service.settings import Applied, Settings
 from backtide.service.telegram_config import load_telegram
+from backtide.service.trust import TrustStore
 from backtide.snapshots import SnapshotStore, utc_now
 from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
 
@@ -386,6 +387,10 @@ def build_egress(
     policy = egress_policy(config, config.model_providers())
     if timings is None:
         timings = config.gate_settings().timings  # [gate] wait_s, hold_s, preapproval_s
+    # The recipients trusted from the web (T10-5, decision 9): <state_dir>/trusted.json, read
+    # once here; a file that cannot be used gives no trust (logged).
+    trust = TrustStore(config.state_dir)
+    trust.load()
     # The gate (T10-2) reads the black box once, at the first start: the holds a backtide that
     # died left open there are closed.
     return Egress(
@@ -396,6 +401,7 @@ def build_egress(
         timings=timings,
         history=box.events,
         watch=watch,
+        trust=trust,
     )
 
 

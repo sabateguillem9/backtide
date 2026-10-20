@@ -781,9 +781,9 @@ def test_a_get_that_sends_a_telegram_message_is_held(attack: Attack, lab: Lab) -
     attack.check(
         "held",
         approval.returncode == 0 and approved["status"] == 200
-        and pending["status"] == 429 and pending.get("retry_after") == "30"
+        and pending["status"] == 429 and pending.get("retry_after") == "2"
         and answer.get("ok") is False and answer.get("error_code") == 429
-        and answer.get("parameters") == {"retry_after": 30}
+        and answer.get("parameters") == {"retry_after": 2}
         and second.details["hold_id"] in str(answer.get("description", ""))
         and rejected.returncode == 0,
         f"el primero esperó conectado y salió al aprobarlo ({approved['status']} a los "

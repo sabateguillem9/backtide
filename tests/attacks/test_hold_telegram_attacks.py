@@ -34,14 +34,17 @@ import pytest
 from attack_kit import Attack, scenario
 from test_gate_attacks import GAVE_UP, arrived, background, made_up, telegram_arrived
 from test_proxy_attacks import Lab, new_tag, start_lab
+from test_web_attacks import web_for
 
 from backtide.blackbox import Event
 from backtide.jail import docker as jail_docker
 from backtide.notify.hold_notice import AGENT, AGENT_END, AGENT_HEAD
 from backtide.service.control import ask_decide, ask_holds
+from backtide.web.approve import ControlApprover
 from tests.integration.internet_kit import OTHER_HOST, PLAIN_HOST, stop_with_internet
 from tests.integration.service_kit import wait_until
 from tests.telegram_fake import OWNER, STRANGER, TOKEN, Call, FakeBotApi, buttons
+from tests.webkit import ROOT
 
 LIFE, WAIT = 50.0, 30.0  # seconds (5 min and 90 s in production)
 TIMINGS = ("--hold-timings", f"{LIFE:g},{WAIT:g},120,120")
@@ -202,6 +205,29 @@ def bot_token() -> str:
     return "123456789:" + made_up(35, BOT_ALPHABET)
 
 
+# The web (T10-5): the real app and its Guard, deciding through the service's real control socket
+# (``backtide web --aprobar`` as the service's user), in this process.
+DECIDE = "/peticiones/decidir"
+WEB_POST = {"origin": ROOT, "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate"}
+HIDDEN_RE = re.compile(r'<input type="hidden" name="(\w+)" value="([^"]*)"')
+
+
+def web_client(lab: Lab, *, logged_in: bool = True) -> Any:
+    client = web_for(
+        lab.service, approver=ControlApprover(lab.service.config.control_socket, enabled=True)
+    )
+    if not logged_in:
+        client.cookies.clear()
+    return client
+
+
+def web_fields(client: Any, verb: str, hold_id: str) -> dict[str, str]:
+    page = client.get(f"{DECIDE}?id={hold_id}&v={verb}").text
+    fields = {name: value.replace("&amp;", "&") for name, value in HIDDEN_RE.findall(page)}
+    assert set(fields) == {"csrf", "ticket", "id", "v"}, page[-600:]
+    return fields
+
+
 # --- aprobacion-falsificada --------------------------------------------------------------------
 
 
@@ -267,6 +293,53 @@ def test_only_the_owners_press_approves_and_only_once(attack: Attack, tlab: Tele
         e for e in lab.service.events("request", "net") if a in str(e.details.get("path", ""))
     ]
     replayed = tlab.ignored(seq)[len(reasons) :]
+    # The web (T10-5): forged POSTs approve nothing; the owner's yes from the web, once.
+    d, e = f"{tag}-d", f"{tag}-e"
+    waiting_d = background(lambda: tlab.send(attack, token, "559", f"hola {d}", timeout="40"))
+    held_d = tlab.held(d)
+    notice_d = tlab.notice(d)
+    tlab.send(attack, token, "560", f"hola {e}")
+    held_e = tlab.held(e)
+    hold_d, hold_e = held_d.details["hold_id"], held_e.details["hold_id"]
+    client, stranger = web_client(lab), web_client(lab, logged_in=False)
+    good = web_fields(client, "aprobar", hold_d)
+    reject_d = web_fields(client, "rechazar", hold_d)
+    other = web_fields(client, "aprobar", hold_e)
+    forged_web = {
+        "otro origen": client.post(
+            DECIDE, data=good, headers=WEB_POST | {"origin": "http://evil.example"}
+        ).status_code,
+        "sin Origin": client.post(
+            DECIDE, data=good, headers={"sec-fetch-site": "same-origin"}
+        ).status_code,
+        "cross-site": client.post(
+            DECIDE, data=good, headers=WEB_POST | {"sec-fetch-site": "cross-site"}
+        ).status_code,
+        "sin cookie": stranger.post(DECIDE, data=good, headers=WEB_POST).status_code,
+        "sin CSRF": client.post(
+            DECIDE, data={k: v for k, v in good.items() if k != "csrf"}, headers=WEB_POST
+        ).status_code,
+        "vale de rechazar para aprobar": client.post(
+            DECIDE, data=reject_d | {"v": "aprobar"}, headers=WEB_POST
+        ).status_code,
+        "vale de otra retención": client.post(
+            DECIDE, data=other | {"id": hold_d}, headers=WEB_POST
+        ).status_code,
+    }
+    expected_web = {"otro origen": 403, "sin Origin": 403, "cross-site": 403, "sin cookie": 401,
+                    "sin CSRF": 400, "vale de rechazar para aprobar": 400,
+                    "vale de otra retención": 400}  # fmt: skip
+    open_after_web = {h["hold_id"] for h in ask_holds(lab.service.config.control_socket)}
+    out_d_before = telegram_arrived(lab, d)
+    web_yes = client.post(DECIDE, data=good, headers=WEB_POST)
+    web_replay = client.post(DECIDE, data=good, headers=WEB_POST)
+    result_d = waiting_d()
+    edit_d = tlab.edit_of(notice_d)
+    time.sleep(1.5)
+    out_d = telegram_arrived(lab, d)
+    client.post(DECIDE, data=web_fields(client, "rechazar", hold_e), headers=WEB_POST)
+    approved_d, rejected_e = tlab.gate("approved", hold_d), tlab.gate("rejected", hold_e)
+    web_said = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", web_yes.text))
     stranger_answers = [
         x
         for x in fake.sent("answerCallbackQuery")
@@ -283,8 +356,15 @@ def test_only_the_owners_press_approves_and_only_once(attack: Attack, tlab: Tele
         and len(out_a) == 1
         and out_b == []
         and out_c == []
-        and again_b.get("status") == 403,
-        f"siete pulsaciones falsas (otra persona en su chat y en el del dueño, el dueño desde "
+        and again_b.get("status") == 403
+        and forged_web == expected_web
+        and {hold_d, hold_e} <= open_after_web
+        and out_d_before == []
+        and len(out_d) == 1,
+        f"Web: siete POST falsificados ({forged_web}) no aprueban nada, la retención sigue "
+        f"abierta y no llega nada ({len(out_d_before)}); el sí desde la web la suelta una vez "
+        f"({len(out_d)}). Telegram: siete pulsaciones falsas (otra persona en su chat y en el "
+        f"del dueño, el dueño desde "
         f"otro chat, el botón de otra retención, uno inventado y el id como dato) no aprueban "
         f"nada: no llega nada ({len(out_before)}) y las dos retenciones siguen abiertas. El "
         f"«Aprobar» del dueño la suelta: llega {len(out_a)} vez, también tras repetir el botón. "
@@ -306,17 +386,22 @@ def test_only_the_owners_press_approves_and_only_once(attack: Attack, tlab: Tele
         and bool(out_a)
         and request.details.get("gate", {}).get("decision") == "approved"
         and tlab.gate("rejected", hold_b)[0].details.get("by") == "telegram"
-        and [e.details.get("why") for e in expired_c] == ["timeout"],
+        and [e.details.get("why") for e in expired_c] == ["timeout"]
+        and [x.details.get("by") for x in approved_d] == ["web"]
+        and "web (uid" in str(approved_d[0].details.get("requested_by"))
+        and [x.details.get("by") for x in rejected_e] == ["web"],
         f"cada pulsación falsa es un telegram_ignored ({reasons}; la repetida, {replayed}) y a "
         f"los extraños no se les "
         f"contesta; gate/approved por {approved and approved.details.get('by')} "
         f"({approved and approved.details.get('requested_by')}) y su net/request "
         f"{request and request.seq} antes de salir; gate/rejected por Telegram y gate/expired "
-        f"{[e.details.get('why') for e in expired_c]}",
+        f"{[e.details.get('why') for e in expired_c]}; desde la web, gate/approved y "
+        f"gate/rejected por {[x.details.get('by') for x in approved_d + rejected_e]} "
+        f"({approved_d[0].details.get('requested_by') if approved_d else None})",
     )
     attack.check(
         "risk",
-        held_a.risk == 2 and held_b.risk == 2 and held_c.risk == 2,
+        held_a.risk == 2 and held_b.risk == 2 and held_c.risk == 2 and held_d.risk == 2,
         f"las tres retenidas llevan riesgo {[held_a.risk, held_b.risk, held_c.risk]}",
     )
     texts = [edit_a.params["text"], edit_b.params["text"], edit_c.params["text"]]
@@ -328,9 +413,16 @@ def test_only_the_owners_press_approves_and_only_once(attack: Attack, tlab: Tele
         and "nadie respondió en 5 minutos" in texts[2]
         and all(
             e.params["reply_markup"] == {"inline_keyboard": []} for e in (edit_a, edit_b, edit_c)
-        ),
+        )
+        and result_d.get("status") == 200
+        and web_yes.status_code == 200
+        and "Aprobada: sale ahora, una sola vez." in web_said
+        and "ya se usó" in web_replay.text
+        and edit_d.params["text"].endswith("Resultado: aprobada desde la web: salió una sola vez."),
         f"el agente esperaba conectado y recibió {result.get('status')} al aprobar; los avisos "
-        f"se editan sin botones: {[t.rsplit(chr(10), 1)[-1] for t in texts]}",
+        f"se editan sin botones: {[t.rsplit(chr(10), 1)[-1] for t in texts]}. Desde la web: "
+        f"{result_d.get('status')} al aprobar, el vale repetido «ya se usó», y el aviso de "
+        f"Telegram lo dice: «{edit_d.params['text'].rsplit(chr(10), 1)[-1]}»",
     )
 
 
@@ -735,6 +827,30 @@ def test_the_notice_stays_unambiguous(attack: Attack, tlab: TelegramLab) -> None
     view = tlab.sent_after("detalle de la retención", viewed)
     view_lines = view.params["text"].split("\n")
     view_theirs = view_lines[view_lines.index(AGENT_HEAD) + 1 : view_lines.index(AGENT_END)]
+    # The web (T10-5): the same hold in the panel, the list, the confirmation and "Ver".
+    hold_id = held.details["hold_id"]
+    client = web_client(lab)
+    web_pages = {
+        path: client.get(path).text
+        for path in (
+            "/panel",
+            "/peticiones",
+            f"{DECIDE}?id={hold_id}&v=aprobar",
+            f"/peticiones/ver?id={hold_id}",
+        )  # fmt: skip
+    }
+    web_problems = []
+    for path, page in web_pages.items():
+        if hold_id not in page:
+            web_problems.append(f"{path}: the hold is not there")
+        for raw in ("\u202e", "\u200b", "\u2066", "\u3164", "\u2800", "<b>APROBADO",
+                    'href="https://evil', 'href="tg:'):  # fmt: skip
+            if raw in page:
+                web_problems.append(f"{path}: raw {raw!r}")
+        agent = page.find("Lo que pide el agente (texto suyo, no de backtide)")
+        fake_head = page.find("RETENIDA")
+        if agent < 0 or (fake_head >= 0 and fake_head < agent):
+            web_problems.append(f"{path}: the agent's text is not in its block")
     tlab.press(notice, "Rechazar")
     edit = tlab.edit_of(notice)
     phrase = str(held.details.get("phrase"))
@@ -793,8 +909,12 @@ def test_the_notice_stays_unambiguous(attack: Attack, tlab: TelegramLab) -> None
         and len(body) <= 4096
         and len(view.params["text"]) <= 4096
         and [label for label, _ in buttons(notice)] == ["Aprobar", "Rechazar", "Ver"]
-        and edit.params["text"].endswith("Resultado: rechazada desde Telegram. No salió."),
-        f"el aviso es texto plano ({len(body)} caracteres), con nuestra cabecera primero "
+        and edit.params["text"].endswith("Resultado: rechazada desde Telegram. No salió.")
+        and web_problems == [],
+        f"en la web (panel, lista, confirmación y «Ver») va escapado y en el bloque del agente, "
+        f"sin RLO, rellenos ni enlaces suyos: {web_problems or 'sin fallos'}. "
+        f"En Telegram, el aviso es texto plano ({len(body)} caracteres), con nuestra cabecera "
+        f"primero "
         f"(«{ours[0]}») y {len(theirs)} líneas del agente, todas marcadas con «{AGENT.strip()}» "
         f"(«{theirs[0][:60] if theirs else ''}…»), y su bloque es una cita de Telegram "
         f"({notice.params.get('entities')}); sin RLO, rellenos invisibles ni espacios seguidos "
