@@ -529,7 +529,8 @@ class Gate:
         but the volatile ones, and the trailers, count: security review of T10-2, M2; with a
         translator's reading, its canonical text in place of the body, decision 2), the
         redaction's verdict on its URL (the API's own credential in the path left out) and on
-        its headers that are not credentials, their lengths and the credentials' (T10-3), a
+        its headers that are not credentials (names and values), their lengths, the credentials'
+        and whether the redaction struck something of them (T10-3 and its review, H1), a
         WebSocket opening, whether its method is exactly a read with no method override header
         and no trailers (M2: either makes it a write), whether the body of a request no
         translator read carries a secret, and the reading itself, checked and fitted."""
@@ -546,12 +547,9 @@ class Gate:
         )
         overridden = any(name.strip().lower() in OVERRIDE_HEADERS for name, _ in headers)
         plain = [pair for pair in headers if pair[0].strip().lower() not in CREDENTIAL_HEADERS]
+        credentials = [pair for pair in headers if pair[0].strip().lower() in CREDENTIAL_HEADERS]
         header_bytes = sum(len(_utf8(name)) + len(_utf8(value)) for name, value in plain)
-        credential_bytes = sum(
-            len(_utf8(name)) + len(_utf8(value))
-            for name, value in headers
-            if name.strip().lower() in CREDENTIAL_HEADERS
-        )
+        credential_bytes = sum(len(_utf8(name)) + len(_utf8(value)) for name, value in credentials)
         path = str(request.path)
         if reading is not None:
             path = credential_free_path(self._view_of(request), self._context(config), reading)
@@ -567,6 +565,10 @@ class Gate:
             or record.headers_struck(plain, config.scrubber),
             header_bytes=header_bytes,
             credential_bytes=credential_bytes,
+            # Review of T10-3, H1: a recognisable token in a credential header is the agent's
+            # own only toward the API it belongs to; backtide holds it toward any other host.
+            credentials_struck=credential_bytes > HEADER_SCAN_LIMIT
+            or record.headers_struck(credentials, config.scrubber, names=False),
             # A translated request's body is the translator's to search (secret_seen).
             body_struck=reading is None and bool(body) and body_has_secret(body, config.scrubber),
             wait_hint_s=None if reading is None else reading.wait_s,

@@ -206,17 +206,21 @@ def _shows_once_decoded(head: str) -> bool:
     return False
 
 
-def headers_struck(pairs: Iterable[tuple[str, str]], secrets: Secrets) -> bool:
-    """Whether the redaction strikes something of these header values (by pattern, or a secret
-    it knows): the gate holds a read whose headers carried one, as one whose URL did (decision
-    1's guard; security review of T10-2, M3). The caller leaves the credential headers out and
-    bounds how much is read. Nothing is cut here: a long value is struck or not, never "struck"
-    for its length."""
+def headers_struck(
+    pairs: Iterable[tuple[str, str]], secrets: Secrets, *, names: bool = True
+) -> bool:
+    """Whether the redaction strikes something of these headers' values, or of their names
+    (by pattern, or a secret it knows; a name is a way out too: review of T10-3, H1): the gate
+    holds a read whose headers carried one, as one whose URL did (decision 1's guard; security
+    review of T10-2, M3). The caller bounds how much is read. Nothing is cut here: a long value
+    is struck or not, never "struck" for its length. ``names=False`` for the credential
+    headers, whose names are ours."""
     scrub = _scrubber(secrets)
-    for _name, value in pairs:
-        text = str(value)
-        if strike_text(scrub.text(text)) != text:
-            return True
+    for name, value in pairs:
+        texts = (str(name), str(value)) if names else (str(value),)
+        for text in texts:
+            if strike_text(scrub.text(text)) != text:
+                return True
     return False
 
 

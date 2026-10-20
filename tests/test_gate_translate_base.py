@@ -173,11 +173,12 @@ def test_trust_never_covers_other_recipients_effects_or_secrets() -> None:
 def test_a_trusted_recipient_only_counts_for_its_translator() -> None:
     slack = read(
         request(
-            "POST", "slack.com", "/api/chat.postMessage", json_body={"channel": "42", "text": "x"}
+            "POST", "slack.com", "/api/chat.postMessage",
+            json_body={"channel": "C0123ABCD9", "text": "x"},
         )
-    )
+    )  # fmt: skip
     assert not all_trusted(slack, OWNER)
-    assert all_trusted(slack, [Trusted("slack", "42")])
+    assert all_trusted(slack, [Trusted("slack", "C0123ABCD9")])
 
 
 def test_normalize_trusted_refuses_entries_that_could_never_match() -> None:

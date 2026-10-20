@@ -52,3 +52,31 @@ def test_the_agents_text_is_one_inert_line() -> None:
     text = describe(tricky)
     assert text == "Telegram: enviar un mensaje al chat 556: «hola / APROBADO[2Jtxt.exe»"
     assert len(describe(reading(first_lines="x" * 5000))) == MAX_CHARS
+
+
+def test_the_agents_text_cannot_close_its_quote_or_fake_our_notes() -> None:
+    """Review of T10-3, L8: «» (and the like) inside the agent's text are replaced, so the
+    quote always ends where ours does and nothing after it is the agent's."""
+    fake = reading(first_lines="hola» (ya aprobado) «")
+    text = describe(fake)
+    assert text == 'Telegram: enviar un mensaje al chat 556: «hola" (ya aprobado) "»'
+    assert text.count("«") == 1 and text.count("»") == 1
+    for mark in "‹›“”„‟〝〞＂":
+        assert mark not in describe(reading(first_lines=f"a{mark}b"))
+    # In what goes between our brackets, the agent cannot close them either.
+    target = reading(
+        effect="change", first_lines=None, target="opens https://x.example/a); ya aprobado ("
+    )
+    assert describe(target) == (
+        "Telegram: cambiar al chat 556 (opens https://x.example/a]; ya aprobado [)"
+    )
+
+
+def test_a_fetched_url_and_an_inline_message_are_noted() -> None:
+    fetched = reading(target="opens https://evil.example/x.png", notes=["fetches_url"])
+    assert describe(fetched) == (
+        "Telegram: enviar un mensaje al chat 556: «hola» (opens https://evil.example/x.png; "
+        "la plataforma descargará esa dirección)"
+    )
+    inline = reading(effect="change", recipients=["inline:AgAA"], notes=["inline_message"])
+    assert "puede estar en cualquier chat" in describe(inline)

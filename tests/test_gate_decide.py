@@ -209,3 +209,35 @@ def test_a_write_whose_url_or_body_carried_a_secret_is_risk_3() -> None:
     assert verdict(replace(WRITE, body_struck=True)) == (Verdict.HOLD, "write", 3)
     assert verdict(replace(WRITE, url_struck=True)) == (Verdict.HOLD, "write", 3)
     assert verdict(replace(WRITE, headers_struck=True)) == (Verdict.HOLD, "write", 2)
+
+
+# --- security review of T10-3 ----------------------------------------------------------------
+
+UNKNOWN_READ = replace(READ, allowed=False)
+
+
+def test_a_credential_header_to_an_unknown_host_is_held() -> None:
+    """Review of T10-3, H1: a read to a host off ``[proxy] allow_hosts`` (and not a provider)
+    with any credential header is held with risk 2 (``credential_unknown_host``): using an
+    authenticated API means listing its host. To a listed host it still passes."""
+    with_token = replace(UNKNOWN_READ, credential_bytes=60)
+    assert verdict(with_token) == (Verdict.HOLD, "credential_unknown_host", 2)
+    assert verdict(replace(with_token, allowed=True)) == (Verdict.PASS, "read", 0)
+    assert verdict(replace(with_token, provider=True)) == (Verdict.PASS, "provider", 0)
+    assert verdict(UNKNOWN_READ) == (Verdict.PASS, "read", 0)
+
+
+def test_a_recognisable_secret_in_a_credential_header_to_an_unknown_host_is_risk_3() -> None:
+    struck = replace(UNKNOWN_READ, credential_bytes=60, credentials_struck=True)
+    assert verdict(struck) == (Verdict.HOLD, "credential_secret", 3)
+    # To a listed host the agent's own token is no leak: within the cap, it passes.
+    assert verdict(replace(struck, allowed=True)) == (Verdict.PASS, "read", 0)
+
+
+def test_a_translated_read_caps_its_credential_headers_too() -> None:
+    """Review of T10-3, L9: MAX_READ_CREDENTIALS holds for a translator's reads as well."""
+    read = replace(TG_SEND, reading=ReadingFacts(Effect.READ, 0))
+    assert verdict(replace(read, credential_bytes=MAX_READ_CREDENTIALS))[0] is Verdict.PASS
+    assert verdict(replace(read, credential_bytes=MAX_READ_CREDENTIALS + 1)) == (
+        Verdict.HOLD, "credentials_long", 2
+    )  # fmt: skip

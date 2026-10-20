@@ -9,6 +9,11 @@ is a send. Long polling (``getUpdates``) and the rest of ``get*`` are reads.
 - FORWARD: ``forwardMessage(s)`` and ``copyMessage(s)``: existing content, never batched.
 - CHANGE: ``editMessage*``, reactions, pins, stopping a poll or a live location, and an
   ``answerCallbackQuery`` with a ``text`` or a ``url`` (it shows them to whoever pressed).
+  An edit by ``inline_message_id`` (which Telegram reads before ``chat_id``) may be in any chat:
+  its recipient is ``inline:<id>``, never trusted (review of T10-3, H2).
+- A send or a change that makes Telegram fetch a URL (a file given by URL, a link preview of
+  a URL in the text, ``link_preview_options.url``) is never trusted (``FETCHES_URL``), and the
+  person reads the URL (review of T10-3, M3).
 - DELETE (risk 3, never trusted or batched): ``deleteMessage(s)``.
 - ADMIN (risk 3): ``setWebhook``, ``logOut``, ``close``, the administration of chats, and the
   bot's public texts: ``setMyCommands``, ``setMyName``, ``setMyDescription``...
@@ -17,6 +22,7 @@ is a send. Long polling (``getUpdates``) and the rest of ``get*`` are reads.
 - Anything else: UNKNOWN.
 """
 
+import hashlib
 import re
 from typing import Any
 
@@ -36,14 +42,19 @@ from backtide.gate.translate.base import (
     account_id,
     attachment,
     data_has_secret,
+    fetch_target,
+    find_url,
     first_lines,
     has_secret,
     has_secret_in,
+    is_http_url,
     opt_clean,
     rpc_params,
     semantic_canonical,
     split_path,
+    strict_json,
     unknown,
+    walk_fields,
 )
 
 NAME = "telegram"
@@ -92,6 +103,16 @@ _PASS = {
 }
 _CALLBACK_SHOWS = ("text", "url")
 _TEXT_PARAMS = ("text", "caption", "question")
+# Parameters that take a file, which Telegram downloads when given an HTTP URL (Bot API, "Sending
+# files"), at any depth (``media`` of an album or of editMessageMedia), and an invoice's photo.
+_FILE_PARAMS = frozenset(
+    {"photo", "document", "video", "animation", "audio", "voice", "sticker", "video_note",
+     "thumbnail", "thumb", "media", "cover", "photo_url", "png_sticker", "tgs_sticker",
+     "webm_sticker"}
+)  # fmt: skip
+# The methods whose text gets a link preview (unless it is turned off).
+_PREVIEWED = frozenset({"sendmessage", "editmessagetext"})
+_INLINE_RE = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
 
 
 def claims(view: RequestView, context: Context) -> bool:
@@ -218,7 +239,13 @@ def _reading(
     scrub = context.scrub
     notes: list[Note] = []
     recipients: tuple[str, ...] = ()
-    if "chat_id" in params:
+    if "inline_message_id" in params and effect is Effect.CHANGE:
+        # Telegram reads it before chat_id: the message may be in any chat (H2).
+        recipients = (_inline(params["inline_message_id"]),)
+        notes.append(Note.INLINE_MESSAGE)
+    elif "inline_message_id" in params:
+        raise Unreadable(Note.NOT_IN_TABLE)
+    elif "chat_id" in params:
         chat = chat_id(params["chat_id"])
         if chat is None:
             raise Unreadable(Note.BAD_ADDRESS)
@@ -235,6 +262,10 @@ def _reading(
         notes.append(Note.DELETES_MESSAGE)
     if method == "answercallbackquery" and isinstance(params.get("url"), str):
         target = opt_clean(f"opens {params['url']}", scrub, TARGET_CHARS)
+    fetched = _fetched_url(method, params) if effect in (Effect.SEND, Effect.CHANGE) else None
+    if fetched is not None:
+        notes.append(Note.FETCHES_URL)
+        target = target or fetch_target(fetched, scrub)
     text = _text(params, method)
     if text is not None and not isinstance(text, str):
         raise Unreadable
@@ -284,6 +315,55 @@ def _reading(
         notes=tuple(notes),
         canonical=canonical,
     )
+
+
+def _inline(value: object) -> str:
+    """``inline:<id>``: the id when plain, else a short digest of it (it is only shown)."""
+    text = str(value) if isinstance(value, int | str) and not isinstance(value, bool) else ""
+    if _INLINE_RE.fullmatch(text):
+        return f"inline:{text}"
+    return "inline:#" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def _fetched_url(method: str, params: dict[str, Any]) -> str | None:
+    """The first URL that this call makes Telegram's servers fetch, or None: a file given by
+    URL (at any depth), ``link_preview_options.url``, or a link in a previewed text or its
+    entities (``text_link``) unless the preview is off (``link_preview_options.is_disabled``,
+    ``disable_web_page_preview``). A button's URL is only opened by whoever presses it."""
+    for key, value in walk_fields({k: v for k, v in params.items() if k != "reply_markup"}):
+        if key in _FILE_PARAMS and is_http_url(value):
+            return str(value).strip()
+    if method not in _PREVIEWED:
+        return None
+    options = _parsed(params.get("link_preview_options"))
+    options = options if isinstance(options, dict) else {}
+    if options.get("is_disabled") in (True, "true") or params.get("disable_web_page_preview") in (
+        True,
+        "true",
+    ):
+        return None
+    if isinstance(options.get("url"), str) and options["url"].strip():
+        return options["url"].strip()
+    texts: list[object] = [params.get("text")]
+    entities = _parsed(params.get("entities"))
+    if isinstance(entities, list):
+        texts += [item.get("url") for item in entities if isinstance(item, dict)]
+    for text in texts:
+        if isinstance(text, str):
+            found = find_url(text)
+            if found is not None:
+                return found
+    return None
+
+
+def _parsed(value: object) -> object:
+    """A form's JSON text as JSON (Telegram takes objects as JSON in a form); else as is."""
+    if isinstance(value, str) and value.lstrip()[:1] in ("{", "["):
+        try:
+            return strict_json(value)
+        except Unreadable:
+            return value
+    return value
 
 
 def _text(params: dict[str, Any], method: str) -> object:

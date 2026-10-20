@@ -17,6 +17,10 @@ OpenClaw's own REST client uses it (docs/32, section 3). Pure.
   ``POST /users/@me/channels`` (opening a direct message sends nothing).
 - Anything else: UNKNOWN.
 
+A send or a change that makes Discord fetch a URL (an embed's image or link, a webhook's
+``avatar_url``, or a link it embeds from the content unless ``flags`` has SUPPRESS_EMBEDS) is
+never trusted (``FETCHES_URL``), and the person reads the URL (review of T10-3, M3).
+
 What is shown of a message is its ``content``, its embeds' texts and its poll; the whole message
 (components, poll, embeds...) is searched for secrets at any depth.
 """
@@ -41,9 +45,12 @@ from backtide.gate.translate.base import (
     content_type,
     credential,
     data_has_secret,
+    fetch_target,
+    find_url,
     first_lines,
     has_secret,
     has_secret_in,
+    is_http_url,
     json_object,
     media_type,
     nested_text,
@@ -52,6 +59,7 @@ from backtide.gate.translate.base import (
     semantic_canonical,
     split_path,
     unknown,
+    walk_fields,
 )
 
 NAME = "discord"
@@ -75,6 +83,7 @@ _THREAD_FIELDS = frozenset(
      "invitable"}
 )  # fmt: skip
 _SHOWN_KEYS = frozenset({"title", "description", "name", "value", "text"})  # embeds and polls
+_SUPPRESS_EMBEDS = 1 << 2  # a message flag: no embeds for the links in its content
 
 
 def credential_segments(segments: tuple[str, ...]) -> frozenset[int]:
@@ -345,6 +354,10 @@ def _message(
             secret = True
     fields = {name: value for name, value in payload.items() if name not in _VOLATILE}
     fields["?query"] = query
+    fetched = _fetched_url(payload, message) if effect in (Effect.SEND, Effect.CHANGE) else None
+    if fetched is not None:
+        notes += (Note.FETCHES_URL,)
+        target = target or fetch_target(fetched, scrub)
     return Reading(
         translator=NAME,
         operation=operation,
@@ -370,6 +383,21 @@ def _message(
             files=entries,
         ),  # fmt: skip
     )
+
+
+def _fetched_url(payload: dict[str, Any], message: dict[str, Any]) -> str | None:
+    """The first URL this call makes Discord fetch: any URL in its embeds, a webhook's avatar,
+    or a link in the content, unless the message suppresses its embeds."""
+    for key, value in walk_fields(
+        {"embeds": message.get("embeds"), "avatar_url": payload.get("avatar_url")}
+    ):
+        if key is not None and is_http_url(value):
+            return str(value).strip()
+    flags = message.get("flags")
+    if isinstance(flags, int) and not isinstance(flags, bool) and flags & _SUPPRESS_EMBEDS:
+        return None
+    content = message.get("content")
+    return find_url(content) if isinstance(content, str) else None
 
 
 def _shown(heading: str | None, content: str | None, message: dict[str, Any]) -> str | None:

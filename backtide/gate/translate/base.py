@@ -154,6 +154,12 @@ class Note(StrEnum):
     GRAPHQL_MUTATION = "graphql_mutation"
     ALTERNATIVE_DIFFERS = "alternative_differs"  # a mail's HTML says other than its plain text
     LONG_URL = "long_url"  # a read whose body carries a URL over URL_CHARS
+    # The platform itself fetches a URL the agent gave (a file by URL, a link preview, an
+    # unfurl, an icon): a way out to any host, so never trusted (review of T10-3, M3).
+    FETCHES_URL = "fetches_url"
+    # A Telegram inline message (``inline_message_id``): it may be in any chat, so never
+    # trusted, whatever ``chat_id`` says (review of T10-3, H2).
+    INLINE_MESSAGE = "inline_message"
     SECRET_SEEN = "secret_seen"  # noqa: S105 (a note, not a secret): striking removed a secret from what it carries
 
 
@@ -695,28 +701,94 @@ def guard_read(view: RequestView, reading: Reading, scrub: KnownScrubber) -> Rea
     }
     if len(view.body) > MAX_READ_BODY:
         return unknown(*held, Note.TOO_LARGE, **options)
-    if reading.secret_seen or body_has_secret(_without_own_token(view), scrub):
+    body = _without_own_token(view) if reading.translator == "slack" else view.body
+    if reading.secret_seen or body_has_secret(body, scrub):
         return replace(unknown(*held, Note.SECRET_SEEN, **options), secret_seen=True)
     return reading
 
 
-_MIN_OWN_TOKEN = 16
-
-
 def _without_own_token(view: RequestView) -> bytes:
-    """The body without the request's own ``Authorization`` token, where a client repeats it
-    (Slack's ``token=`` field, see slack.py): it goes to the same API that it authenticates
-    with, so it is not a secret leaving. Any other secret in the body still counts."""
+    """Slack's body without its ``token`` field when that field is exactly the request's own
+    ``Authorization`` token (``@slack/web-api`` repeats it there, see slack.py): it goes to the
+    same API that it authenticates with, so it is not a secret leaving. Only that field, only a
+    urlencoded form or a JSON object: the same token anywhere else in the body, or any other
+    secret, still counts (review of T10-3, M6). Anything that cannot be read is left whole."""
     try:
         value = credential(view.headers)
-    except Unreadable:
+        if value is None:
+            return view.body
+        token = value[7:].strip() if value.lower().startswith("bearer ") else value
+        kind = media_type(view.headers)
+        if kind == "application/x-www-form-urlencoded":
+            pairs = parse_qsl(decode_utf8(view.body), keep_blank_values=True, strict_parsing=True)
+            kept = [(name, item) for name, item in pairs if not (name == "token" and item == token)]
+            if len(kept) == len(pairs):
+                return view.body
+            return "&".join(f"{name}={item}" for name, item in kept).encode()
+        if kind == "application/json":
+            data = json_object(view.body)
+            if data.get("token") != token:
+                return view.body
+            return json.dumps({k: v for k, v in data.items() if k != "token"}).encode()
+    except (Unreadable, ValueError):
         return view.body
-    if value is None:
-        return view.body
-    token = value.split(" ", 1)[1].strip() if " " in value else value
-    if len(token) < _MIN_OWN_TOKEN:
-        return view.body
-    return view.body.replace(token.encode("utf-8", "surrogateescape"), b"")
+    return view.body
+
+
+# --- what a platform fetches (review of T10-3, M3) -----------------------------------------------
+
+# A link as Telegram, Slack and Discord find one in a text: with a scheme, from "www.", or a bare
+# domain name (Telegram previews "evil.example/x" too). A file name such as "plan.pdf" reads as
+# one as well: such a text is held, never let out unseen.
+_URL_RE = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.-]{0,31}://[^\s<>\"']+"
+    r"|\bwww\.[^\s<>\"']+"
+    r"|(?<![\w@.-])(?:[^\W_][\w-]{0,62}\.)+(?:[^\W\d_]{2,63}|xn--[a-z0-9-]{1,59})(?![\w@-])"
+    r"(?:[/?#:][^\s<>\"']*)?"
+)
+_HTTP_RE = re.compile(r"(?i)\s*https?://")
+
+
+def find_url(text: str) -> str | None:
+    """The first link in ``text`` that a platform would fetch a preview of, or None."""
+    match = _URL_RE.search(text)
+    return None if match is None else match.group(0)
+
+
+def is_http_url(value: object) -> bool:
+    """Whether a file parameter is a URL the platform downloads (not a file id or an upload)."""
+    return isinstance(value, str) and _HTTP_RE.match(value) is not None
+
+
+def walk_fields(value: object) -> list[tuple[str | None, Any]]:
+    """Every (key, value) at any depth of parsed parameters, reading a string that holds a JSON
+    object or list (a form's ``media``, ``blocks``, ``link_preview_options``) as JSON too.
+    Bounded by MAX_NODES (Unreadable past it)."""
+    found: list[tuple[str | None, Any]] = []
+    stack: list[tuple[str | None, Any, int]] = [(None, value, 0)]
+    nodes = 0
+    while stack:
+        key, item, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_NODES:
+            raise Unreadable(Note.TOO_LARGE)
+        if isinstance(item, str) and depth < 4 and item.lstrip()[:1] in ("{", "["):
+            try:
+                item = strict_json(item)
+                depth += 1
+            except Unreadable:
+                pass
+        found.append((key, item))
+        if isinstance(item, dict):
+            stack.extend((str(name), inner, depth) for name, inner in item.items())
+        elif isinstance(item, list):
+            stack.extend((key, inner, depth) for inner in item)
+    return found
+
+
+def fetch_target(url: str, scrub: KnownScrubber) -> str | None:
+    """What the person reads of a fetched URL (struck and cut, as every target)."""
+    return opt_clean(f"opens {url}", scrub, TARGET_CHARS)
 
 
 def first_lines(text: str | None, scrub: KnownScrubber) -> str | None:
@@ -762,6 +834,21 @@ def safe_id(value: object, limit: int = 64) -> str | None:
     if isinstance(value, str) and _HOLD_SAFE_RE.fullmatch(value) and len(value) <= limit:
         return value
     return None
+
+
+def draft_ref(mailbox: str, value: object) -> str | None:
+    """How a saved draft is named in a reading: 32 hex of the SHA-256 of its mailbox and its id,
+    for any id the API gave, plain or not (Graph's are long and end in "="). Never of the token:
+    a refreshed token acts on the same draft (review of T10-3, M7). None without an id."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return None
+    message = b"\0".join(
+        [b"backtide-draft-v1"]
+        + [part.encode("utf-8", "surrogatepass") for part in (mailbox.lower(), value)]
+    )
+    return hashlib.sha256(message).hexdigest()[:32]
 
 
 # --- mail addresses ------------------------------------------------------------------------------
@@ -1155,6 +1242,10 @@ def semantic_canonical(
 # --- trusted recipients (docs/32, section 9) -----------------------------------------------------
 
 
+_SLACK_ID_RE = re.compile(r"[CGD][A-Z0-9]{8,}", re.ASCII)
+_UNTRUSTABLE = frozenset({Note.FETCHES_URL, Note.INLINE_MESSAGE})
+
+
 @dataclass(frozen=True)
 class Trusted:
     """A ``[gate] trusted`` entry: a translator and one normalized recipient."""
@@ -1179,7 +1270,11 @@ def normalize_trusted(translator: str, recipient: str) -> Trusted:
         if chat is None:
             raise ValueError("a trusted Telegram chat is a number or @username")
         return Trusted(translator, chat)
-    if translator in ("slack", "discord"):
+    if translator == "slack":
+        if not _SLACK_ID_RE.fullmatch(value):
+            raise ValueError("a trusted Slack channel is its id (C…, G… or D…), never its name")
+        return Trusted(translator, value)
+    if translator == "discord":
         if not value or not value.isprintable() or len(value) > 128:
             raise ValueError("a trusted channel is its id")
         return Trusted(translator, value)
@@ -1189,10 +1284,16 @@ def normalize_trusted(translator: str, recipient: str) -> Trusted:
 def all_trusted(reading: Reading, trusted: Iterable[Trusted]) -> bool:
     """Whether a reading goes to trusted recipients only (docs/32, section 9): a send or a
     change, with at least one recipient, every one of them trusted for its translator, and
-    no secret struck from it. Never a forward, a deletion, an administration or the unknown."""
+    no secret struck from it. Never a forward, a deletion, an administration or the unknown;
+    never one that makes the platform fetch a URL or edits an inline message (review of T10-3,
+    M3 and H2); and a Slack channel only by its id (M4)."""
     if reading.effect not in (Effect.SEND, Effect.CHANGE) or not reading.recipients:
         return False
-    if reading.secret_seen:
+    if reading.secret_seen or _UNTRUSTABLE & set(reading.notes):
         return False
     allowed = {item.recipient for item in trusted if item.translator == reading.translator}
+    if reading.translator == "slack" and not all(
+        _SLACK_ID_RE.fullmatch(recipient) for recipient in reading.recipients
+    ):
+        return False
     return all(recipient in allowed for recipient in reading.recipients)

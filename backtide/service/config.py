@@ -27,7 +27,10 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   (``trusted``; the owner's Telegram chat of ``telegram.toml`` is trusted too unless
   ``trust_owner_chat = false``), the extra read endpoints of the ``read_post`` translator
   (``read_endpoints``, ``host/path``) and the times (``wait_s``, ``hold_s``, ``preapproval_s``:
-  only shorter than the design's 90 s, 5 min and 10 min). NEVER a key.
+  only shorter than the design's 90 s, 5 min and 10 min), and what reads to unknown hosts may
+  carry out per hour (``read_budget_host_kib``, 256, and ``read_budget_total_kib``, 2048: either
+  way, review of T10-3, M5). A Slack channel is trusted by its id (``C…``, ``G…`` or ``D…``),
+  never by its name. NEVER a key.
 - ``[sensor]`` (T07-3, docs/23): whether the agent may run without the process sensor
   (``required``, false by default: decision 7), the sensor container's limits and the reader's
   rate limits. Never the image (pinned in backtide/jail/sensor.py) nor its folder, which is
@@ -59,6 +62,7 @@ from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
 from backtide.service.holds import HoldTimings
+from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES
 
 DEFAULT_CYCLE_INTERVAL = 120.0  # seconds between two "did anything change?" checks
 DEFAULT_PRUNE_INTERVAL = 600.0
@@ -119,13 +123,19 @@ NOVELTY_STREAK_MINUTES = 10.0
 # seconds; only shorter than the design's: a yes is good for 10 min at most, a hold lives 5).
 _GATE_KEYS = frozenset(
     {"unknown_hosts", "trusted", "trust_owner_chat", "read_endpoints", "wait_s", "hold_s",
-     "preapproval_s"}
+     "preapproval_s", "read_budget_host_kib", "read_budget_total_kib"}
 )  # fmt: skip
 _TRUSTED_FIELD = {"telegram": "chat", "gmail": "email", "graph_mail": "email", "slack": "channel",
                   "discord": "channel"}  # fmt: skip
 _GATE_TIMES = {"wait_s": ("wait", 1, 90), "hold_s": ("life", 30, 300),
                "preapproval_s": ("preapproval", 30, 600)}  # fmt: skip
 MAX_TRUSTED = 256
+# [gate] read_budget_*_kib (review of T10-3, M5): what reads to unknown hosts may carry out per
+# hour, per host and in total. Either way from the defaults (256 KiB and 2 MiB); 0 holds every
+# read to an unknown host that carries anything; 1 GiB at most.
+_READ_BUDGETS = {"read_budget_host_kib": DEFAULT_HOST_BYTES // 1024,
+                 "read_budget_total_kib": DEFAULT_TOTAL_BYTES // 1024}  # fmt: skip
+MAX_READ_BUDGET_KIB = 1024 * 1024
 MIN_NOVELTY_STREAK_MINUTES = 1.0
 # docs/21, section 6: the providers of T06 and their default hosts.
 PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
@@ -209,6 +219,8 @@ class GateSettings:
     trusted: tuple[Trusted, ...] = ()
     read_endpoints: tuple[str, ...] = ()
     timings: HoldTimings = field(default_factory=HoldTimings)
+    read_budget_host: int = DEFAULT_HOST_BYTES  # bytes per host and hour (M5)
+    read_budget_total: int = DEFAULT_TOTAL_BYTES  # bytes per hour, every unknown host together
 
 
 @dataclass(frozen=True)
@@ -619,11 +631,25 @@ class ServiceConfig:
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 raise ConfigError(f"[gate] {key} must be a whole number of seconds, {low}-{high}")
             times[name] = float(value)
+        budgets: dict[str, int] = {}
+        for key, default in _READ_BUDGETS.items():
+            value = self.gate.get(key, default)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= MAX_READ_BUDGET_KIB
+            ):
+                raise ConfigError(
+                    f"[gate] {key} must be a whole number of KiB, 0-{MAX_READ_BUDGET_KIB}"
+                )
+            budgets[key] = value * 1024
         return GateSettings(
             unknown_hosts=mode,
             trusted=tuple(dict.fromkeys(trusted)),
             read_endpoints=endpoints,
             timings=HoldTimings(**times),
+            read_budget_host=budgets["read_budget_host_kib"],
+            read_budget_total=budgets["read_budget_total_kib"],
         )
 
     def read_rules(self) -> str | None:

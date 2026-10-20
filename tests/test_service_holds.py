@@ -316,7 +316,7 @@ def test_a_restart_ignores_what_is_not_a_hold_id(bad: str) -> None:
     assert stale_holds([gate("held", bad, 1)], now=START) == []
 
 
-DRAFT = ("gmail", "0123456789abcdef", "r-42")
+DRAFT = ("gmail", "r-42")
 
 
 def test_a_draft_is_open_while_its_sending_is_held_approved_or_preapproved() -> None:
@@ -328,8 +328,8 @@ def test_a_draft_is_open_while_its_sending_is_held_approved_or_preapproved() -> 
     assert hold is not None
     book.recorded(hold, 10)
     assert book.draft_open(DRAFT)
-    assert not book.draft_open(("gmail", "0123456789abcdef", "r-43"))
-    assert not book.draft_open(("graph_mail", "0123456789abcdef", "r-42"))
+    assert not book.draft_open(("gmail", "r-43"))
+    assert not book.draft_open(("graph_mail", "r-42"))
     book.preapprove(hold)  # nobody waited: preapproved
     assert book.draft_open(DRAFT)
     clock.now += 601  # the preapproval lapsed

@@ -97,6 +97,7 @@ from backtide.gate.providers import Providers
 from backtide.gate.translate.base import (
     OVERRIDE_HEADERS,
     Effect,
+    Note,
     Reading,
     Shape,
     Trusted,
@@ -104,6 +105,7 @@ from backtide.gate.translate.base import (
 )
 from backtide.sensors.files import DailyBudget, TokenBucket
 from backtide.service.holds import Hold, HoldBook, HoldOutcome, HoldStatus, HoldTimings
+from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES, ReadBudget
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +260,9 @@ class Policy:
     unknown_hosts: str = "hold"
     trusted: tuple[Trusted, ...] = ()  # [gate] trusted (docs/32, section 9), normalized
     read_endpoints: tuple[str, ...] = ()  # [gate] read_endpoints, for the read_post translator
+    # [gate] read_budget_host_kib and read_budget_total_kib (review of T10-3, M5), in bytes.
+    read_budget_host: int = DEFAULT_HOST_BYTES
+    read_budget_total: int = DEFAULT_TOTAL_BYTES
 
     def __post_init__(self) -> None:
         if self.unknown_hosts not in UNKNOWN_HOSTS:
@@ -354,6 +359,7 @@ class ProxyChannel:
         on_budget: Callable[[], None] | None = None,
         timings: HoldTimings | None = None,
         book: HoldBook | None = None,
+        read_budget: ReadBudget | None = None,
     ) -> None:
         self._sock = sock
         self._record = record
@@ -384,6 +390,13 @@ class ProxyChannel:
         # the ticker and the control socket's threads all come here).
         self._fp_key = new_key()
         self._book = book if book is not None else HoldBook(timings, clock=monotonic)
+        # What reads to unknown hosts may carry out (M5): the Egress keeps one across channels,
+        # so a proxy restart does not refill it.
+        self._read_budget = (
+            read_budget
+            if read_budget is not None
+            else ReadBudget(policy.read_budget_host, policy.read_budget_total)
+        )
         self._gate_lock = threading.RLock()
         self._holds_ended = False
 
@@ -586,7 +599,7 @@ class ProxyChannel:
         headers_struck_here = any(
             isinstance(value, str) and self._scrub.text(value) != value
             for value in headers.values()
-        )
+        ) or any(self._scrub.text(str(name)) != str(name) for name in headers)  # a name too
         reading = gate["reading"]
         facts = Facts(
             method=str(details.get("method", "")),
@@ -601,10 +614,17 @@ class ProxyChannel:
             preapproved=self._book.preapproved(fp),
             rejected=self._book.rejected(fp),
             credential_bytes=gate["credential_bytes"],
+            credentials_struck=gate["credentials_struck"],
             body_struck=gate["body_struck"],
             reading=None if reading is None else self._reading_facts(reading),
         )
         decision = decide(facts, unknown_hosts=self._policy.unknown_hosts)
+        if decision.verdict is Verdict.PASS and decision.reason == "read" and not allowed:
+            # M5: what a read to an unknown host carries out (its URL and its headers but the
+            # credentials, which are held there anyway) is counted per host and in total.
+            spent = gate["url_bytes"] + gate["header_bytes"]
+            if not self._read_budget.take(str(host).lower(), spent, self._mono()):
+                return self._hold(request_id, event, gate, 2, "read_budget")
         if decision.verdict is Verdict.REJECT:
             return self._refuse(request_id, event, decision.reason, fp=fp)
         if decision.verdict is Verdict.PASS:
@@ -938,6 +958,7 @@ def _as_reading(reading: Mapping[str, Any]) -> Reading:
         account=reading["account"],
         recipients=tuple(reading["recipients"]),
         secret_seen=reading["secret_seen"],
+        notes=tuple(Note(note) for note in reading["notes"]),
     )
 
 
@@ -949,9 +970,12 @@ def _wait_hint(gate: Mapping[str, Any]) -> int | None:
     return min(known) if known else None
 
 
-def _draft_key(reading: Mapping[str, Any]) -> tuple[str, str | None, str] | None:
+def _draft_key(reading: Mapping[str, Any]) -> tuple[str, str] | None:
+    """A draft by its translator and its ``draft`` (already a digest of the mailbox and the
+    draft's id, ``base.draft_ref``), never by the token that acts: a refreshed token is the same
+    draft (review of T10-3, M7)."""
     draft = reading.get("draft")
-    return None if draft is None else (reading["translator"], reading["account"], draft)
+    return None if draft is None else (reading["translator"], draft)
 
 
 _RECORDED_READING = (

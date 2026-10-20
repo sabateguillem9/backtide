@@ -21,6 +21,11 @@ query, a JSON body or a urlencoded form, so the method name decides, never the H
   (outside ``/api``) and file downloads by ``GET``.
 - Anything else: UNKNOWN.
 
+A send or a change that makes Slack fetch a URL (an ``icon_url``, an image in its blocks or
+attachments, or a link it unfurls: unless both ``unfurl_links`` and ``unfurl_media`` are
+false) is never trusted (``FETCHES_URL``), and the person reads the URL (review of T10-3, M3).
+A channel is trusted by its id only (M4).
+
 What is shown of a message is what Slack shows: its ``blocks`` (``text`` is then only the
 notification's fallback), else its ``text``, and its legacy ``attachments``. Every parameter but
 the token is searched for secrets at any depth.
@@ -50,6 +55,8 @@ from backtide.gate.translate.base import (
     credential,
     data_has_secret,
     decode_utf8,
+    fetch_target,
+    find_url,
     first_lines,
     has_secret,
     has_secret_in,
@@ -64,6 +71,7 @@ from backtide.gate.translate.base import (
     split_path,
     strict_json,
     unknown,
+    walk_fields,
 )
 
 NAME = "slack"
@@ -109,6 +117,14 @@ _PASS = {
 }
 _DELETES = frozenset({"chat.delete", "chat.deletescheduledmessage"})
 _SHOWN_KEYS = frozenset({"title", "pretext", "text", "value"})  # in blocks and attachments
+# What Slack's servers download to show a message (at any depth: blocks, attachments).
+_IMAGE_KEYS = frozenset(
+    {"icon_url", "image_url", "thumb_url", "author_icon", "footer_icon", "video_url",
+     "thumbnail_url", "provider_icon_url"}
+)  # fmt: skip
+# Where a link that Slack unfurls is: the message's text and initial comment, and the texts of
+# its blocks and attachments (a file's title is not unfurled).
+_LINK_KEYS = frozenset({"text", "initial_comment", "pretext"})
 
 
 def credential_segments(segments: tuple[str, ...]) -> frozenset[int]:
@@ -203,6 +219,11 @@ def _web_api(
     attachments = _files(params, files, context)
     notes = [Note.DELETES_MESSAGE] if method in _DELETES else []
     fields = {name: value for name, value in params.items() if name != "token"}
+    fetched = _fetched_url(fields)
+    target = _target(params, context)
+    if fetched is not None:
+        notes.append(Note.FETCHES_URL)
+        target = target or fetch_target(fetched, scrub)
     secret = has_secret_in(fields, scrub) or any(
         data_has_secret(part.data, scrub) for part in files
     )
@@ -220,7 +241,7 @@ def _web_api(
         account=account,
         recipients=recipients,
         first_lines=first_lines(shown_text(text, params), scrub),
-        target=_target(params, context),
+        target=target,
         attachments=attachments,
         secret_seen=secret,
         notes=tuple(notes),
@@ -235,6 +256,23 @@ def _web_api(
             files=entries,
         ),  # fmt: skip
     )
+
+
+def _fetched_url(fields: dict[str, Any]) -> str | None:
+    """The first URL this call makes Slack fetch: an image or icon at any depth, or a link it
+    would unfurl (``unfurl_links`` and ``unfurl_media`` both false turn that off)."""
+    walked = walk_fields(fields)
+    for key, value in walked:
+        if key in _IMAGE_KEYS and isinstance(value, str) and value.strip():
+            return value.strip()
+    if all(fields.get(name) in (False, "false") for name in ("unfurl_links", "unfurl_media")):
+        return None
+    for key, value in walked:
+        if key in _LINK_KEYS and isinstance(value, str):
+            found = find_url(value)
+            if found is not None:
+                return found
+    return None
 
 
 def shown_text(text: str | None, message: dict[str, Any]) -> str | None:

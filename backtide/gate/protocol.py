@@ -142,7 +142,7 @@ DECISION_REASONS = frozenset({"rejected", "expired", "paused", "hold_full"})
 HOLD_LEFT_WHY = frozenset({"client_left", "waited", "no_slot"})
 _GATE_KEYS = frozenset(
     {"fp", "url_struck", "url_bytes", "websocket", "exact_read", "wait_hint_s", "headers_struck",
-     "header_bytes", "credential_bytes", "body_struck", "reading"}
+     "header_bytes", "credential_bytes", "credentials_struck", "body_struck", "reading"}
 )  # fmt: skip
 
 _REQUEST_KEYS = frozenset(
@@ -355,6 +355,7 @@ def gate(
     header_bytes: int,
     wait_hint_s: int | None = None,
     credential_bytes: int = 0,
+    credentials_struck: bool = False,
     body_struck: bool = False,
     reading: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -365,13 +366,16 @@ def gate(
     or OPTIONS (and it has no method override header and no trailers), whether the redaction
     struck something of a header that is not a credential and how many bytes those headers have
     (decision 1's guard on the headers), the bytes of its credential headers (capped on a plain
-    read, T10-3), whether its body carries a secret (a write without a translator: risk 3), how
-    long its client waits (the translator's ``wait_s``; None: 90 s) and the translator's
-    ``reading`` (``Reading.summary()``, fitted: ``fit_reading``), or None."""
+    read, T10-3) and whether the redaction struck something of them (held toward a host off the
+    allowed list: review of T10-3, H1), whether its body carries a secret (a write without a
+    translator: risk 3), how long its client waits (the translator's ``wait_s``; None: 90 s)
+    and the translator's ``reading`` (``Reading.summary()``, fitted: ``fit_reading``), or
+    None."""
     facts = {"fp": fp, "url_struck": url_struck, "url_bytes": url_bytes, "websocket": websocket,
              "exact_read": exact_read, "wait_hint_s": wait_hint_s,
              "headers_struck": headers_struck, "header_bytes": header_bytes,
-             "credential_bytes": credential_bytes, "body_struck": body_struck,
+             "credential_bytes": credential_bytes, "credentials_struck": credentials_struck,
+             "body_struck": body_struck,
              "reading": None if reading is None else dict(reading)}  # fmt: skip
     return _check_gate(facts)
 
@@ -635,7 +639,14 @@ def _check_gate(value: object) -> dict[str, Any]:
     fp = value["fp"]
     if not isinstance(fp, str) or not _FP_RE.fullmatch(fp):
         raise ProtocolError("request.gate.fp: not a fingerprint")
-    for name in ("url_struck", "websocket", "exact_read", "headers_struck", "body_struck"):
+    for name in (
+        "url_struck",
+        "websocket",
+        "exact_read",
+        "headers_struck",
+        "credentials_struck",
+        "body_struck",
+    ):
         if type(value[name]) is not bool:
             raise ProtocolError(f"request.gate.{name}: not a boolean")
     hint = value["wait_hint_s"]
@@ -651,6 +662,7 @@ def _check_gate(value: object) -> dict[str, Any]:
         "credential_bytes": _int(
             value["credential_bytes"], "request.gate.credential_bytes", 0, _MAX_URL_BYTES
         ),
+        "credentials_struck": value["credentials_struck"],
         "body_struck": value["body_struck"],
         "wait_hint_s": None
         if hint is None

@@ -4,8 +4,10 @@ reading says it does, in Spanish, in one line that reads well on a phone. Pure: 
 ``describe(reading)`` takes a checked ``gate.reading`` (``protocol.check_reading``). Its words are
 ours; the agent's texts (recipients, subject, first lines, target, attachment names) are only
 quoted, already struck and cut by the translator (and struck again by backtide when recorded),
-on one line and without control characters. T10-4's alert and the web (T10-5) escape them for
-their medium: here they are data, never markup.
+on one line and without control characters. Inside «…» the agent's own quote marks become plain
+ones, and inside our brackets its brackets become square ones: it can never close our quote and
+write something that reads as ours, such as "(ya aprobado)" (review of T10-3, L8). T10-4's
+alert and the web (T10-5) escape them for their medium: here they are data, never markup.
 """
 
 from collections.abc import Mapping, Sequence
@@ -45,7 +47,17 @@ _NOTES = {
     "duplicate": "un campo repetido",
     "bad_address": "un destinatario que no se entiende",
     "translator_failed": "el traductor falló",
+    "fetches_url": "la plataforma descargará esa dirección",
+    "inline_message": "un mensaje en línea: puede estar en cualquier chat",
 }
+# Quote marks the agent could use to close our «…» and write after it as if it were ours
+# (review of T10-3, L8): inside a quote they become plain ones.
+_QUOTES = str.maketrans(
+    {"«": '"', "»": '"', "‹": "'", "›": "'", "“": '"', "”": '"', "„": '"', "‟": '"',
+     "〝": '"', "〞": '"', "＂": '"'}
+)  # fmt: skip
+# And inside our brackets, the brackets.
+_BRACKETS = str.maketrans({"(": "[", ")": "]", "（": "[", "）": "]"})
 
 
 def describe(reading: Mapping[str, Any]) -> str:
@@ -67,10 +79,10 @@ def describe(reading: Mapping[str, Any]) -> str:
     sentence = " ".join(parts)
     quoted = reading.get("subject") or reading.get("first_lines")
     if quoted:
-        sentence += f": «{_line(str(quoted))}»"
+        sentence += f": «{_line(str(quoted)).translate(_QUOTES)}»"
     extra = []
     if operation:
-        extra.append(_line(str(operation)))
+        extra.append(_line(str(operation)).translate(_QUOTES).translate(_BRACKETS))
     attachments = reading.get("attachments") or []
     if attachments:
         extra.append("1 adjunto" if len(attachments) == 1 else f"{len(attachments)} adjuntos")

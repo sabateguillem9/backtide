@@ -408,6 +408,8 @@ def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
         unknown_hosts=gate.unknown_hosts,
         trusted=gate.trusted,
         read_endpoints=gate.read_endpoints,
+        read_budget_host=gate.read_budget_host,
+        read_budget_total=gate.read_budget_total,
     )
     try:
         policy.allow_list()

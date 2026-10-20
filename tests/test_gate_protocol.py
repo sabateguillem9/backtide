@@ -669,6 +669,14 @@ def test_the_gate_carries_the_credential_bytes_and_the_body_secret() -> None:
     back = roundtrip(request(1, net_request(), facts(credential_bytes=5000, body_struck=True)),
                      Sender.PROXY)  # fmt: skip
     assert back["gate"]["credential_bytes"] == 5000 and back["gate"]["body_struck"] is True
-    for bad in ({"credential_bytes": -1}, {"body_struck": "yes"}, {"reading": "send"}):
+    assert back["gate"]["credentials_struck"] is False
+    struck = roundtrip(request(1, net_request(), facts(credentials_struck=True)), Sender.PROXY)
+    assert struck["gate"]["credentials_struck"] is True
+    for bad in (
+        {"credential_bytes": -1},
+        {"body_struck": "yes"},
+        {"reading": "send"},
+        {"credentials_struck": 1},
+    ):
         with pytest.raises(ProtocolError):
             encode(request(1, net_request(), facts() | bad), Sender.PROXY)

@@ -601,3 +601,25 @@ def test_the_same_message_written_otherwise_is_the_same_hold(lab: Lab) -> None:
              if e.details.get("reading", {}).get("first_lines") == text]  # fmt: skip
     assert len(helds) == 1
     assert lab.decide(helds[0].details["hold_id"], "reject")["outcome"] == "rejected"
+
+
+def test_a_translated_api_by_its_ip_literal_never_reaches_it(lab: Lab) -> None:
+    """Review of T10-3, L11: by its address, the fake Bot API has no translator (the translators
+    are picked by name), so its requests fall into rule 6. A Bot API call carries the bot's
+    token in its path, which the guard strikes: held with risk 3. And a read that the gate does
+    let pass never reaches the API either: the proxy checks the server's certificate, and the
+    API's names the certificate has are not its address."""
+    address = ip_on(lab.fake, lab.jail.config.network)
+    text = f"byip{time.time_ns()}"
+    sent = lab.ask("GET", telegram_path("556", text), host=address, timeout=3)
+    assert not sent["ok"] or sent["status"] != 200, sent
+    [held] = [e for e in lab.box.events(source="gate", action="held")
+              if text in str(e.details.get("path", ""))]  # fmt: skip
+    assert (held.risk, held.details["reason"]) == (3, "url_secret")
+    assert lab.decide(held.details["hold_id"], "reject")["outcome"] == "rejected"
+    probe = tag() + "/by-ip"
+    read = lab.ask("GET", probe, host=address)
+    assert read["ok"] and read["status"] == 502, read  # the gate let it pass; TLS did not
+    [request] = lab.events(probe, "request")
+    assert request.details["gate"] == {"decision": "read"}
+    assert lab.arrived(probe) == [] and telegram_arrived(lab, text) == []

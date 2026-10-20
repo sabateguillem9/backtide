@@ -87,7 +87,7 @@ def test_the_slack_file_upload_is_a_send_that_shows_the_file() -> None:
     leaked = read(request("POST", "files.slack.com", "/upload/v1/A", body=SECRET.encode()))
     assert leaked.effect is Effect.SEND and leaked.secret_seen and leaked.risk == 3
     # An upload has no recipient yet: it can never pass as "to a trusted channel".
-    assert not all_trusted(raw, [normalize_trusted("slack", "C1")])
+    assert not all_trusted(raw, [normalize_trusted("slack", "C0123ABCD9")])
     # Asking for the upload URL still passes: the upload itself is held.
     url = read(_slack("files.getUploadURLExternal", {"filename": "a", "length": 3}))
     assert url.effect is Effect.READ
@@ -640,3 +640,263 @@ def test_too_many_top_level_parameters_are_held() -> None:
         headers=(SLACK_AUTH, ("content-type", "application/json")),
     )  # fmt: skip
     assert read(slack).effect is Effect.UNKNOWN
+
+
+# --- security review of T10-3 ---------------------------------------------------------------------
+
+OWNER_CHAT = [normalize_trusted("telegram", "42")]
+CHANNEL = "C0123ABCD9"
+SLACK_OWNER = [normalize_trusted("slack", CHANNEL)]
+INLINE_METHODS = [
+    "editMessageText",
+    "editMessageCaption",
+    "editMessageMedia",
+    "editMessageReplyMarkup",
+    "editMessageLiveLocation",
+    "stopMessageLiveLocation",
+]
+
+
+@pytest.mark.parametrize("method", INLINE_METHODS)
+def test_an_inline_message_is_never_in_a_trusted_chat(method: str) -> None:
+    """H2: ``inline_message_id`` wins over ``chat_id`` in Telegram: the edit may land in any
+    chat where the bot's inline message was posted, so it is never trusted."""
+    params = {
+        "chat_id": 42,
+        "inline_message_id": "AgAAAKjQ-x_",
+        "text": "y",
+        "caption": "y",
+        "media": {"type": "photo", "media": "file-id-1"},
+        "latitude": 1,
+        "longitude": 2,
+    }
+    reading = read(tg(method, params))
+    assert reading.effect is Effect.CHANGE
+    assert Note.INLINE_MESSAGE in reading.notes
+    assert reading.recipients == ("inline:AgAAAKjQ-x_",)
+    assert not all_trusted(reading, OWNER_CHAT)
+    plain = read(tg(method, {k: v for k, v in params.items() if k != "inline_message_id"}))
+    assert all_trusted(plain, OWNER_CHAT)  # the same edit in the owner's chat still passes
+
+
+def test_an_odd_inline_message_id_is_shown_as_a_digest() -> None:
+    reading = read(tg("editMessageText", {"inline_message_id": "a=b/c" * 30, "text": "y"}))
+    [recipient] = reading.recipients
+    assert recipient.startswith("inline:") and len(recipient) < 64
+    assert not all_trusted(reading, OWNER_CHAT)
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("sendPhoto", {"photo": "https://evil.example/x.png"}),
+        ("sendDocument", {"document": "HTTP://evil.example/a.pdf"}),
+        ("sendVideo", {"video": "https://evil.example/v"}),
+        ("sendAnimation", {"animation": "https://evil.example/a"}),
+        ("sendAudio", {"audio": "https://evil.example/a"}),
+        ("sendVoice", {"voice": "https://evil.example/a"}),
+        ("sendSticker", {"sticker": "https://evil.example/a.webp"}),
+        ("sendPhoto", {"photo": "file-id", "thumbnail": "https://evil.example/t"}),
+        ("sendMediaGroup", {"media": [{"type": "photo", "media": "https://evil.example/1"}]}),
+        (
+            "sendMediaGroup",
+            {"media": json.dumps([{"type": "photo", "media": "https://evil.example/2"}])},
+        ),
+        (
+            "editMessageMedia",
+            {"message_id": 1, "media": {"type": "photo", "media": "https://evil.example/3"}},
+        ),
+        ("sendMessage", {"text": "mira https://evil.example/leak"}),
+        ("sendMessage", {"text": "mira evil.example/leak"}),
+        (
+            "sendMessage",
+            {"text": '<a href="https://evil.example/l">aquí</a>', "parse_mode": "HTML"},
+        ),
+        (
+            "sendMessage",
+            {
+                "text": "aquí",
+                "entities": [
+                    {"type": "text_link", "offset": 0, "length": 4, "url": "https://evil.example/e"}
+                ],
+            },
+        ),
+        (
+            "sendMessage",
+            {"text": "hola", "link_preview_options": {"url": "https://evil.example/p"}},
+        ),
+        ("editMessageText", {"message_id": 1, "text": "ve a www.evil.example"}),
+    ],
+)
+def test_a_send_that_makes_telegram_fetch_a_url_is_never_trusted(
+    method: str, params: dict[str, object]
+) -> None:
+    """M3: Telegram's servers fetch a file given by URL and a link's preview: a channel out to
+    any host, even through the owner's chat. Held, with the URL in what the person reads."""
+    reading = read(tg(method, {"chat_id": 42, **params}))
+    assert reading.effect in (Effect.SEND, Effect.CHANGE)
+    assert Note.FETCHES_URL in reading.notes, reading
+    assert reading.target is not None and "evil.example" in reading.target
+    assert not all_trusted(reading, OWNER_CHAT)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"text": "hola, todo bien"},
+        {"text": "mira https://evil.example/x", "link_preview_options": {"is_disabled": True}},
+        {
+            "text": "mira https://evil.example/x",
+            "link_preview_options": json.dumps({"is_disabled": True}),
+        },
+        {"text": "mira evil.example", "disable_web_page_preview": True},
+        {"text": "escribe a ana@example.com"},
+        {"text": "versión 1.2.3, 3.14"},
+    ],
+)
+def test_a_text_without_previews_or_links_stays_trusted(params: dict[str, object]) -> None:
+    reading = read(tg("sendMessage", {"chat_id": 42, **params}))
+    assert Note.FETCHES_URL not in reading.notes
+    assert all_trusted(reading, OWNER_CHAT)
+
+
+def test_a_photo_by_file_id_or_upload_stays_trusted() -> None:
+    assert all_trusted(read(tg("sendPhoto", {"chat_id": 42, "photo": "AgACAgQAAxk"})), OWNER_CHAT)
+    caption = read(tg("sendPhoto", {"chat_id": 42, "photo": "AgAC", "caption": "evil.example"}))
+    assert all_trusted(caption, OWNER_CHAT)  # a caption gets no link preview
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"text": "mira https://evil.example/x"},
+        {"text": "mira https://evil.example/x", "unfurl_links": False},
+        {"text": "mira https://evil.example/x", "unfurl_media": "false"},
+        {"text": "hola", "icon_url": "https://evil.example/i.png"},
+        {
+            "text": "hola",
+            "blocks": [{"type": "image", "image_url": "https://evil.example/b", "alt_text": "x"}],
+        },
+        {
+            "text": "hola",
+            "blocks": json.dumps(
+                [{"type": "image", "alt_text": "x", "image_url": "https://evil.example/b"}]
+            ),
+        },
+        {"text": "hola", "attachments": [{"text": "x", "thumb_url": "https://evil.example/t"}]},
+    ],
+)
+def test_a_slack_message_that_makes_slack_fetch_a_url_is_never_trusted(
+    params: dict[str, object],
+) -> None:
+    reading = read(_slack("chat.postMessage", {"channel": CHANNEL, **params}))
+    assert reading.effect is Effect.SEND
+    assert Note.FETCHES_URL in reading.notes
+    assert reading.target is not None and "evil.example" in reading.target
+    assert not all_trusted(reading, SLACK_OWNER)
+
+
+def test_a_slack_message_with_unfurling_off_stays_trusted() -> None:
+    off = {
+        "channel": CHANNEL,
+        "text": "mira https://evil.example/x",
+        "unfurl_links": False,
+        "unfurl_media": False,
+    }
+    assert all_trusted(read(_slack("chat.postMessage", off)), SLACK_OWNER)
+    form = request("POST", "slack.com", "/api/chat.postMessage", headers=(SLACK_AUTH,),
+                   form=f"channel={CHANNEL}&text=mira+evil.example&unfurl_links=false"
+                   "&unfurl_media=false")  # fmt: skip
+    assert all_trusted(read(form), SLACK_OWNER)
+    plain = {"channel": CHANNEL, "text": "hola"}
+    assert all_trusted(read(_slack("chat.postMessage", plain)), SLACK_OWNER)
+
+
+def test_a_discord_message_that_makes_discord_fetch_a_url_is_never_trusted() -> None:
+    trusted = [normalize_trusted("discord", "1234567890")]
+    link = read(_discord("POST", f"{D}/channels/1234567890/messages",
+                         {"content": "mira https://evil.example/x"}))  # fmt: skip
+    assert Note.FETCHES_URL in link.notes and not all_trusted(link, trusted)
+    suppressed = read(
+        _discord(
+            "POST",
+            f"{D}/channels/1234567890/messages",
+            {"content": "mira https://evil.example/x", "flags": 4},
+        )
+    )
+    assert all_trusted(suppressed, trusted)
+    embed = read(
+        _discord(
+            "POST",
+            f"{D}/channels/1234567890/messages",
+            {
+                "content": "hola",
+                "flags": 4,
+                "embeds": [{"image": {"url": "https://evil.example/i"}}],
+            },
+        )
+    )
+    assert Note.FETCHES_URL in embed.notes and not all_trusted(embed, trusted)
+    assert all_trusted(read(_discord("POST", f"{D}/channels/1234567890/messages",
+                                     {"content": "hola"})), trusted)  # fmt: skip
+
+
+def test_slack_channels_are_trusted_by_id_only() -> None:
+    """M4: a name (``#general``) can be renamed, and Slack reads a name as another channel's:
+    only ids (``C…``, ``G…``, ``D…``) are trusted, and a reading's channel is compared by id."""
+    for name in ("#general", "general", "c0123abcd9", "C12", "@ana", "X0123ABCD9"):
+        with pytest.raises(ValueError):
+            normalize_trusted("slack", name)
+    for good in ("C0123ABCD9", "G0123ABCD9", "D0123ABCD9", " C0123ABCD9 "):
+        assert normalize_trusted("slack", good).recipient == good.strip()
+    by_name = read(_slack("chat.postMessage", {"channel": "#general", "text": "x"}))
+    from backtide.gate.translate.base import Trusted
+
+    assert not all_trusted(by_name, [Trusted("slack", "#general")])
+
+
+def test_only_slack_drops_its_own_token_and_only_its_token_field() -> None:
+    """M6: the Authorization token repeated in the body is left out of the secret scan only for
+    Slack's ``token`` field, when it is exactly the header's. Anywhere else it is a secret."""
+    token = SLACK_AUTH[1].split(" ", 1)[1]
+    twice = request("POST", "slack.com", "/api/conversations.info", headers=(SLACK_AUTH,),
+                    form=f"channel=C1&token={token}&cursor={token}")  # fmt: skip
+    assert read(twice).secret_seen
+    as_json = request("POST", "slack.com", "/api/conversations.info", headers=(SLACK_AUTH,),
+                      json_body={"channel": "C1", "token": token})  # fmt: skip
+    assert read(as_json).effect is Effect.READ and not read(as_json).secret_seen
+    search = request("POST", "api.tavily.com", "/search",
+                     headers=(("authorization", f"Bearer {SECRET}"),),
+                     json_body={"query": f"what is {SECRET}"})  # fmt: skip
+    assert read(search).secret_seen and read(search).effect is Effect.UNKNOWN
+
+
+def test_a_long_graph_draft_id_is_carried_as_a_digest_of_its_mailbox_and_id() -> None:
+    """M7: Graph ids are long and end in "="; they were dropped (``draft = None``). Now a
+    digest of the mailbox and the id, the same whatever the token (refreshed every hour)."""
+    long_id = "AAMkAGI2TG93AAA=" + "x" * 140 + "AAA="
+    patch = read(_graph("PATCH", f"{M}/messages/{long_id}", {"subject": "y"}))
+    assert patch.draft is not None and len(patch.draft) <= 64
+    other_token = read(
+        _graph(
+            "PATCH",
+            f"{M}/messages/{long_id}",
+            {"subject": "y"},
+            auth=("authorization", "Bearer eyOTHER.graph.token"),
+        )
+    )
+    assert other_token.draft == patch.draft and other_token.account != patch.account
+    send = read(_graph("POST", f"{M}/messages/{long_id}/send"))
+    assert send.draft == patch.draft
+    elsewhere = read(_graph("PATCH", f"/v1.0/users/ana@example.com/messages/{long_id}",
+                            {"subject": "y"}))  # fmt: skip
+    assert elsewhere.draft is not None and elsewhere.draft != patch.draft
+    short = read(_graph("PATCH", f"{M}/messages/AAMk1", {"subject": "y"}))
+    assert short.draft is not None and short.draft != patch.draft
+
+
+def test_a_gmail_draft_is_the_same_by_its_send_and_its_update() -> None:
+    send = read(_gmail("POST", f"{G}/drafts/send", {"id": "r-42"}))
+    update = read(_gmail("PUT", f"{G}/drafts/r-42", {"message": {"raw": "eA"}}))
+    assert send.draft is not None and send.draft == update.draft
+    assert read(_gmail("PUT", f"{G}/drafts/r-43", {"message": {"raw": "eA"}})).draft != send.draft

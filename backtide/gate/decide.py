@@ -15,7 +15,7 @@ The order, after the proxy's fixed rules of T06 (ports, private addresses, the r
 | 3 | Its fingerprint is preapproved (one use, 10 min) | ``pass`` |
 | 4 | Its fingerprint was rejected or expired less than 10 min ago | ``reject gate_rejected``, without asking again |
 | 5 | A translator read it (``reading``; rule 6 never applies then) | see below |
-| 6 | No translator: exactly ``GET``, ``HEAD`` or ``OPTIONS`` with no body, no method override header and no trailers | ``pass``, with decision 1's guard: a URL, or a header that is not a credential, whose redaction struck a secret is held with risk 3; a URL, or those headers together, over 2 KiB with risk 2; the credential headers together over 4 KiB with risk 2 (T10-3: with reads to any host they would be a free channel out) |
+| 6 | No translator: exactly ``GET``, ``HEAD`` or ``OPTIONS`` with no body, no method override header and no trailers | ``pass``, with decision 1's guard: a URL, or a header that is not a credential (its name or its value), whose redaction struck a secret is held with risk 3; to a host off the allowed list, a credential header whose redaction struck a secret with risk 3 and any credential header at all with risk 2 (review of T10-3, H1); a URL, or those headers together, over 2 KiB with risk 2; the credential headers together over 4 KiB with risk 2 (T10-3: with reads to any host they would be a free channel out). backtide then charges what passes to an unknown host to its read budget (``read_budget``, docs/32 section 13) |
 | 7 | Anything else (``POST``, ``PUT``, ``PATCH``, ``DELETE``, WebDAV, an unknown method, a ``GET`` with a body, an override header or trailers) | ``hold``: ``DELETE`` with risk 3, any other write with risk 2, or 3 when its URL or its body carried a secret |
 
 Rule 5, a translator's reading (T10-3, docs/32 sections 5 and 9):
@@ -25,7 +25,8 @@ Rule 5, a translator's reading (T10-3, docs/32 sections 5 and 9):
   (``path_credential``: Telegram's bot token, a webhook's secret), so that alone never does.
 - A change to a draft whose sending is held or preapproved (``draft_open``) is held: else the
   text the person approves could change before it goes out (decision 12).
-- ``READ`` passes, within the guard's lengths (URL and headers, 2 KiB each).
+- ``READ`` passes, within the guard's lengths (URL and headers, 2 KiB each; the credential
+  headers, 4 KiB together: review of T10-3, L9).
 - ``SEND`` or ``CHANGE`` to trusted recipients only (``trusted``: ``all_trusted``, never with a
   secret seen nor a cut reading) passes.
 - T10-4 (batches): a reading a batch rule covers will pass here; the hook is ``batch``.
@@ -36,7 +37,9 @@ Rule 5, a translator's reading (T10-3, docs/32 sections 5 and 9):
 The method of rule 6 is the one the agent sent, exactly: ``get`` is not ``GET`` (decision 11:
 an unknown method is a write). ``exact_read`` is False too for a request with a method override
 header or trailers (the proxy sees them; security review of T10-2, M2). The header guard (M3)
-leaves the credential headers out: the agent's own token to an API is not a leak.
+leaves the credential headers out: the agent's own token to an API is not a leak. But only to
+an API the person listed (``allowed``): to any other host, a credential header is held, with risk
+3 when the redaction recognises its value (``credentials_struck``; review of T10-3, H1).
 """  # noqa: E501
 
 from dataclasses import dataclass
@@ -92,6 +95,7 @@ class Facts:
     preapproved: bool = False
     rejected: bool = False  # rejected or expired less than 10 min ago
     credential_bytes: int = 0  # the bytes of its credential headers, names and values
+    credentials_struck: bool = False  # the redaction struck something of a credential header
     body_struck: bool = False  # its body carried a secret (only without a translator)
     reading: ReadingFacts | None = None  # a translator read it (rule 5)
 
@@ -130,6 +134,10 @@ def decide(facts: Facts, *, unknown_hosts: str = "hold") -> Decision:
             return Decision(Verdict.HOLD, "url_secret", 3)
         if facts.headers_struck:
             return Decision(Verdict.HOLD, "header_secret", 3)
+        if not facts.allowed and facts.credentials_struck:
+            return Decision(Verdict.HOLD, "credential_secret", 3)
+        if not facts.allowed and facts.credential_bytes > 0:
+            return Decision(Verdict.HOLD, "credential_unknown_host", 2)
         if facts.url_bytes > MAX_READ_URL:
             return Decision(Verdict.HOLD, "url_long", 2)
         if facts.header_bytes > MAX_READ_HEADERS:
@@ -156,6 +164,8 @@ def _translated(facts: Facts, reading: ReadingFacts) -> Decision:
                 return Decision(Verdict.HOLD, "url_long", 2)
             if facts.header_bytes > MAX_READ_HEADERS:
                 return Decision(Verdict.HOLD, "headers_long", 2)
+            if facts.credential_bytes > MAX_READ_CREDENTIALS:
+                return Decision(Verdict.HOLD, "credentials_long", 2)
             return Decision(Verdict.PASS, "translator_read")
         if effect in (Effect.SEND, Effect.CHANGE) and reading.trusted:
             return Decision(Verdict.PASS, "trusted")

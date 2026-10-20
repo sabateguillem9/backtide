@@ -43,6 +43,7 @@ from backtide.gate.translate.base import (
     content_type,
     credential,
     data_has_secret,
+    draft_ref,
     first_lines,
     has_secret,
     json_object,
@@ -91,7 +92,9 @@ def read(view: RequestView, context: Context) -> Reading:
         return unknown(NAME, Shape.GOOGLE, WAIT_GOG, error.note)
     tail = lowered[start + 4 :]
     try:
-        return _classify(view, context, account, tail, segments[start + 4 :], upload, params)
+        return _classify(
+            view, context, account, tail, segments[start + 4 :], upload, params, lowered[start + 3]
+        )
     except Unreadable as error:
         return unknown(NAME, Shape.GOOGLE, WAIT_GOG, error.note, account=account)
 
@@ -112,6 +115,7 @@ def _classify(
     raw_tail: tuple[str, ...],
     upload: bool,
     params: dict[str, str],
+    mailbox: str = "me",
 ) -> Reading:
     method = view.method
     if method in READ_METHODS:
@@ -123,27 +127,29 @@ def _classify(
     if tail == ("messages", "send") and method == "POST":
         return _send(view, context, account, upload, params)
     if tail == ("drafts", "send") and method == "POST":
-        draft = _draft_id(view)
+        given = _draft_id(view)
+        shown = safe_id(given)
         reading = unknown(
             NAME,
             Shape.GOOGLE,
             WAIT_GOG,
             Note.CONTENT_UNSEEN,
             account=account,
-            target=f"draft {draft}" if draft else "a saved draft",
+            target=f"draft {shown}" if shown else "a saved draft",
         )
-        return replace(reading, draft=draft)
+        return replace(reading, draft=draft_ref(mailbox, given))
     draft = Effect.READ if account in context.owner_accounts else Effect.CHANGE
     if tail == ("drafts",) and method == "POST":
         return _plain(draft, "drafts.create", account, Note.DRAFT)
     if len(tail) == 2 and tail[0] == "drafts":
         target = f"draft {item}" if item else None
+        ref = draft_ref(mailbox, raw_tail[1])  # review of T10-3, M7: any id, by its mailbox
         if method == "PUT":
             changed = _plain(draft, "drafts.update", account, Note.DRAFT, target=target)
-            return replace(changed, draft=item)
+            return replace(changed, draft=ref)
         if method == "DELETE" and not view.body:
             deleted = _plain(Effect.DELETE, "drafts.delete", account, target=target)
-            return replace(deleted, draft=item)
+            return replace(deleted, draft=ref)
     if upload:
         return unknown(NAME, Shape.GOOGLE, WAIT_GOG, account=account)
     if len(tail) == 3 and tail[0] in ("messages", "threads") and method == "POST":
@@ -175,9 +181,10 @@ def _classify(
     return unknown(NAME, Shape.GOOGLE, WAIT_GOG, account=account)
 
 
-def _draft_id(view: RequestView) -> str | None:
+def _draft_id(view: RequestView) -> object:
+    """The ``id`` of ``drafts/send``'s body, as given (None if the body is not JSON)."""
     try:
-        return safe_id(json_object(view.body).get("id"))
+        return json_object(view.body).get("id")
     except Unreadable:
         return None
 

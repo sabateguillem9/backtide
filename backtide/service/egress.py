@@ -62,6 +62,7 @@ from backtide.service.proxy_channel import (
     check_peer,
     open_channel,
 )
+from backtide.service.read_budget import ReadBudget
 from backtide.snapshots import utc_now
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,9 @@ class Egress:
         self._timings = timings
         self._history = history
         self._stale_closed = False
+        # One for the service, not one per connection: a proxy restart never refills what the
+        # reads to unknown hosts may still carry out this hour (review of T10-3, M5).
+        self._read_budget = ReadBudget(policy.read_budget_host, policy.read_budget_total)
 
     # The Guardian's calls
 
@@ -241,6 +245,8 @@ class Egress:
         Records ``system/proxy_reconfigured``, with the providers' names only. Never raises."""
         with self._lock:
             self._policy = policy
+            self._read_budget.host_bytes = policy.read_budget_host
+            self._read_budget.total_bytes = policy.read_budget_total
             names = [p.name for p in policy.providers.items]
             if not self._up or self._channel is None or self._channel.closed:
                 self._record("proxy_reconfigured", {"providers": names, "now": False}, risk=1)
@@ -447,6 +453,7 @@ class Egress:
                         budgets=Budgets(self._mono()),
                         on_budget=self._daily_budget_spent,
                         timings=self._timings,
+                        read_budget=self._read_budget,
                     )
                     channel.handshake(max(0.5, deadline - self._mono()))
                 except BaseException:

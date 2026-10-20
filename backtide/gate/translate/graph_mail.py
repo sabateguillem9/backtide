@@ -42,6 +42,7 @@ from backtide.gate.translate.base import (
     b64_decode,
     credential,
     data_has_secret,
+    draft_ref,
     first_lines,
     has_secret,
     has_secret_in,
@@ -108,7 +109,7 @@ def read(view: RequestView, context: Context) -> Reading:
     except Unreadable as error:
         return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, error.note)
     try:
-        return _classify(view, context, account, rest, raw)
+        return _classify(view, context, account, rest, raw, mailbox)
     except Unreadable as error:
         return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, error.note, account=account)
 
@@ -139,6 +140,7 @@ def _classify(
     account: str | None,
     rest: tuple[str, ...],
     raw: tuple[str, ...],
+    mailbox: str = "me",
 ) -> Reading:
     method = view.method
     if method in READ_METHODS:
@@ -165,20 +167,24 @@ def _classify(
     if tail == () and method == "POST":
         return _plain(draft, "messages.create", account, Note.DRAFT)
     index = len(raw) - len(tail)
-    item = safe_id(raw[index]) if tail and index < len(raw) else None
+    given = raw[index] if tail and index < len(raw) else None
+    item = safe_id(given)
+    # Graph's ids are long and end in "=": the draft is named by a digest of the mailbox and the
+    # id, never dropped (review of T10-3, M7).
+    ref = draft_ref(mailbox, given)
     target = f"message {item}" if item else None
     if len(tail) == 1 and method == "PATCH":
         changed = _plain(draft, "messages.update", account, Note.DRAFT, target=target)
-        return replace(changed, draft=item)
+        return replace(changed, draft=ref)
     if len(tail) == 1 and method == "DELETE" and not view.body:
         return _plain(Effect.DELETE, "messages.delete", account, target=target)
     if tail[1:] == ("attachments",) and method == "POST":
         # It cannot tell a draft from a sent message: an attachment is a draft's only there.
         added = _plain(draft, "messages.attachments.add", account, Note.DRAFT, target=target)
-        return replace(added, draft=item)
+        return replace(added, draft=ref)
     if len(tail) == 3 and tail[1] == "attachments" and method == "DELETE" and not view.body:
         removed = _plain(Effect.DELETE, "messages.attachments.delete", account, target=target)
-        return replace(removed, draft=item)
+        return replace(removed, draft=ref)
     if len(tail) != 2 or method != "POST":
         return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, account=account, target=target)
     action = tail[1]
@@ -187,7 +193,7 @@ def _classify(
     if action in _UNSEEN_ACTIONS:
         unseen = unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, Note.CONTENT_UNSEEN, account=account,
                          target=target or "a saved message")  # fmt: skip
-        return replace(unseen, draft=item if action == "send" else None)
+        return replace(unseen, draft=ref if action == "send" else None)
     if action == "permanentdelete":
         return _plain(Effect.DELETE, "messages.permanentDelete", account, target=target)
     if action in ("move", "copy"):

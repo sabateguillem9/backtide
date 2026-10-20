@@ -1162,3 +1162,85 @@ def test_a_read_to_a_host_named_with_a_secret_only_backtide_knows_is_held(
     assert ack["verdict"] == "hold"
     [held] = translated.gate_events("held")
     assert (held.risk, held.details["reason"]) == (3, "url_secret")
+
+
+# --- security review of T10-3 ----------------------------------------------------------------
+
+
+def test_a_credential_header_to_an_unknown_host_is_held(translated: Gated) -> None:
+    """H1: any credential header toward a host off allow_hosts is held (risk 2); one whose
+    value the redaction recognises, with risk 3. To a listed host it passes."""
+    ack = translated.ask(request_event("nope.example"), facts("7" * 64, credential_bytes=40))
+    assert ack["verdict"] == "hold"
+    struck = facts("8" * 64, credential_bytes=40, credentials_struck=True)
+    assert translated.ask(request_event("nope.example"), struck)["verdict"] == "hold"
+    first, second = translated.gate_events("held")
+    assert (first.risk, first.details["reason"]) == (2, "credential_unknown_host")
+    assert (second.risk, second.details["reason"]) == (3, "credential_secret")
+    listed = translated.ask(request_event("example.com"), facts("9" * 64, credential_bytes=40))
+    assert listed["verdict"] == "allow"
+
+
+def test_a_header_name_with_a_secret_only_backtide_knows_is_held(translated: Gated) -> None:
+    """H1: the recorded header names go through backtide's guard too (the Gateway token)."""
+    event = request_event("example.com", headers=[(f"x-{GATEWAY}", "1")])
+    assert translated.ask(event, facts("a" * 64))["verdict"] == "hold"
+    [held] = translated.gate_events("held")
+    assert (held.risk, held.details["reason"]) == (3, "header_secret")
+
+
+def test_reads_to_unknown_hosts_spend_a_read_budget(box: BlackBox) -> None:
+    """M5: the bytes of URL and headers of the reads that pass to unknown hosts are counted,
+    per host and in total, per hour; over either, the read is held (``read_budget``, risk 2).
+    The listed hosts are not counted."""
+    from backtide.service.read_budget import ReadBudget
+
+    made = Gated(box, policy=policy(unknown_hosts="hold"),
+                 read_budget=ReadBudget(host_bytes=200, total_bytes=300))  # fmt: skip
+    try:
+        one = facts("b" * 64, url_bytes=60, header_bytes=40)  # 100 bytes
+        assert made.ask(request_event("a.example"), one)["verdict"] == "allow"
+        assert made.ask(request_event("a.example"), facts("c" * 64, url_bytes=100, header_bytes=0))[
+            "verdict"
+        ] == "allow"  # fmt: skip
+        over = made.ask(request_event("a.example"), facts("d" * 64, url_bytes=60, header_bytes=0))
+        assert over["verdict"] == "hold"
+        [held] = made.gate_events("held")
+        assert (held.risk, held.details["reason"]) == (2, "read_budget")
+        assert made.ask(request_event("b.example"), facts("e" * 64, url_bytes=40, header_bytes=0))[
+            "verdict"
+        ] == "allow"  # fmt: skip
+        total = made.ask(request_event("c.example"), facts("f" * 64, url_bytes=70, header_bytes=0))
+        assert total["verdict"] == "hold"  # the total: 200 + 40 + 70 > 300
+        for _ in range(5):  # a listed host is never counted
+            assert made.ask(request_event("example.com"), facts("0" * 64, url_bytes=150))[
+                "verdict"
+            ] == "allow"  # fmt: skip
+    finally:
+        made.channel.close()
+
+
+def test_a_send_that_makes_the_platform_fetch_a_url_is_never_trusted(translated: Gated) -> None:
+    """M3: a photo by URL to the owner's chat makes Telegram fetch it: held, with the URL."""
+    from backtide.gate.translate import Context, RequestView, translate
+
+    path = f"/{BOT}/sendPhoto?chat_id={OWNER}&photo=https://evil.example/x.png"
+    view = RequestView(method="GET", host="api.telegram.org", port=443, path=path)
+    reading = translate(view, Context(key=bytes(32)))
+    assert reading is not None
+    gate = facts("1" * 64, reading=protocol.fit_reading(reading.summary()))
+    assert translated.ask(request_event("api.telegram.org", path=path), gate)["verdict"] == "hold"
+    [held] = translated.gate_events("held")
+    assert "https://evil.example/x.png" in held.details["phrase"]
+
+
+def test_an_inline_message_edit_is_never_trusted(translated: Gated) -> None:
+    """H2: ``inline_message_id`` wins over ``chat_id``: the edit may land in any chat."""
+    from backtide.gate.translate import Context, RequestView, translate
+
+    path = f"/{BOT}/editMessageText?chat_id={OWNER}&inline_message_id=AAA111&text=hola"
+    view = RequestView(method="GET", host="api.telegram.org", port=443, path=path)
+    reading = translate(view, Context(key=bytes(32)))
+    assert reading is not None
+    gate = facts("2" * 64, reading=protocol.fit_reading(reading.summary()))
+    assert translated.ask(request_event("api.telegram.org", path=path), gate)["verdict"] == "hold"

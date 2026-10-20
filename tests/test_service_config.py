@@ -771,6 +771,8 @@ def test_the_gate_holds_unknown_hosts_by_default_and_trusts_the_owners_chat(layo
     settings = config.gate_settings()
     assert settings.unknown_hosts == "hold" and settings.trusted == ()
     assert settings.timings.wait == 90 and settings.timings.life == 300
+    # Review of T10-3, M5: what reads to unknown hosts may carry out, per host and in total.
+    assert (settings.read_budget_host, settings.read_budget_total) == (256 * 1024, 2048 * 1024)
     owner = config.gate_settings(owner_chat=123456789).trusted
     assert [(t.translator, t.recipient) for t in owner] == [("telegram", "123456789")]
 
@@ -787,14 +789,17 @@ preapproval_s = 60
 trusted = [
   {translator = "gmail", email = "Ana@Ejemplo.COM"},
   {translator = "telegram", chat = 42},
-  {translator = "slack", channel = "C0123"},
+  {translator = "slack", channel = "C0123ABCD9"},
 ]
+read_budget_host_kib = 64
+read_budget_total_kib = 8192
 """
     settings = ServiceConfig.from_file(write_toml(layout, extra)).gate_settings(owner_chat=7)
     assert settings.unknown_hosts == "deny"
     assert [(t.translator, t.recipient) for t in settings.trusted] == [
-        ("gmail", "ana@ejemplo.com"), ("telegram", "42"), ("slack", "C0123"),
+        ("gmail", "ana@ejemplo.com"), ("telegram", "42"), ("slack", "C0123ABCD9"),
     ]  # fmt: skip
+    assert (settings.read_budget_host, settings.read_budget_total) == (64 * 1024, 8192 * 1024)
     assert settings.read_endpoints == ("search.fake.test/v1/query",)
     timings = settings.timings
     assert (timings.wait, timings.life, timings.preapproval) == (20, 120, 60)
@@ -814,6 +819,13 @@ trusted = [
         '[gate]\ntrusted = [{translator = "gmail", email = "not an address"}]',
         '[gate]\ntrusted = [{translator = "telegram", chat = "x y"}]',
         '[gate]\ntrust_owner_chat = "no"',
+        # Review of T10-3, M4: a Slack channel is trusted by its id, never by its name.
+        '[gate]\ntrusted = [{translator = "slack", channel = "#general"}]',
+        '[gate]\ntrusted = [{translator = "slack", channel = "general"}]',
+        '[gate]\ntrusted = [{translator = "slack", channel = "c0123abcd9"}]',
+        "[gate]\nread_budget_host_kib = -1",
+        "[gate]\nread_budget_total_kib = true",
+        "[gate]\nread_budget_total_kib = 2000000",
         '[gate]\ntoken = "x"',
         "[gate]\nunknown = 1",
         'gate = "hold"',

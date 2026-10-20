@@ -24,7 +24,7 @@ black box; the book only keeps the state:
 - **Caps:** at most ``max_open`` holds open (``open`` and ``releasing``); past it a request is
   refused (``hold_full``) and counted for a ``gate/flood`` at most every ``flood_every`` s.
 - **Drafts** (T10-3): a hold may name the saved draft it sends or changes (``draft``:
-  translator, account and draft id). While one is open, releasing or preapproved,
+  translator and draft reference, never the token). While one is open, releasing or preapproved,
   ``draft_open`` says so, and the gate holds any change to that draft: the text the person
   approves must not change before it goes out (docs/32, decision 12).
 - **What a restart loses only gave leave** (holds, preapprovals, rejections): ``close_all`` ends
@@ -43,7 +43,9 @@ from typing import Any
 
 from backtide.snapshots import utc_now
 
-DraftKey = tuple[str, str | None, str]  # translator, account (16 hex, or None), draft id
+# translator and draft (``base.draft_ref``: a digest of the mailbox and the draft's id, so a
+# refreshed token is the same draft; review of T10-3, M7)
+DraftKey = tuple[str, str]
 
 HOLD_ID_RE = re.compile(r"h-[0-9a-f]{12}", re.ASCII)
 STALE_WINDOW = timedelta(minutes=15)  # what a restart looks back at (docs/32, section 6)

@@ -39,6 +39,7 @@ is no setting that could make it listen on a network interface, and with ``--por
 the real port before the app is built (its ``Host`` check needs it).
 """
 
+import logging
 import socket
 from collections.abc import Callable, Sequence
 from types import FrameType
@@ -53,6 +54,8 @@ from backtide.web.reader import BoxReader
 from backtide.web.rewind import ControlRewinder
 from backtide.web.security import make_prefix, make_run_name, make_token
 from backtide.web.settings import ControlSettings, SettingsClient
+
+logger = logging.getLogger(__name__)
 
 LOOPBACK = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -79,11 +82,19 @@ class _Server(uvicorn.Server):
     After a graceful shutdown uvicorn re-raises each signal it caught (so a parent sees "died of
     SIGINT"), which with Python's own handler back in place means a ``KeyboardInterrupt``
     traceback, or death by SIGTERM, before ``backtide web`` can print its closing line and exit
-    0. The signal has done its job once the server has stopped: we forget it."""
+    0. The signal has done its job once the server has stopped: we forget it.
+
+    ``_captured_signals`` is uvicorn's own (0.54.0, locked in uv.lock; pyproject only asks for
+    0.54 or newer): if an upgrade renames it, nothing is cleared, we say so in the log, and
+    tests/test_web_server.py fails, rather than this going quiet."""
 
     def handle_exit(self, sig: int, frame: FrameType | None) -> None:
         super().handle_exit(sig, frame)
-        self._captured_signals.clear()
+        captured = getattr(self, "_captured_signals", None)
+        if isinstance(captured, list):
+            captured.clear()
+        else:
+            logger.warning("uvicorn changed: a stop signal may end `backtide web` by itself")
 
 
 def make_server(app: Callable) -> uvicorn.Server:  # type: ignore[type-arg]

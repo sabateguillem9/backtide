@@ -1596,7 +1596,7 @@ def test_every_net_request_carries_its_gate_facts() -> None:
     facts = facts_of(Flow(request=Request(method="GET", path="/v1/items?page=2")))
     assert set(facts) == {"fp", "url_struck", "url_bytes", "websocket", "exact_read",
                           "wait_hint_s", "headers_struck", "header_bytes", "credential_bytes",
-                          "body_struck", "reading"}  # fmt: skip
+                          "credentials_struck", "body_struck", "reading"}  # fmt: skip
     assert facts["reading"] is None and facts["credential_bytes"] == 0  # no translator here
     assert facts["headers_struck"] is False
     assert facts["header_bytes"] == len("Host") + len("example.com")
@@ -1748,6 +1748,29 @@ def test_common_token_headers_are_credentials(header: tuple[str, str]) -> None:
     token to that API, not a leak (their bytes are capped instead)."""
     facts = facts_of(Flow(request=get_with(header)))
     assert facts["headers_struck"] is False and facts["credential_bytes"] > 0
+
+
+@pytest.mark.parametrize(
+    "header",
+    [("Authorization", "token ghp_" + "A1b2C3d4" * 5), ("Cookie", "s=ghp_" + "Z9y8X7w6" * 5),
+     ("X-Auth-Token", "Bearer abcdefghijklmnop")],
+)  # fmt: skip
+def test_a_recognisable_secret_in_a_credential_header_is_told(header: tuple[str, str]) -> None:
+    """Review of T10-3, H1: the redaction runs over the credential headers' values too
+    (``credentials_struck``); backtide holds them toward a host off the allowed list."""
+    facts = facts_of(Flow(request=get_with(header)))
+    assert facts["credentials_struck"] is True and facts["headers_struck"] is False
+
+
+def test_an_opaque_credential_is_not_struck() -> None:
+    facts = facts_of(Flow(request=get_with(("Cookie", "theme=dark"))))
+    assert facts["credentials_struck"] is False and facts["credential_bytes"] > 0
+
+
+def test_a_secret_in_a_header_name_is_struck() -> None:
+    """Review of T10-3, H1: a header's NAME is a way out too."""
+    facts = facts_of(Flow(request=get_with(("ghp_" + "A1b2C3d4" * 5, "1"))))
+    assert facts["headers_struck"] is True
 
 
 def test_the_header_bytes_are_every_other_header() -> None:
