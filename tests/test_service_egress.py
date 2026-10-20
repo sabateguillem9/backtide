@@ -86,6 +86,9 @@ class FakeChannel:
         self.closed = True
         self.close_reason = self.close_reason or reason
 
+    def end_holds(self, reason: str) -> None:
+        self.log.append(f"channel.end_holds({reason})")
+
 
 class World:
     def __init__(self, tmp: Any) -> None:
@@ -313,9 +316,11 @@ def test_a_watch_that_breaks_is_recorded(world: World) -> None:
 
 
 def test_stop_stops_the_proxy_then_closes_the_channel(world: World) -> None:
+    """The holds end first, as a clean stop (``gate/expired {why: restart}``): stopping the
+    proxy first would make the reader see the channel lost (review of T10-2)."""
     started(world)
     world.egress.stop("service_stop")
-    assert world.log == ["proxy.stop", "channel.close(stop)"]
+    assert world.log == ["channel.end_holds(stop)", "proxy.stop", "channel.close(stop)"]
     assert world.only("proxy_stop") == ({"reason": "service_stop", "stopped": True}, 0)
     assert not world.egress.allows_agent()
 
@@ -324,7 +329,7 @@ def test_a_proxy_that_will_not_stop_is_killed(world: World) -> None:
     started(world)
     world.jail.fail["stop"] = JailError("timeout")
     world.egress.stop()
-    assert world.log[:2] == ["proxy.stop", "proxy.kill"]
+    assert world.log[:3] == ["channel.end_holds(stop)", "proxy.stop", "proxy.kill"]
     assert world.only("proxy_stop")[0]["stopped"] is True
 
 
@@ -376,8 +381,10 @@ class Holding(FakeChannel):
         super().__init__(log)
         self.asked: list[tuple[Any, ...]] = []
 
-    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> Any:
-        self.asked.append(("decide", hold_id, verdict, by, requested_by))
+    def decide(
+        self, hold_id: str, verdict: str, *, by: str, requested_by: str, frozen: Any = None
+    ) -> Any:
+        self.asked.append(("decide", hold_id, verdict, by, requested_by, frozen))
         return "outcome"
 
     def pending(self) -> list[dict[str, Any]]:
@@ -396,11 +403,14 @@ def test_decisions_go_to_the_channel_of_the_moment(world: World) -> None:
     world.egress._connect = world.connect  # noqa: SLF001
     started(world)
     assert world.egress.decide("h-1", "reject", by="cli", requested_by="me") == "outcome"
+    paused = lambda: True  # noqa: E731
+    world.egress.decide("h-2", "approve", by="cli", requested_by="me", frozen=paused)
     assert world.egress.pending() == [{"hold_id": "h-000000000001"}]
     assert world.egress.reject_holds("rewind") == 2
     assert world.egress.reject_holds("boom") == 0  # never raises into the Guardian
-    assert channel.asked[:2] == [
-        ("decide", "h-1", "reject", "cli", "me"),
+    assert channel.asked[:3] == [
+        ("decide", "h-1", "reject", "cli", "me", None),
+        ("decide", "h-2", "approve", "cli", "me", paused),  # the pause reaches the channel
         ("reject_open", "rewind"),
     ]
 

@@ -159,12 +159,18 @@ class Egress:
         return ok
 
     def stop(self, reason: str = "service_stop") -> None:
-        """The watch, then the proxy, then the channel (the agent is stopped already)."""
+        """The watch, the open holds, then the proxy, then the channel (the agent is stopped
+        already)."""
         if self._ticker is not None:
             self._ticker.close()
             self._ticker = None
         with self._lock:
             self._up = False
+            # The holds end first, as a clean stop (gate/expired {why: restart}): with the proxy
+            # stopped first, the reader would see the channel lost. Nothing goes out meanwhile:
+            # what the proxy holds waits for a decision that never comes, and dies with it.
+            if self._channel is not None:
+                self._channel.end_holds("stop")
             error = self._stop_container()
             self._close_channel("stop")
             details: dict[str, Any] = {"reason": reason, "stopped": error is None}
@@ -191,13 +197,22 @@ class Egress:
 
     # Held requests (T10-2)
 
-    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> HoldOutcome:
-        """Approve or reject a held request (``ProxyChannel.decide``). Without a channel there
-        is no hold: UNKNOWN. Never raises for a hold that is not there."""
+    def decide(
+        self,
+        hold_id: str,
+        verdict: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> HoldOutcome:
+        """Approve or reject a held request (``ProxyChannel.decide``; ``frozen``: the agent is
+        paused or being rewound, so nothing is approved). Without a channel there is no hold:
+        UNKNOWN. Never raises for a hold that is not there."""
         channel = self._channel
         if channel is None or channel.closed:
             return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
-        return channel.decide(hold_id, verdict, by=by, requested_by=requested_by)
+        return channel.decide(hold_id, verdict, by=by, requested_by=requested_by, frozen=frozen)
 
     def pending(self) -> list[dict[str, Any]]:
         channel = self._channel
@@ -213,6 +228,32 @@ class Egress:
         except Exception:
             logger.exception("rejecting the held requests failed")
             return 0
+
+    # New keys (T12e)
+
+    def reload(self, policy: Policy) -> bool:
+        """The providers' keys changed (the web's Settings page): from now on every connection
+        to the proxy hands it ``policy``, and the live one is replaced at once by a new one (the
+        proxy takes the newer connection and its ``config``, as on a reconnect), so the proxy
+        uses the new key without a restart. True if it took it now; False if the proxy is down
+        or did not answer, and then the watch brings it back with ``policy``. Requests held at
+        that moment end with their connection (refused, recorded as expired: fail closed).
+        Records ``system/proxy_reconfigured``, with the providers' names only. Never raises."""
+        with self._lock:
+            self._policy = policy
+            names = [p.name for p in policy.providers.items]
+            if not self._up or self._channel is None or self._channel.closed:
+                self._record("proxy_reconfigured", {"providers": names, "now": False}, risk=1)
+                return False
+            try:
+                ok = self._reconnect()
+            except Exception as error:  # _reconnect should not raise; the watch takes over
+                logger.exception("handing the new keys to the proxy failed")
+                self._record("proxy_reconfigured", {"providers": names, "now": False,
+                                                    "error": _short(error)}, risk=2)  # fmt: skip
+                return False
+            self._record("proxy_reconfigured", {"providers": names, "now": ok}, risk=0 if ok else 2)
+            return ok
 
     def _close_stale_holds(self) -> None:
         """Once per service: the holds a dead backtide left open in the black box are ended

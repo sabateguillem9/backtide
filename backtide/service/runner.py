@@ -20,6 +20,7 @@ Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
   a handler runs on the very thread that may be holding it.
 """
 
+import dataclasses
 import errno
 import fcntl
 import logging
@@ -42,6 +43,7 @@ from backtide.analyzer import (
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
 from backtide.blackbox.redact import KnownScrubber
+from backtide.gate.providers import Providers
 from backtide.jail import AgentJail, JailError, ca
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
@@ -49,7 +51,7 @@ from backtide.notify import AlertQueue, FanOut, LogNotifier, Notifier
 from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.sensors.tetragon import TetragonReader
 from backtide.service.bot import Hooks, telegram_parts
-from backtide.service.config import ConfigError, ServiceConfig
+from backtide.service.config import ConfigError, ServiceConfig, read_provider_keys
 from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
@@ -57,6 +59,7 @@ from backtide.service.holds import HoldTimings
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
 from backtide.service.proxy_channel import Policy, known_secrets
+from backtide.service.settings import Applied, Settings
 from backtide.service.telegram_config import load_telegram
 from backtide.snapshots import SnapshotStore, utc_now
 from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
@@ -230,6 +233,7 @@ def build_guardian(
     sensor_jail: SensorJailConfig | None = None,
     proxy: ProxyJail | None = None,
     hold_timings: HoldTimings | None = None,
+    on_egress: Callable[[Egress], None] | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -250,7 +254,9 @@ def build_guardian(
 
     The egress proxy (T06-4, ``build_egress``) is always there: it is the agent's only way out.
     ``proxy`` replaces its container (the VM tests: their concessions, docs/21 "En la VM"), and
-    ``hold_timings`` the gate's times (the VM tests shorten its 5 min and 90 s, T10-2)."""
+    ``hold_timings`` the gate's times (the VM tests shorten its 5 min and 90 s, T10-2).
+    ``on_egress`` is handed the egress once it is built (``serve``: the Settings page hands it
+    the providers' new keys, T12e)."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
         rules = load_rules(config)  # a broken file is an error, not a guess
@@ -289,6 +295,8 @@ def build_guardian(
         build_sensor(config, jail, rated_box, store, jail_config=sensor_jail) if sensor else None
     )
     egress = build_egress(config, jail, rated_box, proxy=proxy, timings=hold_timings)
+    if on_egress is not None:
+        on_egress(egress)
     guardian = Guardian(
         config,
         store=store,
@@ -361,17 +369,7 @@ def build_egress(
     T06-5), records through the rules (``box``) and strikes the Gateway token too. Constructed
     only: the Guardian starts it. ConfigError for an allowed host the gate cannot use."""
     proxy = proxy if proxy is not None else ProxyJail(config.proxy_jail_config())
-    settings = config.proxy_settings()
-    policy = Policy(
-        allow_hosts=settings.allow_hosts,
-        providers=config.model_providers(),
-        secrets=known_secrets([config.gateway_token.reveal()]),
-        provider_tools=settings.allow_provider_tools,
-    )
-    try:
-        policy.allow_list()
-    except ValueError as error:
-        raise ConfigError(f"[proxy] allow_hosts: {error}") from None
+    policy = egress_policy(config, config.model_providers())
     # The gate (T10-2) reads the black box once, at the first start: the holds a backtide that
     # died left open there are closed.
     return Egress(
@@ -382,6 +380,48 @@ def build_egress(
         timings=timings,
         history=box.events,
     )
+
+
+def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
+    """What backtide lets out through the proxy: the allowed hosts of ``[proxy]``, ``providers``
+    (their hosts, fake and real keys) and the Gateway token to strike. ConfigError for an allowed
+    host the gate cannot use."""
+    settings = config.proxy_settings()
+    policy = Policy(
+        allow_hosts=settings.allow_hosts,
+        providers=providers,
+        secrets=known_secrets([config.gateway_token.reveal()]),
+        provider_tools=settings.allow_provider_tools,
+    )
+    try:
+        policy.allow_list()
+    except ValueError as error:
+        raise ConfigError(f"[proxy] allow_hosts: {error}") from None
+    return policy
+
+
+def providers_now(config: ServiceConfig) -> Providers:
+    """The providers of ``[proxy]`` with the keys ``<state_dir>/keys/`` holds NOW (T12e: the
+    Settings page changed or removed one). A provider whose key was removed is left out, so the
+    proxy stops sending to it. ConfigError, never quoting a key, for a key file it cannot use."""
+    names = [p.name for p in config.proxy_settings().providers]
+    present = [name for name in names if os.path.lexists(config.keys_dir / f"{name}.key")]
+    keys = read_provider_keys(config.keys_dir, present) if present else {}
+    entries = config.proxy.get("providers", [])
+    kept = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") in keys]
+    now = dataclasses.replace(config, proxy={**config.proxy, "providers": kept}, provider_keys=keys)
+    return now.model_providers()
+
+
+def key_reloader(config: ServiceConfig, egress: Egress) -> Callable[[], Applied]:
+    """What the Settings page calls after it writes or removes a provider's key: the providers
+    read again and handed to the running proxy (``Egress.reload``), no restart."""
+
+    def reload() -> Applied:
+        policy = egress_policy(config, providers_now(config))
+        return Applied.NOW if egress.reload(policy) else Applied.WHEN_UP
+
+    return reload
 
 
 def prepare_egress(config: ServiceConfig) -> None:
@@ -536,6 +576,7 @@ def serve(
         telegram = telegram_parts(config, settings) if settings is not None else None
         if telegram is not None:
             notifier = FanOut(notifier or LogNotifier(), telegram.notifier)
+        built: list[Egress] = []
         guardian, alerts, box = build_guardian(
             config,
             jail=jail,
@@ -547,8 +588,19 @@ def serve(
             sensor_jail=sensor_jail,
             proxy=proxy,
             hold_timings=hold_timings,
+            on_egress=built.append,
         )
-        control: ControlHook = ControlServer(guardian, config.control_socket)
+        # The Settings page (T12e): `backtide web --ajustes` asks through this same socket.
+        (egress,) = built
+        settings_service = Settings(
+            config.state_dir,
+            record=box.append,
+            reload_keys=key_reloader(config, egress),
+            in_use=[p.name for p in config.proxy_settings().providers],
+        )
+        control: ControlHook = ControlServer(
+            guardian, config.control_socket, settings=settings_service
+        )
         if telegram is not None:
             snapshots = store if store is not None else SnapshotStore(config.volume)
             telegram.actions.bind(guardian, box, snapshots)

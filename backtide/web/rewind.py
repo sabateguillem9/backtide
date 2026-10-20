@@ -87,38 +87,41 @@ class ControlRewinder:
         self._euid = euid
 
     def availability(self) -> Availability:
-        """Can this process ask the service? Looked at, never connected to, and never
-        followed (a symbolic link is OFF: ``ask_rewind`` would refuse it too). Without
-        ``enabled`` (``--rebobinar``) it is DISABLED, whatever is there."""
-        if not self._enabled:
-            return Availability.DISABLED
-        try:
-            info = os.lstat(self._path)
-        except FileNotFoundError:
-            return self._without_socket()
-        except PermissionError:  # the state folder is not ours to look into
-            return Availability.OTHER_USER
-        except OSError:
-            return Availability.OFF
-        if not stat.S_ISSOCK(info.st_mode):
-            return Availability.OFF
-        if info.st_uid != self._euid():
-            return Availability.OTHER_USER
-        return Availability.READY
-
-    def _without_socket(self) -> Availability:
-        try:
-            folder = os.stat(self._path.parent)
-        except PermissionError:
-            return Availability.OTHER_USER
-        except OSError:
-            return Availability.OFF
-        return Availability.NO_SERVICE if folder.st_uid == self._euid() else Availability.OTHER_USER
+        """Can this process ask the service? Without ``enabled`` (``--rebobinar``) it is
+        DISABLED, whatever is there (``socket_availability``)."""
+        return socket_availability(self._path, enabled=self._enabled, euid=self._euid)
 
     def rewind(self, snapshot_id: str) -> dict[str, Any]:
         if not self._enabled:  # the app never gets here without READY; still, never by accident
             raise ControlError("esta web no se lanzó con --rebobinar")
         return ask_rewind(self._path, snapshot_id, via="web", wait=self._wait, peer=self._peer)
+
+
+def socket_availability(path: Path, *, enabled: bool, euid: Callable[[], int]) -> Availability:
+    """Can this process ask the service at ``path``? Looked at, never connected to, and never
+    followed (a symbolic link is OFF: the client would refuse it too). DISABLED when not
+    ``enabled``, whatever is there. Shared by the rewind and the Settings page (T12e)."""
+    if not enabled:
+        return Availability.DISABLED
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        try:
+            folder = os.stat(path.parent)
+        except PermissionError:
+            return Availability.OTHER_USER
+        except OSError:
+            return Availability.OFF
+        return Availability.NO_SERVICE if folder.st_uid == euid() else Availability.OTHER_USER
+    except PermissionError:  # the state folder is not ours to look into
+        return Availability.OTHER_USER
+    except OSError:
+        return Availability.OFF
+    if not stat.S_ISSOCK(info.st_mode):
+        return Availability.OFF
+    if info.st_uid != euid():
+        return Availability.OTHER_USER
+    return Availability.READY
 
 
 class Tickets:
@@ -164,4 +167,11 @@ class Tickets:
         return Redeemed.INVALID
 
 
-__all__ = ["Availability", "ControlRewinder", "Redeemed", "Rewinder", "Tickets"]
+__all__ = [
+    "Availability",
+    "ControlRewinder",
+    "Redeemed",
+    "Rewinder",
+    "Tickets",
+    "socket_availability",
+]

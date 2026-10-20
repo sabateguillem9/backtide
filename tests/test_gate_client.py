@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from backtide.gate import protocol, record
-from backtide.gate.client import NOT_RECORDED, SOCKET_NAME, Channel
+from backtide.gate.client import NOT_RECORDED, SOCKET_NAME, Channel, Slot
 from backtide.gate.protocol import Sender
 from backtide.gate.providers import FAKE_KEY_PREFIX, Kind, Provider, Providers, Secret
 
@@ -27,7 +27,8 @@ ME = os.getuid()
 REAL = "sk-ant-api03-TEST" + "cl13ntR3alK3y" * 4
 FAKE = FAKE_KEY_PREFIX + "anthropic-" + "C1l2i3e4n5t6A7b8C9d0E1f2G3h4I5j6"
 FAST = {"ack_timeout_ms": 300, "ping_interval_ms": 500, "max_queue": 3}
-GATE = protocol.gate(fp="f" * 64, url_struck=False, url_bytes=20, websocket=False, exact_read=True)
+GATE = protocol.gate(fp="f" * 64, url_struck=False, url_bytes=20, websocket=False, exact_read=True,
+                     headers_struck=False, header_bytes=40)  # fmt: skip
 
 
 @pytest.fixture
@@ -411,7 +412,7 @@ def test_a_held_request_waits_for_its_decision_and_says_it_was_released(folder: 
             await until(lambda: channel.ready)
             ack = await held_ack(channel, side)
             assert ack.held and (ack.hold_id, ack.wait_ms, ack.retry_after) == (HOLD, 500, 30)
-            assert channel.hold(HOLD)
+            assert channel.hold(HOLD) is Slot.TAKEN
             assert await channel.decision(HOLD, 0.05) is None  # not yet
             side.send(protocol.encode(protocol.decision(HOLD, "allow", seq=12), Sender.BACKTIDE))
             decided = await channel.decision(HOLD, 1)
@@ -428,7 +429,7 @@ def test_a_hold_that_waited_says_so_and_a_late_decision_changes_nothing(folder: 
             side = await connect(folder)
             await until(lambda: channel.ready)
             await held_ack(channel, side)
-            assert channel.hold(HOLD)
+            assert channel.hold(HOLD) is Slot.TAKEN
             assert await channel.decision(HOLD, 0.05) is None
             channel.let_go(HOLD, why="waited")
             left = await side.receive_type("hold_left")
@@ -446,7 +447,7 @@ def test_a_deny_is_not_answered(folder: Path) -> None:
             side = await connect(folder)
             await until(lambda: channel.ready)
             await held_ack(channel, side)
-            assert channel.hold(HOLD)
+            assert channel.hold(HOLD) is Slot.TAKEN
             side.send(
                 protocol.encode(protocol.decision(HOLD, "deny", reason="rejected"), "backtide")
             )
@@ -471,13 +472,59 @@ def test_one_request_per_hold_and_at_most_max_holds(folder: Path) -> None:
             for hold_id in ids:
                 await held_ack(channel, side, hold_id)
             await held_ack(channel, side, ids[0])  # a retry that joined the same hold
-            assert channel.hold(ids[0])
-            assert not channel.hold(ids[0])  # its twin waits already: "pending" at once
-            assert channel.hold(ids[1])
-            assert not channel.hold(ids[2])  # no slot
-            assert not channel.hold("h-0000000000ff")  # no ack held it
+            assert channel.hold(ids[0]) is Slot.TAKEN
+            assert channel.hold(ids[0]) is Slot.TWIN  # its twin waits already: "pending" at once
+            channel.let_go(ids[0], why="no_slot", slot=False)
+            assert channel.hold(ids[1]) is Slot.TAKEN
+            assert channel.hold(ids[2]) is Slot.FULL  # no slot
+            assert channel.hold("h-0000000000ff") is Slot.GONE  # no ack held it
             channel.let_go(ids[0], why="waited")
-            assert channel.hold(ids[2])  # a slot is free again
+            assert channel.hold(ids[2]) is Slot.TAKEN  # a slot is free again
+
+    run(go())
+
+
+def test_a_twin_without_a_slot_leaves_the_waiting_ones_slot_alone(folder: Path) -> None:
+    """Security review of T10-2, M1: an identical retry joins the hold in backtide and gets no
+    slot here. It says hold_left, and the request that waits keeps its slot and its decision."""
+
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            side = await connect(folder)
+            await until(lambda: channel.ready)
+            await held_ack(channel, side)  # A
+            await held_ack(channel, side)  # B, the same request again
+            assert channel.hold(HOLD) is Slot.TAKEN
+            assert channel.hold(HOLD) is Slot.TWIN
+            channel.let_go(HOLD, why="no_slot", slot=False)
+            left = await side.receive_type("hold_left")
+            assert left == {"type": "hold_left", "hold_id": HOLD, "why": "no_slot"}
+            side.send(protocol.encode(protocol.decision(HOLD, "allow", seq=12), Sender.BACKTIDE))
+            decided = await channel.decision(HOLD, 1)
+            assert decided is not None and (decided.verdict, decided.seq) == ("allow", 12)
+            channel.let_go(HOLD, released=True)
+            assert await side.receive_type("released") == {"type": "released", "hold_id": HOLD}
+
+    run(go())
+
+
+def test_a_hold_acked_twice_is_told_about_twice(folder: Path) -> None:
+    """Each hold ack is answered once: the second request of a hold, acked before the first let
+    go, is still known when it lets go itself (backtide counts both)."""
+
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            side = await connect(folder)
+            await until(lambda: channel.ready)
+            await held_ack(channel, side)
+            await held_ack(channel, side)
+            assert channel.hold(HOLD) is Slot.TAKEN
+            channel.let_go(HOLD, why="waited")
+            assert (await side.receive_type("hold_left"))["why"] == "waited"
+            assert channel.hold(HOLD) is Slot.TAKEN  # the second one, still acked
+            channel.let_go(HOLD, why="client_left")
+            assert (await side.receive_type("hold_left"))["why"] == "client_left"
+            assert channel.hold(HOLD) is Slot.GONE  # no ack left for it
 
     run(go())
 
@@ -488,13 +535,13 @@ def test_a_lost_channel_refuses_every_hold(folder: Path) -> None:
             side = await connect(folder)
             await until(lambda: channel.ready)
             await held_ack(channel, side)
-            assert channel.hold(HOLD)
+            assert channel.hold(HOLD) is Slot.TAKEN
             waiting = asyncio.ensure_future(channel.decision(HOLD, 5))
             side.writer.close()
             decided = await waiting
             assert decided is not None and decided.verdict == "lost"
             channel.let_go(HOLD, why="client_left")  # nothing to tell, nothing raised
-            assert not channel.hold(HOLD)
+            assert channel.hold(HOLD) is Slot.GONE
 
     run(go())
 
@@ -508,7 +555,7 @@ def test_a_hold_from_an_older_connection_gets_no_slot(folder: Path) -> None:
             new = await connect(folder)
             await until(lambda: channel.ready)
             assert await old.closed() and new is not None
-            assert not channel.hold(HOLD)  # its decision could never come
+            assert channel.hold(HOLD) is Slot.GONE  # its decision could never come
 
     run(go())
 

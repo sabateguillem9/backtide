@@ -298,8 +298,17 @@ class EgressProxy(Protocol):
 
     def stop(self, reason: str = ...) -> None: ...
 
-    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> HoldOutcome:
-        """Approve or reject a held request (T10-2)."""
+    def decide(
+        self,
+        hold_id: str,
+        verdict: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> HoldOutcome:
+        """Approve or reject a held request (T10-2); ``frozen``: nothing is approved while it
+        says True."""
         ...
 
     def pending(self) -> list[dict[str, Any]]:
@@ -460,6 +469,7 @@ class Guardian:
         self._thaw_to = AgentState.RUNNING  # what a freeze to confirm a condition goes back to
         self._confirm_freezes = 0  # freezes to confirm made so far (a start that meets one waits)
         self._pause_reasons: set[str] = set()
+        self._rewinding = False  # a rewind() runs: no held request is approved meanwhile
         # T09: bumped (under freeze_lock) by every freeze the person asks for, also when the
         # pause was open already, so a `seguir` decided before a later `/pausar` never undoes it.
         self._user_pause_epoch = 0
@@ -2128,7 +2138,11 @@ class Guardian:
                     target=target.id,
                     message="backtide no está en marcha: no se ha rebobinado nada.",
                 )
-            return self._rewind_locked(target, requester)
+            self._rewinding = True  # no approval until it ends (B2)
+            try:
+                return self._rewind_locked(target, requester)
+            finally:
+                self._rewinding = False
 
     def _rewind_locked(self, target: Snapshot, requested_by: str) -> RewindOutcome:
         self._settle_earlier_rewind()
@@ -3129,11 +3143,23 @@ class Guardian:
             return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
         try:
             return self._egress.decide(
-                hold_id, verdict, by=via, requested_by=str(requested_by)[:MAX_REQUESTER_CHARS]
+                hold_id,
+                verdict,
+                by=via,
+                requested_by=str(requested_by)[:MAX_REQUESTER_CHARS],
+                frozen=self._approvals_frozen,
             )
         except Exception:
             logger.exception("deciding on a held request failed")
             return HoldOutcome(HoldStatus.FAILED, hold_id)
+
+    def _approvals_frozen(self) -> bool:
+        """Nothing is approved while the person's pause is open or a rewind runs (security
+        review of T10-2, B2): a request in flight when they began is held after their
+        ``reject_holds``, and a yes would let it out for a frozen agent. Called under the
+        channel's gate lock, so it reads without taking ``freeze_lock`` (a set's membership and
+        a bool are read whole); the pause opens its reason before it rejects the holds."""
+        return "user" in self._pause_reasons or self._rewinding
 
     def pending_holds(self) -> list[dict[str, Any]]:
         """The held requests waiting for the person (`backtide retenidas`). Never raises."""

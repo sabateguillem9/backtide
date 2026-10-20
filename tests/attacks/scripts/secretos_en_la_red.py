@@ -10,16 +10,25 @@ query, in an odd header, in lower case, in a JSON body and in a form body, and c
 end of the body excerpt the proxy keeps (the first half inside it, the rest outside; and the
 other way round). The proxy does not know the token: backtide must strike it, and its pieces,
 before recording. A made-up key with a provider's shape goes along in a header and a body.
+
+With a 4th argument ``webhooks`` it sends, instead, credentials that live in a URL path (made up
+here, printed for the test to look for): a Discord webhook (/api/webhooks/{id}/{68-character
+token}) and a Slack incoming webhook (/services/T…/B…/{secret}), each plain, with its slashes
+as %2F, with doubled slashes and in mixed case; and a Telegram bot path with the colon as %3A.
+Each once as a GET and once as a POST.
 """
 
 import http.client
 import json
 import os
+import secrets
 import ssl
+import string
 import sys
 from urllib.parse import quote
 
 host, tag, excerpt = sys.argv[1], sys.argv[2], int(sys.argv[3])
+mode = sys.argv[4] if len(sys.argv) > 4 else "token"
 token = os.environ["OPENCLAW_GATEWAY_TOKEN"]
 made_up = "sk-ant-api03-" + "Mx7" * 30  # the shape of a key, nobody's
 PROXY = ("backtide-proxy", 8080)
@@ -41,6 +50,36 @@ def send(path, method="GET", headers=None, body=None):
     finally:
         conn.close()
 
+
+def made_up_token(length, alphabet=string.ascii_letters + string.digits + "_-"):
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+if mode == "webhooks":
+    discord = made_up_token(68)
+    slack = made_up_token(24, string.ascii_letters + string.digits)
+    telegram = made_up_token(35)
+    hook_id, team, bot = "".join(secrets.choice(string.digits) for _ in range(18)), "T0", "B0"
+    paths = {
+        "discord": f"/api/webhooks/{hook_id}/{discord}",
+        "discord-%2F": f"/api/webhooks%2F{hook_id}%2F{discord}",
+        "discord-//": f"/api//webhooks//{hook_id}//{discord}",
+        "discord-case": f"/api/WebHooks/{hook_id}/{discord}",
+        "slack": f"/services/{team}ABCDEF1/{bot}ABCDEF2/{slack}",
+        "slack-%2F": f"/services%2F{team}ABCDEF1%2F{bot}ABCDEF2%2F{slack}",
+        "slack-//": f"/services//{team}ABCDEF1//{bot}ABCDEF2//{slack}",
+        "slack-case": f"/SerVices/{team}ABCDEF1/{bot}ABCDEF2/{slack}",
+        "telegram-%3A": f"/bot{hook_id[:10]}%3A{telegram}/sendMessage",
+    }
+    sent = {}
+    for name, path in paths.items():
+        for method in ("GET", "POST"):
+            body = b'{"content": "hello"}' if method == "POST" else None
+            headers = {"content-type": "application/json"} if body else {}
+            sent[f"{method} {name}"] = send(f"/{tag}/{name}{path}", method, headers, body)
+    tokens = {"discord": discord, "slack": slack, "telegram": telegram}
+    print(json.dumps({"sent": sent, "tokens": tokens}))
+    sys.exit(0)
 
 half = len(token) // 2
 text = {"content-type": "text/plain"}

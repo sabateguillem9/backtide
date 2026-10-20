@@ -21,11 +21,11 @@ Every builder returns an event checked by ``protocol.validate_event``.
 """
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import unquote, unquote_plus
 
-from backtide.blackbox.redact import REDACTED, KnownScrubber, redact
+from backtide.blackbox.redact import REDACTED, KnownScrubber, redact, strike_text
 from backtide.gate.policy import normalize_host
 from backtide.gate.protocol import BLOCK_RISK, event_risk, validate_event
 
@@ -39,6 +39,7 @@ __all__ = [
     "error_event",
     "llm_request_event",
     "llm_response_event",
+    "headers_struck",
     "path_struck",
     "request_event",
     "response_event",
@@ -201,6 +202,20 @@ def _shows_once_decoded(head: str) -> bool:
     once = unquote(head)
     for decoded in {once, unquote(once), once.replace("\\", "/")} - {head}:
         if redact(decoded) != decoded:
+            return True
+    return False
+
+
+def headers_struck(pairs: Iterable[tuple[str, str]], secrets: Secrets) -> bool:
+    """Whether the redaction strikes something of these header values (by pattern, or a secret
+    it knows): the gate holds a read whose headers carried one, as one whose URL did (decision
+    1's guard; security review of T10-2, M3). The caller leaves the credential headers out and
+    bounds how much is read. Nothing is cut here: a long value is struck or not, never "struck"
+    for its length."""
+    scrub = _scrubber(secrets)
+    for _name, value in pairs:
+        text = str(value)
+        if strike_text(scrub.text(text)) != text:
             return True
     return False
 

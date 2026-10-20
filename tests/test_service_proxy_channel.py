@@ -56,7 +56,7 @@ def policy() -> Policy:
 def facts(fp: str = "e" * 64, **changes: Any) -> dict[str, Any]:
     """The gate facts of a plain GET (T10-2)."""
     base = {"fp": fp, "url_struck": False, "url_bytes": 30, "websocket": False,
-            "exact_read": True}  # fmt: skip
+            "exact_read": True, "headers_struck": False, "header_bytes": 60}  # fmt: skip
     return protocol.gate(**(base | changes))
 
 
@@ -791,6 +791,28 @@ def test_when_the_channel_ends_every_open_hold_is_expired(
     assert gated.channel.decide(hold_id, "approve", by="cli", requested_by="x").status == "unknown"
 
 
+def test_a_clean_stop_ends_the_holds_before_the_proxy_goes(box: BlackBox) -> None:
+    """backtide stopping: the holds end as a restart while the channel is still open (the
+    proxy is stopped next, and its end must not read as a lost channel); from then on nothing
+    is held or approved, and the end of the channel adds nothing."""
+    gated = Gated(box)
+    try:
+        hold_id = gated.ask(delete_event(), write_facts())["hold_id"]
+        gated.channel.end_holds("stop")
+        [expired] = gated.gate_events("expired")
+        assert (expired.details["hold_id"], expired.details["why"]) == (hold_id, "restart")
+        late = gated.ask(delete_event(path="/v1/buckets/b9"), write_facts(OTHER_FP))
+        assert (late["verdict"], late["reason"]) == ("deny", "not_recorded")
+        assert gated.channel.decide(hold_id, "approve", by="cli", requested_by="x").status == (
+            "unknown"
+        )
+        gated.proxy.sock.close()  # the proxy goes: nothing more is recorded about the holds
+        gated.until(lambda: gated.channel.closed)
+        assert len(gated.gate_events("expired")) == 1 and gated.gate_events("held")[1:] == []
+    finally:
+        gated.channel.close("stop")
+
+
 def test_a_proxy_that_goes_away_ends_its_holds(box: BlackBox) -> None:
     gated = Gated(box)
     gated.ask(delete_event(), write_facts())
@@ -819,6 +841,78 @@ def test_the_pending_holds_say_what_the_person_decides_on(gated: Gated) -> None:
         "host": "example.com", "path": "/v1/buckets/b1",
         "target": "https://example.com/v1/buckets/b1", "expires_in_s": 240, "waiting": True,
     }  # fmt: skip
+
+
+def test_a_twin_does_not_change_what_is_recorded_when_the_waiting_one_goes(gated: Gated) -> None:
+    """Security review of T10-2, M2: the net/request recorded on approval is the one of the
+    request in the proxy's slot (the first), not the twin's that got "pending"."""
+    first = gated.ask(delete_event(flow_id="f-first"), write_facts())
+    twin = gated.ask(delete_event(flow_id="f-twin"), write_facts())
+    assert twin["hold_id"] == first["hold_id"]
+    gated.proxy.send(protocol.hold_left(first["hold_id"], "no_slot"))
+    gated.until(lambda: gated.channel._book.get(first["hold_id"]).connected == 1)  # noqa: SLF001
+    assert gated.decide(first["hold_id"]) == "released"
+    [request] = gated.requests()
+    assert request.details["flow_id"] == "f-first"
+
+
+def test_approval_is_refused_while_the_agent_is_paused_or_rewound(gated: Gated) -> None:
+    """Security review of T10-2, B2: a request in flight when the agent was paused is held
+    after the pause; it cannot be approved until the agent runs again."""
+    hold_id = gated.ask(delete_event(), write_facts())["hold_id"]
+    outcome = gated.channel.decide(
+        hold_id, "approve", by="cli", requested_by="x", frozen=lambda: True
+    )
+    assert str(outcome.status) == "paused" and "pausado" in outcome.message
+    assert gated.gate_events("approved") == [] and gated.requests() == []
+    assert [p["hold_id"] for p in gated.channel.pending()] == [hold_id]  # still held
+    rejected = gated.channel.decide(
+        hold_id, "reject", by="cli", requested_by="x", frozen=lambda: True
+    )
+    assert str(rejected.status) == "rejected"  # a no is always welcome
+
+
+def test_a_pause_after_the_yes_leaves_no_preapproval_behind(gated: Gated) -> None:
+    hold_id = gated.ask(delete_event(), write_facts())["hold_id"]
+    assert gated.decide(hold_id) == "released"
+    gated.proxy.receive_type("decision")
+    assert gated.channel.reject_open("pause") == 0
+    gated.proxy.send(protocol.hold_left(hold_id, "client_left"))  # it never went
+    gated.until(lambda: gated.channel._book.get(hold_id) is None)  # noqa: SLF001
+    again = gated.ask(delete_event(flow_id="f2"), write_facts())
+    assert again["verdict"] == "hold" and again["hold_id"] != hold_id
+
+
+@pytest.mark.parametrize(
+    ("changes", "risk"),
+    [
+        ({"headers_struck": True}, 3),  # a read whose headers carried a secret
+        ({"header_bytes": 4000}, 2),
+    ],
+)
+def test_reads_are_guarded_by_their_headers(
+    gated: Gated, changes: dict[str, Any], risk: int
+) -> None:
+    ack = gated.ask(request_event(), facts(**changes))
+    assert ack["verdict"] == "hold"
+    assert gated.gate_events("held")[0].risk == risk
+
+
+def test_a_read_whose_headers_carry_a_secret_only_backtide_knows_is_held(gated: Gated) -> None:
+    """The proxy never sees the Gateway token: in a header value the recording keeps (as the
+    User-Agent), backtide strikes it, and holds the read."""
+    event = request_event(headers=[("User-Agent", f"agent {GATEWAY}")])
+    assert gated.ask(event, facts())["verdict"] == "hold"
+    [held] = gated.gate_events("held")
+    assert (held.risk, held.details["reason"]) == (3, "header_secret")
+
+
+def test_a_read_with_an_override_header_is_held_even_if_the_proxy_said_read(
+    gated: Gated,
+) -> None:
+    """M2 again, in backtide: the recorded header names are looked at as well."""
+    event = request_event(headers=[("X-HTTP-Method-Override", "DELETE")])
+    assert gated.ask(event, facts())["verdict"] == "hold"
 
 
 class Failing:

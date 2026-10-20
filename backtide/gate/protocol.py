@@ -18,8 +18,9 @@ fixes (the proxy cannot choose it). Errors never quote the offending value.
 
 The hold (T10-2, docs/32-diseno-t10-puerta.md, section 6): a ``net/request`` carries ``gate``,
 the facts backtide decides on (its fingerprint, whether the redaction struck something of its
-URL, how long that URL is, whether it opens a WebSocket, whether its method is exactly a read,
-and how long its client waits). The ack may say ``hold``: its ``seq`` is the ``gate/held``
+URL or of a header that is not a credential, how long that URL and those headers are, whether
+it opens a WebSocket, whether its method is exactly a read with no override header and no
+trailers, and how long its client waits). The ack may say ``hold``: its ``seq`` is the ``gate/held``
 already recorded, ``hold_id`` names the hold and ``wait_ms`` is how long the proxy keeps the
 request with its connection open. backtide's ``decision`` comes later: ``allow`` with the
 ``seq`` of the ``net/request`` already recorded, or ``deny``. The proxy answers each hold ack
@@ -87,6 +88,9 @@ BLOCK_RISK = {
     "not_recorded": 2,
     "not_allowed": 1,
     "undecodable": 2,  # a Content-Encoding the proxy cannot undo: its content cannot be checked
+    # HTTP/1 trailers: mitmproxy 12.2.3 cannot read them, so the request can be neither checked
+    # nor held (review of T10-2).
+    "trailers": 2,
     # T06-6: what goes to a provider's host leaves with the real key (provider_tools.py).
     "provider_endpoint": 2,  # not one of the provider's model endpoints
     "provider_body": 2,  # a body that is not the provider's JSON: its tools cannot be checked
@@ -98,7 +102,10 @@ DENY_REASONS = frozenset({"not_allowed", "throttled", "not_recorded", "gate_reje
 # Why backtide denies a held request (``decision``), and why the proxy no longer holds one.
 DECISION_REASONS = frozenset({"rejected", "expired", "paused", "hold_full"})
 HOLD_LEFT_WHY = frozenset({"client_left", "waited", "no_slot"})
-_GATE_KEYS = frozenset({"fp", "url_struck", "url_bytes", "websocket", "exact_read", "wait_hint_s"})
+_GATE_KEYS = frozenset(
+    {"fp", "url_struck", "url_bytes", "websocket", "exact_read", "wait_hint_s", "headers_struck",
+     "header_bytes"}
+)  # fmt: skip
 
 _REQUEST_KEYS = frozenset(
     {"flow_id", "method", "scheme", "host", "port", "path", "http_version", "server_ip",
@@ -303,14 +310,20 @@ def gate(
     url_bytes: int,
     websocket: bool,
     exact_read: bool,
+    headers_struck: bool,
+    header_bytes: int,
     wait_hint_s: int | None = None,
 ) -> dict[str, Any]:
     """The facts of a ``net/request`` that backtide decides on (docs/32, section 6): its exact
     fingerprint (64 hex), whether the redaction struck something of its URL, the URL's length in
-    bytes, whether it opens a WebSocket, whether its method is exactly GET, HEAD or OPTIONS,
-    and how long its client waits (a translator's hint, T10-3; None: 90 s)."""
+    bytes, whether it opens a WebSocket, whether its method is exactly GET, HEAD or OPTIONS (and
+    it has no method override header and no trailers), whether the redaction struck something
+    of a header that is not a credential and how many bytes those headers have (decision 1's
+    guard on the headers), and how long its client waits (a translator's hint, T10-3; None:
+    90 s)."""
     facts = {"fp": fp, "url_struck": url_struck, "url_bytes": url_bytes, "websocket": websocket,
-             "exact_read": exact_read, "wait_hint_s": wait_hint_s}  # fmt: skip
+             "exact_read": exact_read, "wait_hint_s": wait_hint_s,
+             "headers_struck": headers_struck, "header_bytes": header_bytes}  # fmt: skip
     return _check_gate(facts)
 
 
@@ -539,7 +552,7 @@ def _check_gate(value: object) -> dict[str, Any]:
     fp = value["fp"]
     if not isinstance(fp, str) or not _FP_RE.fullmatch(fp):
         raise ProtocolError("request.gate.fp: not a fingerprint")
-    for name in ("url_struck", "websocket", "exact_read"):
+    for name in ("url_struck", "websocket", "exact_read", "headers_struck"):
         if type(value[name]) is not bool:
             raise ProtocolError(f"request.gate.{name}: not a boolean")
     hint = value["wait_hint_s"]
@@ -549,6 +562,8 @@ def _check_gate(value: object) -> dict[str, Any]:
         "url_bytes": _int(value["url_bytes"], "request.gate.url_bytes", 0, _MAX_URL_BYTES),
         "websocket": value["websocket"],
         "exact_read": value["exact_read"],
+        "headers_struck": value["headers_struck"],
+        "header_bytes": _int(value["header_bytes"], "request.gate.header_bytes", 0, _MAX_URL_BYTES),
         "wait_hint_s": None
         if hint is None
         else _int(hint, "request.gate.wait_hint_s", 1, MAX_WAIT_HINT_S),

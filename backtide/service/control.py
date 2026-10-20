@@ -22,6 +22,11 @@ The server (inside the service):
   ``{"cmd": "resume"}``, ``{"cmd": "decide", "hold_id": ..., "verdict": "approve" | "reject"}``
   (plus ``via``; docs/32 section 11) or ``{"cmd": "holds"}``, with exactly those keys. The
   agent never reaches this socket (invariant 1), so it cannot approve its own requests.
+  The Settings page (T12e, ``backtide.service.settings``): ``{"cmd": "secrets"}`` (what is set,
+  with the last four characters at most), ``{"cmd": "set_secret", "kind": ..., "value": ...}``
+  (plus ``chat_id`` for ``telegram``, and ``via``) and ``{"cmd": "clear_secret", "kind": ...}``
+  (plus ``via``). A value is checked and written by the service; it is never logged, never put
+  in a refusal and never sent back.
   Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
   not a snapshot id) is refused WITHOUT calling the Guardian.
 - One thread per connection (``socketserver``), at most ``MAX_CONNECTIONS`` at a time, so a
@@ -55,6 +60,9 @@ from backtide.blackbox import redact
 from backtide.service.holds import HOLD_ID_RE, HoldOutcome, HoldStatus
 from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
+from backtide.service.settings import KINDS as SECRET_KINDS
+from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
+from backtide.service.settings import Applied, Outcome, SettingsOutcome
 from backtide.snapshots import Snapshot
 
 logger = logging.getLogger(__name__)
@@ -91,15 +99,22 @@ REQUESTERS = frozenset({"cli", "web", "telegram"})  # "telegram": the bot in the
 DECIDE_VERDICTS = frozenset({"approve", "reject"})
 _DECIDED = frozenset({HoldStatus.RELEASED, HoldStatus.PREAPPROVED, HoldStatus.REJECTED})
 HOLD_OUTCOMES = frozenset({*(str(status) for status in HoldStatus), REFUSED})
-# `backtide aprobar` / `rechazar`: 0 decided; 1 not done (no such hold, or not recorded); 2 a
-# request that was refused (malformed or not allowed), like an invalid id.
+# `backtide aprobar` / `rechazar`: 0 decided; 1 not done (no such hold, not recorded, or the agent
+# is paused); 2 a request that was refused (malformed or not allowed), like an invalid id.
 HOLD_EXIT_CODES = {
     **{str(status): 0 for status in _DECIDED},
     str(HoldStatus.UNKNOWN): 1,
     str(HoldStatus.FAILED): 1,
+    str(HoldStatus.PAUSED): 1,
     REFUSED: 2,
 }
 MAX_LISTED_HOLDS = 100
+# The Settings page (T12e): who may ask (not the bot: a key is never set from a chat), what a
+# change can answer, and how long a value may be (the service checks its shape).
+SETTINGS_REQUESTERS = frozenset({"cli", "web"})
+SETTINGS_OUTCOMES = frozenset({*(str(status) for status in Outcome), REFUSED})
+APPLIED = frozenset(str(applied) for applied in Applied)
+MAX_SECRET_CHARS = 256
 
 
 class ControlError(Exception):
@@ -127,6 +142,18 @@ class RewindService(Protocol):
     ) -> HoldOutcome: ...
 
     def pending_holds(self) -> list[dict[str, Any]]: ...
+
+
+class SettingsService(Protocol):
+    """What the server needs for the Settings page (``backtide.service.settings.Settings``)."""
+
+    def status(self) -> dict[str, dict[str, Any]]: ...
+
+    def set_secret(
+        self, kind: str, value: str, *, chat_id: str = "", requested_by: str
+    ) -> SettingsOutcome: ...
+
+    def clear_secret(self, kind: str, *, requested_by: str) -> SettingsOutcome: ...
 
 
 PeerCredentials = Callable[[socket.socket], tuple[int, int, int]]
@@ -168,8 +195,10 @@ class ControlServer:
         peer: PeerCredentials = peer_credentials,
         request_timeout: float = REQUEST_TIMEOUT,
         max_connections: int = MAX_CONNECTIONS,
+        settings: SettingsService | None = None,
     ) -> None:
         self._guardian = guardian
+        self._settings = settings
         self._path = Path(path)
         self._allowed_uid = allowed_uid if allowed_uid is not None else os.geteuid()
         self._peer = peer
@@ -311,7 +340,81 @@ class ControlServer:
             return self._decide(request, pid, uid)
         if command == "holds":
             return self._holds(request)
+        if command in ("secrets", "set_secret", "clear_secret"):
+            return self._settings_command(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
+
+    def _settings_command(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """The Settings page (T12e). The value is taken out of the request at once, checked and
+        written by ``Settings``, and never put in a reply, a refusal or a log line."""
+        command = request["cmd"]
+        value = request.pop("value", None)
+        chat_id = request.pop("chat_id", None)
+        try:
+            if self._settings is None:
+                raise _BadRequest("Este servicio no tiene ajustes que cambiar desde aquí.")
+            if command == "secrets":
+                if set(request) != {"cmd"} or value is not None or chat_id is not None:
+                    raise _BadRequest("Una petición de ajustes lleva `cmd` y nada más.")
+                return self._secrets_status()
+            allowed = {"cmd", "kind", "via"}
+            if set(request) - allowed or not {"cmd", "kind"} <= set(request):
+                raise _BadRequest("La petición de ajustes no lleva lo que debe.")
+            via = request.get("via", "cli")
+            if not isinstance(via, str) or via not in SETTINGS_REQUESTERS:
+                raise _BadRequest("Los ajustes solo se cambian desde la web o la terminal.")
+            kind = request["kind"]
+            if not isinstance(kind, str) or kind not in SECRET_KINDS:
+                raise _BadRequest("Ese tipo de clave no existe aquí.")
+            requested_by = f"{via} (uid {uid}, pid {pid})"
+            if command == "clear_secret":
+                if value is not None or chat_id is not None:
+                    raise _BadRequest("Para quitar una clave no se manda ninguna.")
+                outcome = self._settings_call(
+                    kind, lambda: self._settings.clear_secret(kind, requested_by=requested_by)
+                )
+                return _settings_reply(kind, outcome)
+            if not isinstance(value, str) or len(value) > MAX_SECRET_CHARS:
+                raise _BadRequest("La clave tiene que ser un texto corto.")
+            if chat_id is not None and (
+                kind != SECRET_TELEGRAM or not isinstance(chat_id, str) or len(chat_id) > 32
+            ):
+                raise _BadRequest("Solo Telegram lleva un chat, y es un texto corto.")
+            settings = self._settings
+            outcome = self._settings_call(
+                kind,
+                lambda: settings.set_secret(
+                    kind, value, chat_id=chat_id or "", requested_by=requested_by
+                ),
+            )
+            return _settings_reply(kind, outcome)
+        finally:
+            value = chat_id = None  # nothing here keeps the key once it is handed on
+            request.clear()
+
+    def _secrets_status(self) -> dict[str, Any]:
+        try:
+            shown = self._settings.status() if self._settings is not None else {}
+        except Exception as error:
+            logger.error("listing the settings raised instead of answering: %s",
+                         type(error).__name__)  # fmt: skip
+            return {"ok": False, "outcome": "failed", "secrets": {},
+                    "message": "No se han podido leer los ajustes."}  # fmt: skip
+        return {"ok": True, "outcome": "listed", "secrets": shown, "message": ""}
+
+    @staticmethod
+    def _settings_call(kind: str, call: Callable[[], SettingsOutcome]) -> SettingsOutcome:
+        """``call``, which should not raise; if it does, its text is not logged (it might hold
+        the value): only its type."""
+        try:
+            return call()
+        except Exception as error:
+            logger.error("changing the %s setting raised instead of answering: %s", kind,
+                         type(error).__name__)  # fmt: skip
+            return SettingsOutcome(
+                Outcome.FAILED,
+                "Ha fallado algo inesperado: mira el registro del servicio y la caja negra.",
+            )
 
     def _decide(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         if set(request) - {"via"} != {"cmd", "hold_id", "verdict"}:
@@ -442,6 +545,16 @@ class ControlServer:
             if not chunk:
                 return
             seen += len(chunk)
+
+
+def _settings_reply(kind: str, outcome: SettingsOutcome) -> dict[str, Any]:
+    return {
+        "ok": outcome.ok,
+        "outcome": str(outcome.status),
+        "message": outcome.message,
+        "applied": str(outcome.applied),
+        "kind": kind,
+    }
 
 
 def _refusal(message: str) -> dict[str, Any]:
@@ -761,6 +874,131 @@ def ask_holds(
             continue
         holds.append(item)
     return holds
+
+
+def ask_secrets(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, dict[str, Any]]:
+    """What the service at ``path`` has set (the Settings page, T12e): per kind, as
+    ``Settings.status`` says it. ControlError if the reply makes no sense or it could not
+    read them. The caller checks each field before showing it."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "secrets"},
+        what="la lectura de los ajustes",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict) or not isinstance(reply.get("secrets"), dict):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    if reply.get("ok") is not True:
+        message = reply.get("message")
+        raise ControlError(message if isinstance(message, str) else "No se han podido leer.")
+    return {
+        kind: entry
+        for kind, entry in reply["secrets"].items()
+        if kind in SECRET_KINDS and isinstance(entry, dict)
+    }
+
+
+def ask_set_secret(
+    path: Path,
+    kind: str,
+    value: str,
+    *,
+    chat_id: str | None = None,
+    via: str = "cli",
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Ask the service at ``path`` to put ``value`` as the key of ``kind`` (and, for Telegram,
+    ``chat_id``). Returns its reply, checked: ``ok``, ``outcome``, ``message``, ``applied``.
+    ValueError (nothing sent) for an unknown kind or ``via``; neither error ever holds the
+    value."""
+    if kind not in SECRET_KINDS or via not in SETTINGS_REQUESTERS:
+        raise ValueError("unknown kind or via")
+    request: dict[str, Any] = {"cmd": "set_secret", "kind": kind, "value": value}
+    if chat_id is not None:
+        request["chat_id"] = chat_id
+    if via != "cli":
+        request["via"] = via
+    del value
+    try:
+        raw = _ask(
+            Path(path),
+            request,
+            what="el cambio",
+            wait=wait,
+            reply_timeout=REPLY_TIMEOUT * 6,
+            peer=peer,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+    finally:
+        request.clear()
+    return _checked_settings_reply(raw)
+
+
+def ask_clear_secret(
+    path: Path,
+    kind: str,
+    *,
+    via: str = "cli",
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Ask the service at ``path`` to remove the key of ``kind``. Checked like
+    ``ask_set_secret``'s reply."""
+    if kind not in SECRET_KINDS or via not in SETTINGS_REQUESTERS:
+        raise ValueError("unknown kind or via")
+    request: dict[str, Any] = {"cmd": "clear_secret", "kind": kind}
+    if via != "cli":
+        request["via"] = via
+    raw = _ask(
+        Path(path),
+        request,
+        what="el cambio",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    return _checked_settings_reply(raw)
+
+
+def _checked_settings_reply(raw: bytes) -> dict[str, Any]:
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in SETTINGS_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si la clave ha cambiado: "
+            "mira la página de Ajustes y la caja negra."
+        )
+    applied = reply.get("applied")
+    return {
+        "ok": reply["ok"],
+        "outcome": reply["outcome"],
+        "message": reply["message"],
+        "applied": applied if applied in APPLIED else str(Applied.NONE),
+    }
 
 
 def _json_or_none(raw: bytes) -> Any:

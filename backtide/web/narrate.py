@@ -172,7 +172,16 @@ def _tell(event: Event) -> tuple[str, dict[str, Any], bool]:
         return "llm.call", {"target": target or Name(action)}, False
     if source is Source.GATE and target is not None:
         return "gate.hold", {"action": Name(action), "target": target}, False
+    if source is Source.SETTINGS and action in _SETTINGS_ACTIONS:
+        kind = _text(event.details.get("kind"))
+        if kind in _SETTINGS_KINDS:
+            return f"settings.event.{action}", {"what": Ref(f"settings.what.{kind}")}, False
     return _generic(event)
+
+
+# The person's changes to the Settings page (T12e): the kind and nothing else.
+_SETTINGS_ACTIONS = frozenset({"secret_set", "secret_cleared", "secret_failed"})
+_SETTINGS_KINDS = frozenset({"anthropic", "openai", "telegram"})
 
 
 def _generic(event: Event) -> tuple[str, dict[str, Any], bool]:

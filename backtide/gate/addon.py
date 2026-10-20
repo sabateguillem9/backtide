@@ -7,7 +7,11 @@ Design: docs/21-diseno-t06-proxy.md, sections 4 to 8. What each hook does:
 - ``http_connect``: a ``CONNECT`` to a port other than 80 or 443 is refused (``port``).
 - ``requestheaders``: no channel, no request (503, ``not_recorded``); at most ``max_pending``
   requests reading their body or waiting for their ack (429, ``throttled``); a body over the
-  limit is refused before it is read (413, ``too_large``).
+  limit is refused before it is read (413, ``too_large``); an HTTP/1 request that announces
+  trailers is cut (``trailers``: mitmproxy 12.2.3 cannot read them, so it could be neither
+  checked nor held). One whose body never reached the ``request`` hook (mitmproxy's reader
+  failed: an HTTP/1 trailer that was not announced) is recorded when its client goes
+  (``net/error {stage: request_unread}``), and its place is given back.
 - ``request`` (async): the fixed rules, in this order: port, the real key anywhere (URL, every
   header, the trailers, the raw and the decoded body: ``real_key``, on any host), a
   ``Content-Encoding`` that cannot be undone (``undecodable``), ``Host`` against the
@@ -50,7 +54,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from backtide.gate import protocol, record
-from backtide.gate.client import Ack, Channel, GateConfig
+from backtide.gate.client import Ack, Channel, GateConfig, Slot
 from backtide.gate.decide import READ_METHODS
 from backtide.gate.echo import KeyEcho, KeyScanner, SseGuard
 from backtide.gate.fingerprint import fingerprint
@@ -64,8 +68,9 @@ from backtide.gate.policy import (
     port_allowed,
 )
 from backtide.gate.provider_tools import check_request
-from backtide.gate.providers import Provider, swap_key
+from backtide.gate.providers import CREDENTIAL_HEADERS, Provider, swap_key
 from backtide.gate.sse import UsageStream, summarize_json
+from backtide.gate.translate.base import OVERRIDE_HEADERS
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +82,10 @@ JSON_SUMMARY_LIMIT = 1 << 20  # a provider's non-streamed answer is summarized u
 HELD_BUDGET = 128 * 1024 * 1024
 WEBSOCKET_SUMMARY_EVERY = 2.0  # seconds
 HOLD_POLL = 0.25  # seconds: how often a held request looks whether its client is still there
+# Bytes of a read's headers (but the credentials) the redaction reads for decision 1's guard.
+# Past 2 KiB the read is held anyway (risk 2); past this much it is not read at all, and counts
+# as struck (risk 3): what cannot be checked is not let out as a plain read.
+HEADER_SCAN_LIMIT = 64 * 1024
 EXIT_CODE = 70
 
 REFUSALS = {
@@ -91,6 +100,7 @@ REFUSALS = {
     "foreign_credential": (403, "backtide: only the fake key works with this provider\n"),
     "too_large": (413, "backtide: the body is over the limit\n"),
     "undecodable": (400, "backtide: this Content-Encoding cannot be checked\n"),
+    "trailers": (400, "backtide: HTTP/1 trailers cannot be checked, so this request is refused\n"),
     "provider_endpoint": (403, "backtide: only the provider's model endpoints are allowed\n"),
     "provider_body": (400, "backtide: a model request must be the provider's JSON\n"),
     "provider_side_tool": (
@@ -255,6 +265,8 @@ class Gate:
         self.agent_side: frozenset[str] = frozenset()
         self._clients: set[str] = set()
         self._waiting: set[str] = set()  # flows reading their body or waiting for their ack
+        # Flows whose request hook has not come yet: flow id -> (client id, what is known).
+        self._reading: dict[str, tuple[str, dict[str, Any]]] = {}
         self._acked: dict[str, set[tuple[str, int]]] = {}  # client id -> targets let through
         self._scanner_of: tuple[GateConfig, KeyScanner] | None = None
         self.held_bytes = 0  # reserved by the providers' answers held whole right now
@@ -289,9 +301,23 @@ class Gate:
         try:
             self._clients.discard(client.id)
             self._acked.pop(client.id, None)
+            self._forget_unread(client.id)
         except Exception:
             logger.exception("forgetting a client failed: stopping the proxy")
             self._die()
+
+    def _forget_unread(self, client_id: str) -> None:
+        """The requests of a client that is gone whose body never reached the request hook nor
+        the error hook (mitmproxy's reader failed on them): recorded, and their place given
+        back. Nothing of them went out."""
+        for flow_id, (owner, fields) in list(self._reading.items()):
+            if owner != client_id:
+                continue
+            del self._reading[flow_id]
+            self._waiting.discard(flow_id)
+            self._tell_error(
+                "request_unread", None, flow_id=flow_id, host=fields["host"], port=fields["port"]
+            )
 
     # Requests
 
@@ -310,6 +336,15 @@ class Gate:
         # BEFORE the request hook, that is, before backtide has recorded it. The body is read
         # whole (16 MiB at most, ``body_size_limit``), then checked, recorded and only then sent.
         flow.request.stream = False
+        if _announces_http1_trailers(flow.request):
+            # mitmproxy 12.2.3 raises on an HTTP/1 request's trailers before the request hook:
+            # it could be neither checked nor held. Cut now (an answer would have mitmproxy read
+            # the body, and fail on them anyway), and recorded.
+            self._channel.tell(
+                record.blocked_event("trailers", self._flow_fields(flow), self._channel.scrubber)
+            )
+            flow.kill()
+            return
         body = _may_have_body(flow.request)
         if len(self._waiting) >= self._channel.limits["max_pending"]:
             self._channel.count_throttled()
@@ -332,9 +367,12 @@ class Gate:
         # Every request whose body mitmproxy reads holds a place until its request (or error)
         # hook, the refused ones too: at most max_pending bodies of 16 MiB in memory.
         self._waiting.add(flow.id)
+        fields = self._flow_fields(flow)
+        self._reading[flow.id] = (flow.client_conn.id, {k: fields[k] for k in ("host", "port")})
 
     @_guard_request_phase("request")
     async def request(self, flow: Any) -> None:
+        self._reading.pop(flow.id, None)
         try:
             await self._request(flow)
         finally:
@@ -417,7 +455,7 @@ class Gate:
             gate = None  # a provider's host is never held (docs/32, section 5, rule 1)
         else:
             event = record.request_event(fields, config.scrubber)
-            gate = self._gate_facts(request, headers, body, config)
+            gate = self._gate_facts(request, headers, body, config, trailers)
         # Up to max_pending requests wait for their ack at once: each keeps only mitmproxy's raw
         # body, never a decoded copy of up to 16 MiB as well (T06-7).
         del fields["body"]
@@ -439,10 +477,13 @@ class Gate:
         headers: list[tuple[str, str]],
         body: bytes | None,
         config: GateConfig,
+        trailers: list[tuple[str, str]],
     ) -> dict[str, Any]:
-        """What backtide decides a request on (docs/32, section 6): its exact fingerprint, the
-        redaction's verdict on its URL, the URL's length, a WebSocket opening, and whether its
-        method is exactly a read."""
+        """What backtide decides a request on (docs/32, section 6): its exact fingerprint (every
+        header but the volatile ones, and the trailers, count: security review of T10-2, M2),
+        the redaction's verdict on its URL and on its headers that are not credentials, their
+        lengths, a WebSocket opening, and whether its method is exactly a read with no method
+        override header and no trailers (M2: either makes it a write)."""
         fp = fingerprint(
             config.fp_key,
             method=str(request.method),
@@ -451,14 +492,22 @@ class Gate:
             path=str(request.path),
             headers=headers,
             body=body,
+            trailers=trailers,
             canonical=None,  # T10-3: a translator's Reading.canonical (decision 2)
         )
+        overridden = any(name.strip().lower() in OVERRIDE_HEADERS for name, _ in headers)
+        plain = [pair for pair in headers if pair[0].strip().lower() not in CREDENTIAL_HEADERS]
+        header_bytes = sum(len(_utf8(name)) + len(_utf8(value)) for name, value in plain)
         return protocol.gate(
             fp=fp,
             url_struck=record.path_struck(request.path, config.scrubber),
-            url_bytes=len(str(request.url).encode("utf-8", "surrogateescape")),
+            url_bytes=len(_utf8(str(request.url))),
             websocket=any(name.strip().lower() == "upgrade" for name, _ in headers),
-            exact_read=request.method in READ_METHODS,
+            exact_read=request.method in READ_METHODS and not overridden and not trailers,
+            # M3: a GET can carry a secret in a header as well as in its URL.
+            headers_struck=header_bytes > HEADER_SCAN_LIMIT
+            or record.headers_struck(plain, config.scrubber),
+            header_bytes=header_bytes,
             wait_hint_s=None,  # T10-3: what the translator says its client waits
         )
 
@@ -471,12 +520,19 @@ class Gate:
         if flow.response is not None or self._client_gone(flow):
             if flow.response is None:
                 flow.kill()
-            self._channel.let_go(hold_id, why="client_left")
+            self._channel.let_go(hold_id, why="client_left", slot=False)
             return
-        if not self._channel.hold(hold_id):
-            # No slot (max_holds, or an identical request waits already): "pending" at once,
-            # and the hold lives on in backtide.
-            self._channel.let_go(hold_id, why="no_slot")
+        # HTTP/2 and 3: mitmproxy 12.2.3 queues a client's RST_STREAM behind this hook (the
+        # stream's layer is paused until it returns), so nothing here could tell that the client
+        # cancelled it: released later, it would go out with nobody waiting, and with its retry,
+        # twice (security review of T10-2, B1). Such a request is never kept: "pending" at once,
+        # and a yes becomes a preapproval that its retry spends, once.
+        multiplexed = str(flow.request.http_version).upper().startswith(("HTTP/2", "HTTP/3"))
+        if multiplexed or self._channel.hold(hold_id) is not Slot.TAKEN:
+            # No slot (max_holds, an identical request waits already, or HTTP/2): "pending" at
+            # once, and the hold lives on in backtide. A twin must not give back the slot of the
+            # request that waits (M1): it never had one.
+            self._channel.let_go(hold_id, why="no_slot", slot=False)
             self._pending(flow, hold_id, ack.retry_after)
             return
         told = False
@@ -516,7 +572,11 @@ class Gate:
                 self._channel.let_go(hold_id, why="client_left")
 
     def _client_gone(self, flow: Any) -> bool:
+        """Its connection ended, or mitmproxy marked the flow failed (``flow.error``: a reset
+        stream once its queued events run, a kill)."""
         conn = flow.client_conn
+        if getattr(flow, "error", None) is not None:
+            return True
         return getattr(conn, "timestamp_end", None) is not None or conn.id not in self._clients
 
     def _pending(self, flow: Any, hold_id: str, retry_after: int | None) -> None:
@@ -775,6 +835,7 @@ class Gate:
     def error(self, flow: Any) -> None:
         was_waiting = flow.id in self._waiting
         self._waiting.discard(flow.id)
+        self._reading.pop(flow.id, None)
         self._release(flow)
         meta = flow.metadata.get("backtide")
         if not meta:
@@ -993,6 +1054,14 @@ def decode_body(raw: bytes | None, encoding: str | None, limit: int = BODY_LIMIT
     raise Undecodable("undecodable")
 
 
+def _announces_http1_trailers(request: Any) -> bool:
+    """An HTTP/1 request with a ``Trailer`` header (RFC 9110, section 6.6.2): trailers follow
+    its chunked body. (HTTP/2's reach the request hook, and make it a write.)"""
+    if str(request.http_version).upper().startswith(("HTTP/2", "HTTP/3")):
+        return False
+    return request.headers.get("trailer") is not None
+
+
 def _may_have_body(request: Any) -> bool:
     """Whether a body may follow the headers. In HTTP/1 only with ``Content-Length`` above 0 or
     a ``Transfer-Encoding``; in HTTP/2 and 3 a body needs neither, so any request may have one
@@ -1011,6 +1080,10 @@ _BODY_LIMIT_ERROR = "body_size_limit"  # in mitmproxy 12.2.3's message for a bod
 def _over_body_limit(flow: Any) -> bool:
     error = getattr(flow, "error", None)
     return _BODY_LIMIT_ERROR in str(getattr(error, "msg", "") or "")
+
+
+def _utf8(text: str) -> bytes:
+    return text.encode("utf-8", "surrogateescape")
 
 
 def _header_pairs(headers: Any) -> list[tuple[str, str]]:

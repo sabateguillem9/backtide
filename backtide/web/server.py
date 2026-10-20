@@ -1,8 +1,9 @@
 """Run the web: bind 127.0.0.1 only, make the access token, serve until Ctrl-C.
 
 Who runs it. Two ways, and the web tells which one it is (in the terminal and on the snapshots
-page). Writes are explicit: without ``--rebobinar`` (``can_rewind``) the web only watches,
-whoever runs it, and as root it refuses to start (to watch, use a reader).
+page). Writes are explicit: without ``--rebobinar`` (``can_rewind``) and ``--ajustes``
+(``can_set``, the Settings page of T12e, which works the same way: by asking the service) the web
+only watches, whoever runs it, and as root it refuses to start (to watch, use a reader).
 
 - As a lower-privileged READER (the safe default for watching): not root, not the service's
   user. The web reads one file, ``blackbox.db`` (plus its ``-wal`` and ``-shm``), and the
@@ -50,6 +51,7 @@ from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import ControlRewinder
 from backtide.web.security import make_prefix, make_run_name, make_token
+from backtide.web.settings import ControlSettings, SettingsClient
 
 LOOPBACK = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -99,6 +101,8 @@ def run_web(
     *,
     snapshots: Callable[[], list[Snapshot]] | None = None,
     can_rewind: bool = False,
+    can_set: bool = False,
+    settings: SettingsClient | None = None,
     agent_name: str | None = None,
     others: Sequence[AgentSource] = (),
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
@@ -108,7 +112,9 @@ def run_web(
     this run, to compare with the one on the page. ``snapshots`` lists the snapshots; it is
     the volume's own list (``SnapshotStore``) unless given, which only the Mac's demo does
     (scripts/web-demo/serve.py: there is no btrfs there). ``can_rewind`` is `--rebobinar`:
-    without it the rewind buttons stay disabled whoever runs the web. ``agent_name``,
+    without it the rewind buttons stay disabled whoever runs the web. ``can_set`` is `--ajustes`
+    (T12e): without it the Settings page only says how to turn it on, and its POST does not
+    exist; ``settings`` replaces the control socket's client (the Mac's demo). ``agent_name``,
     ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
     requests) are only given by the demo today: T17 and T10 will fill them for real."""
     sock = bind(port)
@@ -127,6 +133,7 @@ def run_web(
         run_name=run_name,
         snapshots=snapshots or from_volume,
         rewinder=ControlRewinder(paths.control_socket, enabled=can_rewind),
+        settings=settings or ControlSettings(paths.control_socket, enabled=can_set),
         agent_name=agent_name,
         others=others,
         pending=pending,

@@ -18,6 +18,9 @@ class Source(StrEnum):
     GATE = "gate"
     SNAPSHOT = "snapshot"
     SYSTEM = "system"
+    # The person's own changes to backtide's settings (T12e): a key set or removed, from the web.
+    # Only the kind and who asked are ever recorded, never the key or a piece of it.
+    SETTINGS = "settings"
 
 
 @dataclass(frozen=True)

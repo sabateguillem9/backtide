@@ -107,11 +107,15 @@ class Lab:
 
 
 def start_lab(
-    btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory, *, inwards: bool = False
+    btrfs_volume: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    *,
+    inwards: bool = False,
+    hold_timings: tuple[str, ...] = HOLD_TIMINGS,
 ) -> Lab:
     """A started service with its fake internet. With ``inwards``, the allowed list also holds
     names that resolve to private addresses (ssrf-por-el-proxy: the fixed rule must still say
-    no)."""
+    no). ``hold_timings`` are the gate's shortened times (test_gate_attacks.py uses its own)."""
     vm._require_agent_image()
     vm._remove_stale_test_agents()
     names = vm._agent_names(os.getpid())
@@ -134,7 +138,7 @@ def start_lab(
     internet: FakeInternet | None = None
     try:
         internet = start_fake_internet(service, tmp_path_factory.mktemp("t06-5-internet"))
-        service.main_args = (*internet.service_args(), *HOLD_TIMINGS)
+        service.main_args = (*internet.service_args(), *hold_timings)
         service.start()
         service.wait_ready()
     except BaseException:
@@ -433,15 +437,32 @@ def test_secrets_in_requests_never_reach_the_black_box(attack: Attack, lab: Lab)
     outcome = attack.run_script(
         lab.agent, "secretos_en_la_red", PLAIN_HOST, tag, str(EXCERPT_BYTES)
     )
-    # The reads with the token only in a header go out; since T10-2 the writes, and the reads
-    # whose URL carried it (decision 1's guard), are held (429): recorded as gate/held.
+    # Since T10-2 the writes, and the reads whose URL or headers carried a secret the scrubber
+    # knows (decision 1's guard, M3 of the review), are held (429): recorded as gate/held. The
+    # lowercased token is not a known secret, so that read goes out (and is struck when recorded).
     statuses = outcome["sent"]
     assert all(status in (200, 429) for status in statuses.values()), outcome
-    assert statuses["header"] == statuses["lowercase"] == 200, outcome
+    assert statuses["header"] == 429 and statuses["lowercase"] == 200, outcome
     assert statuses["path"] == statuses["query"] == statuses["json"] == 429, outcome
     passed = [name for name, status in statuses.items() if status == 200]
     assert len(lab.internet.requests(PLAIN_HOST, f"/{tag}/")) == len(passed)
     recorded = lab.tagged(tag, "request") + lab.tagged(tag, "held")
+    # Credentials that live in a URL path (Discord and Slack webhooks, a Telegram bot path),
+    # plain and encoded: every one held (a GET whose URL carried a secret, with risk 3; a POST,
+    # as any write, with 2). A struck path may lose its tag, so they are found by seq.
+    hooks_tag = new_tag()
+    seq = lab.head()
+    hooks = attack.run_script(
+        lab.agent, "secretos_en_la_red", PLAIN_HOST, hooks_tag, str(EXCERPT_BYTES), "webhooks"
+    )
+    hook_held = [e for e in lab.since(seq, "held") if e.source == "gate"]
+    hook_out = lab.internet.requests(PLAIN_HOST, f"/{hooks_tag}/")
+    hook_risks = {
+        method: sorted({e.risk for e in hook_held if e.details.get("method") == method})
+        for method in ("GET", "POST")
+    }
+    get_reasons = sorted({str(e.details.get("reason")) for e in hook_held
+                          if e.details.get("method") == "GET"})  # fmt: skip
     config = lab.service.config
     box = b""
     for path in (config.blackbox_db, config.blackbox_checkpoint):
@@ -453,21 +474,48 @@ def test_secrets_in_requests_never_reach_the_black_box(attack: Attack, lab: Lab)
     whole = sorted(s for s in spellings(token) if s.encode() in box or s.encode() in proxy_log)
     bits = sorted(p for p in pieces(token) if p.encode() in box)
     made_up = "sk-ant-api03-" + "Mx7" * 30
+    hook_bits = sorted(
+        f"{name}:{p}"
+        for name, value in hooks["tokens"].items()
+        for p in pieces(value)
+        if p.encode() in box or p.encode() in proxy_log
+    )
     attack.check(
         "stopped",
-        whole == [] and bits == [] and made_up.encode() not in box,
+        whole == []
+        and bits == []
+        and made_up.encode() not in box
+        and hook_bits == []
+        and hook_out == []
+        and all(status == 429 for status in hooks["sent"].values()),
         f"el token del Gateway (lo tiene en su entorno) fue en la ruta, la consulta, una cabecera "
         f"rara, en minúsculas, un JSON, un formulario y partido por el borde del extracto de "
         f"{EXCERPT_BYTES} bytes (por los dos lados), con una clave inventada al lado: ni el token "
         f"({whole or 'nada'}), ni ningún trozo suyo de 8 caracteres ({bits[:3] or 'nada'}), ni la "
         "clave inventada están en la caja negra (base, WAL y punto de control) ni en el log del "
-        "proxy",
+        f"proxy. Un webhook de Discord, uno de Slack (cada uno tal cual, con %2F, con // y con "
+        f"mayúsculas mezcladas) y una ruta de bot de Telegram con %3A, por GET y por POST: "
+        f"{sorted(set(hooks['sent'].values()), key=str)}; al servidor falso no llega ninguno "
+        f"({len(hook_out)}) y ningún trozo de 8 caracteres de sus tokens está en la caja negra ni "
+        f"en el log del proxy ({hook_bits[:3] or 'nada'})",
     )
     paths = sorted(str(e.details.get("path", "")) for e in recorded)
     attack.check(
         "recorded",
         len(recorded) == len(outcome["sent"]),
         f"las {len(recorded)} peticiones quedan grabadas, con el secreto tachado ({paths[:2]}...)",
+    )
+    attack.check(
+        "risk",
+        hook_risks == {"GET": [3], "POST": [2]} and get_reasons == ["url_secret"],
+        f"los webhooks retenidos: por GET con riesgo {hook_risks['GET']} ({get_reasons}), por "
+        f"POST con riesgo {hook_risks['POST']}",
+    )
+    attack.check(
+        "held",
+        len(hook_held) == len(hooks["sent"]),
+        f"{len(hook_held)} gate/held para las {len(hooks['sent'])} peticiones con un webhook o un "
+        "token de bot en la ruta: ninguna sale como lectura",
     )
 
 

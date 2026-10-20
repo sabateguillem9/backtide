@@ -6,15 +6,21 @@ black box; the book only keeps the state:
 
 - **A hold** is born with its ``gate/held`` (``open``, then ``recorded``) and lives 5 min from
   then (``life``); a retry with the same fingerprint joins it (``join``: no new event, no new
-  alert) and never extends that life. ``connected`` counts the attempts the proxy holds with
-  their connection open: each hold ack is answered by the proxy with exactly one ``released``
-  or ``hold_left`` (unless a deny came), so the count is exact.
+  alert) and never extends that life. Its ``event`` is the ``net/request`` recorded if the yes
+  lets it out: the one of the request in the proxy's slot. A retry that joins while one waits
+  is a twin with no slot, so it never replaces it (security review of T10-2, M2).
+  ``connected`` counts the attempts the proxy holds with their connection open: each hold ack
+  is answered by the proxy with exactly one ``released`` or ``hold_left`` (unless a deny
+  came), so the count is exact.
 - **A yes is spent once.** With a request connected, the hold is ``releasing`` (backtide sent
   ``decision allow``) until the proxy says ``released`` (spent: gone). If it says ``hold_left``
   instead and nothing else waits, the yes becomes a **preapproval**: the next identical request
   passes, once, within 10 min. With nobody connected the yes is a preapproval at once.
 - **A no is remembered** 10 min (``rejected``), and so is an expiry: the same request is refused
   without asking again.
+- **A pause or a rewind** (``reject_open``) rejects what is open, drops the preapprovals, and
+  marks the yes being released (``frozen``): if the proxy says ``hold_left`` for it afterwards,
+  it is dropped, never kept as a preapproval for the agent's next request (review, B2).
 - **Caps:** at most ``max_open`` holds open (``open`` and ``releasing``); past it a request is
   refused (``hold_full``) and counted for a ``gate/flood`` at most every ``flood_every`` s.
 - **What a restart loses only gave leave** (holds, preapprovals, rejections): ``close_all`` ends
@@ -66,6 +72,7 @@ class HoldStatus(StrEnum):
     REJECTED = "rejected"
     UNKNOWN = "unknown"  # no open hold with that id (decided, expired, or a restart)
     FAILED = "failed"  # the approval could not be recorded, so it was not given
+    PAUSED = "paused"  # the agent is paused or being rewound: nothing is approved meanwhile
 
 
 HOLD_MESSAGES = {
@@ -87,6 +94,10 @@ HOLD_MESSAGES = {
         "No se ha podido grabar la aprobación en la caja negra, así que no se aprueba: la "
         "petición sigue retenida."
     ),
+    HoldStatus.PAUSED: (
+        "El agente está pausado o se está rebobinando, así que no se aprueba nada: la petición "
+        "sigue retenida. Usa /seguir (o `backtide seguir`) y vuelve a aprobarla, o recházala."
+    ),
 }
 
 
@@ -106,7 +117,7 @@ class Hold:
     fp: str
     risk: int
     reason: str
-    event: dict[str, Any]  # the struck net/request of the latest attempt
+    event: dict[str, Any]  # the struck net/request of the attempt in the proxy's slot
     created: float
     expires: float
     expires_at: str  # the same moment on the wall clock, for the black box
@@ -114,6 +125,7 @@ class Hold:
     connected: int = 0
     state: State = State.OPEN
     until: float | None = None  # a preapproval's end
+    frozen: bool = False  # a pause or a rewind came while it was releasing: no preapproval
 
     @property
     def live(self) -> bool:
@@ -227,9 +239,12 @@ class HoldBook:
         self._drop(hold)
 
     def join(self, hold: Hold, event: dict[str, Any]) -> None:
-        """Another request with the same fingerprint waits on ``hold``."""
+        """Another request with the same fingerprint waits on ``hold``. Its event is kept only
+        when no other request is connected: then it is the one that takes the proxy's slot (a
+        twin of a request that waits gets none, and lets go at once)."""
+        if hold.connected == 0:
+            hold.event = event
         hold.connected += 1
-        hold.event = event
 
     def spend(self, fp: str) -> Hold | None:
         """Use the preapproval of ``fp`` (once): the hold, gone, or None."""
@@ -279,7 +294,10 @@ class HoldBook:
             return None
         hold.connected = max(0, hold.connected - 1)
         if hold.state is State.RELEASING and hold.connected == 0:
-            self.preapprove(hold)
+            if hold.frozen:
+                self._drop(hold)  # paused after the yes: it does not wait for the agent
+            else:
+                self.preapprove(hold)
         return hold
 
     def due(self) -> list[Hold]:
@@ -313,8 +331,9 @@ class HoldBook:
         return ended
 
     def reject_open(self) -> list[Hold]:
-        """A pause or a rewind: every open hold rejected (and remembered), and the unused
-        preapprovals dropped (a leave given before it does not survive it)."""
+        """A pause or a rewind: every open hold rejected (and remembered), the unused
+        preapprovals dropped (a leave given before it does not survive it), and the yes being
+        released marked so that it never becomes one."""
         rejected = []
         for hold in list(self._holds.values()):
             if hold.state is State.OPEN:
@@ -322,6 +341,8 @@ class HoldBook:
                 rejected.append(hold)
             elif hold.state is State.PREAPPROVED:
                 self._drop(hold)
+            elif hold.state is State.RELEASING:
+                hold.frozen = True
         return rejected
 
     def flood(self) -> tuple[int, int] | None:

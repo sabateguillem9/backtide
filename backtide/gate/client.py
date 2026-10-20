@@ -23,6 +23,10 @@ a socket of the host). So here:
   time (so the gate can watch the client too), and ``let_go`` gives the slot back saying
   ``released`` or ``hold_left``. When the connection ends, every hold on it is ``LOST``: the
   gate refuses it (503), and backtide records it as expired.
+- **A twin** (the same request again while the first waits: backtide joins it to the same
+  hold) gets no slot (``Slot.TWIN``) and lets go with ``slot=False``: it says ``hold_left`` and
+  leaves the waiting request's slot and decision alone (security review of T10-2, M1). The
+  hold acks are counted per hold, so each one is answered once, whichever lets go first.
 
 Never logs a message's content: only its type (``protocol.describe``) and error kinds.
 Imports the standard library and ``backtide.gate``/``backtide.blackbox.redact`` only.
@@ -38,6 +42,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from backtide.blackbox.redact import KnownScrubber
@@ -113,6 +118,16 @@ class Decision:
     verdict: str
     seq: int | None = None
     reason: str | None = None
+
+
+class Slot(StrEnum):
+    """What ``hold`` did: only TAKEN has a slot (and must ``let_go`` it); the rest let go with
+    ``slot=False``."""
+
+    TAKEN = "taken"
+    TWIN = "twin"  # another request of the same hold has the slot already
+    FULL = "full"  # max_holds are waiting
+    GONE = "gone"  # the connection that held it ended, or no ack held it
 
 
 NOT_RECORDED = Ack("deny", reason="not_recorded")
@@ -198,6 +213,7 @@ class Channel:
         self._wake: asyncio.Event | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._held_on: dict[str, _Connection] = {}  # hold id -> the connection whose ack held it
+        self._acks: dict[str, int] = {}  # hold id -> its hold acks not let go yet
         self._holds: dict[str, _Connection] = {}  # hold id -> the connection of its waiting slot
 
     # Public
@@ -262,7 +278,11 @@ class Channel:
             conn.send(protocol.encode(protocol.request(request_id, event, gate), Sender.PROXY))
             ack = await asyncio.wait_for(future, timeout)
             if ack.held:
-                self._held_on[ack.hold_id] = conn  # type: ignore[index]
+                hold_id = str(ack.hold_id)
+                if self._held_on.get(hold_id) is not conn:
+                    self._acks.pop(hold_id, None)  # an id of an older connection: not this one
+                self._held_on[hold_id] = conn
+                self._acks[hold_id] = self._acks.get(hold_id, 0) + 1
             return ack
         except TimeoutError:
             logger.warning("no ack from backtide in %.1f s: the request is refused", timeout)
@@ -273,18 +293,21 @@ class Channel:
         finally:
             conn.pending.pop(request_id, None)
 
-    def hold(self, hold_id: str) -> bool:
-        """Take a slot for the request held as ``hold_id``. False (nothing taken) when the
-        connection that held it is gone, another request of the same hold is waiting already,
-        or ``max_holds`` are waiting: the gate then answers "pending" at once (``no_slot``)."""
+    def hold(self, hold_id: str) -> Slot:
+        """Take a slot for the request held as ``hold_id``. Anything but TAKEN (nothing taken):
+        the connection that held it is gone (GONE), another request of the same hold is waiting
+        already (TWIN), or ``max_holds`` are waiting (FULL); the gate then answers "pending" at
+        once (``no_slot``) and lets go with ``slot=False``."""
         conn = self._held_on.get(hold_id)
-        if conn is None or conn.closed or conn is not self._conn or hold_id in self._holds:
-            return False
+        if conn is None or conn.closed or conn is not self._conn:
+            return Slot.GONE
+        if hold_id in self._holds:
+            return Slot.TWIN
         if len(self._holds) >= self.limits["max_holds"]:
-            return False
+            return Slot.FULL
         conn.holds[hold_id] = asyncio.get_running_loop().create_future()
         self._holds[hold_id] = conn
-        return True
+        return Slot.TAKEN
 
     async def decision(self, hold_id: str, timeout: float) -> Decision | None:
         """backtide's decision on ``hold_id`` within ``timeout`` s, or None if it has not come
@@ -298,22 +321,39 @@ class Channel:
         except TimeoutError:
             return None
 
-    def let_go(self, hold_id: str, *, released: bool = False, why: str | None = None) -> None:
-        """The request of ``hold_id`` is no longer held: its slot is free, and backtide is told
-        ``released`` (it went out) or ``hold_left {why}`` (not when a deny came: ``why`` None).
+    def let_go(
+        self, hold_id: str, *, released: bool = False, why: str | None = None, slot: bool = True
+    ) -> None:
+        """One request of ``hold_id`` is no longer held: backtide is told ``released`` (it went
+        out) or ``hold_left {why}`` (not when a deny came: ``why`` None). ``slot``: it had the
+        slot (``hold`` said TAKEN), which is free again; a request that never had it
+        (``slot=False``) leaves the slot of the one that waits, and its decision, alone.
         Nothing is said on a connection that has ended (backtide closed the hold already)."""
-        conn = self._holds.pop(hold_id, None) or self._held_on.get(hold_id)
-        self._held_on.pop(hold_id, None)
-        if conn is None:
-            return
-        conn.holds.pop(hold_id, None)
-        if conn.closed or (not released and why is None):
+        conn = self._held_on.get(hold_id)
+        if slot:
+            waiting = self._holds.pop(hold_id, None)
+            conn = waiting or conn
+            if waiting is not None:
+                waiting.holds.pop(hold_id, None)
+        self._forget_ack(hold_id)
+        if conn is None or conn.closed or (not released and why is None):
             return
         message = protocol.released(hold_id) if released else protocol.hold_left(hold_id, why or "")
         try:
             conn.send(protocol.encode(message, Sender.PROXY))
         except (ConnectionError, ProtocolError, OSError) as error:
             logger.warning("cannot tell backtide about a hold (%s)", type(error).__name__)
+
+    def _forget_ack(self, hold_id: str) -> None:
+        """One hold ack of ``hold_id`` is answered: the last one forgets which connection held
+        it (unless a request still has its slot)."""
+        left = self._acks.get(hold_id, 0) - 1
+        if left > 0:
+            self._acks[hold_id] = left
+            return
+        self._acks.pop(hold_id, None)
+        if hold_id not in self._holds:
+            self._held_on.pop(hold_id, None)
 
     def count_throttled(self) -> None:
         """One refusal for the proxy's own limits (connections, requests waiting): counted,
@@ -363,6 +403,7 @@ class Channel:
             for hold_id in [h for h, c in self._held_on.items() if c is conn]:
                 if hold_id not in self._holds:  # a slot still waiting cleans up in let_go
                     del self._held_on[hold_id]
+                    self._acks.pop(hold_id, None)
             if conn.writer_task is not None:
                 conn.writer_task.cancel()
                 self._tasks.discard(conn.writer_task)

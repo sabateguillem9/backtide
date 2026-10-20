@@ -4,7 +4,14 @@ from dataclasses import replace
 
 import pytest
 
-from backtide.gate.decide import MAX_READ_URL, Decision, Facts, Verdict, decide
+from backtide.gate.decide import (
+    MAX_READ_HEADERS,
+    MAX_READ_URL,
+    Decision,
+    Facts,
+    Verdict,
+    decide,
+)
 
 READ = Facts(method="GET", exact_read=True, has_body=False, url_bytes=40, url_struck=False,
              allowed=True)  # fmt: skip
@@ -51,6 +58,23 @@ def test_a_read_with_a_long_url_is_held_with_risk_2() -> None:
     assert verdict(replace(READ, url_bytes=MAX_READ_URL + 1)) == (Verdict.HOLD, "url_long", 2)
     # A secret outweighs the length.
     assert verdict(replace(READ, url_bytes=9000, url_struck=True))[2] == 3
+
+
+def test_a_read_whose_headers_carried_a_secret_is_held_with_risk_3() -> None:
+    """Decision 1's guard looks at the headers too (security review of T10-2, M3): a GET with
+    ``X-Data: AKIA...`` would carry the secret out as surely as its URL."""
+    assert verdict(replace(READ, headers_struck=True)) == (Verdict.HOLD, "header_secret", 3)
+
+
+def test_a_read_with_long_headers_is_held_with_risk_2() -> None:
+    assert verdict(replace(READ, header_bytes=MAX_READ_HEADERS)) == (Verdict.PASS, "read", 0)
+    assert verdict(replace(READ, header_bytes=MAX_READ_HEADERS + 1)) == (
+        Verdict.HOLD, "headers_long", 2
+    )  # fmt: skip
+    assert MAX_READ_HEADERS == 2048
+    assert verdict(replace(READ, header_bytes=9000, headers_struck=True))[2] == 3
+    # Once a write, the method decides: the guard is for what would pass unasked.
+    assert verdict(replace(WRITE, headers_struck=True)) == (Verdict.HOLD, "write", 2)
 
 
 def test_a_model_provider_is_never_held() -> None:

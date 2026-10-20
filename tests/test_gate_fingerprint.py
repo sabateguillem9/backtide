@@ -1,8 +1,9 @@
 """The exact fingerprint of a request (backtide/gate/fingerprint.py, docs/32 section 7).
 
-A "yes" is good for one request only: change one byte of the body, the method, the query, the
-Content-Type or the credential, and it is another fingerprint. The same input gives the same
-fingerprint; another key gives another one (and nobody without the key can compute it).
+A "yes" is good for one request only: change one byte of the body, the method, the query, any
+header but the volatile ones, or a trailer, and it is another fingerprint. The same input gives
+the same fingerprint; another key gives another one (and nobody without the key can compute
+it).
 """
 
 from typing import Any
@@ -73,11 +74,54 @@ def test_any_change_that_matters_is_another_fingerprint(changes: dict[str, Any])
     assert of(**changes) != of()
 
 
-def test_headers_that_are_not_credentials_or_the_type_do_not_count() -> None:
-    """The same message sent by another client version is the same request."""
+def test_volatile_and_hop_by_hop_headers_do_not_count() -> None:
+    """The same message sent again (another client version, another trace id, another date) is
+    the same request; so is the same body framed another way."""
     other = [("content-type", "application/json"), ("authorization", "Bearer token-one"),
-             ("User-Agent", "evil/2.0"), ("Accept", "*/*")]  # fmt: skip
+             ("User-Agent", "evil/2.0"), ("Accept-Encoding", "gzip"), ("Date", "today"),
+             ("traceparent", "00-abc-def-01"), ("X-Request-Id", "r-2"),
+             ("Content-Length", "31"), ("Connection", "keep-alive"), ("TE", "trailers"),
+             ("Transfer-Encoding", "chunked"), ("X-Stainless-Retry-Count", "2")]  # fmt: skip
     assert of(headers=other) == of()
+
+
+# Headers that change what the server does or who it is done as (security review of T10-2, M2).
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("X-HTTP-Method-Override", "DELETE"),
+        ("Destination", "https://dav.fake.test/elsewhere"),  # WebDAV MOVE/COPY
+        ("Dropbox-API-Arg", '{"path": "/other"}'),
+        ("PRIVATE-TOKEN", "glpat-another-account"),  # not in CREDENTIAL_HEADERS
+        ("X-Auth-Token", "another-account"),
+        ("Accept", "application/vnd.other+json"),
+        ("Overwrite", "T"),
+    ],
+)
+def test_every_other_header_counts(extra: tuple[str, str]) -> None:
+    assert of(headers=[*BASE["headers"], extra]) != of()
+
+
+def test_headers_are_compared_by_name_in_any_order_but_repeats_keep_theirs() -> None:
+    shuffled = [("user-agent", "evil/1.0"), ("AUTHORIZATION", "Bearer token-one"),
+                ("content-type", "application/json")]  # fmt: skip
+    assert of(headers=shuffled) == of()
+    one = [*BASE["headers"], ("X-Tag", "a"), ("X-Tag", "b")]
+    assert of(headers=one) == of(headers=[("X-Tag", "a"), *BASE["headers"], ("x-tag", "b")])
+    assert of(headers=one) != of(headers=[*BASE["headers"], ("X-Tag", "b"), ("X-Tag", "a")])
+    assert of(headers=one) != of(headers=[*BASE["headers"], ("X-Tag", "a, b")])
+
+
+def test_names_and_values_cannot_be_shifted_into_each_other() -> None:
+    assert of(headers=[("X-A", "b:c")]) != of(headers=[("X-A:b", "c")])
+    assert of(headers=[("X-A", "1"), ("X-B", "2")]) != of(headers=[("X-A", "1X-B2")])
+
+
+def test_the_trailers_count() -> None:
+    assert of(trailers=[("X-Checksum", "1")]) != of()
+    assert of(trailers=[("X-Checksum", "1")]) != of(trailers=[("X-Checksum", "2")])
+    # A trailer is not the same as the header of the same name.
+    assert of(trailers=[("X-A", "1")]) != of(headers=[*BASE["headers"], ("X-A", "1")])
 
 
 def test_the_host_is_compared_as_the_connection_names_it() -> None:

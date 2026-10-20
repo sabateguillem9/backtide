@@ -10,8 +10,10 @@ rewind's in ``backtide.web.rewind``.
 
 Everything here reads black boxes through ``BoxReader`` (read-only, without the key). The one
 thing it can change is the agent's workspace, and only by asking the service (T12b): a
-confirmation page (GET, the fixed notice and a one-time ticket) and then a POST from it. Every
-other route answers GET only.
+confirmation page (GET, the fixed notice and a one-time ticket) and then a POST from it. The
+other thing it can change, only with `backtide web --ajustes` (T12e), is a key of the Settings
+page ("Ajustes"), again by asking the service: a confirmation page per change and a POST from it
+(``backtide.web.settings``). Every other route answers GET only.
 """
 
 import asyncio
@@ -67,11 +69,22 @@ from backtide.web.security import (
     LANG_COOKIE,
     MAX_FORM_BYTES,
     POST_PATH,
+    SETTINGS_PATH,
+    SETTINGS_POST_PATH,
     Access,
     Guard,
     make_prefix,
     make_run_name,
     make_token,
+)
+from backtide.web.settings import (
+    ACTIONS,
+    KINDS,
+    TELEGRAM,
+    SecretView,
+    SettingsClient,
+    SettingTickets,
+    views,
 )
 from backtide.web.state import STATE_ACTIONS, AgentStatus, read_status
 from backtide.web.text import visible
@@ -93,6 +106,11 @@ MAX_ACTION_CHARS = 64
 RANGES = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}
 FORM_FIELDS = ("csrf", "id", "ticket")  # the rewind's form: these, once each, and nothing else
 MAX_FIELD_CHARS = 128
+# The Settings page's form (T12e): these always; ``valor`` (and ``chat`` for Telegram) to set a key;
+# ``confirmo`` when it replaces one that is set. A pasted key may bring spaces around it.
+SETTINGS_FIELDS = ("csrf", "ticket", "tipo", "accion")
+SETTINGS_OPTIONAL = ("valor", "chat", "confirmo")
+SETTINGS_LIMITS = {"valor": 320, "chat": 32}
 FROM_THE_BOX = "list"  # the rewind state when the list did not come from the volume
 NOT_MAIN = "agent"  # the rewind state of an agent the service does not run (until T17)
 SUMMARY_TTL = 3.0  # an agent's card is read again at most this often...
@@ -126,6 +144,7 @@ def create_app(
     agent_name: str | None = None,
     others: Sequence[AgentSource] = (),
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
+    settings: SettingsClient | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
     keepalive: float = KEEPALIVE,
@@ -143,7 +162,9 @@ def create_app(
     ``reader`` and ``snapshots`` are the main agent's (the one the service runs), called
     ``agent_name``; ``others`` are more agents, read the same way and never rewound from here
     (the demo's today, T17's later). ``pending`` lists the gate's requests waiting for a yes
-    (the demo's today, T10's later): the page shows them, and cannot answer them."""
+    (the demo's today, T10's later): the page shows them, and cannot answer them. ``settings``
+    asks the service about the keys (T12e, ``backtide.web.settings``); its POST path exists
+    only when it is enabled (`backtide web --ajustes`)."""
     access = Access(token or make_token(), session)
     prefix = prefix or make_prefix()
     base = f"/s/{prefix}"
@@ -838,6 +859,171 @@ def create_app(
             agent_started=reply.get("agent_started") is True,
         )
 
+    # -- the Settings page (T12e) ----------------------------------------------------------
+
+    setting_tickets = SettingTickets(clock)
+
+    def _settings_state() -> Availability:
+        if settings is None:
+            return Availability.OFF
+        try:
+            return settings.availability()
+        except Exception:  # never a 500 for a page that only says it cannot ask
+            logger.exception("cannot tell whether the service can be asked about the settings")
+            return Availability.OFF
+
+    def _settings_rows() -> tuple[str, list[SecretView]]:
+        """(state, the rows): the state says whether the rows come from the service."""
+        state = _settings_state()
+        if state is not Availability.READY or settings is None:
+            return str(state), views(None)
+        try:
+            return str(state), views(settings.status())
+        except ControlUnavailable:
+            return str(Availability.NO_SERVICE), views(None)
+        except ControlError as error:
+            logger.warning("the settings cannot be read from the service: %s", error)
+            return "unreadable", views(None)
+
+    def _settings_view(
+        request: Request, t: Translator, status: int, view: str, **values: Any
+    ) -> Response:
+        for name in ("row", "message", "outcome", "applied", "reason"):
+            values.setdefault(name, None)
+        return _page(
+            "settings_step.html",
+            request,
+            status=status,
+            active="settings",
+            t=t,
+            view=view,
+            **values,
+        )
+
+    def _settings_refused(
+        request: Request, t: Translator, status: int, reason: str, **values: Any
+    ) -> Response:
+        return _settings_view(request, t, status, "refused", reason=reason, **values)
+
+    @app.get(SETTINGS_PATH, dependencies=protected)
+    def settings_page(request: Request) -> Response:
+        t = Translator(_language(request)[0])
+        state, rows = _settings_rows()
+        return _page("settings.html", request, active="settings", t=t, state=state, rows=rows)
+
+    def _settings_confirm(request: Request, action: str) -> Response:
+        """The confirmation of one change: a form with a ticket for it. It changes nothing."""
+        t = Translator(_language(request)[0])
+        kind = request.query_params.get("tipo", "")
+        if kind not in KINDS:
+            return _settings_refused(request, t, 200, "settings.err.kind")
+        state, rows = _settings_rows()
+        if state != str(Availability.READY):
+            return _settings_refused(request, t, 200, f"settings.off.{state}")
+        row = next(r for r in rows if r.kind == kind)
+        if action == "clear" and not row.set:
+            return _settings_refused(request, t, 200, "settings.err.not_set", row=row)
+        replacing = action == "set" and row.set
+        return _settings_view(
+            request,
+            t,
+            200,
+            f"confirm_{action}",
+            row=row,
+            replacing=replacing,
+            csrf=access.csrf,
+            ticket=setting_tickets.issue(action, kind, replacing=replacing),
+        )
+
+    @app.get(SETTINGS_PATH + "/cambiar", dependencies=protected)
+    def settings_change(request: Request) -> Response:
+        return _settings_confirm(request, "set")
+
+    @app.get(SETTINGS_PATH + "/quitar", dependencies=protected)
+    def settings_clear(request: Request) -> Response:
+        return _settings_confirm(request, "clear")
+
+    async def settings_save(request: Request) -> Response:
+        """A change. The Guard already checked where it comes from and its size (and that the
+        page is on at all). The value goes to the service and nowhere else: not to a log, not
+        back to the page."""
+        t = Translator(_language(request)[0])
+        form = await _read_form(request, SETTINGS_FIELDS, SETTINGS_OPTIONAL, SETTINGS_LIMITS)
+        if form is None or form["accion"] not in ACTIONS or form["tipo"] not in KINDS:
+            return _settings_refused(request, t, 400, "settings.err.form")
+        action, kind = form["accion"], form["tipo"]
+        shape = {"valor", "chat"} if kind == TELEGRAM else {"valor"}
+        given = set(form) - set(SETTINGS_FIELDS) - {"confirmo"}
+        if (action == "set" and given != shape) or (
+            action == "clear" and set(form) != set(SETTINGS_FIELDS)
+        ):
+            form.clear()
+            return _settings_refused(request, t, 400, "settings.err.form")
+        if not access.csrf_is(form["csrf"]):
+            form.clear()
+            logger.warning("a change of the settings from the web was refused: wrong form token")
+            return _settings_refused(request, t, 403, "settings.err.form")
+        redeemed, replacing = setting_tickets.redeem(form["ticket"], action, kind)
+        if redeemed is not Redeemed.OK:
+            form.clear()
+            reason = "settings.err.used" if redeemed is Redeemed.SPENT else "settings.err.expired"
+            return _settings_refused(request, t, 400, reason)
+        if replacing and form.get("confirmo") != "si":
+            form.clear()
+            return _settings_refused(request, t, 400, "settings.err.confirm")
+        state = await asyncio.to_thread(_settings_state)
+        if state is not Availability.READY or settings is None:
+            form.clear()
+            return _settings_refused(request, t, 503, f"settings.off.{state}")
+        client = settings
+        value = form.pop("valor", "").strip()
+        chat = form.pop("chat", None)
+        form.clear()
+
+        def run() -> tuple[str, dict[str, Any] | None]:
+            nonlocal value
+            try:
+                if action == "clear":
+                    return "asked", client.clear_secret(kind)
+                return "asked", client.set_secret(
+                    kind, value, chat.strip() if chat is not None else None
+                )
+            except ControlUnavailable:
+                return "no_service", None
+            except ControlOutcomeUnknown:
+                logger.warning("a change of the %s setting from the web has no known outcome", kind)
+                return "unknown", None
+            except ControlError as error:
+                logger.error("a change of the %s setting from the web was not sent: %s", kind,
+                             type(error).__name__)  # fmt: skip
+                return "untrusted", None
+            finally:
+                value = ""
+
+        what, reply = await asyncio.to_thread(run)
+        value = chat = None  # nothing here keeps the key once it is sent
+        row = SecretView(kind)
+        if reply is None:
+            status = 503 if what == "no_service" else 200
+            return _settings_view(request, t, status, "result", row=row, outcome=what)
+        status = 200 if reply["ok"] or reply["outcome"] != "refused" else 400
+        return _settings_view(
+            request,
+            t,
+            status,
+            "result",
+            row=row,
+            outcome=reply["outcome"],
+            applied=reply["applied"],
+            message=reply["message"],
+        )
+
+    # The POST exists only when the page is on (`backtide web --ajustes`): without it, neither
+    # the Guard nor the app has a door for it.
+    settings_on = settings is not None and getattr(settings, "enabled", True) is True
+    if settings_on:
+        app.post(SETTINGS_POST_PATH, dependencies=[Depends(require_session)])(settings_save)
+
     # -- the stream ------------------------------------------------------------------------
 
     async def _stream(
@@ -1014,7 +1200,8 @@ def create_app(
                 yield b": keepalive\n\n"
             await asyncio.sleep(poll_interval)
 
-    return Guard(app, port=port, prefix=prefix)
+    post_paths = (POST_PATH, SETTINGS_POST_PATH) if settings_on else (POST_PATH,)
+    return Guard(app, port=port, prefix=prefix, post_paths=post_paths)
 
 
 # -- helpers ---------------------------------------------------------------------------------
@@ -1027,9 +1214,15 @@ def _recent(reader: BoxReader, count: int, up_to: int | None = None) -> list[Eve
     return reader.events(newest_first=True, limit=count)
 
 
-async def _read_form(request: Request) -> dict[str, str] | None:
-    """The rewind's form: ``FORM_FIELDS``, once each, short and printable; None for anything
-    else. Read up to ``MAX_FORM_BYTES`` whatever the request says its length is."""
+async def _read_form(
+    request: Request,
+    fields: Sequence[str] = FORM_FIELDS,
+    optional: Sequence[str] = (),
+    limits: dict[str, int] | None = None,
+) -> dict[str, str] | None:
+    """A form of ``fields`` (each once) and maybe some of ``optional`` (each once at most), every
+    value short (``MAX_FIELD_CHARS``, or its own of ``limits``) and printable; None for anything
+    else. Read up to ``MAX_FORM_BYTES`` whatever the request says its length is. Never logs."""
     body = b""
     async for chunk in request.stream():
         body += chunk
@@ -1040,15 +1233,23 @@ async def _read_form(request: Request) -> dict[str, str] | None:
             body.decode("ascii"),
             keep_blank_values=True,
             strict_parsing=True,
-            max_num_fields=len(FORM_FIELDS),
+            max_num_fields=len(fields) + len(optional),
             errors="strict",
         )
     except ValueError:  # also UnicodeDecodeError, and more fields than allowed
         return None
+    finally:
+        del body
     form = dict(pairs)
-    if len(pairs) != len(FORM_FIELDS) or set(form) != set(FORM_FIELDS):
+    names = [name for name, _ in pairs]
+    del pairs
+    if len(names) != len(form) or not set(fields) <= set(form) <= {*fields, *optional}:
         return None
-    if any(len(value) > MAX_FIELD_CHARS or not value.isprintable() for value in form.values()):
+    sizes = limits or {}
+    if any(
+        len(value) > sizes.get(name, MAX_FIELD_CHARS) or not value.isprintable()
+        for name, value in form.items()
+    ):
         return None
     return form
 

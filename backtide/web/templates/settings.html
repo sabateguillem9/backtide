@@ -1,0 +1,46 @@
+{# The Settings page (T12e): what is set, never a key. A row shows "set, ends in …XXXX, changed
+   on …" (the last four characters at most, and only what backtide.web.settings checked) or "not
+   set". Changing or removing goes through a confirmation page of its own (settings_step.html). #}
+{% extends "base.html" %}
+{% block title %}{{ t('settings.title') }}{% endblock %}
+{% block main %}
+<main class="settings">
+  <h1>{{ t('settings.title') }}</h1>
+  <p class="lede">{{ t('settings.lede') }}</p>
+  {% if state != 'ready' %}<p class="note settings-off">{{ t('settings.off.' ~ state) }}</p>{% endif %}
+  <ul class="settings-list">
+    {% for row in rows %}
+    <li class="setting" data-kind="{{ row.kind }}">
+      <div class="setting-info">
+        <span class="setting-name">{{ t('settings.kind.' ~ row.kind) }}</span>
+        <span class="setting-state">
+        {% if state != 'ready' %}{{ t('settings.unknown') }}
+        {% elif row.problem %}{{ t('settings.problem') }}
+        {% elif row.set %}{{ t('settings.set') }}{% if row.tail %}, {{ t('settings.tail', tail=row.tail) }}{% endif %}{% if row.changed %}, {{ t('settings.changed', when=day_time(row.changed)) }}{% endif %}
+        {% else %}{{ t('settings.unset') }}{% endif %}
+        </span>
+        {% if state == 'ready' and row.kind == 'telegram' and row.set and row.chat_tail %}<span class="setting-note">{{ t('settings.chat_tail', tail=row.chat_tail) }}</span>{% endif %}
+        {% if state == 'ready' and row.provider and not row.in_use %}<span class="setting-note">{{ t('settings.not_in_proxy') }}</span>{% endif %}
+        {% if row.kind == 'telegram' %}<span class="setting-note">{{ t('settings.restart') }}</span>{% endif %}
+      </div>
+      <span class="setting-actions">
+        {% if state == 'ready' %}
+        <a class="setting-go" href="{{ base }}/ajustes/cambiar?tipo={{ row.kind }}">{{ t('settings.change') if row.set else t('settings.put') }}</a>
+        {% if row.set %}<a class="setting-remove" href="{{ base }}/ajustes/quitar?tipo={{ row.kind }}">{{ t('settings.remove') }}</a>{% endif %}
+        {% else %}
+        <span class="setting-go is-off" aria-disabled="true">{{ t('settings.change') }}</span>
+        {% endif %}
+      </span>
+    </li>
+    {% endfor %}
+    <li class="setting" data-kind="cap">
+      <div class="setting-info">
+        <label class="setting-name" for="setting-cap">{{ t('settings.cap') }}</label>
+        <span class="setting-note">{{ t('settings.cap.t11') }}</span>
+      </div>
+      <span class="setting-actions"><input id="setting-cap" class="setting-input" type="text" inputmode="decimal" disabled placeholder="{{ t('settings.cap.t11') }}"></span>
+    </li>
+  </ul>
+  <p class="note">{{ t('settings.agent') }}</p>
+</main>
+{% endblock %}

@@ -289,6 +289,31 @@ a.dot-button { text-decoration: none; }
 .rewind-working.is-failed { color: var(--ink); }
 
 
+/* The Settings page (T12e): one row per key, with what is set and nothing more. Kept plain on
+   purpose; the frontend team polishes it later. */
+.settings-list { list-style: none; margin: var(--space-8) 0 0; padding: 0; }
+.setting { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 0; border-top: var(--stroke-hairline) solid var(--ink-muted); }
+.setting-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.setting-name { font-weight: 500; }
+.setting-state { color: var(--ink-soft); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.setting-note { font-size: 13px; color: var(--ink-muted); }
+.setting-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); flex: none; }
+.setting-go.is-off { color: var(--ink-muted); }
+.setting-remove, .settings-cancel, .settings-back { color: var(--ink-muted); }
+.setting-input { font: inherit; font-size: 16px; color: var(--ink); background: transparent; border: 0; border-bottom: var(--stroke-hairline) solid var(--ink); border-radius: 0; padding: 6px 0; min-width: 0; width: 100%; max-width: 28rem; }
+.setting-input:disabled { color: var(--ink-muted); border-bottom-color: var(--ink-muted); }
+.settings-step { margin-top: var(--space-8); border-top: var(--stroke-hairline) solid var(--ink); padding-top: var(--space-6); }
+.settings-step h2 { margin: 0; font-size: 24px; line-height: 1.2; font-weight: 500; letter-spacing: -0.01em; text-wrap: balance; }
+.settings-step > p { margin: var(--space-3) 0 0; }
+.settings-form { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); margin-top: var(--space-6); }
+.setting-label { margin-top: var(--space-3); font-size: 14px; color: var(--ink-muted); }
+.setting-check { display: flex; align-items: baseline; gap: var(--space-2); margin-top: var(--space-4); }
+.settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4) var(--space-8); margin-top: var(--space-6); }
+.settings-yes { padding: 10px 18px; border: 0; border-radius: 999px; background: var(--ink); color: var(--on-ink); font: inherit; font-weight: 500; cursor: pointer; }
+.settings-said { color: var(--ink-soft); overflow-wrap: anywhere; }
+@media (max-width: 480px) { .setting { flex-direction: column; align-items: flex-start; } }
+
+
 /* ---------------------------------------------------------------------------------------------
    The app: several agents (T12d). Identity colours come from the agent's place in the list
    (.a-1 ... .a-6); a card is grouped by its identity line on top and a pale wash of its colour,

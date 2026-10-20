@@ -190,6 +190,24 @@ def test_path_struck_says_whether_recording_the_url_struck_something(
     assert record.path_struck(path, KNOWN) is struck
 
 
+@pytest.mark.parametrize(
+    ("value", "struck"),
+    [
+        ("application/json", False),
+        ("z" * 9000, False),  # long, but nothing to strike: never "struck" for its length
+        ("AKIA" + "ABCDEFGHIJKLMNOP", True),
+        ("x " * 3000 + "-----BEGIN RSA PRIVATE KEY-----\nMIIE", True),
+        (f"seen {REAL}", True),  # a known secret
+        ("Bearer abcdefghijklmnop", True),
+    ],
+)  # fmt: skip
+def test_headers_struck_says_whether_the_redaction_strikes_a_header_value(
+    value: str, struck: bool
+) -> None:
+    """Decision 1's guard on a read's headers (security review of T10-2, M3)."""
+    assert record.headers_struck([("Accept", "*/*"), ("X-Data", value)], KNOWN) is struck
+
+
 # Credentials the translators know in a URL path (Telegram, Discord, Slack): new every run.
 BOT_TOKEN = "7123456789:AA" + _random(33)
 WEBHOOK_TOKEN = _random(68)

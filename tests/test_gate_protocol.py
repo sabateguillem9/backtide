@@ -65,7 +65,8 @@ HOLD = "h-0123456789ab"
 
 
 def facts(**changes: Any) -> dict[str, Any]:
-    return gate(fp=FP, url_struck=False, url_bytes=40, websocket=False, exact_read=False) | changes
+    return gate(fp=FP, url_struck=False, url_bytes=40, websocket=False, exact_read=False,
+                headers_struck=False, header_bytes=120) | changes  # fmt: skip
 
 
 def blocked(reason: str = "port", risk: int | None = None) -> dict[str, Any]:
@@ -93,6 +94,7 @@ def test_the_proxy_messages_go_there_and_back() -> None:
         hello("0.1.0", 7),
         request(1, net_request(), facts()),
         request(2, net_request(), facts(wait_hint_s=50, url_struck=True, exact_read=True)),
+        request(3, net_request(), facts(headers_struck=True, header_bytes=70_000)),
         released(HOLD),
         hold_left(HOLD, "client_left"),
         hold_left(HOLD, "waited"),
@@ -288,6 +290,7 @@ def test_the_block_risks_are_the_design_ones() -> None:
         "not_recorded": 2,
         "not_allowed": 1,
         "undecodable": 2,
+        "trailers": 2,  # HTTP/1 trailers, which mitmproxy cannot read (review of T10-2)
         "provider_endpoint": 2,
         "provider_body": 2,
         "provider_side_tool": 2,
@@ -368,6 +371,12 @@ def test_a_net_request_carries_its_gate_facts_and_a_model_call_none() -> None:
         {"url_bytes": -1},
         {"url_bytes": 2**31 + 1},
         {"url_bytes": True},
+        {"headers_struck": 0},  # the header guard (security review of T10-2, M3)
+        {"headers_struck": "false"},
+        {"header_bytes": -1},
+        {"header_bytes": 2**31 + 1},
+        {"header_bytes": False},
+        {"header_bytes": 1.5},
         {"wait_hint_s": 0},
         {"wait_hint_s": 91},
         {"wait_hint_s": 1.5},

@@ -2900,10 +2900,20 @@ class FakeEgress:
         self.stops.append(reason)
         self.up = False
 
-    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> Any:
+    def decide(
+        self,
+        hold_id: str,
+        verdict: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> Any:
         self.log.append(f"egress.decide({hold_id},{verdict},{by},{requested_by})")
         if hold_id == "h-boom":
             raise RuntimeError("injected")
+        if verdict == "approve" and frozen is not None and frozen():
+            return HoldOutcome(HoldStatus.PAUSED, hold_id)
         return HoldOutcome(HoldStatus.RELEASED, hold_id)
 
     def pending(self) -> list[dict[str, Any]]:
@@ -3137,6 +3147,39 @@ def test_a_decision_on_a_held_request_goes_to_the_proxy(
     assert world.guardian.pending_holds() == [{"hold_id": "h-000000000001"}]
     failed = world.guardian.decide_hold("h-boom", "reject", via="cli", requested_by="x")
     assert failed.status == "failed"  # never raises
+
+
+def test_nothing_is_approved_while_the_person_paused_the_agent(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    """Security review of T10-2, B2: a request in flight when the agent was paused is held
+    after it; approving it would let it out while the agent is frozen."""
+    proxied(world, clock)
+    world.guardian.start()
+    world.guardian.pause_by_user(requested_by="test")
+    outcome = world.guardian.decide_hold("h-1", "approve", via="cli", requested_by="x")
+    assert outcome.status == "paused"
+    assert world.guardian.decide_hold("h-1", "reject", via="cli", requested_by="x").status == (
+        "released"  # the fake's answer: a no still goes to the proxy
+    )
+    world.guardian.resume(requested_by="test")
+    outcome = world.guardian.decide_hold("h-1", "approve", via="cli", requested_by="x")
+    assert outcome.status == "released"
+
+
+def test_nothing_is_approved_during_a_rewind(world: World, clock: Callable[[], datetime]) -> None:
+    proxied(world, clock)
+    world.guardian.start()
+    world.volume.write()
+    world.guardian.cycle()
+    seen: list[str] = []
+    world.volume.during_swap = lambda: seen.append(
+        str(world.guardian.decide_hold("h-1", "approve", via="cli", requested_by="x").status)
+    )
+    world.guardian.rewind(world.volume.listed[0].id, requested_by="cli")
+    assert seen == ["paused"]
+    after = world.guardian.decide_hold("h-1", "approve", via="cli", requested_by="x")
+    assert after.status == "released"
 
 
 def test_a_pause_rejects_the_held_requests_after_freezing(

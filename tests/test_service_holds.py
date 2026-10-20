@@ -81,6 +81,18 @@ def test_a_retry_with_the_same_fingerprint_joins_the_hold() -> None:
     assert book.pending() == [hold]
 
 
+def test_a_twin_that_joins_while_one_waits_keeps_the_waiting_ones_event() -> None:
+    """Security review of T10-2, M2: what is recorded when the yes lets it out is the request in
+    the proxy's slot (the one waiting), never the latest retry's, which got no slot."""
+    book, _ = make()
+    hold = held(book)
+    twin = EVENT | {"details": EVENT["details"] | {"flow_id": "f2"}}
+    book.join(hold, twin)
+    assert hold.connected == 2 and hold.event == EVENT
+    book.left(hold.hold_id)  # the twin: "pending" at once
+    assert hold.connected == 1 and hold.event == EVENT
+
+
 def test_approved_with_the_request_connected_it_is_spent_when_released() -> None:
     book, _ = make()
     hold = held(book)
@@ -246,6 +258,28 @@ def test_a_pause_or_a_rewind_rejects_the_open_holds() -> None:
     assert book.reject_open() == [first, second]
     assert book.rejected(FP) and book.rejected(OTHER)
     assert not book.preapproved("c" * 64)  # a leave given before the pause does not survive it
+
+
+def test_a_yes_being_released_when_the_agent_is_paused_never_becomes_a_preapproval() -> None:
+    """Security review of T10-2, B2: the proxy may say hold_left after the pause (its client
+    left as the agent froze). That yes must not wait for the agent's next identical request."""
+    book, _ = make()
+    hold = held(book)
+    book.approve(hold.hold_id)
+    book.release(hold)
+    assert book.reject_open() == []  # too late to reject: the decision went
+    assert book.left(hold.hold_id) is hold
+    assert not book.preapproved(FP) and book.get(hold.hold_id) is None
+    assert book.live(FP) is None  # the next identical request asks again
+
+
+def test_a_yes_being_released_when_paused_may_still_be_spent_by_the_proxy() -> None:
+    book, _ = make()
+    hold = held(book)
+    book.approve(hold.hold_id)
+    book.release(hold)
+    book.reject_open()
+    assert book.released(hold.hold_id) is hold and book.get(hold.hold_id) is None
 
 
 def test_ids_are_never_reused() -> None:

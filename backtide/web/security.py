@@ -7,15 +7,18 @@ program on this machine that listens on a port of its own (cookies ignore ports)
   * the ``Host`` header must be exactly ``127.0.0.1:<port>`` (not ``localhost``: that name can
     also resolve to ``::1``, where another program may be listening): a page on ``evil.example``
     that re-points its name at 127.0.0.1 (DNS rebinding) arrives with ITS name in ``Host``;
-  * only GET, except ONE path: ``POST /instantaneas/rebobinar`` (T12b), the only request that
-    changes anything. A POST anywhere else, and any other method, is a 405;
-  * that POST must come from our own page: exactly one ``Origin``, ours (every browser sends it
-    on a POST), ``Sec-Fetch-Site: same-origin`` when the browser sends it (anything else, even
-    ``none``, is refused), a plain form body (``application/x-www-form-urlencoded``: no
+  * only GET, except the paths that change something: ``POST /instantaneas/rebobinar`` (T12b)
+    and, only when `backtide web --ajustes` turned the Settings page on, ``POST
+    /ajustes/guardar`` (T12e: a key set or removed). A POST anywhere else, and any other method,
+    is a 405, so without ``--ajustes`` there is not even a door to knock on;
+  * every such POST must come from our own page: exactly one ``Origin``, ours (every browser
+    sends it on a POST), ``Sec-Fetch-Site: same-origin`` when the browser sends it (anything
+    else, even ``none``, is refused), a plain form body (``application/x-www-form-urlencoded``: no
     ``text/plain`` or multipart tricks) with a ``Content-Length`` of at most ``MAX_FORM_BYTES``
     (no chunked bodies). Behind that the app still wants the session cookie (never the link
     token), the session's CSRF token from the form, and a one-time confirmation ticket for that
-    very snapshot (``backtide.web.rewind.Tickets``);
+    very snapshot (``backtide.web.rewind.Tickets``) or that very change of that very key
+    (``backtide.web.settings.SettingTickets``);
   * a browser ``Origin`` that is not ours is refused, and so is any request the browser says is
     ``same-site`` or ``cross-site`` unless it is a top-level navigation (``Sec-Fetch-Mode:
     navigate``): the stream and the fragments are only ever fetched from our own pages;
@@ -72,8 +75,11 @@ SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
     (b"cache-control", b"no-store"),
 )
 ALLOWED_METHODS = frozenset({"GET"})
-# The one path that takes a POST (under the prefix), and how big its form may be.
+# The paths that take a POST (under the prefix), and how big their form may be. The Settings
+# page's is only taken when it is on (``Guard(post_paths=...)``).
 POST_PATH = "/instantaneas/rebobinar"
+SETTINGS_PATH = "/ajustes"
+SETTINGS_POST_PATH = "/ajustes/guardar"
 MAX_FORM_BYTES = 2048
 FORM_TYPE = "application/x-www-form-urlencoded"
 
@@ -159,11 +165,16 @@ def allowed_origins(port: int) -> frozenset[str]:
 class Guard:
     """Pure ASGI middleware, outside the app: the Host, method, Origin and Sec-Fetch checks, the
     prefix, and the security headers on every response. It does not touch the body, so streaming
-    (SSE) passes through untouched. ``inner`` is the app it guards, ``base`` the prefix path."""
+    (SSE) passes through untouched. ``inner`` is the app it guards, ``base`` the prefix path.
+    ``post_paths`` are the paths that take a POST: the rewind's, and the Settings page's only
+    when it is on."""
 
-    def __init__(self, app: App, *, port: int, prefix: str) -> None:
+    def __init__(
+        self, app: App, *, port: int, prefix: str, post_paths: tuple[str, ...] = (POST_PATH,)
+    ) -> None:
         self.inner = app
         self.base = f"/s/{prefix}"
+        self._post_paths = tuple(self.base + path for path in post_paths)
         self._hosts = allowed_hosts(port)
         self._origins = allowed_origins(port)
 
@@ -201,7 +212,9 @@ class Guard:
         hosts = [v for k, v in headers if k == b"host"]
         if len(hosts) != 1 or hosts[0].decode("latin-1").lower() not in self._hosts:
             return 400, "Host not allowed", []
-        if scope["method"] == "POST" and token_matches(scope["path"], self.base + POST_PATH):
+        if scope["method"] == "POST" and any(
+            token_matches(scope["path"], path) for path in self._post_paths
+        ):
             refusal = self._post_refusal(headers)
             if refusal is not None:
                 return refusal
@@ -221,7 +234,7 @@ class Guard:
     def _post_refusal(
         self, headers: list[tuple[bytes, bytes]]
     ) -> tuple[int, str, list[tuple[bytes, bytes]]] | None:
-        """The rewind's POST: from our own page, a small plain form, or nothing."""
+        """A POST that changes something: from our own page, a small plain form, or nothing."""
 
         def values(name: bytes) -> list[str]:
             return [v.decode("latin-1") for k, v in headers if k == name]

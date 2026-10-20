@@ -49,7 +49,9 @@ remembers of its fingerprint. Every ``gate`` event is written here, never by the
 - **The person decides** (``decide``, from the control socket): ``gate/approved`` and, with the
   request still connected, its ``net/request`` BEFORE ``decision allow`` (nothing goes out
   without its event); with nobody waiting, a preapproval. ``gate/rejected`` and ``decision
-  deny``. ``reject_open`` is the same for a pause or a rewind (``by: pause | rewind``).
+  deny``. ``reject_open`` is the same for a pause or a rewind (``by: pause | rewind``). While
+  the agent is paused or rewound (``frozen``, asked under the same lock as ``reject_open``),
+  nothing is approved: a request in flight when the pause came is held after it (B2).
 - **Time** (a tick every second): ``gate/expired {why: timeout}`` after 5 min, and its deny.
 - **The end of the channel** fails closed: every open hold is ``gate/expired`` (``why``:
   ``restart`` when backtide stops, ``proxy_restart`` when the proxy is restarted, else
@@ -85,6 +87,7 @@ from backtide.gate.fingerprint import new_key, short
 from backtide.gate.policy import ALLOWED_PORTS, AllowList
 from backtide.gate.protocol import BLOCK_RISK, LineReader, ProtocolError, Sender
 from backtide.gate.providers import Providers
+from backtide.gate.translate.base import OVERRIDE_HEADERS
 from backtide.sensors.files import DailyBudget, TokenBucket
 from backtide.service.holds import Hold, HoldBook, HoldOutcome, HoldStatus, HoldTimings
 
@@ -553,15 +556,26 @@ class ProxyChannel:
         body = details.get("body")
         size = body.get("size") if isinstance(body, dict) else None
         # Decision 1's guard with what backtide knows too: the proxy never sees the Gateway
-        # token, so a URL that carried it is only struck here.
+        # token, so a URL (or a header value the recording keeps) that carried it is only
+        # struck here. And a method override header that the recording names makes it a write,
+        # whatever the proxy said (security review of T10-2, M2 and M3).
         path = details.get("path")
         struck_here = not isinstance(path, str) or self._scrub.text(path) != path
+        headers = details.get("headers")
+        headers = headers if isinstance(headers, dict) else {}
+        overridden = any(str(name).strip().lower() in OVERRIDE_HEADERS for name in headers)
+        headers_struck_here = any(
+            isinstance(value, str) and self._scrub.text(value) != value
+            for value in headers.values()
+        )
         facts = Facts(
             method=str(details.get("method", "")),
-            exact_read=gate["exact_read"],
+            exact_read=gate["exact_read"] and not overridden,
             has_body=not (type(size) is int and size == 0),  # unknown: a body (fails closed)
             url_bytes=gate["url_bytes"],
             url_struck=gate["url_struck"] or struck_here,
+            headers_struck=gate["headers_struck"] or headers_struck_here,
+            header_bytes=gate["header_bytes"],
             websocket=gate["websocket"],
             allowed=allowed,
             preapproved=self._book.preapproved(fp),
@@ -589,6 +603,8 @@ class ProxyChannel:
         self, request_id: int, event: dict[str, Any], gate: dict[str, Any], risk: int, reason: str
     ) -> dict[str, Any]:
         fp = gate["fp"]
+        if self._holds_ended:  # backtide is stopping: no hold would ever be closed
+            return protocol.ack(request_id, "deny", reason="not_recorded")
         hold = self._book.live(fp)
         if hold is not None:  # the same request again: it joins, without a new event
             self._book.join(hold, event)
@@ -636,10 +652,19 @@ class ProxyChannel:
 
     # The person's decisions, time and the end (T10-2)
 
-    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> HoldOutcome:
+    def decide(
+        self,
+        hold_id: str,
+        verdict: str,
+        *,
+        by: str,
+        requested_by: str,
+        frozen: Callable[[], bool] | None = None,
+    ) -> HoldOutcome:
         """Approve (``verdict="approve"``) or reject an open hold. ``by`` is who decided
-        (``DECIDERS``), ``requested_by`` the kernel's uid and pid of whoever asked. Never
-        raises for a hold that is not there: the outcome says so."""
+        (``DECIDERS``), ``requested_by`` the kernel's uid and pid of whoever asked. ``frozen``
+        says whether the agent is paused or being rewound: then nothing is approved (PAUSED),
+        and a no still goes. Never raises for a hold that is not there: the outcome says so."""
         if verdict not in {"approve", "reject"} or by not in DECIDERS:
             raise ValueError("verdict is approve or reject; by is cli, web or telegram")
         who = {"by": by, "requested_by": str(requested_by)[:MAX_REQUESTER_CHARS]}
@@ -658,6 +683,9 @@ class ProxyChannel:
             hold = self._book.approve(hold_id)
             if hold is None:
                 return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
+            # Under the lock reject_open takes too: a pause that came first is seen here.
+            if frozen is not None and frozen():
+                return HoldOutcome(HoldStatus.PAUSED, hold_id)  # still open, nothing recorded
             if self._gate_event("approved", hold, who, risk=1) is None:
                 return HoldOutcome(HoldStatus.FAILED, hold_id)  # still open: nothing went out
             if hold.connected:
@@ -685,7 +713,8 @@ class ProxyChannel:
 
     def reject_open(self, by: str) -> int:
         """A pause (``by="pause"``) or a rewind (``"rewind"``): every open hold is rejected
-        (decision 7). Returns how many."""
+        (decision 7), and a yes being released never becomes a preapproval. Returns how many
+        were rejected."""
         with self._gate_lock:
             if self.closed:
                 return 0
@@ -712,6 +741,14 @@ class ProxyChannel:
         if flood is not None:
             count, window = flood
             self._record_gate("flood", "", {"count": count, "window_s": window}, risk=2)
+
+    def end_holds(self, reason: str) -> None:
+        """End every open hold now, as ``close(reason)`` would, while the channel is still
+        open: ``Egress.stop`` calls it before it stops the proxy, so a clean stop is recorded as
+        ``restart`` and not as the lost channel the reader would see first. From then on nothing
+        is held (``not_recorded``) nor approved; the proxy refuses what it holds when the
+        channel ends."""
+        self._end_holds(_END_WHY.get(reason, "channel_lost"))
 
     def _end_holds(self, why: str) -> None:
         """The channel ends: every open hold is expired with ``why`` (the proxy refuses what it

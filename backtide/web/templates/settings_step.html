@@ -1,0 +1,62 @@
+{# One step of a change of the Settings page (T12e): its confirmation (a form with a one-time
+   ticket), its result, or why not now. Plain forms, no JavaScript needed: the POST is a normal
+   navigation, which carries our Origin (Referrer-Policy: same-origin). The key is typed into a
+   password field and never comes back: not in a value, not in a message. #}
+{% extends "base.html" %}
+{% block title %}{{ t('settings.title') }}{% endblock %}
+{% block main %}
+<main class="settings">
+  <h1>{{ t('settings.title') }}</h1>
+  <section class="settings-step" data-view="{{ view }}"{% if outcome %} data-outcome="{{ outcome }}"{% endif %} aria-labelledby="settings-step-title">
+  {% if view == 'confirm_set' %}
+    <h2 id="settings-step-title">{{ t('settings.confirm.set.' ~ ('replace' if replacing else 'new'), what=t('settings.what.' ~ row.kind)) }}</h2>
+    {% if replacing and row.tail %}<p>{{ t('settings.confirm.current', tail=row.tail) }}</p>{% endif %}
+    <p class="note">{{ t('settings.confirm.' ~ ('telegram' if row.kind == 'telegram' else 'provider')) }}</p>
+    <form class="settings-form" method="post" action="{{ base }}/ajustes/guardar" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="ticket" value="{{ ticket }}">
+      <input type="hidden" name="tipo" value="{{ row.kind }}">
+      <input type="hidden" name="accion" value="set">
+      <label class="setting-label" for="setting-value">{{ t('settings.field.' ~ ('token' if row.kind == 'telegram' else 'key')) }}</label>
+      <input id="setting-value" class="setting-input" type="password" name="valor" maxlength="300" autocomplete="off" autocapitalize="off" spellcheck="false"{% if not (row.kind == 'telegram' and row.set) %} required{% endif %}>
+      {% if row.kind == 'telegram' %}
+      <label class="setting-label" for="setting-chat">{{ t('settings.field.chat') }}</label>
+      <input id="setting-chat" class="setting-input" type="text" name="chat" maxlength="20" inputmode="numeric" pattern="[0-9]*" autocomplete="off"{% if not row.set %} required{% endif %}>
+      {% if row.set %}<p class="note">{{ t('settings.field.keep') }}</p>{% endif %}
+      {% endif %}
+      {% if replacing %}
+      <label class="setting-check"><input type="checkbox" name="confirmo" value="si" required> {{ t('settings.confirm.box', tail=row.tail) if row.tail else t('settings.confirm.box.plain') }}</label>
+      {% endif %}
+      <div class="settings-actions">
+        <button class="settings-yes" type="submit">{{ t('settings.confirm.save') }}</button>
+        <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
+      </div>
+    </form>
+  {% elif view == 'confirm_clear' %}
+    <h2 id="settings-step-title">{{ t('settings.confirm.clear', what=t('settings.what.' ~ row.kind)) }}</h2>
+    {% if row.tail %}<p>{{ t('settings.confirm.current', tail=row.tail) }}</p>{% endif %}
+    <p class="note">{{ t('settings.confirm.clear.' ~ ('telegram' if row.kind == 'telegram' else ('in_use' if row.in_use else 'unused'))) }}</p>
+    <form class="settings-form" method="post" action="{{ base }}/ajustes/guardar">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="ticket" value="{{ ticket }}">
+      <input type="hidden" name="tipo" value="{{ row.kind }}">
+      <input type="hidden" name="accion" value="clear">
+      <div class="settings-actions">
+        <button class="settings-yes" type="submit">{{ t('settings.confirm.remove') }}</button>
+        <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
+      </div>
+    </form>
+  {% elif view == 'result' %}
+    <h2 id="settings-step-title">{{ t('settings.out.' ~ outcome) if t.has('settings.out.' ~ outcome) else t('settings.out.unknown') }}</h2>
+    <p class="setting-name">{{ t('settings.kind.' ~ row.kind) }}</p>
+    {% if applied and t.has('settings.applied.' ~ applied) %}<p>{{ t('settings.applied.' ~ applied) }}</p>{% endif %}
+    {% if message %}<p class="settings-said"><span class="muted">{{ t('rewind.said') }}</span> <span lang="es">{{ vis(message, 600) }}</span></p>{% endif %}
+    <p class="settings-actions"><a class="settings-back" href="{{ base }}/ajustes">{{ t('settings.back') }}</a></p>
+  {% else %}
+    <h2 id="settings-step-title">{{ t('settings.not.title') }}</h2>
+    <p>{{ t(reason) }}</p>
+    <p class="settings-actions"><a class="settings-back" href="{{ base }}/ajustes">{{ t('settings.back') }}</a></p>
+  {% endif %}
+  </section>
+</main>
+{% endblock %}

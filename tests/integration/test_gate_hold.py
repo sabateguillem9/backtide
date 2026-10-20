@@ -61,11 +61,12 @@ LIFE = 15.0  # seconds a hold lives (5 min in production)
 TIMINGS = HoldTimings(life=LIFE, wait=WAIT, preapproval=60.0, remember=60.0)
 
 # Runs in the client container: one request through the proxy, with a timeout of its own (a
-# client that gives up), and what came back.
+# client that gives up), and what came back. A sixth argument adds headers (a JSON object).
 ASK = r"""
 import json, ssl, sys, time
 from http.client import HTTPSConnection
 method, host, path, timeout, body = sys.argv[1:6]
+extra = json.loads(sys.argv[6]) if len(sys.argv) > 6 else {}
 timeout = float(timeout)
 tls = ssl.create_default_context(cafile="/opt/t06/agent-ca.pem")
 start = time.monotonic()
@@ -73,6 +74,7 @@ try:
     conn = HTTPSConnection("backtide-proxy", 8080, timeout=timeout, context=tls)
     conn.set_tunnel(host, 443)
     headers = {"content-type": "application/json"} if body else {}
+    headers.update(extra)
     conn.request(method, path, body=body.encode() or None, headers=headers)
     response = conn.getresponse()
     data = response.read().decode("utf-8", "replace")
@@ -95,10 +97,18 @@ class Lab:
     control: Path
     system: list[tuple[str, dict]] = field(default_factory=list)
 
-    def ask(self, method: str, path: str, *, timeout: float = 60, body: str = "") -> dict:
+    def ask(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float = 60,
+        body: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> dict:
         result = docker(
             "exec", self.client, "python3", "/opt/t06/ask.py", method, ALLOWED, path,
-            str(timeout), body, timeout=timeout + 30, check=False,
+            str(timeout), body, json.dumps(headers or {}), timeout=timeout + 30, check=False,
         )  # fmt: skip
         lines = result.stdout.strip().splitlines()
         assert lines, jail_docker.sanitize(result.stderr)
@@ -368,6 +378,95 @@ def test_a_request_whose_client_left_is_not_sent_when_approved(lab: Lab) -> None
     assert len(lab.arrived(path)) == 1
     by = [e.details["by"] for e in lab.gate("approved", hold_id)]
     assert by == ["cli", "preapproval"]
+
+
+# --- the security review of T10-2: twins, headers ---------------------------------------------
+
+
+def connected(lab: Lab, hold_id: str) -> int:
+    channel = lab.egress._channel  # noqa: SLF001 - backtide's book, the state under test
+    assert channel is not None
+    hold = channel._book.get(hold_id)  # noqa: SLF001
+    return -1 if hold is None else hold.connected
+
+
+def until(predicate: Callable[[], bool], what: str, timeout: float = 10) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, what
+        time.sleep(0.1)
+
+
+def test_an_identical_retry_while_one_waits_does_not_take_its_place(lab: Lab) -> None:
+    """M1: the twin joins the hold and hears "pending" at once; the first keeps waiting and,
+    approved, goes out exactly once. backtide's book ends clean: nothing pending, no leave."""
+    path = tag() + "/twin"
+    first = lab.ask_in_background("DELETE", path)
+    held = lab.held(path)
+    hold_id = held.details["hold_id"]
+    twin = lab.ask("DELETE", path)
+    assert twin["status"] == 429 and twin["elapsed"] < WAIT - 1, twin
+    until(lambda: connected(lab, hold_id) == 1, "the twin never said it left")
+    reply = lab.decide(hold_id)
+    assert (reply["ok"], reply["outcome"]) == (True, "released"), reply
+    result = first()
+    assert result["ok"] and result["status"] == 200, result
+    assert len(lab.arrived(path)) == 1
+    [request] = lab.events(path, "request")
+    assert request.details["gate"]["decision"] == "approved"
+    until(lambda: connected(lab, hold_id) == -1, "the yes was never spent")
+    assert [p for p in lab.egress.pending() if p["path"] == path] == []
+    # No leave is left over: the same DELETE again is held again.
+    assert lab.ask("DELETE", path, timeout=2)["ok"] is False
+    again = lab.held(path, after=held.seq)
+    assert lab.decide(again.details["hold_id"], "reject")["outcome"] == "rejected"
+    assert len(lab.arrived(path)) == 1
+
+
+def test_a_yes_is_good_only_for_the_same_headers(lab: Lab) -> None:
+    """M2: a preapproved POST does not let out the same POST with a method override."""
+    path = tag() + "/override"
+    body = '{"archive": "b1"}'
+    assert lab.ask("POST", path, timeout=2, body=body)["ok"] is False  # held; it gives up
+    held = lab.held(path)
+    hold_id = held.details["hold_id"]
+    until(lambda: connected(lab, hold_id) == 0, "the proxy never said the client left")
+    assert lab.decide(hold_id)["outcome"] == "preapproved"
+    override = {"X-HTTP-Method-Override": "DELETE"}
+    other = lab.ask("POST", path, timeout=2, body=body, headers=override)
+    assert other["ok"] is False, other  # another request: held, the leave is not spent
+    second = lab.held(path, after=held.seq)
+    assert second.details["hold_id"] != hold_id
+    assert lab.arrived(path) == []
+    assert lab.ask("POST", path, body=body)["status"] == 200  # the exact one, once
+    [arrived] = lab.arrived(path)
+    assert "x-http-method-override" not in arrived["headers"]
+    assert lab.decide(second.details["hold_id"], "reject")["outcome"] == "rejected"
+
+
+def test_a_get_with_a_method_override_is_held(lab: Lab) -> None:
+    path = tag() + "/get-override"
+    result = lab.ask("GET", path, timeout=2, headers={"X-HTTP-Method-Override": "DELETE"})
+    assert result["ok"] is False, result
+    held = lab.held(path)
+    assert held.details["reason"] == "write"
+    assert lab.decide(held.details["hold_id"], "reject")["outcome"] == "rejected"
+    assert lab.arrived(path) == []
+
+
+def test_a_get_that_carries_a_secret_in_a_header_is_held(lab: Lab) -> None:
+    """M3: decision 1's guard on the headers. The secret is never recorded."""
+    path = tag() + "/header-secret"
+    secret = "AKIA" + "QWERTYUIOPASDFGH"
+    result = lab.ask("GET", path, timeout=2, headers={"X-Data": secret})
+    assert result["ok"] is False, result
+    held = lab.held(path)
+    assert (held.risk, held.details["reason"]) == (3, "header_secret")
+    assert lab.decide(held.details["hold_id"], "reject")["outcome"] == "rejected"
+    assert lab.arrived(path) == []
+    assert secret not in json.dumps([e.details for e in lab.box.events()])
+    plain = lab.ask("GET", path + "/plain", headers={"X-Data": "nothing to see"})
+    assert plain["status"] == 200, plain
 
 
 # --- something falls while it is held --------------------------------------------------------

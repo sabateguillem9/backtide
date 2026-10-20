@@ -573,7 +573,9 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "caja negra (sin su clave ni el token) y se puede lanzar como un usuario sin privilegios "
         "con permiso de lectura sobre ella: así solo mira. Con --rebobinar y con el mismo usuario "
         "que el servicio, también rebobina, pidiéndoselo al servicio por su socket de control "
-        "(con su aviso y una confirmación); como root, sin --rebobinar no arranca. Imprime un "
+        "(con su aviso y una confirmación). Con --ajustes, igual, la página Ajustes pone, cambia "
+        "y quita las claves de los modelos y el bot de Telegram (nunca las enseña). Como root, "
+        "sin --rebobinar ni --ajustes no arranca. Imprime un "
         "enlace de un solo uso, nuevo en cada ejecución, y el nombre de la ejecución; ábrelo en "
         "el navegador (no abre nada por sí mismo). Ctrl-C la para. Sale con 0 si paró bien, 1 si "
         "no pudo arrancar y 2 si la configuración no sirve.",
@@ -593,6 +595,12 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         help="deja que la web pida rebobinados al servicio (hace falta su mismo usuario); sin "
         "esto, la web solo mira",
     )
+    web.add_argument(
+        "--ajustes",
+        action="store_true",
+        help="deja que la página Ajustes cambie las claves pidiéndoselo al servicio (hace falta su "
+        "mismo usuario); sin esto, la página solo dice cómo encenderla",
+    )
     web.set_defaults(handler=_web)
 
 
@@ -606,10 +614,19 @@ WEB_REWIND_LINES = {
     "disabled": "Rebobinar desde la web: no; sin `--rebobinar` esta web solo mira. Para rebobinar, "
     "`backtide rebobinar` (o `backtide web --rebobinar` con el usuario del servicio).",
 }
+WEB_SETTINGS_LINES = {
+    "ready": "Ajustes desde la web: sí. Las claves se ponen y se quitan pidiéndoselo al servicio "
+    "(nunca se enseñan).",
+    "no_service": "Ajustes desde la web: cuando el servicio esté en marcha (`backtide vigilar`).",
+    "other_user": "Ajustes desde la web: no. Esta web no corre con el usuario del servicio.",
+    "off": "Ajustes desde la web: no disponibles.",
+    "disabled": "Ajustes desde la web: no; sin `--ajustes` la página solo dice cómo encenderla.",
+}
 ROOT_WEB_REFUSAL = (
     "esta web iba a correr como root: con todos los privilegios y solo para mirar. Para mirar, "
     "lánzala con un usuario lector (con permiso de lectura sobre la caja negra); si de verdad "
-    "quieres rebobinar desde la web como root, pásale --rebobinar sabiendo lo que haces."
+    "quieres rebobinar o cambiar las claves desde la web como root, pásale --rebobinar o "
+    "--ajustes sabiendo lo que haces."
 )
 
 
@@ -632,8 +649,9 @@ def _web(args: argparse.Namespace) -> int:
     from backtide.web.paths import WebPaths
     from backtide.web.rewind import ControlRewinder
     from backtide.web.server import DEFAULT_PORT, run_web
+    from backtide.web.settings import ControlSettings
 
-    if _effective_uid() == 0 and not args.rebobinar:
+    if _effective_uid() == 0 and not (args.rebobinar or args.ajustes):
         _error(ROOT_WEB_REFUSAL)
         return EXIT_ERROR
     port = DEFAULT_PORT if args.port is None else args.port
@@ -658,11 +676,14 @@ def _web(args: argparse.Namespace) -> int:
         )
         rewinder = ControlRewinder(paths.control_socket, enabled=args.rebobinar)
         print(_web_rewind_line(rewinder.availability()), flush=True)
+        settings = ControlSettings(paths.control_socket, enabled=args.ajustes)
+        line = WEB_SETTINGS_LINES.get(str(settings.availability()), WEB_SETTINGS_LINES["off"])
+        print(line, flush=True)
         if _effective_uid() == 0:
             print(ROOT_WEB_WARNING, flush=True)
 
     try:
-        run_web(paths, port, announce, can_rewind=args.rebobinar)
+        run_web(paths, port, announce, can_rewind=args.rebobinar, can_set=args.ajustes)
     except OSError as error:
         _error(f"no se puede abrir el puerto {port} en 127.0.0.1: {error.strerror or error}")
         return EXIT_FAILED

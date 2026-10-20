@@ -22,7 +22,7 @@ import pytest
 from backtide.blackbox.redact import KnownScrubber
 from backtide.gate import addon
 from backtide.gate.addon import FAILED, REFUSALS, Gate
-from backtide.gate.client import LOST, NOT_RECORDED, Ack, Decision, GateConfig
+from backtide.gate.client import LOST, NOT_RECORDED, Ack, Decision, GateConfig, Slot
 from backtide.gate.protocol import DEFAULT_LIMITS
 from backtide.gate.providers import FAKE_KEY_PREFIX, Kind, Provider, Providers, Secret
 
@@ -179,12 +179,14 @@ class FakeChannel:
         self.gates: list[dict[str, Any] | None] = []
         # Holds (T10-2): whether a slot is given, the decision that comes (after ``polls``
         # waits of nothing), and what the gate said when it let go.
-        self.slot = True
+        self.slot = Slot.TAKEN
+        self.holds_asked = 0
         self.decided: Decision | None = None
         self.polls = 0
         self.waited = 0
         self.on_poll: Callable[[], None] | None = None
         self.let_gone: list[tuple[str, bool, str | None]] = []
+        self.unslotted: list[str] = []  # let go without having had a slot (slot=False)
 
     @property
     def limits(self) -> dict[str, int]:
@@ -206,7 +208,8 @@ class FakeChannel:
     def tell(self, event: dict[str, Any]) -> None:
         self.told.append(event)
 
-    def hold(self, hold_id: str) -> bool:
+    def hold(self, hold_id: str) -> Slot:
+        self.holds_asked += 1
         return self.slot
 
     async def decision(self, hold_id: str, timeout: float) -> Decision | None:
@@ -218,8 +221,12 @@ class FakeChannel:
             return None
         return self.decided
 
-    def let_go(self, hold_id: str, *, released: bool = False, why: str | None = None) -> None:
+    def let_go(
+        self, hold_id: str, *, released: bool = False, why: str | None = None, slot: bool = True
+    ) -> None:
         self.let_gone.append((hold_id, released, why))
+        if not slot:
+            self.unslotted.append(hold_id)
 
     def count_throttled(self) -> None:
         self.throttled += 1
@@ -1473,15 +1480,59 @@ def test_an_allow_that_comes_after_the_client_left_lets_nothing_out() -> None:
     assert flow.killed and channel.let_gone == [(HOLD, False, "client_left")]
 
 
-def test_a_hold_with_no_slot_is_pending_at_once() -> None:
+@pytest.mark.parametrize("slot", [Slot.TWIN, Slot.FULL, Slot.GONE])
+def test_a_hold_with_no_slot_is_pending_at_once_and_leaves_any_slot_alone(slot: Slot) -> None:
+    """Security review of T10-2, M1: a twin (the same request again while the first waits) must
+    not give back the first one's slot: it lets go as a request that never had one."""
     channel = FakeChannel()
     channel.answer = held(wait_ms=5000)
-    channel.slot = False
+    channel.slot = slot
     flow = a_delete()
     gate = hold_gate(channel, flow)
     send(gate, flow)
     assert status(flow) == 429 and channel.waited == 0
-    assert channel.let_gone == [(HOLD, False, "no_slot")]
+    assert channel.let_gone == [(HOLD, False, "no_slot")] and channel.unslotted == [HOLD]
+
+
+def test_a_held_request_whose_client_is_gone_already_never_had_a_slot() -> None:
+    channel = FakeChannel()
+    channel.answer = held()
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    flow.client_conn.timestamp_end = 1.0
+    send(gate, flow)
+    assert flow.killed and channel.holds_asked == 0 and channel.unslotted == [HOLD]
+
+
+@pytest.mark.parametrize("version", ["HTTP/2.0", "HTTP/3"])
+def test_an_http2_request_is_never_kept_waiting(version: str) -> None:
+    """Security review of T10-2, B1: mitmproxy 12.2.3 queues a client's RST_STREAM behind the
+    request hook (layer.py: a paused HttpStream), so nothing the gate can see says that an
+    HTTP/2 client cancelled its request. Such a request is never released: "pending" at once,
+    and the yes becomes a preapproval its retry spends, once."""
+    channel = FakeChannel()
+    channel.answer = held(wait_ms=5000)
+    channel.decided = Decision("allow", seq=12)
+    flow = a_delete()
+    flow.request.http_version = version
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == 429 and channel.waited == 0 and channel.holds_asked == 0
+    assert channel.let_gone == [(HOLD, False, "no_slot")] and channel.unslotted == [HOLD]
+    assert connect(gate, flow).error is not None
+
+
+def test_a_held_flow_with_an_error_counts_as_gone() -> None:
+    channel = FakeChannel()
+    channel.answer = held(wait_ms=5000)
+    channel.decided = Decision("allow", seq=12)
+    channel.polls = 2
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    channel.on_poll = lambda: setattr(flow, "error", FlowError("stream reset by client (CANCEL)"))
+    send(gate, flow)
+    assert flow.killed and channel.let_gone == [(HOLD, False, "client_left")]
+    assert connect(gate, flow).error is not None
 
 
 def test_a_held_request_does_not_keep_a_place_of_max_pending() -> None:
@@ -1544,7 +1595,9 @@ def facts_of(flow: Flow, channel: FakeChannel | None = None) -> dict[str, Any]:
 def test_every_net_request_carries_its_gate_facts() -> None:
     facts = facts_of(Flow(request=Request(method="GET", path="/v1/items?page=2")))
     assert set(facts) == {"fp", "url_struck", "url_bytes", "websocket", "exact_read",
-                          "wait_hint_s"}  # fmt: skip
+                          "wait_hint_s", "headers_struck", "header_bytes"}  # fmt: skip
+    assert facts["headers_struck"] is False
+    assert facts["header_bytes"] == len("Host") + len("example.com")
     assert facts["exact_read"] is True and facts["url_struck"] is False
     assert facts["url_bytes"] == len("https://example.com:443/v1/items?page=2")
     assert facts["websocket"] is False and facts["wait_hint_s"] is None
@@ -1616,3 +1669,219 @@ def test_the_fingerprint_uses_this_configs_key() -> None:
     flow = Flow(request=Request(raw_content=b"x"))
     other = Flow(request=Request(raw_content=b"x"))
     assert facts_of(flow, one)["fp"] != facts_of(other, two)["fp"]
+
+
+# --- what a read may carry in its headers, and what makes it a write (review of T10-2) ----------
+
+
+def get_with(*headers: tuple[str, str], trailers: Headers | None = None) -> Request:
+    return Request(
+        method="GET",
+        path="/v1/items",
+        headers=Headers([("Host", "example.com"), *headers]),
+        trailers=trailers,
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    ["X-HTTP-Method-Override", "x-method-override", "X-HTTP-Method", "X-Original-URL"],
+)
+def test_a_get_with_a_method_override_is_not_a_read(override: str) -> None:
+    """M2: ``GET`` with ``X-HTTP-Method-Override: DELETE`` is a DELETE to many servers."""
+    assert facts_of(Flow(request=get_with((override, "DELETE"))))["exact_read"] is False
+
+
+def test_a_get_with_trailers_is_not_a_read() -> None:
+    request = get_with(trailers=Headers([("X-Checksum", "1")]))
+    assert facts_of(Flow(request=request))["exact_read"] is False
+
+
+def test_the_fingerprint_counts_the_headers_and_the_trailers() -> None:
+    """M2: a yes for one request never rides on another that only differs in a header."""
+
+    def fp(request: Request) -> str:
+        return str(facts_of(Flow(request=request))["fp"])
+
+    base = fp(get_with())
+    assert base == fp(get_with(("User-Agent", "curl/8"), ("traceparent", "00-1-2-01")))
+    assert base != fp(get_with(("Destination", "https://example.com/elsewhere")))
+    assert base != fp(get_with(("PRIVATE-TOKEN", "glpat-other")))
+    assert base != fp(get_with(trailers=Headers([("X-Checksum", "1")])))
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        ("X-Data", "AKIA" + "ABCDEFGHIJKLMNOP"),
+        ("X-Note", "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"),
+        ("X-Debug", f"leak {FAKE}"),  # a key backtide's scrubber knows
+        ("X-Auth-Token", "Bearer abcdefghijklmnop"),
+    ],
+)
+def test_a_secret_in_a_header_of_a_read_is_struck(header: tuple[str, str]) -> None:
+    """M3: decision 1's guard looks at every header but the credentials."""
+    facts = facts_of(Flow(request=get_with(header)))
+    assert facts["headers_struck"] is True and facts["exact_read"] is True
+
+
+def test_the_credential_headers_are_left_to_the_credentials() -> None:
+    """The agent's own token to an API is no leak: Authorization, Cookie... are not looked at
+    (and they count neither for the size)."""
+    request = get_with(("Authorization", "Bearer " + "x" * 3000), ("Cookie", "s=" + "y" * 3000))
+    facts = facts_of(Flow(request=request))
+    assert facts["headers_struck"] is False
+    assert facts["header_bytes"] == len("Host") + len("example.com")
+
+
+def test_the_header_bytes_are_every_other_header() -> None:
+    facts = facts_of(Flow(request=get_with(("X-Data", "z" * 5000), ("X-Data", "é"))))
+    assert facts["header_bytes"] == len("Hostexample.com") + 2 * len("X-Data") + 5000 + 2
+    assert facts["headers_struck"] is False
+
+
+def test_headers_too_big_to_be_checked_count_as_struck() -> None:
+    """Past what the gate reads, a secret could hide: it is held as one (risk 3)."""
+    facts = facts_of(Flow(request=get_with(("X-Data", "z" * (addon.HEADER_SCAN_LIMIT + 1)))))
+    assert facts["headers_struck"] is True
+
+
+# --- a twin and the real channel, end to end (review of T10-2, M1) -------------------------------
+
+
+def test_a_twin_does_not_steal_the_waiting_requests_slot(tmp_path_factory: Any) -> None:
+    """The same DELETE twice at once: the first waits connected, the second joins its hold and
+    hears "pending". Approved, the first goes out exactly once, and backtide's book ends clean:
+    no hold left releasing, no preapproval left over. The real proxy channel (client.py) and
+    backtide's real end (ProxyChannel and its HoldBook) over a Unix socket."""
+    import os
+    import shutil
+    import socket
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from backtide.blackbox import BlackBox, create_key
+    from backtide.gate.client import SOCKET_NAME, Channel
+    from backtide.service.proxy_channel import Policy, ProxyChannel
+
+    folder = Path(tempfile.mkdtemp(prefix="bt"))  # a Unix socket path is ~100 bytes at most
+    folder.chmod(0o700)
+    box_dir = tmp_path_factory.mktemp("twins")
+    box = BlackBox(box_dir / "bb.db", create_key(box_dir / "bb.key")).open()
+    me = os.getuid()
+
+    async def go() -> None:
+        channel = Channel(str(folder), backtide_uid=me, version="t", pid=7, peer=lambda s: me)
+        await channel.start()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(str(folder / SOCKET_NAME))
+        policy = Policy(allow_hosts=("example.com",), providers=Providers([]))
+        backtide = ProxyChannel(sock, record=box.append, policy=policy)
+        try:
+            await asyncio.to_thread(backtide.handshake, 2)
+            backtide.start()
+            for _ in range(200):
+                if channel.ready:
+                    break
+                await asyncio.sleep(0.01)
+            gate, _ = make_gate(channel, clock=time.monotonic)  # type: ignore[arg-type]
+            first = Flow(request=a_delete().request, id="flow-a", client_conn=Client(id="c-a"))
+            twin = Flow(request=a_delete().request, id="flow-b", client_conn=Client(id="c-b"))
+            for flow in (first, twin):
+                gate.client_connected(flow.client_conn)
+            waiting = asyncio.ensure_future(gate.request(first))
+            book = backtide._book  # noqa: SLF001 - the state under test
+            for _ in range(200):
+                if book.pending():
+                    break
+                await asyncio.sleep(0.01)
+            [hold] = book.pending()
+            await gate.request(twin)
+            assert status(twin) == 429  # "pending" at once
+            for _ in range(200):
+                if hold.connected == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert hold.connected == 1  # the twin said it left; the first still waits
+            outcome = backtide.decide(hold.hold_id, "approve", by="cli", requested_by="t")
+            assert str(outcome.status) == "released"
+            await asyncio.wait_for(waiting, 5)
+            assert first.response is None and not first.killed  # it goes out
+            assert "backtide" in first.metadata
+            for _ in range(200):
+                if book.get(hold.hold_id) is None:
+                    break
+                await asyncio.sleep(0.01)
+            assert book.get(hold.hold_id) is None  # spent: released, not stuck releasing
+            assert not book.preapproved(hold.fp)  # and no second leave for a retry
+            requests = [e for e in box.events(source="net") if e.action == "request"]
+            assert [e.details["gate"]["decision"] for e in requests] == ["approved"]
+            assert requests[0].details["flow_id"] == "flow-a"  # the one that went, not the twin
+        finally:
+            backtide.close()
+            await channel.close()
+
+    try:
+        asyncio.run(go())
+    finally:
+        box.close()
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+# --- HTTP/1 trailers, which mitmproxy 12.2.3 cannot read (review of T10-2) ------------------------
+
+
+def chunked_with_trailer(flow_id: str = "flow-t", version: str = "HTTP/1.1") -> Flow:
+    headers = Headers([("Host", "example.com"), ("Transfer-Encoding", "chunked"),
+                       ("Trailer", "X-Final-Owner")])  # fmt: skip
+    return Flow(request=Request(headers=headers, http_version=version), id=flow_id)
+
+
+def test_an_http1_request_that_announces_trailers_is_refused_and_recorded() -> None:
+    """mitmproxy 12.2.3 cannot read an HTTP/1 request's trailers (its reader raises
+    NotImplementedError before the request hook): such a request could never be checked nor
+    held. It is cut at its headers, and recorded."""
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = chunked_with_trailer()
+    gate.requestheaders(flow)
+    assert flow.killed and channel.asked == []
+    assert channel.actions() == ["blocked:trailers"]
+    assert channel.told[0]["risk"] == 2
+    assert not gate._waiting  # noqa: SLF001 - its body is never read
+
+
+def test_an_http2_request_with_trailers_goes_on_to_be_held() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = chunked_with_trailer(version="HTTP/2.0")
+    gate.requestheaders(flow)
+    assert not flow.killed and flow.response is None
+
+
+def test_a_request_whose_body_was_never_delivered_is_recorded_when_its_client_goes() -> None:
+    """An HTTP/1 trailer that was not announced crashes mitmproxy's reader: no request hook and
+    no error hook. When the client goes, the request is recorded (nothing went out) and its
+    place among the max_pending is given back."""
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    lost = with_body("flow-lost")
+    gate.client_connected(lost.client_conn)
+    gate.requestheaders(lost)
+    assert gate._waiting == {"flow-lost"}  # noqa: SLF001
+    gate.client_disconnected(lost.client_conn)
+    assert gate._waiting == set()  # noqa: SLF001
+    assert channel.actions() == ["error:"]
+    assert channel.told[0]["details"]["stage"] == "request_unread"
+    assert channel.told[0]["details"]["flow_id"] == "flow-lost"
+
+
+def test_a_request_that_reached_its_hook_is_not_recorded_as_unread() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = with_body("flow-ok")
+    gate.client_connected(flow.client_conn)
+    send(gate, flow)
+    gate.client_disconnected(flow.client_conn)
+    assert not any(e["action"] == "error" for e in channel.told)
