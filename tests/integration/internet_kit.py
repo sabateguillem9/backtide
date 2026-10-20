@@ -70,7 +70,11 @@ OAUTH_LOGIN_HOSTS = (
     "github.com",
     "openrouter.ai",
 )
-HOSTS = (ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST, OTHER_HOST, *OAUTH_LOGIN_HOSTS)
+# T10-3 (un-get-que-envia): the Bot API's host, so the gate's Telegram translator reads what the
+# agent sends there. The fake internet answers it (with what reached it): a fake Bot API inside
+# the test's internal network, never Telegram (invariant 8).
+TELEGRAM_HOST = "api.telegram.org"
+HOSTS = (ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST, OTHER_HOST, TELEGRAM_HOST, *OAUTH_LOGIN_HOSTS)
 REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"  # proxy_fixtures/fake_internet.py
 GRANTS_OPTION = "--egress-grants"
 
@@ -152,7 +156,7 @@ def start_fake_internet(service: Service, root: Path) -> FakeInternet:
     for folder in (certs, files, internet):
         folder.mkdir(exist_ok=True)
     ca_key, ca_cert = make_ca(certs, "T06-5 test internet CA", 2048, 30)
-    server_pem = make_server_cert(certs, ca_key, ca_cert, OAUTH_LOGIN_HOSTS)
+    server_pem = make_server_cert(certs, ca_key, ca_cert, (TELEGRAM_HOST, *OAUTH_LOGIN_HOSTS))
     shutil.copyfile(server_pem, internet / "server.pem")
     shutil.copyfile(FIXTURES / "fake_internet.py", files / "fake_internet.py")
     for folder in (files, internet):

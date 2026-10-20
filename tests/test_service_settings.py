@@ -495,3 +495,88 @@ def test_the_running_proxy_gets_the_new_key_on_a_new_connection(
     outcome = settings.set_secret("anthropic", later, requested_by="web")
     assert outcome.applied is Applied.WHEN_UP
     assert egress._policy.providers.items[0].real_key.reveal() == later  # noqa: SLF001
+
+
+# -- the process sensor's list of secrets follows the keys -----------------------------------
+
+
+class ReloadableEgress:
+    """The part of Egress that key_reloader uses."""
+
+    def __init__(self, *, up: bool = True) -> None:
+        self.up = up
+        self.policies: list[Policy] = []
+
+    def reload(self, policy: Policy) -> bool:
+        self.policies.append(policy)
+        return self.up
+
+
+def test_the_sensor_strikes_the_keys_it_started_with(tmp_path: Path, state: Path, box: BlackBox):
+    """build_sensor fills the sensor's list with the Gateway token and the providers' keys."""
+    from backtide.jail import AgentJail
+    from backtide.sensors.scrub import LiveScrub
+    from backtide.service.runner import build_sensor
+    from backtide.snapshots import SnapshotStore
+
+    anthropic = anthropic_key()
+    config = service_config(tmp_path, state, {"anthropic": anthropic, "openai": openai_key()})
+    live = LiveScrub()
+    build_sensor(
+        config,
+        AgentJail(config.jail_config()),
+        box,  # type: ignore[arg-type]
+        SnapshotStore(config.volume),
+        scrub=live,
+    )
+    assert anthropic not in live.text(f"curl -H 'x-api-key: {anthropic}'")
+    assert GATEWAY not in live.text(f"echo {GATEWAY}")
+
+
+def test_changing_a_key_in_settings_refreshes_the_sensors_list(
+    tmp_path: Path, state: Path, box: BlackBox, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The new key is struck from the moment it is saved, the replaced one is dropped, the rest
+    stays; and no key is said anywhere."""
+    from backtide.sensors.scrub import LiveScrub
+    from backtide.service.proxy_channel import known_secrets
+
+    caplog.set_level(logging.DEBUG)
+    old, other = anthropic_key(), openai_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
+    live = LiveScrub(known_secrets([GATEWAY, *config.model_providers().known_secrets()]))
+    egress = ReloadableEgress()
+    settings = make(state, box, key_reloader(config, egress, live))  # type: ignore[arg-type]
+
+    new = anthropic_key()
+    assert live.text(f"echo {new}") == f"echo {new}"
+    outcome = settings.set_secret("anthropic", new, requested_by="web (uid 1, pid 2)")
+    assert outcome.status is Outcome.SAVED
+    assert new not in live.text(f"echo {new}"), "the new key is struck"
+    assert old in live.text(f"echo {old}"), "the replaced key is dropped"
+    assert other not in live.text(f"echo {other}") and GATEWAY not in live.text(GATEWAY)
+    assert len(egress.policies) == 1
+
+    # Removing a key drops it too (the provider is left out of the proxy as well).
+    outcome = settings.clear_secret("openai", requested_by="web")
+    assert outcome.status is Outcome.CLEARED
+    assert other in live.text(f"echo {other}")
+    assert new not in live.text(f"echo {new}") and GATEWAY not in live.text(GATEWAY)
+    texts = everything_said(box, caplog, outcome, repr(live))
+    assert leaks(new, *texts) == [] and leaks(old, *texts) == [] and leaks(other, *texts) == []
+
+
+def test_a_key_that_cannot_be_read_leaves_the_sensors_list_as_it_was(
+    tmp_path: Path, state: Path
+) -> None:
+    from backtide.sensors.scrub import LiveScrub
+    from backtide.service.config import ConfigError
+    from backtide.service.proxy_channel import known_secrets
+
+    old = anthropic_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": openai_key()})
+    live = LiveScrub(known_secrets([GATEWAY, old]))
+    (config.keys_dir / "anthropic.key").write_text("not a key at all\n")
+    with pytest.raises(ConfigError):
+        key_reloader(config, ReloadableEgress(), live)()  # type: ignore[arg-type]
+    assert old not in live.text(f"echo {old}")

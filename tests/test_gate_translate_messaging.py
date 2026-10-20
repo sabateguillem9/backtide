@@ -217,6 +217,34 @@ def test_slack_tokens_in_two_places_or_two_channel_fields_are_unknown() -> None:
     assert none.effect is Effect.UNKNOWN  # type: ignore[attr-defined]
 
 
+def test_slack_repeating_its_own_token_in_the_body_is_one_token() -> None:
+    """OpenClaw 2026.9.8 (``@slack/web-api`` 8.1.1) sends the bot token in ``Authorization``
+    and, for calls like ``conversations.info``, also as the form's ``token``: the same value is
+    one token (a read still passes, and the token is not taken for a secret leaving)."""
+    token = SLACK_AUTH[1].split(" ", 1)[1]
+    same = request(
+        "POST", "slack.com", "/api/conversations.info", form=f"channel=C1&token={token}",
+        headers=(SLACK_AUTH,),
+    )  # fmt: skip
+    reading = read(same)
+    assert reading.effect is Effect.READ and not reading.secret_seen  # type: ignore[union-attr]
+    alone = request("POST", "slack.com", "/api/conversations.info", form="channel=C1",
+                    headers=(SLACK_AUTH,))  # fmt: skip
+    assert reading.account == read(alone).account  # type: ignore[union-attr]
+    # Another secret in the same body still counts.
+    leak = request(
+        "POST", "slack.com", "/api/conversations.info",
+        form=f"channel=C1&token={token}&q=AKIAIOSFODNN7EXAMPLE",
+        headers=(SLACK_AUTH,),
+    )  # fmt: skip
+    assert read(leak).secret_seen  # type: ignore[union-attr]
+    sent = request(
+        "POST", "slack.com", "/api/chat.postMessage", form=f"channel=C1&text=hola&token={token}",
+        headers=(SLACK_AUTH,),
+    )  # fmt: skip
+    assert read(sent).effect is Effect.SEND and not read(sent).secret_seen  # type: ignore[union-attr]
+
+
 def test_a_slack_upload_to_several_channels_lists_them_all() -> None:
     reading = _slack(
         "files.completeUploadExternal",

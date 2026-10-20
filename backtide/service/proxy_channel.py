@@ -57,9 +57,15 @@ remembers of its fingerprint. Every ``gate`` event is written here, never by the
   ``restart`` when backtide stops, ``proxy_restart`` when the proxy is restarted, else
   ``channel_lost``), and the proxy refuses what it held. Preapprovals and rejections go with this
   connection's fingerprint key (``fp_key``, in the config: never logged, never recorded).
-- ``unknown_hosts`` (``Policy``): ``"deny"`` keeps T06's allowed list for whatever is off it (the
-  strict mode); ``"hold"`` lets reads to any host pass and holds the writes. Until T10-3 brings
-  ``[gate]`` to the TOML, the service runs in the strict mode.
+- ``unknown_hosts`` (``Policy``, ``[gate] unknown_hosts``): ``"hold"``, the default since T10-3
+  (decision 1), lets reads to any host pass with decision 1's guard and holds the writes;
+  ``"deny"``, the optional strict mode, keeps T06's allowed list for whatever is off it.
+- **The translators** (T10-3, docs/32 sections 5, 8 and 9): a request a translator read comes
+  with its ``reading`` (checked by ``protocol.check_reading``). It decides instead of the method
+  (rule 5): a read passes; a send or a change whose recipients are all trusted (``Policy.trusted``,
+  ``[gate] trusted``: by default the owner's Telegram chat) passes; the rest is held with its
+  reading and the sentence that tells it (``gate/held {reading, phrase}``). A change to a draft
+  whose sending is held or preapproved is held (``HoldBook.draft_open``).
 
 The config is never logged: ``protocol.describe`` names the providers and counts the hosts.
 """
@@ -82,12 +88,20 @@ from backtide.blackbox import BlackBoxError, Event
 from backtide.blackbox.redact import MIN_KNOWN_SECRET, KnownScrubber
 from backtide.gate import protocol, record
 from backtide.gate.client import SOCKET_NAME
-from backtide.gate.decide import UNKNOWN_HOSTS, Facts, Verdict, decide
+from backtide.gate.decide import UNKNOWN_HOSTS, Facts, ReadingFacts, Verdict, decide
 from backtide.gate.fingerprint import new_key, short
+from backtide.gate.phrase import describe
 from backtide.gate.policy import ALLOWED_PORTS, AllowList
 from backtide.gate.protocol import BLOCK_RISK, LineReader, ProtocolError, Sender
 from backtide.gate.providers import Providers
-from backtide.gate.translate.base import OVERRIDE_HEADERS
+from backtide.gate.translate.base import (
+    OVERRIDE_HEADERS,
+    Effect,
+    Reading,
+    Shape,
+    Trusted,
+    all_trusted,
+)
 from backtide.sensors.files import DailyBudget, TokenBucket
 from backtide.service.holds import Hold, HoldBook, HoldOutcome, HoldStatus, HoldTimings
 
@@ -238,9 +252,12 @@ class Policy:
     providers: Providers
     secrets: tuple[str, ...] = ()  # e.g. the Gateway token: struck from whatever is recorded
     provider_tools: tuple[str, ...] = ()  # [proxy] allow_provider_tools (T06-6)
-    # T10-2: what the gate does with a host off the allowed list. "deny" is T06's allowed list
-    # (the strict mode, decision 1): the service's until T10-3 brings [gate] unknown_hosts.
-    unknown_hosts: str = "deny"
+    # What the gate does with a host off the allowed list ([gate] unknown_hosts): "hold" lets
+    # reads pass (with decision 1's guard) and holds writes; "deny" is T06's allowed list, the
+    # optional strict mode (decision 1).
+    unknown_hosts: str = "hold"
+    trusted: tuple[Trusted, ...] = ()  # [gate] trusted (docs/32, section 9), normalized
+    read_endpoints: tuple[str, ...] = ()  # [gate] read_endpoints, for the read_post translator
 
     def __post_init__(self) -> None:
         if self.unknown_hosts not in UNKNOWN_HOSTS:
@@ -391,6 +408,7 @@ class ProxyChannel:
             self._limits or protocol.DEFAULT_LIMITS,
             provider_tools=self._policy.provider_tools,
             fp_key=self._fp_key,
+            read_endpoints=self._policy.read_endpoints,
         )
         try:
             self._send(protocol.encode(config, Sender.BACKTIDE))
@@ -559,8 +577,9 @@ class ProxyChannel:
         # token, so a URL (or a header value the recording keeps) that carried it is only
         # struck here. And a method override header that the recording names makes it a write,
         # whatever the proxy said (security review of T10-2, M2 and M3).
-        path = details.get("path")
+        path, host = details.get("path"), details.get("host")
         struck_here = not isinstance(path, str) or self._scrub.text(path) != path
+        struck_here |= isinstance(host, str) and self._scrub.text(host) != host  # a name too
         headers = details.get("headers")
         headers = headers if isinstance(headers, dict) else {}
         overridden = any(str(name).strip().lower() in OVERRIDE_HEADERS for name in headers)
@@ -568,6 +587,7 @@ class ProxyChannel:
             isinstance(value, str) and self._scrub.text(value) != value
             for value in headers.values()
         )
+        reading = gate["reading"]
         facts = Facts(
             method=str(details.get("method", "")),
             exact_read=gate["exact_read"] and not overridden,
@@ -580,12 +600,17 @@ class ProxyChannel:
             allowed=allowed,
             preapproved=self._book.preapproved(fp),
             rejected=self._book.rejected(fp),
+            credential_bytes=gate["credential_bytes"],
+            body_struck=gate["body_struck"],
+            reading=None if reading is None else self._reading_facts(reading),
         )
         decision = decide(facts, unknown_hosts=self._policy.unknown_hosts)
         if decision.verdict is Verdict.REJECT:
             return self._refuse(request_id, event, decision.reason, fp=fp)
         if decision.verdict is Verdict.PASS:
             note: dict[str, Any] = {"decision": decision.reason}
+            if reading is not None:
+                note |= {key: reading[key] for key in ("translator", "operation", "effect")}
             if decision.reason == "preapproved":
                 hold = self._book.spend(fp)
                 if hold is None:  # cannot be: preapproved() said so under this same lock
@@ -599,6 +624,21 @@ class ProxyChannel:
             return self._let_out(request_id, event, note)
         return self._hold(request_id, event, gate, decision.risk, decision.reason)
 
+    def _reading_facts(self, reading: Mapping[str, Any]) -> ReadingFacts:
+        """What decide.py needs of a checked reading: its effect and risk, whether all its
+        recipients are trusted (never a cut one: a recipient may be missing) and whether it
+        changes a draft whose sending is held or preapproved."""
+        effect = Effect(reading["effect"])
+        trusted = not reading["cut"] and all_trusted(_as_reading(reading), self._policy.trusted)
+        key = _draft_key(reading)
+        changes_draft = key is not None and effect in (Effect.READ, Effect.CHANGE)
+        return ReadingFacts(
+            effect=effect,
+            risk=reading["risk"],
+            trusted=trusted,
+            draft_open=changes_draft and key is not None and self._book.draft_open(key),
+        )
+
     def _hold(
         self, request_id: int, event: dict[str, Any], gate: dict[str, Any], risk: int, reason: str
     ) -> dict[str, Any]:
@@ -606,13 +646,18 @@ class ProxyChannel:
         if self._holds_ended:  # backtide is stopping: no hold would ever be closed
             return protocol.ack(request_id, "deny", reason="not_recorded")
         hold = self._book.live(fp)
+        reading = gate["reading"]
         if hold is not None:  # the same request again: it joins, without a new event
             self._book.join(hold, event)
         else:
-            hold = self._book.open(fp, risk=risk, reason=reason, event=event)
+            draft = None if reading is None else _draft_key(reading)
+            hold = self._book.open(fp, risk=risk, reason=reason, event=event, draft=draft)
             if hold is None:  # too many open: counted in the next gate/flood
                 return protocol.ack(request_id, "deny", reason="hold_full")
-            extra = {"reason": reason, "expires_at": hold.expires_at}
+            extra: dict[str, Any] = {"reason": reason, "expires_at": hold.expires_at}
+            if reading is not None:
+                hold.phrase = self._scrub.text(describe(reading))
+                extra |= {"reading": _recorded_reading(reading), "phrase": hold.phrase}
             stored = self._gate_event("held", hold, extra, risk=risk, request=event["details"])
             if stored is None:
                 self._book.discard(hold)
@@ -625,7 +670,7 @@ class ProxyChannel:
             "hold",
             seq=hold.seq,
             hold_id=hold.hold_id,
-            wait_ms=self._book.wait_ms(hold, gate["wait_hint_s"]),
+            wait_ms=self._book.wait_ms(hold, _wait_hint(gate)),
             retry_after=self._book.timings.retry_after,
         )
 
@@ -882,12 +927,53 @@ def _blocked_from(event: Mapping[str, Any], reason: str) -> dict[str, Any]:
     }
 
 
+def _as_reading(reading: Mapping[str, Any]) -> Reading:
+    """A checked ``gate.reading`` as the translators' Reading (for ``all_trusted``)."""
+    return Reading(
+        translator=reading["translator"],
+        operation=reading["operation"],
+        effect=Effect(reading["effect"]),
+        shape=Shape(reading["shape"]),
+        wait_s=reading["wait_s"],
+        account=reading["account"],
+        recipients=tuple(reading["recipients"]),
+        secret_seen=reading["secret_seen"],
+    )
+
+
+def _wait_hint(gate: Mapping[str, Any]) -> int | None:
+    """How long the request's client waits: the least of the proxy's hint and its reading's
+    ``wait_s`` (decision 3: Telegram 50 s, Discord 10 s, gog 25 s...)."""
+    hints = [gate["wait_hint_s"], None if gate["reading"] is None else gate["reading"]["wait_s"]]
+    known = [hint for hint in hints if hint is not None]
+    return min(known) if known else None
+
+
+def _draft_key(reading: Mapping[str, Any]) -> tuple[str, str | None, str] | None:
+    draft = reading.get("draft")
+    return None if draft is None else (reading["translator"], reading["account"], draft)
+
+
+_RECORDED_READING = (
+    "translator", "operation", "effect", "recipients", "sender", "reply_to", "subject",
+    "first_lines", "target", "attachments", "secret_seen", "notes", "draft", "cut",
+)  # fmt: skip
+
+
+def _recorded_reading(reading: Mapping[str, Any]) -> dict[str, Any]:
+    """What ``gate/held`` keeps of a reading (docs/32, section 7): what it does and to whom,
+    the struck texts and the attachments; not the account's HMAC (it is of this connection's
+    key, worthless after it) nor the proxy's mechanics (wait, shape)."""
+    return {key: reading[key] for key in _RECORDED_READING}
+
+
 def _summary(hold: Hold, now: float) -> dict[str, Any]:
     details = hold.event.get("details") or {}
     return {
         "hold_id": hold.hold_id,
         "risk": hold.risk,
         "reason": hold.reason,
+        "phrase": hold.phrase,
         "method": details.get("method"),
         "host": details.get("host"),
         "path": details.get("path"),

@@ -48,9 +48,12 @@ def providers() -> Providers:
     )
 
 
-def policy() -> Policy:
-    return Policy(allow_hosts=("example.com", "*.allowed.test"), providers=providers(),
-                  secrets=(GATEWAY,))  # fmt: skip
+def policy(**changes: Any) -> Policy:
+    """The strict mode (T06's allowed list), which most of these tests are about; the default
+    since T10-3 is ``unknown_hosts = "hold"``."""
+    options = {"allow_hosts": ("example.com", "*.allowed.test"), "providers": providers(),
+               "secrets": (GATEWAY,), "unknown_hosts": "deny"} | changes  # fmt: skip
+    return Policy(**options)
 
 
 def facts(fp: str = "e" * 64, **changes: Any) -> dict[str, Any]:
@@ -837,7 +840,7 @@ def test_the_pending_holds_say_what_the_person_decides_on(gated: Gated) -> None:
     gated.clock.now += 60
     [pending] = gated.channel.pending()
     assert pending == {
-        "hold_id": hold_id, "risk": 3, "reason": "delete", "method": "DELETE",
+        "hold_id": hold_id, "risk": 3, "reason": "delete", "phrase": None, "method": "DELETE",
         "host": "example.com", "path": "/v1/buckets/b1",
         "target": "https://example.com/v1/buckets/b1", "expires_in_s": 240, "waiting": True,
     }  # fmt: skip
@@ -981,10 +984,10 @@ def test_a_get_with_a_body_is_held(gated: Gated) -> None:
     assert gated.ask(request_event(body=b"q=1"), facts())["verdict"] == "hold"
 
 
-def test_the_strict_mode_is_the_default_until_t10_3(gated: Gated) -> None:
-    """Off the allowed list everything is refused, as in T06 (``[gate] unknown_hosts`` comes
-    with T10-3)."""
-    assert Policy(allow_hosts=(), providers=providers()).unknown_hosts == "deny"
+def test_the_strict_mode_refuses_what_is_off_the_list(gated: Gated) -> None:
+    """``[gate] unknown_hosts = "deny"``: off the allowed list everything is refused, as in T06.
+    Since T10-3 it is optional: the default gates unknown hosts (decision 1)."""
+    assert Policy(allow_hosts=(), providers=providers()).unknown_hosts == "hold"
     for gate in (facts(), write_facts(), facts(websocket=True)):
         ack = gated.ask(request_event("nope.example"), gate)
         assert (ack["verdict"], ack["reason"]) == ("deny", "not_allowed")
@@ -1029,3 +1032,133 @@ def test_a_read_whose_url_carries_a_secret_only_backtide_knows_is_held(gated: Ga
         assert ack["verdict"] == "hold"
     assert [e.risk for e in gated.gate_events("held")] == [3, 3]
     assert GATEWAY not in json.dumps([e.details for e in gated.box.events()])
+
+
+# --- the translators' readings (T10-3, docs/32 sections 5 and 9) ---------------------------------
+
+BOT = "bot123456789:" + "AAbbCCddEEffGGhhIIjjKKllMMnnOOppQ"
+OWNER = "555"
+
+
+def telegram_send(
+    chat: str, text: str = "hola", n: int = 1
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The event and the gate facts of ``GET api.telegram.org/bot…/sendMessage?chat_id=…``,
+    read by the real translator."""
+    from backtide.gate.translate import Context, RequestView, translate
+
+    path = f"/{BOT}/sendMessage?chat_id={chat}&text={text}"
+    view = RequestView(method="GET", host="api.telegram.org", port=443, path=path)
+    reading = translate(view, Context(key=bytes(32)))
+    assert reading is not None
+    event = request_event("api.telegram.org", path=path)
+    return event, facts(f"{n:064x}", reading=protocol.fit_reading(reading.summary()))
+
+
+def a_reading(**fields: Any) -> dict[str, Any]:
+    from backtide.gate.translate.base import Effect, Note, Reading, Shape
+
+    base: dict[str, Any] = {"translator": "gmail", "operation": "unknown",
+                            "effect": Effect.UNKNOWN, "shape": Shape.GOOGLE, "wait_s": 25,
+                            "account": "0123456789abcdef"} | fields  # fmt: skip
+    base["effect"] = Effect(base["effect"])
+    base["notes"] = tuple(Note(note) for note in base.get("notes", ()))
+    return protocol.fit_reading(Reading(**base).summary())
+
+
+@pytest.fixture
+def translated(box: BlackBox) -> Iterator[Gated]:
+    from backtide.gate.translate.base import normalize_trusted
+
+    made = Gated(box, policy=policy(unknown_hosts="hold",
+                                    trusted=(normalize_trusted("telegram", OWNER),)))  # fmt: skip
+    try:
+        yield made
+    finally:
+        made.channel.close()
+
+
+def test_a_send_to_the_owners_chat_passes_with_its_reading_noted(translated: Gated) -> None:
+    event, gate = telegram_send(OWNER)
+    assert translated.ask(event, gate)["verdict"] == "allow"
+    [request] = translated.requests()
+    assert request.details["gate"] == {"decision": "trusted", "translator": "telegram",
+                                       "operation": "sendmessage", "effect": "send"}  # fmt: skip
+    assert translated.gate_events() == []
+
+
+def test_a_send_to_another_chat_is_held_with_its_sentence(translated: Gated) -> None:
+    event, gate = telegram_send("556")
+    ack = translated.ask(event, gate)
+    assert ack["verdict"] == "hold" and ack["wait_ms"] == 50_000  # Telegram's client: 50 s
+    [held] = translated.gate_events("held")
+    assert (held.risk, held.details["reason"]) == (2, "send")
+    assert held.details["phrase"] == "Telegram: enviar un mensaje al chat 556: «hola»"
+    assert held.details["reading"]["recipients"] == ["556"]
+    assert "account" not in held.details["reading"]  # this connection's HMAC: worthless later
+    assert BOT.split(":")[1] not in json.dumps(held.details)
+    [pending] = translated.channel.pending()
+    assert pending["phrase"] == held.details["phrase"]
+
+
+def test_a_send_to_the_owner_with_a_secret_is_held_with_risk_3(translated: Gated) -> None:
+    event, gate = telegram_send(OWNER, text="AKIAIOSFODNN7EXAMPLE")
+    assert gate["reading"]["secret_seen"] is True
+    assert translated.ask(event, gate)["verdict"] == "hold"
+    [held] = translated.gate_events("held")
+    assert held.risk == 3 and "AKIAIOSFODNN7EXAMPLE" not in json.dumps(held.details)
+
+
+def test_a_cut_reading_is_never_trusted(translated: Gated) -> None:
+    event, gate = telegram_send(OWNER)
+    gate["reading"]["cut"] = True
+    assert translated.ask(event, protocol.gate(**gate))["verdict"] == "hold"
+
+
+def test_a_translated_read_to_an_unknown_host_passes_and_a_secret_in_its_url_is_held(
+    translated: Gated,
+) -> None:
+    read = a_reading(operation="get", effect="read")
+    ask = translated.ask
+    assert ask(request_event("gmail.googleapis.com"), facts("1" * 64, reading=read))[
+        "verdict"
+    ] == "allow"  # fmt: skip
+    leak = facts("2" * 64, reading=read, url_struck=True)
+    assert ask(request_event("gmail.googleapis.com"), leak)["verdict"] == "hold"
+    [held] = translated.gate_events("held")
+    assert (held.risk, held.details["reason"]) == (3, "url_secret")
+
+
+def test_a_draft_change_while_its_sending_is_held_is_held(translated: Gated) -> None:
+    """Decision 12: the text the person approves must not change before it goes out. (With no
+    owner accounts configured every draft change is held anyway; this is the READ case.)"""
+    send = a_reading(draft="r-42", target="draft r-42", notes=("content_unseen",))
+    event = request_event("gmail.googleapis.com", method="POST", body=b'{"id": "r-42"}')
+    assert translated.ask(event, write_facts("3" * 64, reading=send))["verdict"] == "hold"
+    change = a_reading(operation="drafts.update", effect="read", draft="r-42")
+    update = request_event("gmail.googleapis.com", method="PUT", body=b"{}")
+    ack = translated.ask(update, write_facts("4" * 64, reading=change))
+    assert ack["verdict"] == "hold"
+    assert translated.gate_events("held")[-1].details["reason"] == "draft_open"
+    other = a_reading(operation="drafts.update", effect="read", draft="r-43")
+    assert translated.ask(update, write_facts("5" * 64, reading=other))["verdict"] == "allow"
+
+
+def test_the_read_endpoints_go_to_the_proxy_in_its_config(box: BlackBox) -> None:
+    made = Gated(box, policy=policy(read_endpoints=("search.fake.test/v1/query",)))
+    try:
+        assert made.config["read_endpoints"] == ["search.fake.test/v1/query"]
+    finally:
+        made.channel.close()
+
+
+def test_a_read_to_a_host_named_with_a_secret_only_backtide_knows_is_held(
+    translated: Gated,
+) -> None:
+    """The proxy never sees the Gateway token: in a host name (lower case, as DNS has it) it
+    is struck by backtide, and the read is held before the name is ever resolved."""
+    host = f"{GATEWAY.lower()}.exfil.example"
+    ack = translated.ask(request_event(host), facts("6" * 64))
+    assert ack["verdict"] == "hold"
+    [held] = translated.gate_events("held")
+    assert (held.risk, held.details["reason"]) == (3, "url_secret")

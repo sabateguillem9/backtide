@@ -99,6 +99,13 @@ def claims(view: RequestView, context: Context) -> bool:
     return view.host in HOSTS
 
 
+def credential_segments(segments: tuple[str, ...]) -> frozenset[int]:
+    """Which segments of a path (split on "/", the query apart) are the bot's token: the gate
+    leaves them out when it looks for a secret in the URL (the token is the API's own way to
+    authenticate, and the black box strikes it anyway)."""
+    return frozenset(i for i, segment in enumerate(segments) if _BOT_RE.fullmatch(segment))
+
+
 def chat_id(value: object) -> str | None:
     """A chat as Telegram reads ``chat_id``: an integer (canonical form) or ``@username``
     (case-insensitive). None for anything else (a bool, a float, a list...)."""

@@ -21,6 +21,7 @@ mail paths are those under ``sendMail``, ``messages``, ``mailFolders`` and ``mai
 
 import json
 import re
+from dataclasses import replace
 from typing import Any
 
 from backtide.gate.translate.base import (
@@ -167,22 +168,26 @@ def _classify(
     item = safe_id(raw[index]) if tail and index < len(raw) else None
     target = f"message {item}" if item else None
     if len(tail) == 1 and method == "PATCH":
-        return _plain(draft, "messages.update", account, Note.DRAFT, target=target)
+        changed = _plain(draft, "messages.update", account, Note.DRAFT, target=target)
+        return replace(changed, draft=item)
     if len(tail) == 1 and method == "DELETE" and not view.body:
         return _plain(Effect.DELETE, "messages.delete", account, target=target)
     if tail[1:] == ("attachments",) and method == "POST":
         # It cannot tell a draft from a sent message: an attachment is a draft's only there.
-        return _plain(draft, "messages.attachments.add", account, Note.DRAFT, target=target)
+        added = _plain(draft, "messages.attachments.add", account, Note.DRAFT, target=target)
+        return replace(added, draft=item)
     if len(tail) == 3 and tail[1] == "attachments" and method == "DELETE" and not view.body:
-        return _plain(Effect.DELETE, "messages.attachments.delete", account, target=target)
+        removed = _plain(Effect.DELETE, "messages.attachments.delete", account, target=target)
+        return replace(removed, draft=item)
     if len(tail) != 2 or method != "POST":
         return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, account=account, target=target)
     action = tail[1]
     if action in _DRAFT_ACTIONS:
         return _plain(draft, f"messages.{action}", account, Note.DRAFT, target=target)
     if action in _UNSEEN_ACTIONS:
-        return unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, Note.CONTENT_UNSEEN, account=account,
-                       target=target or "a saved message")  # fmt: skip
+        unseen = unknown(NAME, Shape.GRAPH, WAIT_DEFAULT, Note.CONTENT_UNSEEN, account=account,
+                         target=target or "a saved message")  # fmt: skip
+        return replace(unseen, draft=item if action == "send" else None)
     if action == "permanentdelete":
         return _plain(Effect.DELETE, "messages.permanentDelete", account, target=target)
     if action in ("move", "copy"):

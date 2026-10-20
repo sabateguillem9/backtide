@@ -53,19 +53,22 @@ def _text(status: int, text: str, extra: tuple[tuple[str, str], ...] = ()) -> An
     return Answer(status, headers, (text + "\n").encode("ascii"))
 
 
-def pending(shape: Shape, hold_id: str | None) -> Answer:
-    """HTTP 429, ``Retry-After: 30``: held, waiting for the person; try again in a while."""
+def pending(shape: Shape, hold_id: str | None, retry_after: int = RETRY_AFTER_S) -> Answer:
+    """HTTP 429, ``Retry-After: 30`` (or ``retry_after``, what backtide's ack says): held,
+    waiting for the person; try again in a while."""
+    if type(retry_after) is not int or not 1 <= retry_after <= 3600:
+        raise ValueError("retry_after is 1-3600 s")
     message = (
         f"backtide: waiting for the person to approve this request{_hold(hold_id)}; "
-        f"try again in {RETRY_AFTER_S} s, not in a loop"
+        f"try again in {retry_after} s, not in a loop"
     )
-    retry = (("retry-after", str(RETRY_AFTER_S)),)
+    retry = (("retry-after", str(retry_after)),)
     if shape is Shape.TELEGRAM:
         return _json(429, {
             "ok": False,
             "error_code": 429,
-            "description": f"Too Many Requests: retry after {RETRY_AFTER_S} ({message})",
-            "parameters": {"retry_after": RETRY_AFTER_S},
+            "description": f"Too Many Requests: retry after {retry_after} ({message})",
+            "parameters": {"retry_after": retry_after},
         }, retry)  # fmt: skip
     if shape is Shape.DISCORD:
         # The headers of Discord's own 429 (its docs, "Rate Limits"): unconfirmed whether
@@ -73,11 +76,11 @@ def pending(shape: Shape, hold_id: str | None) -> Answer:
         limits = (
             ("x-ratelimit-limit", "1"),
             ("x-ratelimit-remaining", "0"),
-            ("x-ratelimit-reset-after", f"{RETRY_AFTER_S:.3f}"),
+            ("x-ratelimit-reset-after", f"{retry_after:.3f}"),
             ("x-ratelimit-scope", "user"),
         )
         return _json(
-            429, {"message": message, "retry_after": RETRY_AFTER_S, "global": False},
+            429, {"message": message, "retry_after": retry_after, "global": False},
             retry + limits,
         )  # fmt: skip
     if shape is Shape.SLACK:

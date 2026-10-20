@@ -1,6 +1,10 @@
 """`backtide web`: arguments, messages in Spanish, exit codes, and the real server it starts. The
 web needs no secret: these tests run with no gateway token and no key file at all."""
 
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -255,3 +259,50 @@ def test_a_root_web_with_only_ajustes_starts_and_warns(
     )
     code, out, _ = run(capsys, "web", "--config", config_file, "--ajustes")
     assert code == 0 and "Ojo: esta web corre como root" in out
+
+
+@pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM], ids=["ctrl-c", "sigterm"])
+def test_a_real_web_stopped_by_a_signal_says_so_and_exits_0(
+    config_file: Path, recorded: BlackBox, stop_signal: signal.Signals
+) -> None:
+    """Ctrl-C (SIGINT) and SIGTERM end `backtide web` the way its help promises: the closing line,
+    exit code 0, no traceback. uvicorn re-raises a captured signal once it has shut down, which
+    used to end the process by the signal itself (code -2 and a KeyboardInterrupt)."""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "backtide.cli",
+            "web",
+            "--config",
+            str(config_file),
+            "--puerto",
+            "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    try:
+        assert process.stdout is not None
+        url = ""
+        for line in process.stdout:  # the link is printed before the server starts to serve
+            if line.strip().startswith("http://"):
+                url = line.strip()
+                break
+        assert url
+        for _ in range(100):  # an answer proves uvicorn is serving, so its handlers are in place
+            try:
+                if httpx.get(url, follow_redirects=False).status_code:
+                    break
+            except httpx.TransportError:
+                time.sleep(0.1)
+        process.send_signal(stop_signal)
+        out, err = process.communicate(timeout=20)
+    finally:
+        process.kill()
+        process.wait()
+    assert process.returncode == 0, err
+    assert "Puesto de vigilancia parado." in out
+    assert "Traceback" not in err and "KeyboardInterrupt" not in err

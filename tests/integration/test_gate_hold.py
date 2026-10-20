@@ -3,6 +3,11 @@
 Done when: a DELETE is held and goes out exactly once, only if it is approved from the terminal
 (``backtide aprobar``'s request over the control socket), and a GET goes out without asking.
 
+T10-3 (the translators): the fake internet answers for ``api.telegram.org`` too (a fake Bot API
+inside the internal network). A ``sendMessage`` to the owner's chat (``Policy.trusted``) passes;
+one to another chat is held with the translator's sentence, and its client gets Telegram's own
+429 ("pending") and 403 ("rejected").
+
 The lab is test_proxy_channel.py's: the real proxy (``ProxyJail``, backtide/gate/main.py and its
 addon) and backtide's real end of the channel (``Egress``, ``ProxyChannel`` and its
 ``HoldBook``), recording into a real black box, with T06-1's fake internet on an internal egress
@@ -27,6 +32,7 @@ import pytest
 
 from backtide.blackbox import BlackBox, Event, create_key
 from backtide.gate.providers import Providers
+from backtide.gate.translate.base import normalize_trusted
 from backtide.jail import docker as jail_docker
 from backtide.jail import proxy_config
 from backtide.jail.proxy import ProxyJail
@@ -55,6 +61,9 @@ from tests.integration.test_proxy_assumptions import (
 pytestmark = pytest.mark.integration
 
 ALLOWED = "plain.fake.test"
+TELEGRAM = "api.telegram.org"  # an alias of the fake internet, in its certificate (T10-3)
+BOT = "bot123456789:" + "AAbbCCddEEffGGhhIIjjKKllMMnnOOppQ"  # made up
+OWNER = "424242424"
 CLIENT_UID = 61000
 WAIT = 6.0  # seconds a held request keeps its connection (90 in production)
 LIFE = 15.0  # seconds a hold lives (5 min in production)
@@ -105,9 +114,10 @@ class Lab:
         timeout: float = 60,
         body: str = "",
         headers: dict[str, str] | None = None,
+        host: str = ALLOWED,
     ) -> dict:
         result = docker(
-            "exec", self.client, "python3", "/opt/t06/ask.py", method, ALLOWED, path,
+            "exec", self.client, "python3", "/opt/t06/ask.py", method, host, path,
             str(timeout), body, json.dumps(headers or {}), timeout=timeout + 30, check=False,
         )  # fmt: skip
         lines = result.stdout.strip().splitlines()
@@ -186,7 +196,8 @@ def lab(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Lab]:
     for folder in (files, certs, internet, t06):
         folder.mkdir()
     internet_key, internet_cert = make_ca(certs, "T10-2 test internet CA", 2048, 30)
-    shutil.copyfile(make_server_cert(certs, internet_key, internet_cert), internet / "server.pem")
+    server_pem = make_server_cert(certs, internet_key, internet_cert, (TELEGRAM,))
+    shutil.copyfile(server_pem, internet / "server.pem")
     shutil.copyfile(FIXTURES / "fake_internet.py", t06 / "fake_internet.py")
     (t06 / "ask.py").write_text(ASK)
     shutil.copyfile(egress_files.agent_ca / "ca.pem", t06 / "agent-ca.pem")
@@ -210,7 +221,7 @@ def lab(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Lab]:
         internal_network(agent_net)
         jail.ensure_network()
         argv = hardened(fake, FAKE_UID) + ["--network", jail.config.network]
-        for host in FAKE_HOSTS:
+        for host in (*FAKE_HOSTS, TELEGRAM):
             argv += ["--network-alias", host]
         argv += [
             "--volume", f"{t06}:/opt/t06:ro,z",
@@ -240,7 +251,11 @@ def lab(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Lab]:
         egress = Egress(
             jail,
             agent_name=client,
-            policy=Policy(allow_hosts=(ALLOWED,), providers=Providers([])),
+            policy=Policy(
+                allow_hosts=(ALLOWED,),
+                providers=Providers([]),
+                trusted=(normalize_trusted("telegram", OWNER),),
+            ),
             record=box.append,
             thread=False,
             timings=TIMINGS,
@@ -506,3 +521,83 @@ def test_with_the_proxy_killed_a_held_request_never_goes_out(lab: Lab) -> None:
     assert lab.decide(held.details["hold_id"])["outcome"] == "unknown"
     assert lab.arrived(path) == []
     assert lab.ask("GET", tag() + "/after")["status"] == 200
+
+
+# --- the translators (T10-3) -----------------------------------------------------------------
+
+
+def telegram_path(chat: str, text: str) -> str:
+    return f"/{BOT}/sendMessage?chat_id={chat}&text={text}"
+
+
+def recorded_with(lab: Lab, text: str, action: str) -> list[Event]:
+    return [e for e in lab.box.events() if text in str(e.details.get("path", ""))
+            and e.action == action]  # fmt: skip
+
+
+def telegram_arrived(lab: Lab, text: str) -> list[dict]:
+    stats = json.loads(
+        docker(
+            "exec", lab.fake, "python3", "-c",
+            "import sys, urllib.request; sys.stdout.write(urllib.request.urlopen("
+            "'http://127.0.0.1:9000/stats', timeout=10).read().decode())",
+        ).stdout
+    )  # fmt: skip
+    return [r for r in stats["requests"] if text in r["path"]]
+
+
+def test_a_send_to_the_owners_chat_passes_without_asking(lab: Lab) -> None:
+    text = f"owner{time.time_ns()}"
+    result = lab.ask("GET", telegram_path(OWNER, text), host=TELEGRAM)
+    assert result["ok"] and result["status"] == 200, result
+    [arrived] = telegram_arrived(lab, text)
+    [request] = recorded_with(lab, text, "request")
+    assert request.details["gate"] == {
+        "decision": "trusted", "translator": "telegram", "operation": "sendmessage",
+        "effect": "send",
+    }  # fmt: skip
+    assert ts(request) < arrived["at"]
+    assert recorded_with(lab, text, "held") == []
+    assert BOT.split(":")[1] not in json.dumps(request.details)
+
+
+def test_a_send_to_another_chat_is_held_with_its_sentence_and_telegrams_429(lab: Lab) -> None:
+    text = f"stranger{time.time_ns()}"
+    body = json.dumps({"chat_id": 556, "text": text})
+    path = f"/{BOT}/sendMessage"
+    pending = lab.ask("POST", path, body=body, host=TELEGRAM)
+    assert pending["ok"] and pending["status"] == 429, pending
+    assert pending["retry_after"] == "30" and pending["elapsed"] >= WAIT - 1
+    answer = json.loads(pending["body"])
+    assert (answer["ok"], answer["error_code"]) == (False, 429)
+    assert answer["parameters"] == {"retry_after": 30}
+    [held] = [e for e in lab.box.events(source="gate", action="held")
+              if e.details.get("reading", {}).get("first_lines") == text]  # fmt: skip
+    assert (held.risk, held.details["reason"]) == (2, "send")
+    assert held.details["phrase"] == f"Telegram: enviar un mensaje al chat 556: «{text}»"
+    assert held.details["hold_id"] in answer["description"]
+    # Nothing reached the fake Bot API at that path (a POST: its text is in the body).
+    assert [r for r in telegram_arrived(lab, "/sendMessage") if r["path"] == path] == []
+    # Rejected, the same message again is refused at once, in Telegram's shape too.
+    assert lab.decide(held.details["hold_id"], "reject")["outcome"] == "rejected"
+    refused = lab.ask("POST", path, body=body, host=TELEGRAM)
+    assert refused["status"] == 403, refused
+    assert json.loads(refused["body"])["error_code"] == 403
+    assert refused["elapsed"] < WAIT
+
+
+def test_the_same_message_written_otherwise_is_the_same_hold(lab: Lab) -> None:
+    """Decision 2: the semantic fingerprint. The same message with its fields in another order
+    (another JSON, the same send) joins the hold the first one opened: no second gate/held."""
+    text = f"twice{time.time_ns()}"
+    path = f"/{BOT}/sendMessage"
+    first = lab.ask("POST", path, body=json.dumps({"chat_id": 557, "text": text}),
+                    host=TELEGRAM, timeout=2)  # fmt: skip
+    assert not first["ok"] or first["status"] == 429, first
+    again = lab.ask("POST", path, body=json.dumps({"text": text, "chat_id": 557}, indent=1),
+                    host=TELEGRAM, timeout=2)  # fmt: skip
+    assert not again["ok"] or again["status"] == 429, again
+    helds = [e for e in lab.box.events(source="gate", action="held")
+             if e.details.get("reading", {}).get("first_lines") == text]  # fmt: skip
+    assert len(helds) == 1
+    assert lab.decide(helds[0].details["hold_id"], "reject")["outcome"] == "rejected"

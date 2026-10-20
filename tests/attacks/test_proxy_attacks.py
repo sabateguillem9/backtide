@@ -112,10 +112,15 @@ def start_lab(
     *,
     inwards: bool = False,
     hold_timings: tuple[str, ...] = HOLD_TIMINGS,
+    unknown_hosts: str = "hold",
+    trusted_chat: str | None = None,
 ) -> Lab:
     """A started service with its fake internet. With ``inwards``, the allowed list also holds
     names that resolve to private addresses (ssrf-por-el-proxy: the fixed rule must still say
-    no). ``hold_timings`` are the gate's shortened times (test_gate_attacks.py uses its own)."""
+    no). ``hold_timings`` are the gate's shortened times (test_gate_attacks.py uses its own).
+    ``unknown_hosts`` is ``[gate] unknown_hosts``: ``"hold"`` (the default since T10-3: reads to
+    any host pass, writes are held) or ``"deny"`` (the strict mode, T06's allowed list).
+    ``trusted_chat``: a Telegram chat in ``[gate] trusted`` (the owner's, in un-get-que-envia)."""
     vm._require_agent_image()
     vm._remove_stale_test_agents()
     names = vm._agent_names(os.getpid())
@@ -132,7 +137,9 @@ def start_lab(
         root,
         tmp_path_factory.mktemp("service-state"),
         names,
-        proxy_toml=f"allow_hosts = {json.dumps(hosts)}\n" + provider_toml(),
+        proxy_toml=f"allow_hosts = {json.dumps(hosts)}\n"
+        + provider_toml()
+        + gate_toml(unknown_hosts, trusted_chat),
         real_keys=real,
     )
     internet: FakeInternet | None = None
@@ -147,13 +154,24 @@ def start_lab(
     return Lab(service, internet, real)
 
 
+def gate_toml(unknown_hosts: str, trusted_chat: str | None) -> str:
+    """``[gate]`` (T10-3), after ``[proxy]`` and its providers."""
+    text = f'\n[gate]\nunknown_hosts = "{unknown_hosts}"\n'
+    if trusted_chat is not None:
+        text += f'trusted = [{{translator = "telegram", chat = "{trusted_chat}"}}]\n'
+    return text
+
+
 @pytest.fixture(scope="module")
 def lab(
     canary_environment: dict[str, str],
     btrfs_volume: Path,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[Lab]:
-    started = start_lab(btrfs_volume, tmp_path_factory, inwards=True)
+    # T06's scenarios are about the allowed list: they run in the strict mode
+    # (``[gate] unknown_hosts = "deny"``). The default (reads to any host pass) is
+    # test_gate_attacks.py's lab: dns-tunel, un-get-que-envia, exfiltrar-credenciales.
+    started = start_lab(btrfs_volume, tmp_path_factory, inwards=True, unknown_hosts="deny")
     try:
         yield started
     finally:
@@ -170,7 +188,7 @@ def own_lab(
     made: list[Lab] = []
 
     def make() -> Lab:
-        made.append(start_lab(btrfs_volume, tmp_path_factory))
+        made.append(start_lab(btrfs_volume, tmp_path_factory, unknown_hosts="deny"))
         return made[-1]
 
     try:
@@ -448,8 +466,9 @@ def test_secrets_in_requests_never_reach_the_black_box(attack: Attack, lab: Lab)
     assert len(lab.internet.requests(PLAIN_HOST, f"/{tag}/")) == len(passed)
     recorded = lab.tagged(tag, "request") + lab.tagged(tag, "held")
     # Credentials that live in a URL path (Discord and Slack webhooks, a Telegram bot path),
-    # plain and encoded: every one held (a GET whose URL carried a secret, with risk 3; a POST,
-    # as any write, with 2). A struck path may lose its tag, so they are found by seq.
+    # plain and encoded: every one held with risk 3 (a GET whose URL carried a secret; since
+    # T10-3 a POST too: a write whose URL or body carried a secret is risk 3, docs/32 section 5).
+    # A struck path may lose its tag, so they are found by seq.
     hooks_tag = new_tag()
     seq = lab.head()
     hooks = attack.run_script(
@@ -507,7 +526,7 @@ def test_secrets_in_requests_never_reach_the_black_box(attack: Attack, lab: Lab)
     )
     attack.check(
         "risk",
-        hook_risks == {"GET": [3], "POST": [2]} and get_reasons == ["url_secret"],
+        hook_risks == {"GET": [3], "POST": [3]} and get_reasons == ["url_secret"],
         f"los webhooks retenidos: por GET con riesgo {hook_risks['GET']} ({get_reasons}), por "
         f"POST con riesgo {hook_risks['POST']}",
     )
@@ -836,89 +855,4 @@ def test_oauth_logins_through_the_proxy_are_refused(attack: Attack, lab: Lab) ->
         "risk",
         {e.risk for e in blocked} == {2},
         f"oauth_login lleva riesgo {sorted({e.risk for e in blocked})}",
-    )
-
-
-# --- dns-tunel ---------------------------------------------------------------------------------
-
-
-@scenario("dns-tunel")
-def test_no_dns_query_for_an_attacker_name_leaves_the_vm(attack: Attack, lab: Lab) -> None:
-    tag = new_tag()
-    marker = f"t06dns{uuid4().hex[:10]}"
-    canary = f"{marker}-canary.{DNS_CANARY_DOMAIN}"
-    seq = lab.head()
-    before_queries = len(lab.internet.dns_queries())
-    before_errors = lab.internet.dns_errors()
-    outcome = attack.run_script(lab.agent, "dns_tunel", tag, marker, PLAIN_HOST, canary)
-    # The control resolves and reaches the allowed host: the way out still works for it.
-    assert outcome["control"] == 200, outcome
-
-    def named(text: str) -> list[dict]:
-        return [q for q in lab.internet.dns_queries() if text in str(q["name"]).lower()]
-
-    # The positive canary: the proxy resolves an allowed name no container answers for, and its
-    # query must reach the fake resolver. Without it, "no query came" could mean "nothing listened".
-    deadline = time.monotonic() + 15
-    while not named(canary) and time.monotonic() < deadline:
-        time.sleep(0.25)
-    canary_seen = named(canary)
-    errors = lab.internet.dns_errors()
-    new_errors = {proto: errors[proto] - before_errors.get(proto, 0) for proto in errors}
-    through = outcome["through_proxy"]
-    doh = outcome["doh"]
-    direct = outcome["direct"]
-    through_refused = all(status == 403 for status in through.values())
-    doh_refused = all(status == 403 for status in doh.values())
-    # Docker's own resolver (127.0.0.11) may answer locally, but only with an error code (2
-    # SERVFAIL, 3 NXDOMAIN, 5 REFUSED) and no answers. The outside addresses and the proxy must
-    # answer nothing at all.
-    local_errors = ("rcode=2 ancount=0", "rcode=3 ancount=0", "rcode=5 ancount=0")
-    docker_bad = {
-        key: value
-        for key, value in direct.items()
-        if "127.0.0.11" in key and str(value).startswith("rcode=") and value not in local_errors
-    }
-    direct_out = {
-        key: value
-        for key, value in direct.items()
-        if "127.0.0.11" not in key and (str(value).startswith("rcode=") or value == "closed")
-    }
-    marker_queries = [q for q in named(marker) if canary not in str(q["name"]).lower()]
-    new_queries = len(lab.internet.dns_queries()) - before_queries
-    attack.check(
-        "stopped",
-        through_refused
-        and doh_refused
-        and direct_out == {}
-        and docker_bad == {}
-        and outcome["default_route"] is False
-        and marker_queries == []
-        and canary_seen != []
-        and new_errors == {"udp": 0, "tcp": 0},
-        f"por el proxy (CONNECT y http:// a subdominios codificados): {through}; DoH a "
-        f"resolvedores conocidos: {doh}; DNS directo (UDP y TCP al 53, a direcciones de "
-        f"documentación): {direct}; la cárcel no tiene ruta por defecto "
-        f"({not outcome['default_route']}); ninguna dirección de fuera contestó "
-        f"({direct_out or 'ninguna'}) y el DNS de Docker solo contestó con error "
-        f"({docker_bad or 'bien'}). El resolvedor falso (upstream del proxy) no recibió ninguna "
-        f"consulta con el marcador ({len(marker_queries)} de {new_queries} nuevas). Consultas "
-        f"del canario (un nombre permitido que el proxy tiene que resolver por él; hace falta al "
-        f"menos una para que el cero de arriba valga): {len(canary_seen)}, y el agente recibió "
-        f"{outcome['canary']}. Errores del resolvedor "
-        f"falso: {new_errors}. Control: resuelve y alcanza el host permitido "
-        f"({outcome['control']})",
-    )
-    blocked = [e for e in lab.since(seq, "blocked") if e.details.get("reason") == "not_allowed"]
-    expected = len(through) + len(doh)  # every proxy attempt refused by the allowed list
-    attack.check(
-        "recorded",
-        len(blocked) >= expected,
-        f"{len(blocked)} net/blocked not_allowed (se esperaban al menos {expected}: "
-        f"{len(through)} por el proxy y {len(doh)} de DoH)",
-    )
-    attack.check(
-        "risk",
-        {e.risk for e in blocked} == {1},
-        f"not_allowed lleva riesgo {sorted({e.risk for e in blocked})}",
     )

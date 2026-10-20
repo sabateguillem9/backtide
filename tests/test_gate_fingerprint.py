@@ -92,7 +92,7 @@ def test_volatile_and_hop_by_hop_headers_do_not_count() -> None:
         ("X-HTTP-Method-Override", "DELETE"),
         ("Destination", "https://dav.fake.test/elsewhere"),  # WebDAV MOVE/COPY
         ("Dropbox-API-Arg", '{"path": "/other"}'),
-        ("PRIVATE-TOKEN", "glpat-another-account"),  # not in CREDENTIAL_HEADERS
+        ("PRIVATE-TOKEN", "glpat-another-account"),  # a credential header: it counts all the same
         ("X-Auth-Token", "another-account"),
         ("Accept", "application/vnd.other+json"),
         ("Overwrite", "T"),

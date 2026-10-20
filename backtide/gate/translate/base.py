@@ -181,6 +181,9 @@ class Reading:
     attachments: tuple[Attachment, ...] = ()
     secret_seen: bool = False  # striking removed something from the text it carries
     path_credential: bool = False  # the path carries the credential (bot token, webhook token)
+    # The saved draft it sends or changes (a Gmail draft id, a Graph message id): while a send of
+    # that draft is held or preapproved, a change to it is held too (docs/32, decision 12).
+    draft: str | None = None
     notes: tuple[Note, ...] = ()
     canonical: bytes | None = field(default=None, repr=False, compare=False)
 
@@ -191,6 +194,8 @@ class Reading:
             raise ValueError("too many recipients")
         if len(self.attachments) > MAX_ATTACHMENTS:
             raise ValueError("too many attachments")
+        if self.draft is not None and safe_id(self.draft) != self.draft:
+            raise ValueError("a draft is a plain id")
         for text, limit in (
             (self.subject, SUBJECT_CHARS),
             (self.first_lines, LINES_CHARS),
@@ -227,6 +232,7 @@ class Reading:
             ],
             "secret_seen": self.secret_seen,
             "path_credential": self.path_credential,
+            "draft": self.draft,
             "notes": [str(note) for note in self.notes],
             "risk": self.risk,
             "wait_s": self.wait_s,
@@ -689,9 +695,28 @@ def guard_read(view: RequestView, reading: Reading, scrub: KnownScrubber) -> Rea
     }
     if len(view.body) > MAX_READ_BODY:
         return unknown(*held, Note.TOO_LARGE, **options)
-    if reading.secret_seen or body_has_secret(view.body, scrub):
+    if reading.secret_seen or body_has_secret(_without_own_token(view), scrub):
         return replace(unknown(*held, Note.SECRET_SEEN, **options), secret_seen=True)
     return reading
+
+
+_MIN_OWN_TOKEN = 16
+
+
+def _without_own_token(view: RequestView) -> bytes:
+    """The body without the request's own ``Authorization`` token, where a client repeats it
+    (Slack's ``token=`` field, see slack.py): it goes to the same API that it authenticates
+    with, so it is not a secret leaving. Any other secret in the body still counts."""
+    try:
+        value = credential(view.headers)
+    except Unreadable:
+        return view.body
+    if value is None:
+        return view.body
+    token = value.split(" ", 1)[1].strip() if " " in value else value
+    if len(token) < _MIN_OWN_TOKEN:
+        return view.body
+    return view.body.replace(token.encode("utf-8", "surrogateescape"), b"")
 
 
 def first_lines(text: str | None, scrub: KnownScrubber) -> str | None:

@@ -41,6 +41,7 @@ the real port before the app is built (its ``Host`` check needs it).
 
 import socket
 from collections.abc import Callable, Sequence
+from types import FrameType
 
 import uvicorn
 
@@ -72,6 +73,19 @@ def bind(port: int) -> socket.socket:
     return sock
 
 
+class _Server(uvicorn.Server):
+    """uvicorn, except that a stop signal ends the run instead of killing the process.
+
+    After a graceful shutdown uvicorn re-raises each signal it caught (so a parent sees "died of
+    SIGINT"), which with Python's own handler back in place means a ``KeyboardInterrupt``
+    traceback, or death by SIGTERM, before ``backtide web`` can print its closing line and exit
+    0. The signal has done its job once the server has stopped: we forget it."""
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        super().handle_exit(sig, frame)
+        self._captured_signals.clear()
+
+
 def make_server(app: Callable) -> uvicorn.Server:  # type: ignore[type-arg]
     """A uvicorn server for ``app`` (it is given the socket when it runs). No access log: the
     first request's address carries the token."""
@@ -87,7 +101,7 @@ def make_server(app: Callable) -> uvicorn.Server:  # type: ignore[type-arg]
         timeout_graceful_shutdown=GRACEFUL_SECONDS,
         limit_concurrency=64,
     )
-    return uvicorn.Server(config)
+    return _Server(config)
 
 
 def web_url(port: int, prefix: str, token: str) -> str:

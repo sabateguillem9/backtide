@@ -77,6 +77,17 @@ _THREAD_FIELDS = frozenset(
 _SHOWN_KEYS = frozenset({"title", "description", "name", "value", "text"})  # embeds and polls
 
 
+def credential_segments(segments: tuple[str, ...]) -> frozenset[int]:
+    """Which segments of a path (split on "/", the query apart) are a webhook's or an
+    interaction's token: ``/api[/vN]/webhooks/{id}/{token}`` and ``/interactions/{id}/{token}``."""
+    lowered = [segment.lower() for segment in segments]
+    for index, segment in enumerate(lowered[:4]):
+        if segment in ("webhooks", "interactions") and index + 2 < len(segments):
+            if _ID_RE.fullmatch(segments[index + 1]):
+                return frozenset({index + 2})
+    return frozenset()
+
+
 def claims(view: RequestView, context: Context) -> bool:
     del context  # the same for every configuration
     return view.host in HOSTS

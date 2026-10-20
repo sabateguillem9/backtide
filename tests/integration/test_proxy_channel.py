@@ -229,7 +229,8 @@ def gate(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gate]:
         egress = Egress(
             jail,
             agent_name=client,  # the agent's role: the only other one on its network
-            policy=Policy(allow_hosts=(ALLOWED,), providers=Providers([])),
+            # T06's lab is about the allowed list: the strict mode (T10-3's default holds).
+            policy=Policy(allow_hosts=(ALLOWED,), providers=Providers([]), unknown_hosts="deny"),
             record=gated.append,
             thread=False,
         )

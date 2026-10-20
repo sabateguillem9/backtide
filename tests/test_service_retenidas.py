@@ -157,3 +157,18 @@ def test_the_cli_has_the_three_commands() -> None:
     assert (approve.hold, approve.verdict) == (HOLD, "approve")
     assert (reject.hold, reject.verdict) == (HOLD, "reject")
     assert listing.handler.__name__ == "_list_holds"
+
+
+def test_a_translated_hold_shows_its_sentence_below(
+    monkeypatch: pytest.MonkeyPatch, config: ServiceConfig
+) -> None:
+    """T10-3: the translator's sentence (backtide.gate.phrase) on its own line, escaped."""
+    holds = [{"hold_id": HOLD, "risk": 2, "method": "GET", "host": "api.telegram.org",
+              "phrase": "Telegram: enviar un mensaje al chat 556: «hola\x1b[2J»",
+              "expires_in_s": 60, "waiting": False}]  # fmt: skip
+    patch(monkeypatch, lock=ServiceRunning("busy"), reply=holds)
+    out = io.StringIO()
+    assert retenidas.listing(config, out=out, err=io.StringIO()) == 0
+    lines = out.getvalue().splitlines()
+    assert lines[0].startswith(f"{HOLD}  riesgo 2  GET api.telegram.org")
+    assert lines[1] == "    Telegram: enviar un mensaje al chat 556: «hola\\x1b[2J»"

@@ -289,29 +289,72 @@ a.dot-button { text-decoration: none; }
 .rewind-working.is-failed { color: var(--ink); }
 
 
-/* The Settings page (T12e): one row per key, with what is set and nothing more. Kept plain on
-   purpose; the frontend team polishes it later. */
-.settings-list { list-style: none; margin: var(--space-8) 0 0; padding: 0; }
-.setting { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 0; border-top: var(--stroke-hairline) solid var(--ink-muted); }
-.setting-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.setting-name { font-weight: 500; }
-.setting-state { color: var(--ink-soft); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.setting-note { font-size: 13px; color: var(--ink-muted); }
-.setting-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); flex: none; }
-.setting-go.is-off { color: var(--ink-muted); }
-.setting-remove, .settings-cancel, .settings-back { color: var(--ink-muted); }
-.setting-input { font: inherit; font-size: 16px; color: var(--ink); background: transparent; border: 0; border-bottom: var(--stroke-hairline) solid var(--ink); border-radius: 0; padding: 6px 0; min-width: 0; width: 100%; max-width: 28rem; }
-.setting-input:disabled { color: var(--ink-muted); border-bottom-color: var(--ink-muted); }
+/* The Settings page (T12e): what is set, never a key. Grouped by what each key is for, one row
+   per key, rows apart by a soft hairline (no box). The state is a dot and its words: filled, set;
+   hollow, not set or unknown; red and ringed, a file that cannot be used. Changing is an ink link,
+   removing is the one red word, and each opens its own step under an ink hairline, with the dot
+   button (red for a removal, still with its words). */
+.settings code, .settings-step code { font: inherit; font-weight: 500; color: var(--ink); white-space: nowrap; font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; user-select: all; }
+.setting-dot { display: inline-block; flex: none; box-sizing: border-box; width: 9px; height: 9px; border-radius: var(--radius-dot); border: var(--stroke-hairline) solid var(--ink-muted); }
+.settings-off { display: flex; align-items: baseline; gap: var(--space-3); margin: var(--space-6) 0 0; font-size: 15px; color: var(--ink-soft); }
+.settings-group { margin-top: var(--space-12); }
+.settings-group > .note { margin-top: var(--space-1); }
+.settings-list { list-style: none; margin: var(--space-4) 0 0; padding: 0; }
+.setting { position: relative; display: flex; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-6); padding: var(--space-4) 0; }
+.setting::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: var(--stroke-hairline); background: var(--ink-muted); opacity: 0.35; }
+.setting-info { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.setting-name { font-size: 17px; line-height: 1.3; font-weight: 500; letter-spacing: -0.01em; }
+.setting-state { display: flex; align-items: baseline; gap: var(--space-2); font-size: 15px; color: var(--ink-soft); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.setting.is-set .setting-dot { background: var(--ink); border-color: var(--ink); }
+.setting.is-problem .setting-state { color: var(--ink); }
+.setting.is-problem .setting-dot, .settings-outcome.is-bad .setting-dot { background: var(--risk-3); border-color: var(--risk-3); outline: var(--stroke-hairline) solid var(--risk-3); outline-offset: 2px; }
+.setting.is-unset .setting-state, .setting.is-unknown .setting-state, .setting.is-later .setting-state { color: var(--ink-muted); }
+.setting.is-later .setting-dot { border-style: dashed; }
+.setting-note { font-size: 13px; letter-spacing: 0.02em; color: var(--ink-muted); }
+.setting-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--space-6); flex: none; font-size: 15px; }
+.setting-go, .setting-remove { display: inline-flex; align-items: center; min-height: var(--size-target); }
+.setting-go { font-weight: 500; color: var(--ink); }
+.setting-go.is-off { font-weight: 400; color: var(--ink-muted); cursor: not-allowed; }
+.setting-remove { color: var(--risk-3); }
+.setting-remove:hover { text-decoration-thickness: 2px; }
+.setting-input { font: inherit; font-size: 22px; line-height: 1.3; color: var(--ink); background: transparent; border: 0; border-bottom: var(--stroke-hairline) solid var(--ink); border-radius: 0; padding: 8px 0 10px; width: 100%; min-width: 0; }
+.setting-input::placeholder { color: var(--placeholder); }
+.setting-input:disabled { color: var(--ink-muted); border-bottom-color: var(--ink-muted); cursor: not-allowed; }
+.setting-cap { width: 8rem; font-size: 17px; padding: 6px 0; }
+.settings-agent { margin-top: var(--space-12); }
+/* a step: the confirmation of one change, its result, or why not now */
 .settings-step { margin-top: var(--space-8); border-top: var(--stroke-hairline) solid var(--ink); padding-top: var(--space-6); }
 .settings-step h2 { margin: 0; font-size: 24px; line-height: 1.2; font-weight: 500; letter-spacing: -0.01em; text-wrap: balance; }
 .settings-step > p { margin: var(--space-3) 0 0; }
-.settings-form { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); margin-top: var(--space-6); }
-.setting-label { margin-top: var(--space-3); font-size: 14px; color: var(--ink-muted); }
-.setting-check { display: flex; align-items: baseline; gap: var(--space-2); margin-top: var(--space-4); }
-.settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4) var(--space-8); margin-top: var(--space-6); }
-.settings-yes { padding: 10px 18px; border: 0; border-radius: 999px; background: var(--ink); color: var(--on-ink); font: inherit; font-weight: 500; cursor: pointer; }
+.settings-step > .note { max-width: var(--size-measure); }
+.settings-current { display: flex; align-items: baseline; gap: var(--space-2); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.settings-current .setting-dot { background: var(--ink); border-color: var(--ink); }
+.settings-step > .settings-warning { display: grid; grid-template-columns: 9px minmax(0, 1fr); gap: var(--space-3); margin-top: var(--space-4); font-size: 15px; color: var(--ink); }
+.settings-warning .dot { margin-top: 6px; }
+.settings-form { display: flex; flex-direction: column; gap: var(--space-6); margin-top: var(--space-8); }
+.setting-field { display: flex; flex-direction: column; }
+.setting-label { font-size: 14px; letter-spacing: 0.02em; color: var(--ink-muted); }
+.setting-hint { margin: var(--space-2) 0 0; font-size: 14px; color: var(--ink-muted); }
+.settings-form > .setting-hint { margin: 0; }
+.setting-check { display: flex; align-items: center; gap: var(--space-3); min-height: var(--size-target); font-size: 15px; color: var(--ink); cursor: pointer; }
+.setting-check input { flex: none; width: 18px; height: 18px; margin: 0; accent-color: var(--ink); cursor: pointer; }
+.settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4) var(--space-8); margin-top: var(--space-2); }
+.settings-step > .settings-actions { margin-top: var(--space-8); }
+.settings-yes { display: inline-flex; align-items: center; gap: var(--space-3); padding: 0; border: 0; background: none; font: inherit; font-size: 17px; font-weight: 500; color: var(--ink); cursor: pointer; }
+.settings-yes.is-remove { color: var(--risk-3); }
+.settings-yes.is-remove .dot-button { background: var(--risk-3); color: var(--on-ink); }
+.settings-cancel, .settings-back { display: inline-flex; align-items: center; min-height: var(--size-target); color: var(--ink-muted); }
+.settings-cancel:hover, .settings-back:hover { color: var(--ink); }
+.settings-outcome { display: flex; align-items: baseline; gap: var(--space-3); }
+.settings-outcome .setting-dot { width: 12px; height: 12px; }
+.settings-outcome.is-ok .setting-dot { background: var(--state-working); border-color: var(--state-working); }
+.settings-what { font-weight: 500; }
 .settings-said { color: var(--ink-soft); overflow-wrap: anywhere; }
-@media (max-width: 480px) { .setting { flex-direction: column; align-items: flex-start; } }
+@media (max-width: 480px) {
+  .setting { flex-direction: column; align-items: flex-start; padding-bottom: var(--space-2); }
+  .setting-actions { margin-top: calc(-1 * var(--space-2)); }
+  .settings-step h2 { font-size: 21px; }
+}
 
 
 /* ---------------------------------------------------------------------------------------------
@@ -538,7 +581,7 @@ a.dot-button { text-decoration: none; }
   /* a rewind running: the dot breathes where the tide went back to, the step rises in */
   .tide-frame.is-rewinding .tide-head { animation: breathe 1.1s var(--ease-travel) infinite; }
   .rewind-confirm.htmx-request .rewind-yes .dot-button { animation: breathe 1.1s var(--ease-travel) infinite; }
-  .rewind-step { animation: rise 0.45s var(--ease-arrive) both; }
+  .rewind-step, .settings-step { animation: rise 0.45s var(--ease-arrive) both; }
   .field input:focus-visible ~ .field-line { animation: draw-line 0.45s var(--ease-arrive) both; }
 
   /* the control room: states breathe, new lines arrive on top, the clock runs down smoothly */

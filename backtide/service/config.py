@@ -21,6 +21,13 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   needed; only the fake one reaches the agent (in openclaw.json). The proxy's CA and channel
   folders live in the state too, and the agent's config folder may never be or contain any of
   them.
+- ``[gate]`` (T10-3, docs/32 sections 5, 8 and 9): what the gate does with hosts off the allowed
+  list (``unknown_hosts``: ``"hold"``, the default, lets reads pass with decision 1's guard and
+  holds writes; ``"deny"`` is the optional strict mode of T06), the trusted recipients
+  (``trusted``; the owner's Telegram chat of ``telegram.toml`` is trusted too unless
+  ``trust_owner_chat = false``), the extra read endpoints of the ``read_post`` translator
+  (``read_endpoints``, ``host/path``) and the times (``wait_s``, ``hold_s``, ``preapproval_s``:
+  only shorter than the design's 90 s, 5 min and 10 min). NEVER a key.
 - ``[sensor]`` (T07-3, docs/23): whether the agent may run without the process sensor
   (``required``, false by default: decision 7), the sensor container's limits and the reader's
   rate limits. Never the image (pinned in backtide/jail/sensor.py) nor its folder, which is
@@ -37,16 +44,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
 
+from backtide.gate.decide import UNKNOWN_HOSTS
+from backtide.gate.protocol import MAX_READ_ENDPOINTS
 from backtide.gate.provider_tools import check_allow_entry
 from backtide.gate.providers import Provider as GateProvider
 from backtide.gate.providers import Providers, is_fake_key, new_fake_key
 from backtide.gate.providers import Secret as GateSecret
+from backtide.gate.translate.base import Trusted, normalize_trusted
+from backtide.gate.translate.read_post import check_read_endpoint
 from backtide.jail.ca import CaPaths
 from backtide.jail.config import AgentJailConfig
 from backtide.jail.openclaw import MODEL_ID, ModelProvider
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
+from backtide.service.holds import HoldTimings
 
 DEFAULT_CYCLE_INTERVAL = 120.0  # seconds between two "did anything change?" checks
 DEFAULT_PRUNE_INTERVAL = 600.0
@@ -73,7 +85,7 @@ MAX_RULES_BYTES = 64 * 1024
 _TOP_LEVEL_KEYS = frozenset(
     {
         "state_dir", "volume", "workspace_limit", "cycle_interval", "prune_interval", "agent",
-        "volume_image", "max_volume_bytes", "proxy", "sensor",
+        "volume_image", "max_volume_bytes", "proxy", "sensor", "gate",
     }
 )  # fmt: skip
 _OPTIONAL_KEYS = ("workspace_limit", "cycle_interval", "prune_interval", "max_volume_bytes")
@@ -103,6 +115,17 @@ _SENSOR_KEYS = (
     _SENSOR_CONTAINER_KEYS | _SENSOR_RATES | _SENSOR_COUNTS | {"required", "novelty_streak_minutes"}
 )
 NOVELTY_STREAK_MINUTES = 10.0
+# [gate] (T10-3): the keys, how each translator names its recipient, and the times' ranges (in
+# seconds; only shorter than the design's: a yes is good for 10 min at most, a hold lives 5).
+_GATE_KEYS = frozenset(
+    {"unknown_hosts", "trusted", "trust_owner_chat", "read_endpoints", "wait_s", "hold_s",
+     "preapproval_s"}
+)  # fmt: skip
+_TRUSTED_FIELD = {"telegram": "chat", "gmail": "email", "graph_mail": "email", "slack": "channel",
+                  "discord": "channel"}  # fmt: skip
+_GATE_TIMES = {"wait_s": ("wait", 1, 90), "hold_s": ("life", 30, 300),
+               "preapproval_s": ("preapproval", 30, 600)}  # fmt: skip
+MAX_TRUSTED = 256
 MIN_NOVELTY_STREAK_MINUTES = 1.0
 # docs/21, section 6: the providers of T06 and their default hosts.
 PROVIDER_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
@@ -178,6 +201,17 @@ class ProviderKey:
 
 
 @dataclass(frozen=True)
+class GateSettings:
+    """What ``[gate]`` says (docs/32): the mode for unknown hosts, the trusted recipients, the
+    extra read endpoints and the gate's times."""
+
+    unknown_hosts: str = "hold"
+    trusted: tuple[Trusted, ...] = ()
+    read_endpoints: tuple[str, ...] = ()
+    timings: HoldTimings = field(default_factory=HoldTimings)
+
+
+@dataclass(frozen=True)
 class ServiceConfig:
     """What the service needs, validated on creation (ConfigError).
 
@@ -201,6 +235,7 @@ class ServiceConfig:
     max_volume_bytes: int | None = None
     proxy: Mapping[str, Any] = field(default_factory=dict)
     sensor: Mapping[str, Any] = field(default_factory=dict)
+    gate: Mapping[str, Any] = field(default_factory=dict)
     # One per provider of [proxy] (from_file reads them from keys/): the real and fake keys.
     provider_keys: Mapping[str, ProviderKey] = field(default_factory=dict, repr=False)
 
@@ -240,6 +275,7 @@ class ServiceConfig:
         self._check_growth(config_dir)
         self._check_proxy(config_dir)
         self._check_sensor(config_dir)
+        self.gate_settings()  # validates [gate]
 
     def _check_proxy(self, config_dir: Path) -> None:
         if not isinstance(self.proxy, Mapping):
@@ -547,6 +583,49 @@ class ServiceConfig:
             allow_hosts=tuple(hosts), providers=providers, allow_provider_tools=allowed
         )
 
+    def gate_settings(self, owner_chat: int | None = None) -> GateSettings:
+        """``[gate]``, checked (ConfigError). ``owner_chat``: the ``chat_id`` of
+        ``telegram.toml``, trusted (with any bot, docs/32 section 9) unless ``trust_owner_chat
+        = false``."""
+        if not isinstance(self.gate, Mapping):
+            raise ConfigError("[gate] must be a table")
+        _reject_secret_keys("[gate]", self.gate)
+        unknown = sorted(set(self.gate) - _GATE_KEYS)
+        if unknown:
+            raise ConfigError(f"unknown [gate] settings: {', '.join(map(repr, unknown))}")
+        mode = self.gate.get("unknown_hosts", "hold")
+        if mode not in UNKNOWN_HOSTS:
+            raise ConfigError('[gate] unknown_hosts must be "hold" (the default) or "deny"')
+        trust_owner = self.gate.get("trust_owner_chat", True)
+        if not isinstance(trust_owner, bool):
+            raise ConfigError("[gate] trust_owner_chat must be true or false")
+        trusted = [_trusted(entry) for entry in _gate_list("trusted", self.gate, MAX_TRUSTED)]
+        if trust_owner and owner_chat is not None:
+            trusted.insert(0, normalize_trusted("telegram", str(owner_chat)))
+        try:
+            endpoints = tuple(
+                dict.fromkeys(
+                    check_read_endpoint(entry)
+                    for entry in _gate_list("read_endpoints", self.gate, MAX_READ_ENDPOINTS)
+                )
+            )
+        except ValueError as error:
+            raise ConfigError(f"[gate] read_endpoints: {error}") from None
+        times: dict[str, float] = {}
+        for key, (name, low, high) in _GATE_TIMES.items():
+            if key not in self.gate:
+                continue
+            value = self.gate[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ConfigError(f"[gate] {key} must be a whole number of seconds, {low}-{high}")
+            times[name] = float(value)
+        return GateSettings(
+            unknown_hosts=mode,
+            trusted=tuple(dict.fromkeys(trusted)),
+            read_endpoints=endpoints,
+            timings=HoldTimings(**times),
+        )
+
     def read_rules(self) -> str | None:
         """The text of ``rules_file``, or None if there is none (the default rules apply). Read
         like the rest of the config: no symlink, ours, not writable by others. Raises
@@ -589,6 +668,10 @@ class ServiceConfig:
             if not isinstance(data["sensor"], dict):
                 raise ConfigError("[sensor] must be a table")
             optional["sensor"] = dict(data["sensor"])
+        if "gate" in data:
+            if not isinstance(data["gate"], dict):
+                raise ConfigError("[gate] must be a table")
+            optional["gate"] = dict(data["gate"])
         names = _provider_names(optional.get("proxy", {}))
         if names:
             optional["provider_keys"] = read_provider_keys(state_dir / STATE_KEYS, names)
@@ -748,6 +831,37 @@ def _provider(entry: object) -> Provider:
             f"{MAX_PROVIDER_MODELS} model ids"
         )
     return Provider(name=name, kind=kind, host=host, models=tuple(models))
+
+
+def _gate_list(key: str, gate: Mapping[str, Any], limit: int) -> list[Any]:
+    value = gate.get(key, [])
+    if not isinstance(value, list) or len(value) > limit:
+        raise ConfigError(f"[gate] {key} must be a list of at most {limit} entries")
+    return value
+
+
+def _trusted(entry: object) -> Trusted:
+    """A ``[gate] trusted`` entry: ``{translator = "telegram", chat = "..."}``, ``{translator =
+    "gmail", email = "..."}`` or ``{translator = "slack", channel = "C..."}``."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("translator"), str):
+        raise ConfigError("[gate] trusted: each entry is a table with a translator")
+    translator = entry["translator"]
+    name = _TRUSTED_FIELD.get(translator)
+    if name is None:
+        raise ConfigError(
+            f"[gate] trusted: translator must be one of {', '.join(sorted(_TRUSTED_FIELD))}"
+        )
+    if set(entry) != {"translator", name}:
+        raise ConfigError(f"[gate] trusted: a {translator} entry has translator and {name}")
+    value = entry[name]
+    if isinstance(value, int) and not isinstance(value, bool) and name == "chat":
+        value = str(value)
+    if not isinstance(value, str):
+        raise ConfigError(f"[gate] trusted: {name} must be a text")
+    try:
+        return normalize_trusted(translator, value)
+    except ValueError as error:
+        raise ConfigError(f"[gate] trusted: {error}") from None
 
 
 def _reject_unknown(data: dict[str, Any]) -> None:

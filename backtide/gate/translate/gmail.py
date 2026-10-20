@@ -124,7 +124,7 @@ def _classify(
         return _send(view, context, account, upload, params)
     if tail == ("drafts", "send") and method == "POST":
         draft = _draft_id(view)
-        return unknown(
+        reading = unknown(
             NAME,
             Shape.GOOGLE,
             WAIT_GOG,
@@ -132,14 +132,18 @@ def _classify(
             account=account,
             target=f"draft {draft}" if draft else "a saved draft",
         )
+        return replace(reading, draft=draft)
     draft = Effect.READ if account in context.owner_accounts else Effect.CHANGE
     if tail == ("drafts",) and method == "POST":
         return _plain(draft, "drafts.create", account, Note.DRAFT)
     if len(tail) == 2 and tail[0] == "drafts":
+        target = f"draft {item}" if item else None
         if method == "PUT":
-            return _plain(draft, "drafts.update", account, Note.DRAFT)
+            changed = _plain(draft, "drafts.update", account, Note.DRAFT, target=target)
+            return replace(changed, draft=item)
         if method == "DELETE" and not view.body:
-            return _plain(Effect.DELETE, "drafts.delete", account, target=f"draft {item}")
+            deleted = _plain(Effect.DELETE, "drafts.delete", account, target=target)
+            return replace(deleted, draft=item)
     if upload:
         return unknown(NAME, Shape.GOOGLE, WAIT_GOG, account=account)
     if len(tail) == 3 and tail[0] in ("messages", "threads") and method == "POST":

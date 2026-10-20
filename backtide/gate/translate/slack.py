@@ -111,6 +111,14 @@ _DELETES = frozenset({"chat.delete", "chat.deletescheduledmessage"})
 _SHOWN_KEYS = frozenset({"title", "pretext", "text", "value"})  # in blocks and attachments
 
 
+def credential_segments(segments: tuple[str, ...]) -> frozenset[int]:
+    """Which segments of a path (split on "/", the query apart) are an incoming webhook's
+    secret: ``/services/T…/B…/<secret>`` (only on hooks.slack.com: the caller asks for it)."""
+    if len(segments) == 5 and segments[0] == "" and segments[1] == "services":
+        return frozenset({4})
+    return frozenset()
+
+
 def claims(view: RequestView, context: Context) -> bool:
     del context  # the same for every configuration
     return view.host == "slack.com" or view.host.endswith(".slack.com")
@@ -139,15 +147,19 @@ def read(view: RequestView, context: Context) -> Reading:
 
 
 def _account(view: RequestView, context: Context, params: dict[str, Any]) -> str | None:
+    """The HMAC of the token that acts. ``@slack/web-api`` 8.1.1 (OpenClaw 2026.9.8) sends it
+    in ``Authorization`` and, for many calls (``conversations.info``, ``users.info``,
+    ``chat.update``...), ALSO as the form's ``token`` with the same value: that is one token.
+    Two different ones are DUPLICATE: which one would Slack use?"""
     header = credential(view.headers)
+    if header is not None and header.lower().startswith("bearer "):
+        header = header[7:].strip()
     body_token = params.get("token")
-    if header is not None and body_token is not None:
-        raise Unreadable(Note.DUPLICATE)  # which one would Slack use?
-    token = header if header is not None else body_token
-    if token is not None and not isinstance(token, str):
+    if body_token is not None and not isinstance(body_token, str):
         raise Unreadable
-    if isinstance(token, str) and token.lower().startswith("bearer "):
-        token = token[7:].strip()
+    if header is not None and body_token is not None and body_token.strip() != header:
+        raise Unreadable(Note.DUPLICATE)
+    token = header if header is not None else body_token
     return account_id(context, NAME, token)
 
 

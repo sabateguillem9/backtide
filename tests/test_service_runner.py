@@ -6,6 +6,7 @@ constructors do no I/O), and the run loop is driven with a fake guardian. The VM
 """
 
 import fcntl
+import gc
 import os
 import signal
 import stat
@@ -486,16 +487,36 @@ def test_a_signal_handler_touches_no_lock_it_only_writes_to_a_pipe() -> None:
     assert threading.main_thread().name not in RecordingEvent.setters
 
 
+def open_fds() -> set[int]:
+    """The descriptors open right now. Listing a directory opens one of its own, which is gone by
+    the time the list is returned: drop whatever no longer answers."""
+    found = set()
+    for name in os.listdir("/dev/fd"):
+        try:
+            os.fstat(int(name))
+        except OSError:
+            continue
+        found.add(int(name))
+    return found
+
+
 def test_no_thread_or_pipe_is_left_behind_by_the_signal_plumbing() -> None:
-    before = threading.active_count()
-    fds = len(os.listdir("/dev/fd"))
+    """What the code under test opened and did not close, not a count of everything the process
+    has: another test's leftover socket or connection that the GC closes in the middle would
+    move a count (it did, once), but it can only take descriptors away from the "before" set."""
+    gc.collect()  # let any earlier test's leftovers close now, not in the middle of this one
+    threads = set(threading.enumerate())
+    fds = open_fds()
     calls: list[str] = []
     stop = threading.Event()
     stop.set()
     for _ in range(3):
         run(calls, FakeGuardian(calls), stop=stop)
-    assert threading.active_count() == before
-    assert len(os.listdir("/dev/fd")) == fds
+    gc.collect()
+    leaked_threads = [t.name for t in set(threading.enumerate()) - threads if t.is_alive()]
+    assert leaked_threads == []
+    leaked_fds = open_fds() - fds
+    assert leaked_fds == set()
 
 
 # --- an unusable black-box key must not leave an unrecorded agent running ----------------------

@@ -1595,7 +1595,9 @@ def facts_of(flow: Flow, channel: FakeChannel | None = None) -> dict[str, Any]:
 def test_every_net_request_carries_its_gate_facts() -> None:
     facts = facts_of(Flow(request=Request(method="GET", path="/v1/items?page=2")))
     assert set(facts) == {"fp", "url_struck", "url_bytes", "websocket", "exact_read",
-                          "wait_hint_s", "headers_struck", "header_bytes"}  # fmt: skip
+                          "wait_hint_s", "headers_struck", "header_bytes", "credential_bytes",
+                          "body_struck", "reading"}  # fmt: skip
+    assert facts["reading"] is None and facts["credential_bytes"] == 0  # no translator here
     assert facts["headers_struck"] is False
     assert facts["header_bytes"] == len("Host") + len("example.com")
     assert facts["exact_read"] is True and facts["url_struck"] is False
@@ -1716,7 +1718,7 @@ def test_the_fingerprint_counts_the_headers_and_the_trailers() -> None:
         ("X-Data", "AKIA" + "ABCDEFGHIJKLMNOP"),
         ("X-Note", "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"),
         ("X-Debug", f"leak {FAKE}"),  # a key backtide's scrubber knows
-        ("X-Auth-Token", "Bearer abcdefghijklmnop"),
+        ("X-Trace-Note", "Bearer abcdefghijklmnop"),
     ],
 )
 def test_a_secret_in_a_header_of_a_read_is_struck(header: tuple[str, str]) -> None:
@@ -1732,6 +1734,20 @@ def test_the_credential_headers_are_left_to_the_credentials() -> None:
     facts = facts_of(Flow(request=request))
     assert facts["headers_struck"] is False
     assert facts["header_bytes"] == len("Host") + len("example.com")
+    # Their bytes are counted apart (capped on a plain read: decide.MAX_READ_CREDENTIALS).
+    assert facts["credential_bytes"] == len("Authorization") + 7 + 3000 + len("Cookie") + 3002
+
+
+@pytest.mark.parametrize(
+    "header",
+    [("PRIVATE-TOKEN", "glpat-" + "a" * 20), ("X-Auth-Token", "Bearer abcdefghijklmnop"),
+     ("JOB-TOKEN", "x" * 30), ("X-Amz-Security-Token", "IQoJb3JpZ2luX2VjE" + "A" * 40)],
+)  # fmt: skip
+def test_common_token_headers_are_credentials(header: tuple[str, str]) -> None:
+    """T10-3: with reads to any host, GitLab's PRIVATE-TOKEN and the like are the agent's own
+    token to that API, not a leak (their bytes are capped instead)."""
+    facts = facts_of(Flow(request=get_with(header)))
+    assert facts["headers_struck"] is False and facts["credential_bytes"] > 0
 
 
 def test_the_header_bytes_are_every_other_header() -> None:
@@ -1885,3 +1901,160 @@ def test_a_request_that_reached_its_hook_is_not_recorded_as_unread() -> None:
     send(gate, flow)
     gate.client_disconnected(flow.client_conn)
     assert not any(e["action"] == "error" for e in channel.told)
+
+
+# --- the translators (T10-3, docs/32 sections 5 and 8) ------------------------------------------
+
+BOT = "bot123456789:" + "AAbbCCddEEffGGhhIIjjKKllMMnnOOppQ"
+TG = "api.telegram.org"
+
+
+def telegram(path: str, *, method: str = "GET", body: bytes = b"", **headers: str) -> Flow:
+    pairs = [("Host", TG), *headers.items()]
+    request = Request(host=TG, method=method, path=path, raw_content=body, headers=Headers(pairs))
+    return Flow(request=request, client_conn=Client(sni=TG))
+
+
+def test_a_get_that_sends_is_read_as_a_send() -> None:
+    """docs/32, section 5: on a host with a translator the method does not decide. The bot's
+    token in the path is the API's own credential: not a struck URL (the black box strikes it
+    anyway, and its event never holds it)."""
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    send(gate, telegram(f"/{BOT}/sendMessage?chat_id=555&text=hola"))
+    [facts] = channel.gates
+    assert facts is not None
+    reading = facts["reading"]
+    assert reading["translator"] == "telegram" and reading["effect"] == "send"
+    assert reading["recipients"] == ["555"] and reading["first_lines"] == "hola"
+    assert reading["path_credential"] is True and reading["cut"] is False
+    assert facts["url_struck"] is False and facts["wait_hint_s"] == 50
+    [event] = channel.asked
+    assert BOT.split(":")[1] not in json.dumps(event)
+
+
+def test_a_secret_in_the_query_of_a_translated_request_is_still_struck() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    send(gate, telegram(f"/{BOT}/getMe?leak=AKIAIOSFODNN7EXAMPLE"))
+    [facts] = channel.gates
+    assert facts is not None and facts["url_struck"] is True
+    assert facts["reading"]["effect"] == "read"
+
+
+def test_the_fingerprint_of_a_translated_send_is_its_meaning() -> None:
+    """Decision 2: the same message as JSON or as a form is the same send (its canonical text),
+    and it is never equal to the exact fingerprint of the same bytes."""
+    as_json = telegram(f"/{BOT}/sendMessage", method="POST",
+                       body=b'{"chat_id": 555, "text": "hola"}',
+                       **{"content-type": "application/json"})  # fmt: skip
+    again = telegram(f"/{BOT}/sendMessage", method="POST",
+                     body=b'{"text": "hola", "chat_id": 555}',
+                     **{"content-type": "application/json"})  # fmt: skip
+    other = telegram(f"/{BOT}/sendMessage", method="POST",
+                     body=b'{"chat_id": 556, "text": "hola"}',
+                     **{"content-type": "application/json"})  # fmt: skip
+    assert facts_of(as_json)["fp"] == facts_of(again)["fp"]
+    assert facts_of(as_json)["fp"] != facts_of(other)["fp"]
+
+
+def test_a_compressed_body_is_read_decoded_by_the_translator() -> None:
+    body = gzip.compress(b'{"chat_id": 555, "text": "hola"}')
+    flow = telegram(f"/{BOT}/sendMessage", method="POST", body=body,
+                    **{"content-type": "application/json", "content-encoding": "gzip"})  # fmt: skip
+    reading = facts_of(flow)["reading"]
+    assert reading["effect"] == "send" and reading["recipients"] == ["555"]
+
+
+def test_a_write_without_a_translator_says_whether_its_body_carries_a_secret() -> None:
+    leak = Flow(request=Request(raw_content=b'{"note": "AKIAIOSFODNN7EXAMPLE"}'))
+    plain = Flow(request=Request(raw_content=b'{"note": "hola"}'))
+    assert facts_of(leak)["body_struck"] is True
+    assert facts_of(plain)["body_struck"] is False
+    # A translated one leaves it to its reading (secret_seen, risk 3).
+    tg = telegram(f"/{BOT}/sendMessage", method="POST",
+                  body=b'{"chat_id": 555, "text": "AKIAIOSFODNN7EXAMPLE"}',
+                  **{"content-type": "application/json"})  # fmt: skip
+    facts = facts_of(tg)
+    assert facts["body_struck"] is False
+    assert facts["reading"]["secret_seen"] is True and facts["reading"]["risk"] == 3
+
+
+def test_a_read_post_endpoint_comes_from_the_config() -> None:
+    channel = FakeChannel()
+    assert channel.config is not None
+    channel.config = dataclasses.replace(
+        channel.config, read_endpoints=frozenset({"search.fake.test/v1/query"})
+    )
+    flow = Flow(
+        request=Request(host="search.fake.test", path="/v1/query", raw_content=b'{"q": "x"}',
+                        headers=Headers([("Host", "search.fake.test"),
+                                         ("content-type", "application/json")])),
+        client_conn=Client(sni="search.fake.test"),
+    )  # fmt: skip
+    reading = facts_of(flow, channel)["reading"]
+    assert reading["translator"] == "read_post" and reading["effect"] == "read"
+
+
+def test_a_held_translated_request_hears_pending_in_its_apis_shape() -> None:
+    """docs/32, section 8: Telegram's own 429, so grammy retries after ``retry_after``."""
+    channel = FakeChannel()
+    channel.answer = held(wait_ms=30)
+    flow = telegram(f"/{BOT}/sendMessage?chat_id=556&text=hola")
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == 429 and flow.response is not None
+    assert flow.response.headers.get("retry-after") == "30"
+    answer = json.loads(flow.response.content)
+    assert answer["ok"] is False and answer["error_code"] == 429
+    assert answer["parameters"] == {"retry_after": 30} and HOLD in answer["description"]
+
+
+@pytest.mark.parametrize("reason", ["rejected", "expired", "paused", "hold_full"])
+def test_a_denied_translated_hold_is_its_apis_403(reason: str) -> None:
+    channel = FakeChannel()
+    channel.answer = held()
+    channel.decided = Decision("deny", reason=reason)
+    flow = telegram(f"/{BOT}/sendMessage?chat_id=556&text=hola")
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == 403 and flow.response is not None
+    answer = json.loads(flow.response.content)
+    assert answer["ok"] is False and answer["error_code"] == 403
+
+
+def test_a_translated_request_refused_at_once_is_its_apis_403() -> None:
+    channel = FakeChannel()
+    channel.answer = Ack("deny", reason="gate_rejected", seq=9)
+    flow = telegram(f"/{BOT}/sendMessage?chat_id=556&text=hola")
+    gate, _ = make_gate(channel)
+    send(gate, flow)
+    assert status(flow) == 403 and flow.response is not None
+    assert json.loads(flow.response.content)["error_code"] == 403
+
+
+def test_a_plain_request_keeps_its_plain_text_refusals() -> None:
+    channel = FakeChannel()
+    channel.answer = Ack("deny", reason="gate_rejected", seq=9)
+    flow = Flow(request=Request())
+    gate, _ = make_gate(channel)
+    send(gate, flow)
+    assert flow.response is not None
+    assert flow.response.content == REFUSALS["gate_rejected"][1].encode()
+
+
+def test_a_secret_in_the_host_name_is_struck_like_one_in_the_url() -> None:
+    """With reads to any host (decision 1), a name is a way out too: the proxy resolves it once
+    the request goes on. A name carrying a secret is held as a URL that carries one."""
+    name = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz.exfil.example"
+    flow = Flow(
+        request=Request(host=name, method="GET", path="/", headers=Headers([("Host", name)])),
+        client_conn=Client(sni=name),
+    )
+    assert facts_of(flow)["url_struck"] is True
+    plain = "a1b2c3d4e5a1b2c3d4e5.exfil.example"
+    flow = Flow(
+        request=Request(host=plain, method="GET", path="/", headers=Headers([("Host", plain)])),
+        client_conn=Client(sni=plain),
+    )
+    assert facts_of(flow)["url_struck"] is False

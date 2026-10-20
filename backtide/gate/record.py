@@ -234,6 +234,16 @@ def path_struck(path: object, secrets: Secrets) -> bool:
     return _path(text, scrub) != _path(text, scrub, strike=False)
 
 
+def host_struck(host: object, secrets: Secrets) -> bool:
+    """Whether recording ``host`` strikes something of it (by pattern, or a secret it knows).
+    With reads to any host (T10-3, decision 1) a name is a way out too: the proxy resolves it
+    (DNS) once the request is let through, so a name carrying a secret is held as a URL is."""
+    scrub = _scrubber(secrets)
+    text = host if isinstance(host, str) else str(host)
+    window = text[: _LIMIT_HOST + _MARGIN]
+    return len(text) > _LIMIT_HOST + _MARGIN or strike_text(scrub.text(window)) != window
+
+
 def _host(host: object, scrub: KnownScrubber) -> str:
     # Struck before normalizing: lower-casing first would hide a known secret from the strike.
     struck = _clean(host, scrub, _LIMIT_HOST)

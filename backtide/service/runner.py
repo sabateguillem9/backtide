@@ -42,13 +42,13 @@ from backtide.analyzer import (
     parse_rules,
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
-from backtide.blackbox.redact import KnownScrubber
 from backtide.gate.providers import Providers
 from backtide.jail import AgentJail, JailError, ca
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
 from backtide.notify import AlertQueue, FanOut, LogNotifier, Notifier
 from backtide.sensors.files import FileWatcher, WatcherConfig
+from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
 from backtide.service.bot import Hooks, telegram_parts
 from backtide.service.config import ConfigError, ServiceConfig, read_provider_keys
@@ -234,6 +234,7 @@ def build_guardian(
     proxy: ProxyJail | None = None,
     hold_timings: HoldTimings | None = None,
     on_egress: Callable[[Egress], None] | None = None,
+    scrub: LiveScrub | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -256,7 +257,8 @@ def build_guardian(
     ``proxy`` replaces its container (the VM tests: their concessions, docs/21 "En la VM"), and
     ``hold_timings`` the gate's times (the VM tests shorten its 5 min and 90 s, T10-2).
     ``on_egress`` is handed the egress once it is built (``serve``: the Settings page hands it
-    the providers' new keys, T12e)."""
+    the providers' new keys, T12e). ``scrub`` is the process sensor's list of secrets to strike,
+    filled here and kept by ``serve`` to refresh it when a key changes."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
         rules = load_rules(config)  # a broken file is an error, not a guess
@@ -292,7 +294,9 @@ def build_guardian(
     if grow is None:
         grow = make_grower(config)
     process_sensor = (
-        build_sensor(config, jail, rated_box, store, jail_config=sensor_jail) if sensor else None
+        build_sensor(config, jail, rated_box, store, jail_config=sensor_jail, scrub=scrub)
+        if sensor
+        else None
     )
     egress = build_egress(config, jail, rated_box, proxy=proxy, timings=hold_timings)
     if on_egress is not None:
@@ -323,11 +327,13 @@ def build_sensor(
     store: SnapshotStore,
     *,
     jail_config: SensorJailConfig | None = None,
+    scrub: LiveScrub | None = None,
 ) -> ProcessSensor:
     """The process sensor of ``config`` (docs/23): Tetragon's container, and the reader that
     records the agent's commands and connections through the rules (``box``), each with the
     snapshot to rewind to, the Gateway token struck and what an earlier run already recorded
-    skipped. Constructed only: the Guardian starts it."""
+    skipped. Constructed only: the Guardian starts it. ``scrub`` is the list of secrets to strike
+    (``serve`` keeps it to refresh it when Settings changes a key, T12e): it is filled here."""
     jail_config = jail_config if jail_config is not None else config.sensor_jail_config()
     # The Gateway token and the providers' keys (the agent may type its fake one in a command;
     # the real one it never has, but nothing it could show is recorded either). known_secrets
@@ -337,12 +343,13 @@ def build_sensor(
         [config.gateway_token.reveal(), *config.model_providers().known_secrets()]
     )
     # cut_tails: Tetragon cuts long arguments (~327 KiB), maybe in the middle of a secret.
-    scrub = KnownScrubber(list(known), cut_tails=True).text if known else None
+    live = scrub if scrub is not None else LiveScrub()
+    live.replace(known)
     reader = TetragonReader(
         config.sensor_reader_config(),
         box,
         snapshot_for=SnapshotBefore(lambda: store.snapshots()),
-        scrub=scrub,
+        scrub=live.text,
         already_recorded=recorded_keys(box),
         stale_probes_before=utc_now(),
     )
@@ -370,6 +377,8 @@ def build_egress(
     only: the Guardian starts it. ConfigError for an allowed host the gate cannot use."""
     proxy = proxy if proxy is not None else ProxyJail(config.proxy_jail_config())
     policy = egress_policy(config, config.model_providers())
+    if timings is None:
+        timings = config.gate_settings().timings  # [gate] wait_s, hold_s, preapproval_s
     # The gate (T10-2) reads the black box once, at the first start: the holds a backtide that
     # died left open there are closed.
     return Egress(
@@ -384,14 +393,21 @@ def build_egress(
 
 def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
     """What backtide lets out through the proxy: the allowed hosts of ``[proxy]``, ``providers``
-    (their hosts, fake and real keys) and the Gateway token to strike. ConfigError for an allowed
-    host the gate cannot use."""
+    (their hosts, fake and real keys), the Gateway token to strike, and the gate of ``[gate]``
+    (T10-3): the mode for unknown hosts, the trusted recipients (with the owner's Telegram chat
+    of ``telegram.toml``, read now) and the extra read endpoints. ConfigError for an allowed
+    host the gate cannot use, or an unusable ``telegram.toml``."""
     settings = config.proxy_settings()
+    telegram = load_telegram(config.state_dir)
+    gate = config.gate_settings(owner_chat=None if telegram is None else telegram.chat_id)
     policy = Policy(
         allow_hosts=settings.allow_hosts,
         providers=providers,
         secrets=known_secrets([config.gateway_token.reveal()]),
         provider_tools=settings.allow_provider_tools,
+        unknown_hosts=gate.unknown_hosts,
+        trusted=gate.trusted,
+        read_endpoints=gate.read_endpoints,
     )
     try:
         policy.allow_list()
@@ -413,12 +429,21 @@ def providers_now(config: ServiceConfig) -> Providers:
     return now.model_providers()
 
 
-def key_reloader(config: ServiceConfig, egress: Egress) -> Callable[[], Applied]:
+def key_reloader(
+    config: ServiceConfig, egress: Egress, scrub: LiveScrub | None = None
+) -> Callable[[], Applied]:
     """What the Settings page calls after it writes or removes a provider's key: the providers
-    read again and handed to the running proxy (``Egress.reload``), no restart."""
+    read again and handed to the running proxy (``Egress.reload``), no restart. With ``scrub``
+    (the process sensor's list of secrets) the new key is added to it and the removed one is
+    dropped, before the proxy can use the new key; if the keys cannot be read, nothing changes."""
 
     def reload() -> Applied:
-        policy = egress_policy(config, providers_now(config))
+        providers = providers_now(config)
+        policy = egress_policy(config, providers)
+        if scrub is not None:
+            scrub.replace(
+                known_secrets([config.gateway_token.reveal(), *providers.known_secrets()])
+            )
         return Applied.NOW if egress.reload(policy) else Applied.WHEN_UP
 
     return reload
@@ -577,6 +602,7 @@ def serve(
         if telegram is not None:
             notifier = FanOut(notifier or LogNotifier(), telegram.notifier)
         built: list[Egress] = []
+        sensor_secrets = LiveScrub()
         guardian, alerts, box = build_guardian(
             config,
             jail=jail,
@@ -589,13 +615,14 @@ def serve(
             proxy=proxy,
             hold_timings=hold_timings,
             on_egress=built.append,
+            scrub=sensor_secrets,
         )
         # The Settings page (T12e): `backtide web --ajustes` asks through this same socket.
         (egress,) = built
         settings_service = Settings(
             config.state_dir,
             record=box.append,
-            reload_keys=key_reloader(config, egress),
+            reload_keys=key_reloader(config, egress, sensor_secrets),
             in_use=[p.name for p in config.proxy_settings().providers],
         )
         control: ControlHook = ControlServer(

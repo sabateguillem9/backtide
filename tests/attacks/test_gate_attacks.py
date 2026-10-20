@@ -15,23 +15,42 @@ person approves and rejects from the terminal, with the real `backtide aprobar` 
 - ``caida-a-media-retencion``: the proxy killed, the proxy frozen, backtide killed and backtide
   stopped, each with a request held: nothing goes out, every hold ends recorded with its ``why``
   and an old yes or hold id is worthless afterwards.
+
+T10-3 (the translators, and ``[gate] unknown_hosts = "hold"``, the default: reads to any host
+pass, writes are held; this lab runs in it, test_proxy_attacks.py's in the strict mode):
+
+- ``un-get-que-envia``: ``GET api.telegram.org/bot…/sendMessage?chat_id=…`` is a send: held with
+  the translator's sentence and Telegram's own 429; to the owner's chat it passes.
+- ``exfiltrar-credenciales``: the SSH key and a token, by POST and in a GET's query, to a host
+  off the list: both held with risk 3, nothing arrives; a plain read to that host passes.
+- ``dns-tunel``: with reads to any host a name is a way out, but only once recorded; what the
+  guard still stops (a secret in a name, a long URL, a DoH POST) is never resolved.
 """
 
+import json
+import secrets
+import string
 import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from attack_kit import CONTAINER_WORK, Attack, scenario
-from test_proxy_attacks import Lab, new_tag, start_lab, ts
+from test_proxy_attacks import DNS_CANARY_DOMAIN, Lab, new_tag, pieces, start_lab, ts
 
 from backtide.blackbox import Event
 from backtide.jail import docker as jail_docker
 from backtide.service.control import ask_decide, ask_holds
-from tests.integration.internet_kit import PLAIN_HOST, stop_with_internet
+from tests.integration.internet_kit import (
+    OTHER_HOST,
+    PLAIN_HOST,
+    TELEGRAM_HOST,
+    stop_with_internet,
+)
 from tests.integration.service_kit import run_cli, wait_until
 
 LIFE, WAIT = 50.0, 30.0  # seconds (5 min and 90 s in production)
@@ -50,6 +69,7 @@ PROBES = {
     "r6": "private_token",
     "r7": "trailer",
 }
+OWNER_CHAT = "424242424"  # the owner's Telegram chat: [gate] trusted in this lab (T10-3)
 
 
 @pytest.fixture(scope="module")
@@ -58,7 +78,9 @@ def lab(
     btrfs_volume: Path,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[Lab]:
-    started = start_lab(btrfs_volume, tmp_path_factory, hold_timings=SHARED_TIMINGS)
+    started = start_lab(
+        btrfs_volume, tmp_path_factory, hold_timings=SHARED_TIMINGS, trusted_chat=OWNER_CHAT
+    )
     try:
         yield started
     finally:
@@ -627,3 +649,262 @@ def test_a_fall_while_held_lets_nothing_out(attack: Attack, fall_lab: Lab) -> No
         all(p["new_holds"] for p in passes.values()),
         "tras cada caída, la petición aprobada antes y la que esperaba vuelven a quedar retenidas",
     )
+
+
+# --- T10-3: the translators and reads to any host ---------------------------------------------
+
+
+def made_up(size: int, alphabet: str = string.ascii_letters + string.digits) -> str:
+    """A secret of this run only, in the shape of a real one (never a real one)."""
+    return "".join(secrets.choice(alphabet) for _ in range(size))
+
+
+def gate_held_with(lab: Lab, text: str, *, timeout: float = 30) -> Event:
+    """The gate/held whose recorded path contains ``text`` (a Telegram path starts with the
+    bot, not with the tag), once it is there."""
+    found: list[Event] = []
+
+    def look() -> bool:
+        found[:] = [e for e in lab.service.events("held", "gate")
+                    if text in str(e.details.get("path", ""))]  # fmt: skip
+        return bool(found)
+
+    wait_until(look, timeout, f"a hold of {text}", context=lab.service.diagnosis)
+    return found[-1]
+
+
+def telegram_arrived(lab: Lab, text: str) -> list[dict]:
+    return [r for r in lab.internet.requests(TELEGRAM_HOST) if text in r["path"]]
+
+
+@scenario("un-get-que-envia")
+def test_a_get_that_sends_a_telegram_message_is_held(attack: Attack, lab: Lab) -> None:
+    tag = new_tag()
+    token = "123456789:" + made_up(35, string.ascii_letters + string.digits + "_-")
+    script = "un_get_que_envia"
+    stranger, mixed, owner = f"{tag}-a", f"{tag}-b", f"{tag}-c"
+    # To a chat that is not trusted: held while it waits connected, then approved.
+    waiting = background(lambda: attack.run_script(
+        lab.agent, script, token, "556", f"hola {stranger}", "sendMessage", "120"
+    ))  # fmt: skip
+    first = gate_held_with(lab, stranger)
+    before = telegram_arrived(lab, stranger)
+    approval = cli(lab, "aprobar", first.details["hold_id"])
+    approved = waiting()
+    # The method's name in odd case is the same send: held, and "pending" in Telegram's shape.
+    pending = attack.run_script(
+        lab.agent, script, token, "557", f"hola {mixed}", "SeNdMeSsAgE", "90"
+    )
+    second = gate_held_with(lab, mixed)
+    rejected = cli(lab, "rechazar", second.details["hold_id"])
+    # To the owner's chat ([gate] trusted): it passes without asking.
+    trusted = attack.run_script(
+        lab.agent, script, token, OWNER_CHAT, f"hola {owner}", "sendMessage", "30"
+    )
+    time.sleep(1.0)
+    out_a, out_b, out_c = (telegram_arrived(lab, t) for t in (stranger, mixed, owner))
+    owner_events = [e for e in lab.service.events("request", "net")
+                    if owner in str(e.details.get("path", ""))]  # fmt: skip
+    owner_held = [e for e in lab.service.events("held", "gate")
+                  if owner in str(e.details.get("path", ""))]  # fmt: skip
+    answer = pending.get("answer") if isinstance(pending.get("answer"), dict) else {}
+    attack.check(
+        "stopped",
+        before == [] and len(out_a) == 1 and out_b == [] and len(out_c) == 1
+        and trusted["status"] == 200,
+        f"el GET de sendMessage al chat 556 espera en la puerta sin llegar ({len(before)}); con "
+        f"`backtide aprobar` sale una vez ({len(out_a)}). El de «SeNdMeSsAgE» al 557 no llega "
+        f"nunca ({len(out_b)}). Control: al chat del dueño sale sin preguntar "
+        f"({trusted['status']}, {len(out_c)})",
+    )  # fmt: skip
+    every = json.dumps([[e.target, e.details] for e in lab.service.events()])
+    secret = token.split(":", 1)[1]
+    phrases = [str(e.details.get("phrase")) for e in (first, second)]
+    attack.check(
+        "recorded",
+        phrases == [f"Telegram: enviar un mensaje al chat 556: «hola {stranger}»",
+                    f"Telegram: enviar un mensaje al chat 557: «hola {mixed}»"]
+        and all(e.details.get("reading", {}).get("effect") == "send" for e in (first, second))
+        and len(owner_events) == 1
+        and owner_events[0].details.get("gate", {}).get("decision") == "trusted"
+        and bool(out_c) and ts(owner_events[0]) < out_c[0]["at"]
+        and owner_held == []
+        and not any(piece in every for piece in pieces(secret)),
+        f"gate/held con la frase del traductor: {phrases}; el del dueño, net/request "
+        f"{[e.details.get('gate') for e in owner_events]} grabado antes de llegar y sin "
+        f"retención ({len(owner_held)}); ningún trozo del token del bot en la caja negra",
+    )  # fmt: skip
+    attack.check(
+        "risk",
+        first.risk == 2 and second.risk == 2,
+        f"retenidos con riesgo {first.risk} y {second.risk}: el token del bot en la ruta, que la "
+        f"caja negra tacha, no lo sube a 3 por sí solo",
+    )
+    attack.check(
+        "held",
+        approval.returncode == 0 and approved["status"] == 200
+        and pending["status"] == 429 and pending.get("retry_after") == "30"
+        and answer.get("ok") is False and answer.get("error_code") == 429
+        and answer.get("parameters") == {"retry_after": 30}
+        and second.details["hold_id"] in str(answer.get("description", ""))
+        and rejected.returncode == 0,
+        f"el primero esperó conectado y salió al aprobarlo ({approved['status']} a los "
+        f"{approved['seconds']} s); el segundo recibió el 429 de Telegram ({pending['status']}, "
+        f"Retry-After {pending.get('retry_after')}, {answer}) y se rechazó",
+    )  # fmt: skip
+
+
+@scenario("exfiltrar-credenciales")
+def test_credentials_sent_to_an_unknown_host_are_held(attack: Attack, lab: Lab) -> None:
+    tag = new_tag()
+    key = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        + "b3BlbnNzaC1rZXktdjEAAAAA" + made_up(40) + "\n" + made_up(64) + "\n"
+        + "-----END OPENSSH PRIVATE KEY-----\n"
+    )  # fmt: skip
+    token = "ghp_" + made_up(36)
+    outcome = attack.run_script(lab.agent, "exfiltrar_credenciales", OTHER_HOST, tag, key, token)
+    upload = held_at(lab, f"/{tag}/upload")
+    collect = gate_held_with(lab, f"/{tag}/collect")
+    still_open = {h["hold_id"] for h in ask_holds(lab.service.config.control_socket)}
+    reject_what_is_left(lab, tag)
+    time.sleep(1.0)
+    got = {r["path"].split("?", 1)[0] for r in lab.internet.requests(OTHER_HOST, f"/{tag}/")}
+    every = json.dumps([[e.target, e.details] for e in lab.service.events()])
+    leaked = [p for p in pieces(token) | pieces(key.split("\n")[2]) if p in every]
+    attack.check(
+        "stopped",
+        got == {f"/{tag}/innocent"} and outcome["control"] == 200,
+        f"la clave SSH ({outcome['key_file']}) y el token por POST ({outcome['post']}) y en la "
+        f"consulta de un GET ({outcome['get']}) no llegan a {OTHER_HOST}: allí solo llegó "
+        f"{sorted(got)}, el GET inocente de control, que pasa ({outcome['control']}: las lecturas "
+        f"a hosts desconocidos pasan desde T10-3)",
+    )
+    attack.check(
+        "recorded",
+        upload.details.get("method") == "POST" and collect.details.get("method") == "GET"
+        and leaked == [],
+        f"gate/held del POST ({upload.details.get('reason')}) y del GET "
+        f"({collect.details.get('reason')}); trozos de la clave o del token en la caja negra: "
+        f"{leaked or 'ninguno'}",
+    )  # fmt: skip
+    attack.check(
+        "risk",
+        upload.risk == 3 and collect.risk == 3,
+        f"el POST con la clave en el cuerpo, riesgo {upload.risk}; el GET con el token en la "
+        f"URL, riesgo {collect.risk} ({collect.details.get('reason')})",
+    )
+    attack.check(
+        "held",
+        {upload.details["hold_id"], collect.details["hold_id"]} <= still_open,
+        f"las dos esperaban la aprobación ({sorted(still_open)}) hasta que el test las rechazó",
+    )
+
+
+@scenario("dns-tunel")
+def test_a_name_leaves_only_once_recorded_and_the_guard_stops_the_rest(
+    attack: Attack, lab: Lab
+) -> None:
+    tag = new_tag()
+    marker = f"t10dns{uuid4().hex[:10]}"
+    canary = f"{marker}-canary.{DNS_CANARY_DOMAIN}"
+    secret_label = "sk-ant-api03-" + made_up(26, string.ascii_lowercase + string.digits)
+    seq = lab.head()
+    before_errors = lab.internet.dns_errors()
+    outcome = attack.run_script(
+        lab.agent, "dns_tunel", tag, marker, PLAIN_HOST, canary, secret_label
+    )
+    assert outcome["control"] == 200, outcome  # the way out still works
+
+    def named(text: str) -> list[dict]:
+        return [q for q in lab.internet.dns_queries() if text in str(q["name"]).lower()]
+
+    deadline = time.monotonic() + 15
+    while not named(canary) and time.monotonic() < deadline:
+        time.sleep(0.25)
+    held = [e for e in lab.service.events("held", "gate") if e.seq > seq]
+    by_host: dict[str, list[Event]] = {}
+    for event in held:
+        by_host.setdefault(str(event.details.get("host")), []).append(event)
+    # The black box strikes the secret from the host it records: found by what follows it.
+    secret_held = [e for e in held if str(e.details.get("host", "")).endswith(
+        outcome["secret_name"].split(".", 1)[1]
+    )]  # fmt: skip
+    secret_kept = [e for e in held if secret_label in json.dumps(e.details)]
+    long_held = by_host.get(outcome["long_name"], [])
+    doh_held = [e for host in ("dns.google", "cloudflare-dns.com", "1.1.1.1")
+                for e in by_host.get(host, [])]  # fmt: skip
+    # What the guard held is never resolved: no query for its names.
+    guarded_queries = (
+        named(f"{marker}-s.")
+        + named(f"{marker}-l.")
+        + named("dns.google")
+        + named("cloudflare-dns.com")
+    )
+    # What passed (plain reads of encoded names) is resolved only after it was recorded.
+    requests = [e for e in lab.service.events("request", "net") if e.seq > seq]
+    first_recorded: dict[str, float] = {}
+    for event in requests:
+        host = str(event.details.get("host", "")).lower()
+        first_recorded.setdefault(host, ts(event))
+    leaked = [
+        q
+        for q in named(marker)
+        if canary not in str(q["name"]).lower()
+        and f"{marker}-s." not in str(q["name"])
+        and f"{marker}-l." not in str(q["name"])
+    ]
+
+    def recorded_at(name: str) -> float | None:
+        """When the request for ``name`` was recorded (a resolver may get it with a search
+        domain after it, or a final dot)."""
+        times = [moment for host, moment in first_recorded.items() if name.startswith(host)]
+        return min(times) if times else None
+
+    before_recorded = [
+        q for q in leaked
+        if (moment := recorded_at(str(q["name"]).lower())) is None or q["at"] < moment
+    ]  # fmt: skip
+    errors = lab.internet.dns_errors()
+    new_errors = {proto: errors[proto] - before_errors.get(proto, 0) for proto in errors}
+    direct = outcome["direct"]
+    local_errors = ("rcode=2 ancount=0", "rcode=3 ancount=0", "rcode=5 ancount=0")
+    docker_bad = {k: v for k, v in direct.items() if "127.0.0.11" in k
+                  and str(v).startswith("rcode=") and v not in local_errors}  # fmt: skip
+    direct_out = {k: v for k, v in direct.items() if "127.0.0.11" not in k
+                  and (str(v).startswith("rcode=") or v == "closed")}  # fmt: skip
+    attack.check(
+        "stopped",
+        len(secret_held) == 1 and secret_kept == [] and len(long_held) == 1 and len(doh_held) == 3
+        and guarded_queries == [] and direct_out == {} and docker_bad == {}
+        and outcome["default_route"] is False and named(canary) != []
+        and new_errors == {"udp": 0, "tcp": 0},
+        f"contenido: lo que la guardia ve se retiene antes de resolver nada (un nombre con un "
+        f"secreto: {len(secret_held)}; una URL de más de 2 KiB: {len(long_held)}; DoH por POST: "
+        f"{len(doh_held)}) y el resolvedor falso no recibió ninguno de sus nombres "
+        f"({len(guarded_queries)}). Las lecturas de nombres codificados pasan (decisión 1): "
+        f"{outcome['through_proxy']}, y {len(leaked)} consultas suyas llegaron al resolvedor. "
+        f"DNS directo: {direct}; sin ruta por defecto ({not outcome['default_route']}). Canario: "
+        f"{len(named(canary))} consultas",
+    )  # fmt: skip
+    attack.check(
+        "recorded",
+        leaked != [] and before_recorded == [],
+        f"{len(leaked)} consultas con el marcador llegaron al resolvedor, cada una después de su "
+        f"net/request ({len(before_recorded)} antes)",
+    )
+    attack.check(
+        "risk",
+        [e.risk for e in secret_held] == [3] and [e.risk for e in long_held] == [2],
+        f"el nombre con un secreto, riesgo {[e.risk for e in secret_held]} "
+        f"({[e.details.get('reason') for e in secret_held]}); la URL larga, "
+        f"{[e.risk for e in long_held]} ({[e.details.get('reason') for e in long_held]})",
+    )
+    statuses = [outcome["guarded"]["secret_name"], outcome["guarded"]["long_url"],
+                *outcome["guarded"]["doh_post"].values()]  # fmt: skip
+    attack.check(
+        "held",
+        all(status != 200 for status in statuses),
+        f"retenidos, el agente no recibió respuesta del servidor: {statuses}",
+    )
+    reject_what_is_left(lab, tag)

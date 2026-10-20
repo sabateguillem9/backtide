@@ -40,7 +40,16 @@ from backtide.gate.translate.base import (
     unknown,
 )
 
-__all__ = ["Context", "Effect", "Reading", "RequestView", "Shape", "has_translator", "translate"]
+__all__ = [
+    "Context",
+    "Effect",
+    "Reading",
+    "RequestView",
+    "Shape",
+    "credential_free_path",
+    "has_translator",
+    "translate",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +60,8 @@ class _Entry(NamedTuple):
     read: Callable[[RequestView, Context], Reading]
     shape: Shape  # and wait: for a refusal before the translator reads anything
     wait: int
+    # The path segments that are the API's own credential (a bot token, a webhook's secret).
+    credential: Callable[[tuple[str, ...]], frozenset[int]] | None = None
 
 
 _TRANSLATORS = (
@@ -60,6 +71,7 @@ _TRANSLATORS = (
         telegram.read,
         Shape.TELEGRAM,
         WAIT_TELEGRAM,
+        telegram.credential_segments,
     ),
     _Entry(gmail.NAME, gmail.claims, gmail.read, Shape.GOOGLE, WAIT_GOG),
     _Entry(
@@ -69,8 +81,22 @@ _TRANSLATORS = (
         Shape.GRAPH,
         WAIT_DEFAULT,
     ),
-    _Entry(slack.NAME, slack.claims, slack.read, Shape.SLACK, WAIT_DEFAULT),
-    _Entry(discord.NAME, discord.claims, discord.read, Shape.DISCORD, WAIT_DISCORD),
+    _Entry(
+        slack.NAME,
+        slack.claims,
+        slack.read,
+        Shape.SLACK,
+        WAIT_DEFAULT,
+        slack.credential_segments,
+    ),
+    _Entry(
+        discord.NAME,
+        discord.claims,
+        discord.read,
+        Shape.DISCORD,
+        WAIT_DISCORD,
+        discord.credential_segments,
+    ),
     _Entry(
         github_graphql.NAME,
         github_graphql.claims,
@@ -88,6 +114,25 @@ def has_translator(view: RequestView, context: Context) -> bool:
     return _pick(view, context) is not None
 
 
+def credential_free_path(view: RequestView, context: Context, reading: Reading) -> str:
+    """The request's path with the segments that are its API's own credential (Telegram's
+    ``bot<token>``, a Discord or Slack webhook's secret) replaced by ``-``, when its reading
+    says the path carries one. The gate looks for secrets in THIS path (decision 1's guard):
+    the credential is how that API authenticates, and the black box strikes it anyway, so it
+    must not make every such request look like a leak (risk 3). Only the path part, never the
+    query, and only segments the translator itself would take for the credential."""
+    entry = _pick(view, context)
+    if not reading.path_credential or entry is None or entry.credential is None:
+        return view.path
+    raw, mark, query = view.path.partition("?")
+    segments = tuple(raw.split("/"))
+    if entry.name == slack.NAME and view.host != slack.WEBHOOK_HOST:
+        return view.path
+    masked = entry.credential(segments)
+    kept = "/".join("-" if index in masked else part for index, part in enumerate(segments))
+    return kept + mark + query
+
+
 def _pick(view: RequestView, context: Context) -> _Entry | None:
     for entry in _TRANSLATORS:
         if entry.claims(view, context):
@@ -99,7 +144,7 @@ def translate(view: RequestView, context: Context) -> Reading | None:
     entry = _pick(view, context)
     if entry is None:
         return None
-    name, _claims, read, shape, wait = entry
+    name, _claims, read, shape, wait, _credential = entry
     refusal = common_refusal(view)
     if refusal is not None:
         return unknown(name, shape, wait, refusal)

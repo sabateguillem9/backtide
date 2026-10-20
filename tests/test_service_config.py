@@ -761,3 +761,64 @@ def test_bad_allowed_provider_tools_are_refused(layout: Path, value: str) -> Non
         ServiceConfig.from_file(
             write_toml(layout, f"[proxy]\nallow_provider_tools = {value}\n")
         ).proxy_settings()
+
+
+# --- [gate] (T10-3, docs/32) ---------------------------------------------------------------------
+
+
+def test_the_gate_holds_unknown_hosts_by_default_and_trusts_the_owners_chat(layout: Path) -> None:
+    config = ServiceConfig.from_file(write_toml(layout))
+    settings = config.gate_settings()
+    assert settings.unknown_hosts == "hold" and settings.trusted == ()
+    assert settings.timings.wait == 90 and settings.timings.life == 300
+    owner = config.gate_settings(owner_chat=123456789).trusted
+    assert [(t.translator, t.recipient) for t in owner] == [("telegram", "123456789")]
+
+
+def test_the_gate_section_is_read(layout: Path) -> None:
+    extra = """
+[gate]
+unknown_hosts = "deny"
+trust_owner_chat = false
+read_endpoints = ["Search.Fake.Test/v1/Query"]
+wait_s = 20
+hold_s = 120
+preapproval_s = 60
+trusted = [
+  {translator = "gmail", email = "Ana@Ejemplo.COM"},
+  {translator = "telegram", chat = 42},
+  {translator = "slack", channel = "C0123"},
+]
+"""
+    settings = ServiceConfig.from_file(write_toml(layout, extra)).gate_settings(owner_chat=7)
+    assert settings.unknown_hosts == "deny"
+    assert [(t.translator, t.recipient) for t in settings.trusted] == [
+        ("gmail", "ana@ejemplo.com"), ("telegram", "42"), ("slack", "C0123"),
+    ]  # fmt: skip
+    assert settings.read_endpoints == ("search.fake.test/v1/query",)
+    timings = settings.timings
+    assert (timings.wait, timings.life, timings.preapproval) == (20, 120, 60)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '[gate]\nunknown_hosts = "allow"',
+        "[gate]\nwait_s = 120",  # never longer than the design's 90 s
+        "[gate]\nhold_s = 900",  # a hold lives 5 min at most
+        "[gate]\npreapproval_s = 3600",
+        "[gate]\nwait_s = true",
+        '[gate]\nread_endpoints = ["https://x.test/a"]',
+        '[gate]\ntrusted = [{translator = "smtp", email = "a@b.c"}]',
+        '[gate]\ntrusted = [{translator = "gmail", chat = "1"}]',
+        '[gate]\ntrusted = [{translator = "gmail", email = "not an address"}]',
+        '[gate]\ntrusted = [{translator = "telegram", chat = "x y"}]',
+        '[gate]\ntrust_owner_chat = "no"',
+        '[gate]\ntoken = "x"',
+        "[gate]\nunknown = 1",
+        'gate = "hold"',
+    ],
+)
+def test_a_bad_gate_section_is_refused(layout: Path, extra: str) -> None:
+    with pytest.raises(ConfigError):
+        ServiceConfig.from_file(write_toml(layout, extra))

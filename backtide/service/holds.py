@@ -23,6 +23,10 @@ black box; the book only keeps the state:
   it is dropped, never kept as a preapproval for the agent's next request (review, B2).
 - **Caps:** at most ``max_open`` holds open (``open`` and ``releasing``); past it a request is
   refused (``hold_full``) and counted for a ``gate/flood`` at most every ``flood_every`` s.
+- **Drafts** (T10-3): a hold may name the saved draft it sends or changes (``draft``:
+  translator, account and draft id). While one is open, releasing or preapproved,
+  ``draft_open`` says so, and the gate holds any change to that draft: the text the person
+  approves must not change before it goes out (docs/32, decision 12).
 - **What a restart loses only gave leave** (holds, preapprovals, rejections): ``close_all`` ends
   it all, failing closed. What must last (what was held, who approved, what expired) is in the
   black box; ``stale_holds`` finds the holds a killed backtide left open there.
@@ -38,6 +42,8 @@ from enum import StrEnum
 from typing import Any
 
 from backtide.snapshots import utc_now
+
+DraftKey = tuple[str, str | None, str]  # translator, account (16 hex, or None), draft id
 
 HOLD_ID_RE = re.compile(r"h-[0-9a-f]{12}", re.ASCII)
 STALE_WINDOW = timedelta(minutes=15)  # what a restart looks back at (docs/32, section 6)
@@ -126,6 +132,8 @@ class Hold:
     state: State = State.OPEN
     until: float | None = None  # a preapproval's end
     frozen: bool = False  # a pause or a rewind came while it was releasing: no preapproval
+    draft: DraftKey | None = None  # the saved draft it sends or changes (T10-3)
+    phrase: str | None = None  # what its translator says it does (backtide.gate.phrase)
 
     @property
     def live(self) -> bool:
@@ -188,6 +196,17 @@ class HoldBook:
             return False
         return True
 
+    def draft_open(self, key: DraftKey) -> bool:
+        """Whether a hold of the draft ``key`` is open, releasing or preapproved (a lapsed
+        preapproval no longer counts)."""
+        now = self._clock()
+        for hold in self._holds.values():
+            if hold.draft != key:
+                continue
+            if hold.state is not State.PREAPPROVED or hold.until is None or now < hold.until:
+                return True
+        return False
+
     def pending(self) -> list[Hold]:
         """The holds waiting for the person, oldest first."""
         return [hold for hold in self._holds.values() if hold.state is State.OPEN]
@@ -203,7 +222,15 @@ class HoldBook:
 
     # A hold's life
 
-    def open(self, fp: str, *, risk: int, reason: str, event: dict[str, Any]) -> Hold | None:
+    def open(
+        self,
+        fp: str,
+        *,
+        risk: int,
+        reason: str,
+        event: dict[str, Any],
+        draft: DraftKey | None = None,
+    ) -> Hold | None:
         """A new hold for ``fp`` (not yet recorded: ``recorded`` or ``discard``), or None when
         ``max_open`` are open already (counted for the next ``gate/flood``)."""
         if sum(1 for hold in self._holds.values() if hold.live) >= self.timings.max_open:
@@ -224,6 +251,7 @@ class HoldBook:
             created=now,
             expires=now + self.timings.life,
             expires_at=_iso(self._wall() + timedelta(seconds=self.timings.life)),
+            draft=draft,
         )
         self._holds[hold_id] = hold
         self._by_fp[fp] = hold

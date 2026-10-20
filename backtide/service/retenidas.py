@@ -50,6 +50,7 @@ NOT_ANSWERING = (
 NONE_HELD = "No hay ninguna petición retenida esperando."
 RISK_NAMES = {0: "riesgo 0", 1: "riesgo 1", 2: "riesgo 2", 3: "riesgo 3"}
 MAX_SHOWN = 160  # characters of the request's target shown per line
+MAX_PHRASE = 400  # characters of a translator's sentence (backtide.gate.phrase)
 
 
 def decide(
@@ -135,7 +136,9 @@ def hold_line(hold: Mapping[str, Any]) -> str:
     seconds = hold.get("expires_in_s")
     left = f"caduca en {seconds // 60} min {seconds % 60:02d} s" if type(seconds) is int else ""
     waiting = "esperando conectada" if hold.get("waiting") is True else "el agente reintentará"
-    return f"{hold['hold_id']}  {risk}  {method} {target}  ({left}; {waiting})"
+    line = f"{hold['hold_id']}  {risk}  {method} {target}  ({left}; {waiting})"
+    phrase = _text(hold.get("phrase"), MAX_PHRASE)
+    return f"{line}\n    {phrase}" if phrase else line  # what its translator says it does
 
 
 def _service(config: ServiceConfig, err: TextIO) -> int | None:

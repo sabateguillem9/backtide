@@ -328,3 +328,18 @@ def test_the_proxy_gets_each_providers_models(layout: Path) -> None:
     by_name = {p.name: p for p in configured(layout).model_providers().items}
     assert by_name["groq"].models == ("llama-3.3-70b", "qwen3.5:9b")
     assert by_name["anthropic"].models == ()
+
+
+def test_the_egress_policy_gates_unknown_hosts_and_trusts_the_owners_chat(layout: Path) -> None:
+    """T10-3: ``[gate]``'s defaults (decision 1, docs/32 section 9). The owner's chat comes from
+    ``telegram.toml`` (a made-up token: the shape of one, never a real one)."""
+    from backtide.service.runner import egress_policy
+
+    config = configured(layout)
+    policy = egress_policy(config, config.model_providers())
+    assert policy.unknown_hosts == "hold" and policy.trusted == ()
+    settings = config.state_dir / "telegram.toml"
+    settings.write_text('token = "123456789:' + "Zx9_-" * 7 + '"\nchat_id = 4242\n')
+    settings.chmod(0o600)
+    policy = egress_policy(config, config.model_providers())
+    assert [(t.translator, t.recipient) for t in policy.trusted] == [("telegram", "4242")]

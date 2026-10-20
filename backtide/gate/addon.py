@@ -44,6 +44,7 @@ mitmproxy's), so the Mac tests run the hooks on small fakes of mitmproxy's objec
 """
 
 import asyncio
+import dataclasses
 import functools
 import logging
 import os
@@ -70,7 +71,17 @@ from backtide.gate.policy import (
 from backtide.gate.provider_tools import check_request
 from backtide.gate.providers import CREDENTIAL_HEADERS, Provider, swap_key
 from backtide.gate.sse import UsageStream, summarize_json
-from backtide.gate.translate.base import OVERRIDE_HEADERS
+from backtide.gate.translate import credential_free_path, shapes, translate
+from backtide.gate.translate.base import (
+    OVERRIDE_HEADERS,
+    Context,
+    Note,
+    Reading,
+    RequestView,
+    Shape,
+    body_has_secret,
+    unknown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -453,23 +464,57 @@ class Gate:
                 fields, provider.name, config.scrubber, provider_tools=verdict.tools
             )
             gate = None  # a provider's host is never held (docs/32, section 5, rule 1)
+            shape = None
         else:
             event = record.request_event(fields, config.scrubber)
-            gate = self._gate_facts(request, headers, body, config, trailers)
+            reading = self._read(request, headers, body, config, trailers)
+            gate = self._gate_facts(request, headers, body, config, trailers, reading)
+            shape = None if reading is None else reading.shape
+            reading = None  # its canonical text lives no longer than the fingerprint needs
         # Up to max_pending requests wait for their ack at once: each keeps only mitmproxy's raw
         # body, never a decoded copy of up to 16 MiB as well (T06-7).
         del fields["body"]
         body = parts = None
         ack = await self._channel.ask(event, gate)
         if ack.held:
-            await self._hold(flow, ack, fields)
+            await self._hold(flow, ack, fields, shape)
             return
         if flow.response is not None:
             return  # killed or answered meanwhile
         if not ack.allowed:
-            self._denied(flow, ack, fields)
+            self._denied(flow, ack, fields, shape)
             return
         self._let_through(flow, fields, provider, swapped)
+
+    def _read(
+        self,
+        request: Any,
+        headers: list[tuple[str, str]],
+        body: bytes | None,
+        config: GateConfig,
+        trailers: list[tuple[str, str]],
+    ) -> Reading | None:
+        """What a translator reads of the request (docs/32, section 8), or None when none
+        knows its host. The body is the decoded one, so its Content-Encoding (identity, gzip or
+        deflate, undone above) is left out of what the translator sees."""
+        view = RequestView.from_fields(
+            {
+                "method": request.method,
+                "scheme": request.scheme,
+                "host": request.host,
+                "port": request.port,
+                "path": request.path,
+                "headers": [p for p in headers if p[0].strip().lower() != "content-encoding"],
+                "body": body or b"",
+            },
+            trailers=bool(trailers),
+        )
+        return translate(view, self._context(config))
+
+    def _context(self, config: GateConfig) -> Context:
+        return Context(
+            key=config.fp_key, scrub=config.scrubber, read_endpoints=config.read_endpoints
+        )
 
     def _gate_facts(
         self,
@@ -478,12 +523,16 @@ class Gate:
         body: bytes | None,
         config: GateConfig,
         trailers: list[tuple[str, str]],
+        reading: Reading | None = None,
     ) -> dict[str, Any]:
-        """What backtide decides a request on (docs/32, section 6): its exact fingerprint (every
-        header but the volatile ones, and the trailers, count: security review of T10-2, M2),
-        the redaction's verdict on its URL and on its headers that are not credentials, their
-        lengths, a WebSocket opening, and whether its method is exactly a read with no method
-        override header and no trailers (M2: either makes it a write)."""
+        """What backtide decides a request on (docs/32, section 6): its fingerprint (every header
+        but the volatile ones, and the trailers, count: security review of T10-2, M2; with a
+        translator's reading, its canonical text in place of the body, decision 2), the
+        redaction's verdict on its URL (the API's own credential in the path left out) and on
+        its headers that are not credentials, their lengths and the credentials' (T10-3), a
+        WebSocket opening, whether its method is exactly a read with no method override header
+        and no trailers (M2: either makes it a write), whether the body of a request no
+        translator read carries a secret, and the reading itself, checked and fitted."""
         fp = fingerprint(
             config.fp_key,
             method=str(request.method),
@@ -493,14 +542,23 @@ class Gate:
             headers=headers,
             body=body,
             trailers=trailers,
-            canonical=None,  # T10-3: a translator's Reading.canonical (decision 2)
+            canonical=None if reading is None else reading.canonical,
         )
         overridden = any(name.strip().lower() in OVERRIDE_HEADERS for name, _ in headers)
         plain = [pair for pair in headers if pair[0].strip().lower() not in CREDENTIAL_HEADERS]
         header_bytes = sum(len(_utf8(name)) + len(_utf8(value)) for name, value in plain)
+        credential_bytes = sum(
+            len(_utf8(name)) + len(_utf8(value))
+            for name, value in headers
+            if name.strip().lower() in CREDENTIAL_HEADERS
+        )
+        path = str(request.path)
+        if reading is not None:
+            path = credential_free_path(self._view_of(request), self._context(config), reading)
         return protocol.gate(
             fp=fp,
-            url_struck=record.path_struck(request.path, config.scrubber),
+            url_struck=record.path_struck(path, config.scrubber)
+            or record.host_struck(request.host, config.scrubber),
             url_bytes=len(_utf8(str(request.url))),
             websocket=any(name.strip().lower() == "upgrade" for name, _ in headers),
             exact_read=request.method in READ_METHODS and not overridden and not trailers,
@@ -508,13 +566,29 @@ class Gate:
             headers_struck=header_bytes > HEADER_SCAN_LIMIT
             or record.headers_struck(plain, config.scrubber),
             header_bytes=header_bytes,
-            wait_hint_s=None,  # T10-3: what the translator says its client waits
+            credential_bytes=credential_bytes,
+            # A translated request's body is the translator's to search (secret_seen).
+            body_struck=reading is None and bool(body) and body_has_secret(body, config.scrubber),
+            wait_hint_s=None if reading is None else reading.wait_s,
+            reading=None if reading is None else _wire_reading(reading),
         )
 
-    async def _hold(self, flow: Any, ack: Ack, fields: dict[str, Any]) -> None:
+    @staticmethod
+    def _view_of(request: Any) -> RequestView:
+        """The request's method, connection host and path: what ``credential_free_path``
+        picks the translator by."""
+        return RequestView.from_fields(
+            {"method": request.method, "host": request.host, "port": request.port,
+             "path": request.path}
+        )  # fmt: skip
+
+    async def _hold(
+        self, flow: Any, ack: Ack, fields: dict[str, Any], shape: Shape | None = None
+    ) -> None:
         """A held request: kept with its connection open until backtide decides, its client
         leaves or ``wait_ms`` passes. Every hold ack is answered with exactly one ``released``
-        or ``hold_left`` (none after a deny), so a yes is spent exactly once."""
+        or ``hold_left`` (none after a deny), so a yes is spent exactly once. ``shape``: how its
+        API writes "pending" and "rejected" (a translator's, T10-3); None: plain text."""
         hold_id = str(ack.hold_id)
         self._waiting.discard(flow.id)  # a held request no longer waits for its ack
         if flow.response is not None or self._client_gone(flow):
@@ -533,7 +607,7 @@ class Gate:
             # once, and the hold lives on in backtide. A twin must not give back the slot of the
             # request that waits (M1): it never had one.
             self._channel.let_go(hold_id, why="no_slot", slot=False)
-            self._pending(flow, hold_id, ack.retry_after)
+            self._pending(flow, hold_id, ack.retry_after, shape)
             return
         told = False
         try:
@@ -553,7 +627,7 @@ class Gate:
                     self._channel.let_go(hold_id, why="client_left")
                 else:
                     self._channel.let_go(hold_id, why="waited")
-                    self._pending(flow, hold_id, ack.retry_after)
+                    self._pending(flow, hold_id, ack.retry_after, shape)
                 told = True
                 return
             if decision.verdict == "allow" and decision.seq is not None:
@@ -564,7 +638,7 @@ class Gate:
             self._channel.let_go(hold_id)  # a deny, or the channel is gone: nothing to say
             told = True
             if decision.verdict == "deny" and decision.reason in REFUSALS:
-                self._answer(flow, decision.reason)
+                self._answer(flow, decision.reason, shape=shape, hold_id=hold_id)
             else:
                 self._refuse_unrecorded(flow, fields)
         finally:
@@ -579,9 +653,16 @@ class Gate:
             return True
         return getattr(conn, "timestamp_end", None) is not None or conn.id not in self._clients
 
-    def _pending(self, flow: Any, hold_id: str, retry_after: int | None) -> None:
-        """429: still waiting for the person, ask again in a while (never in a loop)."""
+    def _pending(
+        self, flow: Any, hold_id: str, retry_after: int | None, shape: Shape | None = None
+    ) -> None:
+        """429: still waiting for the person, ask again in a while (never in a loop). In the
+        shape of its API when a translator read it, so its client retries on its own."""
         seconds = retry_after if retry_after is not None else 30
+        if shape is not None:
+            answer = shapes.pending(shape, hold_id, seconds)
+            flow.response = self._respond(answer.status, answer.body, dict(answer.headers))
+            return
         text = (
             f"backtide: waiting for the person's approval (hold {hold_id}); "
             f"try again in {seconds} s or so, not in a loop\n"
@@ -616,13 +697,15 @@ class Gate:
             "fields": {key: fields[key] for key in ("flow_id", "scheme", "host", "port", "path")},
         }
 
-    def _denied(self, flow: Any, ack: Ack, fields: dict[str, Any]) -> None:
+    def _denied(
+        self, flow: Any, ack: Ack, fields: dict[str, Any], shape: Shape | None = None
+    ) -> None:
         reason = ack.reason or "not_recorded"
         if reason == "not_recorded":
             self._refuse_unrecorded(flow, fields)
             return
         # not_allowed and throttled are backtide's: it recorded or counted them already.
-        self._answer(flow, reason, retry_after=ack.retry_after)
+        self._answer(flow, reason, retry_after=ack.retry_after, shape=shape)
 
     async def server_connect(self, data: Any) -> None:
         try:
@@ -967,7 +1050,23 @@ class Gate:
         """503: no channel or no ack. The refusal is queued and reaches backtide later."""
         self._block("not_recorded", flow, fields if fields is not None else self._flow_fields(flow))
 
-    def _answer(self, flow: Any, reason: str, *, retry_after: int | None = None) -> None:
+    def _answer(
+        self,
+        flow: Any,
+        reason: str,
+        *,
+        retry_after: int | None = None,
+        shape: Shape | None = None,
+        hold_id: str | None = None,
+    ) -> None:
+        """The refusal of ``reason``. The gate's own (rejected, expired, paused, hold_full and
+        gate_rejected) in the shape of its API when a translator read the request (T10-3): a
+        403 its client takes for "forbidden" and does not repeat."""
+        gated = "rejected" if reason == "gate_rejected" else reason
+        if shape is not None and gated in shapes.REFUSAL_REASONS:
+            answer = shapes.refused(shape, hold_id, gated)
+            flow.response = self._respond(answer.status, answer.body, dict(answer.headers))
+            return
         status, text = REFUSALS[reason]
         headers = {"content-type": "text/plain"}
         if retry_after is not None:
@@ -1011,6 +1110,27 @@ class Gate:
                 return
         flow_id = getattr(flow, "id", None)
         self._tell_error(stage, error, flow_id=flow_id if isinstance(flow_id, str) else None)
+
+
+def _wire_reading(reading: Reading) -> dict[str, Any]:
+    """The reading as ``gate.reading`` carries it (``protocol.fit_reading``). One the channel
+    would refuse (cannot be: the translators bound their texts) goes as a technical UNKNOWN
+    of the same translator, which is held; its secret, if any, still counts."""
+    try:
+        return protocol.fit_reading(reading.summary())
+    except protocol.ProtocolError:
+        logger.error("a %s reading could not be sent: held as unknown", reading.translator)
+        held = unknown(
+            reading.translator,
+            reading.shape,
+            reading.wait_s,
+            Note.UNPARSED,
+            account=reading.account,
+            path_credential=reading.path_credential,
+        )
+        if reading.secret_seen:
+            held = dataclasses.replace(held, secret_seen=True)
+        return protocol.fit_reading(held.summary())
 
 
 class Undecodable(Exception):

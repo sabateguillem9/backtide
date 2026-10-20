@@ -314,3 +314,37 @@ def test_a_restart_closes_the_holds_left_open_in_the_last_15_min() -> None:
 @pytest.mark.parametrize("bad", ["", "nope", "h-XYZ"])
 def test_a_restart_ignores_what_is_not_a_hold_id(bad: str) -> None:
     assert stale_holds([gate("held", bad, 1)], now=START) == []
+
+
+DRAFT = ("gmail", "0123456789abcdef", "r-42")
+
+
+def test_a_draft_is_open_while_its_sending_is_held_approved_or_preapproved() -> None:
+    """T10-3 (decision 12): while the send of a saved draft is held, being released or
+    preapproved, a change to that draft must be held too."""
+    book, clock = make()
+    assert not book.draft_open(DRAFT)
+    hold = book.open(FP, risk=2, reason="unknown", event=EVENT, draft=DRAFT)
+    assert hold is not None
+    book.recorded(hold, 10)
+    assert book.draft_open(DRAFT)
+    assert not book.draft_open(("gmail", "0123456789abcdef", "r-43"))
+    assert not book.draft_open(("graph_mail", "0123456789abcdef", "r-42"))
+    book.preapprove(hold)  # nobody waited: preapproved
+    assert book.draft_open(DRAFT)
+    clock.now += 601  # the preapproval lapsed
+    assert not book.draft_open(DRAFT)
+
+
+def test_a_rejected_or_spent_draft_hold_no_longer_counts() -> None:
+    book, _ = make()
+    hold = book.open(FP, risk=2, reason="unknown", event=EVENT, draft=DRAFT)
+    assert hold is not None
+    book.recorded(hold, 10)
+    book.reject(hold.hold_id)
+    assert not book.draft_open(DRAFT)
+    again = book.open(OTHER, risk=2, reason="unknown", event=EVENT, draft=DRAFT)
+    assert again is not None
+    book.recorded(again, 11)
+    book.preapprove(again)
+    assert book.spend(OTHER) is again and not book.draft_open(DRAFT)

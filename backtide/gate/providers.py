@@ -35,10 +35,16 @@ MIN_REAL_KEY = 20
 MAX_MODELS = 32
 MAX_MODEL_ID = 128
 
-# Dropped from every request to a provider host, whatever the provider (docs/21, section 6).
+# The headers that carry a credential: dropped from every request to a provider host, whatever
+# the provider (docs/21, section 6), and left out of decision 1's guard on the other headers of a
+# read (their bytes are capped apart: decide.MAX_READ_CREDENTIALS). Besides the usual ones, the
+# token headers of common APIs (T10-3), so a read with its own token is not held as a leak:
+# GitLab (``PRIVATE-TOKEN``, ``JOB-TOKEN``), OpenStack and many others (``X-Auth-Token``), the
+# ``X-Access-Token`` some APIs use, and an AWS session token (``X-Amz-Security-Token``).
 CREDENTIAL_HEADERS = frozenset(
-    {"authorization", "x-api-key", "api-key", "x-goog-api-key", "cookie", "proxy-authorization"}
-)
+    {"authorization", "x-api-key", "api-key", "x-goog-api-key", "cookie", "proxy-authorization",
+     "private-token", "job-token", "x-auth-token", "x-access-token", "x-amz-security-token"}
+)  # fmt: skip
 # A header name as RFC 9110 defines it ("token"): no spaces, no colons, nothing odd.
 _TOKEN_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", re.ASCII)
 _BEARER_RE = re.compile(r"(?i:bearer) +(?P<token>\S+)", re.ASCII)

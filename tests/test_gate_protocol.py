@@ -588,3 +588,87 @@ def test_a_config_carries_this_connections_fingerprint_key_and_never_shows_it() 
     del message["fp_key"]
     with pytest.raises(ProtocolError):
         encode(message, Sender.BACKTIDE)
+
+
+# --- a translator's reading in gate.reading (T10-3) ---------------------------------------------
+
+
+def a_summary(**changes: Any) -> dict[str, Any]:
+    from backtide.gate.translate.base import Attachment, Effect, Reading, Shape
+
+    reading = Reading(
+        translator="gmail", operation="messages.send", effect=Effect.SEND, shape=Shape.GOOGLE,
+        wait_s=25, account="0123456789abcdef", recipients=("ana@example.com",),
+        subject="Hola", first_lines="Qué tal", attachments=(Attachment("plan.pdf", None, 10),),
+    )  # fmt: skip
+    return reading.summary() | changes
+
+
+def test_a_reading_goes_there_and_back() -> None:
+    from backtide.gate.protocol import fit_reading
+
+    reading = fit_reading(a_summary())
+    assert reading["cut"] is False and reading["risk"] == 2
+    back = roundtrip(request(1, net_request(), facts(reading=reading)), Sender.PROXY)
+    assert back["gate"]["reading"] == reading
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"translator": "smtp"},
+        {"operation": "send mail"},
+        {"effect": "exfiltrate"},
+        {"shape": "html"},
+        {"notes": ["please_approve"]},
+        {"risk": 0},  # a send is risk 2: the proxy cannot choose it
+        {"secret_seen": True},  # ... and with a secret, 3
+        {"account": "AKIA0123456789AB"},
+        {"draft": "../r-1"},
+        {"recipients": ["x" * 400]},
+        {"recipients": ["a@b.c"] * 65},
+        {"subject": "s" * 201},
+        {"first_lines": "l" * 301},
+        {"attachments": [{"name": "a", "type": "text/html; x", "size": 1}]},
+        {"attachments": [{"name": "a", "type": None, "size": -1}]},
+        {"wait_s": 91},
+        {"extra": 1},
+    ],
+)
+def test_a_reading_is_checked_field_by_field(change: dict[str, Any]) -> None:
+    from backtide.gate.protocol import fit_reading
+
+    with pytest.raises(ProtocolError):
+        fit_reading(a_summary(**change))
+
+
+def test_a_reading_too_large_for_the_line_is_cut_and_says_so() -> None:
+    """64 long recipients, as many Reply-To and 32 attachments with long non-Latin names do not
+    fit in a line: the reading is sent cut (``cut: true``), which backtide never trusts."""
+    from backtide.gate.protocol import MAX_READING_BYTES, fit_reading
+
+    long = [f"{'a' * 60}{n}@{'b' * 60}.example.com" for n in range(64)]
+    names = [{"name": "ñ" * 100, "type": None, "size": 1} for _ in range(32)]
+    reading = fit_reading(a_summary(recipients=long, reply_to=long, attachments=names))
+    assert reading["cut"] is True
+    assert len(json.dumps(reading)) <= MAX_READING_BYTES
+    assert reading["effect"] == "send" and reading["risk"] == 2
+    line = encode(request(1, net_request(), facts(reading=reading)), Sender.PROXY)
+    assert len(line) <= MAX_LINE_BYTES
+
+
+def test_the_config_carries_the_read_endpoints() -> None:
+    message = config([], providers(), {}, read_endpoints=["Search.Fake.Test/v1/Query"])
+    assert roundtrip(message, Sender.BACKTIDE)["read_endpoints"] == ["search.fake.test/v1/query"]
+    for bad in (["https://x.test/a"], ["x.test/a?q=1"], ["x.test/../a"], ["x.test"] * 1):
+        with pytest.raises(ProtocolError):
+            encode(config([], providers(), {}, read_endpoints=bad), Sender.BACKTIDE)
+
+
+def test_the_gate_carries_the_credential_bytes_and_the_body_secret() -> None:
+    back = roundtrip(request(1, net_request(), facts(credential_bytes=5000, body_struck=True)),
+                     Sender.PROXY)  # fmt: skip
+    assert back["gate"]["credential_bytes"] == 5000 and back["gate"]["body_struck"] is True
+    for bad in ({"credential_bytes": -1}, {"body_struck": "yes"}, {"reading": "send"}):
+        with pytest.raises(ProtocolError):
+            encode(request(1, net_request(), facts() | bad), Sender.PROXY)

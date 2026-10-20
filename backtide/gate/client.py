@@ -87,6 +87,7 @@ class GateConfig:
     provider_tools: frozenset[str] = frozenset()
     # This connection's fingerprint key (T10-2): in memory only, never in a repr or a log.
     fp_key: bytes = field(default_factory=new_key, repr=False)
+    read_endpoints: frozenset[str] = frozenset()  # [gate] read_endpoints (T10-3)
 
     def __repr__(self) -> str:
         return f"GateConfig({self.providers!r})"
@@ -147,6 +148,7 @@ def gate_config(message: Mapping[str, Any]) -> GateConfig:
         limits=dict(message["limits"]),
         provider_tools=frozenset(message.get("provider_tools", [])),
         fp_key=fp_key,
+        read_endpoints=frozenset(message.get("read_endpoints", [])),
     )
 
 

@@ -9,7 +9,7 @@ fixes (the proxy cannot choose it). Errors never quote the offending value.
 | Message | Sent by | What |
 |---|---|---|
 | ``hello {version, pid}`` | proxy | When it starts |
-| ``config {allow_hosts, providers, limits, provider_tools, fp_key}`` | backtide | The answer to ``hello``; holds the keys |
+| ``config {allow_hosts, providers, limits, provider_tools, fp_key, read_endpoints}`` | backtide | The answer to ``hello``; holds the keys |
 | ``request {id, event, gate?}`` / ``ack {id, verdict, seq, reason?, retry_after?, hold_id?, wait_ms?}`` | proxy / backtide | Before a request goes out |
 | ``decision {hold_id, verdict, seq?, reason?}`` | backtide | The person's answer to a held request (T10) |
 | ``released {hold_id}`` / ``hold_left {hold_id, why}`` | proxy | "I let it go" / "I no longer hold it" |
@@ -29,6 +29,12 @@ with exactly one ``released`` (it let the request go) or ``hold_left`` (``client
 ``config`` carries ``fp_key``, the fingerprint key of this connection: like the real keys, it
 lives in memory only and is never logged.
 
+The translators (T10-3, docs/32 section 8): ``gate`` also carries ``reading``, what a translator
+read of the request (``Reading.summary()``, checked field by field by ``check_reading`` and fitted
+to MAX_READING_BYTES by ``fit_reading``; None when no translator knows its host), the bytes of its
+credential headers and whether its body carried a secret. The reading's ``canonical`` text never
+leaves the proxy: only the fingerprint made of it does.
+
 Design and rationale: docs/21-diseno-t06-proxy.md, section 5.
 """  # noqa: E501
 
@@ -42,6 +48,19 @@ from typing import Any
 from backtide.gate.policy import normalize_pattern
 from backtide.gate.provider_tools import check_allow_entry
 from backtide.gate.providers import Kind, Provider, Providers, Secret
+from backtide.gate.translate.base import (
+    LINES_CHARS,
+    MAX_ATTACHMENTS,
+    MAX_RECIPIENTS,
+    NAME_CHARS,
+    SUBJECT_CHARS,
+    TARGET_CHARS,
+    WAIT_DEFAULT,
+    Effect,
+    Note,
+    Shape,
+)
+from backtide.gate.translate.read_post import check_read_endpoint
 
 MAX_LINE_BYTES = 64 * 1024
 MAX_TEXT = 4096  # bytes of any text inside a message
@@ -55,6 +74,25 @@ MAX_PROVIDER_TOOLS = 64
 MAX_WAIT_MS = 90_000  # a held request keeps its connection 90 s at most (decision 1)
 MAX_WAIT_HINT_S = 90
 _MAX_URL_BYTES = 2**31
+MAX_READ_ENDPOINTS = 64  # [gate] read_endpoints
+# A reading (docs/32, section 8) in a request: at most this many bytes of JSON. One that is larger
+# (64 long recipients, 32 attachments with long non-Latin names...) is sent cut (``fit_reading``):
+# shorter texts and lists, and ``cut: true``, which backtide never trusts (nor, in T10-4, batches).
+MAX_READING_BYTES = 24 * 1024
+_TRANSLATORS = frozenset(
+    {"telegram", "gmail", "graph_mail", "slack", "discord", "github_graphql", "read_post"}
+)
+_OPERATION_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}", re.ASCII)
+_ACCOUNT_RE = re.compile(r"[0-9a-f]{16}", re.ASCII)
+_DRAFT_RE = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
+_MEDIA_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}")
+MAX_RECIPIENT_CHARS = 320  # an address (64 + @ + 253), a chat or a channel id
+_MAX_ATTACHMENT_SIZE = 2**53
+_READING_KEYS = frozenset(
+    {"translator", "operation", "effect", "account", "recipients", "sender", "reply_to",
+     "subject", "first_lines", "target", "attachments", "secret_seen", "path_credential",
+     "draft", "notes", "risk", "wait_s", "shape", "cut"}
+)  # fmt: skip
 HOLD_ID_RE = re.compile(r"h-[0-9a-f]{12}", re.ASCII)
 _FP_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
@@ -104,7 +142,7 @@ DECISION_REASONS = frozenset({"rejected", "expired", "paused", "hold_full"})
 HOLD_LEFT_WHY = frozenset({"client_left", "waited", "no_slot"})
 _GATE_KEYS = frozenset(
     {"fp", "url_struck", "url_bytes", "websocket", "exact_read", "wait_hint_s", "headers_struck",
-     "header_bytes"}
+     "header_bytes", "credential_bytes", "body_struck", "reading"}
 )  # fmt: skip
 
 _REQUEST_KEYS = frozenset(
@@ -265,11 +303,13 @@ def config(
     *,
     provider_tools: Iterable[str] = (),
     fp_key: bytes | None = None,
+    read_endpoints: Iterable[str] = (),
 ) -> dict[str, Any]:
     """The configuration for the proxy. It holds the real keys in clear: never log it (use
     describe()), and drop it as soon as it is encoded. ``provider_tools``: the provider-side
     tools that may go to a provider anyway (``[proxy] allow_provider_tools``, T06-6).
-    ``fp_key``: this connection's fingerprint key (T10-2; a fresh one if None)."""
+    ``fp_key``: this connection's fingerprint key (T10-2; a fresh one if None).
+    ``read_endpoints``: ``[gate] read_endpoints``, for the ``read_post`` translator (T10-3)."""
     key = fp_key if fp_key is not None else secrets.token_bytes(32)
     message = {
         "type": "config",
@@ -288,6 +328,7 @@ def config(
         "limits": dict(limits),
         "provider_tools": list(provider_tools),
         "fp_key": key.hex(),
+        "read_endpoints": list(read_endpoints),
     }
     return _check(message)
 
@@ -313,18 +354,48 @@ def gate(
     headers_struck: bool,
     header_bytes: int,
     wait_hint_s: int | None = None,
+    credential_bytes: int = 0,
+    body_struck: bool = False,
+    reading: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The facts of a ``net/request`` that backtide decides on (docs/32, section 6): its exact
-    fingerprint (64 hex), whether the redaction struck something of its URL, the URL's length in
-    bytes, whether it opens a WebSocket, whether its method is exactly GET, HEAD or OPTIONS (and
-    it has no method override header and no trailers), whether the redaction struck something
-    of a header that is not a credential and how many bytes those headers have (decision 1's
-    guard on the headers), and how long its client waits (a translator's hint, T10-3; None:
-    90 s)."""
+    """The facts of a ``net/request`` that backtide decides on (docs/32, section 6): its
+    fingerprint (64 hex; the semantic one when a translator read it, decision 2), whether the
+    redaction struck something of its URL (the API's own credential in the path apart), the
+    URL's length in bytes, whether it opens a WebSocket, whether its method is exactly GET, HEAD
+    or OPTIONS (and it has no method override header and no trailers), whether the redaction
+    struck something of a header that is not a credential and how many bytes those headers have
+    (decision 1's guard on the headers), the bytes of its credential headers (capped on a plain
+    read, T10-3), whether its body carries a secret (a write without a translator: risk 3), how
+    long its client waits (the translator's ``wait_s``; None: 90 s) and the translator's
+    ``reading`` (``Reading.summary()``, fitted: ``fit_reading``), or None."""
     facts = {"fp": fp, "url_struck": url_struck, "url_bytes": url_bytes, "websocket": websocket,
              "exact_read": exact_read, "wait_hint_s": wait_hint_s,
-             "headers_struck": headers_struck, "header_bytes": header_bytes}  # fmt: skip
+             "headers_struck": headers_struck, "header_bytes": header_bytes,
+             "credential_bytes": credential_bytes, "body_struck": body_struck,
+             "reading": None if reading is None else dict(reading)}  # fmt: skip
     return _check_gate(facts)
+
+
+def fit_reading(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """A reading's ``summary()`` as it goes in ``gate.reading``: checked (ProtocolError) and
+    within MAX_READING_BYTES. One that is larger loses texts and list items until it fits, and
+    says so (``cut: true``): what it decides on (the effect, the account, the secret, the
+    draft) is kept, and backtide never trusts a cut reading, since a recipient may be missing."""
+    reading = check_reading({**summary, "cut": False})
+    if _reading_bytes(reading) <= MAX_READING_BYTES:
+        return reading
+    shorter = dict(reading, cut=True, first_lines=None, reply_to=reading["reply_to"][:4],
+                   attachments=[dict(item, name=item["name"][:24])
+                                for item in reading["attachments"][:8]])  # fmt: skip
+    if _reading_bytes(shorter) <= MAX_READING_BYTES:
+        return check_reading(shorter)
+    smallest = dict(shorter, recipients=shorter["recipients"][:8], reply_to=[], sender=None,
+                    attachments=shorter["attachments"][:2])  # fmt: skip
+    return check_reading(smallest)
+
+
+def _reading_bytes(reading: Mapping[str, Any]) -> int:
+    return len(json.dumps(reading, ensure_ascii=True, separators=(",", ":")))
 
 
 def ack(
@@ -484,7 +555,11 @@ def _check_hello(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _check_config(message: dict[str, Any]) -> dict[str, Any]:
-    _fields(message, {"allow_hosts", "providers", "limits", "fp_key"}, {"provider_tools"})
+    _fields(
+        message,
+        {"allow_hosts", "providers", "limits", "fp_key"},
+        {"provider_tools", "read_endpoints"},
+    )
     fp_key = message["fp_key"]
     if not isinstance(fp_key, str) or not _FP_RE.fullmatch(fp_key):
         raise ProtocolError("config.fp_key: not 32 bytes in hex")
@@ -503,6 +578,13 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
         allowed_tools = list(dict.fromkeys(check_allow_entry(tool) for tool in tools))
     except ValueError:
         raise ProtocolError("config.provider_tools: a tool name is not valid") from None
+    endpoints = message.get("read_endpoints", [])
+    if not isinstance(endpoints, list) or len(endpoints) > MAX_READ_ENDPOINTS:
+        raise ProtocolError("config.read_endpoints: not a list of host/path")
+    try:
+        read_endpoints = list(dict.fromkeys(check_read_endpoint(entry) for entry in endpoints))
+    except ValueError:
+        raise ProtocolError("config.read_endpoints: an entry is not host/path") from None
     limits = message["limits"]
     if not isinstance(limits, dict) or not set(limits) <= set(DEFAULT_LIMITS):
         raise ProtocolError("config.limits: unknown limits")
@@ -526,6 +608,7 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
         "limits": checked,
         "provider_tools": allowed_tools,
         "fp_key": fp_key,
+        "read_endpoints": read_endpoints,
     }
 
 
@@ -552,10 +635,11 @@ def _check_gate(value: object) -> dict[str, Any]:
     fp = value["fp"]
     if not isinstance(fp, str) or not _FP_RE.fullmatch(fp):
         raise ProtocolError("request.gate.fp: not a fingerprint")
-    for name in ("url_struck", "websocket", "exact_read", "headers_struck"):
+    for name in ("url_struck", "websocket", "exact_read", "headers_struck", "body_struck"):
         if type(value[name]) is not bool:
             raise ProtocolError(f"request.gate.{name}: not a boolean")
     hint = value["wait_hint_s"]
+    reading = value["reading"]
     return {
         "fp": fp,
         "url_struck": value["url_struck"],
@@ -564,10 +648,111 @@ def _check_gate(value: object) -> dict[str, Any]:
         "exact_read": value["exact_read"],
         "headers_struck": value["headers_struck"],
         "header_bytes": _int(value["header_bytes"], "request.gate.header_bytes", 0, _MAX_URL_BYTES),
+        "credential_bytes": _int(
+            value["credential_bytes"], "request.gate.credential_bytes", 0, _MAX_URL_BYTES
+        ),
+        "body_struck": value["body_struck"],
         "wait_hint_s": None
         if hint is None
         else _int(hint, "request.gate.wait_hint_s", 1, MAX_WAIT_HINT_S),
+        "reading": None if reading is None else check_reading(reading),
     }
+
+
+def check_reading(value: object) -> dict[str, Any]:
+    """A translator's reading as the channel carries it (``gate.reading``), checked field by
+    field: fixed names and values from our tables (translator, operation, effect, shape,
+    notes), bounded texts and lists, and the risk that the effect and the secret fix (the proxy
+    cannot choose it). ProtocolError, never quoting a value."""
+    where = "request.gate.reading"
+    if not isinstance(value, dict) or set(value) != _READING_KEYS:
+        raise ProtocolError(f"{where}: wrong fields")
+    translator = value["translator"]
+    if not isinstance(translator, str) or translator not in _TRANSLATORS:
+        raise ProtocolError(f"{where}.translator: not a translator")
+    operation = value["operation"]
+    if not isinstance(operation, str) or not _OPERATION_RE.fullmatch(operation):
+        raise ProtocolError(f"{where}.operation: not an operation")
+    try:
+        effect = Effect(value["effect"])
+        shape = Shape(value["shape"])
+        notes = [str(Note(note)) for note in _list(value["notes"], f"{where}.notes", 32)]
+    except (ValueError, TypeError):
+        raise ProtocolError(f"{where}: an effect, shape or note that is not ours") from None
+    for name in ("secret_seen", "path_credential", "cut"):
+        if type(value[name]) is not bool:
+            raise ProtocolError(f"{where}.{name}: not a boolean")
+    account = value["account"]
+    if account is not None and (not isinstance(account, str) or not _ACCOUNT_RE.fullmatch(account)):
+        raise ProtocolError(f"{where}.account: not an account id")
+    draft = value["draft"]
+    if draft is not None and (not isinstance(draft, str) or not _DRAFT_RE.fullmatch(draft)):
+        raise ProtocolError(f"{where}.draft: not a plain id")
+    attachments = []
+    for item in _list(value["attachments"], f"{where}.attachments", MAX_ATTACHMENTS):
+        if not isinstance(item, dict) or set(item) != {"name", "type", "size"}:
+            raise ProtocolError(f"{where}.attachments: wrong fields")
+        kind = item["type"]
+        if kind is not None and (not isinstance(kind, str) or not _MEDIA_RE.fullmatch(kind)):
+            raise ProtocolError(f"{where}.attachments.type: not a media type")
+        attachments.append({
+            "name": _shown(item["name"], f"{where}.attachments.name", NAME_CHARS, empty=True),
+            "type": kind,
+            "size": _int(item["size"], f"{where}.attachments.size", 0, _MAX_ATTACHMENT_SIZE),
+        })  # fmt: skip
+    secret_seen = value["secret_seen"]
+    risk = 0 if effect is Effect.READ else 3 if (
+        effect in (Effect.DELETE, Effect.ADMIN) or secret_seen
+    ) else 2  # fmt: skip
+    if type(value["risk"]) is not int or value["risk"] != risk:
+        raise ProtocolError(f"{where}.risk: not the risk of its effect")
+    return {
+        "translator": translator,
+        "operation": operation,
+        "effect": str(effect),
+        "account": account,
+        "recipients": _recipients(value["recipients"], f"{where}.recipients"),
+        "sender": None
+        if value["sender"] is None
+        else _shown(value["sender"], f"{where}.sender", MAX_RECIPIENT_CHARS),
+        "reply_to": _recipients(value["reply_to"], f"{where}.reply_to"),
+        "subject": _opt_shown(value["subject"], f"{where}.subject", SUBJECT_CHARS),
+        "first_lines": _opt_shown(value["first_lines"], f"{where}.first_lines", LINES_CHARS),
+        "target": _opt_shown(value["target"], f"{where}.target", TARGET_CHARS),
+        "attachments": attachments,
+        "secret_seen": secret_seen,
+        "path_credential": value["path_credential"],
+        "draft": draft,
+        "notes": list(dict.fromkeys(notes)),
+        "risk": risk,
+        "wait_s": _int(value["wait_s"], f"{where}.wait_s", 1, WAIT_DEFAULT),
+        "shape": str(shape),
+        "cut": value["cut"],
+    }
+
+
+def _list(value: object, where: str, limit: int) -> list[Any]:
+    if not isinstance(value, list) or len(value) > limit:
+        raise ProtocolError(f"{where}: not a list, or too long")
+    return value
+
+
+def _recipients(value: object, where: str) -> list[str]:
+    items = _list(value, where, MAX_RECIPIENTS)
+    return [_shown(item, where, MAX_RECIPIENT_CHARS) for item in items]
+
+
+def _shown(value: object, where: str, limit: int, *, empty: bool = False) -> str:
+    """A text of a reading: a string of at most ``limit`` characters (a recipient or a name
+    may be empty only where ``empty``). Its content is the agent's: shown, never obeyed."""
+    if not isinstance(value, str) or len(value) > limit or (not value and not empty):
+        raise ProtocolError(f"{where}: not a text, or too long")
+    _text(value, where, allow_empty=empty)
+    return value
+
+
+def _opt_shown(value: object, where: str, limit: int) -> str | None:
+    return None if value is None else _shown(value, where, limit)
 
 
 def _hold_id(value: object, where: str) -> str:
