@@ -65,13 +65,15 @@ def test_the_agent_state_is_at_the_top(web: TestClient) -> None:
     assert html.index("st-watched") < html.index('id="feed"')
 
 
-def test_risk_is_a_dot_never_a_colour(web: TestClient) -> None:
+def test_risk_is_a_dot_with_its_word_never_a_colour_alone(web: TestClient) -> None:
     html = web.get("/ahora").text
     assert 'class="dot dot-2"' in html and 'aria-label="riesgo importante"' in html
     assert 'class="dot dot-1"' in html
     css = web.get("/static/web.css").text
-    allowed = {"#ffffff", "#0b0b0b", "#2e2e2e", "#6b6b6b", "#767676"}
-    assert set(re.findall(r"#[0-9a-fA-F]{6}\b", css)) <= allowed, "only the brand tokens"
+    # the shape says the risk whatever the colour: hollow, ringed, filled, filled and ringed
+    assert re.search(r"\.dot-0 \{ border:", css) and re.search(r"\.dot-1 \{ border:", css)
+    assert re.search(r"\.dot-2 \{ background:", css)
+    assert re.search(r"\.dot-3 \{ background:[^}]*outline:", css)
     assert not re.search(r"rgba?\(|hsla?\(|gradient|box-shadow", css)
 
 

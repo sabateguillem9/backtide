@@ -24,7 +24,16 @@ from tests.webkit import (
     new_client,
 )
 
-PAGES = ["/", "/ahora", "/historia", "/instantaneas", "/ahora/preguntar?q=ayuda"]
+PAGES = [
+    "/",
+    "/panel",
+    "/ahora",
+    "/historia",
+    "/instantaneas",
+    "/ahora/preguntar?q=ayuda",
+    "/agentes/principal/ahora",
+    "/agentes/principal/historia",
+]
 
 
 @pytest.fixture

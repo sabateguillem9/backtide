@@ -1,24 +1,28 @@
 """The web of backtide: a lookout post on 127.0.0.1.
 
-Four pages: "Ahora" (a live conversation of what the agent does, over Server-Sent Events),
-"Historia" (the filtered timeline), "Instantáneas" (the list, and the rewind button) and
-"Preguntar" (the question box on a page of its own). The security reasoning is in
-``backtide.web.security``; the rewind's in ``backtide.web.rewind``.
+The control room ("Panel", T12d): every agent's card, a live feed of all of them and the gate's
+requests waiting for your yes. Then, for each agent (``backtide.web.agents``), four pages:
+"Ahora" (a live conversation of what the agent does, over Server-Sent Events), "Historia" (the
+filtered timeline), "Instantáneas" (the list, and the rewind button) and "Preguntar" (the
+question box on a page of its own). The main agent's pages keep their old addresses; the others
+live under ``/agentes/<slug>/``. The security reasoning is in ``backtide.web.security``; the
+rewind's in ``backtide.web.rewind``.
 
-Everything here reads the black box through ``BoxReader`` (read-only, without its key). The one
+Everything here reads black boxes through ``BoxReader`` (read-only, without the key). The one
 thing it can change is the agent's workspace, and only by asking the service (T12b): a
 confirmation page (GET, the fixed notice and a one-time ticket) and then a POST from it. Every
 other route answers GET only.
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import math
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
@@ -36,6 +40,23 @@ from backtide.service.control import ControlError, ControlOutcomeUnknown, Contro
 from backtide.service.notice import rewind_notice
 from backtide.snapshots import Snapshot, SnapshotError
 from backtide.web import format as fmt
+from backtide.web.agents import (
+    MAIN_SLUG,
+    Agent,
+    AgentSource,
+    Card,
+    PendingRequest,
+    Roster,
+    Summary,
+    Watch,
+    card,
+    countdown,
+    empty_summary,
+    live_requests,
+    merged_feed,
+    started,
+    summarise,
+)
 from backtide.web.ask import MAX_QUESTION, answer
 from backtide.web.i18n import LANGUAGES, Translator, negotiate
 from backtide.web.narrate import Line, Name, Narrator, line_for, safe_sentence, sentence
@@ -73,6 +94,11 @@ RANGES = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(
 FORM_FIELDS = ("csrf", "id", "ticket")  # the rewind's form: these, once each, and nothing else
 MAX_FIELD_CHARS = 128
 FROM_THE_BOX = "list"  # the rewind state when the list did not come from the volume
+NOT_MAIN = "agent"  # the rewind state of an agent the service does not run (until T17)
+SUMMARY_TTL = 3.0  # an agent's card is read again at most this often...
+SUMMARY_MAX = 20.0  # ...and at least this often, even when its box has not moved
+PANEL_FEED = 40  # lines in the control room's feed when it loads
+REQUESTS_EVERY = 5.0  # how often the stream looks at the requests
 
 
 class Unauthorized(Exception):  # noqa: N818 - an HTTP outcome, not an error
@@ -97,6 +123,9 @@ def create_app(
     run_name: str | None = None,
     snapshots: Callable[[], Sequence[Snapshot]] | None = None,
     rewinder: Rewinder | None = None,
+    agent_name: str | None = None,
+    others: Sequence[AgentSource] = (),
+    pending: Callable[[], Sequence[PendingRequest]] | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
     keepalive: float = KEEPALIVE,
@@ -109,10 +138,16 @@ def create_app(
     ``backtide.web.security``; all random unless given, which the tests do). ``port`` is the one the
     server listens on (the ``Host`` check needs it). A stream lasts ``stream_seconds`` and the
     browser reconnects by itself, so no connection lives forever. ``rewinder`` asks the service
-    to rewind (``backtide.web.rewind``); without one the rewind buttons are disabled."""
+    to rewind (``backtide.web.rewind``); without one the rewind buttons are disabled.
+
+    ``reader`` and ``snapshots`` are the main agent's (the one the service runs), called
+    ``agent_name``; ``others`` are more agents, read the same way and never rewound from here
+    (the demo's today, T17's later). ``pending`` lists the gate's requests waiting for a yes
+    (the demo's today, T10's later): the page shows them, and cannot answer them."""
     access = Access(token or make_token(), session)
     prefix = prefix or make_prefix()
     base = f"/s/{prefix}"
+    roster = Roster(AgentSource(MAIN_SLUG, agent_name, reader, snapshots), others, base)
     run_name = run_name or make_run_name()
     zone = tz if tz is not None else fmt.local_tz()
     env = jinja2.Environment(
@@ -207,8 +242,10 @@ def create_app(
             return saved, False
         return negotiate(request.headers.get("accept-language")), False
 
-    def _helpers(t: Translator, now: datetime) -> dict[str, Any]:
-        """What every template (page or stream fragment) may call."""
+    def _helpers(t: Translator, now: datetime, agent: Agent | None = None) -> dict[str, Any]:
+        """What every template (page or stream fragment) may call. ``agent``: the agent the
+        page is about (None: the control room and the pages of no agent)."""
+        abase = agent.base if agent is not None else roster.main.base
 
         def tell(event_or_line: Event | Line) -> Markup:
             line = event_or_line if isinstance(event_or_line, Line) else line_for(event_or_line)
@@ -233,8 +270,11 @@ def create_app(
             return {
                 "from_": fmt.clock(first, zone),
                 "to": fmt.clock(last, zone),
-                "href": f"{base}/historia?{query}",
+                "href": f"{abase}/historia?{query}",
             }
+
+        def agent_name(who: Agent) -> str:
+            return who.name if who.name is not None else t("agent.default")
 
         return {
             "t": t,
@@ -250,6 +290,11 @@ def create_app(
             "say": lambda key, **params: sentence(t, key, params, zone),
             "name": Name,
             "base": base,
+            "abase": abase,
+            "agent": agent,
+            "roster": roster,
+            "agent_name": agent_name,
+            "countdown": countdown,
             "run_name": run_name,
         }
 
@@ -260,18 +305,20 @@ def create_app(
         status: int = 200,
         active: str,
         t: Translator | None,
+        agent: Agent | None = None,
         **values: Any,
     ) -> HTMLResponse:
         language, remember = _language(request)
         t = t or Translator(language)
         now = clock()
+        values.setdefault("wide", False)
 
         def switch(code: str) -> str:
             rest = [(k, v) for k, v in request.query_params.multi_items() if k not in {"lang", "t"}]
             return f"{_here(request)}?{urlencode([*rest, ('lang', code)])}"
 
         context = {
-            **_helpers(t, now),
+            **_helpers(t, now, agent),
             "active": active,
             "lang": t.language,
             "switch": switch,
@@ -285,16 +332,22 @@ def create_app(
             )
         return response
 
-    def _status_view(t: Translator) -> dict[str, Any]:
+    def _status_view(t: Translator, agent: Agent) -> dict[str, Any]:
         try:
-            status = read_status(reader)
+            status = read_status(agent.reader)
         except BoxUnavailable:
             status = AgentStatus("unknown", None)
         when = fmt.clock(status.since, zone) if status.since else None
         return {"state": status.state, "state_time": when}
 
+    def _snapshot_source(agent: Agent) -> Callable[[], Sequence[Snapshot]] | None:
+        return agent.source.snapshots
+
     def _tide_view(
-        now: datetime, window: timedelta = WINDOW, marked: Sequence[Snapshot] | None = None
+        agent: Agent,
+        now: datetime,
+        window: timedelta = WINDOW,
+        marked: Sequence[Snapshot] | None = None,
     ) -> Any:
         """The tide of ``window`` before ``now``. One read, by primary key only (the newest
         ``ACTIVITY_EVENTS`` + 1 events, whatever the box's size: ``ts`` has no index, so asking
@@ -302,16 +355,17 @@ def create_app(
         The marks are ``marked`` if given, else the volume's snapshots, else the ``take``
         events among the rows read."""
         try:
-            rows = reader.events(newest_first=True, limit=ACTIVITY_EVENTS + 1)
+            rows = agent.reader.events(newest_first=True, limit=ACTIVITY_EVENTS + 1)
         except BoxUnavailable:
             rows = []
         start = now - window
         inside = [e for e in rows[:ACTIVITY_EVENTS] if fmt.parse_ts(e.ts) >= start]
         more = len(rows) > ACTIVITY_EVENTS and fmt.parse_ts(rows[ACTIVITY_EVENTS].ts) >= start
         activity = [fmt.parse_ts(e.ts) for e in inside]
-        if marked is None and snapshots is not None:
+        listing = _snapshot_source(agent)
+        if marked is None and listing is not None:
             try:
-                marked = [s for s in snapshots() if s.taken_at >= start]
+                marked = [s for s in listing() if s.taken_at >= start]
             except (SnapshotError, OSError):
                 marked = None  # the page about snapshots says so; here the box's word will do
         takes = [e for e in inside if e.source is Source.SNAPSHOT and e.action == "take"]
@@ -319,37 +373,154 @@ def create_app(
             list(reversed(takes)), now, activity, more=more, window=window, snapshots=marked
         )
 
-    tide_cache: dict[str, Any] = {"at": float("-inf"), "tide": None}
+    tide_cache: dict[str, tuple[float, Any]] = {}
     tide_lock = threading.Lock()
 
-    def _day_tide(*, fresh: bool = False) -> Any:
-        """The day's tide of "Ahora", built at most once per ``TIDE_REFRESH`` for every page and
-        stream (``fresh`` after a new snapshot: its mark must not wait a minute)."""
+    def _day_tide(agent: Agent, *, fresh: bool = False) -> Any:
+        """The day's tide of an agent's "Ahora", built at most once per ``TIDE_REFRESH`` for
+        every page and stream (``fresh`` after a new snapshot: its mark must not wait a
+        minute)."""
         moment = time.monotonic()
         with tide_lock:
-            cached = tide_cache["tide"]
-            if not fresh and cached is not None and moment - tide_cache["at"] < TIDE_REFRESH:
-                return cached
-        tide = _tide_view(clock())
+            cached = tide_cache.get(agent.slug)
+            if not fresh and cached is not None and moment - cached[0] < TIDE_REFRESH:
+                return cached[1]
+        tide = _tide_view(agent, clock())
         with tide_lock:
-            tide_cache["at"], tide_cache["tide"] = moment, tide
+            tide_cache[agent.slug] = (moment, tide)
         return tide
+
+    # -- the control room's view of each agent --------------------------------------------
+
+    summaries: dict[str, tuple[float, Summary]] = {}
+    summary_lock = threading.Lock()  # guards ``summaries`` only, held for a moment
+    agent_locks = {a.slug: threading.Lock() for a in roster}  # one read of an agent at a time
+    watches = {a.slug: Watch(a.reader) for a in roster}
+    versions = itertools.count(1)
+
+    def _summary(agent: Agent) -> Summary:
+        """What an agent's card says: one read of its newest events, shared by every page and
+        stream, read again when its box has moved (at most every ``SUMMARY_TTL`` seconds) or
+        every ``SUMMARY_MAX`` seconds (its "working" turns into "idle" with time). One reader
+        at a time per agent: whoever comes while it is read waits and takes the result."""
+
+        def fresh_enough(cached: tuple[float, Summary] | None, moment: float) -> bool:
+            return cached is not None and moment - cached[0] < SUMMARY_TTL
+
+        with summary_lock:
+            cached = summaries.get(agent.slug)
+        if fresh_enough(cached, time.monotonic()):
+            return cached[1]  # type: ignore[index]
+        with agent_locks[agent.slug]:
+            moment = time.monotonic()
+            with summary_lock:
+                cached = summaries.get(agent.slug)
+            if fresh_enough(cached, moment):
+                return cached[1]  # type: ignore[index]
+            now = clock()
+            try:
+                if cached is not None and moment - cached[0] < SUMMARY_MAX:
+                    if agent.reader.head_seq() == cached[1].head:
+                        with summary_lock:
+                            summaries[agent.slug] = (moment, cached[1])
+                        return cached[1]
+                rows = agent.reader.events(newest_first=True, limit=ACTIVITY_EVENTS + 1)
+                marks = None
+                listing = _snapshot_source(agent)
+                if listing is not None:
+                    try:
+                        marks = list(listing())
+                    except (SnapshotError, OSError):
+                        marks = None
+                summary = summarise(
+                    rows[:ACTIVITY_EVENTS],
+                    now,
+                    zone,
+                    cut=len(rows) > ACTIVITY_EVENTS,
+                    watch=watches[agent.slug],
+                    snapshots=marks,
+                )
+            except BoxUnavailable:
+                summary = empty_summary(now, unreadable=True)
+            summary = replace(summary, version=next(versions))
+            with summary_lock:
+                summaries[agent.slug] = (moment, summary)
+            return summary
+
+    def _requests() -> tuple[list[PendingRequest] | None, datetime, bool]:
+        """The gate's requests still waiting (None: nothing lists them yet, that is T10), when,
+        and whether the list could NOT be read (then it is empty here, and the page says so
+        instead of "nothing waits")."""
+        now = clock()
+        if pending is None:
+            return None, now, False
+        try:
+            return live_requests(list(pending()), roster, now), now, False
+        except Exception:  # a page, not a 500: the log says why, the page says it is unknown
+            logger.exception("the pending requests cannot be listed")
+            return [], now, True
+
+    def _cards(requests: Sequence[PendingRequest] | None, now: datetime) -> list[Card]:
+        return [card(a, _summary(a), requests or (), now) for a in roster]
+
+    def _agent(slug: str) -> Agent:
+        found = roster.get(slug)
+        if found is None:
+            raise StarletteHTTPException(404)
+        return found
 
     # -- pages -----------------------------------------------------------------------------
 
     @app.get("/", dependencies=protected)
     def home() -> Response:
-        return RedirectResponse(f"{base}/ahora", status_code=303)
+        return RedirectResponse(f"{base}/panel", status_code=303)
+
+    @app.get("/panel", dependencies=protected)
+    def panel_page(request: Request) -> Response:
+        t = Translator(_language(request)[0])
+        requests, now, failed = _requests()
+        cards = _cards(requests, now)
+        return _page(
+            "panel.html",
+            request,
+            active="panel",
+            t=t,
+            wide=True,
+            cards=cards,
+            requests=requests,
+            stale=failed,
+            feed=_panel_feed(cards),
+            heads=".".join(str(c.summary.head) for c in cards),
+            now=now,
+        )
+
+    @app.get("/panel/stream", dependencies=protected)
+    def panel_stream(request: Request, after: str = "") -> Response:
+        resume = request.headers.get("last-event-id", "")
+        starts = _heads(resume) or _heads(after)
+        t = Translator(_language(request)[0])
+        return StreamingResponse(
+            _panel_stream(request, t, starts),
+            media_type="text/event-stream",
+            headers={"x-accel-buffering": "no"},
+        )
 
     @app.get("/ahora", dependencies=protected)
     def now_page(request: Request) -> Response:
+        return _now_page(request, roster.main)
+
+    @app.get("/agentes/{slug}/ahora", dependencies=protected)
+    def agent_now_page(request: Request, slug: str) -> Response:
+        return _now_page(request, _agent(slug))
+
+    def _now_page(request: Request, agent: Agent) -> Response:
         t = Translator(_language(request)[0])
         unreadable = False
         lines: list[Line] = []
         head = 0
         last_ts = None
         try:
-            recent = list(reversed(_recent(reader, PRIME_EVENTS)))
+            recent = list(reversed(_recent(agent.reader, PRIME_EVENTS)))
             lines = Narrator().feed(recent)[-SHOWN_LINES:]
             head = recent[-1].seq if recent else 0
             last_ts = recent[-1].ts if recent else None
@@ -360,19 +531,27 @@ def create_app(
             request,
             active="now",
             t=t,
+            agent=agent,
             lines=lines,
             head=head,
             last_ts=last_ts,
             unreadable=unreadable,
-            tide=_day_tide(),
-            **_status_view(t),
+            tide=_day_tide(agent),
+            **_status_view(t, agent),
         )
 
     @app.get("/ahora/preguntar", dependencies=protected)
     def ask(request: Request, q: str = "") -> Response:
+        return _ask(request, roster.main, q)
+
+    @app.get("/agentes/{slug}/ahora/preguntar", dependencies=protected)
+    def agent_ask(request: Request, slug: str, q: str = "") -> Response:
+        return _ask(request, _agent(slug), q)
+
+    def _ask(request: Request, agent: Agent, q: str) -> Response:
         t = Translator(_language(request)[0])
         try:
-            reply = answer(q, reader=reader, now=clock(), tz=zone, t=t)
+            reply = answer(q, reader=agent.reader, now=clock(), tz=zone, t=t)
             unreadable = False
         except BoxUnavailable:
             reply, unreadable = None, True
@@ -382,6 +561,7 @@ def create_app(
             request,
             active="ask",
             t=t,
+            agent=agent,
             question=q[:MAX_QUESTION],
             reply=reply,
             unreadable=unreadable,
@@ -389,10 +569,17 @@ def create_app(
 
     @app.get("/ahora/stream", dependencies=protected)
     def stream(request: Request, after: str = "0") -> Response:
+        return _open_stream(request, roster.main, after)
+
+    @app.get("/agentes/{slug}/ahora/stream", dependencies=protected)
+    def agent_stream(request: Request, slug: str, after: str = "0") -> Response:
+        return _open_stream(request, _agent(slug), after)
+
+    def _open_stream(request: Request, agent: Agent, after: str) -> Response:
         resume = request.headers.get("last-event-id", "")
         start = _seq(resume) or _seq(after)
         t = Translator(_language(request)[0])
-        events = _stream(request, t, start)
+        events = _stream(request, t, start, agent)
         return StreamingResponse(
             events,
             media_type="text/event-stream",
@@ -401,20 +588,27 @@ def create_app(
 
     @app.get("/historia", dependencies=protected)
     def history_page(request: Request) -> Response:
+        return _history_page(request, roster.main)
+
+    @app.get("/agentes/{slug}/historia", dependencies=protected)
+    def agent_history_page(request: Request, slug: str) -> Response:
+        return _history_page(request, _agent(slug))
+
+    def _history_page(request: Request, agent: Agent) -> Response:
         t = Translator(_language(request)[0])
         now = clock()
         filters = parse_filters(request.query_params, now, zone)
         unreadable = False
         events: list[Event] = []
         try:
-            events = reader.events(**filters.query(), newest_first=True, limit=PAGE_SIZE + 1)
+            events = agent.reader.events(**filters.query(), newest_first=True, limit=PAGE_SIZE + 1)
         except BoxUnavailable:
             unreadable = True
         more = len(events) > PAGE_SIZE
         events = events[:PAGE_SIZE]
         older = None
         if more:
-            older = f"{base}/historia?" + urlencode(
+            older = f"{agent.base}/historia?" + urlencode(
                 [*filters.pairs(), ("antes", str(events[-1].seq))]
             )
         partial = request.headers.get("hx-request") == "true"
@@ -428,6 +622,7 @@ def create_app(
             request,
             active="history",
             t=t,
+            agent=agent,
             filters=filters,
             events=events,
             older=older,
@@ -438,20 +633,28 @@ def create_app(
         if partial and "antes" not in request.query_params:
             # the address of the filtered page, without the form's empty fields
             query = urlencode(filters.pairs())
-            page.headers["HX-Push-Url"] = f"{base}/historia" + (f"?{query}" if query else "")
+            page.headers["HX-Push-Url"] = f"{agent.base}/historia" + (f"?{query}" if query else "")
         return page
 
     @app.get("/instantaneas", dependencies=protected)
     def snapshots_page(request: Request) -> Response:
+        return _snapshots_page(request, roster.main)
+
+    @app.get("/agentes/{slug}/instantaneas", dependencies=protected)
+    def agent_snapshots_page(request: Request, slug: str) -> Response:
+        return _snapshots_page(request, _agent(slug))
+
+    def _snapshots_page(request: Request, agent: Agent) -> Response:
         t = Translator(_language(request)[0])
         now = clock()
         show_all = request.query_params.get("todas") == "1"
         rows: list[Snapshot] = []
         error: str | None = None
         from_box = False
-        if snapshots is not None:
+        listing = _snapshot_source(agent)
+        if listing is not None:
             try:
-                rows = list(snapshots())
+                rows = list(listing())
             except (SnapshotError, OSError) as failure:
                 logger.warning("the snapshot list cannot be read: %s", failure)
                 error = str(failure)
@@ -461,7 +664,7 @@ def create_app(
         if error is not None:
             from_box = True
             try:
-                takes = reader.events(
+                takes = agent.reader.events(
                     source=Source.SNAPSHOT,
                     action="take",
                     newest_first=True,
@@ -474,12 +677,16 @@ def create_app(
             ]
         newest_first = list(reversed(rows))
         shown = newest_first if show_all else newest_first[:LISTED_SNAPSHOTS]
-        rewind_state = FROM_THE_BOX if from_box else str(_availability())
+        if not agent.main:
+            rewind_state = NOT_MAIN  # the service rewinds the agent it runs, and only that one
+        else:
+            rewind_state = FROM_THE_BOX if from_box else str(_availability())
         return _page(
             "snapshots.html",
             request,
             active="snapshots",
             t=t,
+            agent=agent,
             rows=shown,
             rewind_state=rewind_state,
             hidden=len(newest_first) - len(shown),
@@ -487,7 +694,7 @@ def create_app(
             from_box=from_box,
             box_unreadable=box_unreadable,
             now=now,
-            tide=_tide_view(now, _snapshot_window(shown, now), shown),
+            tide=_tide_view(agent, now, _snapshot_window(shown, now), shown),
         )
 
     # -- the rewind (T12b) -----------------------------------------------------------------
@@ -633,7 +840,9 @@ def create_app(
 
     # -- the stream ------------------------------------------------------------------------
 
-    async def _stream(request: Request, t: Translator, start: int) -> AsyncIterator[bytes]:
+    async def _stream(
+        request: Request, t: Translator, start: int, agent: Agent
+    ) -> AsyncIterator[bytes]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + stream_seconds
         narrator = Narrator()
@@ -642,11 +851,12 @@ def create_app(
         failing = False
         last_sent = last_tide = loop.time()
         fresh_tide = False
+        reader_ = agent.reader
         try:
             if start == 0:  # the page saw nothing: begin near the end, not at the beginning
-                seq = max(0, await asyncio.to_thread(reader.head_seq) - SHOWN_LINES)
+                seq = max(0, await asyncio.to_thread(reader_.head_seq) - SHOWN_LINES)
             else:  # rebuild the open burst the page ended on, so it keeps growing in place
-                primed = await asyncio.to_thread(_recent, reader, PRIME_EVENTS, start)
+                primed = await asyncio.to_thread(_recent, reader_, PRIME_EVENTS, start)
                 seen = {line.id for line in narrator.feed(reversed(primed))}
         except BoxUnavailable:
             failing = True
@@ -655,7 +865,7 @@ def create_app(
             if await request.is_disconnected():
                 return
             try:
-                batch = await asyncio.to_thread(reader.events, since_seq=seq, limit=STREAM_BATCH)
+                batch = await asyncio.to_thread(reader_.events, since_seq=seq, limit=STREAM_BATCH)
                 if failing:
                     logger.info("the black box can be read again")
                 failing = False
@@ -670,20 +880,22 @@ def create_app(
                 changed = narrator.feed(batch)
                 html = "\n".join(
                     env.get_template("line.html").render(
-                        **_helpers(t, clock()), line=line, oob=line.id in seen
+                        **_helpers(t, clock(), agent), line=line, oob=line.id in seen
                     )
                     for line in changed
                 )
                 seen.update(line.id for line in changed)
                 yield _sse("lines", html, seq)
                 if any(e.source is Source.SYSTEM and e.action in STATE_ACTIONS for e in batch):
-                    yield _sse("state", await asyncio.to_thread(_render_state, t), None)
+                    yield _sse("state", await asyncio.to_thread(_render_state, t, agent), None)
                 if any(e.source is Source.SNAPSHOT and e.action == "take" for e in batch):
                     last_tide, fresh_tide = float("-inf"), True
                 last_sent = now_t
             if now_t - last_tide >= TIDE_REFRESH:
                 last_tide = now_t
-                yield _sse("tide", await asyncio.to_thread(_render_tide, t, fresh_tide), None)
+                yield _sse(
+                    "tide", await asyncio.to_thread(_render_tide, t, agent, fresh_tide), None
+                )
                 fresh_tide = False
                 last_sent = now_t
             if now_t - last_sent >= keepalive:
@@ -691,11 +903,116 @@ def create_app(
                 yield b": keepalive\n\n"
             await asyncio.sleep(poll_interval)
 
-    def _render_state(t: Translator) -> str:
-        return env.get_template("state.html").render(t=t, **_status_view(t))
+    def _render_state(t: Translator, agent: Agent) -> str:
+        return env.get_template("state.html").render(t=t, **_status_view(t, agent))
 
-    def _render_tide(t: Translator, fresh: bool = False) -> str:
-        return env.get_template("tide.html").render(t=t, tide=_day_tide(fresh=fresh))
+    def _render_tide(t: Translator, agent: Agent, fresh: bool = False) -> str:
+        return env.get_template("tide.html").render(t=t, tide=_day_tide(agent, fresh=fresh))
+
+    # -- the control room's stream ---------------------------------------------------------
+
+    def _panel_feed(cards: Sequence[Card]) -> list[tuple[Agent, Line]]:
+        """The newest lines of every agent, newest first: what the feed shows on load."""
+        return merged_feed(cards, PANEL_FEED)
+
+    def _render_card(t: Translator, one: Card) -> str:
+        return env.get_template("card.html").render(**_helpers(t, clock()), c=one)
+
+    def _render_requests(
+        t: Translator, requests: Sequence[PendingRequest] | None, now: datetime, stale: bool
+    ) -> str:
+        return env.get_template("requests.html").render(
+            **_helpers(t, now), requests=requests, now=now, stale=stale
+        )
+
+    def _render_feed(t: Translator, changed: Sequence[tuple[Agent, Line, bool]]) -> str:
+        """The lines of one poll, every agent's, newest first (they go on top, in the order
+        they started); a line already shown (``True``: a growing burst) replaces itself."""
+        helpers = _helpers(t, clock())
+        ordered = sorted(changed, key=lambda item: _started(item[0], item[1]), reverse=True)
+        return "\n".join(
+            env.get_template("panel_line.html").render(**helpers, who=who, line=line, oob=oob)
+            for who, line, oob in ordered
+        )
+
+    async def _panel_stream(
+        request: Request, t: Translator, starts: list[int]
+    ) -> AsyncIterator[bytes]:
+        """Every agent's new lines (one feed), its card when it changes, and the requests."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + stream_seconds
+        agents = list(roster)
+        if len(starts) != len(agents):
+            starts = [0] * len(agents)
+        narrators = [Narrator() for _ in agents]
+        seen: list[set[int]] = [set() for _ in agents]
+        seqs = list(starts)
+        sent_cards: dict[str, Any] = {}
+        sent_requests: tuple[Any, ...] | None = None
+        last_sent = loop.time()
+        last_requests = float("-inf")
+        for i, agent in enumerate(agents):
+            try:
+                if seqs[i] == 0:
+                    seqs[i] = await asyncio.to_thread(agent.reader.head_seq)
+                else:
+                    primed = await asyncio.to_thread(_recent, agent.reader, PRIME_EVENTS, seqs[i])
+                    seen[i] = {line.id for line in narrators[i].feed(reversed(primed))}
+            except BoxUnavailable:
+                pass
+        # Cards the page drew: send again only what changes from here.
+        requests, now, failed = await asyncio.to_thread(_requests)
+        for one in await asyncio.to_thread(_cards, requests, now):
+            sent_cards[one.agent.slug] = one.key
+        sent_requests = (_requests_key(requests), failed)
+        last_good = None if failed else requests
+        yield b"retry: 2000\n\n"
+        while loop.time() < deadline:
+            if await request.is_disconnected():
+                return
+            now_t = loop.time()
+            changed: list[tuple[Agent, Line, bool]] = []
+            for i, agent in enumerate(agents):
+                try:
+                    batch = await asyncio.to_thread(
+                        agent.reader.events, since_seq=seqs[i], limit=STREAM_BATCH
+                    )
+                except BoxUnavailable:
+                    batch = []
+                if not batch:
+                    continue
+                seqs[i] = batch[-1].seq
+                for line in narrators[i].feed(batch):
+                    changed.append((agent, line, line.id in seen[i]))
+                    seen[i].add(line.id)
+            moved = bool(changed)
+            if moved:
+                yield _sse("feed", _render_feed(t, changed), None)
+            if moved or now_t - last_requests >= REQUESTS_EVERY:
+                last_requests = now_t
+                requests, now, failed = await asyncio.to_thread(_requests)
+                if failed:
+                    # Not "nothing waits": the last list read stays, said to be maybe old.
+                    requests = live_requests(last_good, roster, now) if last_good else []
+                else:
+                    last_good = requests
+                key = (_requests_key(requests), failed)
+                if key != sent_requests:
+                    sent_requests = key
+                    yield _sse("requests", _render_requests(t, requests, now, failed), None)
+                for one in await asyncio.to_thread(_cards, requests, now):
+                    if sent_cards.get(one.agent.slug) != one.key:
+                        sent_cards[one.agent.slug] = one.key
+                        yield _sse(f"card-{one.agent.slug}", _render_card(t, one), None)
+                last_sent = now_t
+            if moved:
+                # where each agent's feed is, so a reconnect goes on from here
+                yield _sse("at", "", _heads_id(seqs))
+                last_sent = now_t
+            if now_t - last_sent >= keepalive:
+                last_sent = now_t
+                yield b": keepalive\n\n"
+            await asyncio.sleep(poll_interval)
 
     return Guard(app, port=port, prefix=prefix)
 
@@ -744,6 +1061,33 @@ def _snapshot_window(shown: Sequence[Snapshot], now: datetime) -> timedelta:
     oldest = now - min(s.taken_at for s in shown)
     hours = math.ceil(max(oldest, timedelta(0)) / timedelta(hours=1) + 0.25)
     return timedelta(hours=min(max(hours, 1), 30 * 24))
+
+
+def _started(agent: Agent, line: Line) -> tuple[str, str, int]:
+    """The order of the control room's feed: when a line began, then whose it is."""
+    return (started(line), agent.slug, line.id)
+
+
+def _requests_key(requests: Sequence[PendingRequest] | None) -> tuple[Any, ...] | None:
+    return None if requests is None else tuple((r.id, r.expires_at) for r in requests)
+
+
+MAX_AGENTS_IN_ID = 64
+
+
+def _heads(text: str) -> list[int]:
+    """The control room's position in every agent's box (``12.0.345``, in roster order); an
+    empty list for anything else (the stream then starts at each box's end)."""
+    if not text or len(text) > 20 * MAX_AGENTS_IN_ID or not text.isascii():
+        return []
+    parts = text.split(".")
+    if len(parts) > MAX_AGENTS_IN_ID or not all(p.isdigit() and len(p) < 19 for p in parts):
+        return []
+    return [int(p) for p in parts]
+
+
+def _heads_id(seqs: Sequence[int]) -> str:
+    return ".".join(str(s) for s in seqs)
 
 
 def _details_json(event: Event) -> str:

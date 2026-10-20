@@ -36,7 +36,11 @@ def test_a_real_browser_session_end_to_end(tmp_path: Path) -> None:
         # 1. the link with the token: a redirect without it, and a cookie
         first = browser.get(f"/?t={TOKEN}", follow_redirects=False)
         assert first.status_code == 200 and f'content="0;url={PREFIX_PATH}/"' in first.text
-        page = browser.get("/", follow_redirects=True)  # the refresh; "/" sends on to "Ahora"
+        room = browser.get("/", follow_redirects=True)  # the refresh; "/" sends on to the room
+        assert room.status_code == 200 and "Sala de control" in room.text
+        assert "Ha creado" in room.text and "notas.md" in room.text
+        assert f'sse-connect="{PREFIX_PATH}/panel/stream?after=3"' in room.text
+        page = browser.get("/ahora")
         assert page.status_code == 200 and "Ha creado" in page.text and "notas.md" in page.text
         assert f'sse-connect="{PREFIX_PATH}/ahora/stream?after=3"' in page.text
 

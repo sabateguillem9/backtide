@@ -21,6 +21,7 @@ backtide is the flight recorder and the rewind button for AI agents. The brand i
 - Use `ink-muted` for the line under a headline, labels, notes and footer links; `ink-soft` for long running text; `placeholder` only inside fields.
 - Put glyphs on an ink fill in `on-ink`, never a literal white.
 - There is no accent color. Do not add one. Emphasis comes from size, weight and space, never hue.
+- One exception, and only inside the product: the app (`backtide web`) has its own palette, with meaning. See "The app: colour with meaning" below. The landing and the documents never use it.
 
 ### Type
 - Use Jost (`--font-sans`) for everything: wordmark, headlines and text. Weight 500 for the wordmark and headlines, 400 for text.
@@ -48,6 +49,20 @@ backtide is the flight recorder and the rewind button for AI agents. The brand i
 - Keyboard focus is a solid `stroke-focus` (2px) outline in `ink`, offset 3px (4px around the dot button). Never remove it.
 - The active language shows in `ink`, the others in `ink-muted`.
 - Errors are a short sentence in `ink` replacing the note; nothing turns red.
+
+## The app: colour with meaning
+
+The product web (`backtide web`) watches several agents at once and has to be read at a glance, so it extends the brand with colour that carries meaning. The tokens are the `app` section of `tokens.json`; the public pages never use them.
+
+- **What does not change.** Paper and ink are still the base, Jost is still the only type, the dot is still the only rounded shape, there are no shadows and no gradients except the tide's fade-in, and `backtide` is lowercase.
+- **Identity: one colour per agent** (`agent-1` to `agent-6`, by the agent's place in the list, so it keeps its colour for the whole run). It is the agent's tag (a short `stroke-identity` line before its name), the line on top of its card, its tide and its name in the live feed. Never without the name next to it.
+- **Risk 0 to 3** (`risk-0` to `risk-3`): the dot keeps its shapes (hollow, hollow with a thicker ring, filled, filled and ringed) and gets the colour on top. Where a risk is the point (a held request), its word is written too.
+- **State** (`state-working`, `state-idle`, `state-frozen`, `state-waiting`, `state-rewinding`, `state-sensor-down`): a dot and the word, always. A filled dot means the agent is running; a pulse means something is alive (slow while it works, quick while it waits for you or has lost its sensor); rewinding breathes. Stopped and "no data" read as idle, with their own word.
+- **Cards.** The control room groups each agent in a card: a pale wash of its colour (`agent-N-wash`) and its identity line on top. No border box, no radius, no shadow. The section that waits for your yes uses `waiting-wash` and the `state-waiting` line while it holds requests, and a plain hairline when it is empty.
+- **Contrast.** Every app colour is at least 4.5:1 on paper and on the washes, in both themes, so it can also colour text (an agent's name in the feed, a state's word, a risk's word). A test checks it.
+- **Colour is never the only signal.** Colour-blind people get the same information from the words and the shapes: names next to identity colours, dot shapes and words for risk, written states, a written countdown next to its shrinking line.
+- **Dark theme.** The app follows `prefers-color-scheme` and has a switch in the header (remembered only in local storage). The dark values of every token are in `tokens.json`; paper and ink swap as in the base dark theme.
+- **Motion** keeps the brand's rules: only transform and opacity, nothing with `prefers-reduced-motion`, nothing while the tab is hidden.
 
 ## Iconography
 

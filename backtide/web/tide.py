@@ -126,13 +126,15 @@ def build_tide(
     more: bool = False,
     window: timedelta = WINDOW,
     snapshots: Sequence[Snapshot] | None = None,
+    width: float = WIDTH,
 ) -> Tide:
     """``takes``: the ``snapshot/take`` events of the window, any order. ``activity``: when the
     events of the window happened (any order); ``more`` says the list was cut. ``window``: how
     far back the line goes (a day on "Ahora"; the snapshots page fits it to its list).
     ``snapshots``: the snapshots to mark instead of ``takes`` (the snapshots page marks the very
-    list it shows, read from the volume)."""
-    left, right = PAD, WIDTH - PAD
+    list it shows, read from the volume). ``width``: of the drawing, in the units of its height;
+    a narrower one (a card's) keeps the same swell, so it reads taller when it is drawn small."""
+    left, right = PAD, width - PAD
     span = right - left
     moments = list(activity)
     levels = activity_levels(moments, now, window)
@@ -168,7 +170,7 @@ def build_tide(
             y = round(wave_y(x, levels, left, right), 1)
             marks.append(Mark(x, ts, y, moment.astimezone(UTC).isoformat()))
     return Tide(
-        WIDTH,
+        width,
         left,
         right,
         tuple(marks),

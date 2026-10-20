@@ -3,39 +3,58 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex">
 <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0,"refreshOnHistoryMiss":true}'>
 {% block head %}{% endblock %}
 <title>{% block title %}{{ t('app.name') }}{% endblock %} · {{ t('app.name') }}</title>
 <link rel="icon" href="{{ base }}/static/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="{{ base }}/static/web.css">
+<script src="{{ base }}/static/theme.js"></script>
 <script src="{{ base }}/static/vendor/htmx.min.js" defer></script>
 <script src="{{ base }}/static/vendor/htmx-sse.js" defer></script>
 <script src="{{ base }}/static/web.js" defer></script>
 </head>
 <body data-age-now="{{ t.raw('age.now') }}" data-age-sec="{{ t.raw('age.sec') }}" data-age-min="{{ t.raw('age.min') }}" data-age-hour="{{ t.raw('age.hour') }}" data-age-day="{{ t.raw('age.day') }}">
-<div class="page">
+{% set many = roster | length > 1 %}
+{% set here = agent if agent else (roster.main if (not many or active not in ('', 'panel')) else none) %}
+<div class="page{% if wide %} wide{% endif %}">
 <header class="top">
   <div class="brand">
-    <a class="home" href="{{ base }}/ahora">{{ t('app.name') }}</a>
+    <a class="home" href="{{ base }}/panel">{{ t('app.name') }}</a>
     <span class="run" title="{{ t('run.label') }}">{{ run_name }}</span>
   </div>
   {% if active %}
   <nav aria-label="{{ t('nav.label') }}">
+    <a href="{{ base }}/panel"{% if active == 'panel' %} aria-current="page"{% endif %}>{{ t('nav.panel') }}{% if active == 'panel' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
+    {% if here %}
     {% for key, path, label in (('now', '/ahora', 'nav.now'), ('history', '/historia', 'nav.history'), ('snapshots', '/instantaneas', 'nav.snapshots'), ('ask', '/ahora/preguntar', 'nav.ask')) %}
-    <a href="{{ base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}{% if active == key %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
+    <a href="{{ here.base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}{% if active == key %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     {% endfor %}
+    {% endif %}
   </nav>
   {% endif %}
 </header>
+{% if agent and many %}
+<div class="agentbar a-{{ agent.colour }}">
+  <p class="agentbar-who"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(agent), 48) }}</span></p>
+  <nav class="agentbar-others" aria-label="{{ t('agents.switch') }}">
+    {% for other in roster %}{% if other.slug != agent.slug %}
+    <a class="a-{{ other.colour }}" href="{{ other.base }}/{{ 'ahora/preguntar' if active == 'ask' else ('historia' if active == 'history' else ('instantaneas' if active == 'snapshots' else 'ahora')) }}"><span class="tag" aria-hidden="true"></span>{{ vis(agent_name(other), 48) }}</a>
+    {% endif %}{% endfor %}
+  </nav>
+</div>
+{% endif %}
 {% block main %}{% endblock %}
 <footer class="foot">
   <span>{{ t('app.local') }}</span>
+  <span class="prefs">
+  <button class="theme-switch" type="button" hidden data-dark="{{ t('theme.dark') }}" data-light="{{ t('theme.light') }}">{{ t('theme.dark') }}</button>
   <span class="langs" role="group" aria-label="{{ t('lang.label') }}">
     {% for code in languages %}
     <a href="{{ switch(code) }}" lang="{{ code }}"{% if code == lang %} aria-current="true"{% endif %}>{{ code | upper }}</a>
     {% endfor %}
+  </span>
   </span>
 </footer>
 </div>

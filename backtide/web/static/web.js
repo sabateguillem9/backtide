@@ -566,6 +566,141 @@
   document.body.addEventListener("htmx:responseError", failed);
   document.body.addEventListener("htmx:sendError", failed);
 
+  // -- light and dark ---------------------------------------------------------------------------
+  // The page follows the system (web.css) until the person flips the switch; the choice is kept
+  // in local storage (theme.js applies it before the page paints). Flipping back to what the
+  // system says forgets the choice, so the page follows the system again.
+
+  var themeSwitch = document.querySelector(".theme-switch");
+  var darkQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  function systemTheme() {
+    return darkQuery && darkQuery.matches ? "dark" : "light";
+  }
+  function shownTheme() {
+    var chosen = root.getAttribute("data-theme");
+    return chosen === "dark" || chosen === "light" ? chosen : systemTheme();
+  }
+  function paintSwitch() {
+    if (!themeSwitch) return;
+    var dark = shownTheme() === "dark";
+    themeSwitch.textContent = themeSwitch.getAttribute(dark ? "data-light" : "data-dark") || "";
+  }
+  function remember(theme) {
+    try {
+      if (theme) window.localStorage.setItem("backtide-theme", theme);
+      else window.localStorage.removeItem("backtide-theme");
+    } catch (ignored) {
+      // no storage: the switch still works for this page
+    }
+  }
+  if (themeSwitch) {
+    themeSwitch.hidden = false;
+    themeSwitch.addEventListener("click", function () {
+      var next = shownTheme() === "dark" ? "light" : "dark";
+      if (next === systemTheme()) {
+        root.removeAttribute("data-theme");
+        remember(null);
+      } else {
+        root.setAttribute("data-theme", next);
+        remember(next);
+      }
+      paintSwitch();
+    });
+    if (darkQuery && darkQuery.addEventListener) darkQuery.addEventListener("change", paintSwitch);
+    paintSwitch();
+  }
+
+  // -- the gate's requests: the time left, to the second -----------------------------------------
+  // Each request carries when it was held and when it is rejected on its own (data-*, written by
+  // the server). Here only the count and the line that shortens move; the words are the
+  // server's. A hidden tab stops the clock; it catches up when the tab comes back.
+
+  function clockText(ms) {
+    var s = Math.ceil(ms / 1000);
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var r = s % 60;
+    var mm = h ? (m < 10 ? "0" : "") + m : String(m);
+    return (h ? h + ":" : "") + mm + ":" + (r < 10 ? "0" : "") + r;
+  }
+  // Only a request that was not there before rises in: the list is sent whole when it changes.
+  var knownRequests = null;
+  function markRequests() {
+    var seen = {};
+    document.querySelectorAll(".req[id]").forEach(function (req) {
+      if (knownRequests !== null && !knownRequests[req.id]) req.classList.add("is-new");
+      seen[req.id] = true;
+    });
+    knownRequests = seen;
+  }
+
+  var clockTimer = 0;
+  function tickClocks() {
+    window.clearTimeout(clockTimer);
+    if (document.hidden) return;
+    var clocks = document.querySelectorAll(".req-clock[data-deadline]");
+    var now = Date.now();
+    clocks.forEach(function (el) {
+      var end = when(el.getAttribute("data-deadline"));
+      var start = when(el.getAttribute("data-held"));
+      if (end === null || start === null) return;
+      var left = Math.max(0, end - now);
+      var count = el.querySelector(".req-count");
+      var text = left > 0 ? clockText(left) : el.getAttribute("data-done") || "";
+      if (count && count.textContent !== text) count.textContent = text;
+      var fill = el.querySelector(".req-fill");
+      if (fill) fill.style.transform = "scaleX(" + clamp(left / Math.max(end - start, 1), 0, 1).toFixed(4) + ")";
+      el.classList.toggle("is-late", left > 0 && left < 60000);
+      el.classList.toggle("is-over", left === 0);
+    });
+    clockTimer = window.setTimeout(tickClocks, clocks.length ? 1000 - (now % 1000) + 5 : 5000);
+  }
+  wakers.push(tickClocks);
+
+  // -- the control room: the feed of every agent, newest on top ----------------------------------
+
+  var pfeed = document.getElementById("pfeed");
+  var PFEED_MAX = 60;
+  function onPanelFeed(records) {
+    var gone = {};
+    records.forEach(function (record) {
+      record.removedNodes.forEach(function (node) {
+        if (node.nodeType === 1 && node.id) gone[node.id] = true;
+      });
+    });
+    records.forEach(function (record) {
+      record.addedNodes.forEach(function (node) {
+        if (node.nodeType !== 1 || !node.classList.contains("pline")) return;
+        if (gone[node.id]) window.setTimeout(function () { node.classList.add("is-grown"); }, 60);
+        else node.classList.add("is-new");
+      });
+    });
+    while (pfeed.children.length > PFEED_MAX) pfeed.removeChild(pfeed.lastElementChild);
+  }
+
+  // A card the stream redrew: its agent moved, so the dot of its little tide hops once.
+  function stirCard(article) {
+    if (!moving() || document.hidden) return;
+    var head = article.querySelector(".mini-head");
+    if (!head) return;
+    head.animate(
+      [
+        { transform: "translateY(0)", easing: EASE_ARRIVE },
+        { transform: "translateY(-9px)", offset: 0.42, easing: EASE_FALL },
+        { transform: "translateY(0)" },
+      ],
+      { duration: 640 }
+    );
+  }
+
+  function connection(on) {
+    document.querySelectorAll(".live .conn, .last-move .conn").forEach(function (conn) {
+      var holder = conn.closest(".live") ? conn : conn.parentNode;
+      conn.textContent = on ? "" : holder.getAttribute("data-off") || "";
+    });
+    root.classList.toggle("is-offline", !on);
+  }
+
   // -- wiring -----------------------------------------------------------------------------------
 
   document.body.addEventListener("htmx:sseMessage", function (event) {
@@ -576,6 +711,13 @@
       reapply();
     } else if (target && target.id === "state") {
       heart();
+    } else if (target && target.classList && target.classList.contains("card")) {
+      tickAges();
+      stirCard(target);
+    } else if (target && target.classList && target.classList.contains("waiting-in")) {
+      markRequests();
+      tickAges();
+      tickClocks();
     }
   });
   // A line about to be replaced in place must not lend its "just arrived" class to the new one.
@@ -584,13 +726,10 @@
     if (old && old.classList) old.classList.remove("is-new", "is-grown");
   });
   document.body.addEventListener("htmx:sseOpen", function () {
-    var conn = document.querySelector(".last-move .conn");
-    if (conn) conn.textContent = "";
+    connection(true);
   });
   document.body.addEventListener("htmx:sseError", function () {
-    var holder = document.querySelector(".last-move");
-    var conn = holder && holder.querySelector(".conn");
-    if (conn) conn.textContent = holder.getAttribute("data-off") || "";
+    connection(false);
     frame && frame.classList.remove("is-beating");
   });
   document.body.addEventListener("htmx:afterRequest", function (event) {
@@ -623,7 +762,10 @@
     stagger(results.querySelectorAll(".event"), 24);
     new MutationObserver(onRowsChange).observe(results, { childList: true, subtree: true });
   }
+  if (pfeed) new MutationObserver(onPanelFeed).observe(pfeed, { childList: true });
+  markRequests();
   snapshotRows();
   heart();
   tickAges();
+  tickClocks();
 })();

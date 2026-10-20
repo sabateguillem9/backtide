@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}{{ t('panel.title') }}{% endblock %}
+{% block main %}
+<main class="panel" hx-ext="sse" sse-connect="{{ base }}/panel/stream?after={{ heads }}">
+  <div class="panel-head">
+    <h1>{{ t('panel.title') }}</h1>
+    <p class="lede">{{ t('panel.lede') }}</p>
+  </div>
+  {# The gate's requests (T10). Approve and Reject are drawn and disabled: there is no form, no
+     POST and no route behind them. Deciding is T10's, with its own reviewed path. #}
+  <section class="waiting" id="waiting" aria-labelledby="waiting-title">
+    <div class="waiting-in" sse-swap="requests">{% include "requests.html" %}</div>
+  </section>
+  <div class="room">
+    <section class="agents" aria-labelledby="agents-title">
+      <h2 class="section-title" id="agents-title">{{ t('panel.agents') }} <span class="section-count num">{{ cards | length }}</span></h2>
+      <div class="cards">
+        {% for c in cards %}
+        <article class="card a-{{ c.agent.colour }}" id="card-{{ c.agent.slug }}" sse-swap="card-{{ c.agent.slug }}" aria-labelledby="name-{{ c.agent.slug }}">{% include "card.html" %}</article>
+        {% endfor %}
+      </div>
+    </section>
+    <section class="live" aria-labelledby="live-title">
+      <h2 class="section-title" id="live-title"><span class="live-dot" aria-hidden="true"></span>{{ t('panel.live') }}</h2>
+      <p class="note conn" aria-live="polite" data-off="{{ t('live.off') }}"></p>
+      <ol class="pfeed" id="pfeed" role="log" aria-live="polite" sse-swap="feed" hx-swap="afterbegin">
+        {% for who, line in feed %}
+        {% set oob = false %}
+        {% include "panel_line.html" %}
+        {% endfor %}
+      </ol>
+      <p class="note pfeed-empty">{{ t('panel.feed.empty') }}</p>
+    </section>
+  </div>
+</main>
+{% endblock %}

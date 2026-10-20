@@ -63,7 +63,17 @@ def test_no_template_has_inline_script_style_or_handlers(template: str) -> None:
     assert "hx-on" not in source and "javascript:" not in source.lower(), template
 
 
-@pytest.mark.parametrize("path", ["/ahora", "/historia", "/instantaneas", "/ahora/preguntar"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/panel",
+        "/ahora",
+        "/historia",
+        "/instantaneas",
+        "/ahora/preguntar",
+        "/agentes/principal/ahora",
+    ],
+)
 def test_the_new_pages_obey_the_policy(web: TestClient, path: str) -> None:
     html = web.get(path).text
     assert not re.search(r"<script(?![^>]*\bsrc=)", html)
@@ -135,10 +145,22 @@ def test_every_animation_and_transition_waits_for_no_preference() -> None:
         assert inside or in_keyframes or brand_button, css[match.start() - 80 : match.start() + 40]
 
 
-def test_only_brand_colours_still() -> None:
+def test_only_token_colours_still() -> None:
+    """Every colour of the page is a token of the brand (the base or the app's palette, T12d),
+    and there are still no shadows and no gradients in the CSS."""
+    import json
+
+    tokens = json.loads(
+        (STATIC.parents[2] / "brand" / "design-system" / "project" / "tokens.json").read_text()
+    )
+    allowed = set()
+    for group in (tokens["color"]["tokens"], tokens["app"]["color"]["tokens"]):
+        for token in group:
+            value = token["value"]
+            allowed |= set(value.values()) if isinstance(value, dict) else {value}
     css = (STATIC / "web.css").read_text()
-    allowed = {"#ffffff", "#0b0b0b", "#2e2e2e", "#6b6b6b", "#767676"}
-    assert set(re.findall(r"#[0-9a-fA-F]{6}\b", css)) <= allowed
+    used = set(re.findall(r"#[0-9a-fA-F]{3,8}\b", css))
+    assert used <= {c for c in allowed if c.startswith("#")}, used - allowed
     assert not re.search(r"rgba?\(|hsla?\(|gradient|box-shadow", css)
 
 

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ t('snaps.title') }}{% endblock %}
 {% block main %}
-<main class="snapshots">
+<main class="snapshots a-{{ agent.colour if agent else 1 }}">
   <h1>{{ t('snaps.title') }}</h1>
   <p class="lede">{{ t('snaps.lede') }}</p>
   {% set live = false %}
@@ -37,7 +37,7 @@
     {% endfor %}
   </ol>
   {% if hidden %}
-  <p class="note">{{ t('snaps.more', n=rows | length) }} <a href="{{ base }}/instantaneas?todas=1">+{{ hidden }}</a></p>
+  <p class="note">{{ t('snaps.more', n=rows | length) }} <a href="{{ abase }}/instantaneas?todas=1">+{{ hidden }}</a></p>
   {% endif %}
   {% endif %}
 </main>

@@ -1,0 +1,14 @@
+{# The agent's day as a small tide, in its own colour (the drawing's currentColor). #}
+<svg class="mini-tide" viewBox="0 0 {{ tide.width | int }} {{ tide.height | int }}" role="img" aria-label="{{ t('tide.mini', n=tide.events) }}">
+  <defs>
+    <linearGradient id="fade-{{ slug }}" gradientUnits="userSpaceOnUse" x1="{{ tide.left }}" y1="0" x2="{{ tide.fade_to }}" y2="0">
+      <stop offset="0" stop-color="currentColor" stop-opacity="0"/>
+      <stop offset="1" stop-color="currentColor" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+  <path class="tide-line" d="{{ tide.path }}{{ tide.swell | replace('M', 'L', 1) }}" stroke="url(#fade-{{ slug }})"/>
+  {% for mark in tide.marks %}
+  <circle class="mini-mark" cx="{{ mark.x }}" cy="{{ mark.y }}" r="3.5"/>
+  {% endfor %}
+  <circle class="mini-head" cx="{{ tide.right }}" cy="{{ tide.base }}" r="6"/>
+</svg>

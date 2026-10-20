@@ -1,10 +1,10 @@
 {% extends "base.html" %}
 {% block title %}{{ t('hist.title') }}{% endblock %}
 {% block main %}
-<main class="history">
+<main class="history a-{{ agent.colour }}">
   <h1>{{ t('hist.title') }}</h1>
   <p class="lede">{{ t('hist.lede') }}</p>
-  <form class="filters" action="{{ base }}/historia" method="get" hx-get="{{ base }}/historia" hx-target="#results" hx-push-url="true" hx-trigger="change, submit">
+  <form class="filters" action="{{ abase }}/historia" method="get" hx-get="{{ abase }}/historia" hx-target="#results" hx-push-url="true" hx-trigger="change, submit">
     <label>{{ t('hist.source') }}
       <select name="origen">
         <option value="">{{ t('hist.any') }}</option>
@@ -36,7 +36,7 @@
     </label>
     <button class="dot-button" type="submit" aria-label="{{ t('hist.apply') }}">{% include "arrow.html" %}</button>
   </form>
-  {% if filters.after is not none %}<p class="note">{{ t('hist.burst') }} <a href="{{ base }}/historia">{{ t('hist.all') }}</a></p>{% endif %}
+  {% if filters.after is not none %}<p class="note">{{ t('hist.burst') }} <a href="{{ abase }}/historia">{{ t('hist.all') }}</a></p>{% endif %}
   <section id="results">
     {% include "history_results.html" %}
   </section>

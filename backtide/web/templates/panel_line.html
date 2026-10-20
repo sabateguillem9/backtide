@@ -1,0 +1,6 @@
+<li class="pline a-{{ who.colour }}{% if line.mark %} mark{% endif %}" id="p-{{ who.slug }}-{{ line.id }}"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {% set began = line.first_ts or line.ts %}
+  <time class="when" datetime="{{ began }}" title="{{ stamp(began) }}">{{ clock(began) }}</time>
+  <span class="dot dot-{{ line.risk }}" role="img" aria-label="{{ t('risk.' ~ line.risk) }}"></span>
+  <span class="pline-body"><a class="who" href="{{ who.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(who), 48) }}</span></a> <span class="said">{{ tell(line) }}</span></span>
+</li>

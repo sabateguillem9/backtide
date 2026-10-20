@@ -1,6 +1,14 @@
-"""Demo data for `backtide web` (T12): a throwaway state with a believable black box, no VM.
+"""Demo data for `backtide web` (T12): a throwaway state with believable black boxes, no VM.
 
 Usage: python scripts/web-demo/seed.py <folder> [--live]
+
+Several agents (T12d's control room): the main one, "OpenClaw personal", is the one
+``backtide.toml`` points at (its story is below). Three more, each with its own black box and its
+own snapshot folders under ``<folder>/agents/<slug>/``, are listed in ``<folder>/agents.json``: a
+coding agent at work, a research bot that is mostly quiet and now and then loses its process
+sensor, and a mail assistant that was frozen for lack of space. ``<folder>/requests.json`` holds
+made-up requests of the gate (T10 does not exist yet) that only serve.py reads: each one waits a
+few minutes and is then rejected on its own, and with ``--live`` new ones come in.
 
 Writes into <folder>: ``backtide.toml``, ``state/`` (a black box written by the real BlackBox),
 ``volume/snapshots/`` (one empty folder per snapshot, which serve.py lists: no btrfs on a Mac)
@@ -15,6 +23,8 @@ The data is made up, calm and harmless on purpose (hostile names are the attack 
 tests/attacks/test_web_attacks.py). Nothing here touches Docker, Btrfs or the network.
 """
 
+import json
+import os
 import random
 import sys
 import time
@@ -90,18 +100,26 @@ class Clock:
         self._now = max(self._now, datetime.now(UTC))
 
 
-def earlier_day(story: Story) -> None:
-    """The day before the last hour, so the tide has a shape: three work sessions with quiet
+MAIN_FILES = ("notas.md", "plan.md", "datos-ventas.csv", "informe-trimestral.md", "ideas.txt")
+MAIN_SESSIONS = ((1.5, 4.0, 6), (8.0, 9.5, 12), (13.5, 18.5, 4))  # (from h, to h, events a step)
+
+
+def earlier_day(
+    story: Story,
+    seed: int = 3,
+    sessions: tuple[tuple[float, float, int], ...] = MAIN_SESSIONS,
+    files: tuple[str, ...] = MAIN_FILES,
+    hours: float = 22,
+) -> None:
+    """The day before the last hour, so the tide has a shape: work sessions with quiet
     stretches between them, and snapshots every half hour while the agent works."""
-    rng = random.Random(3)  # noqa: S311 - demo data, not a secret
+    rng = random.Random(seed)  # noqa: S311 - demo data, not a secret
     story.system("service_start", version="0.1.0")
     story.at(2)
     story.system("agent_start")
-    sessions = ((1.5, 4.0, 6), (8.0, 9.5, 12), (13.5, 18.5, 4))  # (from h, to h, events per step)
-    files = ("notas.md", "plan.md", "datos-ventas.csv", "informe-trimestral.md", "ideas.txt")
     step = 300.0  # five minutes
     begin = story.clock.now()
-    for i in range(int(22 * 3600 / step)):
+    for i in range(int(hours * 3600 / step)):
         hour = i * step / 3600
         busy = next((n for start, end, n in sessions if start <= hour < end), 0)
         if i % (6 if busy else 24) == 0:
@@ -185,27 +203,222 @@ def first_story(story: Story) -> str:
     return good
 
 
-def live(story: Story) -> None:
-    """Add events at the pace of an agent at work, until stopped. Real time from here on."""
+def live_main(story: Story, count: int, rng: random.Random) -> None:
+    """One step of the main agent at work."""
+    if count % SNAPSHOT_EVERY == 0:
+        story.snapshot()
+    elif count % 9 == 0:
+        story.file("create", f"work/borrador_{count}", type="dir")
+        for i in range(rng.randint(6, 14)):
+            story.file("create", f"work/borrador_{count}/parte_{i}.md", size=400 + i)
+    elif count % 11 == 0:
+        for i in range(rng.randint(10, 30)):
+            story.file("delete", f"work/borrador_{count - 2}/parte_{i}.md", risk=1)
+    else:
+        story.file("modify", rng.choice(["work/notas.md", "work/informe-trimestral.md"]), writes=2)
+
+
+# -- the other agents of the control room (T12d) ----------------------------------------------
+
+# slug, name, seed, work sessions of the day before, files it touches
+OTHERS = (
+    ("codigo", "Agente de código", 11, ((2.0, 6.0, 8), (10.0, 14.0, 10), (16.0, 21.5, 7)),
+     ("src/tienda/carrito.py", "src/tienda/pagos.py", "tests/test_carrito.py", "README.md")),
+    ("investigacion", "Bot de investigación", 21, ((4.0, 5.0, 3), (12.0, 12.5, 4), (19.0, 20.0, 3)),
+     ("notas/mareas.md", "notas/fuentes.md", "resumen.md")),
+    ("correo", "Asistente de correo", 31, ((6.0, 9.0, 3), (15.0, 17.0, 2)),
+     ("bandeja/borradores.md", "bandeja/respuestas.md")),
+)  # fmt: skip
+
+
+def other_story(story: Story, slug: str) -> None:
+    """The last hour of one of the other agents (its clock then catches up with now)."""
+    story.at(60)
+    story.snapshot()
+    if slug == "codigo":
+        story.system("sensor_start")
+        for i in range(30):
+            story.at(70)
+            story.file("modify", f"work/src/tienda/{('carrito', 'pagos')[i % 2]}.py", writes=2)
+            if i % 5 == 4:
+                story.box.append("exec", "run", "pytest -q tests/", details={"exit": 0})
+        story.at(30)
+        story.box.append("exec", "run", "rm -rf build/ dist/", risk=2, details={"exit": 0})
+        story.snapshot()
+    elif slug == "investigacion":
+        story.system("sensor_start")
+        for topic in ("mareas vivas", "corrientes de resaca"):
+            story.at(400)
+            story.box.append("llm", "chat", "api.anthropic.com", details={"topic": topic})
+            story.at(5)
+            story.box.append("net", "connect", "arxiv.org:443")
+            story.at(20)
+            story.file("create", f"work/notas/{topic.replace(' ', '-')}.md", size=2400)
+    else:  # correo: frozen for lack of space, waiting for room
+        story.system("sensor_start")
+        story.at(300)
+        story.file("modify", "work/bandeja/borradores.md", writes=3)
+        story.at(200)
+        story.system("space_low")
+        story.at(30)
+        story.system("space_pause", frozen=True)
+
+
+def live_other(story: Story, slug: str, count: int, rng: random.Random, plan: dict) -> None:
+    """One step of one of the other agents."""
+    if slug == "codigo":
+        if plan.get("rewind_at") == count:
+            story.box.append(
+                "snapshot", "rewind_done", plan["rewind_to"],
+                details={"target": plan["rewind_to"], "agent_started": True}, risk=1,
+            )  # fmt: skip
+            story.system("agent_start", reason="rewind")
+            return
+        if count % 120 == 60 and story.last_snapshot:
+            target = story.last_snapshot
+            story.box.append(
+                "snapshot", "rewind_requested", target,
+                details={"target": target, "requested_by": "cli"}, risk=1,
+            )  # fmt: skip
+            plan["rewind_at"], plan["rewind_to"] = count + 4, target
+            return
+        if count % 20 == 0:
+            story.snapshot()
+        elif count % 6 == 0:
+            story.box.append("exec", "run", "pytest -q tests/", details={"exit": 0})
+        elif count % 37 == 0:
+            story.box.append("exec", "run", "rm -rf build/", risk=2, details={"exit": 0})
+        elif count % 3 == 0:
+            for i in range(rng.randint(3, 9)):
+                story.file("modify", f"work/src/tienda/modulo_{i}.py", writes=1)
+        else:
+            story.file(
+                "modify", rng.choice(["work/src/tienda/carrito.py", "work/tests/test_carrito.py"])
+            )
+    elif slug == "investigacion":
+        if count % 90 == 30:
+            story.box.append("system", "sensor_down", "tetragon", risk=2)
+        elif count % 90 == 50:
+            story.system("sensor_restart", attempt=1)
+            story.system("sensor_start")
+        elif count % 25 == 0:
+            story.box.append("llm", "chat", "api.anthropic.com", details={"topic": "mareas"})
+            story.box.append("net", "connect", rng.choice(["arxiv.org:443", "doi.org:443"]))
+            story.file("modify", "work/notas/mareas.md", writes=1)
+        elif count % 60 == 0:
+            story.snapshot()
+
+
+# -- the gate's requests (made up: T10 does not exist yet) ------------------------------------
+
+REQUESTS = (
+    ("principal", "email", "ana.garcia@ejemplo.com", "Asunto: Presupuesto de la reforma. "
+     "Adjunto: presupuesto.pdf", "new_destination", 2),
+    ("codigo", "delete", "github.com/ana/tienda-web (el repositorio entero)", "",
+     "delete", 3),
+    ("investigacion", "pay", "editorial.ejemplo.org (39,95 €)", "Artículo: Modelos de marea, "
+     "2024", "pay", 3),
+    ("principal", "post", "mastodon.ejemplo.social/@ana", "«Hoy hemos terminado la reforma "
+     "de la cocina»", "post", 2),
+    ("codigo", "call", "api.stripe.com/v1/refunds", "Devolución de 120 € al pedido 4411",
+     "unknown", 3),
+    ("principal", "message", "Grupo «Familia» en Telegram", "«Llego a las 9»", "send", 1),
+)  # fmt: skip
+
+
+class Gate:
+    """The made-up requests, written to ``requests.json`` for serve.py. Each waits a few minutes
+    and then is gone (rejected on its own); with ``--live`` the next sample takes its place."""
+
+    def __init__(self, path: Path, rng: random.Random) -> None:
+        self.path = path
+        self.rng = rng
+        self.next = 0
+        self.serial = 0
+        self.open: list[dict[str, object]] = []
+
+    def add(self, now: datetime, seconds: float) -> None:
+        agent, kind, target, detail, reason, risk = REQUESTS[self.next % len(REQUESTS)]
+        self.next += 1
+        self.serial += 1
+        held = now - timedelta(seconds=self.rng.uniform(10, 60))
+        self.open.append(
+            {
+                "id": f"r{self.serial}",
+                "agent": agent,
+                "kind": kind,
+                "target": target,
+                "detail": detail,
+                "reason": reason,
+                "risk": risk,
+                "held_at": held.isoformat(),
+                "expires_at": (now + timedelta(seconds=seconds)).isoformat(),
+            }
+        )
+
+    def tick(self, now: datetime) -> None:
+        """Drop what ran out; keep three waiting (one at a time comes back after a pause)."""
+        before = len(self.open)
+        self.open = [r for r in self.open if datetime.fromisoformat(str(r["expires_at"])) > now]
+        if len(self.open) < 3 and self.rng.random() < 0.15:
+            self.add(now, self.rng.uniform(120, 480))
+        if len(self.open) != before or len(self.open) != getattr(self, "_written", -1):
+            self.write()
+
+    def write(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.open, ensure_ascii=False, indent=2) + "\n")
+        os.replace(tmp, self.path)
+        self._written = len(self.open)
+
+
+def seed_others(folder: Path) -> list[tuple[Story, str]]:
+    """The other agents, each in ``<folder>/agents/<slug>/``, and ``agents.json`` listing them."""
+    listed = []
+    stories = []
+    for slug, name, seed, sessions, files in OTHERS:
+        home = folder / "agents" / slug
+        home.mkdir(parents=True, exist_ok=True)
+        home.chmod(0o700)
+        if not (home / "blackbox.key").exists():
+            create_key(home / "blackbox.key")
+        clock = Clock(datetime.now(UTC) - timedelta(hours=23, minutes=30))
+        box = BlackBox(
+            home / "blackbox.db",
+            load_key(home / "blackbox.key"),
+            checkpoint_path=home / "blackbox.checkpoint",
+            clock=clock,
+        )
+        story = Story(box, clock, home)
+        if box.head() is None:
+            earlier_day(story, seed, sessions, files, hours=22.4)
+            clock.jump_to(datetime.now(UTC) - timedelta(minutes=50))
+            other_story(story, slug)
+        listed.append(
+            {"slug": slug, "name": name, "db": str(home / "blackbox.db"),
+             "snapshots": str(home / "snapshots")}
+        )  # fmt: skip
+        stories.append((story, slug))
+    (folder / "agents.json").write_text(
+        json.dumps({"main": "OpenClaw personal", "others": listed}, ensure_ascii=False, indent=2)
+    )
+    return stories
+
+
+def live(story: Story, others: list[tuple[Story, str]], gate: Gate) -> None:
+    """Add events at the pace of agents at work, until stopped. Real time from here on."""
     rng = random.Random(7)  # noqa: S311 - demo data, not a secret
+    plans: dict[str, dict] = {slug: {} for _, slug in others}
     count = 0
     while True:
         time.sleep(LIVE_EVERY)
-        story.clock.sync()
         count += 1
-        if count % SNAPSHOT_EVERY == 0:
-            story.snapshot()
-        elif count % 9 == 0:
-            story.file("create", f"work/borrador_{count}", type="dir")
-            for i in range(rng.randint(6, 14)):
-                story.file("create", f"work/borrador_{count}/parte_{i}.md", size=400 + i)
-        elif count % 11 == 0:
-            for i in range(rng.randint(10, 30)):
-                story.file("delete", f"work/borrador_{count - 2}/parte_{i}.md", risk=1)
-        else:
-            story.file(
-                "modify", rng.choice(["work/notas.md", "work/informe-trimestral.md"]), writes=2
-            )
+        story.clock.sync()
+        live_main(story, count, rng)
+        for other, slug in others:
+            other.clock.sync()
+            live_other(other, slug, count, rng, plans[slug])
+        gate.tick(datetime.now(UTC))
 
 
 def main(argv: list[str]) -> int:
@@ -231,6 +444,12 @@ def main(argv: list[str]) -> int:
         clock=clock,
     )
     story = Story(box, clock, folder / "volume")
+    others = seed_others(folder)
+    gate = Gate(folder / "requests.json", random.Random(5))  # noqa: S311 - demo data
+    start = datetime.now(UTC)
+    for seconds in (95, 260, 420):
+        gate.add(start, seconds)
+    gate.write()
     if box.head() is None:
         earlier_day(story)
         clock.jump_to(datetime.now(UTC) - timedelta(minutes=58))
@@ -243,7 +462,7 @@ def main(argv: list[str]) -> int:
     print(f"python -m backtide.cli web --config {config}", flush=True)
     if "--live" in argv:
         clock.sync()
-        live(story)
+        live(story, others, gate)
     return 0
 
 

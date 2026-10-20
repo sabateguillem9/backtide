@@ -1,0 +1,31 @@
+{# One agent's card: the inside of <article class="card">, which the stream replaces. #}
+{% set s = c.summary %}
+<div class="card-in st-{{ c.state }}">
+  <div class="card-head">
+    <h3 class="card-name" id="name-{{ c.agent.slug }}"><a href="{{ c.agent.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(c.agent), 48) }}</span></a></h3>
+    <p class="card-state"><span class="pulse" aria-hidden="true"></span>{{ t('st.' ~ c.state) }}</p>
+  </div>
+  {% set tide = s.tide %}
+  {% set slug = c.agent.slug %}
+  {% include "mini_tide.html" %}
+  {% if s.unreadable %}
+  <p class="card-last note">{{ t('box.unreadable') }}</p>
+  {% elif s.last %}
+  <p class="card-last"><span class="dot dot-{{ s.last.risk }}" role="img" aria-label="{{ t('risk.' ~ s.last.risk) }}"></span><span class="said">{{ tell(s.last) }}</span> <time class="ago" data-ago datetime="{{ s.last_ts }}" title="{{ stamp(s.last_ts) }}">{{ age(parse_ts(s.last_ts)) }}</time></p>
+  {% else %}
+  <p class="card-last note">{{ t('card.nothing') }}</p>
+  {% endif %}
+  <dl class="card-counts">
+    <div><dt>{{ t('card.events') }}</dt><dd class="num">{{ s.events_today }}{% if s.more %}+{% endif %}</dd></div>
+    <div><dt>{{ t('card.snaps') }}</dt><dd class="num">{{ s.snaps_today }}</dd></div>
+    <div{% if s.risk3_today %} class="is-risky"{% endif %}><dt>{{ t('card.risk3') }}</dt><dd class="num">{% if s.risk3_cut %}≥{% endif %}{{ s.risk3_today }}</dd></div>
+  </dl>
+  <p class="card-pending">
+    {% if c.pending %}
+    <a href="#req-{{ c.pending[0].id }}"><span class="waiting-mark" aria-hidden="true"></span>{{ t.plural('card.pending', c.pending | length) }}</a>
+    {% else %}
+    <span class="muted">{{ t('card.pending.none') }}</span>
+    {% endif %}
+  </p>
+  <p class="card-links"><a href="{{ c.agent.base }}/ahora">{{ t('nav.now') }}</a><a href="{{ c.agent.base }}/historia">{{ t('nav.history') }}</a><a href="{{ c.agent.base }}/instantaneas">{{ t('nav.snapshots') }}</a></p>
+</div>

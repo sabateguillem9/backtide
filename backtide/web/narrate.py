@@ -223,7 +223,8 @@ def _tell_system(event: Event) -> tuple[str, dict[str, Any], bool]:
         "service_start", "service_stop", "service_start_failed", "agent_start",
         "agent_start_failed", "agent_stop_failed", "space_resume", "space_low",
         "watcher_armed", "watcher_failed", "watcher_lost", "record_budget", "cli_stop",
-        "log", "cycle_failed",
+        "log", "cycle_failed", "sensor_start", "sensor_stop", "sensor_down", "sensor_restart",
+        "sensor_unproven", "sensor_gap", "sensor_failed",
     }  # fmt: skip
     if action in known:
         return f"system.{action}", {}, False

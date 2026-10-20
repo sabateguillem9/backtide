@@ -39,11 +39,12 @@ the real port before the app is built (its ``Host`` check needs it).
 """
 
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import uvicorn
 
 from backtide.snapshots import Snapshot, SnapshotStore
+from backtide.web.agents import AgentSource, PendingRequest
 from backtide.web.app import create_app
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
@@ -98,13 +99,18 @@ def run_web(
     *,
     snapshots: Callable[[], list[Snapshot]] | None = None,
     can_rewind: bool = False,
+    agent_name: str | None = None,
+    others: Sequence[AgentSource] = (),
+    pending: Callable[[], Sequence[PendingRequest]] | None = None,
 ) -> None:
     """Serve the web of ``paths`` on 127.0.0.1:``port`` until the process is stopped.
     ``announce`` gets the link with the token (printed once, never logged) and the name of
     this run, to compare with the one on the page. ``snapshots`` lists the snapshots; it is
     the volume's own list (``SnapshotStore``) unless given, which only the Mac's demo does
     (scripts/web-demo/serve.py: there is no btrfs there). ``can_rewind`` is `--rebobinar`:
-    without it the rewind buttons stay disabled whoever runs the web."""
+    without it the rewind buttons stay disabled whoever runs the web. ``agent_name``,
+    ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
+    requests) are only given by the demo today: T17 and T10 will fill them for real."""
     sock = bind(port)
     real_port = sock.getsockname()[1]
     token, prefix, run_name = make_token(), make_prefix(), make_run_name()
@@ -121,6 +127,9 @@ def run_web(
         run_name=run_name,
         snapshots=snapshots or from_volume,
         rewinder=ControlRewinder(paths.control_socket, enabled=can_rewind),
+        agent_name=agent_name,
+        others=others,
+        pending=pending,
     )
     server = make_server(app)
     announce(web_url(real_port, prefix, token), run_name)
@@ -128,4 +137,6 @@ def run_web(
         server.run(sockets=[sock])
     finally:
         reader.close()
+        for other in others:
+            other.reader.close()
         sock.close()

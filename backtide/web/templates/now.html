@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ t('now.title') }}{% endblock %}
 {% block main %}
-<main class="watch" hx-ext="sse" sse-connect="{{ base }}/ahora/stream?after={{ head }}">
+<main class="watch a-{{ agent.colour }}" hx-ext="sse" sse-connect="{{ abase }}/ahora/stream?after={{ head }}">
   <h1>{{ t('now.title') }}</h1>
   <p class="lede">{{ t('now.lede') }}</p>
   <div class="watchbar">

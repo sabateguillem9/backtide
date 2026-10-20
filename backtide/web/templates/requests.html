@@ -1,0 +1,38 @@
+{# The requests waiting for a yes: a fragment of panel.html, sent again by the stream when the
+   list changes. ``stale``: the list could not be read now (the last one read stays, said so). What the agent chose (the target, the detail) goes through say(): escaped,
+   made visible, in its own isolated span. The buttons are disabled on purpose (T10). #}
+<div class="waiting-head">
+  <h2 id="waiting-title"><span class="waiting-mark" aria-hidden="true"></span>{{ t('wait.title') }}</h2>
+  {% if requests %}<span class="waiting-count num">{{ requests | length }}</span>{% endif %}
+</div>
+{% if requests is none %}
+<p class="note">{{ t('wait.none.t10') }}</p>
+{% elif stale and not requests %}
+<p class="note is-stale">{{ t('wait.unreadable') }}</p>
+{% elif not requests %}
+<p class="note">{{ t('wait.none') }}</p>
+{% else %}
+<p class="note">{{ t('wait.lede') }}</p>
+{% if stale %}<p class="note is-stale">{{ t('wait.stale') }}</p>{% endif %}
+<ol class="requests">
+  {% for r in requests %}
+  {% set who = roster.get(r.agent) %}
+  <li class="req a-{{ who.colour }} risk-{{ r.risk }}" id="req-{{ r.id }}">
+    <p class="req-who"><a href="{{ who.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(who), 48) }}</span></a> <span class="muted">· {{ t('wait.held') }} <time data-ago datetime="{{ r.held_at.isoformat() }}">{{ age(r.held_at) }}</time></span></p>
+    <p class="req-what">{{ say('req.' ~ r.what, target=r.target_name) }}</p>
+    {% if r.detail_name %}<p class="req-detail">{{ say('req.detail', detail=r.detail_name) }}</p>{% endif %}
+    <p class="req-why"><span class="muted">{{ t('wait.why') }}</span> {{ t('why.' ~ r.reason) if t.has('why.' ~ r.reason) else t('why.unknown') }}</p>
+    <p class="req-risk risk-word"><span class="dot dot-{{ r.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ r.risk) }}</p>
+    <div class="req-clock" data-held="{{ r.held_at.isoformat() }}" data-deadline="{{ r.expires_at.isoformat() }}" data-done="{{ t('wait.expired') }}">
+      <p class="req-left"><span class="muted">{{ t('wait.left') }}</span> <span class="req-count num">{{ countdown(r.left(now)) }}</span></p>
+      <span class="req-bar" aria-hidden="true"><span class="req-fill q-{{ (r.fraction_left(now) * 10) | round | int }}"></span></span>
+    </div>
+    <div class="req-actions">
+      <button class="req-yes" type="button" disabled aria-describedby="soon-{{ r.id }}"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('wait.approve') }}</span></button>
+      <button class="req-no" type="button" disabled aria-describedby="soon-{{ r.id }}">{{ t('wait.reject') }}</button>
+      <span class="req-soon" id="soon-{{ r.id }}">{{ t('wait.soon') }}</span>
+    </div>
+  </li>
+  {% endfor %}
+</ol>
+{% endif %}
