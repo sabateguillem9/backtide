@@ -9,6 +9,9 @@ coding agent at work, a research bot that is mostly quiet and now and then loses
 sensor, and a mail assistant that was frozen for lack of space. ``<folder>/requests.json`` holds
 made-up requests of the gate (T10 does not exist yet) that only serve.py reads: each one waits a
 few minutes and is then rejected on its own, and with ``--live`` new ones come in.
+``<folder>/settings.json`` is what the Settings page (T12e) starts with: the Anthropic key set
+(only its last four characters, as the real service tells them), no OpenAI key and the Telegram
+bot set. There is no key anywhere in the demo, and serve.py keeps every change in memory.
 
 Writes into <folder>: ``backtide.toml``, ``state/`` (a black box written by the real BlackBox),
 ``volume/snapshots/`` (one empty folder per snapshot, which serve.py lists: no btrfs on a Mac)
@@ -405,6 +408,20 @@ def seed_others(folder: Path) -> list[tuple[Story, str]]:
     return stories
 
 
+def seed_settings(folder: Path) -> None:
+    """``settings.json``: what the Settings page shows at first, in the shape of the service's
+    ``secrets`` reply (a tail and a date, never a key). serve.py reads it once."""
+    now = datetime.now(UTC)
+    shown = {
+        "anthropic": {"set": True, "tail": "4f2a", "in_use": True, "problem": None,
+                      "changed": f"{now - timedelta(days=2, hours=3):%Y-%m-%dT%H:%M:%SZ}"},
+        "openai": {"set": False, "tail": None, "changed": None, "in_use": False, "problem": None},
+        "telegram": {"set": True, "tail": "Rk7w", "chat_tail": "5531", "in_use": True,
+                     "problem": None, "changed": f"{now - timedelta(days=6):%Y-%m-%dT%H:%M:%SZ}"},
+    }  # fmt: skip
+    (folder / "settings.json").write_text(json.dumps(shown, indent=2) + "\n")
+
+
 def live(story: Story, others: list[tuple[Story, str]], gate: Gate) -> None:
     """Add events at the pace of agents at work, until stopped. Real time from here on."""
     rng = random.Random(7)  # noqa: S311 - demo data, not a secret
@@ -445,6 +462,7 @@ def main(argv: list[str]) -> int:
     )
     story = Story(box, clock, folder / "volume")
     others = seed_others(folder)
+    seed_settings(folder)
     gate = Gate(folder / "requests.json", random.Random(5))  # noqa: S311 - demo data
     start = datetime.now(UTC)
     for seconds in (95, 260, 420):

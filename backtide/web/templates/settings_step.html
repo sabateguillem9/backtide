@@ -1,60 +1,76 @@
 {# One step of a change of the Settings page (T12e): its confirmation (a form with a one-time
    ticket), its result, or why not now. Plain forms, no JavaScript needed: the POST is a normal
    navigation, which carries our Origin (Referrer-Policy: same-origin). The key is typed into a
-   password field and never comes back: not in a value, not in a message. #}
+   password field and never comes back: not in a value, not in a message. The field asks the
+   browser not to fill it in nor offer a saved password (autocomplete="new-password"), and the
+   usual password managers to leave it alone. #}
 {% extends "base.html" %}
 {% block title %}{{ t('settings.title') }}{% endblock %}
 {% block main %}
+{% macro say(key, kind) %}{{ t(key ~ '.' ~ kind, **kwargs) if t.has(key ~ '.' ~ kind) else t(key, **kwargs) }}{% endmacro %}
 <main class="settings">
   <h1>{{ t('settings.title') }}</h1>
   <section class="settings-step" data-view="{{ view }}"{% if outcome %} data-outcome="{{ outcome }}"{% endif %} aria-labelledby="settings-step-title">
   {% if view == 'confirm_set' %}
     <h2 id="settings-step-title">{{ t('settings.confirm.set.' ~ ('replace' if replacing else 'new'), what=t('settings.what.' ~ row.kind)) }}</h2>
-    {% if replacing and row.tail %}<p>{{ t('settings.confirm.current', tail=row.tail) }}</p>{% endif %}
+    {% set chat_shown = row.kind == 'telegram' and row.set and row.chat_tail %}
+    {% if (replacing and row.tail) or chat_shown %}<p class="settings-current"><span class="setting-dot" aria-hidden="true"></span><span>{% if replacing and row.tail %}{{ say('settings.confirm.current', row.kind, tail=row.tail) }}{% endif %}{% if replacing and row.tail and chat_shown %} {% endif %}{% if chat_shown %}{{ t('settings.chat_tail', tail=row.chat_tail) }}{% endif %}</span></p>{% endif %}
     <p class="note">{{ t('settings.confirm.' ~ ('telegram' if row.kind == 'telegram' else 'provider')) }}</p>
     <form class="settings-form" method="post" action="{{ base }}/ajustes/guardar" autocomplete="off">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="ticket" value="{{ ticket }}">
       <input type="hidden" name="tipo" value="{{ row.kind }}">
       <input type="hidden" name="accion" value="set">
-      <label class="setting-label" for="setting-value">{{ t('settings.field.' ~ ('token' if row.kind == 'telegram' else 'key')) }}</label>
-      <input id="setting-value" class="setting-input" type="password" name="valor" maxlength="300" autocomplete="off" autocapitalize="off" spellcheck="false"{% if not (row.kind == 'telegram' and row.set) %} required{% endif %}>
+      {% if row.kind == 'telegram' and row.set %}<p class="setting-hint">{{ t('settings.field.keep') }}</p>{% endif %}
+      <div class="setting-field">
+        <label class="setting-label" for="setting-value">{{ t('settings.field.' ~ ('token' if row.kind == 'telegram' else 'key')) }}</label>
+        <input id="setting-value" class="setting-input" type="password" name="valor" maxlength="300" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" aria-describedby="setting-value-hint" data-1p-ignore data-lpignore="true" data-bwignore{% if not (row.kind == 'telegram' and row.set) %} required{% endif %}>
+        <p class="setting-hint" id="setting-value-hint">{{ t.code('settings.hint.' ~ row.kind) }}</p>
+      </div>
       {% if row.kind == 'telegram' %}
-      <label class="setting-label" for="setting-chat">{{ t('settings.field.chat') }}</label>
-      <input id="setting-chat" class="setting-input" type="text" name="chat" maxlength="20" inputmode="numeric" pattern="[0-9]*" autocomplete="off"{% if not row.set %} required{% endif %}>
-      {% if row.set %}<p class="note">{{ t('settings.field.keep') }}</p>{% endif %}
+      <div class="setting-field">
+        <label class="setting-label" for="setting-chat">{{ t('settings.field.chat') }}</label>
+        <input id="setting-chat" class="setting-input setting-chat" type="text" name="chat" maxlength="20" inputmode="numeric" pattern="[0-9]*" autocomplete="off" aria-describedby="setting-chat-hint"{% if not row.set %} required{% endif %}>
+        <p class="setting-hint" id="setting-chat-hint">{{ t('settings.hint.chat') }}</p>
+      </div>
       {% endif %}
       {% if replacing %}
-      <label class="setting-check"><input type="checkbox" name="confirmo" value="si" required> {{ t('settings.confirm.box', tail=row.tail) if row.tail else t('settings.confirm.box.plain') }}</label>
+      <label class="setting-check"><input type="checkbox" name="confirmo" value="si" required> <span>{{ say('settings.confirm.box', row.kind, tail=row.tail) if row.tail else say('settings.confirm.box.plain', row.kind) }}</span></label>
       {% endif %}
       <div class="settings-actions">
-        <button class="settings-yes" type="submit">{{ t('settings.confirm.save') }}</button>
+        <button class="settings-yes" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('settings.confirm.save') }}</span></button>
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>
   {% elif view == 'confirm_clear' %}
+    {% set consequence = 'telegram' if row.kind == 'telegram' else ('in_use' if row.in_use else 'unused') %}
     <h2 id="settings-step-title">{{ t('settings.confirm.clear', what=t('settings.what.' ~ row.kind)) }}</h2>
-    {% if row.tail %}<p>{{ t('settings.confirm.current', tail=row.tail) }}</p>{% endif %}
-    <p class="note">{{ t('settings.confirm.clear.' ~ ('telegram' if row.kind == 'telegram' else ('in_use' if row.in_use else 'unused'))) }}</p>
+    {% if row.tail %}<p class="settings-current"><span class="setting-dot" aria-hidden="true"></span><span>{{ say('settings.confirm.current', row.kind, tail=row.tail) }}</span></p>{% endif %}
+    {% if consequence == 'unused' %}
+    <p class="note">{{ t('settings.confirm.clear.unused') }}</p>
+    {% else %}
+    <p class="settings-warning"><span class="dot dot-{{ 2 if consequence == 'in_use' else 1 }}" aria-hidden="true"></span><span>{{ t.code('settings.confirm.clear.' ~ consequence) }}</span></p>
+    {% endif %}
     <form class="settings-form" method="post" action="{{ base }}/ajustes/guardar">
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="ticket" value="{{ ticket }}">
       <input type="hidden" name="tipo" value="{{ row.kind }}">
       <input type="hidden" name="accion" value="clear">
       <div class="settings-actions">
-        <button class="settings-yes" type="submit">{{ t('settings.confirm.remove') }}</button>
+        <button class="settings-yes is-remove" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ say('settings.confirm.remove', row.kind) }}</span></button>
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>
   {% elif view == 'result' %}
-    <h2 id="settings-step-title">{{ t('settings.out.' ~ outcome) if t.has('settings.out.' ~ outcome) else t('settings.out.unknown') }}</h2>
-    <p class="setting-name">{{ t('settings.kind.' ~ row.kind) }}</p>
-    {% if applied and t.has('settings.applied.' ~ applied) %}<p>{{ t('settings.applied.' ~ applied) }}</p>{% endif %}
+    {% set mood = 'ok' if outcome in ('saved', 'cleared') else ('none' if outcome == 'not_set' else 'bad') %}
+    <h2 id="settings-step-title" class="settings-outcome is-{{ mood }}"><span class="setting-dot" aria-hidden="true"></span><span>{{ say('settings.out.' ~ outcome, row.kind) if t.has('settings.out.' ~ outcome) else t('settings.out.unknown') }}</span></h2>
+    <p class="settings-what">{{ t('settings.kind.' ~ row.kind) }}</p>
+    {% if applied and t.has('settings.applied.' ~ applied) %}<p>{{ t.code('settings.applied.' ~ applied) }}</p>{% endif %}
     {% if message %}<p class="settings-said"><span class="muted">{{ t('rewind.said') }}</span> <span lang="es">{{ vis(message, 600) }}</span></p>{% endif %}
     <p class="settings-actions"><a class="settings-back" href="{{ base }}/ajustes">{{ t('settings.back') }}</a></p>
   {% else %}
-    <h2 id="settings-step-title">{{ t('settings.not.title') }}</h2>
-    <p>{{ t(reason) }}</p>
+    <h2 id="settings-step-title" class="settings-outcome is-none"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('settings.not.title') }}</span></h2>
+    <p>{{ t.code(reason) }}</p>
     <p class="settings-actions"><a class="settings-back" href="{{ base }}/ajustes">{{ t('settings.back') }}</a></p>
   {% endif %}
   </section>

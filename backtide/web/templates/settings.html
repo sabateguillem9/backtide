@@ -1,46 +1,58 @@
 {# The Settings page (T12e): what is set, never a key. A row shows "set, ends in …XXXX, changed
    on …" (the last four characters at most, and only what backtide.web.settings checked) or "not
-   set". Changing or removing goes through a confirmation page of its own (settings_step.html). #}
+   set". Changing or removing goes through a confirmation page of its own (settings_step.html).
+   Grouped by what each key is for; the state is a dot and its words (filled: set; hollow: not
+   set or unknown; red and ringed: a file that cannot be used), never the dot alone. #}
 {% extends "base.html" %}
 {% block title %}{{ t('settings.title') }}{% endblock %}
 {% block main %}
+{% macro say(key, kind) %}{{ t(key ~ '.' ~ kind, **kwargs) if t.has(key ~ '.' ~ kind) else t(key, **kwargs) }}{% endmacro %}
+{# "changed today at 13:25", "changed yesterday at 09:10", "changed on 14 oct, 09:10": day_time's
+   words for today and yesterday read as a date ("on Today"), so they get their own sentence. #}
+{% macro changed(kind, moment) %}{% set when = day_time(moment) %}{% set today = t('day.today', time='') %}{% set yesterday = t('day.yesterday', time='') %}{% if when.startswith(today) %}{{ say('settings.changed.today', kind, time=when[(today | length):]) }}{% elif when.startswith(yesterday) %}{{ say('settings.changed.yesterday', kind, time=when[(yesterday | length):]) }}{% else %}{{ say('settings.changed', kind, when=when) }}{% endif %}{% endmacro %}
+{% set ready = state == 'ready' %}
 <main class="settings">
   <h1>{{ t('settings.title') }}</h1>
   <p class="lede">{{ t('settings.lede') }}</p>
-  {% if state != 'ready' %}<p class="note settings-off">{{ t('settings.off.' ~ state) }}</p>{% endif %}
-  <ul class="settings-list">
-    {% for row in rows %}
-    <li class="setting" data-kind="{{ row.kind }}">
-      <div class="setting-info">
-        <span class="setting-name">{{ t('settings.kind.' ~ row.kind) }}</span>
-        <span class="setting-state">
-        {% if state != 'ready' %}{{ t('settings.unknown') }}
-        {% elif row.problem %}{{ t('settings.problem') }}
-        {% elif row.set %}{{ t('settings.set') }}{% if row.tail %}, {{ t('settings.tail', tail=row.tail) }}{% endif %}{% if row.changed %}, {{ t('settings.changed', when=day_time(row.changed)) }}{% endif %}
-        {% else %}{{ t('settings.unset') }}{% endif %}
-        </span>
-        {% if state == 'ready' and row.kind == 'telegram' and row.set and row.chat_tail %}<span class="setting-note">{{ t('settings.chat_tail', tail=row.chat_tail) }}</span>{% endif %}
-        {% if state == 'ready' and row.provider and not row.in_use %}<span class="setting-note">{{ t('settings.not_in_proxy') }}</span>{% endif %}
-        {% if row.kind == 'telegram' %}<span class="setting-note">{{ t('settings.restart') }}</span>{% endif %}
-      </div>
-      <span class="setting-actions">
-        {% if state == 'ready' %}
-        <a class="setting-go" href="{{ base }}/ajustes/cambiar?tipo={{ row.kind }}">{{ t('settings.change') if row.set else t('settings.put') }}</a>
-        {% if row.set %}<a class="setting-remove" href="{{ base }}/ajustes/quitar?tipo={{ row.kind }}">{{ t('settings.remove') }}</a>{% endif %}
-        {% else %}
-        <span class="setting-go is-off" aria-disabled="true">{{ t('settings.change') }}</span>
-        {% endif %}
-      </span>
-    </li>
-    {% endfor %}
-    <li class="setting" data-kind="cap">
-      <div class="setting-info">
-        <label class="setting-name" for="setting-cap">{{ t('settings.cap') }}</label>
-        <span class="setting-note">{{ t('settings.cap.t11') }}</span>
-      </div>
-      <span class="setting-actions"><input id="setting-cap" class="setting-input" type="text" inputmode="decimal" disabled placeholder="{{ t('settings.cap.t11') }}"></span>
-    </li>
-  </ul>
-  <p class="note">{{ t('settings.agent') }}</p>
+  {% if not ready %}<p class="settings-off" data-state="{{ state }}"><span class="setting-dot" aria-hidden="true"></span><span>{{ t.code('settings.off.' ~ state) }}</span></p>{% endif %}
+  {% for group, kinds in (('models', ('anthropic', 'openai')), ('alerts', ('telegram',))) %}
+  <section class="settings-group" aria-labelledby="settings-{{ group }}">
+    <h2 class="section-title" id="settings-{{ group }}">{{ t('settings.group.' ~ group) }}</h2>
+    <p class="note">{{ t('settings.group.' ~ group ~ '.note') }}</p>
+    <ul class="settings-list">
+      {% for row in rows if row.kind in kinds %}
+      <li class="setting is-{{ ('problem' if row.problem else ('set' if row.set else 'unset')) if ready else 'unknown' }}" data-kind="{{ row.kind }}">
+        <div class="setting-info">
+          <span class="setting-name">{{ t('settings.kind.' ~ row.kind) }}</span>
+          <span class="setting-state"><span class="setting-dot" aria-hidden="true"></span><span>{% if not ready %}{{ t('settings.unknown') }}{% elif row.problem %}{{ t('settings.problem') }}{% elif row.set %}{{ say('settings.set', row.kind) }}{% if row.tail %}, {{ t('settings.tail', tail=row.tail) }}{% endif %}{% if row.changed %}, <time datetime="{{ row.changed.isoformat() }}" title="{{ stamp(row.changed) }}">{{ changed(row.kind, row.changed) }}</time>{% endif %}{% else %}{{ t('settings.unset') }}{% endif %}</span></span>
+          {% if ready and row.kind == 'telegram' and row.set and row.chat_tail %}<span class="setting-note">{{ t('settings.chat_tail', tail=row.chat_tail) }}</span>{% endif %}
+          {% if ready and row.provider and not row.in_use %}<span class="setting-note">{{ t.code('settings.not_in_proxy') }}</span>{% endif %}
+        </div>
+        <div class="setting-actions">
+          {% if ready %}
+          <a class="setting-go" href="{{ base }}/ajustes/cambiar?tipo={{ row.kind }}">{{ t('settings.change') if row.set else t('settings.put') }}<span class="visually-hidden"> {{ t('settings.what.' ~ row.kind) }}</span></a>
+          {% if row.set %}<a class="setting-remove" href="{{ base }}/ajustes/quitar?tipo={{ row.kind }}">{{ t('settings.remove') }}<span class="visually-hidden"> {{ t('settings.what.' ~ row.kind) }}</span></a>{% endif %}
+          {% else %}
+          <span class="setting-go is-off" aria-disabled="true">{{ t('settings.change') }}</span>
+          {% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endfor %}
+  <section class="settings-group" aria-labelledby="settings-spend">
+    <h2 class="section-title" id="settings-spend">{{ t('settings.group.spend') }}</h2>
+    <ul class="settings-list">
+      <li class="setting is-later" data-kind="cap">
+        <div class="setting-info">
+          <label class="setting-name" for="setting-cap">{{ t('settings.cap') }}</label>
+          <span class="setting-state" id="setting-cap-note"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('settings.cap.t11') }}</span></span>
+        </div>
+        <div class="setting-actions"><input id="setting-cap" class="setting-input setting-cap" type="text" inputmode="decimal" disabled aria-describedby="setting-cap-note"></div>
+      </li>
+    </ul>
+  </section>
+  <p class="note settings-agent">{{ t('settings.agent') }}</p>
 </main>
 {% endblock %}

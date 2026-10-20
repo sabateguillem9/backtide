@@ -5,8 +5,11 @@ style fields are filled by ``Translator`` (plain text) or by ``narrate.sentence`
 agent text made visible and escaped).
 """
 
+import re
 from collections.abc import Mapping
 from typing import Any
+
+from markupsafe import Markup, escape
 
 LANGUAGES = ("es", "en")
 DEFAULT_LANGUAGE = "es"
@@ -386,7 +389,7 @@ ES: dict[str, str] = {
     "settings.changed": "cambiada el {when}",
     "settings.unset": "sin configurar",
     "settings.chat_tail": "Tu chat termina en …{tail}.",
-    "settings.not_in_proxy": "Ningún proveedor de [proxy] se llama así: nadie la usa.",
+    "settings.not_in_proxy": "Ningún proveedor de `[proxy]` se llama así: nadie la usa.",
     "settings.restart": "Un cambio aquí se aplica al reiniciar el servicio.",
     "settings.change": "Cambiar",
     "settings.put": "Poner",
@@ -412,8 +415,8 @@ ES: dict[str, str] = {
     "settings.confirm.no": "Cancelar",
     "settings.confirm.clear": "Quitar {what}",
     "settings.confirm.clear.in_use": "El proxy deja de usarla al momento y el agente se queda sin "
-    "ese modelo. backtide no arranca con un proveedor de [proxy] sin clave: pon otra o quítalo de "
-    "backtide.toml antes de reiniciar.",
+    "ese modelo. backtide no arranca con un proveedor de `[proxy]` sin clave: pon otra o quítalo "
+    "de `backtide.toml` antes de reiniciar.",
     "settings.confirm.clear.unused": "Ningún proveedor la usa ahora mismo.",
     "settings.confirm.clear.telegram": "Sin el archivo no hay bot: los avisos van solo al "
     "registro. Se aplica al reiniciar el servicio.",
@@ -429,7 +432,7 @@ ES: dict[str, str] = {
     "settings.out.untrusted": "No se ha enviado: el socket del servicio no es de fiar",
     "settings.applied.now": "El proxy ya usa lo nuevo.",
     "settings.applied.when_up": "El proxy está caído ahora mismo: lo tomará en cuanto vuelva.",
-    "settings.applied.unused": "Ningún proveedor de [proxy] se llama así: nadie la usa todavía.",
+    "settings.applied.unused": "Ningún proveedor de `[proxy]` se llama así: nadie la usa todavía.",
     "settings.applied.restart": "Se aplica al reiniciar el servicio.",
     "settings.back": "Volver a Ajustes",
     "settings.not.title": "Ahora no",
@@ -447,6 +450,32 @@ ES: dict[str, str] = {
     "settings.what.anthropic": "la clave de Anthropic",
     "settings.what.openai": "la clave de OpenAI",
     "settings.what.telegram": "el bot de Telegram",
+    "settings.group.models": "Modelos",
+    "settings.group.models.note": "El proxy usa una clave nueva en la siguiente llamada, sin "
+    "reiniciar nada. Lo que esté esperando tu sí en ese momento se rechaza.",
+    "settings.group.alerts": "Avisos",
+    "settings.group.alerts.note": "Por el bot te llegan los avisos y desde él pausas al agente. "
+    "Un cambio aquí se aplica al reiniciar el servicio.",
+    "settings.group.spend": "Gasto",
+    "settings.set.telegram": "configurado",
+    "settings.changed.telegram": "cambiado el {when}",
+    "settings.changed.today": "cambiada hoy a las {time}",
+    "settings.changed.today.telegram": "cambiado hoy a las {time}",
+    "settings.changed.yesterday": "cambiada ayer a las {time}",
+    "settings.changed.yesterday.telegram": "cambiado ayer a las {time}",
+    "settings.confirm.current.telegram": "El token que hay ahora termina en …{tail}.",
+    "settings.confirm.box.telegram": "Sí, sustituye lo que hay ahora (el token termina en …{tail})",
+    "settings.confirm.box.plain.telegram": "Sí, sustituye lo que hay ahora",
+    "settings.confirm.remove.telegram": "Sí, quitarlo",
+    "settings.out.saved.telegram": "Guardado",
+    "settings.out.cleared.telegram": "Quitado",
+    "settings.hint.anthropic": "Empieza por `sk-ant-`. Al guardarla no vuelve a mostrarse: solo "
+    "sus cuatro últimos caracteres.",
+    "settings.hint.openai": "Empieza por `sk-`. Al guardarla no vuelve a mostrarse: solo sus "
+    "cuatro últimos caracteres.",
+    "settings.hint.telegram": "Cifras, dos puntos y unos 35 caracteres, tal como lo da "
+    "@BotFather. Al guardarlo no vuelve a mostrarse.",
+    "settings.hint.chat": "Solo cifras.",
     "risk.0": "riesgo normal",
     "risk.1": "riesgo a tener en cuenta",
     "risk.2": "riesgo importante",
@@ -813,7 +842,7 @@ EN: dict[str, str] = {
     "settings.changed": "changed on {when}",
     "settings.unset": "not set",
     "settings.chat_tail": "Your chat ends in …{tail}.",
-    "settings.not_in_proxy": "No [proxy] provider has this name: nobody uses it.",
+    "settings.not_in_proxy": "No `[proxy]` provider has this name: nobody uses it.",
     "settings.restart": "A change here applies when the service restarts.",
     "settings.change": "Change",
     "settings.put": "Set",
@@ -839,8 +868,8 @@ EN: dict[str, str] = {
     "settings.confirm.no": "Cancel",
     "settings.confirm.clear": "Remove {what}",
     "settings.confirm.clear.in_use": "The proxy stops using it at once and the agent is left "
-    "without that model. backtide does not start with a [proxy] provider that has no key: set "
-    "another one or remove it from backtide.toml before restarting.",
+    "without that model. backtide does not start with a `[proxy]` provider that has no key: set "
+    "another one or remove it from `backtide.toml` before restarting.",
     "settings.confirm.clear.unused": "No provider uses it right now.",
     "settings.confirm.clear.telegram": "Without the file there is no bot: alerts only go to the "
     "log. It applies when the service restarts.",
@@ -857,7 +886,7 @@ EN: dict[str, str] = {
     "settings.out.untrusted": "Not sent: the service's socket cannot be trusted",
     "settings.applied.now": "The proxy already uses the new one.",
     "settings.applied.when_up": "The proxy is down right now: it takes it as soon as it is back.",
-    "settings.applied.unused": "No [proxy] provider has this name: nobody uses it yet.",
+    "settings.applied.unused": "No `[proxy]` provider has this name: nobody uses it yet.",
     "settings.applied.restart": "It applies when the service restarts.",
     "settings.back": "Back to Settings",
     "settings.not.title": "Not now",
@@ -875,6 +904,32 @@ EN: dict[str, str] = {
     "settings.what.anthropic": "the Anthropic key",
     "settings.what.openai": "the OpenAI key",
     "settings.what.telegram": "the Telegram bot",
+    "settings.group.models": "Models",
+    "settings.group.models.note": "The proxy uses a new key on the next call, with nothing "
+    "restarted. Whatever is waiting for your yes at that moment is refused.",
+    "settings.group.alerts": "Alerts",
+    "settings.group.alerts.note": "The bot brings you the alerts, and from it you pause the "
+    "agent. A change here applies when the service restarts.",
+    "settings.group.spend": "Spending",
+    "settings.set.telegram": "set",
+    "settings.changed.telegram": "changed on {when}",
+    "settings.changed.today": "changed today at {time}",
+    "settings.changed.today.telegram": "changed today at {time}",
+    "settings.changed.yesterday": "changed yesterday at {time}",
+    "settings.changed.yesterday.telegram": "changed yesterday at {time}",
+    "settings.confirm.current.telegram": "The current token ends in …{tail}.",
+    "settings.confirm.box.telegram": "Yes, replace what is set now (the token ends in …{tail})",
+    "settings.confirm.box.plain.telegram": "Yes, replace what is set now",
+    "settings.confirm.remove.telegram": "Yes, remove it",
+    "settings.out.saved.telegram": "Saved",
+    "settings.out.cleared.telegram": "Removed",
+    "settings.hint.anthropic": "It starts with `sk-ant-`. Once saved it is never shown again: only "
+    "its last four characters.",
+    "settings.hint.openai": "It starts with `sk-`. Once saved it is never shown again: only its "
+    "last four characters.",
+    "settings.hint.telegram": "Digits, a colon and about 35 characters, as @BotFather hands it "
+    "out. Once saved it is never shown again.",
+    "settings.hint.chat": "Digits only.",
     "risk.0": "normal risk",
     "risk.1": "risk to keep in mind",
     "risk.2": "important risk",
@@ -883,6 +938,7 @@ EN: dict[str, str] = {
 }
 
 STRINGS: Mapping[str, Mapping[str, str]] = {"es": ES, "en": EN}
+_CODE = re.compile(r"`([^`]+)`")
 
 
 class Translator:
@@ -910,6 +966,16 @@ class Translator:
 
     def plural(self, key: str, n: int) -> str:
         return self(f"{key}.one" if n == 1 else f"{key}.other", n=n)
+
+    def code(self, key: str, **params: Any) -> Markup:
+        """``t(key)`` as markup, each `command` of it in a ``<code>`` (one click selects it).
+        Every piece is escaped: only our own backticks become tags. For our strings, never for
+        text the agent wrote."""
+        parts = _CODE.split(self(key, **params))  # the odd ones are the commands
+        return Markup("").join(
+            Markup("<code>{}</code>").format(part) if i % 2 else escape(part)
+            for i, part in enumerate(parts)
+        )
 
 
 def negotiate(header: str | None) -> str:

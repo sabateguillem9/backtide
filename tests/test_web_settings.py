@@ -127,7 +127,7 @@ def test_the_page_says_what_is_set_and_never_more(web: TestClient) -> None:
     page = web.get("/ajustes")
     assert page.status_code == 200
     said = text_of(page.text)
-    assert "Clave de Anthropic configurada, termina en …WXyz, cambiada el" in said
+    assert "Clave de Anthropic configurada, termina en …WXyz, cambiada ayer a las" in said
     assert "Clave de OpenAI sin configurar" in said
     assert "Ningún proveedor de [proxy] se llama así" in said
     assert "Bot de Telegram sin configurar" in said
