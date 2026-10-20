@@ -358,3 +358,107 @@ def test_the_watch_runs_on_its_own_thread(tmp_path: Any, monkeypatch: pytest.Mon
     world.egress.start(world.hooks)
     world.egress.stop()
     assert ticks == [f"backtide-egress/{egress.WATCH_EVERY}", "start", "close"]
+
+
+# --- held requests (T10-2) -----------------------------------------------------------------------
+
+
+def test_without_a_channel_nothing_is_held(world: World) -> None:
+    assert world.egress.decide("h-000000000001", "approve", by="cli", requested_by="x").status == (
+        "unknown"
+    )
+    assert world.egress.pending() == []
+    assert world.egress.reject_holds("pause") == 0
+
+
+class Holding(FakeChannel):
+    def __init__(self, log: list[str]) -> None:
+        super().__init__(log)
+        self.asked: list[tuple[Any, ...]] = []
+
+    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> Any:
+        self.asked.append(("decide", hold_id, verdict, by, requested_by))
+        return "outcome"
+
+    def pending(self) -> list[dict[str, Any]]:
+        return [{"hold_id": "h-000000000001"}]
+
+    def reject_open(self, by: str) -> int:
+        self.asked.append(("reject_open", by))
+        if by == "boom":
+            raise RuntimeError("injected")
+        return 2
+
+
+def test_decisions_go_to_the_channel_of_the_moment(world: World) -> None:
+    channel = Holding(world.log)
+    world.connect = lambda jail, timeout: channel  # type: ignore[method-assign,assignment]
+    world.egress._connect = world.connect  # noqa: SLF001
+    started(world)
+    assert world.egress.decide("h-1", "reject", by="cli", requested_by="me") == "outcome"
+    assert world.egress.pending() == [{"hold_id": "h-000000000001"}]
+    assert world.egress.reject_holds("rewind") == 2
+    assert world.egress.reject_holds("boom") == 0  # never raises into the Guardian
+    assert channel.asked[:2] == [
+        ("decide", "h-1", "reject", "cli", "me"),
+        ("reject_open", "rewind"),
+    ]
+
+
+class Ev:
+    def __init__(self, action: str, hold_id: str, ago_s: float, target: str = "t") -> None:
+        from datetime import timedelta
+
+        from backtide.snapshots import utc_now
+
+        self.action = action
+        self.target = target
+        self.ts = (utc_now() - timedelta(seconds=ago_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        self.details = {"hold_id": hold_id, "fp": "0123456789abcdef"}
+
+
+def test_the_first_start_closes_the_holds_a_dead_backtide_left_open(tmp_path: Any) -> None:
+    world = World(tmp_path)
+    asked: list[dict[str, Any]] = []
+    history = [
+        Ev("held", "h-00000000000a", 120, target="https://api.fake.test/x"),
+        Ev("held", "h-00000000000b", 100),
+        Ev("rejected", "h-00000000000b", 90),
+    ]
+
+    def read(**query: Any) -> list[Ev]:
+        asked.append(query)
+        return history
+
+    world.egress._history = read  # noqa: SLF001
+    gate: list[tuple[str, str, dict[str, Any], int]] = []
+
+    def record(source: str, action: str, target: str = "", *, details: Any = None,
+               risk: int = 0) -> None:  # fmt: skip
+        if source == "gate":
+            gate.append((action, target, details, risk))
+        else:
+            world.record(source, action, target, details=details, risk=risk)
+
+    world.hooks = EgressHooks(record=record, alert=world.alert, back=world.back)
+    assert world.egress.start(world.hooks)
+    assert asked and asked[0]["source"] == "gate"
+    assert gate == [
+        ("expired", "https://api.fake.test/x",
+         {"hold_id": "h-00000000000a", "why": "restart", "fp": "0123456789abcdef"}, 2)
+    ]  # fmt: skip
+    world.egress.stop()
+    world.egress.start(world.hooks)  # once per service
+    assert len(gate) == 1
+
+
+def test_a_black_box_that_cannot_be_read_at_start_is_said(tmp_path: Any) -> None:
+    world = World(tmp_path)
+
+    def broken(**query: Any) -> list[Any]:
+        raise RuntimeError("unreadable")
+
+    world.egress._history = broken  # noqa: SLF001
+    assert world.egress.start(world.hooks)
+    details, risk = world.only("gate_restart_check_failed")
+    assert risk == 2 and "unreadable" in details["error"]

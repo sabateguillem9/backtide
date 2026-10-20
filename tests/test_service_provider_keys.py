@@ -309,7 +309,7 @@ def test_write_config_writes_the_fake_key(layout: Path) -> None:
 def test_the_egress_policy_has_the_providers_and_their_hosts(layout: Path) -> None:
     config = configured(layout)
     agent = AgentJail(config.jail_config())
-    box = SimpleNamespace(append=lambda *args, **kwargs: None)
+    box = SimpleNamespace(append=lambda *args, **kwargs: None, events=lambda **query: [])
     egress = build_egress(config, agent, box, proxy=ProxyJail(config.proxy_jail_config()))  # type: ignore[arg-type]
     policy = egress._policy  # noqa: SLF001 - what the channel will send
     assert isinstance(policy.providers, Providers)

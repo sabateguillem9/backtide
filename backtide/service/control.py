@@ -1,5 +1,6 @@
-"""The control socket: how `backtide rebobinar` asks a running service to rewind, and how
-`backtide seguir` asks it to resume after a pause by space (T04d-2).
+"""The control socket: how `backtide rebobinar` asks a running service to rewind, how
+`backtide seguir` asks it to resume after a pause by space (T04d-2), and how `backtide aprobar`,
+`backtide rechazar` and `backtide retenidas` decide on the held requests (T10-2).
 
 Design: docs/19-diseno-t04.md, sections 4 ("El socket de control") and "La CLI".
 
@@ -17,8 +18,10 @@ The server (inside the service):
   credentials cannot be read, the connection is refused.
 - One JSON object per connection, on one line, at most 4 KiB, and 5 s to send it (a total
   deadline, not per read: a client that sends a byte every 4 s does not get more time):
-  ``{"cmd": "rewind", "snapshot_id": ...}`` (plus ``"via": "web"`` from `backtide web`, T12b) or
-  ``{"cmd": "resume"}``, with exactly those keys.
+  ``{"cmd": "rewind", "snapshot_id": ...}`` (plus ``"via": "web"`` from `backtide web`, T12b),
+  ``{"cmd": "resume"}``, ``{"cmd": "decide", "hold_id": ..., "verdict": "approve" | "reject"}``
+  (plus ``via``; docs/32 section 11) or ``{"cmd": "holds"}``, with exactly those keys. The
+  agent never reaches this socket (invariant 1), so it cannot approve its own requests.
   Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
   not a snapshot id) is refused WITHOUT calling the Guardian.
 - One thread per connection (``socketserver``), at most ``MAX_CONNECTIONS`` at a time, so a
@@ -49,6 +52,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from backtide.blackbox import redact
+from backtide.service.holds import HOLD_ID_RE, HoldOutcome, HoldStatus
 from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from backtide.snapshots import Snapshot
@@ -84,6 +88,18 @@ _RESUME_OK = frozenset({ResumeStatus.RESUMED, ResumeStatus.NOT_PAUSED})
 # set: any process of the allowed user could claim either, and the uid and pid recorded next to
 # it are the kernel's. "cli" is what a request without ``via`` means.
 REQUESTERS = frozenset({"cli", "web", "telegram"})  # "telegram": the bot in the service (T09)
+DECIDE_VERDICTS = frozenset({"approve", "reject"})
+_DECIDED = frozenset({HoldStatus.RELEASED, HoldStatus.PREAPPROVED, HoldStatus.REJECTED})
+HOLD_OUTCOMES = frozenset({*(str(status) for status in HoldStatus), REFUSED})
+# `backtide aprobar` / `rechazar`: 0 decided; 1 not done (no such hold, or not recorded); 2 a
+# request that was refused (malformed or not allowed), like an invalid id.
+HOLD_EXIT_CODES = {
+    **{str(status): 0 for status in _DECIDED},
+    str(HoldStatus.UNKNOWN): 1,
+    str(HoldStatus.FAILED): 1,
+    REFUSED: 2,
+}
+MAX_LISTED_HOLDS = 100
 
 
 class ControlError(Exception):
@@ -105,6 +121,12 @@ class RewindService(Protocol):
     def rewind(self, snapshot_id: str, *, requested_by: str) -> RewindOutcome: ...
 
     def resume(self, *, requested_by: str) -> ResumeOutcome: ...
+
+    def decide_hold(
+        self, hold_id: str, verdict: str, *, via: str, requested_by: str
+    ) -> HoldOutcome: ...
+
+    def pending_holds(self) -> list[dict[str, Any]]: ...
 
 
 PeerCredentials = Callable[[socket.socket], tuple[int, int, int]]
@@ -285,7 +307,51 @@ class ControlServer:
             return self._rewind(request, pid, uid)
         if command == "resume":
             return self._resume(request, pid, uid)
+        if command == "decide":
+            return self._decide(request, pid, uid)
+        if command == "holds":
+            return self._holds(request)
         raise _BadRequest("Orden desconocida.")
+
+    def _decide(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        if set(request) - {"via"} != {"cmd", "hold_id", "verdict"}:
+            raise _BadRequest(
+                "Una decisión lleva `cmd`, `hold_id`, `verdict` y quizá `via`, y nada más."
+            )
+        via = request.get("via", "cli")
+        if not isinstance(via, str) or via not in REQUESTERS:
+            raise _BadRequest("`via` tiene que ser uno de: " + ", ".join(sorted(REQUESTERS)) + ".")
+        if via == "telegram" and pid != os.getpid():  # the bot lives in this very process (T09)
+            raise _BadRequest("Solo el bot de backtide, dentro del servicio, pide como `telegram`.")
+        hold_id, verdict = request["hold_id"], request["verdict"]
+        if not isinstance(hold_id, str) or not HOLD_ID_RE.fullmatch(hold_id):
+            raise _BadRequest("Eso no es el identificador de una petición retenida (h-…).")
+        if verdict not in DECIDE_VERDICTS:
+            raise _BadRequest("`verdict` tiene que ser `approve` o `reject`.")
+        try:
+            outcome = self._guardian.decide_hold(
+                hold_id, verdict, via=via, requested_by=f"{via} (uid {uid}, pid {pid})"
+            )
+        except Exception:  # the Guardian should not raise; if it does, nothing was approved
+            logger.exception("deciding on %s raised instead of answering", hold_id)
+            outcome = HoldOutcome(HoldStatus.FAILED, hold_id)
+        return {
+            "ok": outcome.status in _DECIDED,
+            "outcome": str(outcome.status),
+            "message": outcome.message,
+            "hold_id": hold_id,
+        }
+
+    def _holds(self, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una petición de retenidas lleva `cmd` y nada más.")
+        try:
+            holds = self._guardian.pending_holds()
+        except Exception:
+            logger.exception("listing the held requests raised instead of answering")
+            return {"ok": False, "outcome": "failed", "holds": [],
+                    "message": "No se han podido leer las peticiones retenidas."}  # fmt: skip
+        return {"ok": True, "outcome": "listed", "holds": redact(holds), "message": ""}
 
     def _resume(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         if set(request) != {"cmd"}:
@@ -618,6 +684,90 @@ def ask_resume(
         "message": reply["message"],
         "agent_state": state if isinstance(state, str) else "",
     }
+
+
+def ask_decide(
+    path: Path,
+    hold_id: str,
+    verdict: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    reply_timeout: float = REPLY_TIMEOUT * 6,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Ask the service at ``path`` to approve or reject the held request ``hold_id`` (`backtide
+    aprobar` / `rechazar`). Returns its reply, checked: ``ok``, ``outcome`` (a ``HoldStatus`` or
+    "refused") and ``message``. ValueError for a verdict that is not one (nothing sent)."""
+    if verdict not in DECIDE_VERDICTS:
+        raise ValueError("verdict is approve or reject")
+    raw = _ask(
+        Path(path),
+        {"cmd": "decide", "hold_id": hold_id, "verdict": verdict},
+        what="la decisión",
+        wait=wait,
+        reply_timeout=reply_timeout,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in HOLD_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si se ha decidido: mira "
+            "`backtide retenidas` y la caja negra."
+        )
+    return {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
+
+
+def ask_holds(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> list[dict[str, Any]]:
+    """The held requests the service at ``path`` is waiting on (`backtide retenidas`), checked:
+    each a dict with its ``hold_id`` and the texts the CLI shows. ControlError if the reply makes
+    no sense or the service could not list them."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "holds"},
+        what="la lista",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict) or not isinstance(reply.get("holds"), list):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    if reply.get("ok") is not True:
+        message = reply.get("message")
+        raise ControlError(message if isinstance(message, str) else "No se ha podido listar.")
+    holds = []
+    for item in reply["holds"][:MAX_LISTED_HOLDS]:
+        if not isinstance(item, dict) or not isinstance(item.get("hold_id"), str):
+            continue
+        if not HOLD_ID_RE.fullmatch(item["hold_id"]):
+            continue
+        holds.append(item)
+    return holds
+
+
+def _json_or_none(raw: bytes) -> Any:
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def _ask(

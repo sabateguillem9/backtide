@@ -25,16 +25,20 @@ from typing import Any
 import pytest
 
 from backtide.service.control import (
+    HOLD_EXIT_CODES,
     MAX_REQUEST_BYTES,
     OUTCOME_EXIT_CODES,
     ControlError,
     ControlOutcomeUnknown,
     ControlServer,
     ControlUnavailable,
+    ask_decide,
+    ask_holds,
     ask_resume,
     ask_rewind,
     peer_credentials,
 )
+from backtide.service.holds import HoldOutcome, HoldStatus
 from backtide.service.pause import ResumeOutcome, ResumeStatus
 from backtide.service.rewind import RewindOutcome, RewindStatus
 from backtide.snapshots import Snapshot
@@ -76,6 +80,9 @@ class FakeGuardian:
         self.resume_outcome = ResumeOutcome(
             ResumeStatus.RESUMED, "El agente sigue donde estaba.", "running"
         )
+        self.decisions: list[tuple[str, str, str, str]] = []
+        self.hold_status = HoldStatus.RELEASED
+        self.holds: list[dict[str, Any]] = []
 
     def rewind(self, snapshot_id: str, *, requested_by: str) -> RewindOutcome:
         self.calls.append((snapshot_id, requested_by))
@@ -91,6 +98,19 @@ class FakeGuardian:
         if self.error is not None:
             raise self.error
         return self.resume_outcome
+
+    def decide_hold(
+        self, hold_id: str, verdict: str, *, via: str, requested_by: str
+    ) -> HoldOutcome:
+        self.decisions.append((hold_id, verdict, via, requested_by))
+        if self.error is not None:
+            raise self.error
+        return HoldOutcome(self.hold_status, hold_id)
+
+    def pending_holds(self) -> list[dict[str, Any]]:
+        if self.error is not None:
+            raise self.error
+        return self.holds
 
 
 @pytest.fixture
@@ -948,3 +968,91 @@ def test_a_resume_reply_keeps_only_what_the_cli_uses(folder: Path) -> None:
     reply = ask_resume(folder / "control.sock", wait=0, peer=me)
     thread.join(5)
     assert set(reply) == {"ok", "outcome", "message", "agent_state"}
+
+
+# --- held requests (T10-2): `backtide aprobar`, `rechazar` and `retenidas` -----------------------
+
+HOLD = "h-0123456789ab"
+
+
+def decide_request(**fields: object) -> bytes:
+    base: dict[str, object] = {"cmd": "decide", "hold_id": HOLD, "verdict": "approve"}
+    return json.dumps(base | fields).encode() + b"\n"
+
+
+@pytest.mark.parametrize(
+    ("status", "ok"),
+    [(HoldStatus.RELEASED, True), (HoldStatus.PREAPPROVED, True), (HoldStatus.REJECTED, True),
+     (HoldStatus.UNKNOWN, False), (HoldStatus.FAILED, False)],
+)  # fmt: skip
+def test_a_decision_reaches_the_guardian_with_who_asked(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian, status: HoldStatus, ok: bool
+) -> None:
+    guardian.hold_status = status
+    reply = ask_decide(make_server().path, HOLD, "approve", peer=me)
+    assert (reply["ok"], reply["outcome"]) == (ok, str(status))
+    assert reply["message"] == HoldOutcome(status, HOLD).message
+    assert guardian.decisions == [(HOLD, "approve", "cli", f"cli (uid {ME}, pid 4242)")]
+    assert HOLD_EXIT_CODES[reply["outcome"]] == (0 if ok else 1)
+
+
+@pytest.mark.parametrize(
+    ("line", "says"),
+    [
+        (decide_request(hold_id="h-XYZ"), "identificador"),
+        (decide_request(hold_id=7), "identificador"),
+        (decide_request(verdict="maybe"), "approve"),
+        (decide_request(extra=1), "nada más"),
+        (decide_request(via="agent"), "via"),
+        (decide_request(via="telegram"), "bot"),  # only the bot, inside the service
+        (json.dumps({"cmd": "decide", "hold_id": HOLD}).encode() + b"\n", "nada más"),
+        (json.dumps({"cmd": "holds", "x": 1}).encode() + b"\n", "nada más"),
+    ],
+)
+def test_a_bad_decision_is_refused_without_calling_the_guardian(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian, line: bytes, says: str
+) -> None:
+    reply = talk(make_server(), line)
+    assert reply["outcome"] == "refused" and says in reply["message"]
+    assert guardian.decisions == []
+
+
+def test_another_user_cannot_decide(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    reply = talk(make_server(peer=somebody_else), decide_request())
+    assert reply["outcome"] == "refused" and guardian.decisions == []
+
+
+def test_a_guardian_that_raises_approves_nothing(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    guardian.error = RuntimeError("boom")
+    reply = ask_decide(make_server().path, HOLD, "reject", peer=me)
+    assert (reply["ok"], reply["outcome"]) == (False, "failed")
+
+
+def test_the_client_refuses_a_verdict_that_is_not_one(folder: Path) -> None:
+    with pytest.raises(ValueError):
+        ask_decide(folder / "control.sock", HOLD, "maybe")
+
+
+def test_the_held_requests_are_listed_struck_and_checked(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    secret = "sk-ant-api03-" + "x" * 40
+    guardian.holds = [
+        {"hold_id": HOLD, "method": "DELETE", "path": f"/x?k={secret}", "risk": 3},
+        {"hold_id": "not-an-id", "method": "GET"},
+    ]
+    holds = ask_holds(make_server().path, peer=me)
+    assert [h["hold_id"] for h in holds] == [HOLD]
+    assert secret not in json.dumps(holds)
+
+
+def test_a_listing_that_fails_is_an_error(
+    make_server: Callable[..., ControlServer], guardian: FakeGuardian
+) -> None:
+    guardian.error = RuntimeError("boom")
+    with pytest.raises(ControlError):
+        ask_holds(make_server().path, peer=me)

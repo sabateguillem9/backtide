@@ -67,6 +67,9 @@ PROXY_ALIAS = "backtide-proxy"
 # of the agent's own network (Docker's DNS).
 RESOLVING_INWARDS = ("localhost", "2130706433")
 DNS_CANARY_DOMAIN = "dns-canary.test"
+# Since T10-2 the gate holds every write (a POST to the allowed host too). The labs shorten its
+# times (a concession of the tests): a held request waits 3 s and gets "pending" (429).
+HOLD_TIMINGS = ("--hold-timings", "60,3,60,60")
 
 
 @dataclass
@@ -131,7 +134,7 @@ def start_lab(
     internet: FakeInternet | None = None
     try:
         internet = start_fake_internet(service, tmp_path_factory.mktemp("t06-5-internet"))
-        service.main_args = internet.service_args()
+        service.main_args = (*internet.service_args(), *HOLD_TIMINGS)
         service.start()
         service.wait_ready()
     except BaseException:
@@ -195,7 +198,9 @@ def test_out_only_through_the_proxy(attack: Attack, lab: Lab) -> None:
         lab.agent, "salida_por_el_proxy", PLAIN_HOST, OTHER_HOST, lab.internet.ip, tag
     )
     assert outcome["allowed_get"]["status"] == 200, outcome  # the control: the way out works
-    assert outcome["allowed_post"]["status"] == 200, outcome
+    # T10-2: a write waits for the person (held, recorded as gate/held), even to an allowed host.
+    assert outcome["allowed_post"]["status"] == 429, outcome
+    assert [e.details["path"] for e in lab.tagged(tag, "held")] == [f"/{tag}/post"]
     arrived = {r["path"]: r for r in lab.internet.requests(PLAIN_HOST, f"/{tag}/")}
     recorded = {e.details["path"]: e for e in lab.tagged(tag, "request")}
     before_arrival = all(
@@ -224,11 +229,12 @@ def test_out_only_through_the_proxy(attack: Attack, lab: Lab) -> None:
     )
     attack.check(
         "recorded",
-        sorted(arrived) == sorted({f"/{tag}/get", f"/{tag}/post"})
+        sorted(arrived) == [f"/{tag}/get"]
         and before_arrival
         and reasons(blocked) == ["not_allowed"],
         f"{len(recorded)} net/request grabados antes de que el servidor falso los recibiera "
-        f"({sorted(arrived)}); el no permitido, net/blocked {reasons(blocked)}",
+        f"({sorted(arrived)}); el POST, retenido (gate/held, sin llegar); el no permitido, "
+        f"net/blocked {reasons(blocked)}",
     )
     attack.check(
         "risk",
@@ -379,11 +385,12 @@ def test_fronting_and_tunnels_are_refused(attack: Attack, lab: Lab) -> None:
     seq = lab.head()
     outcome = attack.run_script(lab.agent, "fronting_y_tuneles", PLAIN_HOST, OTHER_HOST, tag)
     arrived = {r["path"]: r for r in lab.internet.requests(path_prefix=f"/{tag}/")}
-    # The honest chunked POST is the control: it does go out, recorded before it arrives.
+    # The honest chunked POST is the control: it waits for backtide like any other, which since
+    # T10-2 holds it (a write): recorded whole as gate/held, and nothing of it arrives.
     honest = f"/{tag}/honest-chunked"
-    assert outcome["honest_chunked"] == [200, 200], outcome
-    [request] = [e for e in lab.tagged(tag, "request") if e.details["path"] == honest]
-    assert ts(request) < arrived[honest]["at"]
+    assert outcome["honest_chunked"] == [200, 429], outcome
+    [request] = [e for e in lab.tagged(tag, "held") if e.details["path"] == honest]
+    assert honest not in arrived
     assert request.details["body"]["size"] > 64 * 1024
     fronted = [p for p in arrived if "fronted" in p and not p.endswith("-get")]
     ssh = outcome["ssh_in_443"]
@@ -399,7 +406,7 @@ def test_fronting_and_tunnels_are_refused(attack: Attack, lab: Lab) -> None:
         f"GET honrado en el mismo túnel: {outcome['fronted_chunked']}; al servidor falso no llegó "
         f"nada de eso ({fronted or 'nada'}). CONNECT al 22: {outcome['ssh_port']}. SSH dentro de "
         f"un CONNECT al 443: {ssh} (sin TLS, el proxy no lo deja pasar). Control: el POST a "
-        f"trozos honrado sale ({outcome['honest_chunked']}), grabado antes de llegar",
+        f"trozos honrado llega a backtide y queda retenido ({outcome['honest_chunked']})",
     )
     got = reasons(blocked)
     transport = [e.action for e in lab.since(seq) if e.action in ("tls_failed", "error")]
@@ -426,9 +433,15 @@ def test_secrets_in_requests_never_reach_the_black_box(attack: Attack, lab: Lab)
     outcome = attack.run_script(
         lab.agent, "secretos_en_la_red", PLAIN_HOST, tag, str(EXCERPT_BYTES)
     )
-    assert all(status == 200 for status in outcome["sent"].values()), outcome  # it went out
-    assert len(lab.internet.requests(PLAIN_HOST, f"/{tag}/")) == len(outcome["sent"])
-    recorded = lab.tagged(tag, "request")
+    # The reads with the token only in a header go out; since T10-2 the writes, and the reads
+    # whose URL carried it (decision 1's guard), are held (429): recorded as gate/held.
+    statuses = outcome["sent"]
+    assert all(status in (200, 429) for status in statuses.values()), outcome
+    assert statuses["header"] == statuses["lowercase"] == 200, outcome
+    assert statuses["path"] == statuses["query"] == statuses["json"] == 429, outcome
+    passed = [name for name, status in statuses.items() if status == 200]
+    assert len(lab.internet.requests(PLAIN_HOST, f"/{tag}/")) == len(passed)
+    recorded = lab.tagged(tag, "request") + lab.tagged(tag, "held")
     config = lab.service.config
     box = b""
     for path in (config.blackbox_db, config.blackbox_checkpoint):
@@ -469,9 +482,11 @@ def test_with_backtide_frozen_or_dead_nothing_goes_out(
     tag = new_tag()
     process = lab.service.require_process()
     frozen_path, dead_path = f"/{tag}/frozen", f"/{tag}/dead"
-    # The control: with backtide listening, the same request goes out.
+    # The control: with backtide listening, the same request reaches it, which since T10-2
+    # holds it (a write): 429, recorded as gate/held.
     ok = attack.run_script(lab.agent, "canal_caido", PLAIN_HOST, f"/{tag}/control")
-    assert ok["status"] == 200, ok
+    assert ok["status"] == 429, ok
+    assert [e.details["path"] for e in lab.tagged(tag, "held")] == [f"/{tag}/control"]
     os.kill(process.pid, signal.SIGSTOP)  # backtide hangs: the channel is open, nobody answers
     try:
         frozen = attack.run_script(lab.agent, "canal_caido", PLAIN_HOST, frozen_path)
@@ -498,7 +513,8 @@ def test_with_backtide_frozen_or_dead_nothing_goes_out(
         f"con backtide congelado (SIGSTOP) el proxy espera su confirmación y contesta "
         f"{frozen['status']} a los {frozen['seconds']} s; con backtide muerto (SIGKILL), "
         f"{dead['status']} a los {dead['seconds']} s. El servidor falso no recibió ninguna de las "
-        f"dos (control: con backtide atento, la misma petición sale: {ok['status']})",
+        f"dos (control: con backtide atento, la misma petición llega a backtide y queda "
+        f"retenida: {ok['status']})",
     )
     attack.check(
         "recorded",

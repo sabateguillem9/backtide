@@ -9,6 +9,7 @@ any event.
 """
 
 import asyncio
+import dataclasses
 import gzip
 import json
 import zlib
@@ -21,7 +22,7 @@ import pytest
 from backtide.blackbox.redact import KnownScrubber
 from backtide.gate import addon
 from backtide.gate.addon import FAILED, REFUSALS, Gate
-from backtide.gate.client import NOT_RECORDED, Ack, GateConfig
+from backtide.gate.client import LOST, NOT_RECORDED, Ack, Decision, GateConfig
 from backtide.gate.protocol import DEFAULT_LIMITS
 from backtide.gate.providers import FAKE_KEY_PREFIX, Kind, Provider, Providers, Secret
 
@@ -94,6 +95,7 @@ class Client:
     sockname: tuple[str, int] = (AGENT_SIDE, 8080)
     sni: str | None = "example.com"
     error: str | None = None
+    timestamp_end: float | None = None
 
 
 @dataclass
@@ -174,6 +176,15 @@ class FakeChannel:
         self.throttled = 0
         self.answer: Ack | Exception = Ack("allow", seq=7)
         self.gate: asyncio.Event | None = None
+        self.gates: list[dict[str, Any] | None] = []
+        # Holds (T10-2): whether a slot is given, the decision that comes (after ``polls``
+        # waits of nothing), and what the gate said when it let go.
+        self.slot = True
+        self.decided: Decision | None = None
+        self.polls = 0
+        self.waited = 0
+        self.on_poll: Callable[[], None] | None = None
+        self.let_gone: list[tuple[str, bool, str | None]] = []
 
     @property
     def limits(self) -> dict[str, int]:
@@ -183,8 +194,9 @@ class FakeChannel:
     def scrubber(self) -> KnownScrubber:
         return self.config.scrubber if self.config else KnownScrubber(())
 
-    async def ask(self, event: dict[str, Any]) -> Ack:
+    async def ask(self, event: dict[str, Any], gate: dict[str, Any] | None = None) -> Ack:
         self.asked.append(event)
+        self.gates.append(gate)
         if self.gate is not None:
             await self.gate.wait()
         if isinstance(self.answer, Exception):
@@ -193,6 +205,21 @@ class FakeChannel:
 
     def tell(self, event: dict[str, Any]) -> None:
         self.told.append(event)
+
+    def hold(self, hold_id: str) -> bool:
+        return self.slot
+
+    async def decision(self, hold_id: str, timeout: float) -> Decision | None:
+        self.waited += 1
+        if self.on_poll is not None:
+            self.on_poll()
+        if self.waited <= self.polls or self.decided is None:
+            await asyncio.sleep(min(timeout, 0.001))
+            return None
+        return self.decided
+
+    def let_go(self, hold_id: str, *, released: bool = False, why: str | None = None) -> None:
+        self.let_gone.append((hold_id, released, why))
 
     def count_throttled(self) -> None:
         self.throttled += 1
@@ -725,12 +752,12 @@ def test_the_decoded_body_is_let_go_before_waiting_for_the_ack(
     seen: list[list[str]] = []
 
     class Watching(FakeChannel):
-        async def ask(self, event: dict[str, Any]) -> Ack:
+        async def ask(self, event: dict[str, Any], gate: dict[str, Any] | None = None) -> Ack:
             import gc
 
             gc.collect()
             seen.append(list(freed))
-            return await super().ask(event)
+            return await super().ask(event, gate)
 
     channel = Watching()
     gate, _ = make_gate(channel)
@@ -1336,3 +1363,256 @@ def test_a_key_in_the_answer_is_recorded_even_when_the_flow_cannot_be_killed() -
     assert flow.response.stream(echo_events(REAL)) == b""
     assert channel.actions()[-1] == "blocked:real_key"
     assert died == ["died"]
+
+
+# --- the hold (T10-2, docs/32 section 6) ---------------------------------------------------------
+
+HOLD = "h-0123456789ab"
+
+
+def held(wait_ms: int = 1000) -> Ack:
+    return Ack("hold", seq=5, hold_id=HOLD, wait_ms=wait_ms, retry_after=30)
+
+
+def a_delete(path: str = "/v1/buckets/b1") -> Flow:
+    request = Request(method="DELETE", path=path, raw_content=b"")
+    return Flow(request=request)
+
+
+def hold_gate(channel: FakeChannel, flow: Flow) -> Gate:
+    """A gate whose clock is real (the hold waits in it) and that knows ``flow``'s client."""
+    import time
+
+    gate, _ = make_gate(channel, clock=time.monotonic)
+    gate.client_connected(flow.client_conn)
+    return gate
+
+
+def test_a_held_request_goes_out_only_once_backtide_allows_it() -> None:
+    channel = FakeChannel()
+    channel.answer = held()
+    channel.decided = Decision("allow", seq=12)
+    channel.polls = 3  # the person takes a while
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+
+    seen: list[bool] = []
+    channel.on_poll = lambda: seen.append(bool(gate._acked))  # noqa: SLF001
+    send(gate, flow)
+    assert seen and not any(seen)  # while held: no connection is let open for it
+    assert flow.response is None and not flow.killed  # then it goes on
+    assert channel.let_gone == [(HOLD, True, None)]  # released: the yes is spent
+    assert connect(gate, flow).error is None
+
+
+def test_a_hold_with_no_answer_in_its_wait_is_pending_429() -> None:
+    channel = FakeChannel()
+    channel.answer = held(wait_ms=30)
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == 429
+    assert flow.response is not None and flow.response.headers.get("retry-after") == "30"
+    assert HOLD.encode() in flow.response.content and b"not in a loop" in flow.response.content
+    assert channel.let_gone == [(HOLD, False, "waited")]
+    assert connect(gate, flow).error is not None
+
+
+@pytest.mark.parametrize("reason", ["rejected", "expired", "paused", "hold_full"])
+def test_a_denied_hold_is_a_403_and_nothing_is_said_back(reason: str) -> None:
+    channel = FakeChannel()
+    channel.answer = held()
+    channel.decided = Decision("deny", reason=reason)
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == 403
+    assert flow.response is not None and flow.response.content == REFUSALS[reason][1].encode()
+    assert channel.let_gone == [(HOLD, False, None)]
+    assert connect(gate, flow).error is not None
+
+
+def test_a_hold_whose_channel_is_lost_is_refused_503() -> None:
+    channel = FakeChannel()
+    channel.answer = held()
+    channel.decided = LOST
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == 503
+    assert channel.let_gone == [(HOLD, False, None)]
+    assert "blocked:not_recorded" in channel.actions()
+
+
+def test_a_held_request_whose_client_left_is_never_sent_later() -> None:
+    channel = FakeChannel()
+    channel.answer = held(wait_ms=5000)
+    channel.decided = Decision("allow", seq=12)
+    channel.polls = 2
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+
+    def leave() -> None:
+        flow.client_conn.timestamp_end = 1.0  # curl --max-time: the client gave up (Q3)
+
+    channel.on_poll = leave
+    send(gate, flow)
+    assert flow.killed and flow.response is None
+    assert channel.let_gone == [(HOLD, False, "client_left")]
+    assert connect(gate, flow).error is not None
+
+
+def test_an_allow_that_comes_after_the_client_left_lets_nothing_out() -> None:
+    channel = FakeChannel()
+    channel.answer = held(wait_ms=5000)
+    channel.decided = Decision("allow", seq=12)
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    channel.on_poll = lambda: gate.client_disconnected(flow.client_conn)
+    send(gate, flow)
+    assert flow.killed and channel.let_gone == [(HOLD, False, "client_left")]
+
+
+def test_a_hold_with_no_slot_is_pending_at_once() -> None:
+    channel = FakeChannel()
+    channel.answer = held(wait_ms=5000)
+    channel.slot = False
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == 429 and channel.waited == 0
+    assert channel.let_gone == [(HOLD, False, "no_slot")]
+
+
+def test_a_held_request_does_not_keep_a_place_of_max_pending() -> None:
+    channel = FakeChannel(limits={"max_pending": 1})
+    channel.answer = held(wait_ms=5000)
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+
+    places: list[int] = []
+    channel.on_poll = lambda: places.append(len(gate._waiting))  # noqa: SLF001
+    channel.decided = Decision("deny", reason="rejected")
+    channel.polls = 1
+    send(gate, flow)
+    assert places and places[0] == 0
+
+
+def test_a_hook_that_fails_while_holding_still_lets_the_hold_go() -> None:
+    channel = FakeChannel()
+    channel.answer = held()
+
+    def boom() -> None:
+        raise RuntimeError("injected")
+
+    channel.on_poll = boom
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    send(gate, flow)
+    assert status(flow) == FAILED[0]
+    assert channel.let_gone == [(HOLD, False, "client_left")]
+
+
+def test_a_request_that_was_answered_meanwhile_lets_its_hold_go() -> None:
+    channel = FakeChannel()
+    channel.answer = held()
+    flow = a_delete()
+    gate = hold_gate(channel, flow)
+    flow.client_conn.timestamp_end = 1.0
+    send(gate, flow)
+    assert flow.killed and channel.let_gone == [(HOLD, False, "client_left")]
+
+
+# --- the gate facts ------------------------------------------------------------------------------
+
+
+FP_KEY = bytes(32)
+
+
+def facts_of(flow: Flow, channel: FakeChannel | None = None) -> dict[str, Any]:
+    if channel is None:
+        channel = FakeChannel()
+        assert channel.config is not None
+        channel.config = dataclasses.replace(channel.config, fp_key=FP_KEY)
+    gate, _ = make_gate(channel)
+    send(gate, flow)
+    [facts] = channel.gates
+    assert facts is not None
+    return facts
+
+
+def test_every_net_request_carries_its_gate_facts() -> None:
+    facts = facts_of(Flow(request=Request(method="GET", path="/v1/items?page=2")))
+    assert set(facts) == {"fp", "url_struck", "url_bytes", "websocket", "exact_read",
+                          "wait_hint_s"}  # fmt: skip
+    assert facts["exact_read"] is True and facts["url_struck"] is False
+    assert facts["url_bytes"] == len("https://example.com:443/v1/items?page=2")
+    assert facts["websocket"] is False and facts["wait_hint_s"] is None
+
+
+def test_a_model_call_carries_no_gate_facts() -> None:
+    request = Request(
+        host="api.anthropic.com",
+        path="/v1/messages",
+        headers=Headers(
+            [
+                ("Host", "api.anthropic.com"),
+                ("x-api-key", FAKE),
+                ("content-type", "application/json"),
+            ]
+        ),  # fmt: skip
+        raw_content=json.dumps({"model": "m", "messages": [], "max_tokens": 1}).encode(),
+    )
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    send(gate, Flow(request=request, client_conn=Client(sni="api.anthropic.com")))
+    assert channel.gates == [None]
+
+
+def test_the_fingerprint_follows_the_body_the_method_and_the_query() -> None:
+    def fp(**changes: Any) -> str:
+        request = Request(raw_content=b'{"a": 1}') if not changes else Request(**changes)
+        return str(facts_of(Flow(request=request))["fp"])
+
+    base = fp()
+    assert base == fp(raw_content=b'{"a": 1}')
+    assert base != fp(raw_content=b'{"a": 2}')
+    assert base != fp(raw_content=b'{"a": 1}', method="PUT")
+    assert base != fp(raw_content=b'{"a": 1}', path="/api?x=1")
+
+
+def test_a_fingerprint_is_of_the_decoded_body() -> None:
+    plain = Request(raw_content=b'{"a": 1}')
+    packed = Request(
+        raw_content=gzip.compress(b'{"a": 1}'),
+        headers=Headers([("Host", "example.com"), ("content-encoding", "gzip")]),
+    )
+    assert facts_of(Flow(request=plain))["fp"] == facts_of(Flow(request=packed))["fp"]
+
+
+UPGRADE = Headers([("Host", "example.com"), ("Upgrade", "websocket")])
+
+
+@pytest.mark.parametrize(
+    ("request_", "key", "value"),
+    [
+        (Request(method="GET", path="/cb?access_token=abcdefghijk"), "url_struck", True),
+        (Request(method="GET", path=f"/leak/{REAL[:8]}"), "url_struck", False),
+        (Request(method="get", path="/"), "exact_read", False),
+        (Request(method="OPTIONS", path="/"), "exact_read", True),
+        (Request(method="GET", path="/" + "a" * 3000), "url_bytes", len("https://example.com:443/")
+         + 3000),
+        (Request(method="GET", headers=UPGRADE), "websocket", True),
+    ],
+)  # fmt: skip
+def test_the_gate_facts_say_what_backtide_needs(request_: Request, key: str, value: Any) -> None:
+    assert facts_of(Flow(request=request_))[key] == value
+
+
+def test_the_fingerprint_uses_this_configs_key() -> None:
+    one, two = FakeChannel(), FakeChannel()
+    assert one.config is not None and two.config is not None
+    assert one.config.fp_key != two.config.fp_key
+    flow = Flow(request=Request(raw_content=b"x"))
+    other = Flow(request=Request(raw_content=b"x"))
+    assert facts_of(flow, one)["fp"] != facts_of(other, two)["fp"]

@@ -99,6 +99,7 @@ from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProbl
 from backtide.service.clock import clock_synced as kernel_clock_synced
 from backtide.service.config import ServiceConfig
 from backtide.service.egress import EgressHooks
+from backtide.service.holds import HoldOutcome, HoldStatus
 from backtide.service.pause import (
     Holder,
     PauseOutcome,
@@ -296,6 +297,18 @@ class EgressProxy(Protocol):
         ...
 
     def stop(self, reason: str = ...) -> None: ...
+
+    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> HoldOutcome:
+        """Approve or reject a held request (T10-2)."""
+        ...
+
+    def pending(self) -> list[dict[str, Any]]:
+        """The held requests waiting for the person."""
+        ...
+
+    def reject_holds(self, by: str) -> int:
+        """Reject every open hold (a pause or a rewind, decision 7 of docs/32)."""
+        ...
 
 
 class Violation(Protocol):
@@ -1646,6 +1659,9 @@ class Guardian:
             already = "user" in self._pause_reasons
             before = self._agent_state
         held = self._freeze({"user"}, freeze=True, frozen_already=False)
+        # After the freeze (the urgent part): what the agent asked and waits for is rejected,
+        # so nothing is approved for a frozen agent (docs/32, decision 7).
+        self._reject_holds("pause")
         after = self.agent_state
         failed_freeze = held.pause_error is not None and not isinstance(
             held.pause_error, _BeingStopped
@@ -2116,6 +2132,7 @@ class Guardian:
 
     def _rewind_locked(self, target: Snapshot, requested_by: str) -> RewindOutcome:
         self._settle_earlier_rewind()
+        self._reject_holds("rewind")  # docs/32, decision 7
         attempt = _RewindAttempt(uuid4().hex, target, want_running=self._want_running())
         with self._record_failures_lock:
             failures_before = self._record_failures
@@ -3101,6 +3118,43 @@ class Guardian:
         self._egress_stopped = True
         self._egress_closing.set()
         self._egress.stop(reason)
+
+    def decide_hold(
+        self, hold_id: str, verdict: str, *, via: str, requested_by: str
+    ) -> HoldOutcome:
+        """Approve (``verdict="approve"``) or reject a held request: `backtide aprobar` and
+        `backtide rechazar` (T10-2), later Telegram and the web. ``via`` is who decides (cli,
+        web, telegram), ``requested_by`` the kernel's uid and pid. Never raises."""
+        if self._egress is None or not self._serving:
+            return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
+        try:
+            return self._egress.decide(
+                hold_id, verdict, by=via, requested_by=str(requested_by)[:MAX_REQUESTER_CHARS]
+            )
+        except Exception:
+            logger.exception("deciding on a held request failed")
+            return HoldOutcome(HoldStatus.FAILED, hold_id)
+
+    def pending_holds(self) -> list[dict[str, Any]]:
+        """The held requests waiting for the person (`backtide retenidas`). Never raises."""
+        if self._egress is None or not self._serving:
+            return []
+        try:
+            return self._egress.pending()
+        except Exception:
+            logger.exception("listing the held requests failed")
+            return []
+
+    def _reject_holds(self, by: str) -> None:
+        if self._egress is None:
+            return
+        try:
+            rejected = self._egress.reject_holds(by)
+        except Exception:  # a pause or a rewind never fails for this; the hold expires anyway
+            logger.exception("rejecting the held requests failed (%s)", by)
+            return
+        if rejected:
+            logger.info("%d held requests rejected (%s)", rejected, by)
 
     def _egress_allows_start(self) -> bool:
         """Without the proxy's hello the agent does not start (docs/21, section 9)."""

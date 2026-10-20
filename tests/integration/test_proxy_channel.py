@@ -114,12 +114,10 @@ class GatedBox:
         self.hold.set()
         self.waiting = threading.Event()
         self.broken = False
-        self.only_method: str | None = None  # hold only the appends of this method
         self.append_ms: list[float] = []
 
     def append(self, source: str, action: str, target: str, **kwargs: Any) -> Event:
-        method = (kwargs.get("details") or {}).get("method")
-        if source in {"net", "llm"} and self.only_method in (None, method):
+        if source in {"net", "llm"}:
             self.waiting.set()
             assert self.hold.wait(60)
             if self.broken:
@@ -261,7 +259,6 @@ def healthy(gate: Gate) -> Iterator[None]:
     """Every test starts and ends with the gate up and the black box working."""
     gate.box.hold.set()
     gate.box.broken = False
-    gate.box.only_method = None
     gate.egress.check()
     assert gate.egress.up, gate.system[-3:]
     yield
@@ -344,11 +341,9 @@ def test_when_the_black_box_fails_nothing_goes_out(gate: Gate) -> None:
 def test_a_streamable_body_on_a_kept_alive_tunnel_waits_for_its_ack(gate: Gate, mode: str) -> None:
     """T06-4's review: mitmproxy streams large or chunked request bodies out BEFORE the request
     hook when ``stream_large_bodies`` is on. Here the GET is let through, and the POST that
-    follows on the same tunnel must wait for backtide like any other."""
+    follows on the same tunnel must wait for backtide like any other. Since T10-2 backtide holds
+    it (a write) until the person approves: not a byte of it leaves before that."""
     path = f"/stream-{mode}/{time.time_ns()}"
-    gate.box.only_method = "POST"
-    gate.box.waiting.clear()
-    gate.box.hold.clear()
     results: list[str] = []
     asking = threading.Thread(
         target=lambda: results.append(
@@ -359,10 +354,16 @@ def test_a_streamable_body_on_a_kept_alive_tunnel_waits_for_its_ack(gate: Gate, 
         )
     )  # fmt: skip
     asking.start()
-    assert gate.box.waiting.wait(60), "the proxy never asked about the POST"
+    deadline = time.monotonic() + 60
+    while not [e for e in gate.recorded(path) if e.action == "held"]:
+        assert time.monotonic() < deadline, "the proxy never asked about the POST"
+        time.sleep(0.1)
+    [held] = [e for e in gate.recorded(path) if e.action == "held"]
+    assert held.details["body"]["size"] > 64 * 1024  # read whole before it was asked about
     time.sleep(1.0)
     assert gate.fake_requests(path) == []  # not a byte of the POST reached the server
-    gate.box.hold.set()
+    outcome = gate.egress.decide(held.details["hold_id"], "approve", by="cli", requested_by="t")
+    assert outcome.status == "released"
     asking.join(120)
     assert results and json.loads(results[0].strip().splitlines()[-1]) == [200, 200], results
     [arrived] = gate.fake_requests(path)

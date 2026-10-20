@@ -17,6 +17,12 @@ a socket of the host). So here:
   recorded when it comes back.
 - ``ping`` every ``ping_interval_ms``; with nothing from backtide for three intervals the
   connection is taken for dead and closed (every pending request is then denied).
+- **Holds** (T10-2, docs/32 section 6): an ack may say ``hold``. ``hold(hold_id)`` takes one of
+  ``max_holds`` slots for the request (on the connection that gave the ack; one request per hold
+  at a time), ``decision(hold_id, timeout)`` waits for backtide's ``decision`` a little at a
+  time (so the gate can watch the client too), and ``let_go`` gives the slot back saying
+  ``released`` or ``hold_left``. When the connection ends, every hold on it is ``LOST``: the
+  gate refuses it (503), and backtide records it as expired.
 
 Never logs a message's content: only its type (``protocol.describe``) and error kinds.
 Imports the standard library and ``backtide.gate``/``backtide.blackbox.redact`` only.
@@ -31,11 +37,12 @@ import struct
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from backtide.blackbox.redact import KnownScrubber
 from backtide.gate import protocol, record
+from backtide.gate.fingerprint import KEY_BYTES, new_key
 from backtide.gate.protocol import DEFAULT_LIMITS, LineReader, ProtocolError, Sender
 from backtide.gate.providers import Providers
 
@@ -73,6 +80,8 @@ class GateConfig:
     scrubber: KnownScrubber
     limits: Mapping[str, int]
     provider_tools: frozenset[str] = frozenset()
+    # This connection's fingerprint key (T10-2): in memory only, never in a repr or a log.
+    fp_key: bytes = field(default_factory=new_key, repr=False)
 
     def __repr__(self) -> str:
         return f"GateConfig({self.providers!r})"
@@ -80,28 +89,49 @@ class GateConfig:
 
 @dataclass(frozen=True)
 class Ack:
-    verdict: str  # "allow" or "deny"
+    verdict: str  # "allow", "deny" or "hold"
     seq: int | None = None
     reason: str | None = None
     retry_after: int | None = None
+    hold_id: str | None = None
+    wait_ms: int | None = None
 
     @property
     def allowed(self) -> bool:
         return self.verdict == "allow" and self.seq is not None
 
+    @property
+    def held(self) -> bool:
+        return self.verdict == "hold" and self.hold_id is not None and self.wait_ms is not None
+
+
+@dataclass(frozen=True)
+class Decision:
+    """backtide's answer to a held request: "allow" (with the seq of its net/request), "deny"
+    (with its reason) or "lost" (the channel ended: refused)."""
+
+    verdict: str
+    seq: int | None = None
+    reason: str | None = None
+
 
 NOT_RECORDED = Ack("deny", reason="not_recorded")
+LOST = Decision("lost")
 _NO_SECRETS = KnownScrubber(())
 
 
 def gate_config(message: Mapping[str, Any]) -> GateConfig:
     """A GateConfig from a checked ``config`` message (ProtocolError if it is not usable)."""
     providers = protocol.providers_from_config(message)
+    fp_key = bytes.fromhex(message["fp_key"])
+    if len(fp_key) != KEY_BYTES:
+        raise ProtocolError("config.fp_key: not 32 bytes")
     return GateConfig(
         providers=providers,
         scrubber=KnownScrubber(providers.known_secrets()),
         limits=dict(message["limits"]),
         provider_tools=frozenset(message.get("provider_tools", [])),
+        fp_key=fp_key,
     )
 
 
@@ -114,6 +144,7 @@ class _Connection:
         self.configured = False
         self.closed = False
         self.pending: dict[int, asyncio.Future[Ack]] = {}
+        self.holds: dict[str, asyncio.Future[Decision]] = {}
         self.writer_task: asyncio.Future[None] | None = None
 
     def send(self, data: bytes) -> None:
@@ -129,6 +160,9 @@ class _Connection:
             if not future.done():
                 future.set_result(NOT_RECORDED)
         self.pending.clear()
+        for waiting in self.holds.values():  # every hold on this connection is refused
+            if not waiting.done():
+                waiting.set_result(LOST)
         with contextlib.suppress(Exception):
             self.writer.close()
 
@@ -163,6 +197,8 @@ class Channel:
         self._server: asyncio.AbstractServer | None = None
         self._wake: asyncio.Event | None = None
         self._tasks: set[asyncio.Task[None]] = set()
+        self._held_on: dict[str, _Connection] = {}  # hold id -> the connection whose ack held it
+        self._holds: dict[str, _Connection] = {}  # hold id -> the connection of its waiting slot
 
     # Public
 
@@ -210,9 +246,10 @@ class Channel:
         for task in list(self._tasks):
             task.cancel()
 
-    async def ask(self, event: Mapping[str, Any]) -> Ack:
-        """Send ``event`` (a ``net/request`` or ``llm/request``) and wait for backtide's
-        verdict. Any failure is a denial (NOT_RECORDED): nothing goes out unrecorded."""
+    async def ask(self, event: Mapping[str, Any], gate: Mapping[str, Any] | None = None) -> Ack:
+        """Send ``event`` (a ``net/request`` with its ``gate`` facts, or an ``llm/request``)
+        and wait for backtide's verdict. Any failure is a denial (NOT_RECORDED): nothing goes
+        out unrecorded. A ``hold`` must then go through ``hold`` and ``let_go``."""
         conn = self._conn
         if conn is None or not conn.configured or conn.closed:
             return NOT_RECORDED
@@ -222,8 +259,11 @@ class Channel:
         conn.pending[request_id] = future
         timeout = self.limits["ack_timeout_ms"] / 1000
         try:
-            conn.send(protocol.encode(protocol.request(request_id, event), Sender.PROXY))
-            return await asyncio.wait_for(future, timeout)
+            conn.send(protocol.encode(protocol.request(request_id, event, gate), Sender.PROXY))
+            ack = await asyncio.wait_for(future, timeout)
+            if ack.held:
+                self._held_on[ack.hold_id] = conn  # type: ignore[index]
+            return ack
         except TimeoutError:
             logger.warning("no ack from backtide in %.1f s: the request is refused", timeout)
             return NOT_RECORDED
@@ -232,6 +272,48 @@ class Channel:
             return NOT_RECORDED
         finally:
             conn.pending.pop(request_id, None)
+
+    def hold(self, hold_id: str) -> bool:
+        """Take a slot for the request held as ``hold_id``. False (nothing taken) when the
+        connection that held it is gone, another request of the same hold is waiting already,
+        or ``max_holds`` are waiting: the gate then answers "pending" at once (``no_slot``)."""
+        conn = self._held_on.get(hold_id)
+        if conn is None or conn.closed or conn is not self._conn or hold_id in self._holds:
+            return False
+        if len(self._holds) >= self.limits["max_holds"]:
+            return False
+        conn.holds[hold_id] = asyncio.get_running_loop().create_future()
+        self._holds[hold_id] = conn
+        return True
+
+    async def decision(self, hold_id: str, timeout: float) -> Decision | None:
+        """backtide's decision on ``hold_id`` within ``timeout`` s, or None if it has not come
+        yet. LOST when the hold has no slot or its connection ended."""
+        conn = self._holds.get(hold_id)
+        waiting = conn.holds.get(hold_id) if conn is not None else None
+        if waiting is None:
+            return LOST
+        try:
+            return await asyncio.wait_for(asyncio.shield(waiting), max(0.0, timeout))
+        except TimeoutError:
+            return None
+
+    def let_go(self, hold_id: str, *, released: bool = False, why: str | None = None) -> None:
+        """The request of ``hold_id`` is no longer held: its slot is free, and backtide is told
+        ``released`` (it went out) or ``hold_left {why}`` (not when a deny came: ``why`` None).
+        Nothing is said on a connection that has ended (backtide closed the hold already)."""
+        conn = self._holds.pop(hold_id, None) or self._held_on.get(hold_id)
+        self._held_on.pop(hold_id, None)
+        if conn is None:
+            return
+        conn.holds.pop(hold_id, None)
+        if conn.closed or (not released and why is None):
+            return
+        message = protocol.released(hold_id) if released else protocol.hold_left(hold_id, why or "")
+        try:
+            conn.send(protocol.encode(message, Sender.PROXY))
+        except (ConnectionError, ProtocolError, OSError) as error:
+            logger.warning("cannot tell backtide about a hold (%s)", type(error).__name__)
 
     def count_throttled(self) -> None:
         """One refusal for the proxy's own limits (connections, requests waiting): counted,
@@ -278,6 +360,9 @@ class Channel:
             conn.close()
             if self._conn is conn:
                 self._conn = None
+            for hold_id in [h for h, c in self._held_on.items() if c is conn]:
+                if hold_id not in self._holds:  # a slot still waiting cleans up in let_go
+                    del self._held_on[hold_id]
             if conn.writer_task is not None:
                 conn.writer_task.cancel()
                 self._tasks.discard(conn.writer_task)
@@ -333,7 +418,16 @@ class Channel:
                     seq=message.get("seq"),
                     reason=message.get("reason"),
                     retry_after=message.get("retry_after"),
+                    hold_id=message.get("hold_id"),
+                    wait_ms=message.get("wait_ms"),
                 )
+            )
+        elif kind == "decision":
+            waiting = conn.holds.get(message["hold_id"])
+            if waiting is None or waiting.done():
+                return  # nobody waits for it any more (it waited, or its client left)
+            waiting.set_result(
+                Decision(message["verdict"], seq=message.get("seq"), reason=message.get("reason"))
             )
         elif kind == "ping":
             conn.send(protocol.encode(protocol.pong(), Sender.PROXY))

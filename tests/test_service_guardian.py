@@ -26,6 +26,7 @@ from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
 from backtide.notify import Alert, AlertLevel
 from backtide.service.config import Secret, ServiceConfig
 from backtide.service.guardian import AgentState, CycleResult, FileWatcher, Guardian
+from backtide.service.holds import HoldOutcome, HoldStatus
 from backtide.service.rewind import RewindStatus
 from backtide.snapshots import (
     PruneIncomplete,
@@ -2899,6 +2900,19 @@ class FakeEgress:
         self.stops.append(reason)
         self.up = False
 
+    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> Any:
+        self.log.append(f"egress.decide({hold_id},{verdict},{by},{requested_by})")
+        if hold_id == "h-boom":
+            raise RuntimeError("injected")
+        return HoldOutcome(HoldStatus.RELEASED, hold_id)
+
+    def pending(self) -> list[dict[str, Any]]:
+        return [{"hold_id": "h-000000000001"}]
+
+    def reject_holds(self, by: str) -> int:
+        self.log.append(f"egress.reject_holds({by})")
+        return 1
+
 
 def proxied(world: World, clock: Callable[[], datetime], *, up: bool = True) -> FakeEgress:
     """``world``'s Guardian again, with the egress proxy."""
@@ -3104,3 +3118,40 @@ def test_the_lost_hook_records_why_the_sensor_stops_the_agent(
     world.guardian.start()
     assert sensor.hooks.lost("sensor_lost_events") is True
     assert world.events("agent_stop")[-1].details == {"reason": "sensor_lost_events"}
+
+
+# --- held requests (T10-2, docs/32 sections 6 and 11) --------------------------------------------
+
+
+def test_a_decision_on_a_held_request_goes_to_the_proxy(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    proxied(world, clock)
+    assert world.guardian.decide_hold("h-1", "approve", via="cli", requested_by="x").status == (
+        "unknown"  # not serving yet
+    )
+    world.guardian.start()
+    outcome = world.guardian.decide_hold("h-1", "approve", via="cli", requested_by="cli (uid 1)")
+    assert outcome.status == "released"
+    assert "egress.decide(h-1,approve,cli,cli (uid 1))" in world.log
+    assert world.guardian.pending_holds() == [{"hold_id": "h-000000000001"}]
+    failed = world.guardian.decide_hold("h-boom", "reject", via="cli", requested_by="x")
+    assert failed.status == "failed"  # never raises
+
+
+def test_a_pause_rejects_the_held_requests_after_freezing(
+    world: World, clock: Callable[[], datetime]
+) -> None:
+    proxied(world, clock)
+    world.guardian.start()
+    world.guardian.pause_by_user(requested_by="test")
+    assert index(world.log, "jail.pause") < index(world.log, "egress.reject_holds(pause)")
+
+
+def test_a_rewind_rejects_the_held_requests(world: World, clock: Callable[[], datetime]) -> None:
+    proxied(world, clock)
+    world.guardian.start()
+    snapshot = world.volume.snapshots()[-1] if world.volume.snapshots() else None
+    target = snapshot.id if snapshot is not None else "20261020T120000Z-manual"
+    world.guardian.rewind(target, requested_by="test")
+    assert "egress.reject_holds(rewind)" in world.log

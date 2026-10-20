@@ -27,6 +27,7 @@ ME = os.getuid()
 REAL = "sk-ant-api03-TEST" + "cl13ntR3alK3y" * 4
 FAKE = FAKE_KEY_PREFIX + "anthropic-" + "C1l2i3e4n5t6A7b8C9d0E1f2G3h4I5j6"
 FAST = {"ack_timeout_ms": 300, "ping_interval_ms": 500, "max_queue": 3}
+GATE = protocol.gate(fp="f" * 64, url_struck=False, url_bytes=20, websocket=False, exact_read=True)
 
 
 @pytest.fixture
@@ -169,9 +170,9 @@ def test_unreadable_credentials_are_refused(folder: Path) -> None:
 def test_nothing_is_asked_before_the_config(folder: Path) -> None:
     async def go() -> None:
         async with proxy_side(folder) as channel:
-            assert await channel.ask(a_request()) == NOT_RECORDED  # nobody connected
+            assert await channel.ask(a_request(), GATE) == NOT_RECORDED  # nobody connected
             await connect(folder, configure=False)
-            assert await channel.ask(a_request()) == NOT_RECORDED  # hello, but no config yet
+            assert await channel.ask(a_request(), GATE) == NOT_RECORDED  # hello, but no config yet
             assert channel.config is None
 
     run(go())
@@ -208,8 +209,8 @@ def test_allow_and_deny_come_back_to_the_request_that_asked(folder: Path) -> Non
         async with proxy_side(folder) as channel:
             side = await connect(folder)
             await until(lambda: channel.ready)
-            first = asyncio.ensure_future(channel.ask(a_request("one.example")))
-            second = asyncio.ensure_future(channel.ask(a_request("two.example")))
+            first = asyncio.ensure_future(channel.ask(a_request("one.example"), GATE))
+            second = asyncio.ensure_future(channel.ask(a_request("two.example"), GATE))
             asked = [await side.receive_type("request"), await side.receive_type("request")]
             assert [m["event"]["details"]["host"] for m in asked] == ["one.example", "two.example"]
             one, two = (m["id"] for m in asked)
@@ -227,7 +228,7 @@ def test_no_ack_in_time_is_a_denial(folder: Path) -> None:
         async with proxy_side(folder) as channel:
             side = await connect(folder)
             await until(lambda: channel.ready)
-            asked = asyncio.ensure_future(channel.ask(a_request()))
+            asked = asyncio.ensure_future(channel.ask(a_request(), GATE))
             message = await side.receive_type("request")
             assert await asked == NOT_RECORDED  # 300 ms
             # A late allow changes nothing.
@@ -242,12 +243,12 @@ def test_a_channel_that_closes_denies_what_was_waiting(folder: Path) -> None:
         async with proxy_side(folder) as channel:
             side = await connect(folder)
             await until(lambda: channel.ready)
-            asked = asyncio.ensure_future(channel.ask(a_request()))
+            asked = asyncio.ensure_future(channel.ask(a_request(), GATE))
             await side.receive_type("request")
             side.writer.close()
             assert await asked == NOT_RECORDED
             await until(lambda: not channel.ready)
-            assert await channel.ask(a_request()) == NOT_RECORDED
+            assert await channel.ask(a_request(), GATE) == NOT_RECORDED
 
     run(go())
 
@@ -257,7 +258,7 @@ def test_a_broken_line_from_backtide_closes_the_channel(folder: Path) -> None:
         async with proxy_side(folder) as channel:
             side = await connect(folder)
             await until(lambda: channel.ready)
-            asked = asyncio.ensure_future(channel.ask(a_request()))
+            asked = asyncio.ensure_future(channel.ask(a_request(), GATE))
             await side.receive_type("request")
             side.send(b'{"type": "ack", "id": 1, "verdict": "maybe", "seq": 1}\n')
             assert await asked == NOT_RECORDED
@@ -274,7 +275,7 @@ def test_a_newer_connection_replaces_the_older_one(folder: Path) -> None:
             new = await connect(folder)
             assert await old.closed()
             await until(lambda: channel.ready)
-            asked = asyncio.ensure_future(channel.ask(a_request()))
+            asked = asyncio.ensure_future(channel.ask(a_request(), GATE))
             message = await new.receive_type("request")
             new.send(protocol.encode(protocol.ack(message["id"], "allow", seq=2), "backtide"))
             assert (await asked).allowed
@@ -380,5 +381,151 @@ def test_the_proxys_own_throttles_are_told_as_one_count(folder: Path) -> None:
             got = await side.receive_type("event")
             assert got["event"]["action"] == "throttled"
             assert got["event"]["details"]["count"] == 4
+
+    run(go())
+
+
+# --- holds (T10-2) -------------------------------------------------------------------------------
+
+HOLD = "h-00000000000a"
+
+
+async def held_ack(channel: Channel, side: Backtide, hold_id: str = HOLD) -> Any:
+    asked = asyncio.ensure_future(channel.ask(a_request(), GATE))
+    message = await side.receive_type("request")
+    assert message["gate"] == GATE
+    side.send(
+        protocol.encode(
+            protocol.ack(message["id"], "hold", seq=9, hold_id=hold_id, wait_ms=500,
+                         retry_after=30),
+            Sender.BACKTIDE,
+        )
+    )  # fmt: skip
+    return await asked
+
+
+def test_a_held_request_waits_for_its_decision_and_says_it_was_released(folder: Path) -> None:
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            side = await connect(folder)
+            await until(lambda: channel.ready)
+            ack = await held_ack(channel, side)
+            assert ack.held and (ack.hold_id, ack.wait_ms, ack.retry_after) == (HOLD, 500, 30)
+            assert channel.hold(HOLD)
+            assert await channel.decision(HOLD, 0.05) is None  # not yet
+            side.send(protocol.encode(protocol.decision(HOLD, "allow", seq=12), Sender.BACKTIDE))
+            decided = await channel.decision(HOLD, 1)
+            assert decided is not None and (decided.verdict, decided.seq) == ("allow", 12)
+            channel.let_go(HOLD, released=True)
+            assert await side.receive_type("released") == {"type": "released", "hold_id": HOLD}
+
+    run(go())
+
+
+def test_a_hold_that_waited_says_so_and_a_late_decision_changes_nothing(folder: Path) -> None:
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            side = await connect(folder)
+            await until(lambda: channel.ready)
+            await held_ack(channel, side)
+            assert channel.hold(HOLD)
+            assert await channel.decision(HOLD, 0.05) is None
+            channel.let_go(HOLD, why="waited")
+            left = await side.receive_type("hold_left")
+            assert left == {"type": "hold_left", "hold_id": HOLD, "why": "waited"}
+            side.send(protocol.encode(protocol.decision(HOLD, "allow", seq=12), Sender.BACKTIDE))
+            await asyncio.sleep(0.05)
+            assert channel.ready  # an unknown hold is not a protocol error
+
+    run(go())
+
+
+def test_a_deny_is_not_answered(folder: Path) -> None:
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            side = await connect(folder)
+            await until(lambda: channel.ready)
+            await held_ack(channel, side)
+            assert channel.hold(HOLD)
+            side.send(
+                protocol.encode(protocol.decision(HOLD, "deny", reason="rejected"), "backtide")
+            )
+            decided = await channel.decision(HOLD, 1)
+            assert decided is not None and (decided.verdict, decided.reason) == ("deny", "rejected")
+            channel.let_go(HOLD)
+            side.send(protocol.encode(protocol.ping(), Sender.BACKTIDE))
+            assert (await side.receive())["type"] == "pong"  # and nothing about the hold
+
+    run(go())
+
+
+def test_one_request_per_hold_and_at_most_max_holds(folder: Path) -> None:
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            reader, writer = await asyncio.open_unix_connection(str(folder / SOCKET_NAME))
+            side = Backtide(reader, writer)
+            await side.receive()
+            side.send(config_line(FAST | {"max_holds": 2}))
+            await until(lambda: channel.ready)
+            ids = [f"h-00000000000{n}" for n in range(3)]
+            for hold_id in ids:
+                await held_ack(channel, side, hold_id)
+            await held_ack(channel, side, ids[0])  # a retry that joined the same hold
+            assert channel.hold(ids[0])
+            assert not channel.hold(ids[0])  # its twin waits already: "pending" at once
+            assert channel.hold(ids[1])
+            assert not channel.hold(ids[2])  # no slot
+            assert not channel.hold("h-0000000000ff")  # no ack held it
+            channel.let_go(ids[0], why="waited")
+            assert channel.hold(ids[2])  # a slot is free again
+
+    run(go())
+
+
+def test_a_lost_channel_refuses_every_hold(folder: Path) -> None:
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            side = await connect(folder)
+            await until(lambda: channel.ready)
+            await held_ack(channel, side)
+            assert channel.hold(HOLD)
+            waiting = asyncio.ensure_future(channel.decision(HOLD, 5))
+            side.writer.close()
+            decided = await waiting
+            assert decided is not None and decided.verdict == "lost"
+            channel.let_go(HOLD, why="client_left")  # nothing to tell, nothing raised
+            assert not channel.hold(HOLD)
+
+    run(go())
+
+
+def test_a_hold_from_an_older_connection_gets_no_slot(folder: Path) -> None:
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            old = await connect(folder)
+            await until(lambda: channel.ready)
+            await held_ack(channel, old)
+            new = await connect(folder)
+            await until(lambda: channel.ready)
+            assert await old.closed() and new is not None
+            assert not channel.hold(HOLD)  # its decision could never come
+
+    run(go())
+
+
+def test_the_config_brings_this_connections_fingerprint_key(folder: Path) -> None:
+    key = bytes(range(32))
+
+    async def go() -> None:
+        async with proxy_side(folder) as channel:
+            reader, writer = await asyncio.open_unix_connection(str(folder / SOCKET_NAME))
+            side = Backtide(reader, writer)
+            await side.receive()
+            side.send(
+                protocol.encode(protocol.config([], providers(), FAST, fp_key=key), "backtide")
+            )
+            await until(lambda: channel.ready)
+            assert channel.config is not None and channel.config.fp_key == key
+            assert key.hex() not in repr(channel.config)
 
     run(go())

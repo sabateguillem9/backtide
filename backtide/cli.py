@@ -25,6 +25,8 @@ from backtide.service.control import (
 )
 from backtide.service.notice import ago, rewind_notice
 from backtide.service.offline import rewind_without_service
+from backtide.service.retenidas import decide as decide_hold
+from backtide.service.retenidas import listing as list_holds
 from backtide.service.runner import ServiceLocked, ServiceRunning, serve, take_lock
 from backtide.service.seguir import seguir
 from backtide.snapshots import Snapshot, SnapshotError, SnapshotStore
@@ -126,8 +128,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_config(resume)
     resume.set_defaults(handler=_resume)
+    _add_holds(commands)
     _add_web(commands)
     return parser
+
+
+def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """`backtide retenidas`, `aprobar` and `rechazar` (T10-2): the requests the gate holds."""
+    listing = commands.add_parser(
+        "retenidas",
+        help="lista las peticiones del agente que esperan tu aprobación",
+        description="Lista las peticiones a internet que la puerta retiene hasta que decidas "
+        "(borrados, envíos, escrituras): su identificador, su riesgo y lo que piden. Se lo "
+        "pregunta al servicio en marcha. Sale con 0 si las lista, 1 si no hay servicio y 2 si "
+        "hay un error.",
+    )
+    _add_config(listing)
+    listing.set_defaults(handler=_list_holds)
+    for name, verdict, says in (
+        ("aprobar", "approve", "deja salir una petición retenida, una sola vez"),
+        ("rechazar", "reject", "rechaza una petición retenida: no sale"),
+    ):
+        command = commands.add_parser(
+            name,
+            help=says,
+            description=f"{says[0].upper()}{says[1:]}. El identificador (h-…) sale en "
+            "`backtide retenidas` y en el aviso. Se lo pide al servicio en marcha. Sale con 0 si "
+            "se decidió, 1 si no había esa retención abierta (ya decidida, caducada o tras un "
+            "reinicio), 2 si hay un error de uso y 3 si no se sabe.",
+        )
+        _add_config(command)
+        command.add_argument("hold", metavar="id", help="identificador de la petición (h-…)")
+        command.set_defaults(handler=_decide_hold, verdict=verdict)
 
 
 def _add_config(parser: argparse.ArgumentParser) -> None:
@@ -290,6 +322,26 @@ def _resume(args: argparse.Namespace) -> int:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
     return seguir(config)
+
+
+def _list_holds(args: argparse.Namespace) -> int:
+    """`backtide retenidas`: everything but reading the config is in service/retenidas.py."""
+    try:
+        config = ServiceConfig.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    return list_holds(config)
+
+
+def _decide_hold(args: argparse.Namespace) -> int:
+    """`backtide aprobar` and `backtide rechazar`."""
+    try:
+        config = ServiceConfig.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    return decide_hold(config, args.hold, args.verdict)
 
 
 def _rewind_notice(target: Snapshot, *, now: datetime, tz: tzinfo) -> str:

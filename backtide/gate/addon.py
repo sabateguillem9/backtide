@@ -49,9 +49,11 @@ import zlib
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
-from backtide.gate import record
+from backtide.gate import protocol, record
 from backtide.gate.client import Ack, Channel, GateConfig
+from backtide.gate.decide import READ_METHODS
 from backtide.gate.echo import KeyEcho, KeyScanner, SseGuard
+from backtide.gate.fingerprint import fingerprint
 from backtide.gate.policy import (
     host_mismatch,
     is_ip,
@@ -74,6 +76,7 @@ JSON_SUMMARY_LIMIT = 1 << 20  # a provider's non-streamed answer is summarized u
 # memory (1 GiB) whatever the agent asks for at the same time.
 HELD_BUDGET = 128 * 1024 * 1024
 WEBSOCKET_SUMMARY_EVERY = 2.0  # seconds
+HOLD_POLL = 0.25  # seconds: how often a held request looks whether its client is still there
 EXIT_CODE = 70
 
 REFUSALS = {
@@ -93,6 +96,19 @@ REFUSALS = {
     "provider_side_tool": (
         403,
         "backtide: tools that run on the provider's side are not allowed (allow_provider_tools)\n",
+    ),
+    # The gate (T10-2, docs/32 section 6): plain text until the translators give each API its
+    # own shape (T10-3). No client repeats a 403.
+    "rejected": (403, "backtide: the person rejected this request\n"),
+    "expired": (403, "backtide: nobody answered in 5 min, so this request is rejected\n"),
+    "paused": (403, "backtide: the agent was paused, so this request is rejected\n"),
+    "hold_full": (
+        403,
+        "backtide: too many requests are waiting for approval; this one is refused\n",
+    ),
+    "gate_rejected": (
+        403,
+        "backtide: this same request was rejected a moment ago; it is not asked again\n",
     ),
 }
 FAILED = (502, "backtide: the gate failed, so nothing went out\n")
@@ -398,18 +414,130 @@ class Gate:
             event = record.llm_request_event(
                 fields, provider.name, config.scrubber, provider_tools=verdict.tools
             )
+            gate = None  # a provider's host is never held (docs/32, section 5, rule 1)
         else:
             event = record.request_event(fields, config.scrubber)
+            gate = self._gate_facts(request, headers, body, config)
         # Up to max_pending requests wait for their ack at once: each keeps only mitmproxy's raw
         # body, never a decoded copy of up to 16 MiB as well (T06-7).
         del fields["body"]
         body = parts = None
-        ack = await self._channel.ask(event)
+        ack = await self._channel.ask(event, gate)
+        if ack.held:
+            await self._hold(flow, ack, fields)
+            return
         if flow.response is not None:
             return  # killed or answered meanwhile
         if not ack.allowed:
             self._denied(flow, ack, fields)
             return
+        self._let_through(flow, fields, provider, swapped)
+
+    def _gate_facts(
+        self,
+        request: Any,
+        headers: list[tuple[str, str]],
+        body: bytes | None,
+        config: GateConfig,
+    ) -> dict[str, Any]:
+        """What backtide decides a request on (docs/32, section 6): its exact fingerprint, the
+        redaction's verdict on its URL, the URL's length, a WebSocket opening, and whether its
+        method is exactly a read."""
+        fp = fingerprint(
+            config.fp_key,
+            method=str(request.method),
+            host=normalize_host(request.host) or str(request.host),
+            port=request.port,
+            path=str(request.path),
+            headers=headers,
+            body=body,
+            canonical=None,  # T10-3: a translator's Reading.canonical (decision 2)
+        )
+        return protocol.gate(
+            fp=fp,
+            url_struck=record.path_struck(request.path, config.scrubber),
+            url_bytes=len(str(request.url).encode("utf-8", "surrogateescape")),
+            websocket=any(name.strip().lower() == "upgrade" for name, _ in headers),
+            exact_read=request.method in READ_METHODS,
+            wait_hint_s=None,  # T10-3: what the translator says its client waits
+        )
+
+    async def _hold(self, flow: Any, ack: Ack, fields: dict[str, Any]) -> None:
+        """A held request: kept with its connection open until backtide decides, its client
+        leaves or ``wait_ms`` passes. Every hold ack is answered with exactly one ``released``
+        or ``hold_left`` (none after a deny), so a yes is spent exactly once."""
+        hold_id = str(ack.hold_id)
+        self._waiting.discard(flow.id)  # a held request no longer waits for its ack
+        if flow.response is not None or self._client_gone(flow):
+            if flow.response is None:
+                flow.kill()
+            self._channel.let_go(hold_id, why="client_left")
+            return
+        if not self._channel.hold(hold_id):
+            # No slot (max_holds, or an identical request waits already): "pending" at once,
+            # and the hold lives on in backtide.
+            self._channel.let_go(hold_id, why="no_slot")
+            self._pending(flow, hold_id, ack.retry_after)
+            return
+        told = False
+        try:
+            deadline = self._clock() + (ack.wait_ms or 0) / 1000
+            decision = None
+            while decision is None:
+                if self._client_gone(flow):
+                    break
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    break
+                decision = await self._channel.decision(hold_id, min(HOLD_POLL, remaining))
+            if decision is None or (decision.verdict == "allow" and self._client_gone(flow)):
+                if self._client_gone(flow):
+                    # Never sent later: its client gave up, and a retry may come (docs/32, Q3).
+                    flow.kill()
+                    self._channel.let_go(hold_id, why="client_left")
+                else:
+                    self._channel.let_go(hold_id, why="waited")
+                    self._pending(flow, hold_id, ack.retry_after)
+                told = True
+                return
+            if decision.verdict == "allow" and decision.seq is not None:
+                self._channel.let_go(hold_id, released=True)
+                told = True
+                self._let_through(flow, fields, None, None)
+                return
+            self._channel.let_go(hold_id)  # a deny, or the channel is gone: nothing to say
+            told = True
+            if decision.verdict == "deny" and decision.reason in REFUSALS:
+                self._answer(flow, decision.reason)
+            else:
+                self._refuse_unrecorded(flow, fields)
+        finally:
+            if not told:  # this hook failed: the guard answers 502, and backtide must know
+                self._channel.let_go(hold_id, why="client_left")
+
+    def _client_gone(self, flow: Any) -> bool:
+        conn = flow.client_conn
+        return getattr(conn, "timestamp_end", None) is not None or conn.id not in self._clients
+
+    def _pending(self, flow: Any, hold_id: str, retry_after: int | None) -> None:
+        """429: still waiting for the person, ask again in a while (never in a loop)."""
+        seconds = retry_after if retry_after is not None else 30
+        text = (
+            f"backtide: waiting for the person's approval (hold {hold_id}); "
+            f"try again in {seconds} s or so, not in a loop\n"
+        )
+        headers = {"content-type": "text/plain", "retry-after": str(seconds)}
+        flow.response = self._respond(429, text.encode(), headers)
+
+    def _let_through(
+        self,
+        flow: Any,
+        fields: dict[str, Any],
+        provider: Provider | None,
+        swapped: list[tuple[str, str]] | None,
+    ) -> None:
+        """The request is recorded and may go out: the connection it needs is let open."""
+        request = flow.request
         if swapped is not None:
             # An answer the tap can read: compressed, its usage would be lost (usage_missing).
             swapped = [pair for pair in swapped if pair[0].lower() != "accept-encoding"]

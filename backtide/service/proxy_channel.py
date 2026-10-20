@@ -34,6 +34,31 @@ connects) and section 8 (the budgets).
 - ``ping`` every 5 s; ``last_seen`` is when the proxy last said anything (the Guardian's watch
   takes it for down after 15 s of silence).
 
+**The gate** (T10-2, docs/32-diseno-t10-puerta.md, sections 5 to 7). A ``net/request`` comes with
+its ``gate`` facts and ``decide.py`` gives its verdict, with what this connection's ``HoldBook``
+remembers of its fingerprint. Every ``gate`` event is written here, never by the proxy:
+
+- **pass** (a read, a preapproved fingerprint, a WebSocket to the allowed list): the
+  ``net/request`` is appended with ``details.gate = {decision, ...}`` and then ``allow``. A
+  preapproval is spent with a ``gate/approved {by: preapproval}`` first.
+- **reject**: ``net/blocked`` (``not_allowed``, or ``gate_rejected`` for a fingerprint rejected
+  or expired less than 10 min ago) and ``deny``.
+- **hold**: ``gate/held`` (risk 2 or 3) and ``ack hold`` with its ``seq``; a request with the same
+  fingerprint joins the open hold without a new event. Past 20 open holds: ``deny hold_full``,
+  counted in a ``gate/flood``.
+- **The person decides** (``decide``, from the control socket): ``gate/approved`` and, with the
+  request still connected, its ``net/request`` BEFORE ``decision allow`` (nothing goes out
+  without its event); with nobody waiting, a preapproval. ``gate/rejected`` and ``decision
+  deny``. ``reject_open`` is the same for a pause or a rewind (``by: pause | rewind``).
+- **Time** (a tick every second): ``gate/expired {why: timeout}`` after 5 min, and its deny.
+- **The end of the channel** fails closed: every open hold is ``gate/expired`` (``why``:
+  ``restart`` when backtide stops, ``proxy_restart`` when the proxy is restarted, else
+  ``channel_lost``), and the proxy refuses what it held. Preapprovals and rejections go with this
+  connection's fingerprint key (``fp_key``, in the config: never logged, never recorded).
+- ``unknown_hosts`` (``Policy``): ``"deny"`` keeps T06's allowed list for whatever is off it (the
+  strict mode); ``"hold"`` lets reads to any host pass and holds the writes. Until T10-3 brings
+  ``[gate]`` to the TOML, the service runs in the strict mode.
+
 The config is never logged: ``protocol.describe`` names the providers and counts the hosts.
 """
 
@@ -55,15 +80,19 @@ from backtide.blackbox import BlackBoxError, Event
 from backtide.blackbox.redact import MIN_KNOWN_SECRET, KnownScrubber
 from backtide.gate import protocol, record
 from backtide.gate.client import SOCKET_NAME
+from backtide.gate.decide import UNKNOWN_HOSTS, Facts, Verdict, decide
+from backtide.gate.fingerprint import new_key, short
 from backtide.gate.policy import ALLOWED_PORTS, AllowList
 from backtide.gate.protocol import BLOCK_RISK, LineReader, ProtocolError, Sender
 from backtide.gate.providers import Providers
 from backtide.sensors.files import DailyBudget, TokenBucket
+from backtide.service.holds import Hold, HoldBook, HoldOutcome, HoldStatus, HoldTimings
 
 logger = logging.getLogger(__name__)
 
 HELLO_TIMEOUT = 10.0  # seconds the proxy has to say hello once connected
 PING_EVERY = 5.0
+TICK_EVERY = 1.0  # how often held requests are looked at for their 5 min
 READ_TIMEOUT = 0.5  # the reader wakes this often to see whether it should stop
 REQUEST_RATE = 20.0  # requests per second, sustained (docs/21, section 8)
 REQUEST_BURST = 500
@@ -79,6 +108,10 @@ DROPPED_EVERY = 10.0
 _CREDENTIALS = struct.Struct("3i")
 _OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+MAX_REQUESTER_CHARS = 120
+DECIDERS = frozenset({"cli", "web", "telegram"})  # who may approve or reject (docs/32, section 7)
+# Why the open holds end with the channel: close()'s reason -> gate/expired's why.
+_END_WHY = {"stop": "restart", "restart": "proxy_restart"}
 
 
 class ChannelError(Exception):
@@ -202,6 +235,13 @@ class Policy:
     providers: Providers
     secrets: tuple[str, ...] = ()  # e.g. the Gateway token: struck from whatever is recorded
     provider_tools: tuple[str, ...] = ()  # [proxy] allow_provider_tools (T06-6)
+    # T10-2: what the gate does with a host off the allowed list. "deny" is T06's allowed list
+    # (the strict mode, decision 1): the service's until T10-3 brings [gate] unknown_hosts.
+    unknown_hosts: str = "deny"
+
+    def __post_init__(self) -> None:
+        if self.unknown_hosts not in UNKNOWN_HOSTS:
+            raise ValueError("unknown_hosts is 'hold' or 'deny'")
 
     def __repr__(self) -> str:
         return f"Policy({len(self.allow_hosts)} hosts, {self.providers!r})"
@@ -292,6 +332,8 @@ class ProxyChannel:
         budgets: Budgets | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         on_budget: Callable[[], None] | None = None,
+        timings: HoldTimings | None = None,
+        book: HoldBook | None = None,
     ) -> None:
         self._sock = sock
         self._record = record
@@ -317,6 +359,13 @@ class ProxyChannel:
         self._dropped = 0
         self._last_dropped_event = float("-inf")
         self._budget_told: float | None = None
+        # The gate (T10-2): this connection's fingerprint key and its book of holds. One lock
+        # for the book, what is recorded about it and the messages sent for it (the reader,
+        # the ticker and the control socket's threads all come here).
+        self._fp_key = new_key()
+        self._book = book if book is not None else HoldBook(timings, clock=monotonic)
+        self._gate_lock = threading.RLock()
+        self._holds_ended = False
 
     # Handshake and threads
 
@@ -338,6 +387,7 @@ class ProxyChannel:
             self._policy.providers,
             self._limits or protocol.DEFAULT_LIMITS,
             provider_tools=self._policy.provider_tools,
+            fp_key=self._fp_key,
         )
         try:
             self._send(protocol.encode(config, Sender.BACKTIDE))
@@ -359,6 +409,7 @@ class ProxyChannel:
             thread.start()
 
     def close(self, reason: str = "closed") -> None:
+        self._end_holds(_END_WHY.get(reason, "channel_lost"))
         if not self.closed:
             self.closed = True
             self.close_reason = reason
@@ -413,13 +464,22 @@ class ProxyChannel:
                 self.closed = True
                 self.close_reason = reason
                 self._stop.set()
+            self._end_holds("channel_lost")
             try:  # the proxy sees the end at once (and denies what waits); close() frees the fd
                 self._sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
 
     def _ping_loop(self) -> None:
-        while not self._stop.wait(PING_EVERY):
+        next_ping = self._mono() + PING_EVERY
+        while not self._stop.wait(min(TICK_EVERY, PING_EVERY)):
+            try:
+                self.tick()
+            except Exception:  # the ping goes on: a hold not expired now expires later
+                logger.exception("looking at the held requests failed")
+            if self._mono() < next_ping:
+                continue
+            next_ping = self._mono() + PING_EVERY
             try:
                 self._send(protocol.encode(protocol.ping(), Sender.BACKTIDE))
             except OSError as error:
@@ -454,6 +514,12 @@ class ProxyChannel:
             self._send(protocol.encode(self._verdict(message), Sender.BACKTIDE))
         elif kind == "event":
             self._event(message["event"])
+        elif kind == "released":
+            with self._gate_lock:
+                self._book.released(message["hold_id"])
+        elif kind == "hold_left":
+            with self._gate_lock:
+                self._book.left(message["hold_id"])
         elif kind == "ping":
             self._send(protocol.encode(protocol.pong(), Sender.BACKTIDE))
         elif kind == "hello":
@@ -467,16 +533,233 @@ class ProxyChannel:
             return protocol.ack(request_id, "deny", reason="throttled", retry_after=1)
         details = event["details"]
         host, port = details.get("host"), details.get("port")
-        if not (isinstance(host, str) and port in ALLOWED_PORTS and self._allow.allows(host)):
-            blocked = _blocked_from(event, "not_allowed")
-            stored = self._append(blocked)
+        if not (isinstance(host, str) and port in ALLOWED_PORTS):
+            return self._refuse(request_id, event, "not_allowed")
+        allowed = self._allow.allows(host)
+        gate = message.get("gate")
+        if gate is None:  # a model call (llm/request): never held, only to a provider's host
+            if not allowed:
+                return self._refuse(request_id, event, "not_allowed")
+            return self._let_out(request_id, event)
+        with self._gate_lock:
+            self._tick_locked()
+            return self._gate_verdict(request_id, event, gate, allowed)
+
+    def _gate_verdict(
+        self, request_id: int, event: dict[str, Any], gate: dict[str, Any], allowed: bool
+    ) -> dict[str, Any]:
+        details = event["details"]
+        fp = gate["fp"]
+        body = details.get("body")
+        size = body.get("size") if isinstance(body, dict) else None
+        # Decision 1's guard with what backtide knows too: the proxy never sees the Gateway
+        # token, so a URL that carried it is only struck here.
+        path = details.get("path")
+        struck_here = not isinstance(path, str) or self._scrub.text(path) != path
+        facts = Facts(
+            method=str(details.get("method", "")),
+            exact_read=gate["exact_read"],
+            has_body=not (type(size) is int and size == 0),  # unknown: a body (fails closed)
+            url_bytes=gate["url_bytes"],
+            url_struck=gate["url_struck"] or struck_here,
+            websocket=gate["websocket"],
+            allowed=allowed,
+            preapproved=self._book.preapproved(fp),
+            rejected=self._book.rejected(fp),
+        )
+        decision = decide(facts, unknown_hosts=self._policy.unknown_hosts)
+        if decision.verdict is Verdict.REJECT:
+            return self._refuse(request_id, event, decision.reason, fp=fp)
+        if decision.verdict is Verdict.PASS:
+            note: dict[str, Any] = {"decision": decision.reason}
+            if decision.reason == "preapproved":
+                hold = self._book.spend(fp)
+                if hold is None:  # cannot be: preapproved() said so under this same lock
+                    return protocol.ack(request_id, "deny", reason="not_recorded")
+                approved = self._gate_event(
+                    "approved", hold, {"by": "preapproval"}, risk=1, target=event["target"]
+                )
+                if approved is None:
+                    return protocol.ack(request_id, "deny", reason="not_recorded")
+                note["hold_id"] = hold.hold_id
+            return self._let_out(request_id, event, note)
+        return self._hold(request_id, event, gate, decision.risk, decision.reason)
+
+    def _hold(
+        self, request_id: int, event: dict[str, Any], gate: dict[str, Any], risk: int, reason: str
+    ) -> dict[str, Any]:
+        fp = gate["fp"]
+        hold = self._book.live(fp)
+        if hold is not None:  # the same request again: it joins, without a new event
+            self._book.join(hold, event)
+        else:
+            hold = self._book.open(fp, risk=risk, reason=reason, event=event)
+            if hold is None:  # too many open: counted in the next gate/flood
+                return protocol.ack(request_id, "deny", reason="hold_full")
+            extra = {"reason": reason, "expires_at": hold.expires_at}
+            stored = self._gate_event("held", hold, extra, risk=risk, request=event["details"])
             if stored is None:
+                self._book.discard(hold)
                 return protocol.ack(request_id, "deny", reason="not_recorded")
-            return protocol.ack(request_id, "deny", seq=stored.seq, reason="not_allowed")
-        stored = self._append(event)
+            self._book.recorded(hold, stored.seq)
+        if hold.seq is None:  # cannot be: a hold is only kept once its gate/held is stored
+            return protocol.ack(request_id, "deny", reason="not_recorded")
+        return protocol.ack(
+            request_id,
+            "hold",
+            seq=hold.seq,
+            hold_id=hold.hold_id,
+            wait_ms=self._book.wait_ms(hold, gate["wait_hint_s"]),
+            retry_after=self._book.timings.retry_after,
+        )
+
+    def _let_out(
+        self, request_id: int, event: dict[str, Any], note: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Append the request's own event (with ``details.gate``, the rule that let it pass)
+        and only then ``allow`` with its seq."""
+        stored = self._append(event, None if note is None else {"gate": note})
         if stored is None:
             return protocol.ack(request_id, "deny", reason="not_recorded")
         return protocol.ack(request_id, "allow", seq=stored.seq)
+
+    def _refuse(
+        self, request_id: int, event: dict[str, Any], reason: str, *, fp: str | None = None
+    ) -> dict[str, Any]:
+        blocked = _blocked_from(event, reason)
+        if fp is not None and reason == "gate_rejected":
+            blocked["details"]["fp"] = short(fp)  # joins it to the hold that was rejected
+        stored = self._append(blocked)
+        if stored is None:
+            return protocol.ack(request_id, "deny", reason="not_recorded")
+        return protocol.ack(request_id, "deny", seq=stored.seq, reason=reason)
+
+    # The person's decisions, time and the end (T10-2)
+
+    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> HoldOutcome:
+        """Approve (``verdict="approve"``) or reject an open hold. ``by`` is who decided
+        (``DECIDERS``), ``requested_by`` the kernel's uid and pid of whoever asked. Never
+        raises for a hold that is not there: the outcome says so."""
+        if verdict not in {"approve", "reject"} or by not in DECIDERS:
+            raise ValueError("verdict is approve or reject; by is cli, web or telegram")
+        who = {"by": by, "requested_by": str(requested_by)[:MAX_REQUESTER_CHARS]}
+        with self._gate_lock:
+            if self.closed:
+                return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
+            self._tick_locked()
+            if verdict == "reject":
+                hold = self._book.reject(hold_id)
+                if hold is None:
+                    return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
+                self._gate_event("rejected", hold, who, risk=1)  # a no is good unrecorded too
+                if hold.connected:
+                    self._tell_decision(protocol.decision(hold_id, "deny", reason="rejected"))
+                return HoldOutcome(HoldStatus.REJECTED, hold_id)
+            hold = self._book.approve(hold_id)
+            if hold is None:
+                return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
+            if self._gate_event("approved", hold, who, risk=1) is None:
+                return HoldOutcome(HoldStatus.FAILED, hold_id)  # still open: nothing went out
+            if hold.connected:
+                # Recorded BEFORE it goes out, as every request: its net/request, then allow.
+                note = {"decision": "approved", "hold_id": hold_id, "by": by}
+                stored = self._append(hold.event, {"gate": note})
+                if stored is not None:
+                    self._book.release(hold)
+                    self._tell_decision(protocol.decision(hold_id, "allow", seq=stored.seq))
+                    return HoldOutcome(HoldStatus.RELEASED, hold_id)
+            # Nobody waits (or its net/request could not be recorded): the next identical
+            # request passes once, recorded then, within 10 min.
+            self._book.preapprove(hold)
+            return HoldOutcome(HoldStatus.PREAPPROVED, hold_id)
+
+    def pending(self) -> list[dict[str, Any]]:
+        """The holds waiting for the person, oldest first: what the person needs to decide
+        (the request as it was recorded, struck), never its body."""
+        with self._gate_lock:
+            if self.closed:
+                return []
+            self._tick_locked()
+            now = self._mono()
+            return [_summary(hold, now) for hold in self._book.pending()]
+
+    def reject_open(self, by: str) -> int:
+        """A pause (``by="pause"``) or a rewind (``"rewind"``): every open hold is rejected
+        (decision 7). Returns how many."""
+        with self._gate_lock:
+            if self.closed:
+                return 0
+            holds = self._book.reject_open()
+            reason = "paused" if by == "pause" else "rejected"
+            for hold in holds:
+                self._gate_event("rejected", hold, {"by": by}, risk=1)
+                if hold.connected:
+                    self._tell_decision(protocol.decision(hold.hold_id, "deny", reason=reason))
+            return len(holds)
+
+    def tick(self) -> None:
+        """The holds whose 5 min are over, and the flood count (every TICK_EVERY s)."""
+        with self._gate_lock:
+            if not self.closed:
+                self._tick_locked()
+
+    def _tick_locked(self) -> None:
+        for hold in self._book.due():
+            self._gate_event("expired", hold, {"why": "timeout"}, risk=2)
+            if hold.connected:
+                self._tell_decision(protocol.decision(hold.hold_id, "deny", reason="expired"))
+        flood = self._book.flood()
+        if flood is not None:
+            count, window = flood
+            self._record_gate("flood", "", {"count": count, "window_s": window}, risk=2)
+
+    def _end_holds(self, why: str) -> None:
+        """The channel ends: every open hold is expired with ``why`` (the proxy refuses what it
+        held), and the leave of this connection is forgotten. Once."""
+        with self._gate_lock:
+            if self._holds_ended:
+                return
+            self._holds_ended = True
+            for hold in self._book.close_all():
+                self._gate_event("expired", hold, {"why": why}, risk=2)
+
+    def _tell_decision(self, message: dict[str, Any]) -> None:
+        try:
+            self._send(protocol.encode(message, Sender.BACKTIDE))
+        except OSError as error:
+            # The channel broke: the proxy refuses what it holds, and the reader ends the holds.
+            logger.warning("cannot tell the proxy a decision (%s)", type(error).__name__)
+            self._broken("broken")
+
+    def _gate_event(
+        self,
+        action: str,
+        hold: Hold,
+        extra: Mapping[str, Any],
+        *,
+        risk: int,
+        target: str | None = None,
+        request: Mapping[str, Any] | None = None,
+    ) -> Event | None:
+        own = {**extra, "hold_id": hold.hold_id, "fp": short(hold.fp)}
+        where = target if target is not None else hold.event["target"]
+        return self._record_gate(action, where, own, risk=risk, request=request)
+
+    def _record_gate(
+        self,
+        action: str,
+        target: str,
+        own: Mapping[str, Any],
+        *,
+        risk: int,
+        request: Mapping[str, Any] | None = None,
+    ) -> Event | None:
+        """A ``gate`` event, written by backtide (never the proxy), struck like the rest:
+        ``request`` (what the proxy said of the request) whole, ``own`` (backtide's fields) in
+        its values."""
+        event = {"source": "gate", "action": action, "target": target, "risk": risk,
+                 "details": dict(request or {})}  # fmt: skip
+        return self._append(event, own)
 
     def _spend(self) -> bool:
         """A token of the bucket and one of the day, or a denial at once (never a wait)."""
@@ -523,10 +806,16 @@ class ProxyChannel:
             self._last_dropped_event = now
             self._append(record.dropped_event(count))
 
-    def _append(self, event: Mapping[str, Any]) -> Event | None:
-        """Strike again, then append. None if the black box refused it (logged)."""
+    def _append(
+        self, event: Mapping[str, Any], own: Mapping[str, Any] | None = None
+    ) -> Event | None:
+        """Strike again, then append. ``own``: details of backtide's own (the gate's), whose
+        names are ours and are not struck (a short name can look like the start of a secret to
+        ``cut_tails``), only their values. None if the black box refused it (logged)."""
         target = self._scrub.text(event["target"])
         details = self._scrub(event["details"])
+        if own:
+            details |= {name: self._scrub(value) for name, value in own.items()}
         try:
             return self._record(
                 event["source"], event["action"], target, details=details, risk=event["risk"]
@@ -553,6 +842,21 @@ def _blocked_from(event: Mapping[str, Any], reason: str) -> dict[str, Any]:
         "target": event["target"],
         "risk": BLOCK_RISK[reason],
         "details": details,
+    }
+
+
+def _summary(hold: Hold, now: float) -> dict[str, Any]:
+    details = hold.event.get("details") or {}
+    return {
+        "hold_id": hold.hold_id,
+        "risk": hold.risk,
+        "reason": hold.reason,
+        "method": details.get("method"),
+        "host": details.get("host"),
+        "path": details.get("path"),
+        "target": hold.event.get("target"),
+        "expires_in_s": max(0, int(hold.expires - now)),
+        "waiting": hold.connected > 0,
     }
 
 

@@ -53,6 +53,7 @@ from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
+from backtide.service.holds import HoldTimings
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
 from backtide.service.proxy_channel import Policy, known_secrets
@@ -228,6 +229,7 @@ def build_guardian(
     sensor: bool = True,
     sensor_jail: SensorJailConfig | None = None,
     proxy: ProxyJail | None = None,
+    hold_timings: HoldTimings | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -247,7 +249,8 @@ def build_guardian(
     a file the test user can read).
 
     The egress proxy (T06-4, ``build_egress``) is always there: it is the agent's only way out.
-    ``proxy`` replaces its container (the VM tests: their concessions, docs/21 "En la VM")."""
+    ``proxy`` replaces its container (the VM tests: their concessions, docs/21 "En la VM"), and
+    ``hold_timings`` the gate's times (the VM tests shorten its 5 min and 90 s, T10-2)."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
         rules = load_rules(config)  # a broken file is an error, not a guess
@@ -285,7 +288,7 @@ def build_guardian(
     process_sensor = (
         build_sensor(config, jail, rated_box, store, jail_config=sensor_jail) if sensor else None
     )
-    egress = build_egress(config, jail, rated_box, proxy=proxy)
+    egress = build_egress(config, jail, rated_box, proxy=proxy, timings=hold_timings)
     guardian = Guardian(
         config,
         store=store,
@@ -350,6 +353,7 @@ def build_egress(
     box: AssessedBlackBox,
     *,
     proxy: ProxyJail | None = None,
+    timings: HoldTimings | None = None,
 ) -> Egress:
     """The egress proxy of ``config`` (docs/21, section 9): its container, and what backtide lets
     out through it, the allowed hosts of ``[proxy]`` and the model providers' hosts. The channel
@@ -368,7 +372,16 @@ def build_egress(
         policy.allow_list()
     except ValueError as error:
         raise ConfigError(f"[proxy] allow_hosts: {error}") from None
-    return Egress(proxy, agent_name=agent.config.name, policy=policy, record=box.append)
+    # The gate (T10-2) reads the black box once, at the first start: the holds a backtide that
+    # died left open there are closed.
+    return Egress(
+        proxy,
+        agent_name=agent.config.name,
+        policy=policy,
+        record=box.append,
+        timings=timings,
+        history=box.events,
+    )
 
 
 def prepare_egress(config: ServiceConfig) -> None:
@@ -505,6 +518,7 @@ def serve(
     sensor: bool = True,
     sensor_jail: SensorJailConfig | None = None,
     proxy: ProxyJail | None = None,
+    hold_timings: HoldTimings | None = None,
 ) -> None:
     """What `backtide vigilar` does: take the lock, build the real service and run it until it is
     told to stop, with the control socket of ``backtide rebobinar`` and ``backtide seguir`` open
@@ -532,6 +546,7 @@ def serve(
             sensor=sensor,
             sensor_jail=sensor_jail,
             proxy=proxy,
+            hold_timings=hold_timings,
         )
         control: ControlHook = ControlServer(guardian, config.control_socket)
         if telegram is not None:

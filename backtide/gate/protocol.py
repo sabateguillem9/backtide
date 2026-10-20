@@ -9,15 +9,31 @@ fixes (the proxy cannot choose it). Errors never quote the offending value.
 | Message | Sent by | What |
 |---|---|---|
 | ``hello {version, pid}`` | proxy | When it starts |
-| ``config {allow_hosts, providers, limits, provider_tools}`` | backtide | The answer to ``hello``; holds the keys |
-| ``request {id, event}`` / ``ack {id, verdict, seq, reason?, retry_after?}`` | proxy / backtide | Before a request goes out |
+| ``config {allow_hosts, providers, limits, provider_tools, fp_key}`` | backtide | The answer to ``hello``; holds the keys |
+| ``request {id, event, gate?}`` / ``ack {id, verdict, seq, reason?, retry_after?, hold_id?, wait_ms?}`` | proxy / backtide | Before a request goes out |
+| ``decision {hold_id, verdict, seq?, reason?}`` | backtide | The person's answer to a held request (T10) |
+| ``released {hold_id}`` / ``hold_left {hold_id, why}`` | proxy | "I let it go" / "I no longer hold it" |
 | ``event {event}`` | proxy | Anything that does not send a request out |
 | ``ping`` / ``pong`` | both | Every few seconds |
+
+The hold (T10-2, docs/32-diseno-t10-puerta.md, section 6): a ``net/request`` carries ``gate``,
+the facts backtide decides on (its fingerprint, whether the redaction struck something of its
+URL, how long that URL is, whether it opens a WebSocket, whether its method is exactly a read,
+and how long its client waits). The ack may say ``hold``: its ``seq`` is the ``gate/held``
+already recorded, ``hold_id`` names the hold and ``wait_ms`` is how long the proxy keeps the
+request with its connection open. backtide's ``decision`` comes later: ``allow`` with the
+``seq`` of the ``net/request`` already recorded, or ``deny``. The proxy answers each hold ack
+with exactly one ``released`` (it let the request go) or ``hold_left`` (``client_left``,
+``waited`` or ``no_slot``), unless a ``deny`` came, so an approval is spent exactly once.
+``config`` carries ``fp_key``, the fingerprint key of this connection: like the real keys, it
+lives in memory only and is never logged.
 
 Design and rationale: docs/21-diseno-t06-proxy.md, section 5.
 """  # noqa: E501
 
 import json
+import re
+import secrets
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Any
@@ -35,6 +51,11 @@ _MAX_SEQ = 2**63 - 1
 _MAX_ALLOW_HOSTS = 1000
 _MAX_PROVIDERS = 32
 MAX_PROVIDER_TOOLS = 64
+MAX_WAIT_MS = 90_000  # a held request keeps its connection 90 s at most (decision 1)
+MAX_WAIT_HINT_S = 90
+_MAX_URL_BYTES = 2**31
+HOLD_ID_RE = re.compile(r"h-[0-9a-f]{12}", re.ASCII)
+_FP_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 
 class ProtocolError(ValueError):
@@ -47,8 +68,8 @@ class Sender(StrEnum):
 
 
 _SENT_BY = {
-    Sender.PROXY: frozenset({"hello", "request", "event", "ping", "pong"}),
-    Sender.BACKTIDE: frozenset({"config", "ack", "ping", "pong"}),
+    Sender.PROXY: frozenset({"hello", "request", "event", "released", "hold_left", "ping", "pong"}),
+    Sender.BACKTIDE: frozenset({"config", "ack", "decision", "ping", "pong"}),
 }
 
 # --- events --------------------------------------------------------------------------------------
@@ -70,8 +91,14 @@ BLOCK_RISK = {
     "provider_endpoint": 2,  # not one of the provider's model endpoints
     "provider_body": 2,  # a body that is not the provider's JSON: its tools cannot be checked
     "provider_side_tool": 2,  # a tool or connector that runs on the provider's side
+    # T10-2: the same fingerprint was rejected (or expired) a moment ago: refused without asking.
+    "gate_rejected": 1,
 }
-DENY_REASONS = frozenset({"not_allowed", "throttled", "not_recorded"})
+DENY_REASONS = frozenset({"not_allowed", "throttled", "not_recorded", "gate_rejected", "hold_full"})
+# Why backtide denies a held request (``decision``), and why the proxy no longer holds one.
+DECISION_REASONS = frozenset({"rejected", "expired", "paused", "hold_full"})
+HOLD_LEFT_WHY = frozenset({"client_left", "waited", "no_slot"})
+_GATE_KEYS = frozenset({"fp", "url_struck", "url_bytes", "websocket", "exact_read", "wait_hint_s"})
 
 _REQUEST_KEYS = frozenset(
     {"flow_id", "method", "scheme", "host", "port", "path", "http_version", "server_ip",
@@ -230,10 +257,13 @@ def config(
     limits: Mapping[str, int],
     *,
     provider_tools: Iterable[str] = (),
+    fp_key: bytes | None = None,
 ) -> dict[str, Any]:
     """The configuration for the proxy. It holds the real keys in clear: never log it (use
     describe()), and drop it as soon as it is encoded. ``provider_tools``: the provider-side
-    tools that may go to a provider anyway (``[proxy] allow_provider_tools``, T06-6)."""
+    tools that may go to a provider anyway (``[proxy] allow_provider_tools``, T06-6).
+    ``fp_key``: this connection's fingerprint key (T10-2; a fresh one if None)."""
+    key = fp_key if fp_key is not None else secrets.token_bytes(32)
     message = {
         "type": "config",
         "allow_hosts": list(allow_hosts),
@@ -250,12 +280,38 @@ def config(
         ],
         "limits": dict(limits),
         "provider_tools": list(provider_tools),
+        "fp_key": key.hex(),
     }
     return _check(message)
 
 
-def request(request_id: int, event_: Mapping[str, Any]) -> dict[str, Any]:
-    return _check({"type": "request", "id": request_id, "event": dict(event_)})
+def request(
+    request_id: int, event_: Mapping[str, Any], gate_: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """A request before it goes out. A ``net/request`` carries its ``gate`` facts (``gate()``);
+    an ``llm/request`` (a provider's host: never held) carries none."""
+    message: dict[str, Any] = {"type": "request", "id": request_id, "event": dict(event_)}
+    if gate_ is not None:
+        message["gate"] = dict(gate_)
+    return _check(message)
+
+
+def gate(
+    *,
+    fp: str,
+    url_struck: bool,
+    url_bytes: int,
+    websocket: bool,
+    exact_read: bool,
+    wait_hint_s: int | None = None,
+) -> dict[str, Any]:
+    """The facts of a ``net/request`` that backtide decides on (docs/32, section 6): its exact
+    fingerprint (64 hex), whether the redaction struck something of its URL, the URL's length in
+    bytes, whether it opens a WebSocket, whether its method is exactly GET, HEAD or OPTIONS,
+    and how long its client waits (a translator's hint, T10-3; None: 90 s)."""
+    facts = {"fp": fp, "url_struck": url_struck, "url_bytes": url_bytes, "websocket": websocket,
+             "exact_read": exact_read, "wait_hint_s": wait_hint_s}  # fmt: skip
+    return _check_gate(facts)
 
 
 def ack(
@@ -265,13 +321,40 @@ def ack(
     seq: int | None = None,
     reason: str | None = None,
     retry_after: int | None = None,
+    hold_id: str | None = None,
+    wait_ms: int | None = None,
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"type": "ack", "id": request_id, "verdict": verdict, "seq": seq}
     if reason is not None:
         message["reason"] = reason
     if retry_after is not None:
         message["retry_after"] = retry_after
+    if hold_id is not None:
+        message["hold_id"] = hold_id
+    if wait_ms is not None:
+        message["wait_ms"] = wait_ms
     return _check(message)
+
+
+def decision(
+    hold_id: str, verdict: str, *, seq: int | None = None, reason: str | None = None
+) -> dict[str, Any]:
+    """backtide's answer to a held request: ``allow`` with the ``seq`` of its ``net/request``
+    (recorded already), or ``deny`` with one of DECISION_REASONS."""
+    message: dict[str, Any] = {"type": "decision", "hold_id": hold_id, "verdict": verdict}
+    if seq is not None:
+        message["seq"] = seq
+    if reason is not None:
+        message["reason"] = reason
+    return _check(message)
+
+
+def released(hold_id: str) -> dict[str, Any]:
+    return _check({"type": "released", "hold_id": hold_id})
+
+
+def hold_left(hold_id: str, why: str) -> dict[str, Any]:
+    return _check({"type": "hold_left", "hold_id": hold_id, "why": why})
 
 
 def event(event_: Mapping[str, Any]) -> dict[str, Any]:
@@ -294,6 +377,7 @@ DEFAULT_LIMITS = {
     "max_queue": 1000,
     "ack_timeout_ms": 5000,
     "ping_interval_ms": 5000,
+    "max_holds": 8,  # held requests with their connection open at once (docs/32, section 6)
 }
 _LIMIT_RANGES = {
     "max_connections": (1, 4096),
@@ -301,6 +385,7 @@ _LIMIT_RANGES = {
     "max_queue": (1, 100_000),
     "ack_timeout_ms": (100, 60_000),
     "ping_interval_ms": (500, 60_000),
+    "max_holds": (1, 64),
 }
 _PROVIDER_KEYS = frozenset({"name", "kind", "host", "fake_key", "real_key"})
 
@@ -353,6 +438,10 @@ def describe(message: Mapping[str, Any]) -> str:
         )
     if kind in {"request", "ack"}:
         return f"{kind} {message.get('id')}"
+    if kind in {"decision", "released", "hold_left"}:
+        hold_id = message.get("hold_id")
+        valid = isinstance(hold_id, str) and HOLD_ID_RE.fullmatch(hold_id)
+        return f"{kind} {hold_id if valid else '?'}"
     return str(kind) if kind in _SENT_BY[Sender.PROXY] | _SENT_BY[Sender.BACKTIDE] else "?"
 
 
@@ -382,7 +471,10 @@ def _check_hello(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _check_config(message: dict[str, Any]) -> dict[str, Any]:
-    _fields(message, {"allow_hosts", "providers", "limits"}, {"provider_tools"})
+    _fields(message, {"allow_hosts", "providers", "limits", "fp_key"}, {"provider_tools"})
+    fp_key = message["fp_key"]
+    if not isinstance(fp_key, str) or not _FP_RE.fullmatch(fp_key):
+        raise ProtocolError("config.fp_key: not 32 bytes in hex")
     hosts = message["allow_hosts"]
     if not isinstance(hosts, list) or len(hosts) > _MAX_ALLOW_HOSTS:
         raise ProtocolError("config.allow_hosts: not a list of hosts")
@@ -420,16 +512,53 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
         ],
         "limits": checked,
         "provider_tools": allowed_tools,
+        "fp_key": fp_key,
     }
 
 
 def _check_request(message: dict[str, Any]) -> dict[str, Any]:
-    _fields(message, {"id", "event"})
+    _fields(message, {"id", "event"}, {"gate"})
     checked = validate_event(message["event"])
     if checked["action"] != "request":
         raise ProtocolError("request.event: not a request")
-    return {"type": "request", "id": _int(message["id"], "request.id", 1, _MAX_ID),
-            "event": checked}  # fmt: skip
+    result = {"type": "request", "id": _int(message["id"], "request.id", 1, _MAX_ID),
+              "event": checked}  # fmt: skip
+    # Every net/request is decided on its gate facts; a provider's (llm) is never held.
+    if checked["source"] == "net":
+        if "gate" not in message:
+            raise ProtocolError("request.gate: a net request needs its gate facts")
+        result["gate"] = _check_gate(message["gate"])
+    elif "gate" in message:
+        raise ProtocolError("request.gate: only for a net request")
+    return result
+
+
+def _check_gate(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _GATE_KEYS:
+        raise ProtocolError("request.gate: wrong fields")
+    fp = value["fp"]
+    if not isinstance(fp, str) or not _FP_RE.fullmatch(fp):
+        raise ProtocolError("request.gate.fp: not a fingerprint")
+    for name in ("url_struck", "websocket", "exact_read"):
+        if type(value[name]) is not bool:
+            raise ProtocolError(f"request.gate.{name}: not a boolean")
+    hint = value["wait_hint_s"]
+    return {
+        "fp": fp,
+        "url_struck": value["url_struck"],
+        "url_bytes": _int(value["url_bytes"], "request.gate.url_bytes", 0, _MAX_URL_BYTES),
+        "websocket": value["websocket"],
+        "exact_read": value["exact_read"],
+        "wait_hint_s": None
+        if hint is None
+        else _int(hint, "request.gate.wait_hint_s", 1, MAX_WAIT_HINT_S),
+    }
+
+
+def _hold_id(value: object, where: str) -> str:
+    if not isinstance(value, str) or not HOLD_ID_RE.fullmatch(value):
+        raise ProtocolError(f"{where}: not a hold id")
+    return value
 
 
 def _check_event(message: dict[str, Any]) -> dict[str, Any]:
@@ -441,17 +570,30 @@ def _check_event(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _check_ack(message: dict[str, Any]) -> dict[str, Any]:
-    _fields(message, {"id", "verdict", "seq"}, {"reason", "retry_after"})
+    _fields(message, {"id", "verdict", "seq"}, {"reason", "retry_after", "hold_id", "wait_ms"})
     checked: dict[str, Any] = {"type": "ack", "id": _int(message["id"], "ack.id", 1, _MAX_ID)}
     verdict, seq = message["verdict"], message["seq"]
     reason, retry_after = message.get("reason"), message.get("retry_after")
+    if verdict == "hold":
+        if reason is not None or "hold_id" not in message or "wait_ms" not in message:
+            raise ProtocolError("ack: a hold has a hold_id and a wait, and no reason")
+        checked |= {
+            "verdict": "hold",
+            "seq": _int(seq, "ack.seq", 1, _MAX_SEQ),
+            "hold_id": _hold_id(message["hold_id"], "ack.hold_id"),
+            "wait_ms": _int(message["wait_ms"], "ack.wait_ms", 0, MAX_WAIT_MS),
+            "retry_after": _int(retry_after, "ack.retry_after", 1, 3600),
+        }
+        return checked
+    if "hold_id" in message or "wait_ms" in message:
+        raise ProtocolError("ack: only a hold has a hold_id")
     if verdict == "allow":
         if reason is not None or retry_after is not None:
             raise ProtocolError("ack: an allow has no reason")
         checked |= {"verdict": "allow", "seq": _int(seq, "ack.seq", 1, _MAX_SEQ)}
         return checked
     if verdict != "deny":
-        raise ProtocolError("ack.verdict: not allow or deny")
+        raise ProtocolError("ack.verdict: not allow, deny or hold")
     if not isinstance(reason, str) or reason not in DENY_REASONS:
         raise ProtocolError("ack.reason: not a known reason")
     checked["verdict"] = "deny"
@@ -462,6 +604,46 @@ def _check_ack(message: dict[str, Any]) -> dict[str, Any]:
             raise ProtocolError("ack.retry_after: only when throttled")
         checked["retry_after"] = _int(retry_after, "ack.retry_after", 1, 3600)
     return checked
+
+
+def _check_decision(message: dict[str, Any]) -> dict[str, Any]:
+    _fields(message, {"hold_id", "verdict"}, {"seq", "reason"})
+    checked: dict[str, Any] = {
+        "type": "decision",
+        "hold_id": _hold_id(message["hold_id"], "decision.hold_id"),
+    }
+    verdict = message["verdict"]
+    if verdict == "allow":
+        if "reason" in message:
+            raise ProtocolError("decision: an allow has no reason")
+        checked |= {
+            "verdict": "allow",
+            "seq": _int(message.get("seq"), "decision.seq", 1, _MAX_SEQ),
+        }
+        return checked
+    if verdict != "deny":
+        raise ProtocolError("decision.verdict: not allow or deny")
+    if "seq" in message:
+        raise ProtocolError("decision: a deny has no seq")
+    reason = message.get("reason")
+    if not isinstance(reason, str) or reason not in DECISION_REASONS:
+        raise ProtocolError("decision.reason: not a known reason")
+    checked |= {"verdict": "deny", "reason": reason}
+    return checked
+
+
+def _check_released(message: dict[str, Any]) -> dict[str, Any]:
+    _fields(message, {"hold_id"})
+    return {"type": "released", "hold_id": _hold_id(message["hold_id"], "released.hold_id")}
+
+
+def _check_hold_left(message: dict[str, Any]) -> dict[str, Any]:
+    _fields(message, {"hold_id", "why"})
+    why = message["why"]
+    if not isinstance(why, str) or why not in HOLD_LEFT_WHY:
+        raise ProtocolError("hold_left.why: not a known reason")
+    return {"type": "hold_left", "hold_id": _hold_id(message["hold_id"], "hold_left.hold_id"),
+            "why": why}  # fmt: skip
 
 
 def _check_bare(message: dict[str, Any]) -> dict[str, Any]:
@@ -475,6 +657,9 @@ _CHECKERS = {
     "request": _check_request,
     "ack": _check_ack,
     "event": _check_event,
+    "decision": _check_decision,
+    "released": _check_released,
+    "hold_left": _check_hold_left,
     "ping": _check_bare,
     "pong": _check_bare,
 }

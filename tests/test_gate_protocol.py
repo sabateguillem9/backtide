@@ -15,14 +15,18 @@ from backtide.gate.protocol import (
     Sender,
     ack,
     config,
+    decision,
     decode,
     describe,
     encode,
     event,
+    gate,
     hello,
+    hold_left,
     ping,
     pong,
     providers_from_config,
+    released,
     request,
     validate_event,
 )
@@ -56,6 +60,14 @@ def net_request() -> dict[str, Any]:
     }
 
 
+FP = "ab" * 32
+HOLD = "h-0123456789ab"
+
+
+def facts(**changes: Any) -> dict[str, Any]:
+    return gate(fp=FP, url_struck=False, url_bytes=40, websocket=False, exact_read=False) | changes
+
+
 def blocked(reason: str = "port", risk: int | None = None) -> dict[str, Any]:
     return {
         "source": "net",
@@ -79,7 +91,12 @@ def roundtrip(message: dict[str, Any], sender: Sender) -> dict[str, Any]:
 def test_the_proxy_messages_go_there_and_back() -> None:
     for message in (
         hello("0.1.0", 7),
-        request(1, net_request()),
+        request(1, net_request(), facts()),
+        request(2, net_request(), facts(wait_hint_s=50, url_struck=True, exact_read=True)),
+        released(HOLD),
+        hold_left(HOLD, "client_left"),
+        hold_left(HOLD, "waited"),
+        hold_left(HOLD, "no_slot"),
         event(blocked()),
         ping(),
         pong(),
@@ -91,7 +108,12 @@ def test_the_backtide_messages_go_there_and_back() -> None:
     allow = ack(1, "allow", seq=42)
     deny = ack(2, "deny", seq=43, reason="not_allowed")
     slow = ack(3, "deny", reason="throttled", retry_after=5)
-    for message in (allow, deny, slow, ping(), pong()):
+    held = ack(4, "hold", seq=44, hold_id=HOLD, wait_ms=90_000, retry_after=30)
+    again = ack(5, "deny", seq=45, reason="gate_rejected")
+    full = ack(6, "deny", reason="hold_full")
+    let_go = decision(HOLD, "allow", seq=46)
+    no = [decision(HOLD, "deny", reason=r) for r in ("rejected", "expired", "paused", "hold_full")]
+    for message in (allow, deny, slow, held, again, full, let_go, *no, ping(), pong()):
         assert roundtrip(message, Sender.BACKTIDE) == message
 
 
@@ -112,8 +134,11 @@ def test_a_config_carries_the_keys_and_becomes_providers_again() -> None:
         (lambda: config([], providers(), {}), Sender.PROXY),  # only backtide configures
         (lambda: ack(1, "allow", seq=1), Sender.PROXY),
         (lambda: hello("1", 1), Sender.BACKTIDE),
-        (lambda: request(1, net_request()), Sender.BACKTIDE),
+        (lambda: request(1, net_request(), facts()), Sender.BACKTIDE),
         (lambda: event(blocked()), Sender.BACKTIDE),
+        (lambda: decision(HOLD, "allow", seq=1), Sender.PROXY),  # only backtide decides
+        (lambda: released(HOLD), Sender.BACKTIDE),
+        (lambda: hold_left(HOLD, "waited"), Sender.BACKTIDE),
     ],
 )
 def test_each_side_only_sends_its_own_messages(message: Any, sender: Sender) -> None:
@@ -172,7 +197,7 @@ def test_a_line_over_64_kib_is_refused_both_ways() -> None:
     big["details"]["path"] = "/" + "a" * 4000
     big["details"]["headers"] = {f"x-h{i}": "v" * 1000 for i in range(64)}
     with pytest.raises(ProtocolError):
-        encode(request(1, big), Sender.PROXY)
+        encode(request(1, big, facts()), Sender.PROXY)
     raw = json.dumps({"type": "ping", "pad": "x" * MAX_LINE_BYTES}).encode() + b"\n"
     with pytest.raises(ProtocolError):
         decode(raw, Sender.PROXY)
@@ -266,6 +291,7 @@ def test_the_block_risks_are_the_design_ones() -> None:
         "provider_endpoint": 2,
         "provider_body": 2,
         "provider_side_tool": 2,
+        "gate_rejected": 1,
     }
 
 
@@ -288,7 +314,16 @@ def test_a_request_must_go_through_its_ack_and_an_ack_is_only_for_requests() -> 
     [
         lambda: ack(1, "allow"),  # an allow without its seq
         lambda: ack(1, "allow", seq=1, reason="not_allowed"),
-        lambda: ack(1, "hold", seq=1),  # T10
+        lambda: ack(1, "hold", seq=1),  # a hold without its id and wait
+        lambda: ack(1, "hold", seq=1, hold_id=HOLD, wait_ms=1000),  # nor its Retry-After
+        lambda: ack(1, "hold", hold_id=HOLD, wait_ms=1000, retry_after=30),  # nor its gate/held
+        lambda: ack(1, "hold", seq=1, hold_id="h-XYZ", wait_ms=1000, retry_after=30),
+        lambda: ack(1, "hold", seq=1, hold_id=HOLD, wait_ms=90_001, retry_after=30),
+        lambda: ack(1, "hold", seq=1, hold_id=HOLD, wait_ms=-1, retry_after=30),
+        lambda: ack(1, "hold", seq=1, hold_id=HOLD, wait_ms=10, retry_after=30, reason="write"),
+        lambda: ack(1, "allow", seq=1, hold_id=HOLD),  # only a hold has a hold id
+        lambda: ack(1, "deny", reason="not_allowed", wait_ms=5),
+        lambda: ack(1, "deny", reason="rejected"),  # a decision's reason, not an ack's
         lambda: ack(1, "deny"),  # a deny without its reason
         lambda: ack(1, "deny", reason="because"),
         lambda: ack(1, "deny", reason="not_allowed", retry_after=5),
@@ -297,13 +332,99 @@ def test_a_request_must_go_through_its_ack_and_an_ack_is_only_for_requests() -> 
         lambda: ack(2**53, "allow", seq=1),
         lambda: ack(1, "allow", seq=0),
         lambda: ack(True, "allow", seq=1),
-        lambda: request(0, net_request()),
+        lambda: request(0, net_request(), facts()),
         lambda: hello("1", -5),
     ],
 )
 def test_bad_acks_and_ids_are_refused(build: Any) -> None:
     with pytest.raises(ProtocolError):
         build()
+
+
+# --- the hold (T10-2) --------------------------------------------------------------------------
+
+
+def llm_request() -> dict[str, Any]:
+    return net_request() | {"source": "llm", "details": {"provider": "anthropic", "port": 443}}
+
+
+def test_a_net_request_carries_its_gate_facts_and_a_model_call_none() -> None:
+    with pytest.raises(ProtocolError):
+        request(1, net_request())  # what would backtide decide on?
+    assert "gate" not in request(1, llm_request())
+    with pytest.raises(ProtocolError):
+        request(1, llm_request(), facts())  # a provider's host is never held
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"fp": "AB" * 32},  # lower-case hex only
+        {"fp": "ab" * 31},
+        {"fp": 7},
+        {"url_struck": 1},
+        {"websocket": "yes"},
+        {"exact_read": None},
+        {"url_bytes": -1},
+        {"url_bytes": 2**31 + 1},
+        {"url_bytes": True},
+        {"wait_hint_s": 0},
+        {"wait_hint_s": 91},
+        {"wait_hint_s": 1.5},
+        {"reading": {"effect": "read"}},  # the translators' field comes with T10-3
+    ],
+)
+def test_bad_gate_facts_are_refused(change: dict[str, Any]) -> None:
+    message = {"type": "request", "id": 1, "event": net_request(), "gate": facts() | change}
+    with pytest.raises(ProtocolError):
+        decode(json.dumps(message).encode(), Sender.PROXY)
+
+
+def test_missing_gate_facts_are_refused() -> None:
+    for key in facts():
+        broken = facts()
+        del broken[key]
+        message = {"type": "request", "id": 1, "event": net_request(), "gate": broken}
+        with pytest.raises(ProtocolError):
+            decode(json.dumps(message).encode(), Sender.PROXY)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: decision(HOLD, "allow"),  # an allow names its net/request
+        lambda: decision(HOLD, "allow", seq=1, reason="rejected"),
+        lambda: decision(HOLD, "deny"),
+        lambda: decision(HOLD, "deny", reason="because"),
+        lambda: decision(HOLD, "deny", seq=3, reason="rejected"),
+        lambda: decision(HOLD, "hold", seq=3),
+        lambda: decision("h-0123456789aB", "allow", seq=1),
+        lambda: decision("h-0123456789ab0", "allow", seq=1),
+        lambda: released("x"),
+        lambda: hold_left(HOLD, "bored"),
+        lambda: hold_left(HOLD, ""),
+    ],
+)
+def test_bad_decisions_and_hold_messages_are_refused(build: Any) -> None:
+    with pytest.raises(ProtocolError):
+        build()
+
+
+def test_hold_messages_have_exactly_their_fields() -> None:
+    for message in (
+        {"type": "released", "hold_id": HOLD, "seq": 1},
+        {"type": "hold_left", "hold_id": HOLD, "why": "waited", "extra": 1},
+        {"type": "hold_left", "hold_id": HOLD},
+    ):
+        with pytest.raises(ProtocolError):
+            decode(json.dumps(message).encode(), Sender.PROXY)
+    with pytest.raises(ProtocolError):
+        decode(json.dumps(decision(HOLD, "allow", seq=1) | {"x": 1}).encode(), Sender.BACKTIDE)
+
+
+def test_the_hold_messages_are_described_without_their_content() -> None:
+    assert describe(decision(HOLD, "allow", seq=1)) == f"decision {HOLD}"
+    assert describe({"type": "hold_left", "hold_id": "secret-ish"}) == "hold_left ?"
 
 
 # --- the config --------------------------------------------------------------------------------
@@ -321,6 +442,11 @@ def test_bad_acks_and_ids_are_refused(build: Any) -> None:
         {"limits": {"max_pending": True}},
         {"providers": [{"name": "anthropic"}]},
         {"providers": "x"},
+        {"limits": {"max_holds": 0}},
+        {"limits": {"max_holds": 65}},
+        {"fp_key": "ab" * 16},
+        {"fp_key": "AB" * 32},
+        {"fp_key": None},
     ],
 )
 def test_a_bad_config_is_refused(change: dict[str, Any]) -> None:
@@ -440,5 +566,16 @@ def test_a_config_carries_each_providers_models() -> None:
 def test_bad_provider_models_are_refused(models: object) -> None:
     message = config([], providers(), {})
     message["providers"][0]["models"] = models
+    with pytest.raises(ProtocolError):
+        encode(message, Sender.BACKTIDE)
+
+
+def test_a_config_carries_this_connections_fingerprint_key_and_never_shows_it() -> None:
+    key = bytes(range(32))
+    message = config([], providers(), {}, fp_key=key)
+    assert roundtrip(message, Sender.BACKTIDE)["fp_key"] == key.hex()
+    assert key.hex() not in describe(message)
+    assert config([], providers(), {})["fp_key"] != config([], providers(), {})["fp_key"]
+    del message["fp_key"]
     with pytest.raises(ProtocolError):
         encode(message, Sender.BACKTIDE)

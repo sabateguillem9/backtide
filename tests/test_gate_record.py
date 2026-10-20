@@ -169,6 +169,27 @@ def test_the_query_is_struck_value_by_value(path: str, kept: str) -> None:
     assert request_event(flow(path=path), KNOWN)["details"]["path"] == kept
 
 
+@pytest.mark.parametrize(
+    ("path", "struck"),
+    [
+        ("/v1/items?page=2&q=cats", False),
+        ("/a/b", False),
+        (f"/x?note={REDACTED}", False),  # a marker the agent wrote itself is not a strike
+        ("/cb?c=1&access_token=abcdefghijk&s=2", True),
+        ("/x?Api%2DKey=abcdefgh", True),
+        (f"/leak/{REAL}", True),  # a known secret in the path itself
+        ("/q?" + "a=&" * 300 + "token=abcdefghijk", True),  # past what is looked at: unchecked
+        ("/q?" + "a=&" * 255 + "a=", False),
+        ("/q?" + "p=v&" * 10 + "token=abcdefghijk", True),
+        ("/" + "a" * 5000 + "?token=abcdefghijk", False),  # past what is recorded: held as long
+    ],
+)  # fmt: skip
+def test_path_struck_says_whether_recording_the_url_struck_something(
+    path: str, struck: bool
+) -> None:
+    assert record.path_struck(path, KNOWN) is struck
+
+
 def test_a_get_has_no_excerpt_and_neither_has_a_binary_body() -> None:
     get = request_event(flow(method="GET", body=b"q=1"), KNOWN)["details"]["body"]
     assert get == {"size": 3, "type": "application/json"}

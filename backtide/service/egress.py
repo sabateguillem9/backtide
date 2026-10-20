@@ -21,6 +21,11 @@ a few points of its life; the watch runs on this module's own thread.
   starts an agent that was held for want of a proxy).
 - **Stop** (``stop``): the Guardian stops the agent first; then the proxy (``docker stop``,
   killed if that fails), then the channel, and ``system/proxy_stop``.
+- **Held requests** (T10-2, docs/32 section 6): ``decide``, ``pending`` and ``reject_holds`` go to
+  the channel of the moment (its ``HoldBook``); with no channel there is nothing held. At the
+  first ``start``, the holds a backtide that died left open in the black box (``gate/held`` of
+  the last 15 min with no end) are closed with ``gate/expired {why: restart}``: the proxy that
+  held them refused them when it lost its channel.
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
 """
 
@@ -30,6 +35,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from backtide.blackbox import Event
@@ -38,6 +44,13 @@ from backtide.jail.docker import JailError
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.proxy_config import MITMPROXY_VERSION
 from backtide.notify import AlertLevel
+from backtide.service.holds import (
+    STALE_WINDOW,
+    HoldOutcome,
+    HoldStatus,
+    HoldTimings,
+    stale_holds,
+)
 from backtide.service.pause import Ticker
 from backtide.service.proxy_channel import (
     Budgets,
@@ -49,6 +62,7 @@ from backtide.service.proxy_channel import (
     check_peer,
     open_channel,
 )
+from backtide.snapshots import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +87,8 @@ class EgressHooks:
 
 
 Connect = Callable[[ProxyJail, float], ProxyChannel]
+# The gate events of the black box since a moment (``BlackBox.events(source=, since_ts=)``).
+History = Callable[..., list[Event]]
 
 
 class Egress:
@@ -93,6 +109,8 @@ class Egress:
         connect: Connect | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        timings: HoldTimings | None = None,
+        history: History | None = None,
     ) -> None:
         self._jail = jail
         self._agent_name = agent_name
@@ -113,6 +131,9 @@ class Egress:
         self._restarts: deque[float] = deque()
         self._out_of_restarts_told: float | None = None
         self._budget_alert_due = True
+        self._timings = timings
+        self._history = history
+        self._stale_closed = False
 
     # The Guardian's calls
 
@@ -128,6 +149,7 @@ class Egress:
         """Bring the proxy up and start its watch. False (recorded, alerted) if it is not up."""
         with self._lock:
             self._hooks = hooks
+            self._close_stale_holds()
             ok = self._bring_up("boot")
             if not ok:
                 self._down_since = self._mono()  # recorded as start_failed: the watch retries
@@ -166,6 +188,60 @@ class Egress:
                 self._hooks.back()
             except Exception:
                 logger.exception("the Guardian's hook for a proxy that is back failed")
+
+    # Held requests (T10-2)
+
+    def decide(self, hold_id: str, verdict: str, *, by: str, requested_by: str) -> HoldOutcome:
+        """Approve or reject a held request (``ProxyChannel.decide``). Without a channel there
+        is no hold: UNKNOWN. Never raises for a hold that is not there."""
+        channel = self._channel
+        if channel is None or channel.closed:
+            return HoldOutcome(HoldStatus.UNKNOWN, hold_id)
+        return channel.decide(hold_id, verdict, by=by, requested_by=requested_by)
+
+    def pending(self) -> list[dict[str, Any]]:
+        channel = self._channel
+        return [] if channel is None or channel.closed else channel.pending()
+
+    def reject_holds(self, by: str) -> int:
+        """A pause or a rewind rejects every open hold (decision 7). Never raises."""
+        channel = self._channel
+        if channel is None or channel.closed:
+            return 0
+        try:
+            return channel.reject_open(by)
+        except Exception:
+            logger.exception("rejecting the held requests failed")
+            return 0
+
+    def _close_stale_holds(self) -> None:
+        """Once per service: the holds a dead backtide left open in the black box are ended
+        (``gate/expired {why: restart}``). The proxy refused them when its channel went."""
+        if self._stale_closed or self._history is None:
+            return
+        self._stale_closed = True
+        now = utc_now()
+        try:
+            events = self._history(source="gate", since_ts=now - STALE_WINDOW)
+        except Exception as error:
+            logger.exception("cannot read the black box for held requests left open")
+            self._record("gate_restart_check_failed", {"error": _short(error)}, risk=2)
+            return
+        seen = []
+        held: dict[str, Event] = {}
+        for event in events:
+            hold_id, moment = event.details.get("hold_id"), _parse_ts(event.ts)
+            if isinstance(hold_id, str) and moment is not None:
+                seen.append((event.action, hold_id, moment))
+                if event.action == "held":
+                    held.setdefault(hold_id, event)
+        for hold_id in stale_holds(seen, now=now):
+            details: dict[str, Any] = {"hold_id": hold_id, "why": "restart"}
+            fp = held[hold_id].details.get("fp")
+            if isinstance(fp, str):
+                details["fp"] = fp
+            if self._hooks is not None:
+                self._hooks.record("gate", "expired", held[hold_id].target, details=details, risk=2)
 
     # Watch
 
@@ -329,6 +405,7 @@ class Egress:
                         limits=self._limits,
                         budgets=Budgets(self._mono()),
                         on_budget=self._daily_budget_spent,
+                        timings=self._timings,
                     )
                     channel.handshake(max(0.5, deadline - self._mono()))
                 except BaseException:
@@ -387,6 +464,13 @@ class Egress:
     def _alert(self, level: AlertLevel, title: str, body: str, event: Event | None) -> None:
         if self._hooks is not None:
             self._hooks.alert(level, title, body, event)
+
+
+def _parse_ts(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _short(error: BaseException) -> str:

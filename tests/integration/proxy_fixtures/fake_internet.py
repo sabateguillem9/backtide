@@ -8,7 +8,7 @@ the pinned mitmproxy image. Never contacted from the Mac and never with a real k
   only. Every accepted TCP connection is counted per listener *before* its TLS handshake, so
   a proxy that connects early is seen even if it never sends a request. Every request is
   answered with what arrived (listener, accept number, SNI, method, path, headers, body size),
-  except the model APIs below.
+  except the model APIs below. GET, POST, DELETE, PUT and PATCH (T10-2's held writes).
 - ``/v1/messages``: a fake Anthropic Messages API (JSON or SSE, ``"stream": true``). A user
   message with ``T06-EXEC:[[<command>]]`` in it is answered with a call of the ``exec`` tool
   running that command (T06-5: what does a command of the agent see?); the turn that brings
@@ -71,6 +71,16 @@ class Handler(BaseHTTPRequestHandler):
         self._serve()
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib name
+        self._serve()
+
+    # T10-2: the writes the gate holds (a DELETE "that wipes buckets and their backups").
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib name
+        self._serve()
+
+    def do_PUT(self) -> None:  # noqa: N802 - stdlib name
+        self._serve()
+
+    def do_PATCH(self) -> None:  # noqa: N802 - stdlib name
         self._serve()
 
     def _serve(self) -> None:

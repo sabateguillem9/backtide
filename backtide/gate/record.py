@@ -39,6 +39,7 @@ __all__ = [
     "error_event",
     "llm_request_event",
     "llm_response_event",
+    "path_struck",
     "request_event",
     "response_event",
     "throttled_event",
@@ -162,10 +163,11 @@ def _media_type(pairs: object, scrub: KnownScrubber) -> str | None:
     return _clean(raw.split(";", 1)[0].strip(), scrub, _LIMIT_NAME, lower=True)
 
 
-def _path(path: object, scrub: KnownScrubber) -> str:
+def _path(path: object, scrub: KnownScrubber, *, strike: bool = True) -> str:
     """The path with each query value struck when it is a secret by its name or by a
     pattern (also once decoded), then the whole text struck and cut. Only the first
-    _MAX_PARAMS parameters are looked at; the rest are dropped, never kept unchecked."""
+    _MAX_PARAMS parameters are looked at; the rest are dropped, never kept unchecked.
+    ``strike=False``: the same window, parameters and cut, with nothing struck (to compare)."""
     text = path if isinstance(path, str) else str(path)
     window = text[: _LIMIT_PATH + _MARGIN]
     base, mark, query = window.partition("?")
@@ -175,16 +177,30 @@ def _path(path: object, scrub: KnownScrubber) -> str:
         for part in parts[:_MAX_PARAMS]:
             name, equals, value = part.partition("=")
             decoded = {unquote_plus(name): unquote_plus(value)}
-            if equals and (redact(decoded) != decoded or scrub(decoded) != decoded):
+            if strike and equals and (redact(decoded) != decoded or scrub(decoded) != decoded):
                 value = "[REDACTED]"
             kept.append(f"{name}{equals}{value}")
         if len(parts) > _MAX_PARAMS:
             kept.append(f"[{len(parts) - _MAX_PARAMS} params dropped]")
         window = f"{base}?{'&'.join(kept)}"
-    struck = redact(scrub.text(window))
+    struck = redact(scrub.text(window)) if strike else window
     if len(text) > _LIMIT_PATH + _MARGIN:
         struck = struck[:-_MARGIN]  # as in _strike
     return _cut(struck, _LIMIT_PATH)
+
+
+def path_struck(path: object, secrets: Secrets) -> bool:
+    """Whether recording ``path`` (with its query) strikes something of it: a secret by name, by
+    pattern or known. The gate holds a read whose URL carried one (decision 1's guard, T10-2).
+    Parameters past the first _MAX_PARAMS are never looked at, so they count as struck: what
+    cannot be checked is not let out as a plain read. (Past _LIMIT_PATH the URL is held anyway
+    for its length.)"""
+    scrub = _scrubber(secrets)
+    text = path if isinstance(path, str) else str(path)
+    _, mark, query = text[: _LIMIT_PATH + _MARGIN].partition("?")
+    if mark and query.count("&") >= _MAX_PARAMS:
+        return True
+    return _path(text, scrub) != _path(text, scrub, strike=False)
 
 
 def _host(host: object, scrub: KnownScrubber) -> str:
