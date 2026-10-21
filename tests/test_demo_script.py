@@ -169,6 +169,7 @@ def test_stopping_the_demo_also_removes_the_old_names_the_proxy_and_the_fake_int
     assert removed_containers == {
         demo.CONTAINER,
         demo.PROXY_CONTAINER,
+        demo.OLD_PROXY_CONTAINER,
         demo.OLD_CONTAINER,
         demo.FAKE_INTERNET,
     }

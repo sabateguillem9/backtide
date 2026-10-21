@@ -121,7 +121,9 @@ class ProxyJailConfig:
 
     ca_dir: Path
     channel_dir: Path
-    name: str = "backtide-proxy"
+    # Never the agent-side alias: Docker answers a container's name on every network it is on,
+    # so the proxy would resolve PROXY_ALIAS to its egress address and refuse the agent.
+    name: str = "backtide-egress"
     agent_network: str = "backtide-agente-net"
     network: str = "backtide-salida-net"
     image: str = IMAGE
@@ -170,6 +172,12 @@ class ProxyJailConfig:
             ("network", self.network),
         ):
             _require_match(label, value, _DOCKER_NAME_RE)
+        if self.name == PROXY_ALIAS:
+            raise ValueError(
+                f"name must not be {PROXY_ALIAS!r}, the agent-side alias: Docker resolves a "
+                "container's name on every network, so the proxy would take its egress address "
+                "for the agent side and refuse every client"
+            )
         for label, value in (("agent_network", self.agent_network), ("network", self.network)):
             if value in _RESERVED_NETWORKS:
                 raise ValueError(f"{label} must be backtide's own network, not Docker's {value!r}")

@@ -65,7 +65,9 @@ NETWORK = "backtide-demo-net"
 OLD_CONTAINER = "vigia-demo-agent"
 OLD_NETWORK = "vigia-demo-net"
 # The demo's config does not name its egress proxy, so it runs under the default names.
-PROXY_CONTAINER = "backtide-proxy"
+PROXY_CONTAINER = "backtide-egress"
+# Its default name until 2026-10-21 (it was the agent-side alias, which broke the proxy).
+OLD_PROXY_CONTAINER = "backtide-proxy"
 PROXY_NETWORK = "backtide-salida-net"
 # `make probar FALSO=1` (scripts/demo/probar.py): the test's fake internet on that network.
 FAKE_INTERNET = "backtide-probar-internet"
@@ -370,7 +372,13 @@ def remove_agent() -> None:
     """Remove the demo containers (the agent, its proxy and the old pre-rename agent), then
     their networks: a stopped container still holds the btrfs in its own mount namespace, which
     would make the umount fail. ``-v``: their anonymous volumes go too. Missing ones are fine."""
-    for container in (CONTAINER, PROXY_CONTAINER, OLD_CONTAINER, FAKE_INTERNET):
+    for container in (
+        CONTAINER,
+        PROXY_CONTAINER,
+        OLD_PROXY_CONTAINER,
+        OLD_CONTAINER,
+        FAKE_INTERNET,
+    ):
         run(["docker", "rm", "--force", "--volumes", container])
     networks = run(["docker", "network", "ls", "--format", "{{.Name}}"]).stdout.split()
     for network in (NETWORK, PROXY_NETWORK, OLD_NETWORK):

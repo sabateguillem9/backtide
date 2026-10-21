@@ -715,7 +715,7 @@ def test_the_sensor_options_are_read(layout: Path) -> None:
             '[sensor]\nnovelty_streak_minutes = "10"\n', "novelty_streak", id="streak-str"
         ),
         pytest.param('[sensor]\nname = "backtide-agente"\n', "another container", id="agents"),
-        pytest.param('[sensor]\nname = "backtide-proxy"\n', "another container", id="proxys"),
+        pytest.param('[sensor]\nname = "backtide-egress"\n', "another container", id="proxys"),
         pytest.param('[sensor]\nname = "-x"\n', "sensor", id="bad-name"),
     ],
 )

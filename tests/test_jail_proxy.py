@@ -19,6 +19,7 @@ from test_jail_agent import FakeDocker, Reply
 
 from backtide.jail import docker, proxy_config
 from backtide.jail import proxy as proxy_module
+from backtide.jail.config import PROXY_ALIAS
 from backtide.jail.docker import JailError
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.proxy_config import (
@@ -57,7 +58,7 @@ def test_create_argv_has_every_option_of_the_design(cfg: ProxyJailConfig) -> Non
     argv = proxy_create_argv(cfg)
     assert argv[0] == "create"
     expected = {
-        "--name": ["backtide-proxy"],
+        "--name": ["backtide-egress"],
         "--user": ["61001:61001"],  # neither the agent's 61000 nor backtide's
         "--cap-drop": ["ALL"],
         "--security-opt": ["no-new-privileges=true"],  # and Docker's default seccomp
@@ -627,7 +628,7 @@ def test_the_test_grants_reach_the_proxy_as_variables(cfg: ProxyJailConfig) -> N
         {"test_upstream_ca": "not a pem"},
         {"test_public_addresses": ("10.0.0.1/8",)},
         {"egress_neighbours": ("bad name!",)},
-        {"egress_neighbours": ("backtide-proxy",)},
+        {"egress_neighbours": ("backtide-egress",)},
         {"backtide_uid": -1},
         {"backtide_uid": True},
         {"channel_size": "lots"},
@@ -735,3 +736,11 @@ def test_container_id_is_the_full_id(jail: ProxyJail, fake_docker: FakeDocker) -
     fake_docker.reply("container", "inspect", "--format", "{{.Id}}", Reply("../x\n"))
     with pytest.raises(JailError):
         jail.container_id()
+
+
+def test_the_container_is_never_named_like_the_agent_side_alias(tmp_path: Path) -> None:
+    """Docker answers a container's name on every network it is on: named like the alias, the
+    proxy resolves the alias to its egress address and refuses every client of the agent."""
+    with pytest.raises(ValueError, match="agent-side alias"):
+        ProxyJailConfig(ca_dir=tmp_path / "ca", channel_dir=tmp_path / "ch", name=PROXY_ALIAS)
+    assert ProxyJailConfig(ca_dir=tmp_path / "ca", channel_dir=tmp_path / "ch").name != PROXY_ALIAS
