@@ -12,7 +12,7 @@ import pytest
 import backtide.cli as cli
 from backtide.blackbox import BlackBoxError
 from backtide.cli import main
-from backtide.jail import JailError
+from backtide.jail import ExposedJail, JailError
 from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
 from backtide.service.config import ConfigError
 from backtide.service.runner import ServiceLocked
@@ -176,6 +176,22 @@ def test_an_agent_that_keeps_running_is_said_loudly(
     assert code == 1
     assert "SIGUE EN MARCHA" in err
     assert "backtide parado" not in out
+
+
+def test_a_jail_that_would_see_too_much_is_refused_without_saying_it_runs(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T14a: the boot refused the agent's container before it existed."""
+
+    def serve(config: object) -> None:
+        raise ExposedJail("is not prepared: it would see what it must not: x", ["x"])
+
+    monkeypatch.setattr(cli, "serve", serve)
+    code, _, err = run(capsys, "vigilar", "--config", config_file)
+    assert code == 2
+    assert "no arranca al agente" in err
+    assert "is not prepared" in err
+    assert "SIGUE EN MARCHA" not in err
 
 
 def test_an_unexpected_failure_is_logged_with_its_traceback_and_exits_with_1(

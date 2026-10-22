@@ -31,6 +31,13 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   carry out per hour (``read_budget_host_kib``, 256, and ``read_budget_total_kib``, 2048: either
   way, review of T10-3, M5). A Slack channel is trusted by its id (``C…``, ``G…`` or ``D…``),
   never by its name. NEVER a key.
+- ``[budget]`` (T11, docs/33): the spending caps in dollars (``daily_usd``, 5, and ``monthly_usd``,
+  50, by default: decided by default, revisable), the time zone of "a day" (``timezone``, IANA;
+  the machine's by default), how many model calls may be in flight at once (``max_inflight``, 4),
+  whether the prices update themselves from Anthropic's page (``auto_prices``, on; ``prices_url``
+  only for the tests' fake page) and the owner's own prices (``[budget.prices."<model>"]`` with
+  ``input`` and ``output`` in $/MTok, and optionally ``cache_read``, ``cache_write_5m`` and
+  ``cache_write_1h``), which win over every other table. NEVER a key.
 - ``[sensor]`` (T07-3, docs/23): whether the agent may run without the process sensor
   (``required``, false by default: decision 7), the sensor container's limits and the reader's
   rate limits. Never the image (pinned in backtide/jail/sensor.py) nor its folder, which is
@@ -44,8 +51,10 @@ import stat
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backtide.gate.decide import UNKNOWN_HOSTS
 from backtide.gate.protocol import MAX_READ_ENDPOINTS
@@ -56,13 +65,25 @@ from backtide.gate.providers import Secret as GateSecret
 from backtide.gate.translate.base import Trusted, normalize_trusted
 from backtide.gate.translate.read_post import check_read_endpoint
 from backtide.jail.ca import CaPaths
-from backtide.jail.config import AgentJailConfig
+from backtide.jail.config import AgentJailConfig, Protected
 from backtide.jail.openclaw import MODEL_ID, ModelProvider
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
 from backtide.service.holds import HoldTimings
+from backtide.service.price_update import PRICES_URL, check_url
+from backtide.service.prices import CACHE_1H, CACHE_5M, CACHE_READ, Price, PriceError, to_decimal
 from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES
+from backtide.service.spend import (
+    DEFAULT_DAILY_USD,
+    DEFAULT_MAX_INFLIGHT,
+    DEFAULT_MONTHLY_USD,
+    MAX_CAP_USD,
+    MAX_INFLIGHT,
+    BudgetSettings,
+    check_cap,
+)
+from backtide.snapshots.store import SNAPSHOTS
 
 DEFAULT_CYCLE_INTERVAL = 120.0  # seconds between two "did anything change?" checks
 DEFAULT_PRUNE_INTERVAL = 600.0
@@ -85,13 +106,18 @@ STATE_PROXY_CHANNEL = "proxy-channel"  # the proxy's folder for the channel's so
 STATE_KEYS = "keys"  # the real keys of the model providers (T06-4): never mounted anywhere
 STATE_SENSOR = "sensor"  # Tetragon's events, settings and the reader's cursor (T07)
 MAX_RULES_BYTES = 64 * 1024
+MAX_OWNER_PRICES = 64
 
 _TOP_LEVEL_KEYS = frozenset(
     {
         "state_dir", "volume", "workspace_limit", "cycle_interval", "prune_interval", "agent",
-        "volume_image", "max_volume_bytes", "proxy", "sensor", "gate",
+        "volume_image", "max_volume_bytes", "proxy", "sensor", "gate", "budget",
     }
 )  # fmt: skip
+_BUDGET_KEYS = frozenset(
+    {"daily_usd", "monthly_usd", "timezone", "max_inflight", "auto_prices", "prices_url", "prices"}
+)
+_PRICE_KEYS = frozenset({"input", "output", "cache_read", "cache_write_5m", "cache_write_1h"})
 _OPTIONAL_KEYS = ("workspace_limit", "cycle_interval", "prune_interval", "max_volume_bytes")
 # The container options a file may change. ``allow_shared_ids`` is a test-only concession and
 # ``seccomp_profile`` ships with backtide, so neither is here; the token is never a setting.
@@ -248,6 +274,7 @@ class ServiceConfig:
     proxy: Mapping[str, Any] = field(default_factory=dict)
     sensor: Mapping[str, Any] = field(default_factory=dict)
     gate: Mapping[str, Any] = field(default_factory=dict)
+    budget: Mapping[str, Any] = field(default_factory=dict)
     # One per provider of [proxy] (from_file reads them from keys/): the real and fake keys.
     provider_keys: Mapping[str, ProviderKey] = field(default_factory=dict, repr=False)
 
@@ -283,11 +310,14 @@ class ServiceConfig:
                 f"the agent's config_dir {config_dir} is mounted into the agent and must not "
                 f"contain state_dir {self.state_dir}: the agent would see the black box"
             )
-        self.jail_config()  # validates every agent option; the result is rebuilt on demand
         self._check_growth(config_dir)
         self._check_proxy(config_dir)
         self._check_sensor(config_dir)
+        # Every agent option, and that no folder of the agent shows a protected path (T14a).
+        # Last, so the checks above say first what is wrong in their own words.
+        self.jail_config()  # the result is rebuilt on demand
         self.gate_settings()  # validates [gate]
+        self.budget_settings()  # validates [budget]
 
     def _check_proxy(self, config_dir: Path) -> None:
         if not isinstance(self.proxy, Mapping):
@@ -477,10 +507,35 @@ class ServiceConfig:
                 ca_dir=self.agent_ca_dir,
                 gateway_token=self.gateway_token.reveal(),
                 model_providers=providers,
+                protected=self.agent_protected(),
                 **options,
             )
         except ValueError as error:
             raise ConfigError(f"invalid [agent] settings: {error}") from error
+
+    def agent_protected(self) -> tuple[Protected, ...]:
+        """What the agent must never see (T14a, backtide/jail/mounts.py). Its config and CA
+        folders live in ``state_dir`` by default, and its workspace in ``volume``: nothing
+        else may be mounted from either."""
+        protected = [
+            Protected("backtide's state folder", self.state_dir, inside_ok=True),
+            Protected("the black box", self.blackbox_db),
+            Protected("the black box's key", self.blackbox_key),
+            Protected("the black box's checkpoint", self.blackbox_checkpoint),
+            Protected("the gateway token", self.gateway_token_file),
+            Protected("the control socket", self.control_socket),
+            Protected("the service lock", self.lock_file),
+            Protected("the risk rules", self.rules_file),
+            Protected("the providers' real keys", self.keys_dir),
+            Protected("the proxy's channel", self.proxy_channel_dir),
+            Protected("the proxy's CA and its key", self.proxy_ca_dir),
+            Protected("the sensor's folder", self.sensor_dir),
+            Protected("the snapshot volume", self.volume, inside_ok=True),
+            Protected("the snapshots", self.volume / SNAPSHOTS),
+        ]
+        if self.volume_image is not None:
+            protected.append(Protected("the volume's image", self.volume_image))
+        return tuple(protected)
 
     def model_providers(self) -> Providers:
         """The providers as the proxy gets them through the channel (docs/21, section 6): host,
@@ -652,6 +707,64 @@ class ServiceConfig:
             read_budget_total=budgets["read_budget_total_kib"],
         )
 
+    def budget_settings(self) -> BudgetSettings:
+        """``[budget]``, checked (ConfigError): the spending caps and the prices (T11)."""
+        if not isinstance(self.budget, Mapping):
+            raise ConfigError("[budget] must be a table")
+        _reject_secret_keys("[budget]", self.budget)
+        unknown = sorted(set(self.budget) - _BUDGET_KEYS)
+        if unknown:
+            raise ConfigError(f"unknown [budget] settings: {', '.join(map(repr, unknown))}")
+        caps: dict[str, Decimal] = {}
+        for key, default in (
+            ("daily_usd", DEFAULT_DAILY_USD),
+            ("monthly_usd", DEFAULT_MONTHLY_USD),
+        ):
+            value = self.budget.get(key, default)
+            cap = value if isinstance(value, Decimal) else check_cap(_cap_text(value))
+            if cap is None:
+                raise ConfigError(
+                    f"[budget] {key} must be a positive number of dollars, two decimals at most, "
+                    f"up to {MAX_CAP_USD}"
+                )
+            caps[key] = cap
+        zone_name = self.budget.get("timezone", "local")
+        zone = None
+        if zone_name != "local":
+            try:
+                zone = ZoneInfo(zone_name) if isinstance(zone_name, str) else None
+            except (ZoneInfoNotFoundError, ValueError):
+                zone = None
+            if zone is None:
+                raise ConfigError(
+                    '[budget] timezone must be an IANA zone ("Europe/Madrid") or "local"'
+                )
+        inflight = self.budget.get("max_inflight", DEFAULT_MAX_INFLIGHT)
+        if (
+            isinstance(inflight, bool)
+            or not isinstance(inflight, int)
+            or not 1 <= inflight <= MAX_INFLIGHT
+        ):
+            raise ConfigError(f"[budget] max_inflight must be a whole number, 1-{MAX_INFLIGHT}")
+        auto = self.budget.get("auto_prices", True)
+        if not isinstance(auto, bool):
+            raise ConfigError("[budget] auto_prices must be true or false")
+        url = self.budget.get("prices_url", PRICES_URL)
+        try:
+            url = check_url(url)
+        except ValueError as error:
+            raise ConfigError(f"[budget] {error}") from None
+        return BudgetSettings(
+            daily_usd=caps["daily_usd"],
+            monthly_usd=caps["monthly_usd"],
+            timezone=zone,
+            timezone_name=str(zone_name),
+            max_inflight=inflight,
+            auto_prices=auto,
+            prices_url=url,
+            owner_prices=_owner_prices(self.budget.get("prices", {})),
+        )
+
     def read_rules(self) -> str | None:
         """The text of ``rules_file``, or None if there is none (the default rules apply). Read
         like the rest of the config: no symlink, ours, not writable by others. Raises
@@ -698,6 +811,10 @@ class ServiceConfig:
             if not isinstance(data["gate"], dict):
                 raise ConfigError("[gate] must be a table")
             optional["gate"] = dict(data["gate"])
+        if "budget" in data:
+            if not isinstance(data["budget"], dict):
+                raise ConfigError("[budget] must be a table")
+            optional["budget"] = dict(data["budget"])
         names = _provider_names(optional.get("proxy", {}))
         if names:
             optional["provider_keys"] = read_provider_keys(state_dir / STATE_KEYS, names)
@@ -804,6 +921,46 @@ def _require_private_dir(path: Path, what: str) -> None:
         raise ConfigError(f"{what} {path} is owned by uid {info.st_uid}, not {os.geteuid()}")
     if mode & 0o077:
         raise ConfigError(f"{what} {path} is open to group or others ({mode:04o}): chmod 700 it")
+
+
+def _cap_text(value: object) -> str | None:
+    """A cap from TOML: a number (never a bool) or a text, as ``check_cap`` reads it."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return repr(value) if isinstance(value, float) else str(value)
+    return value if isinstance(value, str) else None
+
+
+def _owner_prices(table: object) -> dict[str, Price]:
+    """``[budget.prices]``: per model, ``input`` and ``output`` in $/MTok and optionally the cache's
+    prices (by default 0.1x, 1.25x and 2x of the input)."""
+    if not isinstance(table, Mapping):
+        raise ConfigError("[budget.prices] must be a table of models")
+    if len(table) > MAX_OWNER_PRICES:
+        raise ConfigError(f"[budget.prices] has more than {MAX_OWNER_PRICES} models")
+    prices: dict[str, Price] = {}
+    for model, entry in table.items():
+        if not isinstance(model, str) or not 0 < len(model) <= 128 or not model.isprintable():
+            raise ConfigError("[budget.prices]: a model name must be a short text")
+        if not isinstance(entry, Mapping) or not {"input", "output"} <= set(entry):
+            raise ConfigError(f"[budget.prices] {model!r}: needs input and output ($/MTok)")
+        unknown = sorted(set(entry) - _PRICE_KEYS)
+        if unknown:
+            raise ConfigError(f"[budget.prices] {model!r}: unknown fields {unknown}")
+        try:
+            values = {name: to_decimal(value) for name, value in entry.items()}
+            base = values["input"]
+            prices[model] = Price(
+                input=base,
+                output=values["output"],
+                cache_write_5m=values.get("cache_write_5m", base * CACHE_5M),
+                cache_write_1h=values.get("cache_write_1h", base * CACHE_1H),
+                cache_read=values.get("cache_read", base * CACHE_READ),
+            )
+        except PriceError as error:
+            raise ConfigError(f"[budget.prices] {model!r}: {error}") from None
+    return prices
 
 
 def _reject_secret_keys(label: str, table: Mapping[str, Any]) -> None:

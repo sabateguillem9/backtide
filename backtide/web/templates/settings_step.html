@@ -42,6 +42,29 @@
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>
+  {% elif view == 'confirm_budget' %}
+    <h2 id="settings-step-title">{{ t('settings.confirm.budget') }}</h2>
+    <p class="settings-current"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('settings.cap.day', spent=spend.day_spent, cap=spend.day_cap) }} · {{ t('settings.cap.month', spent=spend.month_spent, cap=spend.month_cap) }}</span></p>
+    <p class="note">{{ t('settings.confirm.budget.note') }}</p>
+    <form class="settings-form" method="post" action="{{ base }}/ajustes/guardar" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="ticket" value="{{ ticket }}">
+      <input type="hidden" name="tipo" value="tope">
+      <input type="hidden" name="accion" value="set">
+      <div class="setting-field">
+        <label class="setting-label" for="setting-daily">{{ t('settings.field.daily') }}</label>
+        <input id="setting-daily" class="setting-input setting-cap" type="text" name="diario" maxlength="12" inputmode="decimal" placeholder="{{ spend.day_cap_plain }}" aria-describedby="setting-cap-hint">
+      </div>
+      <div class="setting-field">
+        <label class="setting-label" for="setting-monthly">{{ t('settings.field.monthly') }}</label>
+        <input id="setting-monthly" class="setting-input setting-cap" type="text" name="mensual" maxlength="12" inputmode="decimal" placeholder="{{ spend.month_cap_plain }}" aria-describedby="setting-cap-hint">
+        <p class="setting-hint" id="setting-cap-hint">{{ t('settings.hint.cap') }}</p>
+      </div>
+      <div class="settings-actions">
+        <button class="settings-yes" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('settings.confirm.save') }}</span></button>
+        <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
+      </div>
+    </form>
   {% elif view == 'confirm_clear' %}
     {% set consequence = 'telegram' if row.kind == 'telegram' else ('in_use' if row.in_use else 'unused') %}
     <h2 id="settings-step-title">{{ t('settings.confirm.clear', what=t('settings.what.' ~ row.kind)) }}</h2>

@@ -8,6 +8,8 @@
   </div>
   {# The gate's requests (T10). Approve and Reject are drawn and disabled: there is no form, no
      POST and no route behind them. Deciding is T10's, with its own reviewed path. #}
+  {# The spending of the model calls (T11), read from the service when the page loads. #}
+  {% if spend %}<p class="note panel-spend" data-blocked="{{ spend.blocked or '' }}"><span class="muted">{{ t('panel.spend') }}:</span> {% if spend.available %}{{ t('settings.cap.day', spent=spend.day_spent, cap=spend.day_cap) }} · {{ t('settings.cap.month', spent=spend.month_spent, cap=spend.month_cap) }}{% if spend.blocked %}. {{ t('settings.cap.blocked.' ~ spend.blocked) }}{% endif %}{% else %}{{ t('settings.cap.unavailable') }}{% endif %}</p>{% endif %}
   <section class="waiting" id="waiting" aria-labelledby="waiting-title">
     <div class="waiting-in" sse-swap="requests">{% include "requests.html" %}</div>
   </section>

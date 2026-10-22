@@ -646,6 +646,60 @@ def test_the_agent_config_dir_is_never_a_folder_of_the_proxy(layout: Path, folde
             )
 
 
+@pytest.mark.parametrize(
+    ("where", "match"),
+    [
+        ("volume/snapshots", "would show it the snapshots"),
+        ("volume/snapshots/20261021T120000Z", "lies inside the snapshots"),
+        ("state/telegram", None),  # a folder of its own in the state folder: allowed
+    ],
+)
+def test_the_agent_config_dir_never_shows_what_the_agent_must_not_see(
+    layout: Path, where: str, match: str | None
+) -> None:
+    """T14a: no folder mounted into the agent is, holds or sits inside a protected path."""
+    config = {
+        "state_dir": layout / "state",
+        "volume": layout / "volume",
+        "gateway_token": Secret(TOKEN),
+        "agent": {"config_dir": layout / where},
+    }
+    if match is None:
+        ServiceConfig(**config)  # type: ignore[arg-type]
+        return
+    with pytest.raises(ConfigError, match=match):
+        ServiceConfig(**config)  # type: ignore[arg-type]
+
+
+def test_the_agent_is_told_what_it_must_never_see(layout: Path) -> None:
+    state = layout / "state"
+    config = ServiceConfig(
+        state_dir=state,
+        volume=layout / "volume",
+        gateway_token=Secret(TOKEN),
+        volume_image=layout / "volume.img",
+        max_volume_bytes=10**9,
+    )
+    protected = {item.path: item.inside_ok for item in config.jail_config().protected}
+    assert protected == {
+        state: True,  # its config and CA folders live there
+        state / "blackbox.db": False,
+        state / "blackbox.key": False,
+        state / "blackbox.checkpoint": False,
+        state / "gateway.token": False,
+        state / "control.sock": False,
+        state / "backtide.lock": False,
+        state / "rules.toml": False,
+        state / "keys": False,
+        state / "proxy-channel": False,
+        state / "proxy-ca": False,
+        state / "sensor": False,
+        layout / "volume": True,  # its workspace lives there
+        layout / "volume" / "snapshots": False,
+        layout / "volume.img": False,
+    }
+
+
 # --- [sensor] (T07-3, docs/23) -----------------------------------------------------------------
 
 

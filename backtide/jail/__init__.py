@@ -4,8 +4,15 @@ Design and rationale: docs/13-diseno-t03-jaula.md. The container is the boundary
 OpenClaw: its own approvals and hooks run inside the agent's process.
 """
 
-from backtide.jail.agent import AgentJail
+from backtide.jail.agent import AgentJail, ExposedJail
 from backtide.jail.config import IMAGE, OPENCLAW_VERSION, AgentJailConfig
 from backtide.jail.docker import JailError
 
-__all__ = ["IMAGE", "OPENCLAW_VERSION", "AgentJail", "AgentJailConfig", "JailError"]
+__all__ = [
+    "IMAGE",
+    "OPENCLAW_VERSION",
+    "AgentJail",
+    "AgentJailConfig",
+    "ExposedJail",
+    "JailError",
+]

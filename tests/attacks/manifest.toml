@@ -1087,15 +1087,16 @@ held = "yes"
 [[scenario]]
 id = "tope-de-gasto"
 name = "Un bucle que gasta tokens sin parar"
-story = "El agente llama al modelo en bucle: al llegar al tope se cortan las llamadas y llega un aviso."
+story = """El agente llama al modelo en bucle (con y sin streaming): al cruzar el tope del día se \
+rechazan las llamadas siguientes antes de llegar al proveedor, con su forma de error y sin cifras, \
+quedan grabados los avisos del 50, 80 y 100 % y los rechazos, y subir el tope las deja pasar."""
 inspired_by = "Un agente en bucle gastó 32 $ en una hora"
 invariants = [7]
-status = "pending"
-task = "T11"
+status = "ready"
 [scenario.expect]
 stopped = "yes"
 recorded = "yes"
-risk = "pending:T11"
+risk = "2"
 recoverable = "n/a"
 held = "n/a"
 
@@ -1376,5 +1377,25 @@ status = "ready"
 stopped = "yes"
 recorded = "yes"
 risk = "2"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "montar-lo-prohibido"
+name = "Montar en la jaula lo que el agente no debe ver"
+story = """El chequeo de montajes de T14a. Se intenta que el contenedor del agente vea la carpeta de \
+estado de backtide (la caja negra, su clave, el token, el socket de control) de las dos maneras \
+que existen. Con una configuración cuyo config_dir es, por un enlace simbólico, esa carpeta: \
+`backtide vigilar` no arranca, dice qué vería el agente y no crea ningún contenedor. Y con el \
+contenedor del agente recreado, con el servicio en marcha, con un `-v` más de la carpeta de \
+estado: el siguiente ciclo del Guardian lo mata (agent_stop {reason: exposed}, riesgo 3) y, al \
+volver a arrancar el servicio, se niega a arrancarlo (agent_start_failed {exposed})."""
+inspired_by = "Las raíces protegidas de nono (docs/31): negarse a arrancar si la configuración expone el propio estado"
+invariants = [1, 2, 7]
+status = "ready"
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "3"
 recoverable = "n/a"
 held = "n/a"

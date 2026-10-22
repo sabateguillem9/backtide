@@ -69,7 +69,7 @@ from backtide.gate.policy import (
     port_allowed,
 )
 from backtide.gate.provider_tools import check_request
-from backtide.gate.providers import CREDENTIAL_HEADERS, Provider, swap_key
+from backtide.gate.providers import CREDENTIAL_HEADERS, Provider, blocked_response, swap_key
 from backtide.gate.sse import UsageStream, summarize_json
 from backtide.gate.translate import credential_free_path, shapes, translate
 from backtide.gate.translate.base import (
@@ -132,7 +132,12 @@ REFUSALS = {
         403,
         "backtide: this same request was rejected a moment ago; it is not asked again\n",
     ),
+    # T11: a provider's call gets its own API's error shape (providers.blocked_response); this
+    # plain text is only for a request that is not a provider's (it never happens).
+    "spend_cap": (429, "backtide: spending cap reached; ask the owner\n"),
+    "spend_unavailable": (503, "backtide: the spending cannot be counted right now\n"),
 }
+SPEND_REASONS = frozenset({"spend_cap", "spend_unavailable"})
 FAILED = (502, "backtide: the gate failed, so nothing went out\n")
 
 Respond = Callable[[int, bytes, Mapping[str, str]], Any]
@@ -483,6 +488,11 @@ class Gate:
         if flow.response is not None:
             return  # killed or answered meanwhile
         if not ack.allowed:
+            if provider is not None and ack.reason in SPEND_REASONS:
+                # T11: the spending cap, in the provider's own error shape (backtide recorded it).
+                status, text, extra = blocked_response(str(provider.kind), str(ack.reason))
+                flow.response = self._respond(status, text, extra)
+                return
             self._denied(flow, ack, fields, shape)
             return
         self._let_through(flow, fields, provider, swapped)

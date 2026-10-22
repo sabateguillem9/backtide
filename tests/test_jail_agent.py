@@ -16,7 +16,7 @@ import pytest
 
 from backtide.jail import agent as agent_module
 from backtide.jail import docker
-from backtide.jail.agent import AgentJail
+from backtide.jail.agent import AgentJail, ExposedJail
 from backtide.jail.config import (
     AgentJailConfig,
     docker_create_argv,
@@ -25,6 +25,7 @@ from backtide.jail.config import (
     token_env,
 )
 from backtide.jail.docker import JailError
+from backtide.jail.mounts import exposure_problems
 from backtide.jail.openclaw import UnrewindableConfig
 
 TOKEN = "u" * 43
@@ -141,6 +142,28 @@ def container_check(monkeypatch: pytest.MonkeyPatch) -> ContainerCheck:
     a test says otherwise."""
     check = ContainerCheck(problems=[], calls=[])
     monkeypatch.setattr(agent_module, "container_problems", check)
+    return check
+
+
+@dataclass
+class ExposureCheck:
+    """Stands in for mounts.exposure_problems: records what it is shown, answers ``problems``
+    (one list per call, the last one repeating)."""
+
+    answers: list[list[str]]
+    infos: list[dict]
+
+    def __call__(self, info: dict, policy: object) -> list[str]:
+        self.infos.append(info)
+        return list(self.answers[0] if len(self.answers) == 1 else self.answers.pop(0))
+
+
+@pytest.fixture(autouse=True)
+def exposure_check(monkeypatch: pytest.MonkeyPatch) -> ExposureCheck:
+    """mounts.py has its own tests (test_jail_mounts.py): here nothing is exposed, unless a test
+    says otherwise."""
+    check = ExposureCheck(answers=[[]], infos=[])
+    monkeypatch.setattr(agent_module, "exposure_problems", check)
     return check
 
 
@@ -441,6 +464,7 @@ def test_start_stop_and_remove(ready_jail: AgentJail, fake_docker: FakeDocker) -
         ["container", "inspect", "--format", "{{json .}}", "agent-under-test"],
         ["image", "inspect", "--format", "{{json .Config.Env}}", ready_jail.config.image],
         ["start", "agent-under-test"],
+        ["container", "inspect", "--format", "{{json .}}", "agent-under-test"],
         ["stop", "--time", "30", "agent-under-test"],
         ["rm", "--force", "--volumes", "agent-under-test"],
     ]
@@ -468,6 +492,112 @@ def test_start_refuses_a_container_that_is_not_the_jail(
     with pytest.raises(JailError, match="not the jail.*Privileged.*docker rm -f agent-under-test"):
         ready_jail.start()
     assert ["start", ready_jail.config.name] not in fake_docker.commands()
+
+
+# The mount check (T14a): never created, started or left running if it shows what it must not
+
+
+def test_create_refuses_a_planned_container_that_would_see_too_much(
+    ready_jail: AgentJail, fake_docker: FakeDocker, exposure_check: ExposureCheck
+) -> None:
+    exposure_check.infos.clear()  # ready_jail's setup was checked too
+    exposure_check.answers = [["/srv/state is mounted at /mnt"]]
+    with pytest.raises(ExposedJail, match="is not created.*/srv/state is mounted") as e:
+        ready_jail.create()
+    assert e.value.problems == ["/srv/state is mounted at /mnt"]
+    assert fake_docker.calls == []
+    (planned,) = exposure_check.infos
+    binds = [m["Source"] for m in planned["Mounts"]]
+    assert binds == [str(ready_jail.config.agent_dir), str(ready_jail.config.config_dir),
+                     str(ready_jail.config.ca_dir)]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("method", "what"),
+    [("prepare_workspace", "is not prepared"), ("write_config", "gets no config")],
+)
+def test_nothing_is_set_up_for_a_container_that_would_see_too_much(
+    jail: AgentJail, exposure_check: ExposureCheck, method: str, what: str
+) -> None:
+    exposure_check.answers = [["config_dir holds backtide's state folder"]]
+    with pytest.raises(ExposedJail, match=what):
+        getattr(jail, method)()
+    assert not jail.config.agent_dir.exists()
+    assert not jail.config.config_dir.exists()
+
+
+def test_create_checks_the_real_argv_with_the_real_check(
+    ready_jail: AgentJail, fake_docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unstubbed: the jail as config.py builds it passes the check (tmp_path is not sensitive)."""
+    monkeypatch.setattr(agent_module, "exposure_problems", exposure_problems)
+    ready_jail.create()
+    assert [c.args[0] for c in fake_docker.calls] == ["create"]
+
+
+def test_start_refuses_an_existing_container_that_sees_too_much(
+    ready_jail: AgentJail,
+    fake_docker: FakeDocker,
+    exposure_check: ExposureCheck,
+    container_check: ContainerCheck,
+) -> None:
+    exposure_check.infos.clear()  # ready_jail's setup was checked too
+    exposure_check.answers = [["/var/run/docker.sock, mounted at /s, is Docker's socket"]]
+    with pytest.raises(ExposedJail, match="is not started.*Docker's socket.*docker rm -f"):
+        ready_jail.start()
+    assert ["start", ready_jail.config.name] not in fake_docker.commands()
+    assert exposure_check.infos == [json.loads(CONTAINER_INFO.stdout)]
+    assert container_check.calls == []  # the clearer refusal comes first
+
+
+def test_start_kills_a_container_that_sees_too_much_once_started(
+    ready_jail: AgentJail, fake_docker: FakeDocker, exposure_check: ExposureCheck
+) -> None:
+    """Swapped between the check and `docker start`: killed at once."""
+    exposure_check.answers = [[], ["/srv/state is mounted at /mnt"]]
+    with pytest.raises(ExposedJail, match="killed right after it started") as e:
+        ready_jail.start()
+    assert e.value.problems == ["/srv/state is mounted at /mnt"]
+    commands = fake_docker.commands()
+    assert commands.index(["start", "agent-under-test"]) < commands.index(
+        ["kill", "agent-under-test"]
+    )
+
+
+def test_start_kills_a_container_it_cannot_inspect_once_started(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", CONTAINER_INFO, DAEMON_DOWN)
+    with pytest.raises(ExposedJail, match="cannot be inspected"):
+        ready_jail.start()
+    assert ["kill", "agent-under-test"] in fake_docker.commands()
+
+
+def test_start_says_when_the_exposed_container_could_not_be_killed(
+    ready_jail: AgentJail, fake_docker: FakeDocker, exposure_check: ExposureCheck
+) -> None:
+    exposure_check.answers = [[], ["exposed"]]
+    fake_docker.reply("kill", DAEMON_DOWN)
+    with pytest.raises(ExposedJail, match="could not be killed"):
+        ready_jail.start()
+
+
+def test_running_exposure(
+    jail: AgentJail, fake_docker: FakeDocker, exposure_check: ExposureCheck
+) -> None:
+    running = {"State": {"Running": True}, "HostConfig": {}}
+    stopped = {"State": {"Running": False}, "HostConfig": {}}
+    exposure_check.answers = [["exposed"]]
+    fake_docker.reply(
+        "container", "inspect", "--format", "{{json .}}",
+        Reply(json.dumps(running)), Reply(json.dumps(stopped)), NO_CONTAINER, DAEMON_DOWN,
+    )  # fmt: skip
+    assert jail.running_exposure() == ["exposed"]
+    assert jail.running_exposure() == []  # a stopped container runs nothing
+    assert jail.running_exposure() == []  # no container at all
+    (problem,) = jail.running_exposure()
+    assert problem.startswith("the agent's container cannot be inspected")
+    assert exposure_check.infos == [running]
 
 
 def test_start_refuses_a_missing_container(ready_jail: AgentJail, fake_docker: FakeDocker) -> None:

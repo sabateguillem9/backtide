@@ -135,7 +135,8 @@ class SseParser:
 @dataclass
 class LlmSummary:
     """What is kept of one answer. ``usage`` has the keys ``input``, ``output``,
-    ``cache_read`` and ``cache_write`` that were seen, as the provider counts them:
+    ``cache_read`` and ``cache_write`` (and Anthropic's ``cache_write_5m`` / ``cache_write_1h``
+    split) that were seen, as the provider counts them:
     Anthropic's ``input`` leaves the cache out, OpenAI's includes it (docs/24)."""
 
     model: str | None = None
@@ -186,6 +187,9 @@ _ANTHROPIC_USAGE = {
     "output": ("output_tokens",),
     "cache_read": ("cache_read_input_tokens",),
     "cache_write": ("cache_creation_input_tokens",),
+    # The split of the cache writes by how long they live (T11: 1.25x or 2x of the input).
+    "cache_write_5m": ("cache_creation", "ephemeral_5m_input_tokens"),
+    "cache_write_1h": ("cache_creation", "ephemeral_1h_input_tokens"),
 }
 _OPENAI_CHAT_USAGE = {
     "input": ("prompt_tokens",),

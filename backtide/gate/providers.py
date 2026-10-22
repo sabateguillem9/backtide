@@ -7,6 +7,7 @@ real key in the provider's header. A request that carries the real key, anywhere
 host, is refused. Design and rationale: docs/21-diseno-t06-proxy.md, section 6.
 """
 
+import json
 import re
 import secrets
 import string
@@ -203,6 +204,42 @@ def swap_key(
     return [*kept, (provider.header, provider._real_header_value())]
 
 
+# T11 (docs/33): a model call refused by backtide's spending cap. Fixed texts (backtide never
+# sends the proxy a text to show: a broken proxy must not become a way to inject one), in English
+# and Spanish, without figures, windows or a ``retry-after``: the agent learns nothing of the
+# owner's money, and a 429 without a hint is retried little (the provider's own spend limit
+# answers the same way). OpenClaw shows the message to the person in its channel.
+SPEND_MESSAGES = {
+    "spend_cap": "backtide spending cap reached / tope de gasto de backtide alcanzado. "
+    "Do not retry; ask the owner to raise it. / No reintentes; pide al dueño que lo suba.",
+    "spend_unavailable": "backtide cannot count the spending right now, so model calls are "
+    "refused / backtide no puede contar el gasto ahora, así que rechaza las llamadas al modelo.",
+}
+
+
+def blocked_response(kind: str, reason: str) -> tuple[int, bytes, dict[str, str]]:
+    """(status, body, headers) of a refused model call, in the error shape of ``kind``'s API:
+    Anthropic's ``rate_limit_error``, OpenAI's ``insufficient_quota``. ValueError otherwise."""
+    message = SPEND_MESSAGES.get(reason)
+    if message is None:
+        raise ValueError("unknown spend refusal")
+    if kind == Kind.ANTHROPIC:
+        error_type = "rate_limit_error" if reason == "spend_cap" else "api_error"
+        payload: dict[str, object] = {
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        }
+        status = 429 if reason == "spend_cap" else 503
+    elif kind == Kind.OPENAI:
+        code = "insufficient_quota" if reason == "spend_cap" else "service_unavailable"
+        payload = {"error": {"message": message, "type": code, "code": code, "param": None}}
+        status = 429 if reason == "spend_cap" else 503
+    else:
+        raise ValueError("unknown provider kind")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return status, body, {"content-type": "application/json", "x-backtide": reason}
+
+
 def contains_secret(part: str | bytes | None, known: Iterable[str]) -> bool:
     """Whether any of the ``known`` secrets shows in ``part``, as is, URL-encoded (in any
     way), with JSON escapes or HTML entities. Bytes are read as Latin-1, so a key (ASCII)
@@ -239,6 +276,10 @@ class Providers:
 
     def __repr__(self) -> str:
         return f"Providers({', '.join(p.name for p in self.items)})"
+
+    def by_name(self, name: object) -> Provider | None:
+        """The provider called ``name``, if any."""
+        return next((p for p in self.items if p.name == name), None)
 
     def for_host(self, host: str) -> Provider | None:
         """The provider whose host is exactly ``host`` (the connection's), if any."""

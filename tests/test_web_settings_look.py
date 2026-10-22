@@ -154,12 +154,11 @@ def test_commands_are_set_apart_and_escaped(tmp_path: Path) -> None:
     assert str(t.code("x.<b>`<i>`")) == "x.&lt;b&gt;<code>&lt;i&gt;</code>"
 
 
-def test_the_spending_cap_waits_for_t11_with_its_label(web: TestClient) -> None:
+def test_the_spending_cap_row_says_it_does_not_know_without_the_service(web: TestClient) -> None:
     page = web.get("/ajustes").text
-    field = re.search(r'<input id="setting-cap"[^>]*>', page)
-    assert field and " disabled" in field.group(0)
-    assert 'aria-describedby="setting-cap-note"' in field.group(0)
-    assert '<label class="setting-name" for="setting-cap">Tope de gasto</label>' in page
+    assert '<span class="setting-name">Tope de gasto</span>' in page
+    assert 'id="setting-cap-note"' in page and "no se sabe" in page
+    assert '<span class="setting-go is-off" aria-disabled="true">Cambiar</span>' in page
 
 
 # -- the Mac demo's stand-in for the service ------------------------------------------------------

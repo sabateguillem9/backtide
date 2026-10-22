@@ -59,6 +59,7 @@ from backtide.service.holds import (
     stale_holds,
 )
 from backtide.service.pause import Ticker
+from backtide.service.price_update import PriceUpdater
 from backtide.service.proxy_channel import (
     Budgets,
     ChannelError,
@@ -70,6 +71,7 @@ from backtide.service.proxy_channel import (
     open_channel,
 )
 from backtide.service.read_budget import ReadBudget
+from backtide.service.spend import Budget
 from backtide.service.trust import TrustError, TrustStore
 from backtide.snapshots import utc_now
 
@@ -125,8 +127,16 @@ class Egress:
         history: History | None = None,
         watch: HoldWatch | None = None,
         trust: TrustStore | None = None,
+        budget: Budget | None = None,
+        prices: PriceUpdater | None = None,
     ) -> None:
         self._jail = jail
+        # The spending cap (T11): one for the service, handed to every channel. It reads its
+        # totals (or rebuilds them from the black box) at the first start, once the box is open;
+        # ``prices`` keeps its price table up to date on a thread of its own.
+        self.budget = budget
+        self._prices = prices
+        self._budget_opened = False
         self._watch = watch
         # The recipients trusted from the web (T10-5): one list for the service, handed to every
         # channel, so a proxy restart keeps them (they live in <state_dir>/trusted.json).
@@ -171,6 +181,11 @@ class Egress:
         with self._lock:
             self._hooks = hooks
             self._close_stale_holds()
+            if self.budget is not None and not self._budget_opened:
+                self._budget_opened = True
+                self.budget.open()  # never raises: without a count, model calls are refused
+                if self._prices is not None:
+                    self._prices.start()
             ok = self._bring_up("boot")
             if not ok:
                 self._down_since = self._mono()  # recorded as start_failed: the watch retries
@@ -185,6 +200,8 @@ class Egress:
         if self._ticker is not None:
             self._ticker.close()
             self._ticker = None
+        if self._prices is not None:
+            self._prices.close()
         with self._lock:
             self._up = False
             # The holds end first, as a clean stop (gate/expired {why: restart}): with the proxy
@@ -498,6 +515,8 @@ class Egress:
             if self._jail.is_running():
                 step = "kill_stale"
                 self._jail.kill()  # its channel and config are ours to give: a fresh start
+            if self.budget is not None:
+                self.budget.forget_all()  # a new proxy: the old one's calls in flight are gone
             step = "agent_network"
             self._jail.check_agent_network(self._agent_name)
             step = "start"
@@ -556,6 +575,7 @@ class Egress:
                         watch=self._watch,
                         frozen=self._frozen,
                         trust=self._trust,
+                        budget=self.budget,
                     )
                     channel.handshake(max(0.5, deadline - self._mono()))
                 except BaseException:

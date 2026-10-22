@@ -21,7 +21,7 @@ from uuid import UUID
 import pytest
 
 from backtide.blackbox import BlackBox, BlackBoxError, Event, create_key
-from backtide.jail import JailError
+from backtide.jail import ExposedJail, JailError
 from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
 from backtide.notify import Alert, AlertLevel
 from backtide.service.config import Secret, ServiceConfig
@@ -263,6 +263,7 @@ class FakeJail:
         self.stops_anyway = False  # a stop or kill that fails (a timeout) but did stop it
         self.on_stop: Callable[[], None] | None = None  # runs in the middle of `docker stop`
         self.on_wait_ready: Callable[[], None] | None = None  # ... and of `wait_ready`
+        self.exposure: list[str] = []  # what running_exposure() answers while it runs (T14a)
 
     def ensure_network(self) -> None:
         self.log.append("jail.ensure_network")
@@ -286,6 +287,9 @@ class FakeJail:
 
     def is_running(self) -> bool:
         return self.running
+
+    def running_exposure(self) -> list[str]:
+        return list(self.exposure) if self.running else []
 
     def start(self) -> None:
         self.log.append("jail.start")
@@ -875,6 +879,20 @@ def test_an_agent_that_fails_to_start_is_recorded_and_the_service_stays_up(
     assert "agent_start" not in [event.action for event in world.events()]
 
 
+def test_an_agent_whose_container_would_see_too_much_is_not_started(world: World) -> None:
+    """T14a: the mount check refused it; the event says what it would see, at risk 3."""
+    problems = ["/srv/state, mounted at /mnt, holds the black box"]
+    world.jail.start_error = ExposedJail("is not started: it would see...", problems)
+    world.guardian.start()
+    failed = world.only("agent_start_failed")
+    assert failed.risk == 3
+    assert failed.details["exposed"] == problems
+    assert world.guardian.agent_state is AgentState.STOPPED
+    (alert,) = world.alerts.titled("no ha arrancado")
+    assert "vería algo del anfitrión que no debe ver" in alert.body
+    assert "agent_start" not in [event.action for event in world.events()]
+
+
 def test_an_agent_that_never_gets_ready_is_stopped_and_recorded(world: World) -> None:
     world.jail.ready_error = JailError("not ready after 120 s")
     world.guardian.start()
@@ -978,6 +996,46 @@ def running(world: World) -> World:
     world.guardian.start()
     world.log.clear()
     return world
+
+
+# --- the mount check at every cycle (T14a) -----------------------------------------------------
+
+
+def test_a_cycle_kills_an_agent_whose_container_sees_too_much(running: World) -> None:
+    """A container changed under the service (recreated with one more mount): killed at once,
+    recorded at risk 3 with what it saw, alerted, and left stopped."""
+    problems = [f"/srv/x{i} is mounted at /mnt" for i in range(30)]
+    running.jail.exposure = problems
+    running.guardian.cycle()
+    assert running.log[0] == "jail.kill"  # no grace: it already ran with it
+    assert not running.jail.running
+    stop = running.only("agent_stop")
+    assert stop.risk == 3
+    assert stop.details == {"reason": "exposed", "problems": problems[:20]}
+    assert running.guardian.agent_state is AgentState.STOPPED
+    (alert,) = running.alerts.titled("ve lo que no debe")
+    assert alert.event_seq == stop.seq
+    running.guardian.cycle()  # stopped: nothing more to do
+    assert len(running.events("agent_stop")) == 1
+
+
+def test_a_cycle_leaves_an_agent_that_sees_nothing_it_must_not(running: World) -> None:
+    running.guardian.cycle()
+    assert "jail.kill" not in running.log
+    assert running.jail.running
+
+
+def test_a_cycle_that_cannot_stop_an_exposed_agent_says_so(running: World) -> None:
+    running.jail.exposure = ["the agent's container cannot be inspected: daemon down"]
+    running.jail.kill_error = JailError("kill failed")
+    running.jail.stop_error = JailError("stop failed")
+    running.jail.remove_error = JailError("rm failed")
+    running.guardian.cycle()
+    failed = running.only("agent_stop_failed")
+    assert failed.risk == 3
+    assert failed.details["reason"] == "exposed"
+    assert running.guardian.agent_state is AgentState.RUNNING
+    assert running.alerts.titled("sigue en marcha")
 
 
 def test_no_change_means_no_snapshot(running: World) -> None:

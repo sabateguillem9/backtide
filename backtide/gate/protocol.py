@@ -136,7 +136,12 @@ BLOCK_RISK = {
     # T10-2: the same fingerprint was rejected (or expired) a moment ago: refused without asking.
     "gate_rejected": 1,
 }
-DENY_REASONS = frozenset({"not_allowed", "throttled", "not_recorded", "gate_rejected", "hold_full"})
+# spend_cap and spend_unavailable (T11): a model call refused by the spending cap, or because
+# backtide cannot count the spending; the proxy answers in the provider's own error shape.
+DENY_REASONS = frozenset(
+    {"not_allowed", "throttled", "not_recorded", "gate_rejected", "hold_full", "spend_cap",
+     "spend_unavailable"}
+)  # fmt: skip
 # Why backtide denies a held request (``decision``), and why the proxy no longer holds one.
 DECISION_REASONS = frozenset({"rejected", "expired", "paused", "hold_full"})
 HOLD_LEFT_WHY = frozenset({"client_left", "waited", "no_slot"})

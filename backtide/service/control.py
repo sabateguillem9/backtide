@@ -27,6 +27,10 @@ The server (inside the service):
   (plus ``chat_id`` for ``telegram``, and ``via``) and ``{"cmd": "clear_secret", "kind": ...}``
   (plus ``via``). A value is checked and written by the service; it is never logged, never put
   in a refusal and never sent back.
+  The spending cap (T11, ``backtide.service.spend``): ``{"cmd": "budget"}`` (today's and this
+  month's spending, the caps and the prices' date: no secret) and ``{"cmd": "set_budget",
+  "daily_usd": ..., "monthly_usd": ...}`` (either may be left out; plus ``via``: ``cli`` or
+  ``web``), recorded by the service before it changes anything.
   The web's holds page (T10-5, docs/32 section 11 and decision 9): ``{"cmd": "trust",
   "hold_id": ..., "via": "web"}`` ("aprobar y confiar en este destinatario": only ``web``),
   ``{"cmd": "untrust", "trust_id": ...}`` and ``{"cmd": "end_batch", "rule_id": ...}`` (plus
@@ -57,6 +61,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -74,6 +79,7 @@ from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
+from backtide.service.spend import CAP_SHAPE, CapOutcome, check_cap
 from backtide.service.trust import TRUST_ID_RE
 from backtide.snapshots import Snapshot
 
@@ -187,6 +193,19 @@ class SettingsService(Protocol):
     def clear_secret(self, kind: str, *, requested_by: str) -> SettingsOutcome: ...
 
 
+class BudgetService(Protocol):
+    """What the server needs for the spending cap (``backtide.service.spend.Budget``)."""
+
+    def status(self) -> dict[str, Any]: ...
+
+    def set_caps(
+        self, daily: Decimal | None, monthly: Decimal | None, *, requested_by: str
+    ) -> CapOutcome: ...
+
+
+BUDGET_OUTCOMES = frozenset({"saved", "invalid", "failed", REFUSED})
+MAX_BUDGET_REPLY_BYTES = 16 * 1024
+
 PeerCredentials = Callable[[socket.socket], tuple[int, int, int]]
 
 
@@ -227,9 +246,11 @@ class ControlServer:
         request_timeout: float = REQUEST_TIMEOUT,
         max_connections: int = MAX_CONNECTIONS,
         settings: SettingsService | None = None,
+        budget: BudgetService | None = None,
     ) -> None:
         self._guardian = guardian
         self._settings = settings
+        self._budget = budget
         self._path = Path(path)
         self._allowed_uid = allowed_uid if allowed_uid is not None else os.geteuid()
         self._peer = peer
@@ -381,7 +402,42 @@ class ControlServer:
             return self._listing(request)
         if command in ("secrets", "set_secret", "clear_secret"):
             return self._settings_command(request, pid, uid)
+        if command in ("budget", "set_budget"):
+            return self._budget_command(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
+
+    def _budget_command(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """The spending cap (T11): what it says, or new caps (checked here and by the budget)."""
+        if self._budget is None:
+            raise _BadRequest("Este servicio no cuenta el gasto.")
+        if request["cmd"] == "budget":
+            if set(request) != {"cmd"}:
+                raise _BadRequest("Una petición de gasto lleva `cmd` y nada más.")
+            try:
+                status = self._budget.status()
+            except Exception as error:
+                logger.error("reading the spending raised: %s", type(error).__name__)
+                return {"ok": False, "outcome": "failed", "message": "No se ha podido leer."}
+            return {"ok": True, "outcome": "listed", "budget": status, "message": ""}
+        if set(request) - {"cmd", "daily_usd", "monthly_usd", "via"}:
+            raise _BadRequest("La petición de tope no lleva lo que debe.")
+        via = request.get("via", "cli")
+        if not isinstance(via, str) or via not in SETTINGS_REQUESTERS:
+            raise _BadRequest("El tope solo se cambia desde la web o la terminal.")
+        caps: dict[str, Decimal | None] = {}
+        for name in ("daily_usd", "monthly_usd"):
+            value = request.get(name)
+            caps[name] = None if value is None else check_cap(value)
+            if value is not None and caps[name] is None:
+                return {"ok": False, "outcome": "invalid", "message": CAP_SHAPE}
+        try:
+            outcome = self._budget.set_caps(
+                caps["daily_usd"], caps["monthly_usd"], requested_by=f"{via} (uid {uid}, pid {pid})"
+            )
+        except Exception as error:
+            logger.error("changing the spending cap raised: %s", type(error).__name__)
+            return {"ok": False, "outcome": "failed", "message": "Ha fallado algo inesperado."}
+        return {"ok": outcome.ok, "outcome": outcome.outcome, "message": outcome.message}
 
     def _settings_command(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         """The Settings page (T12e). The value is taken out of the request at once, checked and
@@ -1263,6 +1319,82 @@ def ask_clear_secret(
         monotonic=monotonic,
     )
     return _checked_settings_reply(raw)
+
+
+def ask_budget(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """What the service says of the spending (``Budget.status``). ControlError if it makes no
+    sense. The caller checks each field before showing it."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "budget"},
+        what="la lectura del gasto",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict) or reply.get("ok") is not True:
+        message = reply.get("message") if isinstance(reply, dict) else None
+        raise ControlError(message if isinstance(message, str) else "Respuesta inesperada.")
+    status = reply.get("budget")
+    if not isinstance(status, dict):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    return status
+
+
+def ask_set_budget(
+    path: Path,
+    *,
+    daily_usd: str | None,
+    monthly_usd: str | None,
+    via: str = "cli",
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Ask the service for new spending caps (texts as a person typed them). Its reply, checked:
+    ``ok``, ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
+    if via not in SETTINGS_REQUESTERS:
+        raise ValueError("unknown via")
+    request: dict[str, Any] = {"cmd": "set_budget"}
+    if daily_usd is not None:
+        request["daily_usd"] = daily_usd
+    if monthly_usd is not None:
+        request["monthly_usd"] = monthly_usd
+    if via != "cli":
+        request["via"] = via
+    raw = _ask(
+        Path(path),
+        request,
+        what="el cambio del tope",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in BUDGET_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si el tope ha cambiado: "
+            "mira la página de Ajustes y la caja negra."
+        )
+    return {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
 
 
 def _checked_settings_reply(raw: bytes) -> dict[str, Any]:

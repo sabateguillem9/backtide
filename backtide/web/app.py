@@ -106,11 +106,16 @@ from backtide.web.security import (
 )
 from backtide.web.settings import (
     ACTIONS,
+    BUDGET,
     KINDS,
     TELEGRAM,
     SecretView,
     SettingsClient,
     SettingTickets,
+    SpendClient,
+    SpendView,
+    cap_ok,
+    spend_view,
     views,
 )
 from backtide.web.state import STATE_ACTIONS, AgentStatus, read_status
@@ -139,8 +144,8 @@ MAX_FIELD_CHARS = 128
 # The Settings page's form (T12e): these always; ``valor`` (and ``chat`` for Telegram) to set a key;
 # ``confirmo`` when it replaces one that is set. A pasted key may bring spaces around it.
 SETTINGS_FIELDS = ("csrf", "ticket", "tipo", "accion")
-SETTINGS_OPTIONAL = ("valor", "chat", "confirmo")
-SETTINGS_LIMITS = {"valor": 320, "chat": 32}
+SETTINGS_OPTIONAL = ("valor", "chat", "confirmo", "diario", "mensual")
+SETTINGS_LIMITS = {"valor": 320, "chat": 32, "diario": 16, "mensual": 16}
 FROM_THE_BOX = "list"  # the rewind state when the list did not come from the volume
 NOT_MAIN = "agent"  # the rewind state of an agent the service does not run (until T17)
 SUMMARY_TTL = 3.0  # an agent's card is read again at most this often...
@@ -176,6 +181,7 @@ def create_app(
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
     settings: SettingsClient | None = None,
     approver: Approver | None = None,
+    spend: SpendClient | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
     keepalive: float = KEEPALIVE,
@@ -198,7 +204,8 @@ def create_app(
     only when it is enabled (`backtide web --ajustes`). ``approver`` asks the service about the
     held requests (T10-5, ``backtide.web.approve``): without ``pending`` the page lists the real
     ones (from the service with `backtide web --aprobar`, else from the black box), and the
-    POST that decides exists only when it is enabled."""
+    POST that decides exists only when it is enabled. ``spend`` reads the spending (T11) for the
+    panel and Settings; changing the caps goes through ``settings`` (`--ajustes`)."""
     access = Access(token or make_token(), session)
     prefix = prefix or make_prefix()
     base = f"/s/{prefix}"
@@ -594,6 +601,7 @@ def create_app(
             feed=_panel_feed(cards),
             heads=".".join(str(c.summary.head) for c in cards),
             now=now,
+            spend=_spend(),
         )
 
     @app.get("/panel/stream", dependencies=protected)
@@ -969,7 +977,7 @@ def create_app(
     def _settings_view(
         request: Request, t: Translator, status: int, view: str, **values: Any
     ) -> Response:
-        for name in ("row", "message", "outcome", "applied", "reason"):
+        for name in ("row", "message", "outcome", "applied", "reason", "spend"):
             values.setdefault(name, None)
         return _page(
             "settings_step.html",
@@ -986,16 +994,41 @@ def create_app(
     ) -> Response:
         return _settings_view(request, t, status, "refused", reason=reason, **values)
 
+    def _spend() -> SpendView | None:
+        """The spending (T11), or None when the service cannot be asked or says nonsense."""
+        if spend is None:
+            return None
+        try:
+            if spend.availability() is not Availability.READY:
+                return None
+            return spend_view(spend.spend())
+        except ControlError as error:
+            logger.warning("the spending cannot be read from the service: %s", type(error).__name__)
+            return None
+        except Exception:  # never a 500 for a line of the panel
+            logger.exception("reading the spending failed")
+            return None
+
     @app.get(SETTINGS_PATH, dependencies=protected)
     def settings_page(request: Request) -> Response:
         t = Translator(_language(request)[0])
         state, rows = _settings_rows()
-        return _page("settings.html", request, active="settings", t=t, state=state, rows=rows)
+        return _page(
+            "settings.html",
+            request,
+            active="settings",
+            t=t,
+            state=state,
+            rows=rows,
+            spend=_spend(),
+        )
 
     def _settings_confirm(request: Request, action: str) -> Response:
         """The confirmation of one change: a form with a ticket for it. It changes nothing."""
         t = Translator(_language(request)[0])
         kind = request.query_params.get("tipo", "")
+        if kind == BUDGET and action == "set":
+            return _budget_confirm(request, t)
         if kind not in KINDS:
             return _settings_refused(request, t, 200, "settings.err.kind")
         state, rows = _settings_rows()
@@ -1016,6 +1049,64 @@ def create_app(
             ticket=setting_tickets.issue(action, kind, replacing=replacing),
         )
 
+    def _budget_confirm(request: Request, t: Translator) -> Response:
+        """The spending caps' form (T11), with a one-time ticket bound to it. Changes nothing."""
+        state = str(_settings_state())
+        if state != str(Availability.READY):
+            return _settings_refused(request, t, 200, f"settings.off.{state}")
+        shown = _spend()
+        if shown is None or not shown.available:
+            return _settings_refused(request, t, 200, "settings.err.spend")
+        return _settings_view(
+            request,
+            t,
+            200,
+            "confirm_budget",
+            spend=shown,
+            csrf=access.csrf,
+            ticket=setting_tickets.issue("set", BUDGET),
+        )
+
+    async def _budget_save(request: Request, t: Translator, form: dict[str, str]) -> Response:
+        """New caps from the form. The Guard, the form's shape, CSRF and the ticket were checked
+        by ``settings_save``; the service checks the amounts again and records the change."""
+        daily = form.get("diario", "").strip()
+        monthly = form.get("mensual", "").strip()
+        form.clear()
+        if not cap_ok(daily) or not cap_ok(monthly) or not (daily or monthly):
+            return _settings_refused(request, t, 400, "settings.err.cap")
+        state = await asyncio.to_thread(_settings_state)
+        if state is not Availability.READY or settings is None:
+            return _settings_refused(request, t, 503, f"settings.off.{state}")
+        client = settings
+
+        def run() -> tuple[str, dict[str, Any] | None]:
+            try:
+                return "asked", client.set_budget(daily or None, monthly or None)
+            except ControlUnavailable:
+                return "no_service", None
+            except ControlOutcomeUnknown:
+                logger.warning("a change of the spending caps from the web has no known outcome")
+                return "unknown", None
+            except ControlError as error:
+                logger.error("a change of the spending caps was not sent: %s", type(error).__name__)
+                return "untrusted", None
+
+        what, reply = await asyncio.to_thread(run)
+        row = SecretView(BUDGET)
+        if reply is None:
+            status = 503 if what == "no_service" else 200
+            return _settings_view(request, t, status, "result", row=row, outcome=what)
+        return _settings_view(
+            request,
+            t,
+            200 if reply["ok"] or reply["outcome"] != "invalid" else 400,
+            "result",
+            row=row,
+            outcome=reply["outcome"],
+            message=reply["message"],
+        )
+
     @app.get(SETTINGS_PATH + "/cambiar", dependencies=protected)
     def settings_change(request: Request) -> Response:
         return _settings_confirm(request, "set")
@@ -1030,6 +1121,22 @@ def create_app(
         back to the page."""
         t = Translator(_language(request)[0])
         form = await _read_form(request, SETTINGS_FIELDS, SETTINGS_OPTIONAL, SETTINGS_LIMITS)
+        if form is not None and form["tipo"] == BUDGET:
+            # T11: the spending caps, with the same checks as a key (the Guard, CSRF, the ticket).
+            if form["accion"] != "set" or set(form) != {*SETTINGS_FIELDS, "diario", "mensual"}:
+                form.clear()
+                return _settings_refused(request, t, 400, "settings.err.form")
+            if not access.csrf_is(form["csrf"]):
+                form.clear()
+                logger.warning("a change of the spending caps was refused: wrong form token")
+                return _settings_refused(request, t, 403, "settings.err.form")
+            redeemed, _ = setting_tickets.redeem(form["ticket"], "set", BUDGET)
+            if redeemed is not Redeemed.OK:
+                form.clear()
+                spent = redeemed is Redeemed.SPENT
+                reason = "settings.err.used" if spent else "settings.err.expired"
+                return _settings_refused(request, t, 400, reason)
+            return await _budget_save(request, t, form)
         if form is None or form["accion"] not in ACTIONS or form["tipo"] not in KINDS:
             return _settings_refused(request, t, 400, "settings.err.form")
         action, kind = form["accion"], form["tipo"]

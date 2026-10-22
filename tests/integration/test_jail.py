@@ -525,12 +525,13 @@ def test_start_refuses_a_container_that_is_not_the_jail(
     if kind == "an older jail":
         older = replace(jail, seccomp_profile=DOCKER_DEFAULT_PROFILE)
         docker.run(docker_create_argv(older), env=token_env(older))
-        expected = "seccomp profile is not the current one"
+        expected = "not the jail.*seccomp profile is not the current one"
     else:
         docker.run(["create", "--name", name, "--network", jail.network, jail.image])
-        expected = "CapDrop"
+        # The mount check (T14a) refuses it first: it keeps Docker's capabilities.
+        expected = "is not started: it would see what it must not.*CapDrop"
     try:
-        with pytest.raises(JailError, match=f"not the jail.*{expected}"):
+        with pytest.raises(JailError, match=expected):
             AgentJail(jail).start()
         state = _inspect_container(name)["State"]
         assert state["Running"] is False and state["StartedAt"].startswith("0001-")

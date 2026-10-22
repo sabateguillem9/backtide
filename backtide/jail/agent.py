@@ -14,6 +14,10 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
   and start() refuses a container that is not exactly this config's jail (backtide/jail/verify.py)
   or whose mounted config folder holds anything but openclaw.json, or whose CA folder holds
   anything but the certificate (ca.py writes it; the CA's key never goes there).
+- The mount check (T14a, backtide/jail/mounts.py): create() refuses a planned container, and
+  start() an existing one, that would show the agent what it must not (ExposedJail); right
+  after ``docker start`` the running container is checked again and killed if it does.
+  running_exposure() is the same check for the Guardian's cycle.
 - Whatever comes out of the container (exec output, logs) is the agent's: bounded in size,
   sanitized before it reaches a message, and never trusted to configure backtide's own probes.
 """
@@ -45,6 +49,7 @@ from backtide.jail.config import (
     token_env,
 )
 from backtide.jail.docker import JailError
+from backtide.jail.mounts import agent_policy, exposure_problems, planned_info
 from backtide.jail.openclaw import check_rewindable
 from backtide.jail.verify import container_problems
 
@@ -79,6 +84,15 @@ _CA_CERT_MAX = 64 * 1024  # one PEM certificate is about 2 KB
 
 # Whether quiesce starts the agent on exit, given the exception of its body (or None).
 type StartIf = Callable[[BaseException | None], bool]
+
+
+class ExposedJail(JailError):
+    """The agent's container would see, or sees, what it must not (T14a, mounts.py): it is not
+    created, not started, or killed. ``problems`` says what, one sentence each."""
+
+    def __init__(self, message: str, problems: list[str]) -> None:
+        super().__init__(message)
+        self.problems = list(problems)
 
 
 class AgentJail:
@@ -126,7 +140,9 @@ class AgentJail:
         Existing folders are only checked (a real directory, owned by the agent's uid): they
         belong to the agent and to its snapshots, so they are never changed. Creating them for
         another uid needs root (JailError otherwise). ``<root>/workspace`` must exist:
-        SnapshotStore.init() creates it."""
+        SnapshotStore.init() creates it. Nothing is created for a container that would show
+        the agent what it must not (ExposedJail)."""
+        self._check_planned("is not prepared")
         workspace_fd = _open_dir(self.config.workspace)
         try:
             agent_fd = self._ensure_agent_dir(workspace_fd, AGENT_DIR, self.config.agent_dir)
@@ -149,6 +165,7 @@ class AgentJail:
         authorization that a rewind would revive (docs/20, section 8)."""
         config = openclaw_config(self.config)
         check_rewindable(config)  # an unsafe config is never written (UnrewindableConfig)
+        self._check_planned("gets no config")  # never written where the agent must not look
         path = self.config.config_dir
         try:
             os.mkdir(path, CONFIG_DIR_MODE)
@@ -167,9 +184,11 @@ class AgentJail:
     # Lifecycle
 
     def create(self) -> None:
-        """Create the container, stopped. Fails if a container with that name exists."""
+        """Create the container, stopped. Fails if a container with that name exists, and
+        refuses (ExposedJail) a container that would show the agent what it must not."""
         self._check_ids_not_shared()
         self._check_mount_sources()
+        self._check_planned("is not created")
         docker.run(docker_create_argv(self.config), env=token_env(self.config))
 
     def start(self) -> None:
@@ -180,6 +199,22 @@ class AgentJail:
         self._check_mount_sources()
         self._check_container()
         docker.run(["start", self.config.name])
+        self._check_started()
+
+    def running_exposure(self) -> list[str]:
+        """What the running container shows the agent that it must not (T14a); empty if it
+        shows nothing of the sort, or if no container runs. A container that cannot be
+        inspected is a problem: what cannot be checked does not run."""
+        try:
+            info = self._inspect_container("{{json .}}", "the settings of")
+        except JailError as error:
+            return [f"the agent's container cannot be inspected: {error}"]
+        if info is None:
+            return []
+        state = info.get("State")
+        if isinstance(state, dict) and state.get("Running") is False:
+            return []
+        return self._exposure(info)
 
     def stop(self) -> None:
         """Stop the container: SIGTERM, then SIGKILL after ``stop_timeout`` seconds."""
@@ -415,12 +450,46 @@ class AgentJail:
             )
         return _json_object(result.stdout, f"{what} container {self.config.name}")
 
+    def _check_planned(self, what: str) -> None:
+        """The container docker_create_argv would make shows the agent nothing it must not
+        (mounts.py, symlinks resolved): checked before anything is set up for it."""
+        info, unreadable = planned_info(docker_create_argv(self.config))
+        self._refuse_exposure(unreadable + self._exposure(info), what)
+
+    def _exposure(self, info: dict[str, Any]) -> list[str]:
+        return exposure_problems(info, agent_policy(self.config))
+
+    def _refuse_exposure(self, problems: list[str], what: str) -> None:
+        if problems:
+            name = self.config.name
+            raise ExposedJail(
+                f"the agent's container {name} {what}: it would see what it must not: "
+                f"{'; '.join(problems)}. Remove it (docker rm -f {name}), check backtide's "
+                "config, and let backtide create it again",
+                problems,
+            )
+
+    def _check_started(self) -> None:
+        """Right after ``docker start``: the container that runs is still one that shows the
+        agent nothing it must not (it could have been swapped since the check before). If it
+        is not, or it cannot be told, it is killed."""
+        problems = self.running_exposure()
+        if not problems:
+            return
+        try:
+            self.kill()
+        except JailError as error:
+            problems.append(f"and it could not be killed: {error}")
+        self._refuse_exposure(problems, "was killed right after it started")
+
     def _check_container(self) -> None:
-        """The existing container must be exactly the jail of this config (verify.py)."""
+        """The existing container must show the agent nothing it must not (mounts.py) and be
+        exactly the jail of this config (verify.py)."""
         name = self.config.name
         info = self._inspect_container("{{json .}}", "the settings of")
         if info is None:
             raise JailError(f"container {name} does not exist: create() it first")
+        self._refuse_exposure(self._exposure(info), "is not started")
         problems = container_problems(
             self.config,
             info,

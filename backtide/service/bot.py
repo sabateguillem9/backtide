@@ -118,9 +118,14 @@ class GuardianActions:
         self._guardian: _Guardian | None = None
         self._box: BlackBox | None = None
         self._store: _Snapshots | None = None
+        self._budget: Any = None
 
-    def bind(self, guardian: _Guardian, box: BlackBox, store: _Snapshots) -> None:
+    def bind(
+        self, guardian: _Guardian, box: BlackBox, store: _Snapshots, *, budget: Any = None
+    ) -> None:
+        """``budget``: the spending cap (T11, ``spend.Budget``), for ``/estado``."""
         self._guardian, self._box, self._store = guardian, box, store
+        self._budget = budget
 
     # BotActions
 
@@ -160,6 +165,12 @@ class GuardianActions:
         holds, batches = len(self._guardian.pending_holds()), len(self._guardian.batches())
         lines.append(f"Peticiones retenidas: {holds} (/retenidas). Lotes activos: {batches} "
                      "(/lotes).")  # fmt: skip
+        if self._budget is not None:
+            try:
+                lines.extend(self._budget.lines())
+            except Exception:
+                logger.exception("the spending could not be read for /estado")
+                lines.append("Gasto: no se ha podido leer.")
         return "\n".join(lines)
 
     def rewind(self, snapshot_id: str) -> str:

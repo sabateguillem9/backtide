@@ -41,15 +41,26 @@
     </ul>
   </section>
   {% endfor %}
+  {# The spending cap (T11): today's and this month's spending against their caps, the date of
+     the prices, and "Cambiar" (with --ajustes). Read from the service, never from a file. #}
   <section class="settings-group" aria-labelledby="settings-spend">
     <h2 class="section-title" id="settings-spend">{{ t('settings.group.spend') }}</h2>
+    <p class="note">{{ t('settings.group.spend.note') }}</p>
     <ul class="settings-list">
-      <li class="setting is-later" data-kind="cap">
+      <li class="setting {{ 'is-problem' if spend and (spend.blocked or not spend.available) else ('is-set' if spend else 'is-unknown') }}" data-kind="tope">
         <div class="setting-info">
-          <label class="setting-name" for="setting-cap">{{ t('settings.cap') }}</label>
-          <span class="setting-state" id="setting-cap-note"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('settings.cap.t11') }}</span></span>
+          <span class="setting-name">{{ t('settings.cap') }}</span>
+          <span class="setting-state" id="setting-cap-note"><span class="setting-dot" aria-hidden="true"></span><span>{% if not spend %}{{ t('settings.cap.unknown') }}{% elif not spend.available %}{{ t('settings.cap.unavailable') }}{% else %}{{ t('settings.cap.day', spent=spend.day_spent, cap=spend.day_cap) }} · {{ t('settings.cap.month', spent=spend.month_spent, cap=spend.month_cap) }}{% endif %}</span></span>
+          {% if spend and spend.blocked %}<span class="setting-note">{{ t('settings.cap.blocked.' ~ spend.blocked) }}</span>{% endif %}
+          {% if spend and spend.prices_on %}<span class="setting-note">{{ t('settings.cap.prices.fetched', day=spend.prices_on) }}</span>{% elif spend and spend.defaults_on %}<span class="setting-note">{{ t('settings.cap.prices.defaults', day=spend.defaults_on) }}</span>{% endif %}
         </div>
-        <div class="setting-actions"><input id="setting-cap" class="setting-input setting-cap" type="text" inputmode="decimal" disabled aria-describedby="setting-cap-note"></div>
+        <div class="setting-actions">
+          {% if ready and spend and spend.available %}
+          <a class="setting-go" href="{{ base }}/ajustes/cambiar?tipo=tope">{{ t('settings.change') }}<span class="visually-hidden"> {{ t('settings.what.tope') }}</span></a>
+          {% else %}
+          <span class="setting-go is-off" aria-disabled="true">{{ t('settings.change') }}</span>
+          {% endif %}
+        </div>
       </li>
     </ul>
   </section>

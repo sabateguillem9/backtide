@@ -452,6 +452,10 @@ def interrupted_rewind(service: Service, when: str) -> tuple[str, int]:
     return target, workspace_before
 
 
+# [budget] of the tests' services (T11): no price page, and caps no test reaches by accident.
+TEST_BUDGET = "auto_prices = false\ndaily_usd = 100000\nmonthly_usd = 100000\nmax_inflight = 64\n"
+
+
 def make_service(
     root: Path,
     state_dir: Path,
@@ -462,13 +466,19 @@ def make_service(
     proxy_toml: str = "",
     real_keys: Mapping[str, str] | None = None,
     agent_memory: str = "2g",
+    budget_toml: str = TEST_BUDGET,
 ) -> Service:
     """Write the config and token of a service for the btrfs folder ``root`` (nothing runs
     yet). ``names`` are the container and network names, from the fixtures' cleanup scheme.
 
     ``proxy_toml`` goes at the end of ``[proxy]`` (``allow_hosts``, ``[[proxy.providers]]``),
     and ``real_keys`` (provider name -> a key the TEST made, never a real one) are written to
-    ``<state_dir>/keys/<name>.key`` (0600, in a 0700 folder) as an installation would."""
+    ``<state_dir>/keys/<name>.key`` (0600, in a 0700 folder) as an installation would.
+
+    ``budget_toml`` is the body of ``[budget]`` (T11). By default (``TEST_BUDGET``) the prices
+    do not update themselves (a test never reads the real pricing page: invariant 8) and the caps
+    are out of reach (the fake models are unknown, so each call is charged by excess);
+    tope-de-gasto sets its own cap of cents and points ``prices_url`` at a fake page."""
     container, network = names
     token = secrets.token_urlsafe(32)
     state_dir.chmod(0o700)
@@ -488,6 +498,8 @@ def make_service(
         f'volume = "{root}"\n'
         f"cycle_interval = {cycle_interval}\n"
         + (f"workspace_limit = {workspace_limit}\n" if workspace_limit is not None else "")
+        + "[budget]\n"
+        + budget_toml
         + "[agent]\n"
         f'name = "{container}"\n'
         f'network = "{network}"\n'

@@ -54,7 +54,7 @@ from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import ControlRewinder
 from backtide.web.security import make_prefix, make_run_name, make_token
-from backtide.web.settings import ControlSettings, SettingsClient
+from backtide.web.settings import ControlSettings, ControlSpend, SettingsClient
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +166,7 @@ def run_web(
         rewinder=ControlRewinder(paths.control_socket, enabled=can_rewind),
         settings=settings or ControlSettings(paths.control_socket, enabled=can_set),
         approver=approver or ControlApprover(paths.control_socket, enabled=can_approve),
+        spend=ControlSpend(paths.control_socket),
         agent_name=agent_name,
         others=others,
         pending=pending,

@@ -138,6 +138,7 @@ from backtide.service.holds import (
     trust_target,
 )
 from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES, ReadBudget
+from backtide.service.spend import Budget
 from backtide.service.trust import TrustError, TrustStore
 
 logger = logging.getLogger(__name__)
@@ -396,8 +397,12 @@ class ProxyChannel:
         watch: HoldWatch | None = None,
         frozen: Callable[[], bool] | None = None,
         trust: TrustStore | None = None,
+        budget: Budget | None = None,
     ) -> None:
         self._sock = sock
+        # The spending cap (T11, docs/33): asked before a model call goes out, told what each
+        # answer cost. One for the service (the Egress keeps it across channels).
+        self._budget = budget
         self._watch = watch
         # The recipients the person trusted from the web (T10-5, decision 9): with [gate]
         # trusted, what a send to trusted recipients only is compared with.
@@ -617,7 +622,7 @@ class ProxyChannel:
         if gate is None:  # a model call (llm/request): never held, only to a provider's host
             if not allowed:
                 return self._refuse(request_id, event, "not_allowed")
-            return self._let_out(request_id, event)
+            return self._model_call(request_id, event)
         with self._gate_lock:
             self._tick_locked()
             return self._gate_verdict(request_id, event, gate, allowed)
@@ -834,6 +839,60 @@ class ProxyChannel:
         if stored is None:
             return protocol.ack(request_id, "deny", reason="not_recorded")
         return protocol.ack(request_id, "allow", seq=stored.seq)
+
+    def _model_call(self, request_id: int, event: dict[str, Any]) -> dict[str, Any]:
+        """An ``llm/request`` to an allowed provider: the spending cap first (T11). A refusal
+        never reaches the provider; ``Budget.admit`` records it (``llm/blocked``)."""
+        if self._budget is None:
+            return self._let_out(request_id, event)
+        details = event["details"]
+        flow_id = details.get("flow_id")
+        body = details.get("body")
+        try:
+            why = self._budget.admit(
+                flow_id,
+                model=details.get("model"),
+                request_bytes=body.get("size") if isinstance(body, dict) else None,
+                max_tokens=details.get("max_tokens"),
+            )
+        except Exception:  # without a count nothing goes out
+            logger.exception("the spending cap could not be asked: the model call is refused")
+            why = "spend_unavailable"
+        if why == "throttled":
+            self._throttled += 1
+            return protocol.ack(request_id, "deny", reason="throttled", retry_after=2)
+        if why is not None:
+            return protocol.ack(request_id, "deny", reason=why)
+        ack = self._let_out(request_id, event)
+        if ack["verdict"] != "allow":
+            self._budget.forget(flow_id)
+        return ack
+
+    def _charge(self, event: dict[str, Any]) -> None:
+        """An ``llm/response``: priced, recorded with its cost, then added to the spending (also
+        when the event cannot be recorded or is over the event budget: the money was spent).
+        Anything that ends a call without an answer frees its place in flight."""
+        details = event["details"]
+        if event["source"] == "llm" and event["action"] == "response":
+            provider = self._policy.providers.by_name(details.get("provider"))
+            kind = str(provider.kind) if provider is not None else "anthropic"
+            try:
+                cost = self._budget.settle(kind, details)  # type: ignore[union-attr]
+            except Exception:
+                logger.exception("pricing a model answer failed")
+                self._event_plain(event)
+                return
+            size = len(json.dumps(event, separators=(",", ":")))
+            stored = None
+            if self._budgets.take_event(size, self._mono()):
+                stored = self._append(event, {"cost": cost.details()})
+            else:
+                self._dropped += 1
+            self._budget.book_cost(cost, stored)  # type: ignore[union-attr]
+            return
+        if event["source"] == "net" and event["action"] in ("error", "blocked"):
+            self._budget.forget(details.get("flow_id"))  # type: ignore[union-attr]
+        self._event_plain(event)
 
     def _refuse(
         self, request_id: int, event: dict[str, Any], reason: str, *, fp: str | None = None
@@ -1218,6 +1277,12 @@ class ProxyChannel:
                 logger.exception("telling about the daily budget failed")
 
     def _event(self, event: dict[str, Any]) -> None:
+        if self._budget is not None:
+            self._charge(event)
+            return
+        self._event_plain(event)
+
+    def _event_plain(self, event: dict[str, Any]) -> None:
         size = len(json.dumps(event, separators=(",", ":")))
         if not self._budgets.take_event(size, self._mono()):
             self._dropped += 1
@@ -1226,6 +1291,8 @@ class ProxyChannel:
 
     def _report_counts(self) -> None:
         now = self._mono()
+        if self._budget is not None:
+            self._budget.flush_blocked()
         if self._throttled and now - self._last_throttled_event >= THROTTLED_EVERY:
             window = max(1, int(now - self._throttled_since))
             count, self._throttled = self._throttled, 0

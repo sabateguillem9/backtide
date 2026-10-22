@@ -13,7 +13,7 @@ from pathlib import Path
 
 from backtide import __version__
 from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, load_key, redact
-from backtide.jail import JailError
+from backtide.jail import ExposedJail, JailError
 from backtide.jail.openclaw import UnrewindableConfig
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import (
@@ -233,6 +233,12 @@ def _watch(args: argparse.Namespace) -> int:
         for note in getattr(error, "__notes__", []):
             _error(note)
         return EXIT_FAILED
+    except ExposedJail as error:  # T14a: refused before the agent could see anything
+        _error(
+            "backtide no arranca al agente: su contenedor vería algo del anfitrión que no debe "
+            f"ver (invariantes 1 y 2). Corrige la configuración y vuelve a arrancar: {error}"
+        )
+        return EXIT_ERROR
     except JailError as error:
         _error(f"EL AGENTE SIGUE EN MARCHA y backtide no ha podido pararlo: {error}")
         return EXIT_FAILED

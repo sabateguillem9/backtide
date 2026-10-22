@@ -59,7 +59,7 @@ from tests.integration.internet_kit import (
     start_fake_internet,
     stop_with_internet,
 )
-from tests.integration.service_kit import Service, make_service, wait_until
+from tests.integration.service_kit import TEST_BUDGET, Service, make_service, wait_until
 
 PROXY_ALIAS = "backtide-proxy"
 # Names an allowed list could hold that resolve to places the agent may not reach (in the
@@ -117,6 +117,7 @@ def start_lab(
     telegram_toml: str | None = None,
     agent_memory: str = "2g",
     trusted_mail: str | None = None,
+    budget_toml: str = TEST_BUDGET,
 ) -> Lab:
     """A started service with its fake internet. With ``inwards``, the allowed list also holds
     names that resolve to private addresses (ssrf-por-el-proxy: the fixed rule must still say
@@ -128,7 +129,8 @@ def start_lab(
     127.0.0.1; the owner's chat in it is trusted by the gate too). ``agent_memory``: the agent's
     memory (T10-5's test_openclaw_telegram.py runs a second OpenClaw Gateway inside it).
     ``trusted_mail``: a Gmail address in ``[gate] trusted`` too (confiar-sin-querer: it must
-    trust nothing until the owner's mail accounts exist)."""
+    trust nothing until the owner's mail accounts exist). ``budget_toml``: the body of ``[budget]``
+    (T11's tope-de-gasto: a cap of cents, the fake model's price and a fake price page)."""
     vm._require_agent_image()
     vm._remove_stale_test_agents()
     names = vm._agent_names(os.getpid())
@@ -150,6 +152,7 @@ def start_lab(
         + gate_toml(unknown_hosts, trusted_chat, trusted_mail),
         real_keys=real,
         agent_memory=agent_memory,
+        budget_toml=budget_toml,
     )
     if telegram_toml is not None:
         path = service.config.state_dir / "telegram.toml"

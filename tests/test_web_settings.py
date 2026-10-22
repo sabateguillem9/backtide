@@ -131,8 +131,8 @@ def test_the_page_says_what_is_set_and_never_more(web: TestClient) -> None:
     assert "Clave de OpenAI sin configurar" in said
     assert "Ningún proveedor de [proxy] se llama así" in said
     assert "Bot de Telegram sin configurar" in said
-    assert "Tope de gasto" in said and "Llega con T11" in said
-    assert re.search(r'<input id="setting-cap"[^>]* disabled', page.text)
+    assert "Tope de gasto no se sabe: el servicio no contesta" in said  # no spending client here
+    assert 'href="' + PREFIX_PATH + '/ajustes/cambiar?tipo=tope"' not in page.text
     assert "<form" not in page.text, "the list itself changes nothing"
     assert f'href="{PREFIX_PATH}/ajustes/quitar?tipo=anthropic"' in page.text
     assert f'href="{PREFIX_PATH}/ajustes/quitar?tipo=openai"' not in page.text

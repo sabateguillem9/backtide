@@ -29,6 +29,9 @@ class StubJail:
     def is_running(self) -> bool:
         return self.running
 
+    def running_exposure(self) -> list[str]:
+        return []
+
     def ensure_network(self) -> None: ...
 
     def prepare_workspace(self) -> None: ...

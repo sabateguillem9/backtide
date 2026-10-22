@@ -58,9 +58,11 @@ from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
 from backtide.service.holds import HoldTimings, HoldWatch
 from backtide.service.pause import Holder, make_space_gate, read_holders
+from backtide.service.price_update import PriceUpdater
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
 from backtide.service.proxy_channel import Policy, known_secrets
 from backtide.service.settings import Applied, Settings
+from backtide.service.spend import Budget
 from backtide.service.telegram_config import load_telegram
 from backtide.service.trust import TrustStore
 from backtide.snapshots import SnapshotStore, utc_now
@@ -305,7 +307,13 @@ def build_guardian(
         else None
     )
     egress = build_egress(
-        config, jail, rated_box, proxy=proxy, timings=hold_timings, watch=hold_watch
+        config,
+        jail,
+        rated_box,
+        proxy=proxy,
+        timings=hold_timings,
+        watch=hold_watch,
+        alerts=alerts,
     )
     if on_egress is not None:
         on_egress(egress)
@@ -378,6 +386,7 @@ def build_egress(
     proxy: ProxyJail | None = None,
     timings: HoldTimings | None = None,
     watch: HoldWatch | None = None,
+    alerts: AlertQueue | None = None,
 ) -> Egress:
     """The egress proxy of ``config`` (docs/21, section 9): its container, and what backtide lets
     out through it, the allowed hosts of ``[proxy]`` and the model providers' hosts. The channel
@@ -392,6 +401,7 @@ def build_egress(
     # once here; a file that cannot be used gives no trust (logged).
     trust = TrustStore(config.state_dir)
     trust.load()
+    budget, prices = build_budget(config, box, alerts)
     # The gate (T10-2) reads the black box once, at the first start: the holds a backtide that
     # died left open there are closed.
     return Egress(
@@ -403,7 +413,34 @@ def build_egress(
         history=box.events,
         watch=watch,
         trust=trust,
+        budget=budget,
+        prices=prices,
     )
+
+
+def build_budget(
+    config: ServiceConfig, box: AssessedBlackBox, alerts: AlertQueue | None
+) -> tuple[Budget, PriceUpdater]:
+    """The spending cap of ``[budget]`` (T11, docs/33) and, unless ``auto_prices = false``, the
+    updater of its prices (Anthropic's page, from the service: never through the agent's proxy).
+    Constructed only: the Egress opens the budget and starts the updater at its first start."""
+    settings = config.budget_settings()
+    budget = Budget(
+        settings,
+        state_dir=config.state_dir,
+        record=box.append,
+        alert=None if alerts is None else alerts.submit,
+        history=box.events,
+    )
+    # With auto_prices = false it only loads the last good table fetched before (no thread).
+    prices = PriceUpdater(
+        budget,
+        state_dir=config.state_dir,
+        record=box.append,
+        url=settings.prices_url,
+        auto=settings.auto_prices,
+    )
+    return budget, prices
 
 
 def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
@@ -652,12 +689,13 @@ def serve(
             reload_keys=key_reloader(config, egress, sensor_secrets),
             in_use=[p.name for p in config.proxy_settings().providers],
         )
+        # The spending cap (T11): `backtide web` reads it and changes it through the socket too.
         control: ControlHook = ControlServer(
-            guardian, config.control_socket, settings=settings_service
+            guardian, config.control_socket, settings=settings_service, budget=egress.budget
         )
         if telegram is not None:
             snapshots = store if store is not None else SnapshotStore(config.volume)
-            telegram.actions.bind(guardian, box, snapshots)
+            telegram.actions.bind(guardian, box, snapshots, budget=egress.budget)
             control = Hooks(control, telegram.bot)
         run_guardian(
             guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control

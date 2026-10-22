@@ -523,7 +523,32 @@ ES: dict[str, str] = {
     "settings.put": "Poner",
     "settings.remove": "Quitar",
     "settings.cap": "Tope de gasto",
-    "settings.cap.t11": "Llega con T11",
+    "settings.cap.day": "Hoy: {spent} $ de {cap} $",
+    "settings.cap.month": "Este mes: {spent} $ de {cap} $",
+    "settings.cap.blocked.day": "Tope de hoy alcanzado: las llamadas al modelo se rechazan hasta "
+    "mañana o hasta que lo subas.",
+    "settings.cap.blocked.month": "Tope del mes alcanzado: las llamadas al modelo se rechazan "
+    "hasta el mes que viene o hasta que lo subas.",
+    "settings.cap.prices.fetched": "Precios actualizados el {day} (fuente: Anthropic).",
+    "settings.cap.prices.defaults": "Precios de fábrica del {day}.",
+    "settings.cap.unknown": "no se sabe: el servicio no contesta",
+    "settings.cap.unavailable": "backtide no puede contar el gasto ahora mismo: las llamadas al "
+    "modelo se rechazan.",
+    "settings.kind.tope": "Tope de gasto",
+    "settings.what.tope": "el tope de gasto",
+    "settings.out.saved.tope": "Guardado",
+    "settings.confirm.budget": "Cambiar el tope de gasto",
+    "settings.confirm.budget.note": "Se aplica a la siguiente llamada al modelo. Si lo subes por "
+    "encima de lo gastado, el agente puede volver a llamar al modelo enseguida. Deja vacío lo que "
+    "no quieras cambiar.",
+    "settings.field.daily": "Tope diario, en dólares",
+    "settings.field.monthly": "Tope mensual, en dólares",
+    "settings.hint.cap": "Mayor que cero, con dos decimales como mucho: 5 o 7,50.",
+    "settings.err.cap": "El tope tiene que ser una cantidad de dólares mayor que cero, con dos "
+    "decimales como mucho: no se ha cambiado nada.",
+    "settings.err.spend": "El servicio no ha dicho cuánto se ha gastado: prueba otra vez en un "
+    "momento.",
+    "panel.spend": "Gasto de los modelos",
     "settings.agent": "El agente nunca ve esta página ni las claves de verdad: sigue con su clave "
     "falsa, y el proxy pone la real al salir.",
     "settings.confirm.set.new": "Poner {what}",
@@ -585,6 +610,9 @@ ES: dict[str, str] = {
     "settings.group.alerts.note": "Por el bot te llegan los avisos y desde él pausas al agente. "
     "Un cambio aquí se aplica al reiniciar el servicio.",
     "settings.group.spend": "Gasto",
+    "settings.group.spend.note": "Al llegar a un tope, backtide rechaza las llamadas del agente al "
+    "modelo hasta el día o el mes siguiente, o hasta que lo subas aquí. Las que ya están en marcha "
+    "terminan. Pon también un límite en la consola de tu proveedor: es la segunda red.",
     "settings.set.telegram": "configurado",
     "settings.changed.telegram": "cambiado el {when}",
     "settings.changed.today": "cambiada hoy a las {time}",
@@ -1104,7 +1132,31 @@ EN: dict[str, str] = {
     "settings.put": "Set",
     "settings.remove": "Remove",
     "settings.cap": "Spending cap",
-    "settings.cap.t11": "Comes with T11",
+    "settings.cap.day": "Today: {spent} $ of {cap} $",
+    "settings.cap.month": "This month: {spent} $ of {cap} $",
+    "settings.cap.blocked.day": "Today's cap is reached: model calls are refused until tomorrow or "
+    "until you raise it.",
+    "settings.cap.blocked.month": "This month's cap is reached: model calls are refused until next "
+    "month or until you raise it.",
+    "settings.cap.prices.fetched": "Prices updated on {day} (source: Anthropic).",
+    "settings.cap.prices.defaults": "Built-in prices of {day}.",
+    "settings.cap.unknown": "unknown: the service does not answer",
+    "settings.cap.unavailable": "backtide cannot count the spending right now: model calls are "
+    "refused.",
+    "settings.kind.tope": "Spending cap",
+    "settings.what.tope": "the spending cap",
+    "settings.out.saved.tope": "Saved",
+    "settings.confirm.budget": "Change the spending cap",
+    "settings.confirm.budget.note": "It applies to the next model call. Raised above what was "
+    "spent, the agent can call the model again at once. Leave empty what you do not want to "
+    "change.",
+    "settings.field.daily": "Daily cap, in dollars",
+    "settings.field.monthly": "Monthly cap, in dollars",
+    "settings.hint.cap": "Above zero, two decimals at most: 5 or 7.50.",
+    "settings.err.cap": "A cap is an amount of dollars above zero, two decimals at most: nothing "
+    "was changed.",
+    "settings.err.spend": "The service did not say how much was spent: try again in a moment.",
+    "panel.spend": "Model spending",
     "settings.agent": "The agent never sees this page nor the real keys: it keeps its fake key, "
     "and the proxy puts the real one in on the way out.",
     "settings.confirm.set.new": "Set {what}",
@@ -1167,6 +1219,9 @@ EN: dict[str, str] = {
     "settings.group.alerts.note": "The bot brings you the alerts, and from it you pause the "
     "agent. A change here applies when the service restarts.",
     "settings.group.spend": "Spending",
+    "settings.group.spend.note": "At a cap, backtide refuses the agent's model calls until the "
+    "next day or month, or until you raise it here. Calls already running finish. Set a limit in "
+    "your provider's console too: it is the second net.",
     "settings.set.telegram": "set",
     "settings.changed.telegram": "changed on {when}",
     "settings.changed.today": "changed today at {time}",

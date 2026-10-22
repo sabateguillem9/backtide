@@ -93,7 +93,7 @@ from uuid import uuid4
 
 import backtide
 from backtide.blackbox import BlackBox, BlackBoxError, Event, redact
-from backtide.jail import AgentJail, JailError
+from backtide.jail import AgentJail, ExposedJail, JailError
 from backtide.jail.openclaw import UnrewindableConfig
 from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProblem
 from backtide.service.clock import clock_synced as kernel_clock_synced
@@ -251,6 +251,9 @@ class FileWatcher(Protocol):
         """Stop for good: drain, write what is pending, close everything."""
         ...
 
+
+# How many of the mount check's problems an event keeps (T14a): the first say enough.
+MAX_EXPOSURE_PROBLEMS = 20
 
 # Why a required sensor stops the agent (``agent_stop {reason}``).
 _SENSOR_REASONS = frozenset(
@@ -1076,11 +1079,19 @@ class Guardian:
         halt_error = self._halt() if running else None
         still_running = halt_error is not None
         self._set_state(AgentState.RUNNING if still_running else AgentState.STOPPED)
+        details: dict[str, Any] = {
+            "error": _short(error),
+            "quota": quota,
+            "still_running": still_running,
+        }
+        exposed = isinstance(error, ExposedJail)
+        if exposed:
+            details["exposed"] = error.problems[:MAX_EXPOSURE_PROBLEMS]
         event = self._record(
             "system",
             "agent_start_failed",
-            details={"error": _short(error), "quota": quota, "still_running": still_running},
-            risk=3 if still_running else 2,
+            details=details,
+            risk=3 if still_running or exposed else 2,
         )
         if still_running:
             stop_event = self._record(
@@ -1101,6 +1112,11 @@ class Guardian:
             body = (
                 "El agente no ha podido arrancar porque su carpeta ha llegado al tope de "
                 "espacio: borra archivos del agente o sube el tope, y reinicia backtide."
+            )
+        elif exposed:
+            body = (
+                "backtide no arranca al agente: su contenedor vería algo del anfitrión que no "
+                "debe ver (la caja negra, las claves, un socket...). Detalles en el evento."
             )
         else:
             body = "El agente no ha podido arrancar. Detalles en el evento."
@@ -1126,6 +1142,7 @@ class Guardian:
             self.agent_lock.release()
 
     def _cycle_locked(self) -> CycleResult:
+        self._check_exposure()
         try:
             workspace_id = self._store.workspace_id()
         except SnapshotError as error:
@@ -1143,6 +1160,45 @@ class Guardian:
             snapshot = self._take(Reason.PERIODIC, "cycle", assessment.workspace, check_space=True)
         return CycleResult(
             changed=assessment.changed, snapshot=snapshot, pruned=self._maybe_prune()
+        )
+
+    def _check_exposure(self) -> None:
+        """T14a: the running agent's container still shows it nothing it must not see
+        (``AgentJail.running_exposure``, backtide/jail/mounts.py); one that cannot be inspected
+        counts as one that does. One changed under the service (recreated by hand with one
+        more mount, say) is killed at once and stays stopped: a start refuses it until it is
+        removed and backtide creates it again."""
+        problems = self._jail.running_exposure()
+        if not problems:
+            return
+        details: dict[str, Any] = {
+            "reason": "exposed",
+            "problems": problems[:MAX_EXPOSURE_PROBLEMS],
+        }
+        self._set_state(AgentState.STOPPING)
+        error = self._halt(kill_first=True)
+        if error is not None:
+            self._set_state(AgentState.RUNNING)
+            event = self._record(
+                "system", "agent_stop_failed", details={**details, "error": _short(error)}, risk=3
+            )
+            self._alert(
+                AlertLevel.ERROR,
+                "El agente ve lo que no debe y sigue en marcha",
+                "El contenedor del agente ve algo del anfitrión que no debe ver y no se ha "
+                "podido parar. Detalles en el evento.",
+                event,
+            )
+            return
+        self._set_state(AgentState.STOPPED)
+        event = self._record("system", "agent_stop", details=details, risk=3)
+        self._alert(
+            AlertLevel.ERROR,
+            "Agente parado: su contenedor ve lo que no debe",
+            "El contenedor del agente ve algo del anfitrión que no debe ver (detalles en el "
+            "evento). backtide lo ha parado y no lo arrancará así: bórralo y deja que backtide "
+            "lo cree de nuevo.",
+            event,
         )
 
     def _assess(self) -> _Assessment:

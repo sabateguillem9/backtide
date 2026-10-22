@@ -34,12 +34,16 @@ from typing import Any, Protocol
 from backtide.service.control import (
     ControlError,
     PeerCredentials,
+    ask_budget,
     ask_clear_secret,
     ask_secrets,
+    ask_set_budget,
     ask_set_secret,
     peer_credentials,
 )
+from backtide.service.prices import usd
 from backtide.service.settings import KINDS, PROVIDERS, TELEGRAM, check_chat_id
+from backtide.service.spend import check_cap
 from backtide.web.rewind import (
     CONFIRM_SECONDS,
     MAX_TICKETS,
@@ -53,6 +57,8 @@ from backtide.web.security import TOKEN_BYTES, token_matches
 ACTIONS = ("set", "clear")
 _TAIL_RE = re.compile(r"[A-Za-z0-9_-]{4}", re.ASCII)
 _CHAT_TAIL_RE = re.compile(r"[0-9]{4}", re.ASCII)
+_DAY_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
+BUDGET = "tope"  # the Settings page's "kind" for the spending caps (T11)
 
 
 class SettingsClient(Protocol):
@@ -66,6 +72,8 @@ class SettingsClient(Protocol):
     def set_secret(self, kind: str, value: str, chat_id: str | None) -> dict[str, Any]: ...
 
     def clear_secret(self, kind: str) -> dict[str, Any]: ...
+
+    def set_budget(self, daily: str | None, monthly: str | None) -> dict[str, Any]: ...
 
 
 class ControlSettings:
@@ -106,6 +114,109 @@ class ControlSettings:
     def clear_secret(self, kind: str) -> dict[str, Any]:
         self._require()
         return ask_clear_secret(self._path, kind, via="web", wait=self._wait, peer=self._peer)
+
+    def set_budget(self, daily: str | None, monthly: str | None) -> dict[str, Any]:
+        """New spending caps (T11), as typed: the service checks them and records the change."""
+        self._require()
+        return ask_set_budget(
+            self._path,
+            daily_usd=daily,
+            monthly_usd=monthly,
+            via="web",
+            wait=self._wait,
+            peer=self._peer,
+        )
+
+
+class SpendClient(Protocol):
+    """What the panel and Settings read of the spending (T11). Raises the control socket's
+    errors."""
+
+    def availability(self) -> Availability: ...
+
+    def spend(self) -> dict[str, Any]: ...
+
+
+class ControlSpend:
+    """The real one: the spending is read-only and holds no secret, so it is asked whenever the
+    socket is the service's (``--ajustes`` is only needed to CHANGE the caps)."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        wait: float = 2.0,
+        peer: PeerCredentials = peer_credentials,
+        euid: Callable[[], int] = os.geteuid,
+    ) -> None:
+        self._path = Path(path)
+        self._wait = wait
+        self._peer = peer
+        self._euid = euid
+
+    def availability(self) -> Availability:
+        return socket_availability(self._path, enabled=True, euid=self._euid)
+
+    def spend(self) -> dict[str, Any]:
+        return ask_budget(self._path, wait=self._wait, peer=self._peer)
+
+
+@dataclass(frozen=True)
+class SpendView:
+    """The spending as a page shows it, checked field by field (dollars with a comma)."""
+
+    available: bool
+    day_spent: str = ""
+    day_cap: str = ""
+    month_spent: str = ""
+    month_cap: str = ""
+    day_cap_plain: str = ""  # "5.00", to fill the form in
+    month_cap_plain: str = ""
+    blocked: str | None = None  # "day" | "month"
+    prices_on: str | None = None  # the date of the last good table from Anthropic
+    defaults_on: str | None = None
+
+
+def spend_view(raw: object) -> SpendView | None:
+    """``SpendClient.spend``'s reply, checked; None if it makes no sense."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("available") is not True:
+        return SpendView(False)
+    try:
+        day, month = raw["day"], raw["month"]
+        amounts = [day["spent_micro"], day["cap_micro"], month["spent_micro"], month["cap_micro"]]
+    except (KeyError, TypeError):
+        return None
+    if not all(type(a) is int and 0 <= a <= 10**15 for a in amounts):
+        return None
+    prices = raw.get("prices") if isinstance(raw.get("prices"), dict) else {}
+    blocked = raw.get("blocked")
+    return SpendView(
+        True,
+        day_spent=_money(amounts[0]),
+        day_cap=_money(amounts[1]),
+        month_spent=_money(amounts[2]),
+        month_cap=_money(amounts[3]),
+        day_cap_plain=usd(amounts[1]),
+        month_cap_plain=usd(amounts[3]),
+        blocked=blocked if blocked in ("day", "month") else None,
+        prices_on=_day(prices.get("updated_on")),
+        defaults_on=_day(prices.get("defaults_on")),
+    )
+
+
+def _money(micro: int) -> str:
+    return usd(micro).replace(".", ",")
+
+
+def _day(value: object) -> str | None:
+    return value if isinstance(value, str) and _DAY_RE.fullmatch(value) else None
+
+
+def cap_ok(value: str) -> bool:
+    """Empty (keep it) or a cap ``check_cap`` takes. The service checks it again."""
+    return value == "" or check_cap(value) is not None
 
 
 @dataclass(frozen=True)
@@ -210,6 +321,12 @@ class SettingTickets:
 
 __all__ = [
     "ACTIONS",
+    "BUDGET",
+    "ControlSpend",
+    "SpendClient",
+    "SpendView",
+    "cap_ok",
+    "spend_view",
     "TELEGRAM",
     "ControlSettings",
     "SecretView",
