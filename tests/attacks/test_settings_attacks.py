@@ -10,6 +10,14 @@
   agent's next model call reaches the provider with the new key, with no restart, while the agent
   still has only its fake one, and no piece of the new key is anywhere the agent or a log can see.
 
+- ``modelo-sin-clave``: the same service, started with NO key for ``anthropic`` (it waits for
+  it, docs/21 section 6). The agent insists on the model with its fake key, and with a key of its
+  own: every call is refused in Anthropic's own error shape (``no_key``, a 400) or as a foreign
+  credential, and none reaches the provider; the refusals are in the black box
+  (``llm/blocked {reason: no_key}``, a few, not one per call). The person sets a key through the
+  control socket (as the web's Settings page does): the next call reaches the provider with it,
+  no restart. The person removes it: the calls are refused again, and the service keeps running.
+
 In the VM the agent runs with the service's own uid (``allow_shared_ids``, a concession of the
 tests), so the control socket's ``SO_PEERCRED`` check would let it in: what keeps it out is that
 the socket is not in its filesystem at all, and this scenario checks exactly that.
@@ -40,6 +48,7 @@ from test_web_attacks import host_addresses
 from backtide.blackbox import Event
 from backtide.gate.addon import REFUSALS
 from backtide.jail import docker as jail_docker
+from backtide.service.control import ask_clear_secret, ask_set_secret
 from tests.integration.internet_kit import (
     ANTHROPIC_HOST,
     ANTHROPIC_MODEL,
@@ -104,11 +113,8 @@ def provider_toml() -> str:
     )
 
 
-@pytest.fixture
-def settings_lab(
-    canary_environment: dict[str, str],
-    btrfs_volume: Path,
-    tmp_path_factory: pytest.TempPathFactory,
+def start_settings_lab(
+    btrfs_volume: Path, tmp_path_factory: pytest.TempPathFactory, *, with_key: bool = True
 ) -> Iterator[Lab]:
     vm._require_agent_image()
     vm._remove_stale_test_agents()
@@ -121,7 +127,7 @@ def settings_lab(
         tmp_path_factory.mktemp("service-state"),
         names,
         proxy_toml=provider_toml(),
-        real_keys={PROVIDER: old},
+        real_keys={PROVIDER: old} if with_key else None,
     )
     internet: FakeInternet | None = None
     try:
@@ -129,9 +135,28 @@ def settings_lab(
         service.main_args = (*internet.service_args(), *HOLD_TIMINGS)
         service.start()
         service.wait_ready()
-        yield Lab(service, internet, old)
+        yield Lab(service, internet, old if with_key else "")
     finally:
         stop_with_internet(service, internet)
+
+
+@pytest.fixture
+def settings_lab(
+    canary_environment: dict[str, str],
+    btrfs_volume: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Lab]:
+    yield from start_settings_lab(btrfs_volume, tmp_path_factory)
+
+
+@pytest.fixture
+def keyless_lab(
+    canary_environment: dict[str, str],
+    btrfs_volume: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Lab]:
+    """The same service, started without any key for ``anthropic``."""
+    yield from start_settings_lab(btrfs_volume, tmp_path_factory, with_key=False)
 
 
 # -- the key the person sets, and the pieces of it that must never show --------------------------
@@ -520,4 +545,107 @@ def test_the_agent_cannot_reach_the_settings(
         secret_set is not None and secret_set.risk == 1,
         f"el cambio de clave lleva riesgo {secret_set.risk if secret_set else '-'}: algo que "
         "conviene ver, no un peligro",
+    )
+
+
+# -- modelo-sin-clave -----------------------------------------------------------------------------
+
+NO_KEY_TEXT = "no key set yet for anthropic"
+
+
+def insist(attack: Attack, lab: Lab, key: str, calls: int) -> list[dict]:
+    """The agent's loop of model calls (tope_de_gasto's script) with ``key``."""
+    return attack.run_script(
+        lab.service.jail, "tope_de_gasto", ANTHROPIC_HOST, key, ANTHROPIC_MODEL, str(calls)
+    )["calls"]
+
+
+def provider_calls(lab: Lab) -> list[dict]:
+    return lab.internet.requests(ANTHROPIC_HOST, "/v1/messages")
+
+
+def refused_for_want_of_a_key(calls: list[dict]) -> bool:
+    return bool(calls) and all(
+        c["status"] == 400 and c.get("type") == "invalid_request_error"
+        and NO_KEY_TEXT in str(c.get("message"))
+        for c in calls
+    )  # fmt: skip
+
+
+@scenario("modelo-sin-clave")
+def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: Lab) -> None:
+    lab = keyless_lab
+    service = lab.service
+    socket_path = service.config.control_socket
+    pid = service.require_process().pid
+    waiting = lab.since(0, "provider_waiting", "system")
+    assert [e.details for e in waiting] == [{"provider": PROVIDER, "problem": "missing"}], waiting
+
+    # 1. The agent insists with its fake key, and with a key of its own.
+    mark = lab.head()
+    with_fake = insist(attack, lab, lab.fake, 6)
+    own_key = "sk-ant-api03-" + "EVILAGENT" * 6
+    with_own = insist(attack, lab, own_key, 2)
+    reached_without = len(provider_calls(lab))
+    blocked = [e for e in lab.since(mark, "blocked", "llm") if e.details.get("reason") == "no_key"]
+    foreign = [
+        e
+        for e in lab.since(mark, "blocked", "net")
+        if e.details.get("reason") == "foreign_credential"
+    ]
+
+    # 2. The person sets a key (what the web's Settings page asks), then removes it.
+    new_key = new_test_key()
+    saved = ask_set_secret(socket_path, PROVIDER, new_key, via="web")
+    with_key = insist(attack, lab, lab.fake, 1)
+    seen = [c["headers"].get("x-api-key") for c in provider_calls(lab)]
+    cleared = ask_clear_secret(socket_path, PROVIDER, via="web")
+    after_clear = insist(attack, lab, lab.fake, 2)
+    reached_after = len(provider_calls(lab))
+    alive = service.require_process().poll() is None and service.process.pid == pid
+
+    attack.check(
+        "stopped",
+        refused_for_want_of_a_key(with_fake)
+        and [c["status"] for c in with_own] == [403, 403]
+        and reached_without == 0
+        and saved["ok"]
+        and saved["applied"] == "now"
+        and [c["status"] for c in with_key] == [200]
+        and seen == [new_key]
+        and cleared["ok"]
+        and cleared["applied"] == "now"
+        and refused_for_want_of_a_key(after_clear)
+        and reached_after == 1
+        and alive,
+        f"sin clave, con su clave falsa: {[c['status'] for c in with_fake]} "
+        f"({with_fake[0].get('type')}: {with_fake[0].get('message')}); con una clave suya: "
+        f"{[c['status'] for c in with_own]}; al proveedor no llegó nada ({reached_without}). "
+        f"La persona pone una clave: {saved.get('applied')}, la siguiente llamada da "
+        f"{[c['status'] for c in with_key]} y llega con la clave nueva ({seen == [new_key]}). "
+        f"La quita: {cleared.get('applied')}, y otra vez {[c['status'] for c in after_clear]}; "
+        f"al proveedor llegó solo la de en medio ({reached_after}). El servicio sigue (pid {pid}): "
+        f"{alive}",
+    )
+    counted = sum(int(e.details.get("count", 0)) for e in blocked)
+    ready = lab.since(mark, "provider_ready", "system")
+    waiting_again = lab.since(mark, "provider_waiting", "system")
+    attack.check(
+        "recorded",
+        bool(blocked)
+        and len(blocked) < len(with_fake)
+        and len(foreign) == 2
+        and bool(ready)
+        and [e.details for e in waiting_again] == [{"provider": PROVIDER, "problem": "missing"}],
+        f"{len(blocked)} llm/blocked no_key (que cuentan {counted} de las {len(with_fake)} "
+        f"primeras llamadas; el resto, en el siguiente), {len(foreign)} net/blocked "
+        "foreign_credential, "
+        f"system/provider_ready {len(ready)} y system/provider_waiting otra vez "
+        f"{[e.details for e in waiting_again]}",
+    )
+    attack.check(
+        "risk",
+        bool(blocked) and {e.risk for e in blocked} == {1},
+        f"llm/blocked no_key con riesgo {sorted({e.risk for e in blocked})}: el dueño aún no ha "
+        "puesto la clave, no es un ataque",
     )

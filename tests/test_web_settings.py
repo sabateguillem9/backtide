@@ -123,6 +123,21 @@ def post(web: TestClient, fields: dict[str, str], **headers: str) -> Any:
 # -- the page -------------------------------------------------------------------------------------
 
 
+def test_a_provider_without_its_key_says_the_agent_cannot_use_it(
+    tmp_path: Path, fake: FakeSettings
+) -> None:
+    fake.shown["openai"] = {"set": False, "tail": None, "changed": None, "in_use": True,
+                            "problem": None, "waiting": True}  # fmt: skip
+    fake.shown["anthropic"] = {"set": True, "tail": None, "changed": None, "in_use": True,
+                               "problem": "unreadable", "waiting": True}  # fmt: skip
+    said = text_of(new_client(tmp_path, settings=fake, clock=lambda: NOW).get("/ajustes").text)
+    assert (
+        "Clave de OpenAI sin configurar — el agente no puede usar el modelo hasta que la pongas"
+        in said
+    )
+    assert "no se puede usar (mira el registro del servicio) — el agente no puede usar" in said
+
+
 def test_the_page_says_what_is_set_and_never_more(web: TestClient) -> None:
     page = web.get("/ajustes")
     assert page.status_code == 200
@@ -230,7 +245,7 @@ def test_telegram_sends_the_token_and_the_chat(web: TestClient, fake: FakeSettin
 
 def test_a_key_is_removed_with_its_own_confirmation(web: TestClient, fake: FakeSettings) -> None:
     page = text_of(web.get("/ajustes/quitar?tipo=anthropic").text)
-    assert "no arranca con un proveedor de [proxy] sin clave" in page
+    assert "el agente no puede usar ese modelo hasta que pongas otra" in page
     refused = web.get("/ajustes/quitar?tipo=openai")
     assert "<form" not in refused.text and "No hay nada que quitar" in text_of(refused.text)
     fields = confirm(web, "clear", "anthropic")

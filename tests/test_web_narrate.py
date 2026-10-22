@@ -290,3 +290,27 @@ def test_the_summary_grows_the_burst_in_place_for_the_stream() -> None:
     (first,) = narrator.feed([ev(1, "file", "delete", "a"), ev(2, "file", "delete", "b")])
     (again,) = narrator.feed([ev(3, "file", "summary", ".", details={"counts": {"delete": 8}})])
     assert again.id == first.id == 1 and again.count == 10
+
+
+# -- a provider waiting for its key (docs/21, section 6) ----------------------------------------
+
+
+def test_a_provider_without_its_key_is_told_plainly() -> None:
+    no_key = ev(1, "llm", "blocked", "anthropic", details={"reason": "no_key", "count": 3})
+    assert plain(say(no_key)) == (
+        "No ha podido usar el modelo anthropic: falta su clave (ponla en Ajustes)"
+    )
+    capped = ev(2, "llm", "blocked", "", details={"reason": "spend_cap"})
+    assert plain(say(capped)) == "Una llamada al modelo se ha rechazado antes de salir"
+    waiting = ev(3, "system", "provider_waiting", details={"provider": "anthropic",
+                                                          "problem": "missing"})  # fmt: skip
+    assert plain(say(waiting)) == (
+        "anthropic no tiene clave: el agente no puede usar el modelo hasta que la pongas en Ajustes"
+    )
+    broken = ev(4, "system", "provider_waiting", details={"provider": "<b>x</b>",
+                                                         "problem": "unusable"})  # fmt: skip
+    html = say(broken)
+    assert "&lt;b&gt;" in html and "<b>x" not in html and "no se puede usar" in html
+    assert plain(say(ev(5, "system", "provider_ready", details={"provider": "openai"}), EN)) == (
+        "openai has its key now"
+    )

@@ -20,7 +20,7 @@ socket. Built in ``runner.serve`` when ``<state_dir>/telegram.toml`` exists.
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
@@ -119,13 +119,22 @@ class GuardianActions:
         self._box: BlackBox | None = None
         self._store: _Snapshots | None = None
         self._budget: Any = None
+        self._waiting: Callable[[], Mapping[str, str]] | None = None
 
     def bind(
-        self, guardian: _Guardian, box: BlackBox, store: _Snapshots, *, budget: Any = None
+        self,
+        guardian: _Guardian,
+        box: BlackBox,
+        store: _Snapshots,
+        *,
+        budget: Any = None,
+        waiting: Callable[[], Mapping[str, str]] | None = None,
     ) -> None:
-        """``budget``: the spending cap (T11, ``spend.Budget``), for ``/estado``."""
+        """``budget``: the spending cap (T11, ``spend.Budget``), for ``/estado``; ``waiting``: the
+        providers that wait for their key (``Egress.waiting``)."""
         self._guardian, self._box, self._store = guardian, box, store
         self._budget = budget
+        self._waiting = waiting
 
     # BotActions
 
@@ -171,6 +180,17 @@ class GuardianActions:
             except Exception:
                 logger.exception("the spending could not be read for /estado")
                 lines.append("Gasto: no se ha podido leer.")
+        if self._waiting is not None:
+            try:
+                waiting = sorted(self._waiting())
+            except Exception:
+                logger.exception("the providers waiting for their key could not be read")
+                waiting = []
+            if waiting:
+                lines.append(
+                    f"Sin clave: {', '.join(waiting)}. El agente no puede usar el modelo hasta "
+                    "que la pongas en Ajustes."
+                )
         return "\n".join(lines)
 
     def rewind(self, snapshot_id: str) -> str:

@@ -10,6 +10,8 @@
      POST and no route behind them. Deciding is T10's, with its own reviewed path. #}
   {# The spending of the model calls (T11), read from the service when the page loads. #}
   {% if spend %}<p class="note panel-spend" data-blocked="{{ spend.blocked or '' }}"><span class="muted">{{ t('panel.spend') }}:</span> {% if spend.available %}{{ t('settings.cap.day', spent=spend.day_spent, cap=spend.day_cap) }} · {{ t('settings.cap.month', spent=spend.month_spent, cap=spend.month_cap) }}{% if spend.blocked %}. {{ t('settings.cap.blocked.' ~ spend.blocked) }}{% endif %}{% else %}{{ t('settings.cap.unavailable') }}{% endif %}</p>{% endif %}
+  {# The providers that wait for their key (the owner has not set it): the agent cannot use them. #}
+  {% if spend and spend.waiting %}<p class="note panel-waiting"><span class="dot dot-2" aria-hidden="true"></span> {{ t('panel.waiting', names=spend.waiting | join(', ')) }}</p>{% endif %}
   <section class="waiting" id="waiting" aria-labelledby="waiting-title">
     <div class="waiting-in" sse-swap="requests">{% include "requests.html" %}</div>
   </section>

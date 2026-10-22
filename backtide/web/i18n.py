@@ -488,6 +488,13 @@ ES: dict[str, str] = {
     "exec.run": "Ha ejecutado {target}",
     "net.connect": "Ha conectado con {target}",
     "llm.call": "Ha hablado con un modelo ({target})",
+    "llm.blocked": "Una llamada al modelo se ha rechazado antes de salir",
+    "llm.blocked.no_key": "No ha podido usar el modelo {target}: falta su clave (ponla en Ajustes)",
+    "system.provider_waiting.missing": "{target} no tiene clave: el agente no puede usar el modelo "
+    "hasta que la pongas en Ajustes",
+    "system.provider_waiting.unusable": "La clave de {target} no se puede usar: el agente no puede "
+    "usar el modelo hasta que la pongas otra vez",
+    "system.provider_ready": "{target} ya tiene su clave",
     "gate.hold": "La puerta ha retenido {action} hacia {target}",
     "generic": "{source} · {action} · {target}",
     "generic.notarget": "{source} · {action}",
@@ -512,10 +519,14 @@ ES: dict[str, str] = {
     "settings.kind.telegram": "Bot de Telegram",
     "settings.unknown": "no se sabe",
     "settings.problem": "hay un archivo, pero no se puede usar (mira el registro del servicio)",
+    "settings.problem.waiting": "hay un archivo, pero no se puede usar (mira el registro del "
+    "servicio) — el agente no puede usar el modelo hasta que la pongas otra vez",
     "settings.set": "configurada",
     "settings.tail": "termina en …{tail}",
     "settings.changed": "cambiada el {when}",
     "settings.unset": "sin configurar",
+    "settings.unset.waiting": "sin configurar — el agente no puede usar el modelo hasta que la "
+    "pongas",
     "settings.chat_tail": "Tu chat termina en …{tail}.",
     "settings.not_in_proxy": "Ningún proveedor de `[proxy]` se llama así: nadie la usa.",
     "settings.restart": "Un cambio aquí se aplica al reiniciar el servicio.",
@@ -563,6 +574,8 @@ ES: dict[str, str] = {
     "settings.out.saved.precios": "Aceptados",
     "settings.err.no_prices": "No hay precios nuevos por aceptar.",
     "panel.spend": "Gasto de los modelos",
+    "panel.waiting": "Sin clave: {names}. El agente no puede usar ese modelo hasta que la pongas "
+    "en Ajustes.",
     "settings.agent": "El agente nunca ve esta página ni las claves de verdad: sigue con su clave "
     "falsa, y el proxy pone la real al salir.",
     "settings.confirm.set.new": "Poner {what}",
@@ -581,9 +594,8 @@ ES: dict[str, str] = {
     "settings.confirm.save": "Guardar",
     "settings.confirm.no": "Cancelar",
     "settings.confirm.clear": "Quitar {what}",
-    "settings.confirm.clear.in_use": "El proxy deja de usarla al momento y el agente se queda sin "
-    "ese modelo. backtide no arranca con un proveedor de `[proxy]` sin clave: pon otra o quítalo "
-    "de `backtide.toml` antes de reiniciar.",
+    "settings.confirm.clear.in_use": "El proxy deja de usarla al momento: el agente no puede usar "
+    "ese modelo hasta que pongas otra. backtide sigue en marcha.",
     "settings.confirm.clear.unused": "Ningún proveedor la usa ahora mismo.",
     "settings.confirm.clear.telegram": "Sin el archivo no hay bot: los avisos van solo al "
     "registro. Se aplica al reiniciar el servicio.",
@@ -1111,6 +1123,14 @@ EN: dict[str, str] = {
     "exec.run": "Ran {target}",
     "net.connect": "Connected to {target}",
     "llm.call": "Talked to a model ({target})",
+    "llm.blocked": "A model call was refused before it went out",
+    "llm.blocked.no_key": "Could not use the model {target}: its key is missing (set it in "
+    "Settings)",
+    "system.provider_waiting.missing": "{target} has no key: the agent cannot use the model until "
+    "you set it in Settings",
+    "system.provider_waiting.unusable": "The key of {target} cannot be used: the agent cannot use "
+    "the model until you set it again",
+    "system.provider_ready": "{target} has its key now",
     "gate.hold": "The gate held {action} to {target}",
     "generic": "{source} · {action} · {target}",
     "generic.notarget": "{source} · {action}",
@@ -1135,10 +1155,13 @@ EN: dict[str, str] = {
     "settings.kind.telegram": "Telegram bot",
     "settings.unknown": "unknown",
     "settings.problem": "there is a file, but it cannot be used (see the service's log)",
+    "settings.problem.waiting": "there is a file, but it cannot be used (see the service's log) "
+    "— the agent cannot use the model until you set it again",
     "settings.set": "set",
     "settings.tail": "ends in …{tail}",
     "settings.changed": "changed on {when}",
     "settings.unset": "not set",
+    "settings.unset.waiting": "not set — the agent cannot use the model until you set it",
     "settings.chat_tail": "Your chat ends in …{tail}.",
     "settings.not_in_proxy": "No `[proxy]` provider has this name: nobody uses it.",
     "settings.restart": "A change here applies when the service restarts.",
@@ -1184,6 +1207,8 @@ EN: dict[str, str] = {
     "settings.out.saved.precios": "Accepted",
     "settings.err.no_prices": "There are no new prices to accept.",
     "panel.spend": "Model spending",
+    "panel.waiting": "No key: {names}. The agent cannot use that model until you set it in "
+    "Settings.",
     "settings.agent": "The agent never sees this page nor the real keys: it keeps its fake key, "
     "and the proxy puts the real one in on the way out.",
     "settings.confirm.set.new": "Set {what}",
@@ -1202,9 +1227,8 @@ EN: dict[str, str] = {
     "settings.confirm.save": "Save",
     "settings.confirm.no": "Cancel",
     "settings.confirm.clear": "Remove {what}",
-    "settings.confirm.clear.in_use": "The proxy stops using it at once and the agent is left "
-    "without that model. backtide does not start with a `[proxy]` provider that has no key: set "
-    "another one or remove it from `backtide.toml` before restarting.",
+    "settings.confirm.clear.in_use": "The proxy stops using it at once: the agent cannot use that "
+    "model until you set another one. backtide keeps running.",
     "settings.confirm.clear.unused": "No provider uses it right now.",
     "settings.confirm.clear.telegram": "Without the file there is no bot: alerts only go to the "
     "log. It applies when the service restarts.",

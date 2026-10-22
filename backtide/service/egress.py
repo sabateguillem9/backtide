@@ -28,6 +28,11 @@ a few points of its life; the watch runs on this module's own thread.
   that died left open in the black box (``gate/held`` of the last 15 min with no end) are
   closed with ``gate/expired {why: restart}``: the proxy that held them refused them when it
   lost its channel.
+- **Providers waiting for their key** (docs/21, section 6): at the start, and each time the
+  Settings page hands new keys (``reload``), a provider that waits is recorded once as
+  ``system/provider_waiting {provider, problem}`` (``missing``, risk 1; ``unusable``, risk 2,
+  with a warning in the log and an alert), and one that gets its key back as
+  ``system/provider_ready``. ``waiting()`` says which wait now (Settings, /estado, the panel).
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
 """
 
@@ -165,6 +170,11 @@ class Egress:
         # One for the service, not one per connection: a proxy restart never refills what the
         # reads to unknown hosts may still carry out this hour (review of T10-3, M5).
         self._read_budget = ReadBudget(policy.read_budget_host, policy.read_budget_total)
+        self._key_states: dict[str, str] = {}  # the providers that wait, as last recorded
+
+    def waiting(self) -> dict[str, str]:
+        """The providers that wait for their key now, and why ("missing" or "unusable")."""
+        return self._policy.waiting()
 
     # The Guardian's calls
 
@@ -181,6 +191,7 @@ class Egress:
         with self._lock:
             self._hooks = hooks
             self._close_stale_holds()
+            self._note_keys()
             if self.budget is not None and not self._budget_opened:
                 self._budget_opened = True
                 self.budget.open()  # never raises: without a count, model calls are refused
@@ -363,6 +374,7 @@ class Egress:
             self._policy = policy
             self._read_budget.host_bytes = policy.read_budget_host
             self._read_budget.total_bytes = policy.read_budget_total
+            self._note_keys()
             names = [p.name for p in policy.providers.items]
             if not self._up or self._channel is None or self._channel.closed:
                 self._record("proxy_reconfigured", {"providers": names, "now": False}, risk=1)
@@ -376,6 +388,47 @@ class Egress:
                 return False
             self._record("proxy_reconfigured", {"providers": names, "now": ok}, risk=0 if ok else 2)
             return ok
+
+    def _note_keys(self) -> None:
+        """Record (and log once) each provider that starts waiting for its key, and each that
+        gets it back. Never raises. Before ``start`` (no hooks yet) it waits for ``start``."""
+        if self._hooks is None:
+            return
+        try:
+            now = self._policy.waiting()
+            for name, problem in sorted(now.items()):
+                if self._key_states.get(name) == problem:
+                    continue
+                note = self._policy.key_note(name)
+                if problem == "unusable":
+                    logger.warning(
+                        "the key of provider %s cannot be used, so its model calls are refused "
+                        "until it is set again: %s", name, note,
+                    )  # fmt: skip
+                else:
+                    logger.warning(
+                        "provider %s has no key yet: its model calls are refused until the "
+                        "owner sets it in the Settings page", name,
+                    )  # fmt: skip
+                details = {"provider": name, "problem": problem}
+                event = self._record(
+                    "provider_waiting", details, risk=2 if problem == "unusable" else 1
+                )
+                if problem == "unusable":
+                    self._alert(
+                        AlertLevel.WARNING,
+                        f"La clave de {name} no se puede usar",
+                        "Hay un archivo de clave, pero no se puede usar (mira el registro del "
+                        "servicio). El agente no puede usar ese modelo hasta que la pongas otra "
+                        "vez en Ajustes.",
+                        event,
+                    )
+            for name in sorted(set(self._key_states) - set(now)):
+                if self._policy.providers.by_name(name) is not None:
+                    self._record("provider_ready", {"provider": name}, risk=0)
+            self._key_states = dict(now)
+        except Exception:
+            logger.exception("recording which providers wait for their key failed")
 
     def _close_stale_holds(self) -> None:
         """Once per service: the holds a dead backtide left open in the black box are ended

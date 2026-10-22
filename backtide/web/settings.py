@@ -61,6 +61,7 @@ _CHAT_TAIL_RE = re.compile(r"[0-9]{4}", re.ASCII)
 _DAY_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 BUDGET = "tope"  # the Settings page's "kind" for the spending caps (T11)
 PRICES = "precios"  # ... and for accepting the new prices that wait for the owner (T11, B3)
+_PROVIDER_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", re.ASCII)
 _MODEL_RE = re.compile(r"claude-[a-z]+-[0-9]{1,2}(?:-[0-9]{1,2})?", re.ASCII)
 _PRICE_RE = re.compile(r"[0-9]{1,5}(?:\.[0-9]{1,8})?", re.ASCII)
 _DIGEST_RE = re.compile(r"[0-9a-f]{16}", re.ASCII)
@@ -203,14 +204,17 @@ class SpendView:
     defaults_on: str | None = None
     pending: tuple[PendingPrice, ...] = ()  # B3: what waits for "Aceptar los precios nuevos"
     pending_digest: str | None = None
+    # The providers of [proxy] that wait for their key: the agent cannot use them yet.
+    waiting: tuple[str, ...] = ()
 
 
 def spend_view(raw: object) -> SpendView | None:
     """``SpendClient.spend``'s reply, checked; None if it makes no sense."""
     if not isinstance(raw, dict):
         return None
+    waiting = _waiting(raw.get("models_waiting"))
     if raw.get("available") is not True:
-        return SpendView(False)
+        return SpendView(False, waiting=waiting)
     try:
         day, month = raw["day"], raw["month"]
         amounts = [day["spent_micro"], day["cap_micro"], month["spent_micro"], month["cap_micro"]]
@@ -231,8 +235,18 @@ def spend_view(raw: object) -> SpendView | None:
         blocked=blocked if blocked in ("day", "month") else None,
         prices_on=_day(prices.get("updated_on")),
         defaults_on=_day(prices.get("defaults_on")),
+        waiting=waiting,
         **_pending(prices),
     )
+
+
+def _waiting(raw: object) -> tuple[str, ...]:
+    """The names of the providers that wait for their key, or none when any makes no sense."""
+    if not isinstance(raw, list) or len(raw) > 32:
+        return ()
+    if not all(isinstance(name, str) and _PROVIDER_RE.fullmatch(name) for name in raw):
+        return ()
+    return tuple(dict.fromkeys(raw))
 
 
 def _pending(prices: dict[str, Any]) -> dict[str, Any]:
@@ -288,6 +302,8 @@ class SecretView:
     changed: datetime | None = None
     in_use: bool = False
     problem: bool = False
+    # A provider of [proxy] the agent cannot use until its key is set (none, or unusable).
+    waiting: bool = False
 
     @property
     def provider(self) -> bool:
@@ -314,6 +330,7 @@ def views(raw: dict[str, Any] | None) -> list[SecretView]:
                 changed=_moment(entry.get("changed")),
                 in_use=entry.get("in_use") is True,
                 problem=entry.get("problem") is not None,
+                waiting=entry.get("waiting") is True,
             )
         )
     return rows

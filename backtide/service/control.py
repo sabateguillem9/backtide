@@ -62,7 +62,7 @@ import stat
 import struct
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -249,10 +249,14 @@ class ControlServer:
         max_connections: int = MAX_CONNECTIONS,
         settings: SettingsService | None = None,
         budget: BudgetService | None = None,
+        waiting: Callable[[], Mapping[str, str]] | None = None,
     ) -> None:
         self._guardian = guardian
         self._settings = settings
         self._budget = budget
+        # The providers that wait for their key (``Egress.waiting``): the panel says so, next
+        # to the spending. Only names of [proxy], never a key.
+        self._waiting = waiting
         self._path = Path(path)
         self._allowed_uid = allowed_uid if allowed_uid is not None else os.geteuid()
         self._peer = peer
@@ -416,7 +420,9 @@ class ControlServer:
             if set(request) != {"cmd"}:
                 raise _BadRequest("Una petición de gasto lleva `cmd` y nada más.")
             try:
-                status = self._budget.status()
+                status = dict(self._budget.status())
+                if self._waiting is not None:
+                    status["models_waiting"] = sorted(self._waiting())
             except Exception as error:
                 logger.error("reading the spending raised: %s", type(error).__name__)
                 return {"ok": False, "outcome": "failed", "message": "No se ha podido leer."}

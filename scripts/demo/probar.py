@@ -15,18 +15,16 @@ Concessions (all in scripts/, none in backtide/), besides the demo's own:
 
 - The proxy runs with the VM tests' concessions (``demo.dev_proxy``) and the process sensor is
   left out (Tetragon is a privileged container of its own; `make it` tests it).
-- **Starting without a key.** backtide refuses a provider of ``[proxy]`` whose
-  ``keys/<name>.key`` is missing, but the Settings page that writes that file needs a running
-  service. So, while the file is missing, this process (and only it) reads the provider with a
-  placeholder real key, ``sk-ant-backtide-probar-sin-clave-…``: OpenClaw gets its fake key as
-  always, and a model call before the real key is set reaches Anthropic with the placeholder and
-  gets "invalid x-api-key" back (no cost). Saving the key in Settings hands the proxy the real
-  one at once (``Egress.reload`` reads ``keys/`` again), and the placeholder is never written
-  anywhere.
 - ``--internet-falso`` (the verification, never the founder's run): before the service starts,
   T06's fake internet (tests/integration/internet_kit.py) goes on the proxy's egress network,
   which is made ``--internal``, with ``api.anthropic.com`` among its names, and the proxy gets
-  the tests' grants. Nothing reaches Anthropic or Telegram (invariant 8).
+  the tests' grants; the config says ``[budget] auto_prices = false``, so the service does not
+  fetch Anthropic's pricing page either. Nothing reaches Anthropic or Telegram (invariant 8).
+
+It starts without the Anthropic key, as backtide itself does (docs/21, section 6): until the
+key is saved in the Settings page, the provider waits for it and the proxy answers every model
+call with backtide's "no key set yet" (a 400 in Anthropic's own shape) without contacting
+Anthropic. Saving the key makes it usable at once (``Egress.reload`` reads ``keys/`` again).
 """
 
 import argparse
@@ -34,12 +32,10 @@ import base64
 import binascii
 import json
 import os
-import secrets
 import sys
 import threading
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import backtide.service.config as service_config
@@ -47,7 +43,7 @@ from backtide.blackbox import Event
 from backtide.jail import AgentJail
 from backtide.jail import docker as jail_docker
 from backtide.jail.openclaw import MODEL_ID
-from backtide.service.config import ConfigError, ProviderKey, Secret, ServiceConfig
+from backtide.service.config import ConfigError, ServiceConfig
 from scripts.demo import demo
 from scripts.demo.demo import NETWORK, Paths
 
@@ -73,15 +69,24 @@ IMAGE_SIZE = 8 * demo.GIB
 CYCLE_INTERVAL = 10  # seconds between "did anything change?" checks (the demo's is 5)
 TURN_TIMEOUT = 660.0  # OpenClaw's own turn timeout is 600 s; a held write can wait 90 s in it
 MAX_MESSAGE_BYTES = 16 * 1024
-PLACEHOLDER_PREFIX = "sk-ant-backtide-probar-sin-clave-"
 
 
 # -- The config ----------------------------------------------------------------------------------
 
 
-def render_config(paths: Paths, uid: int, gid: int, *, model: str = DEFAULT_MODEL) -> str:
+def render_config(
+    paths: Paths, uid: int, gid: int, *, model: str = DEFAULT_MODEL, offline: bool = False
+) -> str:
+    """The test's backtide.toml. ``offline`` (``--internet-falso``): the service does not fetch
+    Anthropic's pricing page (it would go out of the VM, outside the proxy)."""
     if not MODEL_ID.fullmatch(model):
         raise demo.DemoError(f"el modelo {model!r} no tiene forma de id de modelo")
+    budget = (
+        "\n# The fake internet: nothing leaves the VM, Anthropic's pricing page neither.\n"
+        "[budget]\nauto_prices = false\n"
+        if offline
+        else ""
+    )
     return (
         f'state_dir = "{paths.state}"\n'
         f'volume = "{paths.volume}"\n'
@@ -117,6 +122,7 @@ def render_config(paths: Paths, uid: int, gid: int, *, model: str = DEFAULT_MODE
         "[gate]\n"
         'unknown_hosts = "hold"\n'
         "trust_owner_chat = true\n"
+        f"{budget}"
     )
 
 
@@ -130,29 +136,6 @@ def model_of(paths: Paths) -> str | None:
         if line.startswith("models = ["):
             return line.split('"')[1]  # the first is the agent's
     return None
-
-
-# -- Starting without a key ----------------------------------------------------------------------
-
-_strict_keys = service_config.read_provider_keys
-
-
-def keys_or_placeholder(folder: Path, names: list[str]) -> dict[str, ProviderKey]:
-    """``read_provider_keys`` (every check of it, the fake key made as always), but a provider
-    whose ``<name>.key`` does not exist yet gets a placeholder as its real key (see the module's
-    docstring). The placeholder lives in this process only."""
-    try:
-        os.mkdir(folder, 0o700)  # what the Settings page would make; checked by the reader
-    except FileExistsError:
-        pass
-    present = [name for name in names if os.path.lexists(folder / f"{name}.key")]
-    keys = _strict_keys(folder, present) if present else {}
-    for name in names:
-        if name not in keys:
-            fake = service_config._fake_key(folder / f"{name}.fake", name)
-            placeholder = PLACEHOLDER_PREFIX + secrets.token_hex(16)
-            keys[name] = ProviderKey(real=Secret(placeholder), fake=fake)
-    return {name: keys[name] for name in names}
 
 
 def has_real_key(paths: Paths) -> bool:
@@ -233,14 +216,14 @@ def command_up(paths: Paths, *, model: str, fake_internet: bool) -> int:
     demo.require_dev_vm_user_with_sudo()
     if demo.service_pid(paths) is not None:
         raise demo.DemoError("ya hay una prueba o una demo en marcha; `make probar-parar` la quita")
-    render_config(paths, 0, 0, model=model)  # refuses an odd model before anything changes
+    render_config(paths, 0, 0, model=model, offline=fake_internet)  # refuses an odd model
     demo.require_agent_image()
     if paths.base.exists() or demo.mount_at(paths.mnt) is not None:
         print("Quedaba una prueba o una demo anterior: la quito para empezar de cero.", flush=True)
     demo.teardown(paths)
     demo.create_volume(
         paths,
-        lambda p, uid, gid: render_config(p, uid, gid, model=model),
+        lambda p, uid, gid: render_config(p, uid, gid, model=model, offline=fake_internet),
         telegram=not fake_internet,  # the fake internet's run never reaches the real Telegram
         image_size=IMAGE_SIZE,
     )
@@ -262,8 +245,8 @@ def command_up(paths: Paths, *, model: str, fake_internet: bool) -> int:
     print(
         "FALTA LA CLAVE DE ANTHROPIC. No la pegues aquí ni en ningún archivo: en otra "
         "terminal,\n  make probar-web\nabre el enlace en el navegador del Mac, ve a «Ajustes» y "
-        "pégala en «Anthropic».\nHasta entonces, si le hablas al agente, Anthropic contestará "
-        "que la clave no vale (sin coste).\n",
+        "pégala en «Anthropic».\nHasta entonces, si le hablas al agente, backtide le contesta "
+        "que aún no hay clave, sin llamar a Anthropic (sin coste).\n",
         flush=True,
     )
     if telegram:
@@ -372,15 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     paths = demo.PATHS
-    # Every command of this process reads the keys this module's way (see the docstring).
-    service_config.read_provider_keys = keys_or_placeholder  # type: ignore[assignment]
     try:
         if args.command == "up":
             return command_up(paths, model=args.modelo, fake_internet=args.internet_falso)
         if args.command == "pedir":
             return command_pedir(paths, args.mensaje)
-        # The demo's own commands, with this module's reading of the keys (a test without its
-        # key yet can still list and rewind).
+        # The demo's own commands (a test without its key yet can list and rewind too).
         demo.require_demo_mount(paths)
         if args.command == "instantaneas":
             return demo.command_instantaneas(paths)

@@ -94,6 +94,28 @@ def test_a_reached_cap_is_said(tmp_path: Path) -> None:
     assert "Tope de hoy alcanzado" in text_of(web.get("/panel").text)
 
 
+def test_the_panel_says_which_models_wait_for_their_key(tmp_path: Path) -> None:
+    web = new_client(
+        tmp_path, settings=BudgetFake(), spend=FakeSpend(dict(STATUS, models_waiting=["anthropic"]))
+    )
+    panel = text_of(web.get("/panel").text)
+    assert (
+        "Sin clave: anthropic. El agente no puede usar ese modelo hasta que la pongas en "
+        "Ajustes." in panel
+    )
+    off = dict(available=False, models_waiting=["openai"])
+    unavailable = new_client(tmp_path, settings=BudgetFake(), spend=FakeSpend(off))
+    assert "Sin clave: openai." in text_of(unavailable.get("/panel").text)
+    # Nothing waits: no line.
+    assert "Sin clave" not in text_of(new_client(tmp_path, spend=FakeSpend()).get("/panel").text)
+
+
+@pytest.mark.parametrize("odd", [["<b>x</b>"], "anthropic", [1], ["a"] * 40])
+def test_odd_waiting_names_are_not_shown(odd: object) -> None:
+    view = spend_view(dict(STATUS, models_waiting=odd))
+    assert view is not None and view.waiting == ()
+
+
 def test_nonsense_from_the_service_is_not_shown() -> None:
     assert spend_view({"available": True, "day": {"spent_micro": -1}}) is None
     assert spend_view([]) is None

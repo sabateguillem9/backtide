@@ -27,8 +27,11 @@ The rules:
 - **Recorded first**: the event goes to the black box before the file changes, and if it cannot be
   recorded nothing changes. If the write then fails, ``settings/secret_failed`` says so.
 - **Applied**: a provider's key is handed to the egress proxy at once (``reload_keys``: a new
-  connection to the proxy with the new config, no restart). The Telegram bot reads its file when the
-  service starts, so a change there applies at the next start, and the reply says so.
+  connection to the proxy with the new config, no restart). A provider of ``[proxy]`` without a
+  usable key waits for it (``waiting``): the service runs, the proxy refuses its model calls,
+  and ``status`` says so (``waiting``) until the key is set; removing it makes it wait again.
+  The Telegram bot reads its file when the service starts, so a change there applies at the
+  next start, and the reply says so.
 - One change at a time (a lock), and the value is dropped as soon as it is written. Python cannot
   wipe an immutable string, so "dropped" means no reference is kept.
 """
@@ -40,7 +43,7 @@ import re
 import secrets
 import stat
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -110,6 +113,7 @@ class SettingsOutcome:
 
 Record = Callable[..., object]  # BlackBox.append (or the rated one)
 Reload = Callable[[], Applied]  # hand the keys of keys/ to the proxy again
+Waiting = Callable[[], Mapping[str, str]]  # the providers that wait for their key, and why
 
 
 class SettingsError(Exception):
@@ -146,7 +150,9 @@ def tail_of(value: str) -> str | None:
 class Settings:
     """The keys of ``state_dir``. ``record`` appends to the black box; ``reload_keys`` hands the
     providers' keys to the proxy again (None: nothing to tell, which only tests do); ``in_use``
-    names the providers of ``[proxy]`` (a key for another name is saved and used by nobody)."""
+    names the providers of ``[proxy]`` (a key for another name is saved and used by nobody);
+    ``waiting`` says which of them the proxy holds without a usable key now (``Egress.waiting``;
+    None: it is read from the files)."""
 
     def __init__(
         self,
@@ -155,11 +161,13 @@ class Settings:
         record: Record,
         reload_keys: Reload | None = None,
         in_use: Iterable[str] = (),
+        waiting: Waiting | None = None,
     ) -> None:
         self._state_dir = Path(state_dir)
         self._record = record
         self._reload = reload_keys
         self._in_use = frozenset(in_use)
+        self._waiting = waiting
         self._lock = threading.Lock()
 
     @property
@@ -170,14 +178,37 @@ class Settings:
 
     def status(self) -> dict[str, dict[str, Any]]:
         """Per kind: ``set``, ``tail`` (last four or None), ``changed`` (ISO 8601 UTC or None),
-        ``in_use`` (a provider of [proxy] by that name) and ``problem`` (None, or "unreadable":
-        there is a file and it cannot be used). Telegram adds ``chat_tail``. Never raises for a
+        ``in_use`` (a provider of [proxy] by that name), ``problem`` (None, or "unreadable":
+        there is a file and it cannot be used) and ``waiting`` (a provider of [proxy] the agent
+        cannot use until its key is set). Telegram adds ``chat_tail``. Never raises for a
         broken file: it says so."""
+        waiting = self._waiting_now()
         shown: dict[str, dict[str, Any]] = {}
         for kind in PROVIDERS:
-            shown[kind] = self._provider_status(kind)
+            entry = self._provider_status(kind)
+            if entry["in_use"]:
+                # The proxy's own view first: a file that reads well but holds no key the gate
+                # can use (too short, two providers with one key) waits too.
+                problem = waiting.get(kind)
+                if problem == "unusable" and entry["set"]:
+                    entry["problem"] = "unreadable"
+                entry["waiting"] = (
+                    problem is not None or not entry["set"] or entry["problem"] is not None
+                )
+            else:
+                entry["waiting"] = False
+            shown[kind] = entry
         shown[TELEGRAM] = self._telegram_status()
         return shown
+
+    def _waiting_now(self) -> Mapping[str, str]:
+        if self._waiting is None:
+            return {}
+        try:
+            return dict(self._waiting())
+        except Exception as error:  # the files still say what they can
+            logger.error("settings: which providers wait cannot be read: %s", _what(error))
+            return {}
 
     def _provider_status(self, kind: str) -> dict[str, Any]:
         path = self.keys_dir / f"{kind}.key"
@@ -485,9 +516,8 @@ _SAVED = {
     Applied.NONE: "Guardada.",
 }
 _CLEARED = {
-    Applied.NOW: "Quitada. El proxy ya no la usa, así que el agente se queda sin ese modelo. "
-    "backtide no arranca con un proveedor de [proxy] sin clave: pon otra o quítalo de "
-    "backtide.toml antes de reiniciar.",
+    Applied.NOW: "Quitada. El proxy ya no la usa: el agente no puede usar ese modelo hasta que "
+    "pongas otra.",
     Applied.WHEN_UP: "Quitada. El proxy está caído ahora mismo y vuelve sin ella.",
     Applied.UNUSED: "Quitada.",
     Applied.RESTART: "Quitada. Se aplica al reiniciar el servicio.",

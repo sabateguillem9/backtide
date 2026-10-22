@@ -301,9 +301,10 @@ def test_the_status_says_set_its_tail_and_when_and_nothing_more(state: Path, box
     anthropic = shown["anthropic"]
     assert anthropic["set"] is True and anthropic["tail"] == key[-4:]
     assert anthropic["in_use"] is True and anthropic["problem"] is None
+    assert anthropic["waiting"] is False
     assert anthropic["changed"].endswith("Z")
     assert shown["openai"] == {"set": False, "tail": None, "changed": None, "in_use": False,
-                               "problem": None}  # fmt: skip
+                               "problem": None, "waiting": False}  # fmt: skip
     assert leaks(key, json.dumps(shown).replace(key[-4:], "")) == []
 
 
@@ -315,6 +316,39 @@ def test_a_broken_file_is_shown_as_a_problem_not_read(state: Path, box: BlackBox
     (folder / "anthropic.key").chmod(0o644)  # open to others: refused like the service does
     entry = make(state, box).status()["anthropic"]
     assert entry["set"] is True and entry["problem"] == "unreadable" and entry["tail"] is None
+    assert entry["waiting"] is True  # the agent cannot use it until it is set again
+
+
+def test_a_provider_in_use_without_its_key_is_shown_waiting(state: Path, box: BlackBox) -> None:
+    proxy_says = {"openai": "missing"}
+    settings = make(state, box, waiting=lambda: dict(proxy_says))
+    shown = settings.status()
+    assert shown["openai"]["set"] is False and shown["openai"]["waiting"] is True
+    assert shown["anthropic"]["waiting"] is True  # no file either
+    settings.set_secret("anthropic", anthropic_key(), requested_by="web")
+    assert settings.status()["anthropic"]["waiting"] is False
+    # Not used by [proxy]: nothing waits for it.
+    assert make(state, box, in_use=["anthropic"]).status()["openai"]["waiting"] is False
+
+
+def test_a_key_the_proxy_cannot_use_is_a_problem_though_its_file_reads(
+    state: Path, box: BlackBox
+) -> None:
+    """A file that reads well but holds no key the gate can use (two providers with one key, a
+    hand-written one too short): the proxy's view wins, and nothing of it is said."""
+    key = anthropic_key()
+    settings = make(state, box, waiting=lambda: {"anthropic": "unusable"})
+    settings.set_secret("anthropic", key, requested_by="web")
+    entry = settings.status()["anthropic"]
+    assert entry["set"] is True and entry["problem"] == "unreadable" and entry["waiting"] is True
+
+
+def test_a_broken_waiting_reader_never_breaks_the_page(state: Path, box: BlackBox) -> None:
+    def broken() -> dict[str, str]:
+        raise RuntimeError("boom")
+
+    shown = make(state, box, waiting=broken).status()
+    assert shown["anthropic"]["waiting"] is True  # still from the files: none set
 
 
 # -- Telegram -----------------------------------------------------------------------------------
@@ -394,8 +428,10 @@ def service_config(tmp_path: Path, state: Path, keys: dict[str, str]) -> Service
     return ServiceConfig.from_file(path)
 
 
-def real_keys(providers: Providers) -> dict[str, str]:
-    return {p.name: p.real_key.reveal() for p in providers.items}
+def real_keys(providers: Providers | tuple[Providers, Any]) -> dict[str, str | None]:
+    if isinstance(providers, tuple):
+        providers = providers[0]
+    return {p.name: None if p.real_key is None else p.real_key.reveal() for p in providers.items}
 
 
 def test_providers_now_reads_the_keys_folder_again(
@@ -409,13 +445,36 @@ def test_providers_now_reads_the_keys_folder_again(
     settings.set_secret("anthropic", changed, requested_by="web")
     assert real_keys(providers_now(config)) == {"anthropic": changed, "openai": second}
     settings.clear_secret("openai", requested_by="web")
-    now = providers_now(config)
-    assert real_keys(now) == {"anthropic": changed}, "a removed key leaves its provider out"
-    policy = egress_policy(config, now)
-    assert [p.name for p in policy.providers.items] == ["anthropic"]
-    assert "api.openai.com" not in policy.allow_list().entries
+    now, problems = providers_now(config)
+    assert real_keys(now) == {"anthropic": changed, "openai": None}, "a removed key: it waits"
+    assert problems["openai"][0] == "missing"
+    policy = egress_policy(config, now, problems)
+    assert policy.waiting() == {"openai": "missing"}
+    assert [p.name for p in policy.providers.items] == ["anthropic", "openai"]
+    # Still a provider's host: a call there is refused (no_key), never a plain request.
+    assert "api.openai.com" in policy.allow_list().entries
     # The fake keys (the agent's) are the very same ones it had.
-    assert now.items[0].fake_key == config.provider_keys["anthropic"].fake
+    assert [p.fake_key for p in now.items] == [
+        config.provider_keys[name].fake for name in ("anthropic", "openai")
+    ]
+    # Set again: usable at once.
+    settings.set_secret("openai", second, requested_by="web")
+    assert real_keys(providers_now(config)) == {"anthropic": changed, "openai": second}
+
+
+def test_providers_now_fails_closed_on_a_keys_folder_it_cannot_use(
+    tmp_path: Path, state: Path
+) -> None:
+    config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
+    assert config.provider_keys["openai"].real is None  # waits from the start
+    config.keys_dir.chmod(0o755)
+    now, problems = providers_now(config)
+    assert real_keys(now) == {"anthropic": None, "openai": None}
+    assert {name: problem for name, (problem, _) in problems.items()} == {
+        "anthropic": "unusable",
+        "openai": "unusable",
+    }
+    config.keys_dir.chmod(0o700)
 
 
 class FakeJail:
@@ -566,17 +625,23 @@ def test_changing_a_key_in_settings_refreshes_the_sensors_list(
     assert leaks(new, *texts) == [] and leaks(old, *texts) == [] and leaks(other, *texts) == []
 
 
-def test_a_key_that_cannot_be_read_leaves_the_sensors_list_as_it_was(
-    tmp_path: Path, state: Path
-) -> None:
+def test_a_key_that_cannot_be_used_makes_its_provider_wait(tmp_path: Path, state: Path) -> None:
+    """Fail closed: a file the gate cannot use is "waiting", never the old key and never a
+    call without one. The proxy is told, nothing raises."""
     from backtide.sensors.scrub import LiveScrub
-    from backtide.service.config import ConfigError
     from backtide.service.proxy_channel import known_secrets
 
-    old = anthropic_key()
-    config = service_config(tmp_path, state, {"anthropic": old, "openai": openai_key()})
-    live = LiveScrub(known_secrets([GATEWAY, old]))
+    old, other = anthropic_key(), openai_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
+    live = LiveScrub(known_secrets([GATEWAY, old, other]))
+    egress = ReloadableEgress()
     (config.keys_dir / "anthropic.key").write_text("not a key at all\n")
-    with pytest.raises(ConfigError):
-        key_reloader(config, ReloadableEgress(), live)()  # type: ignore[arg-type]
-    assert old not in live.text(f"echo {old}")
+    assert key_reloader(config, egress, live)() is Applied.NOW  # type: ignore[arg-type]
+    (policy,) = egress.policies
+    assert policy.waiting() == {"anthropic": "unusable"}
+    assert real_keys(policy.providers) == {"anthropic": None, "openai": other}
+    assert other not in live.text(f"echo {other}") and GATEWAY not in live.text(GATEWAY)
+
+    (config.keys_dir / "anthropic.key").chmod(0o644)  # unreadable: the same
+    key_reloader(config, egress, live)()  # type: ignore[arg-type]
+    assert egress.policies[-1].waiting() == {"anthropic": "unusable"}

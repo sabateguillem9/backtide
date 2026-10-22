@@ -137,10 +137,11 @@ BLOCK_RISK = {
     "gate_rejected": 1,
 }
 # spend_cap and spend_unavailable (T11): a model call refused by the spending cap, or because
-# backtide cannot count the spending; the proxy answers in the provider's own error shape.
+# backtide cannot count the spending; no_key: the provider waits for its key (the owner has not
+# set it). The proxy answers those in the provider's own error shape.
 DENY_REASONS = frozenset(
     {"not_allowed", "throttled", "not_recorded", "gate_rejected", "hold_full", "spend_cap",
-     "spend_unavailable"}
+     "spend_unavailable", "no_key"}
 )  # fmt: skip
 # Why backtide denies a held request (``decision``), and why the proxy no longer holds one.
 DECISION_REASONS = frozenset({"rejected", "expired", "paused", "hold_full"})
@@ -336,7 +337,8 @@ def config(
                 "kind": str(p.kind),
                 "host": p.host,
                 "fake_key": p.fake_key,
-                "real_key": p.real_key.reveal(),
+                # None: waiting for its key (the proxy refuses every call to it: no_key).
+                "real_key": None if p.real_key is None else p.real_key.reveal(),
                 "models": list(p.models),
             }
             for p in providers.items
@@ -503,7 +505,8 @@ _PROVIDER_KEYS = frozenset({"name", "kind", "host", "fake_key", "real_key"})
 
 
 def providers_from_config(message: Mapping[str, Any]) -> Providers:
-    """The providers of a ``config`` message, with each real key inside a Secret."""
+    """The providers of a ``config`` message, with each real key inside a Secret (None: the
+    provider waits for its key)."""
     items = message.get("providers")
     if not isinstance(items, list) or len(items) > _MAX_PROVIDERS:
         raise ProtocolError("config.providers: not a list of providers")
@@ -513,7 +516,10 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
             "models"
         }:
             raise ProtocolError("config.providers: wrong fields")
-        if not all(isinstance(entry[key], str) for key in _PROVIDER_KEYS):
+        if not all(isinstance(entry[key], str) for key in _PROVIDER_KEYS - {"real_key"}):
+            raise ProtocolError("config.providers: a field is not a text")
+        real = entry["real_key"]
+        if real is not None and not isinstance(real, str):
             raise ProtocolError("config.providers: a field is not a text")
         models = entry.get("models", [])
         if not isinstance(models, list):
@@ -525,7 +531,7 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
                     kind=Kind(entry["kind"]) if entry["kind"] in set(Kind) else entry["kind"],
                     host=entry["host"],
                     fake_key=entry["fake_key"],
-                    real_key=Secret(entry["real_key"]),
+                    real_key=None if real is None else Secret(real),
                     models=tuple(models),
                 )
             )
@@ -542,10 +548,12 @@ def describe(message: Mapping[str, Any]) -> str:
     """A line for the log: the type and, for a config, names and counts. Never a key."""
     kind = message.get("type")
     if kind == "config":
-        names = [p.get("name") for p in message.get("providers", []) if isinstance(p, dict)]
+        entries = [p for p in message.get("providers", []) if isinstance(p, dict)]
+        names = [str(p.get("name")) + ("" if p.get("real_key") else " (no key yet)")
+                 for p in entries]  # fmt: skip
         hosts = message.get("allow_hosts", [])
         return (
-            f"config: providers {', '.join(str(n) for n in names) or '-'}; "
+            f"config: providers {', '.join(names) or '-'}; "
             f"{len(hosts) if isinstance(hosts, list) else '?'} allowed hosts"
         )
     if kind in {"request", "ack"}:
@@ -628,7 +636,8 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
                 "kind": str(p.kind),
                 "host": p.host,
                 "fake_key": p.fake_key,
-                "real_key": p.real_key.reveal(),
+                # None: waiting for its key (the proxy refuses every call to it: no_key).
+                "real_key": None if p.real_key is None else p.real_key.reveal(),
                 "models": list(p.models),
             }
             for p in providers.items

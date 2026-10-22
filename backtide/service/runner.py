@@ -28,7 +28,7 @@ import os
 import signal
 import stat
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import FrameType, TracebackType
 from typing import Protocol
@@ -52,7 +52,7 @@ from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
 from backtide.service.bot import Hooks, telegram_parts
-from backtide.service.config import ConfigError, ServiceConfig, read_provider_keys
+from backtide.service.config import ConfigError, ProviderKey, ServiceConfig, read_real_keys
 from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
@@ -394,7 +394,8 @@ def build_egress(
     T06-5), records through the rules (``box``) and strikes the Gateway token too. Constructed
     only: the Guardian starts it. ConfigError for an allowed host the gate cannot use."""
     proxy = proxy if proxy is not None else ProxyJail(config.proxy_jail_config())
-    policy = egress_policy(config, config.model_providers())
+    providers, problems = config.model_providers_and_problems()
+    policy = egress_policy(config, providers, problems)
     if timings is None:
         timings = config.gate_settings().timings  # [gate] wait_s, hold_s, preapproval_s
     # The recipients trusted from the web (T10-5, decision 9): <state_dir>/trusted.json, read
@@ -443,12 +444,17 @@ def build_budget(
     return budget, prices
 
 
-def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
+def egress_policy(
+    config: ServiceConfig,
+    providers: Providers,
+    problems: Mapping[str, tuple[str, str]] | None = None,
+) -> Policy:
     """What backtide lets out through the proxy: the allowed hosts of ``[proxy]``, ``providers``
-    (their hosts, fake and real keys), the Gateway token to strike, and the gate of ``[gate]``
-    (T10-3): the mode for unknown hosts, the trusted recipients (with the owner's Telegram chat
-    of ``telegram.toml``, read now) and the extra read endpoints. ConfigError for an allowed
-    host the gate cannot use, or an unusable ``telegram.toml``."""
+    (their hosts, fake and real keys; ``problems`` says why those without a real key wait), the
+    Gateway token to strike, and the gate of ``[gate]`` (T10-3): the mode for unknown hosts,
+    the trusted recipients (with the owner's Telegram chat of ``telegram.toml``, read now) and
+    the extra read endpoints. ConfigError for an allowed host the gate cannot use, or an
+    unusable ``telegram.toml``."""
     settings = config.proxy_settings()
     telegram = load_telegram(config.state_dir)
     gate = config.gate_settings(owner_chat=None if telegram is None else telegram.chat_id)
@@ -471,6 +477,7 @@ def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
         read_endpoints=gate.read_endpoints,
         read_budget_host=gate.read_budget_host,
         read_budget_total=gate.read_budget_total,
+        key_problems=dict(problems or {}),
     )
     try:
         policy.allow_list()
@@ -479,30 +486,37 @@ def egress_policy(config: ServiceConfig, providers: Providers) -> Policy:
     return policy
 
 
-def providers_now(config: ServiceConfig) -> Providers:
-    """The providers of ``[proxy]`` with the keys ``<state_dir>/keys/`` holds NOW (T12e: the
-    Settings page changed or removed one). A provider whose key was removed is left out, so the
-    proxy stops sending to it. ConfigError, never quoting a key, for a key file it cannot use."""
+def providers_now(config: ServiceConfig) -> tuple[Providers, dict[str, tuple[str, str]]]:
+    """The providers of ``[proxy]`` with the real keys ``<state_dir>/keys/`` holds NOW (T12e: the
+    Settings page set, changed or removed one), and why those without one wait. A provider
+    whose key was removed, or whose file cannot be used, waits for its key again: the proxy
+    refuses its calls (``no_key``). The fake keys are the ones the service started with (the
+    agent's, never changed). ConfigError only for a ``[proxy]`` the gate cannot use."""
     names = [p.name for p in config.proxy_settings().providers]
-    present = [name for name in names if os.path.lexists(config.keys_dir / f"{name}.key")]
-    keys = read_provider_keys(config.keys_dir, present) if present else {}
-    entries = config.proxy.get("providers", [])
-    kept = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") in keys]
-    now = dataclasses.replace(config, proxy={**config.proxy, "providers": kept}, provider_keys=keys)
-    return now.model_providers()
+    reals = read_real_keys(config.keys_dir, names)
+    keys = {
+        name: ProviderKey(real=real, fake=config.provider_keys[name].fake, problem=problem,
+                          why=why)
+        for name, (real, problem, why) in reals.items()
+        if name in config.provider_keys
+    }  # fmt: skip
+    now = dataclasses.replace(config, provider_keys=keys)
+    return now.model_providers_and_problems()
 
 
 def key_reloader(
     config: ServiceConfig, egress: Egress, scrub: LiveScrub | None = None
 ) -> Callable[[], Applied]:
     """What the Settings page calls after it writes or removes a provider's key: the providers
-    read again and handed to the running proxy (``Egress.reload``), no restart. With ``scrub``
+    read again and handed to the running proxy (``Egress.reload``), no restart. A provider left
+    without a usable key waits for it (``no_key``), never crashes the service. With ``scrub``
     (the process sensor's list of secrets) the new key is added to it and the removed one is
-    dropped, before the proxy can use the new key; if the keys cannot be read, nothing changes."""
+    dropped, before the proxy can use the new key; if ``[proxy]`` cannot be used, nothing
+    changes."""
 
     def reload() -> Applied:
-        providers = providers_now(config)
-        policy = egress_policy(config, providers)
+        providers, problems = providers_now(config)
+        policy = egress_policy(config, providers, problems)
         if scrub is not None:
             scrub.replace(
                 known_secrets([config.gateway_token.reveal(), *providers.known_secrets()])
@@ -688,14 +702,22 @@ def serve(
             record=box.append,
             reload_keys=key_reloader(config, egress, sensor_secrets),
             in_use=[p.name for p in config.proxy_settings().providers],
+            waiting=egress.waiting,
         )
-        # The spending cap (T11): `backtide web` reads it and changes it through the socket too.
+        # The spending cap (T11): `backtide web` reads it and changes it through the socket too,
+        # and, next to it, which providers wait for their key (the panel).
         control: ControlHook = ControlServer(
-            guardian, config.control_socket, settings=settings_service, budget=egress.budget
+            guardian,
+            config.control_socket,
+            settings=settings_service,
+            budget=egress.budget,
+            waiting=egress.waiting,
         )
         if telegram is not None:
             snapshots = store if store is not None else SnapshotStore(config.volume)
-            telegram.actions.bind(guardian, box, snapshots, budget=egress.budget)
+            telegram.actions.bind(
+                guardian, box, snapshots, budget=egress.budget, waiting=egress.waiting
+            )
             control = Hooks(control, telegram.bot)
         run_guardian(
             guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control

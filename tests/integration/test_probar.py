@@ -5,10 +5,12 @@ the real OpenClaw with Claude Sonnet 5.5 as its model and the proxy, where ``api
 is T06's fake provider on an internal network. Nothing reaches Anthropic or Telegram and every
 key is made up (invariant 8). It checks, in the order the founder goes:
 
-1. the service starts with no Anthropic key, and a message gets the agent's answer
-   (`make probar-pedir`), with the placeholder as the key the provider sees;
+1. the service starts with no Anthropic key: the provider waits for it, a message to the agent
+   (`make probar-pedir`) gets backtide's "no key set yet" from the proxy, nothing reaches the
+   provider, and the refusal is in the black box (``llm/blocked {reason: no_key}``);
 2. the key saved through the service's Settings path (the control socket, as the web does) is
-   the one the provider sees from the next message on, and the agent's fake key never changes;
+   the one the provider sees from the very next message on (OpenClaw put no cooldown on its
+   key for the refusal), and the agent's fake key never changes;
 3. a write of the agent to a host off every list is held by the gate.
 
 It shares the demo's folder (``~/backtide-demo-run``) and names, so it skips when a demo or a
@@ -75,13 +77,15 @@ def running(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
         demo.teardown(paths)
 
 
-def ask(message: str) -> str:
-    """`make probar-pedir MSG=...`: the same command, in this process."""
+def ask(message: str, *, ok: bool = True) -> str:
+    """`make probar-pedir MSG=...`: the same command, in this process. ``ok``: it must end
+    well (OpenClaw may end a turn whose model call failed with an error code)."""
     out = io.StringIO()
     encoded = base64.b64encode(message.encode()).decode()
-    with contextlib.redirect_stdout(out):
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
         code = probar.main(["pedir", encoded])
-    assert code == 0, out.getvalue()
+    if ok:
+        assert code == 0, out.getvalue()
     return out.getvalue()
 
 
@@ -90,7 +94,7 @@ def model_calls() -> list[dict]:
     return internet.requests(PROVIDER_HOST, "/v1/messages")
 
 
-def held_events() -> list:
+def events_of(source: str, action: str) -> list:
     state = demo.PATHS.state
     box = BlackBox(
         state / "blackbox.db",
@@ -99,17 +103,24 @@ def held_events() -> list:
         readonly=True,
     )
     try:
-        return [e for e in box.events() if (e.source.value, e.action) == ("gate", "held")]
+        return [e for e in box.events() if (e.source.value, e.action) == (source, action)]
     finally:
         box.close()
 
 
-def test_without_a_key_it_starts_and_the_agent_answers(running: Path) -> None:
-    said = ask("Hola, ¿qué tal?")
-    assert REPLY_TEXT in said
+def held_events() -> list:
+    return events_of("gate", "held")
+
+
+def test_without_a_key_it_starts_and_the_model_calls_wait_for_it(running: Path) -> None:
+    said = ask("Hola, ¿qué tal?", ok=False)
+    assert REPLY_TEXT not in said, said
     assert "aún no has puesto la clave" in said
-    keys = [c["headers"].get("x-api-key", "") for c in model_calls()]
-    assert keys and all(k.startswith(probar.PLACEHOLDER_PREFIX) for k in keys)
+    assert model_calls() == []  # nothing reached the provider
+    [waiting] = events_of("system", "provider_waiting")
+    assert waiting.details == {"provider": "anthropic", "problem": "missing"}
+    blocked = events_of("llm", "blocked")
+    assert blocked and blocked[0].details["reason"] == "no_key", said
     assert not (demo.PATHS.state / "keys" / "anthropic.key").exists()  # never written
 
 

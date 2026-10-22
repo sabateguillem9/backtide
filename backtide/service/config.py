@@ -44,6 +44,7 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   ``<state_dir>/sensor`` and never overlaps anything mounted into the agent.
 """
 
+import dataclasses
 import errno
 import os
 import re
@@ -227,13 +228,23 @@ class Secret:
         raise TypeError("a Secret cannot be pickled or copied")
 
 
+KEY_MISSING = "missing"  # no <name>.key yet: the owner has not set it
+KEY_UNUSABLE = "unusable"  # a <name>.key that cannot be used (not 0600, a link, empty, malformed)
+
+
 @dataclass(frozen=True)
 class ProviderKey:
     """The two keys of one model provider: the real one (only the proxy's channel reveals it)
-    and the fake one the agent gets. Neither shows in a repr."""
+    and the fake one the agent gets. Neither shows in a repr.
 
-    real: Secret = field(repr=False)
+    ``real`` is None while the provider waits for its key (docs/21, section 6): ``problem`` says
+    why (``KEY_MISSING`` or ``KEY_UNUSABLE``) and ``why`` what is wrong with the file, in the
+    words of the reader (what the file IS, never what it holds)."""
+
+    real: Secret | None = field(repr=False)
     fake: str = field(repr=False)
+    problem: str | None = None
+    why: str | None = None
 
 
 @dataclass(frozen=True)
@@ -339,10 +350,10 @@ class ServiceConfig:
                 )
         names = [provider.name for provider in self.proxy_settings().providers]
         missing = [name for name in names if name not in self.provider_keys]
-        if missing:
+        if missing:  # from_file always reads them; a config made by hand may forget them
             raise ConfigError(
-                f"[proxy] providers {', '.join(missing)} have no keys: put each real key in "
-                f"<state_dir>/{STATE_KEYS}/<name>.key (0600)"
+                f"[proxy] providers {', '.join(missing)} have no fake key (from_file reads them "
+                f"from <state_dir>/{STATE_KEYS}/)"
             )
         extra = sorted(set(self.provider_keys) - set(names))
         if extra:
@@ -549,28 +560,55 @@ class ServiceConfig:
 
     def model_providers(self) -> Providers:
         """The providers as the proxy gets them through the channel (docs/21, section 6): host,
-        fake key and real key (inside the gate's own Secret). ConfigError, never quoting a
-        key, for a key the gate cannot use or two providers that clash."""
-        items = []
+        fake key and real key (inside the gate's own Secret; None while it waits for its key).
+        ConfigError, never quoting a key, for a provider the gate cannot use or two providers
+        that clash. A real key the gate cannot use is not an error: that provider waits."""
+        return self.model_providers_and_problems()[0]
+
+    def model_providers_and_problems(self) -> tuple[Providers, dict[str, tuple[str, str]]]:
+        """``model_providers`` and, for each provider that waits for its key, why
+        (``KEY_MISSING`` or ``KEY_UNUSABLE``) and what is wrong, never quoting a key. Fails
+        closed: a key file that cannot be read, a key of the wrong shape and a key two providers
+        share all leave their provider waiting, never let through without its key."""
+        items: list[GateProvider] = []
+        problems: dict[str, tuple[str, str]] = {}
         for provider in self.proxy_settings().providers:
             key = self.provider_keys.get(provider.name)
             if key is None:
                 continue
+            fields = {
+                "name": provider.name,
+                "kind": provider.kind,
+                "host": provider.host,
+                "fake_key": key.fake,
+                "models": provider.models,
+            }
             try:
-                items.append(
-                    GateProvider(
-                        name=provider.name,
-                        kind=provider.kind,  # type: ignore[arg-type]
-                        host=provider.host,
-                        fake_key=key.fake,
-                        real_key=GateSecret(key.real.reveal()),
-                        models=provider.models,
-                    )
-                )
+                waiting = GateProvider(**fields, real_key=None)  # type: ignore[arg-type]
             except ValueError as error:  # Provider's messages never hold a key
                 raise ConfigError(f"[proxy] providers: {error}") from None
+            if key.real is None:
+                problems[provider.name] = (
+                    key.problem or KEY_MISSING,
+                    key.why or "no key file yet",
+                )
+                items.append(waiting)
+                continue
+            try:
+                items.append(
+                    GateProvider(**fields, real_key=GateSecret(key.real.reveal()))  # type: ignore[arg-type]
+                )
+            except ValueError as error:  # the real key's shape: it waits (fail closed)
+                problems[provider.name] = (KEY_UNUSABLE, str(error))
+                items.append(waiting)
+        reals = [p.real_key.reveal() for p in items if p.real_key is not None]
+        shared = {real for real in reals if reals.count(real) > 1}
+        for index, item in enumerate(items):
+            if item.real_key is not None and item.real_key.reveal() in shared:
+                items[index] = dataclasses.replace(item, real_key=None)
+                problems[item.name] = (KEY_UNUSABLE, "the same real key as another provider")
         try:
-            return Providers(items)
+            return Providers(items), problems
         except ValueError as error:
             raise ConfigError(f"[proxy] providers: {error}") from None
 
@@ -872,18 +910,61 @@ def _provider_names(proxy: Mapping[str, Any]) -> list[str]:
 
 def read_provider_keys(folder: Path, names: list[str]) -> dict[str, ProviderKey]:
     """The keys of each provider in ``names``: ``<name>.key``, the real one, which the person
-    puts there; and ``<name>.fake``, made here the first time (0600, never replaced). The
-    folder must be ours and 0700, and nothing in it a symlink. ConfigError, saying what a file
-    IS (path, size, mode, owner) and never what it holds."""
+    puts there (the Settings page, or by hand); and ``<name>.fake``, made here the first time
+    (0600, never replaced). The folder is made (0700) if there is none yet; it must be ours and
+    0700, and nothing in it a symlink.
+
+    A provider whose ``<name>.key`` is missing, or cannot be used, waits for its key
+    (``real`` None, ``read_real_key``): backtide starts and the proxy refuses its calls. A
+    folder or a fake key that cannot be used is a ConfigError, saying what a file IS (path,
+    size, mode, owner) and never what it holds."""
+    try:
+        os.mkdir(folder, 0o700)  # the umask can only take bits away; checked below
+    except FileExistsError:
+        pass  # whatever is there (a link, a folder open to others) the check refuses
+    except OSError as error:
+        raise ConfigError(
+            f"cannot make the keys folder {folder}: {os.strerror(error.errno or 0)}"
+        ) from None
     _require_private_dir(folder, "the keys folder")
     keys = {}
     for name in names:
-        real_file = folder / f"{name}.key"
-        real = _decode(_read_file(real_file, "real key file", MAX_KEY_BYTES, private=True)).strip()
-        if not real:
-            raise ConfigError(f"real key file {real_file} of provider {name} is empty")
-        keys[name] = ProviderKey(real=Secret(real), fake=_fake_key(folder / f"{name}.fake", name))
+        fake = _fake_key(folder / f"{name}.fake", name)
+        real, problem, why = read_real_key(folder, name)
+        keys[name] = ProviderKey(real=real, fake=fake, problem=problem, why=why)
     return keys
+
+
+def read_real_keys(
+    folder: Path, names: list[str]
+) -> dict[str, tuple[Secret | None, str | None, str | None]]:
+    """``read_real_key`` for each of ``names``, after checking the folder (ours, 0700, not a
+    link). A folder that cannot be used leaves every provider waiting (``KEY_UNUSABLE``).
+    Never raises."""
+    try:
+        _require_private_dir(folder, "the keys folder")
+    except ConfigError as error:
+        return {name: (None, KEY_UNUSABLE, str(error)) for name in names}
+    return {name: read_real_key(folder, name) for name in names}
+
+
+def read_real_key(folder: Path, name: str) -> tuple[Secret | None, str | None, str | None]:
+    """``(key, None, None)`` from ``<folder>/<name>.key``, or ``(None, problem, why)`` when
+    there is none (``KEY_MISSING``) or it cannot be used (``KEY_UNUSABLE``: not 0600 and ours,
+    a link, too big, not UTF-8, empty). ``why`` says what the file IS, never what it holds.
+    The folder is the caller's to check. Never raises."""
+    path = folder / f"{name}.key"
+    try:
+        if not os.path.lexists(path):
+            return None, KEY_MISSING, f"there is no {path} yet"
+        real = _decode(_read_file(path, "real key file", MAX_KEY_BYTES, private=True)).strip()
+    except ConfigError as error:
+        return None, KEY_UNUSABLE, str(error)
+    except OSError as error:
+        return None, KEY_UNUSABLE, f"cannot read {path}: {os.strerror(error.errno or 0)}"
+    if not real:
+        return None, KEY_UNUSABLE, f"real key file {path} of provider {name} is empty"
+    return Secret(real), None, None
 
 
 def _fake_key(path: Path, name: str) -> str:

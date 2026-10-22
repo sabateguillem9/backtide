@@ -4,7 +4,9 @@ real key. Pure: no I/O (the fake key's randomness comes from ``secrets``).
 The agent only ever holds a fake key, ``backtide-fake-<provider>-<32 random characters>``.
 On the way out to its provider's host, the proxy drops every credential header and puts the
 real key in the provider's header. A request that carries the real key, anywhere and to any
-host, is refused. Design and rationale: docs/21-diseno-t06-proxy.md, section 6.
+host, is refused. A provider whose real key the owner has not set yet (or whose key file cannot
+be used) is "waiting": it has no real key at all, and nothing goes to its host (``no_key``).
+Design and rationale: docs/21-diseno-t06-proxy.md, section 6.
 """
 
 import json
@@ -122,7 +124,9 @@ class Provider:
     kind: Kind
     host: str
     fake_key: str = field(repr=False)
-    real_key: Secret = field(repr=False)
+    # None: waiting for its key (the owner has not set it, or its file cannot be used). The
+    # proxy then refuses every call to this provider (``no_key``) and never contacts it.
+    real_key: Secret | None = field(repr=False)
     # The model ids of [[proxy.providers]] models: when there are any, a request to this
     # provider may only ask for one of them (T06-6). Empty: any model.
     models: tuple[str, ...] = ()
@@ -140,6 +144,19 @@ class Provider:
         object.__setattr__(self, "host", host)
         if not is_fake_key(self.fake_key, self.name):
             raise ValueError(f"provider {self.name}: the fake key does not have the right shape")
+        if self.real_key is not None:
+            self._check_real_key()
+        models = tuple(self.models) if isinstance(self.models, list | tuple) else None
+        if (
+            models is None
+            or len(models) > MAX_MODELS
+            or not all(isinstance(m, str) and 0 < len(m) <= MAX_MODEL_ID and m.isprintable()
+                       for m in models)
+        ):  # fmt: skip
+            raise ValueError(f"provider {self.name}: models must be up to {MAX_MODELS} model ids")
+        object.__setattr__(self, "models", models)
+
+    def _check_real_key(self) -> None:
         if not isinstance(self.real_key, Secret):
             raise ValueError(f"provider {self.name}: the real key must be a Secret")
         real = self.real_key.reveal()
@@ -150,15 +167,11 @@ class Provider:
             )
         if real.startswith(FAKE_KEY_PREFIX) or real in self.fake_key or self.fake_key in real:
             raise ValueError(f"provider {self.name}: the real key cannot be a fake key")
-        models = tuple(self.models) if isinstance(self.models, list | tuple) else None
-        if (
-            models is None
-            or len(models) > MAX_MODELS
-            or not all(isinstance(m, str) and 0 < len(m) <= MAX_MODEL_ID and m.isprintable()
-                       for m in models)
-        ):  # fmt: skip
-            raise ValueError(f"provider {self.name}: models must be up to {MAX_MODELS} model ids")
-        object.__setattr__(self, "models", models)
+
+    @property
+    def waiting(self) -> bool:
+        """Whether it waits for its real key: then nothing is sent to it."""
+        return self.real_key is None
 
     @property
     def header(self) -> str:
@@ -175,8 +188,30 @@ class Provider:
         return compare_digest(value.encode(), self.fake_key.encode())
 
     def _real_header_value(self) -> str:
+        if self.real_key is None:
+            raise ValueError(f"provider {self.name}: it has no real key yet")
         real = self.real_key.reveal()
         return f"Bearer {real}" if self.kind is Kind.OPENAI else real
+
+
+def only_fake_key(
+    provider: Provider, headers: Sequence[tuple[str, str]], *, scheme: str, port: int
+) -> list[tuple[str, str]] | None:
+    """The headers without any credential header, if the request carries exactly the fake key
+    of ``provider`` as its only credential (``swap_key``'s rules); None otherwise
+    (``foreign_credential``). For a provider that waits for its key, too: what the agent sends
+    it is checked the same, though nothing goes out."""
+    if scheme != "https" or type(port) is not int or port != 443:
+        return None
+    if not all(isinstance(name, str) and _TOKEN_RE.fullmatch(name) for name, _ in headers):
+        return None
+    credentials = [(name, value) for name, value in headers if name.lower() in CREDENTIAL_HEADERS]
+    if len(credentials) != 1:
+        return None
+    [(name, value)] = credentials
+    if name.lower() != provider.header or not provider._carries_fake_key(value):
+        return None
+    return [(name, value) for name, value in headers if name.lower() not in CREDENTIAL_HEADERS]
 
 
 def swap_key(
@@ -189,18 +224,13 @@ def swap_key(
     key never travels in clear), every header name is a plain HTTP token, and there is
     EXACTLY ONE credential header, the provider's, holding exactly its fake key: not
     another key, an OAuth token, a cookie, the fake key in another header, twice, or nothing.
+    None too for a provider that waits for its key (fail closed: there is nothing to send).
     """
-    if scheme != "https" or type(port) is not int or port != 443:
+    if provider.real_key is None:
         return None
-    if not all(isinstance(name, str) and _TOKEN_RE.fullmatch(name) for name, _ in headers):
+    kept = only_fake_key(provider, headers, scheme=scheme, port=port)
+    if kept is None:
         return None
-    credentials = [(name, value) for name, value in headers if name.lower() in CREDENTIAL_HEADERS]
-    if len(credentials) != 1:
-        return None
-    [(name, value)] = credentials
-    if name.lower() != provider.header or not provider._carries_fake_key(value):
-        return None
-    kept = [(name, value) for name, value in headers if name.lower() not in CREDENTIAL_HEADERS]
     return [*kept, (provider.header, provider._real_header_value())]
 
 
@@ -215,27 +245,50 @@ SPEND_MESSAGES = {
     "spend_unavailable": "backtide cannot count the spending right now, so model calls are "
     "refused / backtide no puede contar el gasto ahora, así que rechaza las llamadas al modelo.",
 }
+# A provider that waits for its key (docs/21, section 6): a 400 ``invalid_request_error``, which
+# OpenClaw 2026.9.8 neither retries nor counts against its key (a 401 or 403 would put the
+# agent's fake key on a cooldown of 30 s and up, so the first call after the owner sets the key
+# would fail). OpenClaw also matches words of the message before the status: none of "api key",
+# "authentication", "credentials", "unauthorized", "forbidden", "expired", "permission",
+# "rate limit", "quota", "billing" or "credit" may appear in it.
+NO_KEY_MESSAGE = (
+    "backtide: no key set yet for {name}; the owner sets it in the Settings page of backtide. / "
+    "backtide: aún no hay clave para {name}; el dueño la pone en la página Ajustes de backtide."
+)
+NO_KEY = "no_key"
 
 
-def blocked_response(kind: str, reason: str) -> tuple[int, bytes, dict[str, str]]:
+def blocked_response(
+    kind: str, reason: str, provider: str = "this model provider"
+) -> tuple[int, bytes, dict[str, str]]:
     """(status, body, headers) of a refused model call, in the error shape of ``kind``'s API:
-    Anthropic's ``rate_limit_error``, OpenAI's ``insufficient_quota``. ValueError otherwise."""
+    Anthropic's ``rate_limit_error``, OpenAI's ``insufficient_quota``; for ``no_key`` (the
+    provider ``provider`` waits for its key), a 400 ``invalid_request_error`` of either.
+    ValueError otherwise."""
     message = SPEND_MESSAGES.get(reason)
+    if reason == NO_KEY:
+        if not isinstance(provider, str) or not provider.isprintable() or len(provider) > 64:
+            raise ValueError("a provider name is a short text")
+        message = NO_KEY_MESSAGE.format(name=provider)
     if message is None:
-        raise ValueError("unknown spend refusal")
+        raise ValueError("unknown model call refusal")
     if kind == Kind.ANTHROPIC:
-        error_type = "rate_limit_error" if reason == "spend_cap" else "api_error"
+        error_type = {"spend_cap": "rate_limit_error", NO_KEY: "invalid_request_error"}.get(
+            reason, "api_error"
+        )
         payload: dict[str, object] = {
             "type": "error",
             "error": {"type": error_type, "message": message},
         }
-        status = 429 if reason == "spend_cap" else 503
     elif kind == Kind.OPENAI:
-        code = "insufficient_quota" if reason == "spend_cap" else "service_unavailable"
-        payload = {"error": {"message": message, "type": code, "code": code, "param": None}}
-        status = 429 if reason == "spend_cap" else 503
+        code = {"spend_cap": "insufficient_quota", NO_KEY: "backtide_no_key"}.get(
+            reason, "service_unavailable"
+        )
+        error_type = "invalid_request_error" if reason == NO_KEY else code
+        payload = {"error": {"message": message, "type": error_type, "code": code, "param": None}}
     else:
         raise ValueError("unknown provider kind")
+    status = {"spend_cap": 429, NO_KEY: 400}.get(reason, 503)
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return status, body, {"content-type": "application/json", "x-backtide": reason}
 
@@ -259,13 +312,15 @@ def contains_secret(part: str | bytes | None, known: Iterable[str]) -> bool:
 
 
 class Providers:
-    """The configured providers: no two share a name, a host or a key."""
+    """The configured providers: no two share a name, a host or a key. Those waiting for their
+    key (``real_key`` None) are here too: their host is a provider's host, and nothing goes
+    there."""
 
     def __init__(self, items: Iterable[Provider]) -> None:
         self.items: tuple[Provider, ...] = tuple(items)
         names = [p.name for p in self.items]
         hosts = [p.host for p in self.items]
-        keys = [p.real_key.reveal() for p in self.items] + [p.fake_key for p in self.items]
+        keys = [*self._real_keys(), *(p.fake_key for p in self.items)]
         if len(set(names)) != len(names):
             raise ValueError("two providers have the same name")
         if len(set(hosts)) != len(hosts):
@@ -276,6 +331,13 @@ class Providers:
 
     def __repr__(self) -> str:
         return f"Providers({', '.join(p.name for p in self.items)})"
+
+    def _real_keys(self) -> list[str]:
+        return [p.real_key.reveal() for p in self.items if p.real_key is not None]
+
+    def waiting(self) -> tuple[str, ...]:
+        """The names of the providers that wait for their key."""
+        return tuple(p.name for p in self.items if p.real_key is None)
 
     def by_name(self, name: object) -> Provider | None:
         """The provider called ``name``, if any."""
@@ -289,11 +351,9 @@ class Providers:
     def real_key_in(self, *parts: str | bytes | None) -> bool:
         """Whether any real key shows in any of ``parts`` (the URL, each header name and
         value, the body, a WebSocket message). Checked for every request, to any host."""
-        real = [p.real_key.reveal() for p in self.items]
+        real = self._real_keys()
         return any(contains_secret(part, real) for part in parts)
 
     def known_secrets(self) -> tuple[str, ...]:
         """Every real and fake key, for ``scrub_known`` before anything is recorded."""
-        return tuple(p.real_key.reveal() for p in self.items) + tuple(
-            p.fake_key for p in self.items
-        )
+        return (*self._real_keys(), *(p.fake_key for p in self.items))

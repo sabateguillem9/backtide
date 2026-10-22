@@ -168,6 +168,11 @@ def _tell(event: Event) -> tuple[str, dict[str, Any], bool]:
         return "exec.run", {"target": target or Name(action)}, False
     if source is Source.NET:
         return "net.connect", {"target": target or Name(action)}, False
+    if source is Source.LLM and action == "blocked":
+        # A model call refused before it went out: for want of the key, or by the spending cap.
+        if event.details.get("reason") == "no_key" and target is not None:
+            return "llm.blocked.no_key", {"target": target}, False
+        return "llm.blocked", {}, False
     if source is Source.LLM:
         return "llm.call", {"target": target or Name(action)}, False
     if source is Source.GATE and target is not None:
@@ -245,6 +250,11 @@ def _tell_system(event: Event) -> tuple[str, dict[str, Any], bool]:
     if action == "space_pause":
         frozen = details.get("frozen") is True
         return f"system.space_pause.{'frozen' if frozen else 'stopped'}", {}, False
+    provider = _text(details.get("provider"))
+    if action in ("provider_waiting", "provider_ready") and provider:
+        problem = "unusable" if details.get("problem") == "unusable" else "missing"
+        key = f"system.{action}" + (f".{problem}" if action == "provider_waiting" else "")
+        return key, {"target": Name(provider)}, False
     return _generic(event)
 
 

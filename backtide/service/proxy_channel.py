@@ -24,7 +24,10 @@ connects) and section 8 (the budgets).
   (the user's ``allow_hosts`` and the providers' hosts, ports 80 and 443 only): anything else
   is recorded as ``net/blocked {reason: not_allowed}`` and denied; then the request's own event
   is appended and only then ``allow`` with its ``seq``. If the append fails: ``deny
-  not_recorded``. Acks go in the order the requests came.
+  not_recorded``. Acks go in the order the requests came. A model call to a provider that waits
+  for its key (the owner has not set it, or its file cannot be used) is ``deny no_key``, never
+  sent: recorded as ``llm/blocked {reason: no_key}``, the first at once and then at most one
+  every ``NO_KEY_EVERY`` s per provider with how many.
 - Events that send nothing out (responses, the proxy's own refusals) have their own budgets, by
   count and by bytes, per second and per day: a proxy that the agent makes refuse things in a
   loop cannot fill the disk of the black box. Over them they are counted and a ``net/dropped``
@@ -87,7 +90,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -159,6 +162,7 @@ EVENT_BYTES_RATE = 256 * 1024  # bytes of events per second, sustained
 EVENT_BYTES_BURST = 8 * 1024 * 1024
 DAILY_EVENT_BYTES = 512 * 1024 * 1024
 DROPPED_EVERY = 10.0
+NO_KEY_EVERY = 10.0  # at most one llm/blocked {reason: no_key} per provider this often
 _CREDENTIALS = struct.Struct("3i")
 _OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -298,10 +302,25 @@ class Policy:
     # [gate] read_budget_host_kib and read_budget_total_kib (review of T10-3, M5), in bytes.
     read_budget_host: int = DEFAULT_HOST_BYTES
     read_budget_total: int = DEFAULT_TOTAL_BYTES
+    # Why each provider without its key waits: ("missing", why) for no key file yet, or
+    # ("unusable", why) for a file that cannot be used; ``why`` says what the file IS, never
+    # what it holds. Only the names ``providers`` has without a key count.
+    key_problems: Mapping[str, tuple[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.unknown_hosts not in UNKNOWN_HOSTS:
             raise ValueError("unknown_hosts is 'hold' or 'deny'")
+
+    def waiting(self) -> dict[str, str]:
+        """The providers that wait for their key, and why ("missing" or "unusable")."""
+        return {
+            name: "unusable" if self.key_problems.get(name, ("",))[0] == "unusable" else "missing"
+            for name in self.providers.waiting()
+        }
+
+    def key_note(self, name: str) -> str:
+        """What is wrong with the key of ``name``, for the log (never a key)."""
+        return self.key_problems.get(name, ("", "no key file yet"))[1]
 
     def __repr__(self) -> str:
         return f"Policy({len(self.allow_hosts)} hosts, {self.providers!r})"
@@ -434,6 +453,9 @@ class ProxyChannel:
         self._dropped = 0
         self._last_dropped_event = float("-inf")
         self._budget_told: float | None = None
+        # Model calls refused for want of a key since the last llm/blocked, per provider.
+        self._no_key: dict[str, int] = {}
+        self._no_key_last: dict[str, float] = {}
         # The gate (T10-2): this connection's fingerprint key and its book of holds. One lock
         # for the book, what is recorded about it and the messages sent for it (the reader,
         # the ticker and the control socket's threads all come here).
@@ -505,6 +527,10 @@ class ProxyChannel:
         for thread in self._threads:
             if thread is not threading.current_thread():
                 thread.join(5)
+        # The refusals for want of a key counted since the last llm/blocked are not lost with
+        # the channel (a new key, or a proxy restart, makes a new one).
+        for provider in [name for name, count in self._no_key.items() if count]:
+            self._record_no_key(provider)
 
     def silent_for(self) -> float:
         return self._mono() - self.last_seen
@@ -623,6 +649,9 @@ class ProxyChannel:
         if gate is None:  # a model call (llm/request): never held, only to a provider's host
             if not allowed:
                 return self._refuse(request_id, event, "not_allowed")
+            waiting = self._waiting_provider(host, details.get("provider"))
+            if waiting is not None:
+                return self._no_key_refusal(request_id, waiting, details.get("model"))
             return self._model_call(request_id, event)
         with self._gate_lock:
             self._tick_locked()
@@ -840,6 +869,44 @@ class ProxyChannel:
         if stored is None:
             return protocol.ack(request_id, "deny", reason="not_recorded")
         return protocol.ack(request_id, "allow", seq=stored.seq)
+
+    def _waiting_provider(self, host: str, named: object) -> str | None:
+        """The provider without its key this model call goes to, by backtide's own reading of
+        the host (and, failing closed, by the name the proxy gives), if any."""
+        providers = self._policy.providers
+        for provider in (providers.for_host(host), providers.by_name(named)):
+            if provider is not None and provider.real_key is None:
+                return provider.name
+        return None
+
+    def _no_key_refusal(self, request_id: int, provider: str, model: object) -> dict[str, Any]:
+        """``deny no_key``: the call never reaches the provider. Recorded as ``llm/blocked``, the
+        first at once and then at most one every NO_KEY_EVERY s with how many."""
+        self._no_key[provider] = self._no_key.get(provider, 0) + 1
+        if self._mono() - self._no_key_last.get(provider, float("-inf")) >= NO_KEY_EVERY:
+            self._record_no_key(provider, model)
+        return protocol.ack(request_id, "deny", reason="no_key")
+
+    def _record_no_key(self, provider: str, model: object = None) -> None:
+        count = self._no_key.pop(provider, 0)
+        self._no_key_last[provider] = self._mono()
+        details: dict[str, Any] = {
+            "reason": "no_key",
+            "provider": provider,
+            "problem": self._policy.waiting().get(provider, "missing"),
+            "count": count,
+        }
+        if isinstance(model, str):
+            details["model"] = model[:128]
+        event = {"source": "llm", "action": "blocked", "target": provider, "risk": 1,
+                 "details": details}  # fmt: skip
+        self._append(event)  # a refusal: nothing goes out whether or not it is recorded
+
+    def _flush_no_key(self) -> None:
+        now = self._mono()
+        for provider in [name for name, count in self._no_key.items() if count]:
+            if now - self._no_key_last.get(provider, float("-inf")) >= NO_KEY_EVERY:
+                self._record_no_key(provider)
 
     def _model_call(self, request_id: int, event: dict[str, Any]) -> dict[str, Any]:
         """An ``llm/request`` to an allowed provider: the spending cap first (T11). A refusal
@@ -1325,6 +1392,8 @@ class ProxyChannel:
         now = self._mono()
         if self._budget is not None:
             self._budget.flush_blocked()
+        if self._no_key:
+            self._flush_no_key()
         if self._throttled and now - self._last_throttled_event >= THROTTLED_EVERY:
             window = max(1, int(now - self._throttled_since))
             count, self._throttled = self._throttled, 0

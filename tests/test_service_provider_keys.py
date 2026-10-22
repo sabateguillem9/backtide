@@ -107,24 +107,50 @@ def test_no_key_is_ever_said(layout: Path) -> None:
     assert repr(config.model_providers()) == "Providers(anthropic, groq)"
 
 
-def test_a_provider_without_its_key_is_refused(layout: Path) -> None:
+def waiting_of(config: ServiceConfig) -> dict[str, str]:
+    """Each provider that waits for its key, and why ("missing" or "unusable")."""
+    providers, problems = config.model_providers_and_problems()
+    assert set(providers.waiting()) == set(problems)
+    return {name: problem for name, (problem, _why) in problems.items()}
+
+
+def test_a_provider_without_its_key_waits_for_it(layout: Path) -> None:
     write_key(layout, "anthropic", REAL_ANTHROPIC)  # groq has none
-    with pytest.raises(ConfigError, match=r"keys/groq\.key"):
-        ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    key = config.provider_keys["groq"]
+    assert key.real is None and key.problem == "missing" and is_fake_key(key.fake, "groq")
+    assert waiting_of(config) == {"groq": "missing"}
+    providers = config.model_providers()
+    groq = providers.by_name("groq")
+    assert groq is not None and groq.waiting and groq.real_key is None
+    assert groq.host == "api.groq.com"  # still a provider's host: nothing goes there
+    assert providers.known_secrets() == (REAL_ANTHROPIC, *(p.fake_key for p in providers.items))
+    assert not (keys_dir(layout) / "groq.key").exists()  # never written by backtide
+    # The agent gets both providers, each with its fake key, from the start.
+    assert [p.name for p in config.jail_config().model_providers] == ["anthropic", "groq"]
 
 
-def test_a_missing_keys_folder_is_refused(layout: Path) -> None:
-    with pytest.raises(ConfigError, match="keys"):
-        ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+def test_a_missing_keys_folder_is_made_and_every_provider_waits(layout: Path) -> None:
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    info = keys_dir(layout).lstat()
+    assert stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+    assert sorted(p.name for p in keys_dir(layout).iterdir()) == ["anthropic.fake", "groq.fake"]
+    assert waiting_of(config) == {"anthropic": "missing", "groq": "missing"}
+    assert config.model_providers().known_secrets() == tuple(
+        config.provider_keys[name].fake for name in ("anthropic", "groq")
+    )
 
 
 @pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
-def test_a_key_file_others_can_read_is_refused_without_quoting_it(layout: Path, mode: int) -> None:
+def test_a_key_file_others_can_read_waits_without_quoting_it(layout: Path, mode: int) -> None:
     write_key(layout, "anthropic", REAL_ANTHROPIC, mode)
     write_key(layout, "groq", REAL_OPENAI)
-    with pytest.raises(ConfigError, match="600") as error:
-        ServiceConfig.from_file(write_toml(layout, PROVIDERS))
-    assert REAL_ANTHROPIC not in str(error.value)
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    assert waiting_of(config) == {"anthropic": "unusable"}  # fail closed: never used
+    key = config.provider_keys["anthropic"]
+    assert key.real is None and key.why is not None and "600" in key.why
+    assert REAL_ANTHROPIC not in key.why
+    assert REAL_ANTHROPIC not in config.model_providers().known_secrets()
 
 
 @pytest.mark.parametrize("mode", [0o750, 0o705, 0o755])
@@ -136,15 +162,18 @@ def test_a_keys_folder_others_can_enter_is_refused(layout: Path, mode: int) -> N
         ServiceConfig.from_file(write_toml(layout, PROVIDERS))
 
 
-def test_a_symlinked_key_is_refused(layout: Path, tmp_path: Path) -> None:
+def test_a_symlinked_key_waits(layout: Path, tmp_path: Path) -> None:
     elsewhere = tmp_path / "elsewhere.key"
     elsewhere.write_text(REAL_ANTHROPIC)
     elsewhere.chmod(0o600)
     keys_dir(layout).mkdir(mode=0o700)
     (keys_dir(layout) / "anthropic.key").symlink_to(elsewhere)
     write_key(layout, "groq", REAL_OPENAI)
-    with pytest.raises(ConfigError, match="symlink"):
-        ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    assert waiting_of(config) == {"anthropic": "unusable"}
+    why = config.provider_keys["anthropic"].why
+    assert why is not None and "symlink" in why
+    assert REAL_ANTHROPIC not in config.model_providers().known_secrets()
 
 
 def test_a_symlinked_keys_folder_is_refused(layout: Path, tmp_path: Path) -> None:
@@ -167,12 +196,17 @@ def test_a_symlinked_keys_folder_is_refused(layout: Path, tmp_path: Path) -> Non
     ],
     ids=["too-short", "space", "empty", "a-fake-key"],
 )
-def test_a_bad_real_key_is_refused_without_quoting_it(layout: Path, value: str) -> None:
+def test_a_bad_real_key_waits_without_quoting_it(layout: Path, value: str) -> None:
     write_key(layout, "anthropic", value)
     write_key(layout, "groq", REAL_OPENAI)
-    with pytest.raises(ConfigError, match="anthropic") as error:
-        ServiceConfig.from_file(write_toml(layout, PROVIDERS))
-    assert not value or value not in str(error.value)
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    providers, problems = config.model_providers_and_problems()
+    assert {name: problem for name, (problem, _) in problems.items()} == {"anthropic": "unusable"}
+    assert "anthropic" in problems["anthropic"][1]
+    assert not value or value not in problems["anthropic"][1]
+    anthropic = providers.by_name("anthropic")
+    assert anthropic is not None and anthropic.real_key is None  # never "pass without a key"
+    assert not value or value not in providers.known_secrets()
 
 
 def test_a_provider_openclaw_does_not_know_needs_its_models(layout: Path) -> None:
@@ -198,12 +232,14 @@ def test_a_provider_on_another_kinds_host_is_refused(layout: Path, kind: str, ho
         ServiceConfig.from_file(write_toml(layout, extra))
 
 
-def test_two_providers_with_the_same_real_key_are_refused(layout: Path) -> None:
+def test_two_providers_with_the_same_real_key_both_wait(layout: Path) -> None:
     write_key(layout, "anthropic", REAL_ANTHROPIC)
     write_key(layout, "groq", REAL_ANTHROPIC)
-    with pytest.raises(ConfigError, match="share") as error:
-        ServiceConfig.from_file(write_toml(layout, PROVIDERS))
-    assert REAL_ANTHROPIC not in str(error.value)
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    providers, problems = config.model_providers_and_problems()
+    assert set(providers.waiting()) == {"anthropic", "groq"}
+    assert all(why == "the same real key as another provider" for _, why in problems.values())
+    assert REAL_ANTHROPIC not in providers.known_secrets()
 
 
 def test_a_fake_file_that_is_not_a_fake_key_is_refused(layout: Path) -> None:

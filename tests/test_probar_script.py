@@ -1,6 +1,7 @@
 """The logic of scripts/demo/probar.py that does not need the VM (`make probar`, docs/probar.md):
-the config it writes, starting without the Anthropic key, the message it hands the agent and
-the lines of its live view. Every key here is made up."""
+the config it writes, starting without the Anthropic key (backtide itself waits for it: no
+placeholder anywhere), the message it hands the agent and the lines of its live view. Every key
+here is made up."""
 
 import base64
 import os
@@ -16,7 +17,7 @@ from backtide.gate.providers import is_fake_key
 from backtide.jail.config import openclaw_config
 from backtide.jail.openclaw import check_rewindable
 from backtide.service import config as service_config
-from backtide.service.config import ConfigError, ServiceConfig
+from backtide.service.config import ServiceConfig
 from scripts.demo import demo, probar
 
 MADE_UP_KEY = "sk-ant-test-made-up-" + "Q" * 24
@@ -33,20 +34,14 @@ def paths(tmp_path: Path) -> demo.Paths:
     return paths
 
 
-@pytest.fixture
-def placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """What probar.main installs for every command of its process."""
-    monkeypatch.setattr(service_config, "read_provider_keys", probar.keys_or_placeholder)
-
-
-def write_config(paths: demo.Paths, model: str = probar.DEFAULT_MODEL) -> None:
-    paths.config.write_text(probar.render_config(paths, 1000, 1000, model=model))
+def write_config(
+    paths: demo.Paths, model: str = probar.DEFAULT_MODEL, *, offline: bool = False
+) -> None:
+    paths.config.write_text(probar.render_config(paths, 1000, 1000, model=model, offline=offline))
     paths.config.chmod(0o600)
 
 
-def test_the_config_has_claude_the_gate_and_more_memory(
-    paths: demo.Paths, placeholder: None
-) -> None:
+def test_the_config_has_claude_the_gate_and_more_memory(paths: demo.Paths) -> None:
     write_config(paths)
     config = ServiceConfig.from_file(paths.config)
 
@@ -69,6 +64,16 @@ def test_the_config_has_claude_the_gate_and_more_memory(
     text = paths.config.read_text()
     assert "allow_shared_ids" not in text and "key =" not in text  # never in the file
     assert tomllib.loads(text)["agent"]["name"] == demo.CONTAINER  # the demo's names
+    assert config.budget_settings().auto_prices is True  # the founder's run: real prices
+
+
+def test_the_fake_internets_run_never_fetches_the_prices(paths: demo.Paths) -> None:
+    """`make probar FALSO=1` stays inside the VM: not even Anthropic's pricing page."""
+    write_config(paths, offline=True)
+    config = ServiceConfig.from_file(paths.config)
+    assert config.budget_settings().auto_prices is False
+    assert tomllib.loads(paths.config.read_text())["budget"] == {"auto_prices": False}
+    assert "[budget]" not in probar.render_config(paths, 1, 1)
 
 
 def test_the_model_can_be_chosen_and_an_odd_one_is_refused(paths: demo.Paths) -> None:
@@ -82,8 +87,8 @@ def test_the_model_can_be_chosen_and_an_odd_one_is_refused(paths: demo.Paths) ->
     assert probar.model_of(paths) == "claude-haiku-5-5"
 
 
-def test_it_starts_without_the_real_key_and_never_writes_a_placeholder(
-    paths: demo.Paths, placeholder: None
+def test_it_starts_without_the_real_key_and_the_provider_waits_for_it(
+    paths: demo.Paths,
 ) -> None:
     write_config(paths)
     config = ServiceConfig.from_file(paths.config)
@@ -93,14 +98,16 @@ def test_it_starts_without_the_real_key_and_never_writes_a_placeholder(
     assert sorted(p.name for p in keys.iterdir()) == ["anthropic.fake"]  # no .key written
     key = config.provider_keys["anthropic"]
     assert is_fake_key(key.fake, "anthropic")
-    assert key.real.reveal().startswith(probar.PLACEHOLDER_PREFIX)
+    assert key.real is None and key.problem == "missing"
+    assert config.model_providers().waiting() == ("anthropic",)
     assert config.jail_config().model_providers[0].fake_key == key.fake  # the agent's is fake
     assert not probar.has_real_key(paths)
+    assert not hasattr(probar, "keys_or_placeholder") and not hasattr(probar, "PLACEHOLDER_PREFIX")
+    # Nothing replaces backtide's own reading of the keys any more.
+    assert service_config.read_provider_keys.__module__ == "backtide.service.config"
 
 
-def test_once_the_settings_page_saved_the_key_it_is_the_real_one(
-    paths: demo.Paths, placeholder: None
-) -> None:
+def test_once_the_settings_page_saved_the_key_it_is_the_real_one(paths: demo.Paths) -> None:
     write_config(paths)
     fake = ServiceConfig.from_file(paths.config).provider_keys["anthropic"].fake
     real_file = paths.state / "keys" / "anthropic.key"
@@ -109,29 +116,22 @@ def test_once_the_settings_page_saved_the_key_it_is_the_real_one(
 
     key = ServiceConfig.from_file(paths.config).provider_keys["anthropic"]
 
-    assert key.real.reveal() == MADE_UP_KEY
+    assert key.real is not None and key.real.reveal() == MADE_UP_KEY
     assert key.fake == fake  # the agent keeps the same fake key
     assert probar.has_real_key(paths)
 
 
-def test_a_bad_key_file_is_still_refused(paths: demo.Paths, placeholder: None) -> None:
+def test_a_bad_key_file_is_never_used(paths: demo.Paths) -> None:
     write_config(paths)
     ServiceConfig.from_file(paths.config)
     real_file = paths.state / "keys" / "anthropic.key"
     real_file.write_text(MADE_UP_KEY + "\n")
     real_file.chmod(0o644)
-    with pytest.raises(ConfigError, match="600") as error:
-        ServiceConfig.from_file(paths.config)
-    assert MADE_UP_KEY not in str(error.value)
-
-
-def test_without_the_placeholder_backtide_itself_refuses_a_missing_key(
-    paths: demo.Paths,
-) -> None:
-    write_config(paths)
-    (paths.state / "keys").mkdir(mode=0o700)
-    with pytest.raises(ConfigError, match=r"anthropic\.key"):
-        ServiceConfig.from_file(paths.config)
+    config = ServiceConfig.from_file(paths.config)
+    key = config.provider_keys["anthropic"]
+    assert key.real is None and key.problem == "unusable"  # fail closed: it waits
+    assert key.why is not None and "600" in key.why and MADE_UP_KEY not in key.why
+    assert MADE_UP_KEY not in config.model_providers().known_secrets()
 
 
 def encoded(text: str) -> str:

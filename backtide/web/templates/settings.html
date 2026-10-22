@@ -24,7 +24,7 @@
       <li class="setting is-{{ ('problem' if row.problem else ('set' if row.set else 'unset')) if ready else 'unknown' }}" data-kind="{{ row.kind }}">
         <div class="setting-info">
           <span class="setting-name">{{ t('settings.kind.' ~ row.kind) }}</span>
-          <span class="setting-state"><span class="setting-dot" aria-hidden="true"></span><span>{% if not ready %}{{ t('settings.unknown') }}{% elif row.problem %}{{ t('settings.problem') }}{% elif row.set %}{{ say('settings.set', row.kind) }}{% if row.tail %}, {{ t('settings.tail', tail=row.tail) }}{% endif %}{% if row.changed %}, <time datetime="{{ row.changed.isoformat() }}" title="{{ stamp(row.changed) }}">{{ changed(row.kind, row.changed) }}</time>{% endif %}{% else %}{{ t('settings.unset') }}{% endif %}</span></span>
+          <span class="setting-state"><span class="setting-dot" aria-hidden="true"></span><span>{% if not ready %}{{ t('settings.unknown') }}{% elif row.problem %}{{ t('settings.problem.waiting') if row.waiting else t('settings.problem') }}{% elif row.set %}{{ say('settings.set', row.kind) }}{% if row.tail %}, {{ t('settings.tail', tail=row.tail) }}{% endif %}{% if row.changed %}, <time datetime="{{ row.changed.isoformat() }}" title="{{ stamp(row.changed) }}">{{ changed(row.kind, row.changed) }}</time>{% endif %}{% else %}{{ t('settings.unset.waiting') if row.waiting else t('settings.unset') }}{% endif %}</span></span>
           {% if ready and row.kind == 'telegram' and row.set and row.chat_tail %}<span class="setting-note">{{ t('settings.chat_tail', tail=row.chat_tail) }}</span>{% endif %}
           {% if ready and row.provider and not row.in_use %}<span class="setting-note">{{ t.code('settings.not_in_proxy') }}</span>{% endif %}
         </div>

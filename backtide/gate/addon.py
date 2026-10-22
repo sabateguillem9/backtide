@@ -18,10 +18,13 @@ Design: docs/21-diseno-t06-proxy.md, sections 4 to 8. What each hook does:
   connection and the SNI (``host_mismatch``), OAuth logins, and on a provider's host the fake
   key swapped for the real one (``foreign_credential`` otherwise) and only a model call with the
   client's own tools (``provider_endpoint``, ``provider_body`` or ``provider_side_tool``
-  otherwise: provider_tools.py, T06-6). An IP literal that is not public, also written as numbers
-  (``127.1``, ``0x7f.1``), is ``private_address`` before backtide is asked. Then backtide is asked
-  (``request`` -> ``ack``): only with ``allow`` and a ``seq`` (the event is in the black box)
-  does the request go on. ``connection_strategy=lazy`` means no server was contacted so far.
+  otherwise: provider_tools.py, T06-6). A provider that waits for its key (the owner has not
+  set it) is checked the same, and then always refused in its own API's error shape
+  (``no_key``, recorded by backtide as ``llm/blocked``): nothing goes to it. An IP literal
+  that is not public, also written as numbers (``127.1``, ``0x7f.1``), is ``private_address``
+  before backtide is asked. Then backtide is asked (``request`` -> ``ack``): only with
+  ``allow`` and a ``seq`` (the event is in the black box) does the request go on.
+  ``connection_strategy=lazy`` means no server was contacted so far.
 - ``server_connect`` (async): only for a host and port that an ack let through on this client
   connection; the name is resolved here, EVERY address must be public, and the connection is
   pinned to the address that was checked (the SNI keeps the name).
@@ -69,7 +72,14 @@ from backtide.gate.policy import (
     port_allowed,
 )
 from backtide.gate.provider_tools import check_request, endpoint_of
-from backtide.gate.providers import CREDENTIAL_HEADERS, Provider, blocked_response, swap_key
+from backtide.gate.providers import (
+    CREDENTIAL_HEADERS,
+    NO_KEY,
+    Provider,
+    blocked_response,
+    only_fake_key,
+    swap_key,
+)
 from backtide.gate.sse import UsageStream, summarize_json
 from backtide.gate.translate import credential_free_path, shapes, translate
 from backtide.gate.translate.base import (
@@ -136,8 +146,11 @@ REFUSALS = {
     # plain text is only for a request that is not a provider's (it never happens).
     "spend_cap": (429, "backtide: spending cap reached; ask the owner\n"),
     "spend_unavailable": (503, "backtide: the spending cannot be counted right now\n"),
+    NO_KEY: (400, "backtide: no key set yet for this model provider\n"),
 }
 SPEND_REASONS = frozenset({"spend_cap", "spend_unavailable"})
+# The refusals of a model call that the proxy answers in the provider's own error shape.
+PROVIDER_REASONS = SPEND_REASONS | {NO_KEY}
 FAILED = (502, "backtide: the gate failed, so nothing went out\n")
 
 Respond = Callable[[int, bytes, Mapping[str, str]], Any]
@@ -445,8 +458,11 @@ class Gate:
         provider = config.providers.for_host(request.host)
         swapped = None
         if provider is not None:
-            swapped = swap_key(provider, headers, scheme=request.scheme, port=request.port)
-            if swapped is None:
+            if provider.waiting:  # checked as if it had its key; refused after backtide's say
+                ok = only_fake_key(provider, headers, scheme=request.scheme, port=request.port)
+            else:
+                swapped = ok = swap_key(provider, headers, scheme=request.scheme, port=request.port)
+            if ok is None:
                 self._block("foreign_credential", flow, fields)
                 return
             # What goes there leaves with the real key: only a model call with the client's own
@@ -506,15 +522,34 @@ class Gate:
             return
         if flow.response is not None:
             return  # killed or answered meanwhile
+        if provider is not None and provider.waiting and ack.allowed:
+            # Backtide says no_key for a provider without its key: an allow here is a bug of
+            # its, and there is no real key to send. Never sent (fail closed): its place in the
+            # spending cap is given back and the agent gets the no_key answer.
+            logger.error("backtide let a call to a provider without its key through: refused")
+            self._tell_error(
+                "not_sent",
+                None,
+                flow_id=fields["flow_id"],
+                host=fields["host"],
+                port=fields["port"],
+                upstream=False,
+            )
+            self._provider_refusal(flow, provider, NO_KEY)
+            return
         if not ack.allowed:
-            if provider is not None and ack.reason in SPEND_REASONS:
-                # T11: the spending cap, in the provider's own error shape (backtide recorded it).
-                status, text, extra = blocked_response(str(provider.kind), str(ack.reason))
-                flow.response = self._respond(status, text, extra)
+            if provider is not None and ack.reason in PROVIDER_REASONS:
+                # T11 and no_key: in the provider's own error shape (backtide recorded it).
+                self._provider_refusal(flow, provider, str(ack.reason))
                 return
             self._denied(flow, ack, fields, shape)
             return
         self._let_through(flow, fields, provider, swapped)
+
+    def _provider_refusal(self, flow: Any, provider: Provider, reason: str) -> None:
+        """A model call refused in ``provider``'s own API's error shape."""
+        status, text, extra = blocked_response(str(provider.kind), reason, provider.name)
+        flow.response = self._respond(status, text, extra)
 
     def _read(
         self,
@@ -716,6 +751,9 @@ class Gate:
     ) -> None:
         """The request is recorded and may go out: the connection it needs is let open."""
         request = flow.request
+        if provider is not None and swapped is None:
+            # Never to a provider without the real key in its place (the guard answers 502).
+            raise RuntimeError("a call to a provider without its key swapped")
         if swapped is not None:
             # An answer the tap can read: compressed, its usage would be lost (usage_missing).
             swapped = [pair for pair in swapped if pair[0].lower() != "accept-encoding"]
@@ -928,7 +966,7 @@ class Gate:
         if config is None:
             raise RuntimeError("no config to check an answer against")
         if self._scanner_of is None or self._scanner_of[0] is not config:
-            keys = [provider.real_key.reveal() for provider in config.providers.items]
+            keys = [p.real_key.reveal() for p in config.providers.items if p.real_key is not None]
             self._scanner_of = (config, KeyScanner(keys))
         return self._scanner_of[1]
 

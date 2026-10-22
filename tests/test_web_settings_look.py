@@ -110,7 +110,10 @@ def test_removing_looks_like_removing(web: TestClient) -> None:
     step = web.get("/ajustes/quitar?tipo=anthropic").text
     assert '<button class="settings-yes is-remove" type="submit">' in step
     said = text_of(step)
-    assert "Sí, quitarla" in said and "no arranca con un proveedor de [proxy] sin clave" in said
+    assert (
+        "Sí, quitarla" in said
+        and "el agente no puede usar ese modelo hasta que pongas otra" in said
+    )
     assert '<p class="settings-warning">' in step, "the consequence is not a muted note"
     telegram = text_of(web.get("/ajustes/quitar?tipo=telegram").text)
     assert "Sí, quitarlo" in telegram, "el bot: masculine"
