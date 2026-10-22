@@ -13,6 +13,7 @@ from backtide.jail.config import (
     SYS_MASK_OPTIONS,
     SYS_MASKS,
     AgentJailConfig,
+    create_env,
     docker_create_argv,
     network_create_argv,
     openclaw_config,
@@ -178,10 +179,21 @@ def test_create_argv_carries_no_secret(cfg: AgentJailConfig) -> None:
     assert token_env(cfg) == {"OPENCLAW_GATEWAY_TOKEN": TOKEN}
 
 
+def created_env(cfg: AgentJailConfig) -> dict[str, str]:
+    """The container's variables as ``docker create`` makes them: ``--env NAME=value`` from the
+    argv, and ``--env NAME`` from the CLI's own environment (create_env), the token last."""
+    cli = create_env(cfg)
+    env = {}
+    for entry in option_values(docker_create_argv(cfg), "--env"):
+        name, eq, value = entry.partition("=")
+        env[name] = value if eq else cli[name]
+    return env
+
+
 def test_create_argv_sets_the_environment_of_the_design(cfg: AgentJailConfig) -> None:
-    env = dict(
-        entry.split("=", 1) for entry in option_values(docker_create_argv(cfg), "--env")[:-1]
-    )
+    env = created_env(cfg)
+    assert list(env)[-1] == "OPENCLAW_GATEWAY_TOKEN"
+    del env["OPENCLAW_GATEWAY_TOKEN"]
     assert env == {
         "HOME": "/workspace/home",
         "OPENCLAW_STATE_DIR": "/workspace/state",
@@ -207,11 +219,43 @@ def test_the_agent_finds_the_proxy_and_trusts_only_its_ca(cfg: AgentJailConfig) 
     loopback Gateway stays out of the proxy. No DNS server is ever given: with --dns, Docker
     forwards outside names even from an internal network (docs/21, T06-1 P5)."""
     argv = docker_create_argv(cfg)
-    env = dict(entry.split("=", 1) for entry in option_values(argv, "--env")[:-1])
+    env = created_env(cfg)
     for name, value in PROXY_ENV.items():
         assert env[name] == value, name
     assert jail_config.CONTAINER_CA_DIR.as_posix() == "/etc/backtide-ca"
     assert not any(arg.startswith("--dns") for arg in argv)
+
+
+def test_the_profiles_own_variables_go_by_name_only(cfg: AgentJailConfig) -> None:
+    """Review of the profiles, L8: the profile's values reach docker through the CLI's
+    environment, so neither ``ps`` nor a JailError (which quotes the command) shows them."""
+    env = option_values(docker_create_argv(cfg), "--env")
+    own = dict(cfg.profile.env)
+    assert own and all(name in env for name in own)
+    assert not any(entry.startswith(f"{name}=") for entry in env for name in own)
+    assert create_env(cfg) == own | token_env(cfg)
+    # The jail's own variables keep their values in the argv: nothing secret, and verify.py
+    # and the snapshot read them there.
+    assert "HOME=/workspace/home" in env and "DO_NOT_TRACK=1" in env
+
+
+def test_an_images_healthcheck_never_runs_in_the_agents_container(cfg: AgentJailConfig) -> None:
+    argv = docker_create_argv(cfg)
+    assert "--no-healthcheck" in argv[: argv.index(cfg.image)]
+
+
+@pytest.mark.parametrize(
+    "timeout", [float("inf"), float("nan"), 1e9, 600.5, 0, -1, True, "60"], ids=str
+)
+def test_the_ready_timeout_is_bounded(cfg: AgentJailConfig, timeout: object) -> None:
+    """Review of the profiles, M1: wait_ready holds agent_lock while the agent already runs."""
+    with pytest.raises(ValueError, match="ready_timeout must be a number of seconds"):
+        replace(cfg, ready_timeout=timeout)
+
+
+def test_the_longest_ready_timeout_is_ten_minutes(cfg: AgentJailConfig) -> None:
+    assert jail_config.MAX_READY_TIMEOUT == 600
+    assert replace(cfg, ready_timeout=600).ready_timeout == 600
 
 
 def test_create_argv_follows_the_config(cfg: AgentJailConfig) -> None:

@@ -13,9 +13,11 @@ decides security is the same for every agent, and no profile field reaches it.
   ``/sys/fs/btrfs`` and ``/sys/devices/virtual/block`` are covered with empty read-only tmpfs.
 - The network is ``--internal`` with an isolated gateway: no route out and no address of the
   host on the bridge. No ports are published and no host entries are added.
-- No real API key ever reaches the container. The profile's token (OpenClaw's Gateway token)
-  and fake keys reach it through the docker CLI's environment (``-e NAME`` without a value),
-  never through an argv that ``ps`` shows.
+- No real API key ever reaches the container. The profile's token (OpenClaw's Gateway token),
+  its fake keys and its own variables reach it through the docker CLI's environment (``-e NAME``
+  without a value, create_env), never through an argv that ``ps`` or an error message shows.
+- No healthcheck: ``--no-healthcheck`` keeps an image's ``HEALTHCHECK`` from running a command
+  of its own inside the agent's container every few seconds (verify.py requires it off).
 - The only way out is the egress proxy (docs/21-diseno-t06-proxy.md), a neighbour on the same
   internal network under the alias ``backtide-proxy``. The variables only help programs find
   it: whatever ignores them has no route at all. The agent trusts the proxy's CA through its
@@ -24,6 +26,7 @@ decides security is the same for every agent, and no profile field reaches it.
   internal network (T06-1, P5), and verify.py requires it empty.
 """
 
+import math
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -81,6 +84,9 @@ AGENT_UID = 61000
 AGENT_GID = 61000
 
 NO_NEW_PRIVILEGES = "no-new-privileges=true"
+# How long wait_ready may wait at most (review of the profiles, M1): it holds agent_lock while
+# the agent already runs, so the cycle (its snapshots) and the sensor's hooks wait behind it.
+MAX_READY_TIMEOUT = 600.0
 LOG_DRIVER = "local"
 LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}  # bounded: the agent prints what it likes
 
@@ -261,8 +267,16 @@ class AgentJailConfig:
         ):
             if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
                 raise ValueError(f"{label} must be a positive integer, got {number!r}")
-        if self.ready_timeout <= 0:
-            raise ValueError(f"ready_timeout must be positive, got {self.ready_timeout!r}")
+        if (
+            isinstance(self.ready_timeout, bool)
+            or not isinstance(self.ready_timeout, int | float)
+            or not math.isfinite(self.ready_timeout)
+            or not 0 < self.ready_timeout <= MAX_READY_TIMEOUT
+        ):
+            raise ValueError(
+                f"ready_timeout must be a number of seconds above 0 and at most "
+                f"{MAX_READY_TIMEOUT:g}, got {self.ready_timeout!r}"
+            )
         if not isinstance(self.allow_shared_ids, bool):
             raise ValueError(f"allow_shared_ids must be a bool, got {self.allow_shared_ids!r}")
         if not isinstance(self.model_providers, tuple) or not all(
@@ -359,9 +373,9 @@ def jail_env_names() -> frozenset[str]:
 
 
 def token_env(config: AgentJailConfig) -> dict[str, str]:
-    """The environment the docker CLI needs for ``docker create``: the values that never go in
-    an argv. The profile's token (OpenClaw: the Gateway token) and the FAKE key of each provider
-    the profile reads from a variable (none for OpenClaw: its fake keys are in openclaw.json)."""
+    """The secret values of the agent's environment: the profile's token (OpenClaw: the Gateway
+    token) and the FAKE key of each provider the profile reads from a variable (none for
+    OpenClaw: its fake keys are in openclaw.json). They reach ``docker create`` by create_env."""
     profile = config.profile
     env: dict[str, str] = {}
     if profile.token_env is not None and config.gateway_token is not None:
@@ -371,6 +385,15 @@ def token_env(config: AgentJailConfig) -> dict[str, str]:
         if provider in fake_keys:
             env[name] = fake_keys[provider]
     return env
+
+
+def create_env(config: AgentJailConfig) -> dict[str, str]:
+    """The environment the docker CLI needs for ``docker create``: every value that never goes
+    in an argv (``ps`` shows it, and JailError messages quote the command). The profile's own
+    variables (review of the profiles, L8: an owner's variable is not a secret, but nothing of
+    the agent's environment needs to show), then token_env's. None of their names is one the
+    docker CLI reads itself (profile.reaches_docker_cli)."""
+    return dict(config.profile.env) | token_env(config)
 
 
 def volume_binds(config: AgentJailConfig) -> list[str]:
@@ -415,8 +438,9 @@ def nano_cpus(cpus: str) -> int:
 def docker_create_argv(config: AgentJailConfig) -> list[str]:
     """Arguments for ``docker`` (without the program name) that create the agent container.
 
-    Run it with token_env(config) in the CLI's environment: ``-e OPENCLAW_GATEWAY_TOKEN``
-    without a value makes the CLI copy it from there. Only the image, the entrypoint, the
+    Run it with create_env(config) in the CLI's environment: ``-e OPENCLAW_GATEWAY_TOKEN``
+    without a value makes the CLI copy it from there, and so for the profile's own variables.
+    ``--no-healthcheck`` turns off an image's own HEALTHCHECK. Only the image, the entrypoint, the
     command, the working folder and the variables come from the profile, always after every
     security option, and the profile's checks keep each a single argument docker cannot read as
     an option of its own."""
@@ -429,6 +453,7 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
         "--security-opt", NO_NEW_PRIVILEGES,
         "--security-opt", f"seccomp={config.seccomp_profile}",
         "--read-only",
+        "--no-healthcheck",
         "--network", config.network,
         "--restart", "no",
         "--memory", config.memory,
@@ -444,10 +469,12 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
         argv += ["--tmpfs", f"{target}:{options}"]
     for bind in volume_binds(config):
         argv += ["--volume", bind]
+    own = {name for name, _ in config.profile.env}
     for name, value in container_env(config):
-        argv += ["--env", f"{name}={value}"]
+        # The profile's own by name only: the value comes from the CLI's environment.
+        argv += ["--env", name if name in own else f"{name}={value}"]
     for name in token_env(config):
-        argv += ["--env", name]  # value taken from the CLI's environment, see token_env
+        argv += ["--env", name]  # value taken from the CLI's environment, see create_env
     profile = config.profile
     if profile.workdir is not None:
         argv += ["--workdir", str(profile.workdir)]

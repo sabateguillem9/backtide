@@ -35,9 +35,9 @@ from backtide.jail.config import (
     READY_LOG_LINE,
     SECCOMP_PROFILE,
     TOKEN_ENV,
+    create_env,
     docker_create_argv,
     openclaw_config,
-    token_env,
 )
 from backtide.jail.openclaw import check_rewindable
 from backtide.jail.seccomp import BLOCKED_ERRNO
@@ -536,7 +536,7 @@ def test_start_refuses_a_container_that_is_not_the_jail(
     jail = replace(running_agent.jail.config, name=name)
     if kind == "an older jail":
         older = replace(jail, seccomp_profile=DOCKER_DEFAULT_PROFILE)
-        docker.run(docker_create_argv(older), env=token_env(older))
+        docker.run(docker_create_argv(older), env=create_env(older))
         expected = "not the jail.*seccomp profile is not the current one"
     else:
         docker.run(["create", "--name", name, "--network", jail.network, jail.image])

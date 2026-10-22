@@ -16,7 +16,8 @@ from typing import Any
 import pytest
 
 from backtide.jail import proxy_config
-from backtide.jail.config import IMAGE, AgentJailConfig
+from backtide.jail.config import IMAGE, AgentJailConfig, container_env
+from backtide.jail.profile import AgentProfile
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.verify import container_problems, proxy_container_problems
 
@@ -161,7 +162,23 @@ def test_the_order_of_lists_docker_keeps_does_not_matter(cfg: AgentJailConfig) -
         ("Config.Hostname", "debug", "Hostname"),
         ("Config.Entrypoint", ["docker-entrypoint.sh"], "Entrypoint"),
         ("Config.Cmd", ["sh"], "Cmd"),
+        ("Config.Cmd", None, "Cmd"),  # OpenClaw's command is not empty
         ("Config.StopTimeout", 1, "StopTimeout"),
+        # Review of the profiles, L5: nothing of the image's runs beside the agent, Docker's
+        # own runtime and cgroup, and a working folder that is a folder
+        ("Config.Healthcheck", {"Test": ["CMD", "node", "dist/docker-healthcheck.js"]}, "Health"),
+        ("Config.Healthcheck", {"Test": ["CMD-SHELL", "touch /workspace/x"]}, "Healthcheck"),
+        ("Config.Healthcheck", {"Test": ["NONE", "x"]}, "Healthcheck"),
+        ("Config.Healthcheck", ["NONE"], "Healthcheck"),
+        ("Config.WorkingDir", "/proc/self/root", "WorkingDir"),
+        ("Config.WorkingDir", "/proc", "WorkingDir"),
+        ("Config.WorkingDir", "/sys/fs/cgroup", "WorkingDir"),
+        ("Config.WorkingDir", "/dev/shm", "WorkingDir"),
+        ("Config.WorkingDir", "work", "WorkingDir"),
+        ("Config.WorkingDir", "/app/../proc", "WorkingDir"),
+        ("HostConfig.Runtime", "runsc", "Runtime"),
+        ("HostConfig.Runtime", "io.containerd.kata.v2", "Runtime"),
+        ("HostConfig.CgroupParent", "/system.slice", "CgroupParent"),
         # Privileges
         ("HostConfig.Privileged", True, "Privileged"),
         ("HostConfig.CapAdd", ["SYS_ADMIN"], "CapAdd"),
@@ -327,6 +344,42 @@ def test_the_config_decides_the_expected_values(cfg: AgentJailConfig) -> None:
     host["PidsLimit"] = 64
     host["Tmpfs"] = {**host["Tmpfs"], "/tmp": "rw,nosuid,nodev,size=64m"}
     assert problems(other, info) == []
+
+
+@pytest.mark.parametrize(
+    "healthcheck",
+    [None, {}, {"Test": ["NONE"]}, {"Test": ["NONE"], "Interval": 180000000000, "Retries": 3}],
+)
+def test_no_healthcheck_or_the_one_docker_leaves_switched_off(
+    cfg: AgentJailConfig, healthcheck: object
+) -> None:
+    """``--no-healthcheck`` leaves ``Test: ["NONE"]``, with the image's intervals beside it (as
+    the VM shows for OpenClaw's image); an image without one leaves none."""
+    assert problems(cfg, changed("Config.Healthcheck", healthcheck)) == []
+
+
+@pytest.mark.parametrize("working_dir", [None, "", "/", "/app", "/home/agent/workspace"])
+def test_an_images_plain_working_folder_passes(cfg: AgentJailConfig, working_dir: object) -> None:
+    assert problems(cfg, changed("Config.WorkingDir", working_dir)) == []
+
+
+@pytest.mark.parametrize("runtime", [None, "", "runc"])
+def test_dockers_own_runtime_passes(cfg: AgentJailConfig, runtime: object) -> None:
+    assert problems(cfg, changed("HostConfig.Runtime", runtime)) == []
+
+
+def test_an_entrypoint_without_a_command_has_no_cmd_at_all() -> None:
+    """Review of the profiles, L7: docker keeps ``Cmd: null`` then, the same as []."""
+    agent = AgentProfile(name="bare", version="1", image=IMAGE, entrypoint="sleep", command=())
+    bare = AgentJailConfig(workspace=WORKSPACE, config_dir=CONFIG_DIR, ca_dir=CA_DIR, profile=agent)
+    env = [*IMAGE_ENV, *(f"{n}={v}" for n, v in container_env(bare))]
+    info = changed("Config.Env", env)
+    info["Config"]["Entrypoint"] = ["sleep"]
+    for cmd in (None, []):
+        info["Config"]["Cmd"] = cmd
+        assert problems(bare, info) == []
+    info["Config"]["Cmd"] = ["infinity"]
+    assert problems(bare, info) == ["Cmd is ['infinity'], not []"]
 
 
 def test_missing_sections_are_problems_not_crashes(cfg: AgentJailConfig) -> None:

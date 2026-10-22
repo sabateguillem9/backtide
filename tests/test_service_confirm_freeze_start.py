@@ -160,3 +160,26 @@ def test_a_user_pause_during_the_wait_wins(rewinding: World) -> None:
     assert rewinding.log.count("jail.wait_ready") == 1
     assert "user" in guardian.pause_reasons
     assert not rewinding.jail.running or rewinding.jail.paused
+
+
+@pytest.mark.parametrize("where", ["boot", "rewind"])
+def test_an_agent_killed_while_it_got_ready_is_never_asked_again(
+    world: World, rewinding: World, where: str
+) -> None:
+    """Review of the profiles, M1: wait_ready checks the running container and kills one that
+    sees what it must not (ExposedJail). Even with a freeze to confirm in between, that start
+    is over: recorded as exposed, never waited for again."""
+    from backtide.jail import ExposedJail  # noqa: PLC0415
+
+    here = world if where == "boot" else rewinding
+    freeze_once_to_confirm(here)
+    here.jail.ready_error = ExposedJail(
+        "killed while it got ready", ["/srv/state is mounted at /mnt"]
+    )
+    if where == "boot":
+        here.guardian.start()
+    else:
+        here.guardian.rewind(here.volume.listed[0].id, requested_by="cli")
+    assert here.log.count("jail.wait_ready") == 1
+    (failed,) = here.events("agent_start_failed")
+    assert failed.details["exposed"] == ["/srv/state is mounted at /mnt"] and failed.risk == 3

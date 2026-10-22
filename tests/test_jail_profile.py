@@ -5,6 +5,7 @@ test_jail_openclaw_snapshot.py."""
 import dataclasses
 import json
 import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -22,7 +23,14 @@ from backtide.jail.config import (
     token_env,
 )
 from backtide.jail.docker import JailError
-from backtide.jail.profile import RESERVED_ENV, AgentProfile, ProfileError, is_reserved_env
+from backtide.jail.profile import (
+    RESERVED_ENV,
+    AgentProfile,
+    ProfileError,
+    image_env_problem,
+    image_secret,
+    is_reserved_env,
+)
 from backtide.jail.profiles import DEFAULT_PROFILE, OPENCLAW
 from backtide.jail.profiles.openclaw import ModelProvider, UnrewindableConfig
 from backtide.jail.verify import container_problems
@@ -116,10 +124,30 @@ RESERVED = (
     "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_OPTIONS",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "ld_audit", "BASH_ENV", "ENV", "PATH", "PYTHONPATH",
     "NODE_TLS_REJECT_UNAUTHORIZED", "GIT_SSL_NO_VERIFY",
+    # By family, after the review of the profiles (L6): not a complete list, a floor.
+    "No_proxy", "All_Proxy", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_PARAMETERS", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_ASKPASS", "GIT_EXEC_PATH",
+    "PROMPT_COMMAND", "PS4", "BASH_FUNC_ls%%", "BASH_FUNC_x", "PERL5LIB", "PERL5OPT",
+    "PERLLIB", "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+    "IBM_JAVA_OPTIONS", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONWARNINGS", "npm_config_prefix",
+    "NPM_CONFIG_USERCONFIG", "GCONV_PATH", "GLIBC_TUNABLES", "DYLD_INSERT_LIBRARIES",
+    "OPENSSL_CONF", "SSLKEYLOGFILE", "NODE_REPL_EXTERNAL_MODULE", "ZDOTDIR", "LUA_INIT",
 )  # fmt: skip
 
 
 @pytest.mark.parametrize("name", RESERVED)
+def test_the_reserved_families(name: str) -> None:
+    assert is_reserved_env(name)
+
+
+@pytest.mark.parametrize(
+    "name", ["NODE_ENV", "MY_AGENT_MODE", "XDG_CONFIG_HOME", "GITHUB_WORKSPACE", "TERM", "LANG"]
+)
+def test_what_is_not_reserved(name: str) -> None:
+    assert not is_reserved_env(name)
+
+
+@pytest.mark.parametrize("name", [n for n in RESERVED if n.replace("_", "").isalnum()])
 @pytest.mark.parametrize(
     "where",
     [
@@ -132,7 +160,8 @@ RESERVED = (
     ids=["env", "proxy_url_env", "ca_file_env", "token_env", "fake_key_env"],
 )
 def test_a_profile_cannot_set_a_reserved_variable(name: str, where: Any) -> None:
-    with pytest.raises(ValueError, match="set by the jail"):
+    # GIT_CONFIG_KEY_0 and SSLKEYLOGFILE carry a secret's word: refused for that first.
+    with pytest.raises(ValueError, match="set by the jail|never carry a secret|must end in _KEY"):
         profile(**where(name))
 
 
@@ -183,6 +212,118 @@ def test_a_profile_cannot_set_a_reserved_variable(name: str, where: Any) -> None
 def test_invalid_profiles_are_refused(changes: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         profile(**changes)
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["a\x1b[2Jb", "a\u202eb", "a\u200bb", "a\tb", "a\x07b", "x" * 301],
+    ids=["escape", "bidi", "zero-width", "tab", "bell", "too-long"],
+)
+def test_a_rewind_notice_line_is_printable_and_short(line: str) -> None:
+    """Review of the profiles, L9: the lines go as they are to the terminal, Telegram and the
+    web."""
+    with pytest.raises(ValueError, match="printable text of at most 300"):
+        profile(rewind_notice_lines=(line,))
+
+
+def test_the_named_profiles_notice_lines_pass() -> None:
+    assert OPENCLAW.rewind_notice_lines
+    assert profile(rewind_notice_lines=("x" * 300, "Ñandú: ¿vuelve? «sí».")).rewind_notice_lines
+
+
+# --- the image's own environment (review of the profiles, L6 and L8) -------------------------
+
+# The two pinned images' own variables (docker image inspect in the VM): none is refused.
+OPENCLAW_IMAGE_ENV = (
+    "PATH=/home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "NODE_VERSION=24.21.0", "YARN_VERSION=1.22.22", "COREPACK_HOME=/usr/local/share/corepack",
+    "PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright", "NODE_ENV=production",
+)  # fmt: skip
+CLAUDE_CODE_IMAGE_ENV = (
+    "PATH=/home/agent/.local/bin:/usr/local/share/npm-global/bin:/usr/local/sbin:/usr/local/bin"
+    ":/usr/sbin:/usr/bin:/sbin:/bin",
+    "NPM_CONFIG_PREFIX=/usr/local/share/npm-global",
+    "NO_PROXY=localhost,127.0.0.1,::1,172.17.0.0/16",  # the jail's wins (not checked here)
+    "BASH_ENV=/etc/sandbox-persistent.sh",  # the jail's wins
+    "CLAUDE_ENV_FILE=/etc/sandbox-persistent.sh",
+)
+PYTHON_IMAGE_ENV = (
+    "LANG=C.UTF-8", "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+    "PYTHON_VERSION=3.12.13", "PYTHON_SHA256=" + "7e" * 32, "PYTHONUNBUFFERED=1",
+)  # fmt: skip
+
+
+def _env_problems(entries: tuple[str, ...]) -> dict[str, str | None]:
+    pairs = (entry.partition("=") for entry in entries)
+    return {name: image_env_problem(name, value) for name, _, value in pairs}
+
+
+@pytest.mark.parametrize(
+    "entries", [OPENCLAW_IMAGE_ENV, PYTHON_IMAGE_ENV, CLAUDE_CODE_IMAGE_ENV[:2]], ids=str
+)
+def test_the_usual_images_own_variables_pass(entries: tuple[str, ...]) -> None:
+    assert set(_env_problems(entries).values()) == {None}
+    assert not any(image_secret(*entry.split("=", 1)) for entry in entries)
+
+
+HOSTILE_IMAGE_ENV = {
+    "LD_PRELOAD": "/workspace/work/evil.so",
+    "LD_LIBRARY_PATH": "/usr/lib:/tmp/libs",
+    "ld_audit": "/dev/shm/a.so",  # noqa: S108 - inside the container
+    "NODE_OPTIONS": "--require /workspace/home/x.js",
+    "node_options": "--import ./x.mjs",
+    "PYTHONPATH": "/proc/self/cwd",
+    "PYTHONSTARTUP": "~/.startup.py",
+    "PERL5LIB": "lib",
+    "PERL5OPT": "-Mx -I$HOME/lib",
+    "RUBYLIB": "/usr/lib/ruby::/usr/lib/x",
+    "PATH": "/usr/bin:.:/bin",
+    "No_proxy": "*",
+    "ALL_PROXY": "socks5://127.0.0.1:1080",
+    "PROMPT_COMMAND": "true",
+    "PS4": "$(id)",
+    "BASH_FUNC_ls%%": "() { true; }",
+    "ENV": "/etc/shrc",
+    "GIT_CONFIG_COUNT": "1",
+    "JAVA_TOOL_OPTIONS": "-javaagent:/tmp/a.jar",
+    "npm_config_userconfig": "/workspace/home/.npmrc",
+    "GCONV_PATH": "/run/gconv",
+}
+
+
+@pytest.mark.parametrize(("name", "value"), HOSTILE_IMAGE_ENV.items(), ids=HOSTILE_IMAGE_ENV)
+def test_an_images_loader_variable_pointing_at_the_agent_is_refused(name: str, value: str) -> None:
+    why = image_env_problem(name, value)
+    assert why is not None
+    assert value not in why  # never quoted
+
+
+def test_an_images_node_options_with_numbers_only_passes() -> None:
+    assert image_env_problem("NODE_OPTIONS", "--max-old-space-size=4096") is None
+    assert image_env_problem("NODE_OPTIONS", "--require x") is not None  # found from the cwd
+    assert image_env_problem("LD_PRELOAD", "/usr/lib/libjemalloc.so.2") is None  # read-only
+    assert image_env_problem("LD_PRELOAD", "") is None  # empty: nothing loaded
+
+
+SECRET_IMAGE_ENV = {
+    "LEAKED_API_TOKEN": "plain-looking-value-0",
+    "DB_PASSWORD": "hunter2",
+    "AWS_SECRET_ACCESS_KEY": "abcd",
+    "SERVICE_CREDENTIALS": "x",
+    "AGENT_SETTING": "sk-ant-api03-" + "Zz9" * 10,
+}
+
+
+@pytest.mark.parametrize(("name", "value"), SECRET_IMAGE_ENV.items(), ids=SECRET_IMAGE_ENV)
+def test_an_images_secret_by_name_or_shape_is_refused(name: str, value: str) -> None:
+    assert image_secret(name, value)
+
+
+@pytest.mark.parametrize(
+    "entry", ["GPG_KEY=7169605F", "NODE_SHA256=abc", "KEYRING_VERSION=1", "API_TOKEN="]
+)
+def test_the_images_public_names_pass(entry: str) -> None:
+    assert not image_secret(*entry.split("=", 1))
 
 
 def test_check_profile_param_only_allows_request_fields() -> None:
@@ -357,6 +498,54 @@ def test_prepare_workspace_creates_the_profiles_folders(local: dict[str, Any]) -
     jail = AgentJail(AgentJailConfig(**local, profile=profile(workspace_dirs=("home", "src"))))
     jail.prepare_workspace()
     assert sorted(p.name for p in jail.config.agent_dir.iterdir()) == ["home", "src"]
+
+
+def test_prepare_workspace_creates_the_profiles_working_folder(local: dict[str, Any]) -> None:
+    """Review of the profiles, L5: backtide makes it, for the agent; Docker would otherwise
+    create a missing one itself, as root."""
+    agent = profile(workdir=PurePosixPath("/workspace/work/repo/src"))
+    jail = AgentJail(AgentJailConfig(**local, profile=agent))
+    jail.prepare_workspace()
+    folder = jail.config.agent_dir / "work" / "repo" / "src"
+    assert folder.is_dir() and not folder.is_symlink()
+    assert folder.stat().st_uid == os.getuid() and stat.S_IMODE(folder.stat().st_mode) == 0o700
+    jail.write_config()
+    jail._check_mount_sources()  # noqa: SLF001 - what create() and start() check first
+
+
+@pytest.mark.parametrize("link", ["work/repo", "work/repo/src", "work"])
+def test_a_symlinked_working_folder_is_refused(local: dict[str, Any], link: str) -> None:
+    """The agent controls everything below /workspace: its working folder, or any folder on
+    the way to it, made a symlink is never followed, at prepare, create or start."""
+    agent = profile(workdir=PurePosixPath("/workspace/work/repo/src"))
+    jail = AgentJail(AgentJailConfig(**local, profile=agent))
+    jail.prepare_workspace()
+    jail.write_config()
+    target = jail.config.agent_dir / link
+    elsewhere = local["workspace"].parent / "elsewhere"
+    (elsewhere / "repo" / "src").mkdir(parents=True)
+    _replace_with_link(target, elsewhere if link == "work" else elsewhere / target.name)
+    with pytest.raises(JailError, match="not a directory \\(a symlink"):
+        jail._check_mount_sources()  # noqa: SLF001
+    with pytest.raises(JailError, match="not a directory \\(a symlink"):
+        jail.prepare_workspace()
+
+
+def test_a_missing_working_folder_is_refused_at_start(local: dict[str, Any]) -> None:
+    agent = profile(workdir=PurePosixPath("/workspace/work/repo"))
+    jail = AgentJail(AgentJailConfig(**local, profile=agent))
+    jail.prepare_workspace()
+    jail.write_config()
+    (jail.config.agent_dir / "work" / "repo").rmdir()
+    with pytest.raises(JailError, match="repo is missing"):
+        jail._check_mount_sources()  # noqa: SLF001
+
+
+def _replace_with_link(path: Path, target: Path) -> None:
+    for child in sorted(path.rglob("*"), reverse=True):
+        child.rmdir()
+    path.rmdir()
+    path.symlink_to(target)
 
 
 def test_a_profile_without_config_files_gets_an_empty_folder(local: dict[str, Any]) -> None:

@@ -18,6 +18,7 @@ purpose, so what is checked there is that it has nothing else (docs/23, section 
 """
 
 import json
+from pathlib import PurePosixPath
 from typing import Any
 
 from backtide.jail import proxy_config
@@ -232,7 +233,43 @@ def _config_problems(config: AgentJailConfig, created: dict[str, Any]) -> list[s
     }
     if profile.workdir is not None:
         expected["WorkingDir"] = str(profile.workdir)
-    return _differences("", created, expected)
+    # An entrypoint without a command: docker keeps no Cmd at all (null), the same as [].
+    problems = [
+        f"{name} is {created.get(name)!r}, not {value!r}"
+        for name, value in expected.items()
+        if (created.get(name) or [] if name == "Cmd" else created.get(name)) != value
+    ]
+    healthcheck = created.get("Healthcheck")
+    if healthcheck and not (isinstance(healthcheck, dict) and healthcheck.get("Test") == ["NONE"]):
+        # The image's HEALTHCHECK runs a command of its own in the agent's container every few
+        # seconds; docker_create_argv turns it off (--no-healthcheck).
+        problems.append("Config.Healthcheck is set: only the agent runs in its container")
+    if profile.workdir is None:
+        problems += _working_dir_problems(created.get("WorkingDir"))
+    return problems
+
+
+# ``--no-healthcheck`` leaves ``Config.Healthcheck.Test`` as ["NONE"] (and keeps the image's
+# intervals beside it, which then mean nothing: measured in the VM with OpenClaw's image).
+# Where an image's WORKDIR may never put the agent: the kernel's views, not a folder of files.
+_KERNEL_TREES = ("proc", "sys", "dev")
+
+
+def _working_dir_problems(working_dir: object) -> list[str]:
+    """The image's own WORKDIR (a profile without ``workdir`` keeps it): a plain absolute path
+    outside /proc, /sys and /dev (``/proc/self/root``, ``/proc/1/cwd`` are other trees). Empty
+    or missing: Docker's ``/``."""
+    if working_dir in (None, ""):
+        return []
+    path = PurePosixPath(str(working_dir))
+    if (
+        not isinstance(working_dir, str)
+        or not path.is_absolute()
+        or ".." in path.parts
+        or (len(path.parts) > 1 and path.parts[1] in _KERNEL_TREES)
+    ):
+        return [f"Config.WorkingDir is {str(working_dir)[:200]!r}: not a plain folder"]
+    return []
 
 
 def _host_problems(
@@ -262,6 +299,12 @@ def _host_problems(
     if sorted(host.get("Binds") or []) != sorted(volume_binds(config)):
         problems.append(f"its mounts are {host.get('Binds')!r}, not {volume_binds(config)!r}")
     problems += _security_opt_problems(host.get("SecurityOpt") or [], seccomp_profile)
+    # Docker's own runtime and cgroup, as for the proxy (_proxy_runtime_problems). The masks of
+    # /proc and /sys are mounts.py's (exposure_problems).
+    if host.get("Runtime") not in (None, "", "runc"):
+        problems.append(f"HostConfig.Runtime is {host.get('Runtime')!r}, not runc")
+    if host.get("CgroupParent"):
+        problems.append(f"HostConfig.CgroupParent is set: {host['CgroupParent']!r}")
     return problems
 
 

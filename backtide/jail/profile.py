@@ -10,10 +10,15 @@ Nothing that decides the jail's security comes from here, and an AgentProfile ha
 it: the uid and gid, the capabilities, seccomp, the read-only root, the tmpfs and the /sys
 masks, the mounts, the network, the limits, ``HOME``, the proxy's variables and the CA's path
 are AgentJailConfig's (backtide/jail/config.py) and the same for every agent. A profile cannot
-set a variable the jail sets itself (``RESERVED_ENV``) nor one that changes how programs load
-code (``NODE_OPTIONS``, ``LD_*``, ``BASH_ENV``...), nor allow anything at the provider but
-top-level fields by name (``param:<name>``, decision 5): never a provider-side tool. A wrong
-profile can stop its agent from working, never let it escape or send anything unrecorded.
+set a variable the jail sets itself, nor one of the families that change how programs load code
+or find the network (``is_reserved_env``: ``LD_*``, ``NODE_OPTIONS``, ``PYTHON*``, ``PERL5*``,
+``GIT_CONFIG_*``, ``npm_config_*``, ``BASH_FUNC_*``, every ``*_PROXY``...). The list is by
+families and grows when a new way to load code shows up: it is a floor, not a complete list of
+what an environment variable can do. A profile cannot either name a variable the docker CLI
+reads on the host (``reaches_docker_cli``: its values travel in that CLI's environment), nor
+allow anything at the provider but plain top-level fields by name (``param:<name>``, decision
+5): never a provider-side tool, search or retrieval. A wrong profile can stop its agent from
+working, never let it escape or send anything unrecorded.
 
 The jail's layout inside the container lives here too: a profile names those paths (OpenClaw's
 state folder, its config file) but never changes them.
@@ -43,21 +48,86 @@ CONTAINER_STATE = CONTAINER_WORKSPACE / "state"
 CONTAINER_WORK = CONTAINER_WORKSPACE / "work"
 
 # Variables a profile may never set (docs/34, section 6): those the jail sets itself (config.py
-# checks it has them all), and those that change how a program finds its code or its network.
+# checks it has them all), and those that change how a program finds its code, its shell or its
+# network. By name here and by family below (_RESERVED_SHAPES), whatever the case: not a
+# complete list of what a variable can do, a floor that grows with each new way found.
 RESERVED_ENV = frozenset(
     {
         "HOME", "DO_NOT_TRACK", "NODE_USE_ENV_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
         "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_OPTIONS",
         "BASH_ENV", "CLAUDE_ENV_FILE", "ENV", "PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
         "NODE_PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_SSL_NO_VERIFY",
-        "NODE_TLS_REJECT_UNAUTHORIZED", "PYTHONHTTPSVERIFY",
+        "NODE_TLS_REJECT_UNAUTHORIZED", "PYTHONHTTPSVERIFY", "NODE_REPL_EXTERNAL_MODULE",
+        "NODE_ICU_DATA", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS",
+        "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF",
+        "PROMPT_COMMAND", "PS4", "SHELLOPTS", "BASHOPTS", "ZDOTDIR", "PERLLIB",
+        "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "GCONV_PATH", "GLIBC_TUNABLES", "HOSTALIASES",
+        "LOCALDOMAIN", "RES_OPTIONS", "OPENSSL_CONF", "OPENSSL_MODULES", "SSLKEYLOGFILE",
+        "CURL_HOME", "WGETRC", "LUA_INIT", "LUA_PATH", "LUA_CPATH",
     }
 )  # fmt: skip
-# By shape, whatever the case: every *_PROXY (HTTP_PROXY, ALL_PROXY, NO_PROXY...), and LD_*.
-_RESERVED_SHAPES = (re.compile(r".*_PROXY", re.IGNORECASE), re.compile(r"LD_.*", re.IGNORECASE))
+# By family, whatever the case: every *_PROXY (HTTP_PROXY, ALL_PROXY, No_proxy...), the dynamic
+# loaders' LD_* and DYLD_*, git's GIT_CONFIG_* (GIT_CONFIG_COUNT, KEY_0, VALUE_0, PARAMETERS),
+# bash's exported functions, Perl's, Ruby's, Python's and Java's own, and npm's settings.
+_RESERVED_SHAPES = tuple(
+    re.compile(shape, re.IGNORECASE)
+    for shape in (
+        r".*_PROXY", r"LD_.*", r"DYLD_.*", r"GIT_CONFIG_.*", r"BASH_FUNC_.*", r"PERL5.*",
+        r"RUBY.*", r"PYTHON.*", r".*_JAVA_OPTIONS", r"NPM_CONFIG_.*",
+    )
+)  # fmt: skip
+# Code, or settings that run code, as they are read (shell code, git's config given by
+# variables: ``core.fsmonitor``, ``core.sshCommand``...): an image may set none of them, there
+# is no path to look at.
+_CODE_SHAPES = tuple(
+    re.compile(shape, re.IGNORECASE)
+    for shape in (
+        r"PROMPT_COMMAND", r"PS4", r"ENV", r"BASH_FUNC_.*", r"SHELLOPTS", r"BASHOPTS",
+        r"GIT_CONFIG_(?:COUNT|KEY_.*|VALUE_.*|PARAMETERS)", r"GIT_SSH_COMMAND",
+        r"GIT_PROXY_COMMAND",
+    )
+)  # fmt: skip
+# Lists of folders a program looks for code in, ``:``-separated: every entry must be absolute.
+_PATH_LIST_SHAPES = tuple(
+    re.compile(shape, re.IGNORECASE)
+    for shape in (
+        r".*PATH", r"LD_LIBRARY_PATH", r"PERL5LIB", r"PERLLIB", r"RUBYLIB", r"GCONV_PATH",
+    )
+)  # fmt: skip
+# Where the agent can write inside its container, or reach what it writes: a variable of the
+# image that points there hands it code that runs in every later process (the jail's probes,
+# the battery's scripts, ``/bin/true``). ``~`` and ``$`` expand to who knows where (HOME is
+# /workspace/home).
+_AGENT_WRITABLE = ("/workspace", "/tmp", "/var/tmp", "/dev/shm", "/proc", "/dev/fd", "/run")  # noqa: S108 - inside the container
+_EXPANSIONS = ("~", "$", "`")
+_NUMBER_RE = re.compile(r"[0-9][0-9.]*[kmgKMG%]?", re.ASCII)
+# What the docker CLI (and the Go programs it runs: its plugins, credential helpers) reads from
+# its own environment on the host. The profile's variables, the token and the fake key reach
+# ``docker create`` through that environment (``--env NAME``, never their values in the argv),
+# so none of them may be one of these: ``DOCKER_HOST`` would point backtide's own docker at
+# another daemon, ``DOCKER_CONFIG`` at another config, ``GO*`` and ``OTEL_*`` change how the
+# CLI runs or where it reports, ``SSH_*`` and ``DBUS_*`` what its ssh:// contexts and credential
+# helpers talk to. ``LC_ALL`` is always ``C`` for the CLI (docker.run sets it last), so a
+# profile's value could never reach the agent: refused too.
+_DOCKER_CLI_SHAPES = tuple(
+    re.compile(shape, re.IGNORECASE)
+    for shape in (
+        r"DOCKER_.*", r"BUILDKIT_.*", r"BUILDX_.*", r"COMPOSE_.*", r"GO.*", r"OTEL_.*",
+        r"NOTARY_.*", r"SSH_.*", r"DBUS_.*", r"LC_ALL", r"TMPDIR", r"XDG_RUNTIME_DIR",
+        r"KUBECONFIG", r"CONTAINERD_.*", r"MOBY_.*",
+    )
+)  # fmt: skip
+# The variable that gets a fake model key says so by its name (``ANTHROPIC_API_KEY``,
+# ``OPENAI_API_KEY``, ``..._TOKEN``): never one that means something else to a program.
+_KEY_SUFFIXES = ("_KEY", "_TOKEN")
 # A profile's own variables never carry a secret: the fake key and the Gateway token have their
 # own fields, and their values never go in the argv.
 _SECRET_WORDS = ("KEY", "SECRET", "PASSWORD", "TOKEN", "CREDENTIAL")
+# What the image's own environment may hold under a secret's name, being public: the GPG key
+# id that python's images verify their download with, checksums and versions.
+_PUBLIC_IMAGE_NAMES = ("GPG_KEY",)
+_PUBLIC_IMAGE_SUFFIXES = ("_SHA256", "_VERSION")
+MAX_NOTICE_LINE = 300  # characters of one line of the rewind notice: a sentence, not a page
 
 # Never a first "-": docker would read the image as one of its own options.
 PINNED_IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}", re.ASCII)
@@ -92,6 +162,57 @@ class ProfileError(ValueError):
 def is_reserved_env(name: str) -> bool:
     """Whether ``name`` is a variable only the jail may set, or none may."""
     return name.upper() in RESERVED_ENV or any(shape.fullmatch(name) for shape in _RESERVED_SHAPES)
+
+
+def reaches_docker_cli(name: str) -> bool:
+    """Whether the docker CLI on the host, or a program it runs, reads ``name`` itself."""
+    return any(shape.fullmatch(name) for shape in _DOCKER_CLI_SHAPES)
+
+
+def image_secret(name: str, value: str) -> bool:
+    """Whether the image's own variable ``name=value`` looks like it carries a secret: as for a
+    profile's (``secret_shaped``), or a non-empty value under a secret's name (``..._TOKEN``,
+    ``..._KEY``, ``PASSWORD``...), except the public ones images carry (``GPG_KEY``,
+    ``*_SHA256``, ``*_VERSION``). Docker hands every one of them to the agent."""
+    if secret_shaped(name, value):
+        return True
+    upper = name.upper()
+    if not value or upper in _PUBLIC_IMAGE_NAMES or upper.endswith(_PUBLIC_IMAGE_SUFFIXES):
+        return False
+    return any(word in upper for word in _SECRET_WORDS)
+
+
+def image_env_problem(name: str, value: str) -> str | None:
+    """Why the image's own variable ``name=value`` cannot reach the agent, or None. Only for a
+    reserved name (``is_reserved_env``) that the jail does not set itself (the jail's value
+    wins over the image's): a proxy setting, code (shell, git's config), or something that
+    points where the agent writes (``/workspace``, ``/tmp``...), expands (``~``, ``$``) or is
+    relative (a folder the agent is in). Never quotes the value. What passes is the pinned
+    image's own (absolute paths on the read-only root), and AgentJail logs it."""
+    if not value or not is_reserved_env(name):
+        return None
+    if name.upper().endswith("_PROXY"):
+        return "a proxy setting: the jail's alone"
+    if any(shape.fullmatch(name) for shape in _CODE_SHAPES):
+        return "code that runs as it is read"
+    if any(mark in value for mark in _EXPANSIONS):
+        return "it expands: unchecked"
+    for token in re.split(r"[\s:=,;]+", value):
+        if not token or token.startswith("-"):
+            continue
+        if token.startswith("/"):
+            if any(token == place or token.startswith(f"{place}/") for place in _AGENT_WRITABLE):
+                return "points where the agent writes"
+        elif "/" in token or token.startswith("."):
+            return "a relative path: the agent's folder"
+        elif name.upper() == "NODE_OPTIONS" and not _NUMBER_RE.fullmatch(token):
+            # --require x, --import x, --loader x: Node looks for x from where it runs.
+            return "a module Node looks for in the agent's folder"
+    if any(shape.fullmatch(name) for shape in _PATH_LIST_SHAPES) and any(
+        not entry.startswith("/") for entry in value.split(":")
+    ):
+        return "an empty or relative entry: the agent's folder"
+    return None
 
 
 def secret_shaped(name: str, value: str) -> bool:
@@ -201,6 +322,13 @@ class AgentProfile:
             raise ValueError("rewind_notice_lines must be a tuple of texts")
         for line in self.rewind_notice_lines:
             _text("a rewind notice line", line, allow_empty=False)
+            # Printed as it is in the terminal, Telegram and the web: no escape sequence, no
+            # bidi override, no zero-width trick, and a sentence, not a wall of text.
+            if not line.isprintable() or len(line) > MAX_NOTICE_LINE:
+                raise ValueError(
+                    f"a rewind notice line must be printable text of at most {MAX_NOTICE_LINE} "
+                    "characters"
+                )
         if not isinstance(self.provider_params, tuple):
             raise ValueError("provider_params must be a tuple")
         for entry in self.provider_params:
@@ -262,6 +390,21 @@ class AgentProfile:
             _match("variable name", name, _ENV_NAME_RE)
             if is_reserved_env(name):
                 raise ValueError(f"{name} is set by the jail, never by a profile")
+        # These reach `docker create` through the docker CLI's own environment on the host.
+        for name in [*own, *(name for name, _ in self.fake_key_env)] + (
+            [] if self.token_env is None else [self.token_env]
+        ):
+            if reaches_docker_cli(name):
+                raise ValueError(
+                    f"{name} is read by the docker CLI on the host, and the agent's variables "
+                    "reach it through that CLI's environment: use another name"
+                )
+        for name, _ in self.fake_key_env:
+            if not name.upper().endswith(_KEY_SUFFIXES):
+                raise ValueError(
+                    f"{name}: the variable that gets the fake model key must end in _KEY, "
+                    "_API_KEY or _TOKEN"
+                )
         if len(set(every)) != len(every):
             raise ValueError("the profile sets the same variable twice")
 

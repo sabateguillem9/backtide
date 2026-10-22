@@ -644,9 +644,7 @@ class Guardian:
         try:
             self._box.open()
             self._previous_run = self._box.head() is not None
-            self._box.append(
-                "system", "service_start", "", details={"version": backtide.__version__}
-            )
+            self._box.append("system", "service_start", "", details=self._start_details())
         except BlackBoxError as error:
             logger.error("cannot use the black box, so the service does not start: %s", error)
             self._alert(
@@ -657,6 +655,17 @@ class Guardian:
             )
             self._stop_unrecorded(error)
             raise
+
+    def _start_details(self) -> dict[str, Any]:
+        """What ``service_start`` says: backtide's version, which agent profile runs and the
+        provider fields that profile lets through the gate on its own (``param:<name>``, decision
+        5 of docs/34), so what reaches a provider beyond the gate's lists is on the record."""
+        profile = self._config.agent_profile
+        return {
+            "version": backtide.__version__,
+            "profile": profile.name,
+            "profile_params": list(profile.provider_params),
+        }
 
     def _stop_unrecorded(self, error: BaseException) -> None:
         """The black box is not usable: stop an agent that is running, with nothing to record."""
@@ -992,6 +1001,8 @@ class Guardian:
             self._jail.start()
             try:
                 self._jail.wait_ready()
+            except ExposedJail:
+                raise  # killed while it got ready: never asked again
             except JailError:
                 if not self._ready_after_confirm_freeze(freezes):
                     raise
@@ -2556,7 +2567,11 @@ class Guardian:
                 raise
             # The agent was started and ``wait_ready`` failed. If that was a freeze to confirm
             # that turned out a false alarm, the agent is ready now and the start succeeded.
-            if body_error is not None or not self._ready_after_confirm_freeze(freezes):
+            if (
+                body_error is not None
+                or isinstance(error, ExposedJail)  # killed while it got ready: never again
+                or not self._ready_after_confirm_freeze(freezes)
+            ):
                 attempt.start_error = error
                 attempt.problems.append("agent")
                 self._agent_did_not_start(error)

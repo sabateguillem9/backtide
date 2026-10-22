@@ -1449,3 +1449,28 @@ recorded = "yes"
 risk = "3"
 recoverable = "n/a"
 held = "n/a"
+
+[[scenario]]
+id = "perfil-hostil"
+name = "Un perfil y una imagen hostiles para el agente"
+story = """Tras la revisión de seguridad de los perfiles. Un perfil `custom` es el TOML del dueño y la \
+imagen que nombra, y los dos pueden venir copiados de un sitio hostil. Se hacen en la VM, a partir \
+de la imagen fijada de OpenClaw (`docker commit --change`, sin descargar nada), imágenes con un \
+secreto en su ENV, con `LD_PRELOAD`, `NODE_OPTIONS` y un `No_proxy` en mayúsculas y minúsculas \
+apuntando a lo que escribe el agente, con un `VOLUME`, con un `HEALTHCHECK` que escribe en \
+/workspace y un `WORKDIR` bajo /proc; y TOML con `key_env = "DOCKER_HOST"`, una variable que lee \
+el docker del anfitrión, `timeout = inf` (y nan, 1e9), campos del proveedor que encienden una \
+búsqueda en su lado, una variable reservada y un aviso con una secuencia de escape. Cada cosa se \
+rechaza (el servicio no arranca, o el agente no arranca nunca y queda grabado) o se neutraliza (el \
+healthcheck no se ejecuta, el agente arranca en su carpeta). Y lo que puede hacer el propio \
+agente: cambiar su carpeta de trabajo por un enlace a /etc del anfitrión, que se rechaza al \
+siguiente arranque. El agente nunca corre debilitado."""
+inspired_by = "La revisión de seguridad de los perfiles (T17a-3): lo que entra por el TOML y por la imagen"
+invariants = [2, 5, 7]
+status = "ready"
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "2"
+recoverable = "n/a"
+held = "n/a"

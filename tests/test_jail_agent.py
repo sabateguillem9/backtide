@@ -19,10 +19,10 @@ from backtide.jail import docker
 from backtide.jail.agent import AgentJail, ExposedJail
 from backtide.jail.config import (
     AgentJailConfig,
+    create_env,
     docker_create_argv,
     network_create_argv,
     openclaw_config,
-    token_env,
 )
 from backtide.jail.docker import JailError
 from backtide.jail.mounts import exposure_problems
@@ -440,7 +440,8 @@ def test_create_passes_the_token_through_the_environment(
     ready_jail.create()
     (call,) = [c for c in fake_docker.calls if c.args[0] == "create"]
     assert call.args == docker_create_argv(ready_jail.config)
-    assert call.env == token_env(ready_jail.config)
+    assert call.env == create_env(ready_jail.config)  # the profile's variables, and the token
+    assert call.env[openclaw_profile.TOKEN_ENV] == TOKEN
     assert TOKEN not in " ".join(call.args)
 
 
@@ -786,6 +787,83 @@ def test_start_refuses_an_image_whose_own_environment_carries_a_secret(
     assert ["start", ready_jail.config.name] not in fake_docker.commands()
 
 
+@pytest.mark.parametrize(
+    "entry",
+    ["SERVICE_CREDENTIALS=x", "TOKEN_FILE_CONTENTS=abc12345", "MYKEY=abc"],
+)
+def test_start_refuses_an_image_variable_named_like_a_secret(
+    ready_jail: AgentJail, fake_docker: FakeDocker, entry: str
+) -> None:
+    """Review of the profiles, L8: the same check of the name as for a profile's own
+    variables, which ``secret_shaped`` alone missed for these."""
+    fake_docker.reply("image", "inspect", Reply(json.dumps(["PATH=/bin", entry])))
+    name, _, value = entry.partition("=")
+    with pytest.raises(JailError, match=f"looks like a secret.*\\({name}\\)") as caught:
+        ready_jail.start()
+    assert value not in str(caught.value)
+    assert ["start", ready_jail.config.name] not in fake_docker.commands()
+
+
+HOSTILE_IMAGE_ENV = [
+    "LD_PRELOAD=/workspace/work/evil.so",
+    "NODE_OPTIONS=--require /workspace/home/evil.js",
+    "No_proxy=*",
+    "PS4=$(touch /workspace/work/ran)",
+    "GIT_CONFIG_COUNT=1",  # with GIT_CONFIG_KEY_0=core.fsmonitor: git runs what it says
+]
+
+
+def test_start_refuses_an_image_that_loads_code_from_where_the_agent_writes(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    """Review of the profiles, L6: a reserved variable of the image that the jail does not set
+    reaches the agent as the image says; pointing at /workspace it would run the agent's code in
+    every later process (the probes, ``/bin/true``). Every one is named; no value is quoted."""
+    fake_docker.reply("image", "inspect", Reply(json.dumps(["PATH=/bin", *HOSTILE_IMAGE_ENV])))
+    with pytest.raises(JailError, match="cannot run as the agent") as caught:
+        ready_jail.start()
+    message = str(caught.value)
+    for entry in HOSTILE_IMAGE_ENV:
+        name, _, value = entry.partition("=")
+        assert f"{name} (" in message
+        assert len(value) < 3 or value not in message
+    assert ["start", ready_jail.config.name] not in fake_docker.commands()
+
+
+def test_start_names_both_secrets_and_loaders_of_the_image(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    env = ["LEAKED_API_TOKEN=plain-value-0", "LD_PRELOAD=/tmp/x.so"]
+    fake_docker.reply("image", "inspect", Reply(json.dumps(env)))
+    with pytest.raises(JailError, match="LEAKED_API_TOKEN.*LD_PRELOAD"):
+        ready_jail.start()
+
+
+def test_start_logs_the_images_own_reserved_variables(
+    ready_jail: AgentJail, fake_docker: FakeDocker, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Absolute paths on the read-only root are the pinned image's own: they run, said once."""
+    env = [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "NPM_CONFIG_PREFIX=/usr/local/share/npm-global",
+        "NO_PROXY=172.17.0.0/16",  # the jail's own wins: no warning
+        "BASH_ENV=/etc/sandbox-persistent.sh",
+    ]
+    fake_docker.reply("image", "inspect", Reply(json.dumps(env)))
+    with caplog.at_level("INFO", logger="backtide.jail.agent"):
+        ready_jail.start()
+    assert ["start", ready_jail.config.name] in fake_docker.commands()
+    (warning,) = [
+        r.getMessage()
+        for r in caplog.records
+        if "does not override" in r.getMessage() and r.levelname == "INFO"  # never an alert
+    ]
+    assert "NPM_CONFIG_PREFIX, PATH, PYTHONDONTWRITEBYTECODE" in warning
+    assert "NO_PROXY" not in warning and "BASH_ENV" not in warning
+    assert "/usr/local" not in warning  # names only
+
+
 def test_start_accepts_an_image_environment_without_secrets(
     ready_jail: AgentJail, fake_docker: FakeDocker
 ) -> None:
@@ -947,6 +1025,74 @@ def test_wait_ready_needs_the_log_line_and_health(
     health = [c for c in fake_docker.commands() if c[0] == "exec"]
     assert health[-1][-1] == "http://127.0.0.1:18789/healthz"
     assert clock[0] > 0  # it polled
+
+
+def test_wait_ready_checks_the_running_container_while_it_waits(
+    ready_jail: AgentJail,
+    fake_docker: FakeDocker,
+    clock: list[float],
+    exposure_check: ExposureCheck,
+) -> None:
+    """Review of the profiles, M1: the caller holds agent_lock, so the cycle cannot check the
+    agent while it gets ready. A container that starts seeing what it must not is killed."""
+    ready_jail.start()  # checked before and right after `docker start`
+    exposure_check.answers = [["/srv/state is mounted at /mnt"]]
+    fake_docker.reply("container", "inspect", state())
+    fake_docker.reply("logs", Reply(stdout="[gateway] starting...\n"))  # never ready
+    with pytest.raises(ExposedJail, match="killed while it got ready.*/srv/state") as caught:
+        ready_jail.wait_ready()
+    assert caught.value.problems == ["/srv/state is mounted at /mnt"]
+    assert agent_module.EXPOSURE_INTERVAL <= clock[0] < ready_jail.config.ready_timeout
+    assert ["kill", "agent-under-test"] in fake_docker.commands()
+    assert any("did not start it" in p for p in ready_jail.running_exposure())  # never pinned
+
+
+def test_wait_ready_checks_again_every_interval(
+    ready_jail: AgentJail,
+    fake_docker: FakeDocker,
+    clock: list[float],
+    exposure_check: ExposureCheck,
+    container_check: ContainerCheck,
+) -> None:
+    ready_jail.start()
+    before = len(exposure_check.infos)
+    fake_docker.reply("container", "inspect", state())
+    fake_docker.reply("logs", Reply(stdout="[gateway] starting...\n"))
+    with pytest.raises(JailError, match="not ready after 10 s"):
+        ready_jail.wait_ready()
+    checks = len(exposure_check.infos) - before
+    assert checks == 2  # at 5 s and at 10 s of the 10 s wait
+    assert len(container_check.calls) >= 2 + checks  # and that it is still the jail
+
+
+def test_wait_ready_kills_a_container_that_is_no_longer_the_jail(
+    ready_jail: AgentJail,
+    fake_docker: FakeDocker,
+    clock: list[float],
+    container_check: ContainerCheck,
+) -> None:
+    ready_jail.start()
+    container_check.answers = [["HostConfig.RestartPolicy.Name is 'always', not 'no'"]]
+    fake_docker.reply("container", "inspect", state())
+    fake_docker.reply("logs", Reply(stdout="[gateway] starting...\n"))
+    with pytest.raises(ExposedJail, match="no longer the jail"):
+        ready_jail.wait_ready()
+    assert ["kill", "agent-under-test"] in fake_docker.commands()
+
+
+def test_wait_ready_checks_nothing_more_when_the_agent_is_ready_at_once(
+    ready_jail: AgentJail,
+    fake_docker: FakeDocker,
+    clock: list[float],
+    exposure_check: ExposureCheck,
+) -> None:
+    ready_jail.start()
+    before = len(exposure_check.infos)
+    fake_docker.reply("container", "inspect", state())
+    fake_docker.reply("logs", READY_LOGS)
+    fake_docker.reply("exec", HEALTHY)
+    ready_jail.wait_ready()
+    assert len(exposure_check.infos) == before  # start's own checks: it was ready before 5 s
 
 
 def test_wait_ready_fails_when_the_agent_exits(

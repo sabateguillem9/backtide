@@ -7,6 +7,11 @@ the environment the docker CLI gets, the network's argv, the container's environ
 openclaw.json, a container that verify.py accepts, and every problem verify.py reports for an
 empty ``docker inspect`` (which names each value it expects). Nothing of it may change for
 OpenClaw; regenerate it only on purpose, when the jail changes for every agent.
+
+Changed on purpose twice since, each time with a script that proved nothing else moved: T17a-3
+(``BASH_ENV`` and ``CLAUDE_ENV_FILE`` at /dev/null) and the security review of the profiles
+(``--no-healthcheck``, and the profile's own variables by name in the argv, their values in the
+docker CLI's environment: ``create_cli_env`` is create_env now).
 """
 
 import copy
@@ -20,6 +25,7 @@ from backtide.jail.config import (
     AgentJailConfig,
     Protected,
     container_env,
+    create_env,
     docker_create_argv,
     network_create_argv,
     token_env,
@@ -111,7 +117,8 @@ def test_docker_create_is_byte_for_byte_the_same(label: str) -> None:
     expected = SNAPSHOT["configs"][label]
     config = CONFIGS[label]
     assert docker_create_argv(config) == expected["create_argv"]
-    assert token_env(config) == expected["create_cli_env"]
+    assert create_env(config) == expected["create_cli_env"]
+    assert token_env(config) == {"OPENCLAW_GATEWAY_TOKEN": config.gateway_token}
     assert network_create_argv(config) == expected["network_argv"]
     assert [list(pair) for pair in container_env(config)] == expected["container_env"]
 

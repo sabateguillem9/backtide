@@ -9,15 +9,20 @@ goes through exactly the same checks of AgentProfile, plus those of its own shap
   program, the rest goes first in the command) and ``command``;
 - ``workdir``: where it starts, inside /workspace (``work``, ``home`` or below them);
 - ``env``: its own variables, never a reserved name (the jail's, ``*_PROXY``, the CA's, HOME,
-  PATH, ``LD_*``, ``NODE_OPTIONS``, ``BASH_ENV``...), a secret's name or a value shaped like a
-  secret;
+  PATH, and the families that load code: ``LD_*``, ``NODE_OPTIONS``, ``PYTHON*``,
+  ``GIT_CONFIG_*``, ``npm_config_*``...), a name the docker CLI reads on the host
+  (``DOCKER_*``, ``GO*``, ``OTEL_*``...: the values travel in that CLI's environment), a
+  secret's name or a value shaped like a secret;
 - ``[agent.model]``: which provider of ``[[proxy.providers]]`` it uses, the variable that gets
-  its FAKE key (``key_env``: the only variable the fake key reaches) and the request fields of
-  the provider its model client sends (``allow_params``, decision 5);
+  its FAKE key (``key_env``: the only variable the fake key reaches; its name ends in ``_KEY``,
+  ``_API_KEY`` or ``_TOKEN``) and the plain request fields of the provider its model client
+  sends (``allow_params``, decision 5): never one that switches on a search, a retrieval or a
+  tool at the provider (``search_parameters``, ``extra_body``...), which only ``[proxy]
+  allow_provider_tools`` can allow;
 - ``[agent.ready]``: an optional log line and probe (the timeout is AgentJailConfig's
-  ``ready_timeout``, which ServiceConfig fills in);
-- ``[agent.rewind]``: lines of the rewind notice, after one that says backtide does not know
-  this agent.
+  ``ready_timeout``, which ServiceConfig fills in: 600 s at most);
+- ``[agent.rewind]``: lines of the rewind notice (printable, 300 characters at most), after one
+  that says backtide does not know this agent.
 
 It writes nothing in /config (the folder is still mounted, empty), has no Gateway token, and
 nothing of the jail (uid, mounts, network, ports, capabilities, seccomp...) is among its keys:

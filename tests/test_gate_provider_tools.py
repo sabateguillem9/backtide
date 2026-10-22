@@ -456,3 +456,39 @@ def test_the_node_budget_is_checked_before_parsing(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(provider_tools, "MAX_NODES", 50)
     raw = b'{"model": "m", "messages": [' + b",".join([b"{}"] * 100) + b"]}"
     assert refused(anthropic(raw)) == ("provider_body", ())
+
+
+# --- what an agent profile may allow (decision 5 of docs/34; review of the profiles, M3) ---------
+
+# Fields that switch on something on the provider's side (search, retrieval, grounding, a tool,
+# a connector, code that runs there, a source it fetches, another model or route): a profile can
+# never allow them, whatever their case or spelling. Only the owner can, with
+# ``[proxy] allow_provider_tools``.
+PROVIDER_SIDE_PARAMS = (
+    "search_parameters", "extra_body", "extra_headers", "extra_query", "web_search_options",
+    "web_search", "websearch", "search_domain_filter", "search_recency_filter", "enable_search",
+    "searchparameters", "retrieval", "retrieval_config", "grounding", "google_search",
+    "googlesearchretrieval", "tools", "tool_config", "tool_resources", "functions", "plugins",
+    "connectors", "mcp_servers", "mcp", "file_search", "file_ids", "documents", "attachments",
+    "data_sources", "datasources", "vector_store_ids", "knowledge_base", "code_execution",
+    "code_interpreter", "sandbox", "browse", "browsing", "fetch", "urls", "image_url",
+    "citations", "return_citations", "sources", "models", "fallback_models", "route",
+    "provider", "prompt_id", "assistant_id", "agent_id", "webhook", "callback_url",
+    "live_search", "online", "context_files", "web.search", "x-search", "search:mode",
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("name", PROVIDER_SIDE_PARAMS)
+def test_a_profile_never_allows_a_field_that_works_on_the_providers_side(name: str) -> None:
+    with pytest.raises(ValueError, match="provider's side") as caught:
+        provider_tools.check_profile_param(f"param:{name}")
+    assert "allow_provider_tools" in str(caught.value)  # it says who can allow it
+    # The owner still can, by its name as the gate reports it.
+    assert check_allow_entry(f"param:{name}") == f"param:{name}"
+
+
+@pytest.mark.parametrize(
+    "name", ["diagnostics", "client_metadata", "betas", "anthropic_version", "safety_settings"]
+)
+def test_a_profile_may_still_allow_a_plain_request_field(name: str) -> None:
+    assert provider_tools.check_profile_param(f"param:{name}") == f"param:{name}"

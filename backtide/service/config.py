@@ -5,7 +5,9 @@ Design: docs/19-diseno-t04.md, section "Disposición".
 - ``/etc/backtide/backtide.toml`` holds paths, numbers and the agent's container options. NEVER a
   secret: the gateway token is read from ``<state_dir>/gateway.token`` (0600), and a
   ``gateway_token`` key in the TOML is refused. The token is OpenClaw's Gateway's: only read,
-  passed to the jail and struck for a profile that uses one.
+  passed to the jail and struck for a profile that uses one. For any other profile a token file
+  left there (an OpenClaw that ran on the same volume before) is still read, leniently, only
+  to strike it wherever it shows: never passed to the agent.
 - ``[agent] profile`` (T17a-3, docs/34 section 7): ``"openclaw"`` (the default) or ``"custom"``,
   whose own settings (image by digest, entrypoint, command, workdir, env, ``[agent.model]``,
   ``[agent.ready]``, ``[agent.rewind]``) describe any other agent (backtide/jail/profiles/
@@ -52,6 +54,7 @@ Design: docs/19-diseno-t04.md, section "Disposición".
 
 import dataclasses
 import errno
+import math
 import os
 import re
 import stat
@@ -74,7 +77,7 @@ from backtide.gate.providers import Secret as GateSecret
 from backtide.gate.translate.base import Trusted, normalize_trusted
 from backtide.gate.translate.read_post import check_read_endpoint
 from backtide.jail.ca import CaPaths
-from backtide.jail.config import AGENT_DIR, AgentJailConfig, Protected
+from backtide.jail.config import AGENT_DIR, MAX_READY_TIMEOUT, AgentJailConfig, Protected
 from backtide.jail.model import MODEL_ID, ModelProvider
 from backtide.jail.profile import AgentProfile
 from backtide.jail.profiles import CUSTOM, DEFAULT_PROFILE, NAMED, profile_names
@@ -314,6 +317,8 @@ class ServiceConfig:
     volume: Path
     # OpenClaw's Gateway token, for a profile that uses one (required then): None otherwise.
     gateway_token: Secret | None = None
+    # For a profile without one: what an old gateway.token holds, to strike and nothing else.
+    struck_token: Secret | None = field(default=None, repr=False)
     workspace_limit: int | None = None
     cycle_interval: float = DEFAULT_CYCLE_INTERVAL
     prune_interval: float = DEFAULT_PRUNE_INTERVAL
@@ -340,6 +345,8 @@ class ServiceConfig:
         profile = agent_profile_of(self.agent)  # every [agent] setting, the profile's first
         if self.gateway_token is not None and not isinstance(self.gateway_token, Secret):
             raise ConfigError("gateway_token must be a Secret")
+        if self.struck_token is not None and not isinstance(self.struck_token, Secret):
+            raise ConfigError("struck_token must be a Secret")
         if profile.token_env is not None and self.gateway_token is None:
             raise ConfigError(
                 f"profile {profile.name} needs the gateway token: <state_dir>/{STATE_TOKEN}"
@@ -553,8 +560,13 @@ class ServiceConfig:
         return agent_profile_of(self.agent)
 
     def gateway_secrets(self) -> list[str]:
-        """The Gateway token, to strike wherever it shows, when there is one."""
-        return [] if self.gateway_token is None else [self.gateway_token.reveal()]
+        """The Gateway token, to strike wherever it shows, when there is one: the profile's, or
+        the one an OpenClaw left in ``gateway.token`` before the profile changed (the volume,
+        the logs and the snapshots may still hold it). Only to strike: jail_config() passes the
+        token to a profile that uses one, and never ``struck_token``."""
+        return [
+            token.reveal() for token in (self.gateway_token, self.struck_token) if token is not None
+        ]
 
     def jail_config(self) -> AgentJailConfig:
         """The agent's container settings. It carries the token in the clear (it must reach
@@ -943,13 +955,15 @@ class ServiceConfig:
         agent = dict(agent)
         if "config_dir" in agent:
             agent["config_dir"] = _as_path("[agent] config_dir", agent["config_dir"])
-        token = None
+        token = struck = None
+        token_file = state_dir / STATE_TOKEN
         if agent_profile_of(agent).token_env is not None:  # OpenClaw's Gateway; others have none
-            token_file = state_dir / STATE_TOKEN
             text = _decode(
                 _read_file(token_file, "gateway token file", MAX_TOKEN_BYTES, private=True)
             )
             token = Secret(text.strip())
+        else:
+            struck = read_token_to_strike(token_file)
         optional = {key: data[key] for key in _OPTIONAL_KEYS if key in data}
         if "volume_image" in data:
             optional["volume_image"] = _as_path("volume_image", data["volume_image"])
@@ -976,6 +990,7 @@ class ServiceConfig:
             state_dir=state_dir,
             volume=volume,
             gateway_token=token,
+            struck_token=struck,
             agent=agent,
             **optional,
         )
@@ -1032,8 +1047,16 @@ def _check_ready_timeout(agent: Mapping[str, Any]) -> None:
     if "ready_timeout" in agent:
         raise ConfigError("[agent] ready_timeout and [agent.ready] timeout: set only one")
     timeout = ready["timeout"]
-    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
-        raise ConfigError("[agent.ready] timeout must be a positive number of seconds")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int | float)
+        or not math.isfinite(timeout)  # TOML has inf and nan
+        or not 0 < timeout <= MAX_READY_TIMEOUT
+    ):
+        raise ConfigError(
+            "[agent.ready] timeout must be a number of seconds above 0 and at most "
+            f"{MAX_READY_TIMEOUT:g} (backtide waits for the agent that long with the cycle on hold)"
+        )
 
 
 def _require_private_state_dir(path: Path) -> None:
@@ -1177,6 +1200,39 @@ def read_real_key(
     if not real:
         return None, KEY_UNUSABLE, f"real key file {path} of provider {name} is empty"
     return Secret(real), None, None
+
+
+def read_token_to_strike(path: Path) -> Secret | None:
+    """What a ``gateway.token`` left by an OpenClaw holds, for a profile that has no token: to
+    strike wherever it shows (the agent's volume and snapshots may hold it), never to use. Only
+    a regular file of the service's own user, never through a link, at most MAX_TOKEN_BYTES of
+    UTF-8; None if there is none or nothing of MIN_KNOWN_SECRET characters. Never raises, never
+    says what it read: a file that cannot be used for OpenClaw can still be struck."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_size > MAX_TOKEN_BYTES
+        ):
+            return None
+        data = os.read(fd, MAX_TOKEN_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        value = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    if len(data) > MAX_TOKEN_BYTES or len(value) < MIN_KNOWN_SECRET:
+        return None
+    return Secret(value)
 
 
 def read_strike_only(folder: Path, name: str) -> Secret | None:

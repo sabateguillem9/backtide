@@ -15,14 +15,18 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
   or whose mounted config folder holds anything but the profile's config files (OpenClaw:
   openclaw.json), or whose CA folder holds anything but the certificate (ca.py writes it; the
   CA's key never goes there), or whose image carries what looks like a secret in its own
-  environment (Docker hands those variables to the agent).
+  environment, or a reserved variable the jail does not set that points where the agent writes
+  (LD_PRELOAD, NODE_OPTIONS, a mixed-case No_proxy...: Docker hands those variables to the
+  agent), or whose working folder is a symlink (the agent controls everything in /workspace).
 - What the agent is (its folders in /workspace, its config files, how it says it is ready)
   comes from the config's agent profile (backtide/jail/profile.py); every check here is the
   same for every agent.
 - The mount check (T14a, backtide/jail/mounts.py): create() refuses a planned container, and
   start() an existing one, that would show the agent what it must not (ExposedJail); right
   after ``docker start`` the running container is checked again and killed if it does.
-  running_exposure() is the same check for the Guardian's cycle. A running container must also
+  running_exposure() is the same check for the Guardian's cycle, and wait_ready() runs it too
+  every EXPOSURE_INTERVAL seconds while it waits: it holds agent_lock, so the cycle skips
+  itself, and the agent must not run unwatched meanwhile. A running container must also
   still be the very container start() checked (its Id: one recreated by hand under backtide,
   even with the same mounts, is not), still be this config's jail (verify.py, against the
   seccomp profile and image environment start() used: ``docker update`` changes some fields)
@@ -51,9 +55,10 @@ from backtide.jail.config import (
     AGENT_DIR,
     CA_CERT_FILE,
     AgentJailConfig,
+    create_env,
     docker_create_argv,
+    jail_env_names,
     network_create_argv,
-    token_env,
 )
 from backtide.jail.docker import JailError
 from backtide.jail.mounts import (
@@ -62,12 +67,20 @@ from backtide.jail.mounts import (
     live_mount_problems,
     planned_info,
 )
-from backtide.jail.profile import secret_shaped
+from backtide.jail.profile import (
+    CONTAINER_WORKSPACE,
+    image_env_problem,
+    image_secret,
+    is_reserved_env,
+)
 from backtide.jail.verify import container_problems
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 0.5  # seconds between two readiness checks
+# Seconds between two checks of the running container while wait_ready waits (start() checks
+# it right after `docker start`; the Guardian's cycle afterwards, which waits for agent_lock).
+EXPOSURE_INTERVAL = 5.0
 EXEC_TIMEOUT = 60.0
 EXEC_MAX_OUTPUT = 1024 * 1024  # bytes a docker exec may print by default
 HEALTH_TIMEOUT = 15.0  # one run of the profile's ready probe, docker exec included
@@ -169,6 +182,7 @@ class AgentJail:
                 for name in self.config.profile.workspace_dirs:
                     path = self.config.agent_dir / name
                     os.close(self._ensure_agent_dir(agent_fd, name, path))
+                self._ensure_workdir(agent_fd)
             finally:
                 os.close(agent_fd)
         finally:
@@ -219,7 +233,7 @@ class AgentJail:
         self._check_ids_not_shared()
         self._check_mount_sources()
         self._check_planned("is not created")
-        docker.run(docker_create_argv(self.config), env=token_env(self.config))
+        docker.run(docker_create_argv(self.config), env=create_env(self.config))
 
     def start(self) -> None:
         """Start the container. It must exist and be exactly this config's jail (anything
@@ -374,9 +388,15 @@ class AgentJail:
         Raises JailError, with the last log lines, if the
         container stops or ``timeout`` (default: the config's) passes first, and also if the
         probe or the logs print more than their bound (the agent is not to be trusted then).
-        A frozen container fails at once."""
+        A frozen container fails at once.
+
+        The caller holds agent_lock with the agent already running, so the Guardian's cycle
+        skips its check: every EXPOSURE_INTERVAL seconds the running container is checked here
+        as the cycle would (running_exposure), and one that fails is killed (ExposedJail)."""
         timeout = self.config.ready_timeout if timeout is None else timeout
-        deadline = time.monotonic() + timeout
+        now = time.monotonic()
+        deadline = now + timeout
+        next_check = now + EXPOSURE_INTERVAL
         while True:
             state = self._state()
             if state is None:
@@ -390,6 +410,9 @@ class AgentJail:
                 # Frozen (the pause by space, maybe in the middle of a start): it will not get
                 # ready, and waiting would only hold agent_lock for nothing.
                 raise JailError(f"the agent {self.config.name} is frozen: it cannot get ready")
+            if time.monotonic() >= next_check:
+                self._check_while_waiting()
+                next_check = time.monotonic() + EXPOSURE_INTERVAL
             if self._logged_ready(str(state.get("StartedAt", ""))) and self._healthy():
                 return
             if time.monotonic() >= deadline:
@@ -550,15 +573,24 @@ class AgentJail:
         if not problems:
             self._started = checked
             return
+        self._kill_exposed(problems, "was killed right after it started")
+
+    def _check_while_waiting(self) -> None:
+        """wait_ready's check of the running container: the cycle's, while it cannot run."""
+        problems = self._running_problems(self._started)
+        if problems:
+            self._started = None
+            self._kill_exposed(problems, "was killed while it got ready")
+
+    def _kill_exposed(self, problems: list[str], what: str) -> None:
+        """Kill a container that failed its check, and raise ExposedJail with ``problems``."""
         still_running = False
         try:
             self.kill()
         except JailError as error:
             problems.append(f"and it could not be killed: {error}")
             still_running = True
-        self._refuse_exposure(
-            problems, "was killed right after it started", still_running=still_running
-        )
+        self._refuse_exposure(problems, what, still_running=still_running)
 
     def _check_container(self) -> _Checked:
         """The existing container must show the agent nothing it must not (mounts.py) and be
@@ -608,20 +640,49 @@ class AgentJail:
             return []  # an image without any variable
         if not isinstance(env, list) or not all(isinstance(entry, str) for entry in env):
             raise unexpected
-        secret = sorted(
-            {
-                name
-                for name, _, value in (entry.partition("=") for entry in env)
-                if secret_shaped(name, value)
-            }
-        )
+        pairs = [entry.partition("=") for entry in env]
+        secret = sorted({name for name, _, value in pairs if image_secret(name, value)})
+        # A reserved name the jail sets itself is overridden by the jail's value; any other
+        # reaches the agent as the image says (review of the profiles, L6).
+        ours = jail_env_names() | {name for name, _ in self.config.profile.env}
+        loaders = {
+            name: why
+            for name, _, value in pairs
+            if name not in ours and (why := image_env_problem(name, value)) is not None
+        }
+        # Names only, never a value; the reasons first and the image last, so the black box's
+        # bounded copy of the message keeps every name.
+        problems = []
         if secret:
             # Docker hands the image's variables to the agent: one with a secret would be a key
-            # the agent sees (docs/34, section 6). Names only, never a value.
+            # the agent sees (docs/34, section 6).
+            problems.append(f"it carries what looks like a secret in its ENV ({', '.join(secret)})")
+        if loaders:
+            problems.append(
+                "it sets what the jail does not, to load code or reach the network: "
+                + "; ".join(f"{name} ({why})" for name, why in sorted(loaders.items()))
+            )
+        if problems:
             raise JailError(
-                f"image {self.config.image} carries what looks like a secret in its own "
-                f"environment ({', '.join(secret)}): the agent would see it. Use an image "
-                "without secrets in its ENV"
+                f"the image cannot run as the agent: {'; '.join(problems)}. Use an image "
+                f"without them in its ENV ({self.config.image})"
+            )
+        kept = sorted(
+            {
+                name
+                for name, _, value in pairs
+                if value and name not in ours and is_reserved_env(name)
+            }
+        )
+        if kept:
+            # Said in the log, not alerted: what is left points at the pinned image's own
+            # read-only root (every image has its PATH), and a warning would reach Telegram at
+            # every start. What could run the agent's code was refused above.
+            logger.info(
+                "image %s sets %s itself, which the jail does not override: they reach the "
+                "agent as the pinned image says",
+                self.config.image,
+                ", ".join(kept),
             )
         return env
 
@@ -661,6 +722,38 @@ class AgentJail:
             profile.ready_probe, timeout=HEALTH_TIMEOUT, max_output=HEALTH_MAX_OUTPUT
         )
         return result.returncode == 0 and profile.ready_answer(result.stdout) is True
+
+    def _workdir_parts(self) -> tuple[str, ...]:
+        """The profile's working folder, as folders below the agent's (none: the image's)."""
+        workdir = self.config.profile.workdir
+        return () if workdir is None else workdir.relative_to(CONTAINER_WORKSPACE).parts
+
+    def _ensure_workdir(self, agent_fd: int) -> None:
+        """Create the profile's working folder where missing, for the agent, never following
+        a symlink (Docker would otherwise create it itself, as root)."""
+        fd, path = os.dup(agent_fd), self.config.agent_dir
+        try:
+            for name in self._workdir_parts():
+                path = path / name
+                child = self._ensure_agent_dir(fd, name, path)
+                os.close(fd)
+                fd = child
+        finally:
+            os.close(fd)
+
+    def _check_workdir(self) -> None:
+        """The profile's working folder, opened folder by folder without following a symlink:
+        the agent controls everything below /workspace, and Docker must never be pointed
+        through a link of its own (review of the profiles, L5)."""
+        fd, path = _open_dir(self.config.agent_dir), self.config.agent_dir
+        try:
+            for name in self._workdir_parts():
+                path = path / name
+                child = _open_dir(path, name=name, dir_fd=fd)
+                os.close(fd)
+                fd = child
+        finally:
+            os.close(fd)
 
     def _ensure_agent_dir(self, parent_fd: int, name: str, path: Path) -> int:
         """Open ``name`` below ``parent_fd`` as a directory, creating it for the agent first
@@ -758,6 +851,7 @@ class AgentJail:
         folders are checked again here, right before the agent can see them: backtide's, and
         nothing in them but their one file."""
         os.close(_open_dir(self.config.agent_dir))
+        self._check_workdir()
         _check_ca_dir(self.config.ca_dir)
         config_fd = _open_dir(self.config.config_dir)
         try:

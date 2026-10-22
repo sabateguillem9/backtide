@@ -201,16 +201,45 @@ def check_allow_entry(entry: object) -> str:
 
 
 PARAM_PREFIX = "param:"
+# Words of a request field that switches on something on the provider's side (review of the
+# profiles, M3): a search or a retrieval (xAI's ``search_parameters``, Perplexity's
+# ``search_*``, Qwen's ``enable_search``, Gemini's grounding), a tool, function, plugin or
+# connector (OpenRouter's ``plugins``, MCP), code the provider runs, a file, document, vector
+# store or data source it reads (Azure's ``data_sources``), a source it fetches (a URL, a
+# browse), a model, route or provider other than the one asked for (OpenRouter's ``models`` and
+# ``provider``: past the ``models`` list), a stored prompt, assistant or agent, a callback, and
+# a client library's own pass-through of any field (``extra_body``, ``extra_headers``). Matched
+# in the name without its separators, so ``searchParameters`` (which the gate folds to
+# ``searchparameters``) and ``web.search`` count too. Such a field can only come from the
+# owner's ``[proxy] allow_provider_tools``, where it is named on purpose; a profile is copied
+# from an agent's documentation, and a field it allows silently would carry the real key to a
+# provider-side search or fetch that the black box never sees.
+_PROVIDER_SIDE_WORDS = (
+    "search", "retriev", "grounding", "extra", "tool", "function", "plugin", "connector",
+    "mcp", "file", "document", "attachment", "source", "vector", "knowledge", "interpreter",
+    "execut", "sandbox", "computer", "shell", "bash", "python", "brows", "fetch", "crawl",
+    "scrap", "url", "http", "web", "online", "citation", "model", "route", "routing",
+    "provider", "prompt", "assistant", "agentid", "webhook", "callback",
+)  # fmt: skip
+_SEPARATORS_RE = re.compile(r"[_.:-]", re.ASCII)
 
 
 def check_profile_param(entry: object) -> str:
     """A provider-side field an agent profile allows (decision 5 of docs/34): a top-level field
     of the request, ``param:<name>``, and nothing else. A profile can never allow a tool, a
-    connector, a fetched source or a model that the gate refuses: only the owner can, with
-    ``allow_provider_tools``. Raises ValueError, with a message that is safe to show."""
+    connector, a fetched source or a model that the gate refuses, nor a field that switches on
+    a search, a retrieval or a tool at the provider (``_PROVIDER_SIDE_WORDS``): only the owner
+    can, with ``allow_provider_tools``. Raises ValueError, with a message that is safe to show."""
     name = check_allow_entry(entry)
     if not name.startswith(PARAM_PREFIX) or name == PARAM_PREFIX:
         raise ValueError(f"a profile only allows request fields by name ({PARAM_PREFIX}<name>)")
+    flat = _SEPARATORS_RE.sub("", name.removeprefix(PARAM_PREFIX))
+    if any(word in flat for word in _PROVIDER_SIDE_WORDS):
+        raise ValueError(
+            f"{name} may switch on something on the provider's side (a search, a retrieval, a "
+            "tool, a source it fetches, another model...): a profile never allows it; only "
+            "[proxy] allow_provider_tools can, by its name"
+        )
     return name
 
 

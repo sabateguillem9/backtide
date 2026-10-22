@@ -13,10 +13,12 @@ cycle (a container recreated with one more ``-v`` is killed).
 """
 
 import json
+import os
 import secrets
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,7 +26,7 @@ import pytest
 from backtide.gate.providers import is_fake_key
 from backtide.jail import IMAGE
 from backtide.jail import docker as jail_docker
-from backtide.jail.config import CONTAINER_CA_FILE, PROXY_URL, docker_create_argv, token_env
+from backtide.jail.config import CONTAINER_CA_FILE, PROXY_URL, create_env, docker_create_argv
 from backtide.jail.mounts import agent_policy, exposure_problems
 from backtide.jail.profiles.custom import UNKNOWN_AGENT_NOTICE
 from backtide.jail.profiles.openclaw import TOKEN_ENV
@@ -131,6 +133,8 @@ def test_a_custom_agent_runs_in_the_whole_jail(sensed_custom: Service) -> None:
     assert created["Entrypoint"] == ["tini"]
     assert created["Cmd"] == ["-s", "--", "sh", "-c", f"echo {READY_LINE}; exec sleep infinity"]
     assert created["WorkingDir"] == "/workspace/work"
+    # OpenClaw's image has a HEALTHCHECK of its own: it never runs in the jail.
+    assert created["Healthcheck"]["Test"] == ["NONE"] and "Health" not in info["State"]
 
     # The jail, the same as OpenClaw's: verify.py accepts exactly it.
     assert created["User"] == f"{jail.uid}:{jail.gid}"
@@ -263,7 +267,7 @@ def test_the_mount_check_holds_for_a_custom_agent(
     jail_docker.run(["rm", "--force", name])
     argv = docker_create_argv(service.jail.config)
     argv[1:1] = ["--volume", f"{service.config.state_dir}:/mnt/caja:ro"]
-    jail_docker.run(argv, env=token_env(service.jail.config))
+    jail_docker.run(argv, env=create_env(service.jail.config))
     jail_docker.run(["start", name])
     wait_until(
         lambda: len(service.events("agent_stop")) > before and not service.jail.is_running(),
@@ -278,3 +282,55 @@ def test_the_mount_check_holds_for_a_custom_agent(
     time.sleep(1)
     assert not service.jail.is_running()
     assert service.stop() == 0
+
+
+def test_a_custom_agent_with_an_entrypoint_and_no_command(
+    make_real_service: Callable[..., Service], tmp_path: Path
+) -> None:
+    """Review of the profiles, L7: with ``--entrypoint`` and nothing after the image, Docker
+    keeps ``Config.Cmd`` null, not []; verify.py takes both, so the agent starts and is still
+    checked as the jail at every cycle. The program must run on its own, with no argument: a
+    one-line script copied into OpenClaw's pinned image and committed locally (no download)."""
+    script = tmp_path / "wait"
+    script.write_text("#!/bin/sh\nexec sleep infinity\n")
+    script.chmod(0o755)
+    tag = f"backtide-test-bare-{os.getpid()}"
+    source = f"{tag}-src"
+    jail_docker.run(["create", "--name", source, IMAGE])  # never started
+    try:
+        jail_docker.run(["cp", str(script), f"{source}:/usr/local/bin/backtide-wait"])
+        jail_docker.run(["commit", source, f"{tag}:latest"])
+    finally:
+        jail_docker.run(["rm", "--force", source])
+    try:
+        digest = json.loads(
+            jail_docker.run(
+                ["image", "inspect", "--format", "{{json .Id}}", f"{tag}:latest"]
+            ).stdout
+        )
+        bare = (
+            'profile = "custom"\n'
+            f'image = "{tag}@{digest}"\n'
+            'entrypoint = ["/usr/local/bin/backtide-wait"]\n'
+            "[agent.ready]\n"
+            "timeout = 60\n"
+        )
+        service = make_real_service(agent_toml=bare)
+        service.start()
+        service.wait_ready()
+        info = _inspect(service.jail.config.name)
+        assert info["Config"]["Entrypoint"] == ["/usr/local/bin/backtide-wait"]
+        assert info["Config"]["Cmd"] is None  # what docker keeps: the reason for the fix
+        image_env = service.jail._image_env()  # noqa: SLF001 - what start() checked it against
+        seccomp = json.loads(service.jail.config.seccomp_profile.read_text())
+        problems = container_problems(
+            service.jail.config, info, seccomp_profile=seccomp, image_env=image_env
+        )
+        assert problems == []
+        assert service.events("agent_start") and not service.events("agent_start_failed")
+        time.sleep(service.config.cycle_interval * 2)  # a cycle or two: nothing stops it
+        assert service.jail.is_running() and not service.events("agent_stop")
+        assert service.stop() == 0
+        service.jail.remove()
+    finally:
+        jail_docker.run(["image", "rm", "--force", f"{tag}:latest"], check=False)

@@ -193,10 +193,10 @@ def test_a_custom_agent_needs_no_gateway_token_and_gets_none(layout: Path) -> No
     assert openclaw_profile.TOKEN_ENV not in dict(container_env(jail)) | token_env(jail)
 
 
-def test_a_gateway_token_file_is_not_even_read_for_a_custom_agent(layout: Path) -> None:
+def test_a_gateway_token_file_is_never_used_for_a_custom_agent(layout: Path) -> None:
     token = layout / "state" / "gateway.token"
     token.write_text(TOKEN + "\n")
-    token.chmod(0o644)  # unusable for OpenClaw: never read for a custom agent
+    token.chmod(0o644)  # unusable for OpenClaw: never used for a custom agent, only struck
     assert load(layout).gateway_token is None
 
 
@@ -205,6 +205,35 @@ def test_openclaw_still_needs_its_gateway_token(layout: Path) -> None:
         load(layout, "")
     with pytest.raises(ConfigError, match="needs the gateway token"):
         ServiceConfig(state_dir=layout / "state", volume=layout / "volume")
+
+
+def test_an_old_gateway_token_is_still_struck_for_a_custom_agent(layout: Path) -> None:
+    """Review of the profiles, L10: an OpenClaw ran on this volume before, so its Gateway token
+    may be in the snapshots and the logs. The file is read only to strike it, also when it
+    could not be used for OpenClaw (open to others), and never reaches the container."""
+    token = layout / "state" / "gateway.token"
+    token.write_text(TOKEN + "\n")
+    token.chmod(0o644)
+    config = load(layout)
+    assert config.gateway_token is None
+    assert config.gateway_secrets() == [TOKEN]
+    jail = config.jail_config()
+    assert jail.gateway_token is None and TOKEN not in token_env(jail).values()
+    assert TOKEN not in " ".join(docker_create_argv(jail)) + repr(config) + repr(jail)
+
+
+@pytest.mark.parametrize("content", ["", "short", "\xff\xfe"])
+def test_an_unusable_old_token_is_not_struck_and_never_fails(layout: Path, content: str) -> None:
+    token = layout / "state" / "gateway.token"
+    token.write_bytes(content.encode("latin-1"))
+    assert load(layout).gateway_secrets() == []
+
+
+def test_an_old_token_through_a_link_is_not_read(layout: Path) -> None:
+    elsewhere = layout / "elsewhere"
+    elsewhere.write_text(TOKEN + "\n")
+    (layout / "state" / "gateway.token").symlink_to(elsewhere)
+    assert load(layout).gateway_secrets() == []
 
 
 def test_a_token_given_anyway_is_struck_but_never_reaches_the_container(layout: Path) -> None:
@@ -361,14 +390,60 @@ def test_the_fake_key_cannot_go_in_a_reserved_variable(layout: Path, name: str) 
         load(layout, text)
 
 
-def test_the_fake_key_variable_cannot_also_be_an_own_variable(layout: Path) -> None:
-    with pytest.raises(ConfigError, match="same variable twice"):
-        load(
-            layout,
-            CUSTOM.replace(
-                'key_env = "ANTHROPIC_API_KEY"', 'key_env = "MY_AGENT_MODEL_AUTH"'
-            ).replace('MY_AGENT_TELEMETRY = "0"', 'MY_AGENT_MODEL_AUTH = "x"'),
-        )
+@pytest.mark.parametrize("name", ["MY_AGENT_MODEL_AUTH", "MODEL", "ANTHROPIC_BASE_URL", "KEYS"])
+def test_the_fake_key_variable_must_say_it_holds_a_key(layout: Path, name: str) -> None:
+    """Review of the profiles, L4: it ends in _KEY, _API_KEY or _TOKEN. So it can never be one
+    of the agent's own variables either (those never carry a secret's name)."""
+    text = CUSTOM.replace('key_env = "ANTHROPIC_API_KEY"', f'key_env = "{name}"')
+    with pytest.raises(ConfigError, match="must end in _KEY, _API_KEY or _TOKEN"):
+        load(layout, text)
+
+
+@pytest.mark.parametrize("name", ["MY_AGENT_KEY", "OPENAI_API_KEY", "AGENT_TOKEN", "x_api_key"])
+def test_a_fake_key_variable_that_says_so(layout: Path, name: str) -> None:
+    text = CUSTOM.replace('key_env = "ANTHROPIC_API_KEY"', f'key_env = "{name}"')
+    assert load(layout, text).agent_profile.fake_key_env == ((name, "anthropic"),)
+
+
+# What the docker CLI (and the Go programs it runs) reads from its own environment on the host:
+# the fake key and the profile's variables travel there (review of the profiles, L4 and L8).
+DOCKER_CLI_NAMES = (
+    "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH",
+    "DOCKER_API_VERSION", "DOCKER_AUTH_TOKEN", "docker_host", "BUILDKIT_PROGRESS",
+    "BUILDX_BUILDER", "COMPOSE_PROJECT_NAME", "GODEBUG", "GOMAXPROCS", "GOTRACEBACK", "GOFLAGS",
+    "GOAUTH_TOKEN", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS",
+    "NOTARY_AUTH_TOKEN", "SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS", "LC_ALL", "TMPDIR",
+    "XDG_RUNTIME_DIR", "KUBECONFIG", "CONTAINERD_ADDRESS",
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("name", ["LANG", "LC_MESSAGES", "XDG_CONFIG_HOME", "MY_AGENT_GOAL"])
+def test_an_own_variable_the_docker_cli_ignores(layout: Path, name: str) -> None:
+    """The CLI's own messages stay C (docker.run sets LC_ALL last), and it reads no XDG folder
+    but its runtime one: these reach the agent through it, unchanged (GO* is a prefix)."""
+    assert dict(load(layout, custom(env=f'{{ {name} = "x" }}')).agent_profile.env) == {name: "x"}
+
+
+@pytest.mark.parametrize("name", [n for n in DOCKER_CLI_NAMES if n.upper().endswith("_TOKEN")])
+def test_the_fake_key_never_goes_where_the_docker_cli_reads(layout: Path, name: str) -> None:
+    text = CUSTOM.replace('key_env = "ANTHROPIC_API_KEY"', f'key_env = "{name}"')
+    with pytest.raises(ConfigError, match="read by the docker CLI on the host"):
+        load(layout, text)
+
+
+@pytest.mark.parametrize("name", ["DOCKER_HOST", "DOCKER_CONFIG", "OTEL_EXPORTER_OTLP_ENDPOINT"])
+def test_a_key_env_the_docker_cli_reads_is_refused(layout: Path, name: str) -> None:
+    """The finding's own case: ``key_env = "DOCKER_HOST"`` would hand backtide's docker the
+    fake key as the daemon's address. Refused for its name (and its suffix)."""
+    text = CUSTOM.replace('key_env = "ANTHROPIC_API_KEY"', f'key_env = "{name}"')
+    with pytest.raises(ConfigError, match="docker CLI on the host|must end in _KEY"):
+        load(layout, text)
+
+
+@pytest.mark.parametrize("name", [n for n in DOCKER_CLI_NAMES if "TOKEN" not in n.upper()])
+def test_an_own_variable_never_goes_where_the_docker_cli_reads(layout: Path, name: str) -> None:
+    with pytest.raises(ConfigError, match="read by the docker CLI on the host"):
+        load(layout, custom(env=f'{{ {name} = "x" }}'))
 
 
 @pytest.mark.parametrize(
@@ -571,10 +646,29 @@ def test_bad_provider_params_are_refused(layout: Path, params: str) -> None:
         load(layout, text)
 
 
-def test_a_provider_param_is_never_a_provider_side_tool(layout: Path) -> None:
-    text = CUSTOM.replace('allow_params = ["diagnostics"]', 'allow_params = ["mcp_servers"]')
-    # Allowed as a field name, which the gate never confuses with its connector of that name.
-    assert load(layout, text).agent_profile.provider_params == ("param:mcp_servers",)
+@pytest.mark.parametrize(
+    "name",
+    ["mcp_servers", "search_parameters", "extra_body", "web_search_options", "searchParameters"],
+)
+def test_a_provider_param_is_never_a_provider_side_tool(layout: Path, name: str) -> None:
+    """Review of the profiles, M3: a field that switches on a search, a retrieval or a tool at
+    the provider comes only from the owner's [proxy] allow_provider_tools. (``searchParameters``
+    is refused for its case already: the gate folds a field's name to lower case.)"""
+    text = CUSTOM.replace('allow_params = ["diagnostics"]', f'allow_params = ["{name}"]')
+    with pytest.raises(ConfigError, match="provider's side|lower-case"):
+        load(layout, text)
+
+
+def test_the_owner_may_still_allow_a_provider_side_field(layout: Path) -> None:
+    text = CUSTOM.replace(
+        "[proxy]\n", '[proxy]\nallow_provider_tools = ["param:search_parameters"]\n', 1
+    )
+    config = load(layout, text)
+    assert config.agent_profile.provider_params == ("param:diagnostics",)
+    assert config.proxy_settings().allow_provider_tools == (
+        "param:search_parameters",
+        "param:diagnostics",
+    )
 
 
 def test_two_ready_timeouts_are_refused(layout: Path) -> None:
@@ -582,10 +676,27 @@ def test_two_ready_timeouts_are_refused(layout: Path) -> None:
         load(layout, custom(ready_timeout="30"))
 
 
-@pytest.mark.parametrize("timeout", ["0", "-1", '"60"', "true"])
+@pytest.mark.parametrize(
+    "timeout", ["0", "-1", '"60"', "true", "inf", "+inf", "-inf", "nan", "1e9", "600.5"]
+)
 def test_a_bad_ready_timeout_is_refused(layout: Path, timeout: str) -> None:
-    with pytest.raises(ConfigError, match="timeout"):
+    """Review of the profiles, M1: wait_ready holds agent_lock while the agent already runs, so
+    an endless wait (TOML has inf and nan) would freeze the cycle and the sensor's hooks."""
+    with pytest.raises(ConfigError, match="timeout must be a number of seconds above 0"):
         load(layout, CUSTOM.replace("timeout = 45", f"timeout = {timeout}"))
+
+
+@pytest.mark.parametrize("timeout", ["inf", "nan", "1e9", "601"])
+def test_a_bad_ready_timeout_is_refused_for_openclaw_too(layout: Path, timeout: str) -> None:
+    (layout / "state" / "gateway.token").write_text(TOKEN + "\n")
+    (layout / "state" / "gateway.token").chmod(0o600)
+    with pytest.raises(ConfigError, match="ready_timeout must be a number of seconds"):
+        load(layout, f"[agent]\nready_timeout = {timeout}\n")
+
+
+def test_the_longest_ready_timeout(layout: Path) -> None:
+    jail = load(layout, CUSTOM.replace("timeout = 45", "timeout = 600")).jail_config()
+    assert jail.ready_timeout == 600
 
 
 @pytest.mark.parametrize(
@@ -595,6 +706,12 @@ def test_a_bad_ready_timeout_is_refused(layout: Path, timeout: str) -> None:
         ('log_line = "my-agent ready"', "log_line = 1"),
         ('probe = ["/bin/true"]', 'probe = "/bin/true"'),
         ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', 'notice = [""]'),
+        # Review of the profiles, L9: printable, and a sentence, not a page.
+        ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', 'notice = ["a\\u001b[2Jb"]'),
+        ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', 'notice = ["a\\u202eb"]'),
+        ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', 'notice = ["a\\u200bb"]'),
+        ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', 'notice = ["a\\tb"]'),
+        ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', f'notice = ["{"x" * 301}"]'),
         ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', 'notice = "x"'),
         ('notice = ["Lo que el agente ya mandó fuera no vuelve."]', 'notice = ["x"] \n extra = 1'),
     ],

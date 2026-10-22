@@ -24,7 +24,7 @@ from risk_kit import summary
 
 from backtide.blackbox import Event
 from backtide.jail import docker as jail_docker
-from backtide.jail.config import docker_create_argv, token_env
+from backtide.jail.config import create_env, docker_create_argv
 from tests.integration.service_kit import Service, wait_until
 
 KILL_TIMEOUT = 60.0  # a few cycles of the test service (3 s each) and the kill itself
@@ -64,7 +64,7 @@ def test_mounting_what_the_agent_must_not_see(
     jail_docker.run(["rm", "--force", name])
     argv = docker_create_argv(service.jail.config)
     argv[1:1] = ["--volume", f"{service.config.state_dir}:/mnt/caja:ro"]
-    jail_docker.run(argv, env=token_env(service.jail.config))
+    jail_docker.run(argv, env=create_env(service.jail.config))
     jail_docker.run(["start", name])
     tampered_at = time.monotonic()
     wait_until(
@@ -162,7 +162,7 @@ def _recreate(service: Service, *, network: str) -> None:
     jail_docker.run(["rm", "--force", name])
     argv = docker_create_argv(service.jail.config)
     argv[argv.index("--network") + 1] = network
-    jail_docker.run(argv, env=token_env(service.jail.config))
+    jail_docker.run(argv, env=create_env(service.jail.config))
     jail_docker.run(["start", name])
 
 

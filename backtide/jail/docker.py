@@ -67,7 +67,8 @@ def run(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, "LC_ALL": "C", **(env or {})},
+            # LC_ALL last: nothing in ``env`` changes the messages backtide reads back.
+            env={**os.environ, **(env or {}), "LC_ALL": "C"},
             # Its own session: a Ctrl-C in the terminal goes to the foreground process group and
             # must reach backtide (which stops the agent in an orderly way), not the `docker stop`
             # it is waiting for. A timeout still kills the child: process.kill() is by pid.

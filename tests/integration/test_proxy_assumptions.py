@@ -46,7 +46,7 @@ import pytest
 
 from backtide.jail import IMAGE, AgentJail, AgentJailConfig
 from backtide.jail import docker as jail_docker
-from backtide.jail.config import docker_create_argv, openclaw_config, token_env
+from backtide.jail.config import create_env, docker_create_argv, openclaw_config
 
 pytestmark = pytest.mark.integration
 
@@ -1062,7 +1062,7 @@ def openclaw_container(files: OpenClawFiles, *, gateway: bool) -> Iterator[OpenC
     if not gateway:
         argv = [*argv[: argv.index(config.image) + 1], "-s", "--", "sleep", "infinity"]
     try:
-        jail_docker.run(argv, env=token_env(config))
+        jail_docker.run(argv, env=create_env(config))
         docker("start", config.name)
         if gateway:
             AgentJail(config).wait_ready()

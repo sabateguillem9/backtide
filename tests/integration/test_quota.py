@@ -52,8 +52,8 @@ from backtide.jail.config import (
     CONTAINER_WORKSPACE,
     HEALTH_URL,
     SYS_MASKS,
+    create_env,
     docker_create_argv,
-    token_env,
 )
 from backtide.snapshots import Reason, RestoreIncomplete, RestoreResult, SnapshotNoSpace, btrfs
 from backtide.snapshots.store import SnapshotStore
@@ -533,7 +533,7 @@ def run_without_the_sys_masks(agent, agent_leftovers, command: list[str]) -> str
     kept[entrypoint + 1] = command[0]  # create has --entrypoint tini <image> <gateway command>
     image = kept.index(config.image)
     run = [*kept[: image + 1], *command[1:]]
-    return docker.run(run, env=token_env(config), timeout=120).stdout
+    return docker.run(run, env=create_env(config), timeout=120).stdout
 
 
 def test_the_agent_cannot_lift_its_cap_or_dodge_it_with_reflinks(

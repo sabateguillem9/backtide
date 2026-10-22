@@ -622,7 +622,9 @@ _VALUE_OPTIONS = frozenset(
         "--network-alias", "--stop-signal",
     }
 )  # fmt: skip
-_FLAG_OPTIONS = frozenset({"--read-only", "--privileged", "--init", "--interactive", "-i"})
+_FLAG_OPTIONS = frozenset(
+    {"--read-only", "--privileged", "--init", "--interactive", "-i", "--no-healthcheck"}
+)
 _LIST_KEYS = {
     "--cap-add": "CapAdd",
     "--cap-drop": "CapDrop",

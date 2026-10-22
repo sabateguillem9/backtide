@@ -638,6 +638,14 @@ def test_the_service_start_event_carries_the_version(world: World) -> None:
     assert world.only("service_start").details["version"]
 
 
+def test_the_service_start_event_says_the_profile_and_its_provider_fields(world: World) -> None:
+    """Review of the profiles, M3: what the agent's profile lets through the gate on its own is
+    on the record from the start (OpenClaw: nothing)."""
+    world.guardian.start()
+    details = world.only("service_start").details
+    assert (details["profile"], details["profile_params"]) == ("openclaw", [])
+
+
 def test_an_agent_found_running_is_stopped_first_and_the_gap_is_recorded(world: World) -> None:
     world.jail.running = True
     world.guardian.start()

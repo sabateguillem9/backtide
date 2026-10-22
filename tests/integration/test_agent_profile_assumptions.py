@@ -58,6 +58,7 @@ from backtide.jail.config import (
     AgentJailConfig,
     ModelProvider,
     container_env,
+    create_env,
     docker_create_argv,
     token_env,
 )
@@ -86,11 +87,12 @@ JAIL_UID = 61000  # backtide/jail/config.py AGENT_UID and AGENT_GID
 
 SETTINGS_FILE = "claude.json"  # in /config: the settings backtide gives Claude Code (decision 7)
 SETTINGS = f"/config/{SETTINGS_FILE}"
-# The variables of the Claude Code profile (docs/34, section 7).
+# The variables of the Claude Code profile (docs/34, section 7). Not NPM_CONFIG_AUDIT any more:
+# npm_config_* is a reserved family since the security review of the profiles, and T17a-4
+# decides how npm's audit is turned off (docs/34, section 11).
 PROFILE_ENV = (
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
     ("CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", "1"),
-    ("NPM_CONFIG_AUDIT", "false"),
 )
 CA_ENV = ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
 CA_ENV_ALL = (*CA_ENV, "GIT_SSL_CAINFO")
@@ -796,7 +798,7 @@ def test_p1_runs_as_the_jail_uid(lab: Lab, record_property: Callable[[str, objec
         f"/workspace:rw,nosuid,nodev,size=256m,uid={JAIL_UID},gid={JAIL_UID},mode=0700",
     ]
     try:
-        jail_docker.run(argv, env=token_env(config))
+        jail_docker.run(argv, env=create_env(config))
         docker("start", config.name)
         user = f"{JAIL_UID}:{JAIL_UID}"
         docker("exec", "--user", user, config.name, "mkdir", "-p", "/workspace/home",
