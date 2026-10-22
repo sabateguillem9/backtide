@@ -14,11 +14,22 @@ resolves a local provider's name: it gets a fixed IPv4 and port through the chan
 - Never the agent's own network: ``outside`` checks an address against its subnets (the Egress
   asks Docker for them before the proxy starts).
 
-Never logs or records anything but names, addresses and ports: none of them is a secret.
+- Which Ollama answers there (T20-4, docs/35 section 6.4): the service asks ``GET
+  /api/version`` (``ollama_version``), once per place, from the VM and never through the proxy,
+  and says whether it is older than ``MIN_OLLAMA_VERSION``. Plain HTTP/1.0 to the fixed address
+  only, on a bare socket: VERSION_TIMEOUT seconds in all (connecting, headers and body, however
+  slowly they drip: review of T20-4), no redirect followed, no chunked answer, at most
+  MAX_VERSION_ANSWER bytes in all, and only a version number is taken from it.
+
+Never logs or records anything but names, addresses, ports and versions: none of them is a
+secret.
 """
 
+import json
 import logging
+import re
 import socket
+import time
 from collections.abc import Callable, Iterable, Mapping
 from ipaddress import IPv4Address, IPv4Network, ip_network
 from typing import Any
@@ -29,6 +40,15 @@ from backtide.service.config import Provider
 logger = logging.getLogger(__name__)
 
 OLLAMA_PORT = 11434
+# The oldest Ollama backtide is happy with: 0.14.0 (January 2026) added Anthropic's API
+# (``/v1/messages``, which Claude Code needs; its release notes), and it is after
+# ``/v1/responses`` (0.13.3) and the fixes of CVE-2024-37032, -39720 and -39722 (0.1.x).
+MIN_OLLAMA_VERSION = "0.14.0"
+VERSION_TIMEOUT = 5.0  # seconds IN ALL: Ollama answers /api/version at once, with no model loaded
+MAX_VERSION_ANSWER = 8192  # bytes, headers and body: Ollama's answer is about 150
+_STATUS_RE = re.compile(rb"HTTP/1\.[01] ([0-9]{3})(?: [^\r\n]*)?", re.ASCII)
+_LENGTH_RE = re.compile(rb"content-length: *([0-9]{1,6}) *", re.ASCII | re.IGNORECASE)
+_VERSION_RE = re.compile(r"(\d{1,4})\.(\d{1,4})\.(\d{1,4})(?:[-+][0-9A-Za-z.-]{1,32})?", re.ASCII)
 Lookup = Callable[..., list[Any]]  # socket.getaddrinfo
 
 
@@ -129,3 +149,100 @@ def outside(upstreams: Mapping[str, tuple[str, int]], subnets: Iterable[str]) ->
                 f"provider {name}: {address} is on the agent's own network: a local model is "
                 "never the agent nor the proxy"
             )
+
+
+def ollama_version(
+    address: str,
+    port: int,
+    *,
+    timeout: float = VERSION_TIMEOUT,
+    connect: Callable[..., socket.socket] = socket.create_connection,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> str:
+    """The version the Ollama at ``address:port`` says it is (``GET /api/version``), checked to
+    be one (``0.40.8``, ``0.14.0-rc1``). LocalModelError if it does not answer, takes more than
+    ``timeout`` seconds in all ("too slow"), answers anything else than a 200 with that (a
+    redirect is not followed, a chunked answer is refused) or says something else."""
+    deadline = monotonic() + timeout
+    where = f"{address}:{port}"
+    try:
+        link = connect((address, port), timeout=timeout)
+    except TimeoutError:
+        raise LocalModelError(f"{where} is too slow to say its version") from None
+    except OSError as error:
+        raise LocalModelError(f"{where} does not answer ({type(error).__name__})") from None
+    try:
+        link.sendall(
+            f"GET /api/version HTTP/1.0\r\nHost: {where}\r\nAccept: application/json\r\n"
+            "Connection: close\r\n\r\n".encode("ascii")
+        )
+        data = _read_bounded(link, where, deadline, monotonic)
+    except TimeoutError:
+        raise LocalModelError(f"{where} is too slow to say its version") from None
+    except OSError as error:
+        raise LocalModelError(f"{where} does not answer ({type(error).__name__})") from None
+    finally:
+        link.close()
+    return _version_in(data, where)
+
+
+def _read_bounded(
+    link: socket.socket, where: str, deadline: float, monotonic: Callable[[], float]
+) -> bytes:
+    """The whole answer: until the server closes, or until the body its Content-Length gives
+    is in. LocalModelError past the deadline or past MAX_VERSION_ANSWER bytes."""
+    data = b""
+    while True:
+        left = deadline - monotonic()
+        if left <= 0:
+            raise LocalModelError(f"{where} is too slow to say its version")
+        link.settimeout(left)
+        chunk = link.recv(MAX_VERSION_ANSWER + 1 - len(data))
+        if not chunk:
+            return data
+        data += chunk
+        if len(data) > MAX_VERSION_ANSWER:
+            raise LocalModelError(f"{where}'s answer to /api/version is too long")
+        head, found, body = data.partition(b"\r\n\r\n")
+        if found:
+            lengths = [_LENGTH_RE.fullmatch(line) for line in head.split(b"\r\n")[1:]]
+            length = next((int(m.group(1)) for m in lengths if m is not None), None)
+            if length is not None and len(body) >= length:
+                return data
+
+
+def _version_in(data: bytes, where: str) -> str:
+    head, found, body = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = _STATUS_RE.fullmatch(lines[0]) if found else None
+    if status is None:
+        raise LocalModelError(f"{where} does not say an Ollama version (not an HTTP answer)")
+    if status.group(1) != b"200":
+        raise LocalModelError(f"{where} answered /api/version with {status.group(1).decode()}")
+    if any(line.lower().startswith(b"transfer-encoding:") for line in lines[1:]):
+        raise LocalModelError(f"{where} does not say an Ollama version (a chunked answer)")
+    lengths = [_LENGTH_RE.fullmatch(line) for line in lines[1:]]
+    length = next((int(m.group(1)) for m in lengths if m is not None), None)
+    if length is not None:
+        body = body[:length]
+    try:
+        version = json.loads(body).get("version")
+    except (ValueError, AttributeError):
+        version = None
+    if not isinstance(version, str) or not _VERSION_RE.fullmatch(version):
+        raise LocalModelError(f"{where} does not say an Ollama version")
+    return version
+
+
+def older_than(version: str, minimum: str = MIN_OLLAMA_VERSION) -> bool:
+    """Whether ``version`` (as ``ollama_version`` checked it) is older than ``minimum``. A
+    pre-release of the minimum (``0.14.0-rc1``) counts as the minimum."""
+    return _numbers(version) < _numbers(minimum)
+
+
+def _numbers(version: str) -> tuple[int, int, int]:
+    found = _VERSION_RE.fullmatch(version)
+    if found is None:
+        raise ValueError(f"not a version: {version!r}")
+    major, minor, patch = found.groups()
+    return int(major), int(minor), int(patch)

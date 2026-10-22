@@ -102,8 +102,8 @@ from backtide.gate.translate.read_post import check_read_endpoint
 from backtide.jail.ca import CaPaths
 from backtide.jail.config import AGENT_DIR, MAX_READY_TIMEOUT, AgentJailConfig, Protected
 from backtide.jail.model import MODEL_ID, ModelProvider
-from backtide.jail.profile import AgentProfile
-from backtide.jail.profiles import CUSTOM, DEFAULT_PROFILE, NAMED, profile_names
+from backtide.jail.profile import PROVIDER_NAME_RULE, AgentProfile, is_provider_name
+from backtide.jail.profiles import CUSTOM, DEFAULT_PROFILE, NAMED, WITH_PROVIDER, profile_names
 from backtide.jail.profiles.custom import KEYS as CUSTOM_KEYS
 from backtide.jail.profiles.custom import custom_profile
 from backtide.jail.proxy_config import ProxyJailConfig
@@ -647,6 +647,7 @@ class ServiceConfig:
                     host=p.host,
                     fake_key=self.provider_keys[p.name].fake,
                     models=p.models,
+                    local=p.local is not None,  # T20: never where it is, only that it is local
                 )
                 for p in self.proxy_settings().providers
                 if p.name in self.provider_keys
@@ -1130,17 +1131,42 @@ def agent_profile_of(agent: Mapping[str, Any]) -> AgentProfile:
                 f"[agent] profile must be one of {', '.join(map(repr, profile_names()))}, "
                 f"got {name!r:.80}"
             )
-        if own:
+        if own and (name not in WITH_PROVIDER or set(own) != {"model"}):
             raise ConfigError(
                 f'[agent] {", ".join(map(repr, sorted(own)))}: only for profile = "{CUSTOM}" '
                 f"(the {name} profile has its own)"
             )
+        if own:
+            return _named_with_provider(name, own["model"])
         return NAMED[name]
     _check_ready_timeout(agent)
     try:
         return custom_profile(agent.get("image"), own)
     except ValueError as error:
         raise ConfigError(f"invalid [agent] (profile custom): {error}") from None
+
+
+def _named_with_provider(name: str, model: object) -> AgentProfile:
+    """A named profile thinking with the provider ``[agent.model] provider`` names (T20-4:
+    Claude Code with a local Ollama). Only ``provider``: the rest is the profile's own."""
+    if (
+        not isinstance(model, Mapping)
+        or set(model) != {"provider"}
+        or not isinstance(model["provider"], str)
+    ):
+        raise ConfigError(
+            f'[agent.model] of the {name} profile takes only provider = "<a name of '
+            '[[proxy.providers]]>"'
+        )
+    if not is_provider_name(model["provider"]):  # never quoted: it may be a pasted key
+        raise ConfigError(
+            f"[agent.model] provider of the {name} profile is not a provider name "
+            f"({PROVIDER_NAME_RULE})"
+        )
+    try:
+        return WITH_PROVIDER[name](model["provider"])
+    except ValueError as error:
+        raise ConfigError(f"invalid [agent.model] (profile {name}): {error}") from None
 
 
 def _check_ready_timeout(agent: Mapping[str, Any]) -> None:

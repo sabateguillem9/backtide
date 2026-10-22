@@ -2,6 +2,7 @@
 thinking with Claude through the proxy, the gate asking on Telegram and on the web. In the VM.
 
     python -m scripts.demo.probar up [--modelo <id>] [--internet-falso] [--perfil claude-code]
+                                     [--local <Ollama model>]
     python -m scripts.demo.probar pedir <message in base64>          # OpenClaw
     python -m scripts.demo.probar entrar [--continue]                # Claude Code (T17a-4)
     python -m scripts.demo.probar tarea <message in base64> [--continue]
@@ -13,6 +14,12 @@ instead of OpenClaw: the same volume, proxy, gate, Settings page and Telegram, a
 talks to it with backtide's own `entrar`, `tarea`, `importar` and `exportar` (backtide/
 shell_cli.py), through the running service. Claude Code chooses its own models, so ``[proxy]
 providers`` lists none for it (the spending cap of ``[budget]`` still holds).
+
+With ``--local <model>`` (T20-4, `make probar LOCAL=qwen3-coder:30b`) the agent thinks with the
+owner's own Ollama on the Mac instead of Claude: the only provider is the local ``ollama`` at
+``host.lima.internal:11434`` (the Mac's 127.0.0.1 as the VM sees it), of kind ``openai`` for
+OpenClaw and ``anthropic`` for Claude Code (which then uses it through ``[agent.model]``), with
+that one model. No Anthropic key is needed and its calls cost 0 (docs/35, section 6).
 
 It lives where the demo lives (scripts/demo/demo.py: ``~/backtide-demo-run``, the same volume,
 the same container names and the same sudo checks), so `make probar-parar`, `make
@@ -50,6 +57,7 @@ from typing import Any
 
 import backtide.service.config as service_config
 from backtide.blackbox import Event
+from backtide.gate.providers import is_cloud_model, virtual_host
 from backtide.jail import AgentJail
 from backtide.jail import docker as jail_docker
 from backtide.jail.openclaw import MODEL_ID
@@ -60,6 +68,11 @@ from scripts.demo.demo import NETWORK, Paths
 
 PROVIDER = "anthropic"
 PROVIDER_HOST = "api.anthropic.com"
+# T20-4: the owner's Ollama on the Mac. The VM sees the Mac's 127.0.0.1 at host.lima.internal
+# (192.168.5.2), so Ollama keeps listening on the Mac's loopback only (docs/35, section 6.8).
+LOCAL_PROVIDER = "ollama"
+LOCAL_HOST = virtual_host(LOCAL_PROVIDER)
+LOCAL_URL = "http://host.lima.internal:11434"
 DEFAULT_MODEL = "claude-sonnet-5-5"
 # OpenClaw 2026.9.8's "utility model" for Anthropic (``defaultUtilityModel``): it asks it small
 # things at the start of a turn. Not listed, the proxy refuses it (``model_not_listed``), and
@@ -96,14 +109,18 @@ def render_config(
     model: str = DEFAULT_MODEL,
     offline: bool = False,
     profile: str = OPENCLAW,
+    local: str | None = None,
 ) -> str:
     """The test's backtide.toml. ``offline`` (``--internet-falso``): the service does not fetch
     Anthropic's pricing page (it would go out of the VM, outside the proxy). ``profile``: the
-    agent, OpenClaw or Claude Code (which picks its own models: none are listed for it)."""
+    agent, OpenClaw or Claude Code (which picks its own models: none are listed for it).
+    ``local``: a model of the owner's Ollama, the only one the agent then uses (T20-4)."""
     if not MODEL_ID.fullmatch(model):
         raise demo.DemoError(f"el modelo {model!r} no tiene forma de id de modelo")
     if profile not in PROFILES:
         raise demo.DemoError(f"el perfil {profile!r} no existe: {' o '.join(PROFILES)}")
+    if local is not None:
+        return _render_local(paths, uid, gid, model=local, offline=offline, profile=profile)
     if profile == CLAUDE_CODE:
         agent_profile = 'profile = "claude-code"\n'
         models = "# Claude Code picks its own models (the main one and a small one): none listed.\n"
@@ -156,6 +173,74 @@ def render_config(
         "trust_owner_chat = true\n"
         f"{budget}"
     )
+
+
+def _render_local(
+    paths: Paths, uid: int, gid: int, *, model: str, offline: bool, profile: str
+) -> str:
+    """The config with the owner's Ollama as the only provider (``render_config``'s ``local``)."""
+    if not MODEL_ID.fullmatch(model):
+        raise demo.DemoError(f"el modelo local {model!r} no tiene forma de id de modelo")
+    if is_cloud_model(model):
+        raise demo.DemoError(
+            f"{model} se ejecuta en la nube de Ollama (sus datos saldrían de casa): elige un "
+            "modelo local"
+        )
+    if offline:
+        raise demo.DemoError(
+            "LOCAL y FALSO no van juntos: con el internet falso el proxy no llega a tu Ollama"
+        )
+    if profile == CLAUDE_CODE:
+        kind = "anthropic"  # Claude Code speaks Anthropic's API, and Ollama serves it
+        agent_model = f'\n[agent.model]\nprovider = "{LOCAL_PROVIDER}"\n'
+        agent_profile = 'profile = "claude-code"\n'
+    else:
+        kind = "openai"
+        agent_model = ""
+        agent_profile = ""
+    return (
+        f'state_dir = "{paths.state}"\n'
+        f'volume = "{paths.volume}"\n'
+        f"workspace_limit = {WORKSPACE_LIMIT}  # 192 MiB\n"
+        f"cycle_interval = {CYCLE_INTERVAL}\n"
+        "\n"
+        "[agent]\n"
+        f"{agent_profile}"
+        f'name = "{demo.CONTAINER}"\n'
+        f'network = "{NETWORK}"\n'
+        f"uid = {uid}\n"
+        f"gid = {gid}\n"
+        f'memory = "{AGENT_MEMORY}"\n'
+        'cpus = "2"\n'
+        f"{agent_model}"
+        "\n"
+        "# The egress proxy: the VM user's ids (demo.dev_proxy), and the owner's Ollama on the\n"
+        "# Mac as the only model (make probar LOCAL=...). No key: nothing is paid, the agent\n"
+        f"# calls https://{LOCAL_HOST} and the proxy takes it to Ollama.\n"
+        "[proxy]\n"
+        f"uid = {uid}\n"
+        f"gid = {gid}\n"
+        "\n"
+        "[[proxy.providers]]\n"
+        f'name = "{LOCAL_PROVIDER}"\n'
+        f'kind = "{kind}"\n'
+        f'local = "{LOCAL_URL}"\n'
+        f"models = {json.dumps([model])}\n"
+        "\n"
+        "# The gate's defaults, written out: reads pass, writes to unknown hosts are held, and\n"
+        "# the owner's Telegram chat (telegram.toml) is trusted.\n"
+        "[gate]\n"
+        'unknown_hosts = "hold"\n'
+        "trust_owner_chat = true\n"
+    )
+
+
+def is_local(paths: Paths) -> bool:
+    """Whether the running test thinks with the owner's Ollama (its config says so)."""
+    try:
+        return f'local = "{LOCAL_URL}"' in paths.config.read_text()
+    except OSError:
+        return False
 
 
 def model_of(paths: Paths) -> str | None:
@@ -224,7 +309,7 @@ def describe(event: Event) -> str | None:
         risk = f"riesgo {event.risk}  " if action == "held" else ""
         return f"{when}  PUERTA      {action:<15} {risk}{method} {target}".rstrip()
     if source == "net":
-        if action == "request" and str(details.get("host", "")) == PROVIDER_HOST:
+        if action == "request" and str(details.get("host", "")) in (PROVIDER_HOST, LOCAL_HOST):
             return None  # the model's own calls: the llm lines say them
         why = details.get("reason")
         because = f"  ({visible(str(why))})" if why else ""
@@ -255,12 +340,19 @@ def require_profile_image(profile: str) -> None:
         demo.run(["docker", "pull", "--quiet", image], timeout=demo.PULL_TIMEOUT)
 
 
-def command_up(paths: Paths, *, model: str, fake_internet: bool, profile: str = OPENCLAW) -> int:
+def command_up(
+    paths: Paths,
+    *,
+    model: str,
+    fake_internet: bool,
+    profile: str = OPENCLAW,
+    local: str | None = None,
+) -> int:
     demo.require_dev_vm_user_with_sudo()
     if demo.service_pid(paths) is not None:
         raise demo.DemoError("ya hay una prueba o una demo en marcha; `make probar-parar` la quita")
     # Refuses an odd model or profile before anything is touched.
-    render_config(paths, 0, 0, model=model, offline=fake_internet, profile=profile)
+    render_config(paths, 0, 0, model=model, offline=fake_internet, profile=profile, local=local)
     require_profile_image(profile)
     if paths.base.exists() or demo.mount_at(paths.mnt) is not None:
         print("Quedaba una prueba o una demo anterior: la quito para empezar de cero.", flush=True)
@@ -268,7 +360,7 @@ def command_up(paths: Paths, *, model: str, fake_internet: bool, profile: str = 
     demo.create_volume(
         paths,
         lambda p, uid, gid: render_config(
-            p, uid, gid, model=model, offline=fake_internet, profile=profile
+            p, uid, gid, model=model, offline=fake_internet, profile=profile, local=local
         ),
         telegram=not fake_internet,  # the fake internet's run never reaches the real Telegram
         image_size=IMAGE_SIZE,
@@ -282,24 +374,37 @@ def command_up(paths: Paths, *, model: str, fake_internet: bool, profile: str = 
             raise
         print("INTERNET FALSO: nada sale a Anthropic ni a Telegram (solo para verificar).")
     telegram = (paths.state / "telegram.toml").exists()
-    who = (
-        "Agente: Claude Code (elige él sus modelos de Anthropic, a través del proxy).\n"
-        if profile == CLAUDE_CODE
-        else f"Modelo del agente: {model} (de Anthropic, a través del proxy).\n"
-    )
+    if local is not None:
+        agent = "Claude Code" if profile == CLAUDE_CODE else "OpenClaw"
+        who = (
+            f"Agente: {agent}, pensando con {local} de tu Ollama del Mac (a través del proxy, "
+            "coste 0).\n"
+        )
+    elif profile == CLAUDE_CODE:
+        who = "Agente: Claude Code (elige él sus modelos de Anthropic, a través del proxy).\n"
+    else:
+        who = f"Modelo del agente: {model} (de Anthropic, a través del proxy).\n"
     print(
         "Volumen de la prueba listo (Btrfs con cuotas, tope del agente: 192 MiB).\n"
         f"{who}"
         "Arranco `backtide vigilar`: espera a ver `agent_start` y las primeras instantáneas.\n",
         flush=True,
     )
-    print(
-        "FALTA LA CLAVE DE ANTHROPIC. No la pegues aquí ni en ningún archivo: en otra "
-        "terminal,\n  make probar-web\nabre el enlace en el navegador del Mac, ve a «Ajustes» y "
-        "pégala en «Anthropic».\nHasta entonces, si le hablas al agente, backtide le contesta "
-        "que aún no hay clave, sin llamar a Anthropic (sin coste).\n",
-        flush=True,
-    )
+    if local is not None:
+        print(
+            "Sin clave: tu Ollama no la necesita. Tiene que estar abierto en el Mac, con ese "
+            "modelo descargado\n(ollama pull ...); backtide graba su versión al arrancar "
+            "(provider_local_ready).\n",
+            flush=True,
+        )
+    else:
+        print(
+            "FALTA LA CLAVE DE ANTHROPIC. No la pegues aquí ni en ningún archivo: en otra "
+            "terminal,\n  make probar-web\nabre el enlace en el navegador del Mac, ve a «Ajustes» "
+            "y pégala en «Anthropic».\nHasta entonces, si le hablas al agente, backtide le "
+            "contesta que aún no hay clave, sin llamar a Anthropic (sin coste).\n",
+            flush=True,
+        )
     if telegram:
         print("Telegram: los avisos y las retenciones irán a tu bot.\n", flush=True)
     elif fake_internet:
@@ -372,7 +477,7 @@ def command_pedir(paths: Paths, encoded: str) -> int:
     jail = AgentJail(replace(config.jail_config(), allow_shared_ids=True))
     if not jail.is_running():
         raise demo.DemoError("el agente no está en marcha: arranca `make probar` en otra terminal")
-    if not has_real_key(paths):
+    if not is_local(paths) and not has_real_key(paths):
         print("Aviso: aún no has puesto la clave de Anthropic en Ajustes (make probar-web).")
     print(f"Tú: {visible(message, 400)}\nEl agente piensa (con {model_of(paths)})...", flush=True)
     result = jail.exec(agent_turn_argv(message), timeout=TURN_TIMEOUT)
@@ -419,6 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--internet-falso", action="store_true", help="solo para verificar: nada sale de la VM"
     )
     up.add_argument("--perfil", choices=PROFILES, default=OPENCLAW, help="el agente")
+    up.add_argument("--local", help="un modelo de tu Ollama del Mac, en vez de Claude (T20-4)")
     enter = commands.add_parser("entrar", help="Claude Code en tu terminal")
     enter.add_argument("--continue", dest="resume", action="store_true")
     task = commands.add_parser("tarea", help="una tarea a Claude Code, y su respuesta")
@@ -446,7 +552,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "up":
             return command_up(
-                paths, model=args.modelo, fake_internet=args.internet_falso, profile=args.perfil
+                paths,
+                model=args.modelo,
+                fake_internet=args.internet_falso,
+                profile=args.perfil,
+                local=args.local,
             )
         if args.command == "pedir":
             return command_pedir(paths, args.mensaje)

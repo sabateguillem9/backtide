@@ -50,7 +50,7 @@ PROFILE_FIELDS = {
     "name", "version", "image", "entrypoint", "command", "workdir", "workspace_dirs", "env",
     "proxy_url_env", "ca_file_env", "token_env", "fake_key_env", "config_names",
     "render_config", "check_config", "ready_log_line", "ready_probe", "ready_answer",
-    "rewind_notice_lines", "provider_params", "check_providers", "mode", "shell",
+    "rewind_notice_lines", "provider_params", "check_providers", "provider_env", "mode", "shell",
 }  # fmt: skip
 # What decides the jail's security: AgentJailConfig's or fixed, never a profile's.
 SECURITY_FIELDS = (

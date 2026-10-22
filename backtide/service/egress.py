@@ -40,7 +40,11 @@ a few points of its life; the watch runs on this module's own thread.
   alert): the old address stays until the owner restarts the service (review of T20-2/3, L2).
   Before the proxy starts, no local provider may be on the agent's own network (the start fails
   at step ``local_provider``); those subnets are kept, and a reload that would break the rule is
-  not taken.
+  not taken. Each time one is recorded somewhere new, the service asks that Ollama its version
+  (``ask_version``, on a thread of its own; T20-4): ``system/provider_local_ready {provider,
+  version, minimum, old}``, risk 2 with an alert when it is older than the minimum, or
+  ``system/provider_local_unanswered {provider, address, port, why}`` (risk 1) when it does not
+  answer (Ollama closed on the Mac, a wrong port).
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
 """
 
@@ -71,7 +75,12 @@ from backtide.service.holds import (
     TrustStatus,
     stale_holds,
 )
-from backtide.service.local_models import LocalModelError, outside
+from backtide.service.local_models import (
+    MIN_OLLAMA_VERSION,
+    LocalModelError,
+    older_than,
+    outside,
+)
 from backtide.service.pause import Ticker
 from backtide.service.price_update import PriceUpdater
 from backtide.service.proxy_channel import (
@@ -144,8 +153,12 @@ class Egress:
         trust: TrustStore | None = None,
         budget: Budget | None = None,
         prices: PriceUpdater | None = None,
+        ask_version: Callable[[str, int], str] | None = None,
     ) -> None:
         self._jail = jail
+        # T20-4: how the service asks a local Ollama its version (local_models.ollama_version);
+        # None asks nothing (the tests' fake worlds).
+        self._ask_version = ask_version
         # The spending cap (T11): one for the service, handed to every channel. It reads its
         # totals (or rebuilds them from the black box) at the first start, once the box is open;
         # ``prices`` keeps its price table up to date on a thread of its own.
@@ -499,6 +512,7 @@ class Egress:
                     continue
                 if before is None:
                     self._record("provider_local", details)
+                    self._check_version(provider.name, address, port)
                 else:
                     logger.warning(
                         "local provider %s moved from %s:%d to %s:%d", provider.name, *before,
@@ -507,10 +521,64 @@ class Egress:
                     details["before"] = f"{before[0]}:{before[1]}"
                     details["applied"] = True
                     self._record("provider_local_changed", details, risk=1)
+                    self._check_version(provider.name, address, port)
                 self._local_states[provider.name] = provider.upstream
             self._note_moves()
         except Exception:
             logger.exception("recording where the local providers are failed")
+
+    def _check_version(self, name: str, address: str, port: int) -> None:
+        """Ask the Ollama of the local provider ``name`` its version, on a thread of its own
+        (the start never waits for it), and record what it says."""
+        if self._ask_version is None:
+            return
+        if not self._thread:
+            self._tell_version(name, address, port)
+            return
+        threading.Thread(
+            target=self._tell_version,
+            args=(name, address, port),
+            name=f"ollama-version-{name}",
+            daemon=True,
+        ).start()
+
+    def _tell_version(self, name: str, address: str, port: int) -> None:
+        """``system/provider_local_ready`` (risk 2 and an alert when it is older than the
+        minimum) or ``system/provider_local_unanswered`` (risk 1). Never raises."""
+        ask = self._ask_version
+        if ask is None:
+            return
+        try:
+            try:
+                version = ask(address, port)
+            except LocalModelError as error:
+                logger.warning("local provider %s: %s", name, error)
+                self._record(
+                    "provider_local_unanswered",
+                    {"provider": name, "address": address, "port": port, "why": str(error)},
+                    risk=1,
+                )
+                return
+            old = older_than(version)
+            details = {
+                "provider": name, "version": version, "minimum": MIN_OLLAMA_VERSION, "old": old,
+            }  # fmt: skip
+            event = self._record("provider_local_ready", details, risk=2 if old else 0)
+            if old:
+                logger.warning(
+                    "local provider %s: Ollama %s is older than %s", name, version,
+                    MIN_OLLAMA_VERSION,
+                )  # fmt: skip
+                self._alert(
+                    AlertLevel.WARNING,
+                    f"El Ollama de {name} es antiguo",
+                    f"Dice ser la versión {version}, y backtide pide la {MIN_OLLAMA_VERSION} o "
+                    "una más nueva (las viejas no tienen la API que usa Claude Code y han tenido "
+                    "fallos de seguridad). Actualiza Ollama en esa máquina.",
+                    event,
+                )
+        except Exception:
+            logger.exception("asking the local provider %s its version failed", name)
 
     def _note_moves(self) -> None:
         """A local provider whose name resolved elsewhere at a reload keeps its old address

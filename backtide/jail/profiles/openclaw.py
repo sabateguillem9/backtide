@@ -129,9 +129,24 @@ def check_providers(providers: tuple[ModelProvider, ...]) -> None:
             )
 
 
+# A local provider (T20-4, docs/35 section 6.6; OpenClaw 2026.9.8's own docs/gateway/config-tools/
+# custom-providers.md and extensions/ollama/src/stream-compat.ts, read in the pinned image):
+# - ``injectNumCtxForOpenAICompat: false``: with ``openai-completions`` OpenClaw adds
+#   ``options.num_ctx`` to every call to a provider it takes for Ollama (one named ``ollama``),
+#   and the proxy refuses ``options`` (``param:options``). The context is set on the Mac
+#   (``OLLAMA_CONTEXT_LENGTH``).
+# - ``timeoutSeconds``: a local model can take minutes to load and answer (docs/35, P7). Node's
+#   own limit is 300 s (T10-1), so no more than that.
+# - ``models.mode: "replace"`` when the agent's model is a local one (decision 8): only the
+#   configured catalog, no plugin discovery (an ``ollama`` provider would ask the proxy for
+#   ``/api/tags``, which it refuses) and nothing to fall back to.
+LOCAL_TIMEOUT_SECONDS = 300
+
+
 def model_settings(providers: Iterable[ModelProvider]) -> dict[str, Any]:
-    """What openclaw.json says of the providers: ``models`` (merged with OpenClaw's catalog) and
-    the agent's default model. Empty without providers."""
+    """What openclaw.json says of the providers: ``models`` (merged with OpenClaw's catalog, or
+    only these when the agent's model is local) and the agent's default model: the first model
+    of the first provider that lists some. Empty without providers."""
     items = tuple(providers)
     if not items:
         return {}
@@ -143,11 +158,16 @@ def model_settings(providers: Iterable[ModelProvider]) -> dict[str, Any]:
             "auth": "api-key",
             "apiKey": provider.fake_key,
         }
+        if provider.local:
+            entry["timeoutSeconds"] = LOCAL_TIMEOUT_SECONDS
+            if provider.kind == "openai":
+                entry["injectNumCtxForOpenAICompat"] = False
         if provider.models:
             entry["models"] = [{"id": model, "name": model} for model in provider.models]
         entries[provider.name] = entry
-    settings: dict[str, Any] = {"models": {"mode": "merge", "providers": entries}}
     default = next((p for p in items if p.models), None)
+    mode = "replace" if default is not None and default.local else "merge"
+    settings: dict[str, Any] = {"models": {"mode": mode, "providers": entries}}
     if default is not None:
         settings["primary"] = f"{default.name}/{default.models[0]}"
     return settings

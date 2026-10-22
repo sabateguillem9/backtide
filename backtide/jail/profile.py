@@ -24,6 +24,7 @@ The jail's layout inside the container lives here too: a profile names those pat
 state folder, its config file) but never changes them.
 """
 
+import dataclasses
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -184,6 +185,14 @@ class ProfileError(ValueError):
         return ()
 
 
+def is_provider_name(name: object) -> bool:
+    """Whether ``name`` has the shape of a provider's name (``[[proxy.providers]] name``)."""
+    return isinstance(name, str) and _PROVIDER_NAME_RE.fullmatch(name) is not None
+
+
+PROVIDER_NAME_RULE = "a-z, 0-9 and -, 1 to 32 characters, no - at either end"
+
+
 def is_reserved_env(name: str) -> bool:
     """Whether ``name`` is a variable only the jail may set, or none may."""
     return name.upper() in RESERVED_ENV or any(shape.fullmatch(name) for shape in _RESERVED_SHAPES)
@@ -268,6 +277,11 @@ def _any_answer(output: str) -> bool:
 
 def _any_providers(providers: "tuple[ModelProvider, ...]") -> None:
     del providers
+
+
+def _no_provider_env(providers: "tuple[ModelProvider, ...]") -> tuple[tuple[str, str], ...]:
+    del providers
+    return ()
 
 
 @dataclass(frozen=True)
@@ -359,6 +373,9 @@ class AgentProfile:
       know (``param:<name>``, decision 5 of docs/34); allowed for this profile only.
     - ``check_providers``: refuses (ValueError) model providers this agent cannot use (OpenClaw:
       one it has no catalog of, without its model ids).
+    - ``provider_env``: variables whose values come from the model providers backtide gives the
+      agent (T20-4, Claude Code with a local model: its base URL and model ids), never a key.
+      ``for_providers`` adds them to ``env``, so they go through exactly the same checks.
     - ``mode``: ``"service"`` (the command is the agent) or ``"shell"`` (the container waits and
       the owner runs the agent in it: ``shell`` says how, and only a shell profile has one).
     - ``env`` may hold a reserved name only for a named profile, and only one of the exact pairs
@@ -385,6 +402,9 @@ class AgentProfile:
     rewind_notice_lines: tuple[str, ...] = ()
     provider_params: tuple[str, ...] = ()
     check_providers: "Callable[[tuple[ModelProvider, ...]], None]" = _any_providers
+    provider_env: "Callable[[tuple[ModelProvider, ...]], tuple[tuple[str, str], ...]]" = (
+        _no_provider_env
+    )
     mode: str = SERVICE_MODE
     shell: ShellCommands | None = None
 
@@ -411,6 +431,7 @@ class AgentProfile:
             ("check_config", self.check_config),
             ("ready_answer", self.ready_answer),
             ("check_providers", self.check_providers),
+            ("provider_env", self.provider_env),
         ):
             if not callable(function):
                 raise ValueError(f"{label} must be callable")
@@ -433,6 +454,17 @@ class AgentProfile:
             check_profile_param(entry)
         if len(set(self.provider_params)) != len(self.provider_params):
             raise ValueError("provider_params has the same field twice")
+
+    def for_providers(self, providers: "tuple[ModelProvider, ...]") -> "AgentProfile":
+        """This profile with ``provider_env``'s variables for ``providers`` added to ``env``
+        (ValueError, as for any profile, if one of them breaks a rule of ``env``), or itself when
+        there are none. The result has no ``provider_env`` left, so it is never added twice."""
+        extra = self.provider_env(providers)
+        if not isinstance(extra, tuple):
+            raise ValueError("provider_env must give a tuple of (name, value) pairs")
+        if not extra:
+            return self
+        return dataclasses.replace(self, env=(*self.env, *extra), provider_env=_no_provider_env)
 
     def _check_workdir(self) -> None:
         if self.workdir is None:

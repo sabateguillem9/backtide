@@ -29,10 +29,20 @@ any agent.
 - `backtide entrar` writes the first-run answers into ~/.claude.json first (``SEED``): UI state,
   not authorization. If the agent changes it, or a rewind brings an old one back, Claude Code
   only asks again.
+- Its model provider (T20-4, docs/35 section 6.6): ``anthropic`` (api.anthropic.com, where Claude
+  Code goes by itself) unless ``[agent.model] provider`` names another one of kind
+  ``anthropic``, such as a local Ollama (``claude_code_profile``). Then the fake key of THAT
+  provider goes in ``ANTHROPIC_API_KEY``, ``ANTHROPIC_BASE_URL`` is ``https://<its host>`` (a
+  local one's virtual name, which only the proxy understands) and every model Claude Code picks
+  by itself (the main one, Opus, Sonnet, Haiku, the small fast one and the subagents') is one of
+  its ``models``: the first, and the last for the small background ones. Otherwise its
+  background calls would ask for a ``claude-haiku-...`` that the proxy refuses
+  (``model_not_listed``). Only what Claude Code needs to work: the proxy decides what passes.
 """
 
 import json
 from collections.abc import Mapping
+from functools import cache
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -41,10 +51,12 @@ from backtide.jail.profile import (
     CONTAINER_CONFIG_DIR,
     CONTAINER_WORK,
     HOME_DIR,
+    PROVIDER_NAME_RULE,
     SHELL_MODE,
     AgentProfile,
     ProfileError,
     ShellCommands,
+    is_provider_name,
 )
 
 if TYPE_CHECKING:
@@ -74,8 +86,18 @@ SETTINGS: Mapping[str, Any] = {
 }
 
 KEY_ENV = "ANTHROPIC_API_KEY"
-PROVIDER = "anthropic"  # the [[proxy.providers]] it uses: kind anthropic, the real host
+PROVIDER = "anthropic"  # the [[proxy.providers]] it uses by default: kind anthropic, real host
 API_HOST = "api.anthropic.com"  # Claude Code calls it itself: no ANTHROPIC_BASE_URL
+# Another provider of kind anthropic (T20-4: a local Ollama's /v1/messages): where Claude Code
+# sends its calls, and the model ids it uses for everything it would otherwise pick itself.
+BASE_URL_ENV = "ANTHROPIC_BASE_URL"
+MAIN_MODEL_ENVS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+)
+SMALL_MODEL_ENVS = ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")
 ENV = (
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
     ("CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", "1"),
@@ -223,17 +245,47 @@ def _same(found: object, reviewed: object) -> bool:
     return found == reviewed
 
 
-def check_providers(providers: tuple[ModelProvider, ...]) -> None:
-    """Claude Code calls api.anthropic.com itself (no base URL): its provider must be an
-    anthropic one at that host, or the gate would see its fake key go to an unknown host."""
-    for provider in providers:
-        if provider.name == PROVIDER and (
-            provider.kind != "anthropic" or provider.host != API_HOST
-        ):
+def check_providers(providers: tuple[ModelProvider, ...], provider: str = PROVIDER) -> None:
+    """Claude Code only speaks Anthropic's API: the provider it uses (``provider``) must be of
+    kind ``anthropic``, and one at another host than api.anthropic.com (a local Ollama) must
+    list its models, which Claude Code is then told to use. A provider named ``anthropic`` is
+    always Anthropic's own host (Claude Code calls it itself when it is the one it uses).
+    ValueError otherwise."""
+    for item in providers:
+        if item.name == PROVIDER and (item.kind != "anthropic" or item.host != API_HOST):
             raise ValueError(
                 f'provider {PROVIDER}: Claude Code needs kind = "anthropic" and host = '
                 f'"{API_HOST}" (it calls that host itself)'
             )
+        if item.name != provider:
+            continue
+        if item.kind != "anthropic":
+            raise ValueError(
+                f"provider {item.name}: Claude Code only speaks Anthropic's API (kind = "
+                '"anthropic"; an Ollama serves it at the same address)'
+            )
+        if item.host != API_HOST and not item.models:
+            raise ValueError(
+                f"provider {item.name}: Claude Code needs its model ids (it would ask for "
+                "Claude's own models otherwise)"
+            )
+
+
+def model_env(
+    providers: tuple[ModelProvider, ...], provider: str = PROVIDER
+) -> tuple[tuple[str, str], ...]:
+    """The variables that point Claude Code at ``provider`` when it is not api.anthropic.com:
+    its base URL and the model ids for everything Claude Code would pick itself. Nothing for
+    Anthropic's own host, or when the provider is not given (the service checks it is there)."""
+    found = next((item for item in providers if item.name == provider), None)
+    if found is None or found.host == API_HOST or not found.models:
+        return ()
+    main, small = found.models[0], found.models[-1]
+    return (
+        (BASE_URL_ENV, f"https://{found.host}"),
+        *((name, main) for name in MAIN_MODEL_ENVS),
+        *((name, small) for name in SMALL_MODEL_ENVS),
+    )
 
 
 def version_answer(output: str) -> bool:
@@ -241,24 +293,48 @@ def version_answer(output: str) -> bool:
     return output.strip() == f"{CLAUDE_CODE_VERSION} (Claude Code)"
 
 
-CLAUDE_CODE = AgentProfile(
-    name=NAME,
-    version=CLAUDE_CODE_VERSION,
-    image=IMAGE,
-    entrypoint=ENTRYPOINT,
-    command=COMMAND,
-    workdir=PurePosixPath(WORKDIR),
-    workspace_dirs=(HOME_DIR, "work"),
-    env=ENV,
-    fake_key_env=((KEY_ENV, PROVIDER),),
-    config_names=(SETTINGS_FILE,),
-    render_config=render_settings,
-    check_config=check_settings,
-    ready_probe=(CLAUDE, "--version"),
-    ready_answer=version_answer,
-    rewind_notice_lines=REWIND_NOTICE_LINES,
-    provider_params=PROVIDER_PARAMS,
-    check_providers=check_providers,
-    mode=SHELL_MODE,
-    shell=ShellCommands(session=SESSION, task=TASK, resume=RESUME, seed=SEED_ARGV, seed_input=SEED),
-)
+def claude_code_profile(provider: str = PROVIDER) -> AgentProfile:
+    """Claude Code's profile, thinking with ``provider`` (``[agent.model] provider``; Anthropic
+    by default). The same object for the same name. A ``provider`` that is not a provider's
+    name is refused without quoting it: the owner may have pasted a key there."""
+    if not is_provider_name(provider):
+        raise ValueError(f"the provider is not a provider name ({PROVIDER_NAME_RULE})")
+    return _claude_code(provider)
+
+
+@cache
+def _claude_code(provider: str) -> AgentProfile:
+
+    def check(providers: tuple[ModelProvider, ...]) -> None:
+        check_providers(providers, provider)
+
+    def env(providers: tuple[ModelProvider, ...]) -> tuple[tuple[str, str], ...]:
+        return model_env(providers, provider)
+
+    return AgentProfile(
+        name=NAME,
+        version=CLAUDE_CODE_VERSION,
+        image=IMAGE,
+        entrypoint=ENTRYPOINT,
+        command=COMMAND,
+        workdir=PurePosixPath(WORKDIR),
+        workspace_dirs=(HOME_DIR, "work"),
+        env=ENV,
+        fake_key_env=((KEY_ENV, provider),),
+        config_names=(SETTINGS_FILE,),
+        render_config=render_settings,
+        check_config=check_settings,
+        ready_probe=(CLAUDE, "--version"),
+        ready_answer=version_answer,
+        rewind_notice_lines=REWIND_NOTICE_LINES,
+        provider_params=PROVIDER_PARAMS,
+        check_providers=check,
+        provider_env=env,
+        mode=SHELL_MODE,
+        shell=ShellCommands(
+            session=SESSION, task=TASK, resume=RESUME, seed=SEED_ARGV, seed_input=SEED
+        ),
+    )
+
+
+CLAUDE_CODE = claude_code_profile()

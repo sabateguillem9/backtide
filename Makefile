@@ -75,11 +75,12 @@ demo-web: ## Demo: the web of the running demo, in the VM (open the link on the 
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
 	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --rebobinar --aprobar'
 
-probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5; PERFIL=claude-code para Claude Code), en primer plano (terminal 1; docs/probar.md)
+probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5; PERFIL=claude-code para Claude Code; LOCAL=<modelo de tu Ollama> en vez de Claude), en primer plano (terminal 1; docs/probar.md)
 	@case "$(MODEL)" in ""|*[!0-9A-Za-z._:/@+-]*) echo "MODEL tiene caracteres raros" >&2; exit 2;; esac
 	@case "$(FALSO)" in ""|1) ;; *) echo "FALSO solo puede valer 1" >&2; exit 2;; esac
+	@case "$(LOCAL)" in *[!0-9A-Za-z._:/@+-]*) echo "LOCAL tiene caracteres raros" >&2; exit 2;; esac
 	@case "$(PERFIL)" in ""|openclaw|claude-code) ;; *) echo "PERFIL es openclaw o claude-code" >&2; exit 2;; esac
-	$(VM_SH) '$(PROBAR_VM) up --modelo $(MODEL) $(if $(FALSO),--internet-falso) $(if $(PERFIL),--perfil $(PERFIL))'
+	$(VM_SH) '$(PROBAR_VM) up --modelo $(MODEL) $(if $(FALSO),--internet-falso) $(if $(PERFIL),--perfil $(PERFIL)) $(if $(LOCAL),--local $(LOCAL))'
 
 probar-web: ## Prueba real: la web con Ajustes, aprobar y rebobinar (abre el enlace en el Mac; docs/probar.md)
 	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac

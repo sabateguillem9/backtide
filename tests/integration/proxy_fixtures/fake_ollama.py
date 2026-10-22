@@ -7,14 +7,17 @@ only reach it through a local provider's fixed address.
 
 - 11434: plain HTTP, like Ollama. ``POST /v1/chat/completions`` answers like Ollama's copy of
   OpenAI's API (JSON, or SSE with ``"stream": true``), ``POST /v1/messages`` like its copy of
-  Anthropic's, ``GET /v1/models`` with one model. Anything else (``/api/pull``, ``/api/tags``...)
+  Anthropic's (JSON, or SSE with ``"stream": true``: Claude Code streams; T20-4), ``GET
+  /v1/models`` with one model. Anything else (``/api/pull``, ``/api/tags``...)
   gets ``{"fake": "ollama"}``, so a request that should never arrive is seen when it does. A
   model request with ``T20-REDIRECT`` in its body gets ``302 Location: http://<this
   container>:22/``; with ``T20-SWITCH``, ``101 Switching Protocols`` (the proxy must cut both).
 - 22 and 8080: decoys. They count every TCP connection and close it: the tests check that nothing
   ever reaches them.
 - 9000: control, ``GET /stats``: every request seen on 11434 (method, path, headers, body size,
-  the peer's address) and the connections accepted per port.
+  the ``model`` and the top-level fields of a JSON body, the peer's address) and the connections
+  accepted per port. ``GET /api/version`` says VERSION: the service asks it from the VM, never
+  through the proxy (``system/provider_local_ready``), so its peer is not the proxy's.
 
 Prints READY_LINE once all of them listen.
 """
@@ -27,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 READY_LINE = "t20-ollama-ready"
 REPLY_TEXT = "T20 PONG FROM THE FAKE OLLAMA"
 MODEL = "t20-fake-coder:7b"
+VERSION = "0.40.8"  # what it says it is
 DECOYS = (22, 8080)
 LOCK = threading.Lock()
 REQUESTS: list[dict] = []
@@ -65,6 +69,12 @@ class Ollama(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _note(self, body: bytes) -> None:
+        try:
+            request = json.loads(body) if body else None
+        except ValueError:
+            request = None
+        fields = sorted(request) if isinstance(request, dict) else []
+        model = request.get("model") if isinstance(request, dict) else None
         with LOCK:
             REQUESTS.append(
                 {
@@ -72,9 +82,23 @@ class Ollama(BaseHTTPRequestHandler):
                     "path": self.path,
                     "headers": {k.lower(): v for k, v in self.headers.items()},
                     "body_size": len(body),
+                    "fields": fields,
+                    "model": model if isinstance(model, str) else None,
                     "peer": self.client_address[0],
                 }
             )
+
+    def _sse(self, events: list[tuple[str | None, dict]]) -> None:
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        for name, data in events:
+            chunk = "" if name is None else f"event: {name}\n"
+            self.wfile.write(f"{chunk}data: {json.dumps(data)}\n\n".encode())
+            self.wfile.flush()
 
     def _send(self, code: int, data: bytes, kind: str = "application/json", **extra: str) -> None:
         self.send_response(code)
@@ -87,6 +111,9 @@ class Ollama(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - http.server's name
         self._note(b"")
+        if self.path == "/api/version":  # what the SERVICE asks, from the VM (T20-4)
+            self._send(200, json.dumps({"version": VERSION}).encode())
+            return
         if self.path.split("?", 1)[0] == "/v1/models":
             listing = {"object": "list", "data": [{"id": MODEL, "object": "model"}]}
             self._send(200, json.dumps(listing).encode())
@@ -118,6 +145,9 @@ class Ollama(BaseHTTPRequestHandler):
             request = json.loads(body or b"{}")
         except ValueError:
             request = {}
+        if path == "/v1/messages" and request.get("stream") is True:
+            self._sse(anthropic_stream())
+            return
         if path == "/v1/messages":
             answer = {
                 "id": "msg_t20",
@@ -160,6 +190,27 @@ class Ollama(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 7, "completion_tokens": 8, "total_tokens": 15},
         }
         self._send(200, json.dumps(answer).encode())
+
+
+def anthropic_stream() -> list[tuple[str | None, dict]]:
+    """Ollama's copy of Anthropic's streamed answer: REPLY_TEXT in one text block."""
+    message = {
+        "id": "msg_t20", "type": "message", "role": "assistant", "model": MODEL, "content": [],
+        "stop_reason": None, "stop_sequence": None,
+        "usage": {"input_tokens": 5, "output_tokens": 1},
+    }  # fmt: skip
+    return [
+        ("message_start", {"type": "message_start", "message": message}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": REPLY_TEXT}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta",
+                           "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": {"output_tokens": 6}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]  # fmt: skip
 
 
 class Control(BaseHTTPRequestHandler):

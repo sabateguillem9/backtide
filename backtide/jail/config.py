@@ -195,7 +195,12 @@ class AgentJailConfig:
     ca_dir: Path
     gateway_token: str | None = field(default=None, repr=False)
     # The model providers with their FAKE keys, for the profile (T06-5; OpenClaw puts them in
-    # openclaw.json): never in the argv. The real keys never reach this object.
+    # openclaw.json): never in the argv. The real keys never reach this object. The profile's
+    # variables that come from them (``provider_env``: Claude Code's base URL and models) are
+    # fixed when the config is made: for such a profile, never change this field with
+    # dataclasses.replace (it would keep the old ones, which only makes the agent fail); make a
+    # new config from ServiceConfig.jail_config() instead. OpenClaw's openclaw.json is rendered
+    # from this field each time, so a test may replace it there.
     model_providers: tuple[ModelProvider, ...] = field(default=(), repr=False)
     name: str = "backtide-agente"
     network: str = "backtide-agente-net"
@@ -287,6 +292,9 @@ class AgentJailConfig:
         if len(set(names)) != len(names):
             raise ValueError("two model providers have the same name")
         self.profile.check_providers(self.model_providers)
+        # T20-4: the variables that come from the providers (Claude Code's base URL and models
+        # for a local one) join the profile's own, with the same checks; never a key.
+        object.__setattr__(self, "profile", self.profile.for_providers(self.model_providers))
         self._check_protected()
 
     def _check_protected(self) -> None:
