@@ -629,6 +629,179 @@ def test_a_git_config_is_left_out_only_with_credentials(
     assert (plan.secrets == [".git/config"]) is secret
 
 
+GHP = "ghp_" + "A" * 36  # made up
+GH_ENV = '{"mcpServers": {"gh": {"command": "npx", "env": {"GITHUB_TOKEN": "' + GHP + '"}}}}'
+NPX = '{"x": {"command": "npx", "args": ["-y", "@scope/server", "--port", "3"]}}'
+CODEX_GH = '[mcp_servers.gh]\ncommand = "npx"\nenv = { GITHUB_TOKEN = "' + GHP + '" }\n'
+
+
+@pytest.mark.parametrize(
+    ("path", "text", "secret"),
+    [
+        (".mcp.json", GH_ENV, True),
+        (".mcp.json", '{"mcpServers": {"gh": {"env": {"GH_TOKEN": "${GITHUB_TOKEN}"}}}}', False),
+        (".mcp.json", '{"mcpServers": {"x": {"command": "npx", "args": ["-y", "pkg"]}}}', False),
+        (".mcp.json", '{"x": {"headers": {"Authorization": "Bearer abcdefgh12345"}}}', True),
+        (".mcp.json", '{"x": {"env": {"OPENAI_API_KEY": "plain"}}}', True),
+        (".mcp.json", '{"x": {"env": {"SLACK": "xoxb-1234567890-abc"}}}', True),
+        (".mcp.json", '{"x": {"env": {"DB_PASSWORD": 1234}}}', True),
+        (".mcp.json", '{"x": {"env": {"API_TOKEN": ""}}}', False),
+        (".mcp.json", '{"x": {"url": "https://bob:hunter2@example.invalid/mcp"}}', True),
+        (".mcp.json", "not json {", True),
+        ("sub/.MCP.json", GH_ENV, True),
+        (".claude.json", '{"primaryApiKey": "sk-ant-' + "a" * 30 + '"}', True),
+        (".claude.json", '{"numStartups": 3, "projects": {"/w": {"allowedTools": []}}}', False),
+        (".claude.json.backup", GH_ENV, True),
+        (".claude/settings.local.json", '{"env": {"ANTHROPIC_AUTH_TOKEN": "abc"}}', True),
+        (".claude/settings.local.json", '{"apiKeyHelper": "~/bin/key.sh"}', True),  # fail closed
+        (".claude/settings.local.json", '{"apiKeyHelper": "echo sk-ant-' + "b" * 30 + '"}', True),
+        ("sub/.Claude/Settings.Local.JSON", '{"env": {"GH_TOKEN": "' + GHP + '"}}', True),
+        (".claude/settings.json", '{"permissions": {"allow": ["Bash(ls)"]}}', False),
+        (".claude/settings.json", '{"env": {"GITHUB_PAT": "github_pat_' + "c" * 30 + '"}}', True),
+        (".cursor/mcp.json", GH_ENV, True),
+        (".VSCode/mcp.json", GH_ENV, True),
+        # M2 of the review: the shapes MCP configs take
+        (".mcp.json", '{"x": {"args": ["-y", "--api-key", "abcd1234efgh5678"]}}', True),
+        (".mcp.json", '{"x": {"args": ["--token=abcd1234"]}}', True),
+        (".mcp.json", '{"x": {"DB_PASS": "p"}}', True),
+        (".mcp.json", '{"x": {"OPENAI_KEY": "k"}}', True),
+        (".mcp.json", '{"x": {"TOKEN_GITHUB": "t"}}', True),
+        (".mcp.json", '{"x": {"GH_CREDENTIALS": "c"}}', True),
+        (".mcp.json", '{"x": {"X_AUTH": "a"}}', True),
+        (".mcp.json", '{"x": {"env": {"LOG_LEVEL": "debug"}}}', True),  # all of env
+        (".mcp.json", '{"x": {"env": {"PORT": 8080}}}', True),
+        (".mcp.json", '{"x": {"Env": {"A": "${A}", "B": "${B}"}}}', False),
+        (".mcp.json", '{"x": {"env": {"A": "${A}x"}}}', True),
+        (".mcp.json", '{"x": {"headers": ["X-Thing: y"]}}', True),
+        (".mcp.json", '{"x": {"Headers": {"X-Custom": "abc"}}}', True),
+        (".mcp.json", '{"x": [{"Name": "Authorization", "Value": "abc"}]}', True),
+        (".mcp.json", '{"x": [["X-Api-Key", "abc"]]}', True),
+        (".mcp.json", '{"apiKey": ["abc"]}', True),
+        (".mcp.json", '{"apiKey": {"value": "abc"}}', True),
+        (".mcp.json", NPX, False),
+        # B2: only ${VAR} is a reference
+        (".mcp.json", '{"x": {"env": {"A": "$A"}}}', True),
+        (".mcp.json", '{"x": {"GH_TOKEN": "$ecretPassw0rd"}}', True),
+        # B1: a repeated key, the first one with the secret
+        (".mcp.json", '{"API_TOKEN": "plain", "API_TOKEN": "${X}"}', True),
+        (".mcp.json", '{"x": {"env": {"A": "lit"}}, "x": {"command": "npx"}}', True),
+        # M3: other agents' configs
+        (".gemini/settings.json", GH_ENV, True),
+        (".gemini/settings.json", '{"theme": "Default"}', False),
+        ("claude_desktop_config.json", GH_ENV, True),
+        ("sub/Claude_Desktop_Config.json", '{"mcpServers": {}}', False),
+        ("mcp_config.json", GH_ENV, True),
+        (".codex/config.toml", CODEX_GH, True),
+        (".codex/config.toml", '[mcp_servers.gh]\nenv = { LOG = "debug" }\n', True),
+        (".codex/config.toml", 'model = "o3"\n[mcp_servers.gh]\ncommand = "npx"\n', False),
+        (".codex/config.toml", "not = = toml", True),
+        (".Codex/Config.TOML", 'token = "abc"\n', True),
+    ],
+)  # fmt: skip
+def test_an_agent_config_is_left_out_only_with_a_secret_inside(
+    tmp_path: Path, path: str, text: str, secret: bool
+) -> None:
+    """Finding 6 of the final review: `.mcp.json` (an MCP server's `env`), `.claude.json` and
+    `.claude/settings*.json` often hold a real token. Read like a `.git/config`: left out with
+    a secret-shaped value (backtide's redact shapes, or a secret name with a literal value),
+    imported without one (an env reference such as `${GITHUB_TOKEN}` is not a secret)."""
+    folder = tmp_path / "r"
+    (folder / path).parent.mkdir(parents=True, exist_ok=True)
+    (folder / path).write_text(text)
+    (folder / "main.py").write_text("print(1)\n")
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        plan = shell_cli.plan_import(fd)
+        assert (plan.secrets == [path]) is secret
+        assert ("main.py", 9) in plan.files
+        everything = shell_cli.plan_import(fd, include_secrets=True)
+        assert everything.secrets == [] and path in {rel for rel, _ in everything.files}
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "path", [".credentials.json", ".claude/.credentials.json", "a/.Credentials.JSON"]
+)
+def test_a_credentials_file_is_left_out_by_its_name(tmp_path: Path, path: str) -> None:
+    folder = tmp_path / "r"
+    (folder / path).parent.mkdir(parents=True, exist_ok=True)
+    (folder / path).write_text("{}")
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert shell_cli.plan_import(fd).secrets == [path]
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("same_size", [False, True])
+def test_a_scanned_config_that_changes_before_the_copy_is_refused(
+    tmp_path: Path, same_size: bool
+) -> None:
+    """B3 of the review: what is copied is what was read. A ``.mcp.json`` that was clean when
+    it was planned and changed before the tar (even to the same size and time) fails."""
+    folder = tmp_path / "r"
+    folder.mkdir()
+    config_file = folder / ".mcp.json"
+    config_file.write_text('{"mcpServers": {"a": {"command": "npx"}}}')
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        plan = shell_cli.plan_import(fd)
+        assert plan.secrets == [] and ".mcp.json" in plan.scanned
+        before = config_file.stat()
+        changed = '{"mcpServers": {"a": {"command": "npm"}}}' if same_size else GH_ENV
+        config_file.write_text(changed)
+        if same_size:
+            os.utime(config_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with pytest.raises(shell_cli.ImportRefused, match="ha cambiado"):
+            shell_cli.write_tar(fd, plan, io.BytesIO())
+    finally:
+        os.close(fd)
+
+
+def test_a_scanned_config_that_did_not_change_is_copied(tmp_path: Path) -> None:
+    folder = tmp_path / "r"
+    folder.mkdir()
+    (folder / ".mcp.json").write_text('{"mcpServers": {}}')
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        plan = shell_cli.plan_import(fd)
+        out = io.BytesIO()
+        shell_cli.write_tar(fd, plan, out)
+    finally:
+        os.close(fd)
+    out.seek(0)
+    with tarfile.open(fileobj=out) as tar:
+        assert tar.getnames() == [".mcp.json"]
+
+
+def test_an_agent_config_too_big_to_read_is_left_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "r"
+    folder.mkdir()
+    (folder / ".mcp.json").write_text('{"mcpServers": {}, "pad": "' + "x" * 100 + '"}')
+    monkeypatch.setattr(shell_cli, "MAX_AGENT_CONFIG", 50)
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert shell_cli.plan_import(fd).secrets == [".mcp.json"]
+    finally:
+        os.close(fd)
+
+
+def test_an_agent_config_with_a_token_is_named_and_never_printed(
+    config: ServiceConfig, calls: Calls, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    folder = tmp_path / "proyecto"
+    folder.mkdir()
+    (folder / ".mcp.json").write_text(GH_ENV)
+    (folder / "main.py").write_text("print(1)\n")
+    assert run_import(config, folder) == 0
+    assert set(FakePopen.made[0].members()) == {"main.py"}
+    out = capsys.readouterr().out
+    assert ".mcp.json" in out and "--incluir-secretos" in out and GHP not in out
+
+
 def test_bytes_are_counted_as_files_are_added(repo: Path) -> None:
     fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -638,7 +811,9 @@ def test_bytes_are_counted_as_files_are_added(repo: Path) -> None:
     assert plan.bytes == sum(size for _, size in plan.files) == 14
 
 
-@pytest.mark.parametrize("where", ["home", "above", ".ssh", ".ssh/keys", ".aws"])
+@pytest.mark.parametrize(
+    "where", ["home", "above", ".ssh", ".ssh/keys", ".aws", ".claude", ".Claude/x"]
+)
 def test_the_owners_home_and_key_folders_are_never_a_source(
     config: ServiceConfig,
     calls: Calls,
@@ -650,6 +825,7 @@ def test_the_owners_home_and_key_folders_are_never_a_source(
     home = tmp_path / "casa"
     (home / ".ssh" / "keys").mkdir(parents=True)
     (home / ".aws").mkdir()
+    (home / ".claude" / "x").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     source = {"home": home, "above": tmp_path}.get(where, home / where)
     assert run_import(config, source, include_secrets=True) == 2
@@ -705,6 +881,67 @@ def test_exportar_names_what_it_left_out_and_how_commits_leave(
     assert "--git" in out and "a\\x1b" in out and "mayúsculas" in out and "README" in out
 
 
+def test_exportar_names_what_the_owners_tools_would_run_and_says_why(
+    config: ServiceConfig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 5 of the final review: `.claude/`, `.mcp.json`, `.vscode/`... stay in the jail,
+    and the owner is told which and how to take them."""
+
+    def ask_export(path: Path, destination: str) -> dict[str, Any]:
+        return {
+            "ok": True, "outcome": "done", "message": "", "destination": destination,
+            "snapshot": "s", "details": {"files": 1, "skipped_config": 3},
+            "skipped": [["config", ".claude"], ["config", "sub/.mcp.json"]],
+        }  # fmt: skip
+
+    monkeypatch.setattr(shell_cli, "ask_export", ask_export)
+    assert shell_cli.exportar(config, "/srv/out") == 0
+    out = capsys.readouterr().out
+    assert "Sin copiar: 3 archivos o carpetas que tus herramientas pueden ejecutar" in out
+    assert ".claude, sub/.mcp.json y 1 más" in out and "--incluir-config" in out
+    assert shell_cli.EXPORTED_WARNING in out and ".mcp.json" in shell_cli.EXPORTED_WARNING
+
+
+def test_exportar_incluir_config_asks_for_it_and_warns(
+    config: ServiceConfig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asked: list[dict[str, Any]] = []
+
+    def ask_export(path: Path, destination: str, **options: Any) -> dict[str, Any]:
+        asked.append(options)
+        return {
+            "ok": True, "outcome": "done", "message": "", "destination": destination,
+            "snapshot": "s", "details": {"files": 4}, "skipped": [],
+        }  # fmt: skip
+
+    monkeypatch.setattr(shell_cli, "ask_export", ask_export)
+    assert shell_cli.exportar(config, "/srv/out", include_config=True) == 0
+    assert asked == [{"include_config": True}]
+    assert shell_cli.INCLUDED_CONFIG_WARNING in capsys.readouterr().out
+
+
+def test_incluir_config_is_not_for_a_bundle(
+    config: ServiceConfig, calls: Calls, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert shell_cli.exportar(config, "/srv/p.bundle", git="p", include_config=True) == 2
+    assert calls.asked == [] and calls.runs == []
+    assert "--incluir-config" in capsys.readouterr().err
+
+
+def test_exportar_incluir_config_through_the_cli(
+    tmp_path: Path, calls: Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Any] = []
+    monkeypatch.setattr(
+        shell_cli, "exportar", lambda *args, **options: seen.append((args, options)) or 0
+    )
+    path = str(write_config(tmp_path))
+    assert main(["exportar", "--config", path, "--incluir-config", "/srv/out"]) == 0
+    assert main(["exportar", "--config", path, "/srv/out2"]) == 0
+    assert seen[0][1] == {"git": None, "include_config": True}
+    assert seen[1][1] == {"git": None, "include_config": False}
+
+
 # --- exportar --git (A1) ------------------------------------------------------------------------
 
 
@@ -738,7 +975,10 @@ def test_exportar_git_has_the_agent_make_a_bundle_inside_and_exports_only_it(
     assert asked == [("/srv/p.bundle", {"bundle": name, "repo": "proyecto"})]
     assert remove == [*PREFIX, "rm", "-f", "--", bundle]  # tidied up; the snapshot keeps it
     out = capsys.readouterr().out
-    assert "git clone --no-checkout /srv/p.bundle" in out and shell_cli.EXPORTED_WARNING in out
+    assert "git clone --no-checkout /srv/p.bundle" in out
+    # M1 of the review: nothing in a bundle is filtered, so it never says it was
+    assert shell_cli.BUNDLE_WARNING in out and shell_cli.EXPORTED_WARNING not in out
+    assert "git ls-tree -r --name-only HEAD" in out and "--incluir-config" not in out
 
 
 def test_exportar_git_of_the_whole_work_folder(

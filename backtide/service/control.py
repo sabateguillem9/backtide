@@ -227,6 +227,7 @@ class RewindService(Protocol):
         requested_by: str,
         bundle: str | None = None,
         repo: str | None = None,
+        include_config: bool = False,
     ) -> ExportOutcome: ...
 
 
@@ -497,11 +498,17 @@ class ControlServer:
 
     def _export(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         keys = set(request)
-        if keys != {"cmd", "dest"} and keys != {"cmd", "dest", "bundle", "repo"}:
+        if keys not in (
+            {"cmd", "dest"},
+            {"cmd", "dest", "include_config"},
+            {"cmd", "dest", "bundle", "repo"},
+        ):
             raise _BadRequest(
-                "Una petición de exportar lleva `cmd` y `dest` (y, con --git, `bundle` y `repo`), "
-                "y nada más."
+                "Una petición de exportar lleva `cmd` y `dest` (y, con --git, `bundle` y `repo`; "
+                "sin --git, quizá `include_config`), y nada más."
             )
+        if "include_config" in request and request["include_config"] is not True:
+            raise _BadRequest("`include_config` solo puede ser true.")
         destination = request["dest"]
         if not isinstance(destination, str):
             raise _BadRequest("`dest` tiene que ser una ruta.")
@@ -518,6 +525,7 @@ class ControlServer:
                 destination,
                 requested_by=f"cli (uid {uid}, pid {pid})",
                 **({"bundle": bundle, "repo": repo} if "bundle" in request else {}),
+                **({"include_config": True} if "include_config" in request else {}),
             )
         except Exception:
             logger.exception("an export raised instead of answering")
@@ -1776,7 +1784,7 @@ def _skipped_names(value: object) -> list[list[str]]:
             isinstance(item, list | tuple)
             and len(item) == 2
             and all(isinstance(part, str) for part in item)
-            and item[0] in ("git", "name", "case")
+            and item[0] in ("git", "name", "case", "config")
             and 0 < len(item[1]) <= MAX_SKIPPED_TEXT
             and item[1].isprintable()
         ):
@@ -1856,6 +1864,7 @@ def ask_export(
     *,
     bundle: str | None = None,
     repo: str | None = None,
+    include_config: bool = False,
     wait: float = WAIT_FOR_SERVICE,
     reply_timeout: float = CLIENT_REPLY_TIMEOUT,
     peer: PeerCredentials = peer_credentials,
@@ -1866,10 +1875,16 @@ def ask_export(
     exportar`). Returns ``ok``, ``outcome``, ``message``, ``destination``, ``snapshot`` and
     ``details`` (counts) and ``skipped`` (what it skipped by name: ``[why, path]``), checked.
     With ``bundle`` (and ``repo``, the folder it came from), only that git bundle of the agent's
-    HOME is exported, into the new file ``destination`` (`backtide exportar --git`)."""
+    HOME is exported, into the new file ``destination`` (`backtide exportar --git`). With
+    ``include_config`` (not with a bundle), what the owner's tools run or read by themselves is
+    copied too (`backtide exportar --incluir-config`)."""
+    if include_config and bundle is not None:
+        raise ValueError("include_config is for a folder export, not a bundle")
     request: dict[str, Any] = {"cmd": "export", "dest": destination}
     if bundle is not None:
         request |= {"bundle": bundle, "repo": repo or "."}
+    if include_config:
+        request["include_config"] = True
     raw = _ask(
         Path(path),
         request,

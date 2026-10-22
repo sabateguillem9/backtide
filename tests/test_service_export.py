@@ -208,13 +208,13 @@ def test_a_folder_shaped_like_a_repository_is_never_copied(tmp_path: Path, head:
     work = tmp_path / "work"
     (work / "vendor").mkdir(parents=True)
     (work / "vendor" / "lib.py").write_text("x = 1\n")
-    plant_repo(work / "vendor" / ".cache" / "x", head=head, objects="OBJECTS")
+    plant_repo(work / "vendor" / "cache" / "x", head=head, objects="OBJECTS")
     result = export_tree(work, tmp_path / "out")
     out = tmp_path / "out"
     assert (out / "vendor" / "lib.py").exists()
-    assert os.listdir(out / "vendor" / ".cache") == []
+    assert os.listdir(out / "vendor" / "cache") == []
     assert result.skipped_git == 1
-    assert ("git", "vendor/.cache/x") in result.named
+    assert ("git", "vendor/cache/x") in result.named
 
 
 def test_a_folder_with_a_commondir_is_a_repository_too(tmp_path: Path) -> None:
@@ -244,6 +244,166 @@ def test_counts_skip_what_is_not_copied(tmp_path: Path, monkeypatch: pytest.Monk
     (work / "small").write_bytes(b"y")
     monkeypatch.setattr(export, "MAX_BYTES", 100)
     assert export_tree(work, tmp_path / "out").files == 1
+
+
+# --- what the owner's own tools run or read by themselves (review of T17a-4, finding 5) ---------
+
+HOOK = '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "touch /tmp/p"}]}]}}'
+
+
+def plant_config(work: Path) -> None:
+    """What a prompt-injected agent writes as a normal part of a project, for the owner's tools
+    on the Mac: Claude Code's hooks and MCP servers, VS Code's tasks, direnv, CI, and the
+    instructions of other coding agents."""
+    for folder in (".claude", ".vscode", ".idea", ".devcontainer", ".cursor", ".github/workflows"):
+        (work / folder).mkdir(parents=True)
+    (work / ".claude" / "settings.json").write_text(HOOK)
+    (work / ".claude" / "settings.local.json").write_text(HOOK)
+    (work / ".mcp.json").write_text('{"mcpServers": {"x": {"command": "touch"}}}')
+    (work / ".vscode" / "tasks.json").write_text('{"runOptions": {"runOn": "folderOpen"}}')
+    (work / ".idea" / "workspace.xml").write_text("<x/>\n")
+    (work / ".envrc").write_text("touch /tmp/p\n")
+    (work / ".devcontainer" / "devcontainer.json").write_text('{"initializeCommand": "x"}')
+    (work / ".devcontainer.json").write_text('{"initializeCommand": "x"}')
+    (work / ".cursor" / "mcp.json").write_text("{}")
+    (work / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+    (work / ".github" / "copilot-instructions.md").write_text("x\n")
+    for name in (
+        "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md", ".cursorrules",
+        ".windsurfrules", ".clinerules", "opencode.json", "claude_desktop_config.json",
+        "mcp_config.json", "proyecto.code-workspace", ".pre-commit-config.yaml", ".brand-new-tool",
+    ):  # fmt: skip
+        (work / name).write_text("Run ./setup.sh first.\n")
+    (work / ".gitignore").write_text("*.pyc\n")  # harmless: copied
+    (work / "main.py").write_text("print(1)\n")
+
+
+CONFIG_PATHS = {
+    ".claude", ".vscode", ".idea", ".devcontainer", ".cursor", ".github", ".mcp.json",
+    ".envrc", ".devcontainer.json", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md",
+    ".cursorrules", ".windsurfrules", ".clinerules", "opencode.json",
+    "claude_desktop_config.json", "mcp_config.json", "proyecto.code-workspace",
+    ".pre-commit-config.yaml", ".brand-new-tool",
+}  # fmt: skip
+
+
+def test_what_the_owners_tools_run_by_themselves_is_left_out_and_named(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    plant_config(work)
+    result = export_tree(work, tmp_path / "out")
+    assert sorted(os.listdir(tmp_path / "out")) == [".gitignore", "main.py"]
+    assert result.skipped_config == len(CONFIG_PATHS) and result.files == 2
+    named = [path for why, path in result.named if why == "config"]
+    assert set(named) <= CONFIG_PATHS and len(named) == export.MAX_NAMED  # the first ones
+    assert result.details()["skipped_config"] == len(CONFIG_PATHS)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".VSCode/tasks.json", ".Claude/settings.json", "sub/.claude/settings.json",
+        "a/b/.MCP.JSON", "pkg/claude.md", "pkg/Claude.Local.MD", "x/.ENVRC", "x/.IDEA/w.xml",
+        "lib/.GitHub/Workflows/ci.yml", ".cursor/rules", ".devcontainer/Dockerfile",
+        "AGENTS.md", "sub/agents.MD", "GEMINI.md", "pkg/Gemini.md", ".cursorrules",
+        "a/.CursorRules", ".windsurfrules", "b/.WindsurfRules", ".clinerules", "c/.ClineRules",
+        ".clinerules/01-style.md", "d/.CLINERULES/x.md", ".github/copilot-instructions.md",
+        "e/.GitHub/Copilot-Instructions.MD", ".github/prompts/p.prompt.md",
+        ".github/agents/a.md", ".github/actions/x/action.yml", "opencode.json",
+        "f/OpenCode.JSON", "claude_desktop_config.json", "g/MCP_Config.json",
+        "w.code-workspace", "h/W.Code-Workspace", ".pre-commit-config.yaml", ".husky/pre-commit",
+        ".eslintrc.js", ".eslintrc.cjs", ".prettierrc.js", ".prettierrc.mjs", ".pylintrc",
+        ".flake8", ".npmrc", ".env", ".tool-versions", ".mise.toml", ".zed/settings.json",
+        ".windsurf/rules.md", ".roo/rules.md", ".amazonq/rules/x.md", ".aider.conf.yml",
+        ".continue/config.json", "i/.anything-new",
+    ],
+)  # fmt: skip
+def test_in_any_case_and_at_any_depth(tmp_path: Path, path: str) -> None:
+    """APFS opens ``.VSCode`` as ``.vscode``, and Claude Code reads a CLAUDE.md or a
+    ``.claude/`` of a subfolder too. A name with a dot first is out unless it is known to be
+    harmless: the list of tools that run them by themselves always lags behind."""
+    work = tmp_path / "work"
+    (work / path).parent.mkdir(parents=True, exist_ok=True)
+    (work / path).write_text("x\n")
+    (work / "keep.txt").write_text("y\n")
+    result = export_tree(work, tmp_path / "out")
+    assert not os.path.lexists(tmp_path / "out" / path)
+    assert (tmp_path / "out" / "keep.txt").exists()
+    assert result.skipped_config == 1 and result.files == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".gitignore", ".GitIgnore", ".gitattributes", ".editorconfig", ".dockerignore",
+        ".python-version", ".nvmrc", ".node-version", ".prettierrc", ".prettierrc.json",
+        ".prettierrc.yaml", ".prettierrc.yml", ".prettierrc.toml", ".prettierrc.json5",
+        ".eslintrc", ".eslintrc.json", ".eslintrc.yaml", ".eslintrc.yml", ".prettierignore",
+        ".eslintignore", ".ruff.toml",
+    ],
+)  # fmt: skip
+def test_harmless_dot_files_are_copied_at_any_depth(tmp_path: Path, name: str) -> None:
+    work = tmp_path / "work"
+    (work / "sub").mkdir(parents=True)
+    (work / name).write_text("x\n")
+    (work / "sub" / name).write_text("y\n")
+    result = export_tree(work, tmp_path / "out")
+    assert (tmp_path / "out" / name).read_text() == "x\n"
+    assert (tmp_path / "out" / "sub" / name).read_text() == "y\n"
+    assert result.skipped_config == 0 and result.files == 2
+
+
+def test_a_harmless_name_as_a_folder_is_still_out(tmp_path: Path) -> None:
+    """Only files: a folder called ``.gitignore`` is no file of git's."""
+    work = tmp_path / "work"
+    (work / ".gitignore").mkdir(parents=True)
+    (work / ".gitignore" / "x").write_text("x\n")
+    result = export_tree(work, tmp_path / "out")
+    assert os.listdir(tmp_path / "out") == [] and result.skipped_config == 1
+
+
+def test_names_like_the_left_out_ones_are_copied(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    (work / "docs" / "workflows").mkdir(parents=True)
+    (work / "docs" / "workflows" / "a.md").write_text("x\n")
+    (work / "claude.md.txt").write_text("x\n")
+    (work / "docs" / "copilot-instructions.md").write_text("x\n")
+    (work / "docs" / "agents.md.bak").write_text("x\n")
+    (work / "code-workspace.md").write_text("x\n")
+    (work / "file.").write_text("x\n")
+    result = export_tree(work, tmp_path / "out")
+    out = tmp_path / "out"
+    assert (out / "docs" / "workflows" / "a.md").exists()
+    assert (out / "docs" / "copilot-instructions.md").exists()
+    assert (out / "docs" / "agents.md.bak").exists() and (out / "code-workspace.md").exists()
+    assert (out / "claude.md.txt").exists() and (out / "file.").exists()
+    assert result.skipped_config == 0
+
+
+def test_include_config_takes_them_but_never_git(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    plant_config(work)
+    plant_repo(work / ".git")
+    result = export_tree(work, tmp_path / "out", include_config=True)
+    out = tmp_path / "out"
+    assert (out / ".claude" / "settings.json").read_text() == HOOK
+    assert (out / ".mcp.json").exists() and (out / ".github" / "workflows" / "ci.yml").exists()
+    assert (out / "AGENTS.md").exists() and (out / ".github" / "copilot-instructions.md").exists()
+    assert (out / ".brand-new-tool").exists() and (out / "proyecto.code-workspace").exists()
+    assert not os.path.lexists(out / ".git")
+    assert result.skipped_config == 0 and result.skipped_git == 1
+
+
+def test_config_left_out_does_not_count_towards_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = tmp_path / "work"
+    (work / ".claude").mkdir(parents=True)
+    (work / ".claude" / "big").write_bytes(b"x" * 1000)
+    (work / "small").write_bytes(b"y")
+    monkeypatch.setattr(export, "MAX_BYTES", 100)
+    assert export_tree(work, tmp_path / "out").files == 1
+    with pytest.raises(ExportError, match="demasiado grande"):
+        export_tree(work, tmp_path / "out2", include_config=True)
 
 
 # --- names (B6) ---------------------------------------------------------------------------------

@@ -2330,13 +2330,16 @@ class Guardian:
         requested_by: str,
         bundle: str | None = None,
         repo: str | None = None,
+        include_config: bool = False,
     ) -> ExportOutcome:
         """`backtide exportar`: a snapshot of the workspace (``Reason.MANUAL``, trigger
         "export": kept, the record of what left) and a copy of its work folder into the owner's
         new folder ``destination`` (backtide/service/export.py: never overwriting, never
         following a link, never a git repository). With ``bundle`` (`exportar --git`), only that
         git bundle, which the agent made in ``~/.backtide-export/`` of its HOME (``repo`` is the
-        folder it bundled, for the record), into the new file ``destination``. Recorded as
+        folder it bundled, for the record), into the new file ``destination``. What the owner's
+        tools run or read by themselves (``.claude/``, ``.mcp.json``, ``.vscode/``...) is left out
+        unless ``include_config`` (recorded either way). Recorded as
         ``system/export_started`` before anything is copied (nothing is copied if that cannot
         be recorded), then ``system/export`` or ``export_failed``. Never raises."""
         profile = self._jail.config.profile
@@ -2352,6 +2355,8 @@ class Guardian:
         what: dict[str, Any] = {"kind": "tree" if bundle is None else "bundle"}
         if bundle is not None:
             what["repo"] = str(repo or ".")[:MAX_REQUESTER_CHARS]
+        else:
+            what["include_config"] = include_config is True
         config = self._config
         protected = (
             config.volume,
@@ -2401,7 +2406,7 @@ class Guardian:
         try:
             if bundle is None:
                 work = CONTAINER_WORK.relative_to(CONTAINER_WORKSPACE)
-                result = export_tree(agent / work, target)
+                result = export_tree(agent / work, target, include_config=include_config is True)
             else:
                 result = export_bundle(agent / HOME_DIR, bundle, target)
         except ExportError as error:

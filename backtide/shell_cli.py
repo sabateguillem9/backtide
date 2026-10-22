@@ -26,6 +26,15 @@ After the security review of T17a-4: everything goes to the container by its id,
 and a second ``--continue`` waits for the first (M4); `importar` leaves out what looks like a
 secret unless ``--incluir-secretos``, and never takes the owner's HOME or its key folders (M2);
 and `exportar` warns that what it took out was written by the agent (A1).
+
+After the final security review of T17a-4 and its review: `exportar` leaves out what the
+owner's own tools may run or read by themselves (every name with a dot first but a few harmless
+files, ``CLAUDE.md``, ``AGENTS.md``...) unless ``--incluir-config`` (finding 5,
+backtide/service/export.py), and a bundle says that its commits may carry them (M1); `importar`
+reads the agent configs that often carry a token (``.mcp.json``, ``.claude.json``,
+``.claude/settings*.json``, Gemini's, Claude Desktop's, Codex's) like a ``.git/config``,
+failing closed: one with a secret inside is left out (6, M2, M3, B1, B2), and what was read is
+what is copied (B3). ``~/.claude`` is never a source.
 """
 
 import contextlib
@@ -41,12 +50,15 @@ import tempfile
 import termios
 import threading
 import time
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
 from backtide.blackbox import redact
+from backtide.blackbox.redact import strike_text
+from backtide.blackbox.secret_words import CONFIG_WORDS, ENV_WORDS
 from backtide.jail import docker
 from backtide.jail.docker import JailError
 from backtide.jail.profile import CONTAINER_HOME, SHELL_MODE, ShellCommands, check_prompt
@@ -92,7 +104,24 @@ SETTLE = 0.1  # what the terminal still answers to the agent's last queries arri
 BUNDLE_TIMEOUT = 10 * 60.0
 EXPORTED_WARNING = (
     "Lo exportado lo escribió el agente: no ejecutes nada de ahí (git, make, npm, tests, abrirlo "
-    "en el editor o en Claude Code) sin revisarlo."
+    "en el editor o en Claude Code) sin revisarlo. Lo más delicado es lo que tus herramientas "
+    "ejecutan o leen solas al abrir la carpeta (.claude/, .mcp.json, .vscode/, .envrc, .github/, "
+    "CLAUDE.md, AGENTS.md…): un agente engañado lo escribe como una parte normal del proyecto. "
+    "Por eso `exportar` deja fuera, salvo con --incluir-config, todo lo que empieza por punto "
+    "(menos unos pocos archivos inofensivos, como .gitignore o .editorconfig), CLAUDE.md, "
+    "AGENTS.md, GEMINI.md, las configuraciones de MCP y los *.code-workspace."
+)
+INCLUDED_CONFIG_WARNING = (
+    "Con --incluir-config han salido también .claude/, .mcp.json, .vscode/, .envrc, .github/, "
+    "CLAUDE.md y el resto de lo que tus herramientas pueden ejecutar o leer solas: revísalo uno a "
+    "uno antes de abrir la carpeta con Claude Code, tu editor o direnv."
+)
+BUNDLE_WARNING = (
+    "Lo exportado lo escribió el agente, y en un bundle no se deja nada fuera: los commits pueden "
+    "traer .claude/, .mcp.json, .vscode/, .envrc, .github/, CLAUDE.md… que tus herramientas "
+    "ejecutan o leen solas al abrir la carpeta. Clona con `git clone --no-checkout` y revisa "
+    "`git ls-tree -r --name-only HEAD` (y `git log -p`) antes de sacar los archivos o abrir la "
+    "carpeta."
 )
 _TERM_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}", re.ASCII)
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", re.ASCII)
@@ -368,6 +397,9 @@ class ImportRefused(Exception):
     """The host folder cannot be imported; the message is Spanish."""
 
 
+Identity = tuple[int, int, int, int, int]  # st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size
+
+
 @dataclass
 class ImportPlan:
     """What a host folder holds, read without following links."""
@@ -377,6 +409,7 @@ class ImportPlan:
     skipped: list[str] = field(default_factory=list)  # links and others, relative
     secrets: list[str] = field(default_factory=list)  # what looks like a secret, left out
     bytes: int = 0  # of ``files``, kept as they are added
+    scanned: dict[str, Identity] = field(default_factory=dict)  # read for secrets, as read
 
 
 # What looks like a secret (M2 of the review of T17a-4): left out of an import unless the owner
@@ -392,7 +425,7 @@ SECRET_FILES = frozenset(
     }
 )  # fmt: skip
 _SECRET_NAME_RE = re.compile(
-    r"\.env.*|credentials.*|id_[a-z0-9_-]+(?:\.pub)?|service-account.*\.json"
+    r"\.env.*|\.?credentials.*|id_[a-z0-9_-]+(?:\.pub)?|service-account.*\.json"
     r"|.*\.(?:pem|key|p12|pfx|jks|keystore|kdbx|ppk|keytab|tfvars|tfstate)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -401,9 +434,44 @@ _SECRET_NAME_RE = re.compile(
 # http.extraheader (CI checkouts put an Authorization header there).
 _URL_SECRET_RE = re.compile(r"://(?:[^/@\s]*:[^/@\s]*|[^/@\s:]{20,})@|extraheader", re.IGNORECASE)
 MAX_GIT_CONFIG = 1024 * 1024
+# An agent's config that often carries a real token (finding 6 of the final review of T17a-4,
+# M2, M3, B1 and B2 of its review): an MCP server's "env" or "headers" in .mcp.json,
+# .claude.json, the "env" or the apiKeyHelper of .claude/settings.local.json, Gemini's, Claude
+# Desktop's, Codex's (TOML). Read like a git config, failing closed: left out when the raw text
+# or any text in it has a secret's shape (backtide's redact patterns, also each array's texts
+# joined with spaces), when a name that sounds like a secret (CONFIG_WORDS, ENV_WORDS, or
+# ending in "key", anywhere and without case) has any literal under it, or when anything under
+# "env" or "headers" is a literal. Only an exact "${VAR}" is not a literal. Every key is seen,
+# repeated ones too. One that cannot be read or parsed, or that is bigger than
+# MAX_AGENT_CONFIG, is taken as one. Compared without case, at any depth.
+_AGENT_CONFIG_RE = re.compile(
+    r"\.mcp\.json|\.claude\.json(?:\..*)?|claude_desktop_config\.json|mcp_config\.json",
+    re.DOTALL,
+)
+AGENT_CONFIG_IN = frozenset(
+    {
+        (".claude", "settings.json"),
+        (".claude", "settings.local.json"),
+        (".claude", ".credentials.json"),  # left out by its name anyway
+        (".cursor", "mcp.json"),
+        (".vscode", "mcp.json"),
+        (".gemini", "settings.json"),
+    }
+)
+TOML_AGENT_CONFIG_IN = frozenset({(".codex", "config.toml")})
+MAX_AGENT_CONFIG = 8 * 1024 * 1024  # .claude.json keeps a history per project
+_SECRET_KEY_RE = re.compile(rf"{CONFIG_WORDS}|{ENV_WORDS}|key$", re.IGNORECASE)
+_ENV_REFERENCE_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+# In the raw text, a pair whose value is a reference or empty is not a secret: taken out first.
+_REFERENCE_PAIR_RE = re.compile(
+    r'"(?:[^"\\]|\\.)*"\s*:\s*"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\})?"', re.DOTALL
+)
+_HOT_KEYS = frozenset({"env", "environment", "headers"})  # every literal under them is a secret
+_PAIR_NAMES = frozenset({"name", "key", "header"})  # {"Name": "Authorization", "Value": ...}
+_PAIR_VALUES = frozenset({"value", "values"})
 # Folders of the owner's HOME that are never a source, nor inside one (with HOME itself and
 # every folder above it).
-PRIVATE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".config", ".docker", ".kube")
+PRIVATE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".config", ".docker", ".kube", ".claude")
 
 
 def looks_secret(relative: str, kind: str) -> bool:
@@ -414,23 +482,138 @@ def looks_secret(relative: str, kind: str) -> bool:
     return name in SECRET_FILES or bool(_SECRET_NAME_RE.fullmatch(name))
 
 
-def _git_config_with_secret(dir_fd: int, name: str, relative: str) -> bool:
-    """A ``config`` inside a ``.git`` folder whose remotes carry credentials. One that cannot
-    be read is taken as one (it is left out, and said)."""
+def _identity(info: os.stat_result) -> Identity:
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+
+
+def _scan_kind(relative: str) -> str | None:
+    """Which reader a file of an import needs before it goes in: "git" (a ``config`` inside a
+    ``.git``), "json" or "toml" (an agent's config), or None."""
     parts = relative.casefold().split("/")
-    if name.casefold() != "config" or ".git" not in parts[:-1]:
+    pair = tuple(parts[-2:])
+    if parts[-1] == "config" and ".git" in parts[:-1]:
+        return "git"
+    if _AGENT_CONFIG_RE.fullmatch(parts[-1]) or pair in AGENT_CONFIG_IN:
+        return "json"
+    if pair in TOML_AGENT_CONFIG_IN:
+        return "toml"
+    return None
+
+
+def _scanned_secret(dir_fd: int, name: str, relative: str, plan: "ImportPlan") -> bool:
+    """Whether a file that has to be read before it goes in (``_scan_kind``) holds a secret.
+    One that cannot be read, is too big or cannot be parsed is taken as one (it is left out,
+    and said). One without is noted in ``plan.scanned`` as it was read (B3 of the review): the
+    copy refuses it if it changed since."""
+    kind = _scan_kind(relative)
+    if kind is None:
         return False
+    limit = MAX_GIT_CONFIG if kind == "git" else MAX_AGENT_CONFIG
     try:
         fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
     except OSError:
         return True
     try:
-        text = os.read(fd, MAX_GIT_CONFIG).decode("utf-8", errors="replace")
+        identity = _identity(os.fstat(fd))
+        chunks, size = [], 0
+        while size <= limit and (chunk := os.read(fd, limit + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
     except OSError:
         return True
     finally:
         os.close(fd)
-    return bool(_URL_SECRET_RE.search(text))
+    if size > limit:
+        return True
+    raw = b"".join(chunks)
+    if kind == "git":
+        secret = bool(_URL_SECRET_RE.search(raw.decode("utf-8", errors="replace")))
+    else:
+        secret = _config_holds_secret(raw, toml=kind == "toml")
+    if not secret:
+        plan.scanned[relative] = identity
+    return secret
+
+
+class _Pairs(list[tuple[str, Any]]):
+    """A JSON object as all its pairs, in order: a repeated key is never lost (B1)."""
+
+
+def _config_holds_secret(raw: bytes, *, toml: bool) -> bool:
+    try:
+        text = raw.decode("utf-8")
+        data = tomllib.loads(text) if toml else json.loads(text, object_pairs_hook=_Pairs)
+    except (ValueError, RecursionError):
+        return True
+    if toml:
+        data = _as_pairs(data)
+    elif strike_text(_REFERENCE_PAIR_RE.sub("", text)) != _REFERENCE_PAIR_RE.sub("", text):
+        return True
+    return _holds_secret(data)
+
+
+def _as_pairs(data: object) -> object:
+    """Parsed TOML in the shape _holds_secret walks: tables as _Pairs (its dates are left as
+    they are: never a secret)."""
+    stack: list[tuple[object, Any]] = []
+    root = _Pairs()
+    top = data if isinstance(data, dict) else {}
+    stack.append((top, root))
+    while stack:
+        node, into = stack.pop()
+        items = node.items() if isinstance(node, dict) else enumerate(node)  # type: ignore[union-attr]
+        for key, value in items:
+            if isinstance(value, dict):
+                made: Any = _Pairs()
+                stack.append((value, made))
+            elif isinstance(value, list):
+                made = []
+                stack.append((value, made))
+            else:
+                made = value
+            if isinstance(into, _Pairs):
+                into.append((key, made))
+            else:
+                into.append(made)
+    return root
+
+
+def _is_literal(value: object) -> bool:
+    """A value given as it is: a non-empty text that is not exactly ``${VAR}``, or a number."""
+    if isinstance(value, str):
+        return bool(value.strip()) and not _ENV_REFERENCE_RE.fullmatch(value)
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _secret_key(key: object) -> bool:
+    return isinstance(key, str) and bool(_SECRET_KEY_RE.search(key.strip()))
+
+
+def _holds_secret(data: object) -> bool:
+    """Whether parsed config holds a secret (see _AGENT_CONFIG_RE above). ``hot``: under a
+    secret's name, ``env`` or ``headers``, every literal counts."""
+    stack: list[tuple[object, bool]] = [(data, False)]
+    while stack:
+        node, hot = stack.pop()
+        if isinstance(node, _Pairs):
+            named = any(key.casefold() in _PAIR_NAMES and _secret_key(value) for key, value in node)
+            for key, value in node:
+                if strike_text(key) != key:
+                    return True
+                folded = key.casefold()
+                warm = folded in _HOT_KEYS or _secret_key(key) or (named and folded in _PAIR_VALUES)
+                stack.append((value, hot or warm))
+        elif isinstance(node, list):
+            texts = " ".join(item for item in node if isinstance(item, str))
+            if strike_text(texts) != texts:
+                return True
+            pair = len(node) == 2 and isinstance(node[0], str) and _secret_key(node[0])
+            stack.extend((item, hot or (pair and index == 1)) for index, item in enumerate(node))
+        elif isinstance(node, str) and strike_text(node) != node:
+            return True
+        elif hot and _is_literal(node):
+            return True
+    return False
 
 
 def plan_import(source_fd: int, *, include_secrets: bool = False) -> ImportPlan:
@@ -449,7 +632,7 @@ def plan_import(source_fd: int, *, include_secrets: bool = False) -> ImportPlan:
                     is_dir = stat.S_ISDIR(info.st_mode)
                     if (is_dir or stat.S_ISREG(info.st_mode)) and not include_secrets:
                         if looks_secret(rel, "dir" if is_dir else "file") or (
-                            not is_dir and _git_config_with_secret(fd, name, rel)
+                            not is_dir and _scanned_secret(fd, name, rel, plan)
                         ):
                             plan.secrets.append(rel)
                             continue
@@ -493,6 +676,10 @@ def write_tar(source_fd: int, plan: ImportPlan, out: BinaryIO) -> None:
                 found = os.fstat(fd)
                 if not stat.S_ISREG(found.st_mode):
                     raise ImportRefused(f"{rel} ha dejado de ser un archivo normal")
+                if rel in plan.scanned and _identity(found) != plan.scanned[rel]:
+                    raise ImportRefused(
+                        f"{rel} ha cambiado desde que se revisó si llevaba secretos: no se importa"
+                    )
                 info = tarfile.TarInfo(rel)
                 info.size = found.st_size
                 info.mode = found.st_mode & 0o755 | 0o600
@@ -676,9 +863,9 @@ def _extract(
     if plan.secrets:
         print(
             "Sin copiar porque parecen secretos (claves, tokens, .env, una URL de git con "
-            f"contraseña…): {_listed(plan.secrets, MAX_LISTED_SECRETS)}. Si el agente de verdad "
-            "los necesita, vuelve a importar con --incluir-secretos (y recuerda que el agente los "
-            "podrá leer)."
+            "contraseña, un .mcp.json o unos ajustes de Claude Code con un token…): "
+            f"{_listed(plan.secrets, MAX_LISTED_SECRETS)}. Si el agente de verdad los necesita, "
+            "vuelve a importar con --incluir-secretos (y recuerda que el agente los podrá leer)."
         )
     return EXIT_OK
 
@@ -699,11 +886,23 @@ def _tail(handle: BinaryIO, limit: int) -> bytes:
 # -- exportar ------------------------------------------------------------------------------------
 
 
-def exportar(config: ServiceConfig, destination: str, *, git: str | None = None) -> int:
+def exportar(
+    config: ServiceConfig,
+    destination: str,
+    *,
+    git: str | None = None,
+    include_config: bool = False,
+) -> int:
     shell = shell_of(config)
     if shell is None:
         return EXIT_ERROR
     path = Path(os.path.abspath(Path(destination).expanduser()))
+    if git is not None and include_config:
+        error(
+            "--incluir-config es para exportar la carpeta de trabajo; con --git sale un bundle "
+            "con los commits, que ya llevan esos archivos (revísalos antes de sacarlos)"
+        )
+        return EXIT_ERROR
     if git is not None:
         if not REPO_RE.fullmatch(git):
             error(
@@ -712,7 +911,7 @@ def exportar(config: ServiceConfig, destination: str, *, git: str | None = None)
             )
             return EXIT_ERROR
         return _export_bundle(config, path, git)
-    reply = _ask_export(config, path)
+    reply = _ask_export(config, path, **({"include_config": True} if include_config else {}))
     if isinstance(reply, int):
         return reply
     counts = reply["details"]
@@ -729,10 +928,12 @@ def exportar(config: ServiceConfig, destination: str, *, git: str | None = None)
         )
     _report_skipped(counts, reply.get("skipped", []))
     print(f"AVISO: {EXPORTED_WARNING}")
+    if include_config:
+        print(f"AVISO: {INCLUDED_CONFIG_WARNING}")
     return EXIT_OK
 
 
-def _ask_export(config: ServiceConfig, path: Path, **options: str) -> dict[str, Any] | int:
+def _ask_export(config: ServiceConfig, path: Path, **options: Any) -> dict[str, Any] | int:
     """The service's answer to an export, or the exit code (the error said)."""
     try:
         reply = ask_export(config.control_socket, str(path), **options)
@@ -759,6 +960,13 @@ SKIPPED_WHY = {
         "<carpeta> <ruta.bundle>`",
     ),
     "name": ("skipped_names", "nombres con caracteres de control o invisibles"),
+    "config": (
+        "skipped_config",
+        "archivos o carpetas que tus herramientas pueden ejecutar o leer solas al abrir la "
+        "carpeta (lo que empieza por punto, salvo inofensivos como .gitignore, y CLAUDE.md, "
+        "AGENTS.md, GEMINI.md, configuraciones de MCP, *.code-workspace); si de verdad los "
+        "quieres, vuelve a exportar con --incluir-config",
+    ),
     "case": (
         "skipped_collisions",
         "nombres que solo cambian en mayúsculas y minúsculas de otro que ya estaba (el destino "
@@ -819,5 +1027,5 @@ def _export_bundle(config: ServiceConfig, path: Path, repo: str) -> int:
         "la configuración ni los hooks del agente; revisa los commits (git log -p) antes de "
         "sacar los archivos."
     )
-    print(f"AVISO: {EXPORTED_WARNING}")
+    print(f"AVISO: {BUNDLE_WARNING}")
     return EXIT_OK

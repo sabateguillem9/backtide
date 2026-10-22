@@ -170,9 +170,9 @@ def test_an_export_is_recorded_as_started_before_anything_is_copied(
 
     real = guardian_module.export_tree
 
-    def copying(source: Path, target: Path) -> object:
+    def copying(source: Path, target: Path, **options: bool) -> object:
         seen.append(bool(shell_world.events("export_started")))
-        return real(source, target)
+        return real(source, target, **options)
 
     guardian_module.export_tree = copying  # type: ignore[assignment]
     try:
@@ -181,9 +181,37 @@ def test_an_export_is_recorded_as_started_before_anything_is_copied(
         guardian_module.export_tree = real  # type: ignore[assignment]
     assert outcome.status is ExportStatus.DONE and seen == [True]
     started = shell_world.only("export_started")
-    assert started.details == {"kind": "tree", "requested_by": "cli"}
+    assert started.details == {"kind": "tree", "include_config": False, "requested_by": "cli"}
     assert started.snapshot_id == outcome.snapshot
     assert shell_world.only("export").details["kind"] == "tree"
+
+
+def test_what_the_owners_tools_run_is_left_out_and_recorded_by_name(
+    shell_world: World, tmp_path: Path
+) -> None:
+    """Finding 5 of the final review: `.mcp.json`, `CLAUDE.md`, `.envrc`... stay in the jail
+    unless the owner says `--incluir-config`, and the record names them."""
+    with_work(shell_world, {".mcp.json": "{}", "CLAUDE.md": "x", ".envrc": "x", "a.py": "1"})
+    out = tmp_path / "out"
+    outcome = shell_world.guardian.export(str(out), requested_by="cli")
+    assert outcome.status is ExportStatus.DONE, outcome.message
+    assert sorted(path.name for path in out.iterdir()) == ["a.py"]
+    event = shell_world.only("export")
+    assert event.details["skipped_config"] == 3 and event.details["include_config"] is False
+    assert sorted(path for why, path in event.details["skipped"] if why == "config") == [
+        ".envrc", ".mcp.json", "CLAUDE.md",
+    ]  # fmt: skip
+    assert outcome.details["skipped_config"] == 3
+
+
+def test_include_config_takes_them_and_is_recorded(shell_world: World, tmp_path: Path) -> None:
+    with_work(shell_world, {".mcp.json": "{}", "a.py": "1"})
+    out = tmp_path / "out"
+    outcome = shell_world.guardian.export(str(out), requested_by="cli", include_config=True)
+    assert outcome.status is ExportStatus.DONE, outcome.message
+    assert (out / ".mcp.json").exists()
+    assert shell_world.only("export_started").details["include_config"] is True
+    assert shell_world.only("export").details["skipped_config"] == 0
 
 
 def test_without_a_black_box_nothing_is_exported(shell_world: World, tmp_path: Path) -> None:

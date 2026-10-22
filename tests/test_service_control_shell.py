@@ -110,6 +110,10 @@ def test_a_shell_request_reaches_the_guardian(
         {"cmd": "export", "dest": "/x", "bundle": 3, "repo": "."},
         {"cmd": "export", "dest": "/x", "bundle": "b", "repo": "../etc"},
         {"cmd": "export", "dest": "/x", "bundle": "b", "repo": "/etc"},
+        {"cmd": "export", "dest": "/x", "include_config": False},
+        {"cmd": "export", "dest": "/x", "include_config": 1},
+        {"cmd": "export", "dest": "/x", "include_config": "yes"},
+        {"cmd": "export", "dest": "/x", "bundle": "b", "repo": ".", "include_config": True},
         {"cmd": "import", "name": "r", "source": "/s", "files": 1, "bytes": 1, "replace": False},
         {**IMPORT, "secrets_left_out": -1},
         {**IMPORT, "include_secrets": "yes"},
@@ -204,16 +208,28 @@ def test_a_bundle_export_names_the_bundle_and_its_repo(
     assert guardian.exports[0][2] == {"bundle": "export-x.bundle", "repo": "p"}
 
 
+def test_include_config_reaches_the_guardian_only_when_asked(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    assert ask_export(server.path, "/home/me/out", include_config=True, peer=me)["ok"] is True
+    assert guardian.exports[0][2] == {"include_config": True}
+    with pytest.raises(ValueError):
+        ask_export(server.path, "/home/me/b", bundle="export-x.bundle", include_config=True)
+
+
 def test_what_an_export_skipped_comes_back_by_name_checked(
     server: ControlServer, guardian: ShellGuardian
 ) -> None:
-    skipped = [["git", "proyecto/.git"], ["name", "a\\x1b"], ["evil", "x"], ["git", "\x1b[2J"]]
+    skipped = [["git", "proyecto/.git"], ["name", "a\\x1b"], ["evil", "x"], ["git", "\x1b[2J"],
+               ["config", "sub/.claude"]]  # fmt: skip
     guardian.export_outcome = ExportOutcome(
         ExportStatus.DONE, "", "/home/me/out", SNAP, {"skipped_git": 2, "skipped": skipped}
     )
     reply = ask_export(server.path, "/home/me/out", peer=me)
     assert reply["details"] == {"skipped_git": 2}
-    assert reply["skipped"] == [["git", "proyecto/.git"], ["name", "a\\x1b"]]
+    assert reply["skipped"] == [
+        ["git", "proyecto/.git"], ["name", "a\\x1b"], ["config", "sub/.claude"],
+    ]  # fmt: skip
 
 
 def test_an_unknown_kind_is_a_programming_error(tmp_path: Path) -> None:

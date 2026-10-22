@@ -213,7 +213,12 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         description="El servicio hace una instantánea y copia de ella /workspace/work a la "
         "carpeta que digas, que no puede existir (nunca se sobrescribe nada). No sigue enlaces "
         "simbólicos ni copia lo que no es un archivo o una carpeta, ni ningún repositorio de git "
-        "(su configuración podría ejecutar código aquí). Con --git <carpeta>, el agente hace "
+        "(su configuración podría ejecutar código aquí), ni, salvo con --incluir-config, lo que "
+        "tus herramientas pueden ejecutar o leer solas al abrir la carpeta: todo lo que empieza "
+        "por punto (.claude/, .mcp.json, .vscode/, .envrc, .github/…) salvo unos pocos archivos "
+        "inofensivos (.gitignore, .editorconfig, .python-version…), y CLAUDE.md, AGENTS.md, "
+        "GEMINI.md, las configuraciones de MCP y los *.code-workspace. "
+        "Con --git <carpeta>, el agente hace "
         "dentro de la jaula un bundle de git de ese repositorio y solo sale ese archivo, a la "
         "ruta nueva que digas: los commits, sin configuración ni hooks. Lo exportado lo escribió "
         "el agente: revísalo antes de ejecutar nada de ahí. Queda grabado. Sale con 0 si se "
@@ -226,6 +231,14 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         metavar="carpeta",
         help="saca solo los commits de ese repositorio de /workspace/work, como un bundle de git "
         "(`.` para la carpeta de trabajo entera)",
+    )
+    take.add_argument(
+        "--incluir-config",
+        action="store_true",
+        dest="incluir_config",
+        help="copia también lo que Claude Code, tu editor o direnv pueden ejecutar o leer solos al "
+        "abrir la carpeta (lo que empieza por punto, CLAUDE.md, AGENTS.md…): por defecto se deja "
+        "fuera y se dice qué",
     )
     take.set_defaults(handler=_export)
 
@@ -267,7 +280,9 @@ def _export(args: argparse.Namespace) -> int:
     config = _shell_config(args)
     if config is None:
         return EXIT_ERROR
-    return shell_cli.exportar(config, args.destination, git=args.git)
+    return shell_cli.exportar(
+        config, args.destination, git=args.git, include_config=args.incluir_config
+    )
 
 
 def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:

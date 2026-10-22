@@ -33,6 +33,21 @@ name that is not printable is skipped (B6), and so is one that the destination a
 because it ignores case (APFS: ``readme`` after ``README``). What is skipped is counted and the
 first ``MAX_NAMED`` are named, escaped. And the destination is never where code is loaded from
 (B5): backtide's own checkout, a Python environment, any folder of ``sys.path``.
+
+After the final security review of T17a-4 (finding 5, and M4 of its review): nor what the
+owner's own tools run or read by themselves when the owner opens the folder: Claude Code's hooks
+in ``.claude/settings.json`` and MCP servers in ``.mcp.json``, ``CLAUDE.md``, VS Code's
+``tasks.json`` with ``runOn: folderOpen``, direnv's ``.envrc``, a dev container's
+``initializeCommand``, GitHub's workflows, actions and agent instructions in ``.github/``... A
+prompt-injected agent writes them as a normal part of a project, so the owner would not suspect
+them. A list of such names always lags behind the tools, so it goes the other way round: every
+file or folder whose name starts with a dot is left out, except the files of ``DOT_ALLOWED``,
+which no tool runs (no ``.pre-commit-config.yaml``, which runs hooks on commit, nor an
+``.eslintrc.js``, a ``.pylintrc`` with an ``init-hook`` or a ``.flake8`` with local plugins,
+which an editor's linter runs on open). Some names without a dot are left out too
+(``CONFIG_NAMES``, ``CONFIG_SUFFIXES``: the instructions of coding agents and their MCP
+configs, a VS Code workspace). All at any depth and without case, counted and named like the
+git paths; ``include_config`` takes them (``.git`` keeps its own rule, and never leaves).
 """
 
 import errno
@@ -65,6 +80,26 @@ _REPO_PARTS = frozenset({"objects", "refs", "commondir"})
 BUNDLE_DIR = ".backtide-export"
 BUNDLE_RE = re.compile(r"export-[0-9a-f]{32}\.bundle", re.ASCII)
 BUNDLE_HEADERS = (b"# v2 git bundle\n", b"# v3 git bundle\n")
+# What the owner's tools on the host run or read by themselves when the owner opens the folder
+# (finding 5 of the final review, M4 of its review): every name with a dot first, but these
+# files (never folders), which only say how to ignore, format or pick a version. Compared
+# without case, at any depth.
+DOT_ALLOWED = frozenset(
+    {
+        ".gitignore", ".gitattributes", ".editorconfig", ".dockerignore", ".python-version",
+        ".nvmrc", ".node-version", ".prettierrc", ".prettierrc.json", ".prettierrc.json5",
+        ".prettierrc.yaml", ".prettierrc.yml", ".prettierrc.toml", ".eslintrc", ".eslintrc.json",
+        ".eslintrc.yaml", ".eslintrc.yml", ".prettierignore", ".eslintignore", ".ruff.toml",
+    }
+)  # fmt: skip
+# And these names without a dot: what coding agents read as instructions, their MCP configs.
+CONFIG_NAMES = frozenset(
+    {
+        "claude.md", "claude.local.md", "agents.md", "gemini.md", "opencode.json",
+        "claude_desktop_config.json", "mcp_config.json",
+    }
+)  # fmt: skip
+CONFIG_SUFFIXES = (".code-workspace",)  # a VS Code workspace: its settings, tasks, extensions
 
 
 class ExportError(Exception):
@@ -82,7 +117,9 @@ class ExportResult:
     skipped_git: int = 0  # .git folders and files, and folders shaped like a repository
     skipped_names: int = 0  # names that are not printable
     skipped_collisions: int = 0  # names the destination already had, ignoring case
-    named: tuple[tuple[str, str], ...] = ()  # ("git" | "name" | "case", relative path, escaped)
+    skipped_config: int = 0  # what the owner's tools run or read by themselves (CONFIG_*)
+    # ("git" | "name" | "case" | "config", relative path, escaped)
+    named: tuple[tuple[str, str], ...] = ()
 
     def details(self) -> dict[str, Any]:
         return {
@@ -94,6 +131,7 @@ class ExportResult:
             "skipped_git": self.skipped_git,
             "skipped_names": self.skipped_names,
             "skipped_collisions": self.skipped_collisions,
+            "skipped_config": self.skipped_config,
             "skipped": [list(item) for item in self.named],
         }
 
@@ -163,10 +201,11 @@ def _refuse_code_places(target: Path, shown: Path) -> None:
             )
 
 
-def export_tree(source: Path, destination: Path) -> ExportResult:
+def export_tree(source: Path, destination: Path, *, include_config: bool = False) -> ExportResult:
     """Copy the folder ``source`` (in a read-only snapshot) into the new folder ``destination``
     (checked with check_destination). The last component of ``source`` is opened without
-    following a link too. Raises ExportError, with nothing created, if the source cannot be
+    following a link too. What the owner's tools run by themselves is left out unless
+    ``include_config``. Raises ExportError, with nothing created, if the source cannot be
     opened or is too big; an error halfway leaves what was copied (never deleted: the owner
     decides), and says so."""
     try:
@@ -178,7 +217,7 @@ def export_tree(source: Path, destination: Path) -> ExportResult:
         ) from None
     try:
         root_is_repo = _shaped_like_a_repo(source_fd)
-        counted = _count(source_fd, root_is_repo)
+        counted = _count(source_fd, root_is_repo, include_config)
         if counted.bytes > MAX_BYTES or counted.files + counted.folders > MAX_ENTRIES:
             raise ExportError(
                 f"la carpeta de trabajo es demasiado grande para exportarla ({counted.bytes} "
@@ -200,7 +239,7 @@ def export_tree(source: Path, destination: Path) -> ExportResult:
                 f"no se puede abrir {destination}: {os.strerror(error.errno or 0)}"
             ) from None
         try:
-            return _copy(source_fd, destination_fd, root_is_repo)
+            return _copy(source_fd, destination_fd, root_is_repo, include_config)
         except OSError as error:
             raise ExportError(
                 f"la copia a {destination} se ha quedado a medias "
@@ -222,6 +261,7 @@ class _Tally:
     skipped_git: int = 0
     skipped_names: int = 0
     skipped_collisions: int = 0
+    skipped_config: int = 0
     named: list[tuple[str, str]] = field(default_factory=list)
 
     def skip(self, why: str, relative: str) -> None:
@@ -229,6 +269,8 @@ class _Tally:
             self.skipped_git += 1
         elif why == "name":
             self.skipped_names += 1
+        elif why == "config":
+            self.skipped_config += 1
         else:
             self.skipped_collisions += 1
         if len(self.named) < MAX_NAMED:
@@ -236,15 +278,16 @@ class _Tally:
 
     def result(self) -> ExportResult:
         return ExportResult(
-            self.files,
-            self.folders,
-            self.bytes,
-            self.skipped_links,
-            self.skipped_other,
-            self.skipped_git,
-            self.skipped_names,
-            self.skipped_collisions,
-            tuple(self.named),
+            files=self.files,
+            folders=self.folders,
+            bytes=self.bytes,
+            skipped_links=self.skipped_links,
+            skipped_other=self.skipped_other,
+            skipped_git=self.skipped_git,
+            skipped_names=self.skipped_names,
+            skipped_collisions=self.skipped_collisions,
+            skipped_config=self.skipped_config,
+            named=tuple(self.named),
         )
 
 
@@ -282,6 +325,27 @@ def _git_skip(name: str, kind: str, parent_fd: int, depth: int, root_is_repo: bo
     return None
 
 
+def _skip(name: str, kind: str, parent_fd: int, depth: int, flags: tuple[bool, bool]) -> str | None:
+    """Why an entry is not copied ("name", "git" or "config"), or None. ``flags`` is
+    (root_is_repo, include_config)."""
+    root_is_repo, include_config = flags
+    if why := _git_skip(name, kind, parent_fd, depth, root_is_repo):
+        return why
+    if include_config or not is_config(name, kind):
+        return None
+    return "config"
+
+
+def is_config(name: str, kind: str) -> bool:
+    """Whether an entry is something the owner's tools may run or read by themselves: a name
+    with a dot first (unless a file of ``DOT_ALLOWED``), or one of ``CONFIG_NAMES`` or
+    ``CONFIG_SUFFIXES``, without case."""
+    folded = name.casefold()
+    if folded.startswith("."):
+        return not (kind == "file" and folded in DOT_ALLOWED)
+    return folded in CONFIG_NAMES or folded.endswith(CONFIG_SUFFIXES)
+
+
 def _kind(dir_fd: int, name: str) -> tuple[str, os.stat_result]:
     info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     if stat.S_ISLNK(info.st_mode):
@@ -293,9 +357,10 @@ def _kind(dir_fd: int, name: str) -> tuple[str, os.stat_result]:
     return "other", info
 
 
-def _count(root_fd: int, root_is_repo: bool) -> ExportResult:
+def _count(root_fd: int, root_is_repo: bool, include_config: bool) -> ExportResult:
     """What the copy would take, without writing anything (nor counting what it skips)."""
     tally = _Tally()
+    flags = (root_is_repo, include_config)
     stack = [(os.dup(root_fd), 0)]
     try:
         while stack:
@@ -303,7 +368,7 @@ def _count(root_fd: int, root_is_repo: bool) -> ExportResult:
             try:
                 for name in sorted(os.listdir(fd)):
                     kind, info = _kind(fd, name)
-                    if kind == "link" or _git_skip(name, kind, fd, depth, root_is_repo):
+                    if kind == "link" or _skip(name, kind, fd, depth, flags):
                         continue
                     if kind == "file":
                         tally.files += 1
@@ -321,8 +386,11 @@ def _count(root_fd: int, root_is_repo: bool) -> ExportResult:
     return tally.result()
 
 
-def _copy(source_fd: int, destination_fd: int, root_is_repo: bool) -> ExportResult:
+def _copy(
+    source_fd: int, destination_fd: int, root_is_repo: bool, include_config: bool
+) -> ExportResult:
     tally = _Tally()
+    flags = (root_is_repo, include_config)
     stack = [(os.dup(source_fd), os.dup(destination_fd), 0, "")]
     try:
         while stack:
@@ -333,7 +401,7 @@ def _copy(source_fd: int, destination_fd: int, root_is_repo: bool) -> ExportResu
                     relative = f"{prefix}{name}"
                     if kind == "link":
                         tally.skipped_links += 1
-                    elif why := _git_skip(name, kind, src, depth, root_is_repo):
+                    elif why := _skip(name, kind, src, depth, flags):
                         tally.skip(why, relative)
                     elif kind == "dir":
                         if depth + 1 > MAX_DEPTH:
