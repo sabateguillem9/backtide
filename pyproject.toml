@@ -1,8 +1,10 @@
 [project]
 name = "backtide"
 version = "0.1.0"
-description = "Caja negra para agentes de IA: graba lo que hacen, rebobina y frena lo irreversible."
+description = "A black box for AI agents: records what they do, rewinds, and holds the irreversible until you approve."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.143.2",

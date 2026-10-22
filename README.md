@@ -163,4 +163,4 @@ nono is the better fit for "give a coding agent least privilege on my laptop"; b
 
 ## License
 
-Not chosen yet. Until a license file is added, no permission to use, copy or distribute this code is granted.
+Apache License 2.0. See [LICENSE](LICENSE). Copyright 2026 Guillem Sabaté.
