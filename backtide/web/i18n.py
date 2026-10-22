@@ -494,6 +494,8 @@ ES: dict[str, str] = {
     "hasta que la pongas en Ajustes",
     "system.provider_waiting.unusable": "La clave de {target} no se puede usar: el agente no puede "
     "usar el modelo hasta que la pongas otra vez",
+    "system.provider_waiting.not_applied": "La clave nueva de {target} no ha llegado al proxy: el "
+    "agente no puede usar el modelo hasta que se recargue o se reinicie el servicio",
     "system.provider_ready": "{target} ya tiene su clave",
     "gate.hold": "La puerta ha retenido {action} hacia {target}",
     "generic": "{source} · {action} · {target}",
@@ -613,6 +615,8 @@ ES: dict[str, str] = {
     "settings.applied.when_up": "El proxy está caído ahora mismo: lo tomará en cuanto vuelva.",
     "settings.applied.unused": "Ningún proveedor de `[proxy]` se llama así: nadie la usa todavía.",
     "settings.applied.restart": "Se aplica al reiniciar el servicio.",
+    "settings.applied.failed_closed": "Pero no se ha podido entregar al proxy: el modelo queda "
+    "parado hasta que se recargue o se reinicie el servicio.",
     "settings.back": "Volver a Ajustes",
     "settings.not.title": "Ahora no",
     "settings.err.kind": "Ese ajuste no existe.",
@@ -1130,6 +1134,8 @@ EN: dict[str, str] = {
     "you set it in Settings",
     "system.provider_waiting.unusable": "The key of {target} cannot be used: the agent cannot use "
     "the model until you set it again",
+    "system.provider_waiting.not_applied": "The new key of {target} did not reach the proxy: the "
+    "agent cannot use the model until the keys are reloaded or the service restarts",
     "system.provider_ready": "{target} has its key now",
     "gate.hold": "The gate held {action} to {target}",
     "generic": "{source} · {action} · {target}",
@@ -1247,6 +1253,8 @@ EN: dict[str, str] = {
     "settings.applied.when_up": "The proxy is down right now: it takes it as soon as it is back.",
     "settings.applied.unused": "No `[proxy]` provider has this name: nobody uses it yet.",
     "settings.applied.restart": "It applies when the service restarts.",
+    "settings.applied.failed_closed": "But it could not be handed to the proxy: the model stays "
+    "stopped until the keys are reloaded or the service restarts.",
     "settings.back": "Back to Settings",
     "settings.not.title": "Not now",
     "settings.err.kind": "That setting does not exist.",

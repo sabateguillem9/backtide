@@ -1221,7 +1221,11 @@ pone una clave por el socket de control, como la página Ajustes: la siguiente l
 proveedor con ella, sin reiniciar. La quita: las llamadas se rechazan otra vez y el servicio sigue \
 en marcha. Después, con un telegram.toml roto, la pone y la quita: las llamadas se rechazan al \
 momento. Y una clave escrita a mano que no vale (abierta a otros, y luego un enlace) deja al \
-proveedor esperando cuando se vuelven a leer las claves: con ella no llega nada al proveedor."""
+proveedor esperando cuando se vuelven a leer las claves: con ella no llega nada al proveedor. Por \
+último, con la recarga de claves rota de verdad dentro del servicio: quitar la clave rechaza las \
+llamadas al momento, la clave quitada se bloquea como clave real en la cabecera del proveedor, en \
+otro host (cabecera, query y cuerpo), una clave puesta mientras tanto se avisa como no entregada \
+al proxy y no se usa, y la siguiente recarga que funciona devuelve el modelo."""
 inspired_by = "Arrancar sin clave sin clave de relleno, y fallar cerrado (T09b y su revisión)"
 invariants = [3, 6, 7]
 status = "ready"

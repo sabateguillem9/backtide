@@ -162,6 +162,21 @@ def test_the_proxys_config_carries_the_keys_to_strike_only() -> None:
             protocol.decode(json.dumps(broken).encode() + b"\n", protocol.Sender.BACKTIDE)
 
 
+def test_the_keys_to_strike_only_have_their_own_cap() -> None:
+    """Review of 40dfd53, finding 4: strike_only is not capped by the number of providers but by
+    MAX_STRIKE_ONLY (failed reloads add to it), and that many still fit in one line."""
+    keys = [f"sk-ant-api03-TEST{i:03d}" + "Unus4bleButR3al" * 3 for i in range(70)]
+    fits = Providers([waiting_anthropic()], strike_only=keys[: protocol.MAX_STRIKE_ONLY])
+    line = protocol.encode(protocol.config(["example.com"], fits, {}), protocol.Sender.BACKTIDE)
+    decoded = protocol.decode(line, protocol.Sender.BACKTIDE)
+    assert len(protocol.providers_from_config(decoded).strike_only) == protocol.MAX_STRIKE_ONLY
+    assert protocol.MAX_STRIKE_ONLY > 32  # more than _MAX_PROVIDERS
+    assert protocol.STRIKE_ONLY_CHARS < protocol.MAX_LINE_BYTES // 2
+    too_many = Providers([waiting_anthropic()], strike_only=keys[: protocol.MAX_STRIKE_ONLY + 1])
+    with pytest.raises(protocol.ProtocolError):
+        protocol.encode(protocol.config(["example.com"], too_many, {}), protocol.Sender.BACKTIDE)
+
+
 def test_backtide_strikes_a_key_it_never_swaps_in() -> None:
     policy = strict_policy(providers=Providers([waiting_anthropic()], strike_only=[STRUCK]))
     assert STRUCK not in policy.scrubber().text(f"echo {STRUCK}")

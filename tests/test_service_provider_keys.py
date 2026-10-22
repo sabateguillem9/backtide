@@ -8,6 +8,7 @@ key here is made up by the test."""
 import json
 import os
 import stat
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -289,15 +290,102 @@ def test_a_key_file_that_changes_while_it_is_read_waits(layout: Path) -> None:
         temp.chmod(0o600)
         os.replace(temp, path)  # the same key, but another file than the one first read
 
+    def later() -> float:  # the file has been still long enough (finding 6 is tested below)
+        return time.time() + 60
+
     for change in (half_written, moved_in):
         write_key(layout, "anthropic", REAL_ANTHROPIC)
-        real, problem, why = read_real_key(folder, "anthropic", pause=change)
+        real, problem, why = read_real_key(folder, "anthropic", pause=change, clock=later)
         assert (real, problem) == (None, KEY_UNUSABLE), change.__name__
         assert why is not None and "changed while" in why and REAL_ANTHROPIC[:8] not in why
     pauses: list[float] = []
-    real, problem, why = read_real_key(folder, "anthropic", pause=pauses.append)
+    real, problem, why = read_real_key(folder, "anthropic", pause=pauses.append, clock=later)
     assert real is not None and real.reveal() == REAL_ANTHROPIC and (problem, why) == (None, None)
     assert pauses and 0 < pauses[0] <= 0.1  # a short pause between the two reads
+
+
+def test_a_key_file_written_a_moment_ago_is_taken_only_once_it_is_still(
+    layout: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 40dfd53, finding 6: a key is taken only once its file has not changed for
+    KEY_STILL_S. A fresher one is waited for (once, at most KEY_STILL_S: what the Settings
+    page's own reload meets); if it changes again meanwhile, or still looks fresh, it waits
+    until the next reload. The double read stays."""
+    from backtide.service import config as config_module
+    from backtide.service.config import KEY_SETTLE_S, KEY_UNUSABLE, read_real_key
+
+    monkeypatch.setattr(config_module, "KEY_STILL_S", 0.5)
+    path = write_key(layout, "anthropic", REAL_ANTHROPIC)
+    folder = keys_dir(layout)
+    written = max(path.stat().st_mtime, path.stat().st_ctime)
+    now = [written + 0.1]  # 0.1 s after it was written
+
+    def clock() -> float:
+        return now[0]
+
+    def waits(seconds: float) -> None:
+        pauses.append(seconds)
+        now[0] += seconds
+
+    # Fresh: waited for the rest of the half second, then read twice, and taken.
+    pauses: list[float] = []
+    real, problem, why = read_real_key(folder, "anthropic", pause=waits, clock=clock)
+    assert real is not None and real.reveal() == REAL_ANTHROPIC and (problem, why) == (None, None)
+    assert len(pauses) == 2 and abs(pauses[0] - 0.4) < 0.01 and pauses[1] == KEY_SETTLE_S
+
+    # Written again while it was waited for: the next reload reads it.
+    def written_again(seconds: float) -> None:
+        if not pauses:
+            path.write_text(REAL_ANTHROPIC[:20])  # a hand still writing it
+            now[0] = max(path.stat().st_mtime, path.stat().st_ctime) + 0.05
+        pauses.append(seconds)
+
+    write_key(layout, "anthropic", REAL_ANTHROPIC)
+    now[0] = max(path.stat().st_mtime, path.stat().st_ctime) + 0.1
+    pauses = []
+    real, problem, why = read_real_key(folder, "anthropic", pause=written_again, clock=clock)
+    assert (real, problem) == (None, KEY_UNUSABLE)
+    assert why is not None and "a moment ago" in why and REAL_ANTHROPIC[:8] not in why
+
+    # A clock that does not move (or a time in the future): never taken fresh.
+    write_key(layout, "anthropic", REAL_ANTHROPIC)
+    now[0] = max(path.stat().st_mtime, path.stat().st_ctime) - 30
+    pauses = []
+    real, problem, why = read_real_key(folder, "anthropic", pause=pauses.append, clock=clock)
+    assert (real, problem) == (None, KEY_UNUSABLE) and pauses[0] <= 0.5
+
+    # The real clock: a file written just now is taken after the wait.
+    write_key(layout, "anthropic", REAL_ANTHROPIC)
+    started = time.monotonic()
+    real, _, _ = read_real_key(folder, "anthropic")
+    assert real is not None and real.reveal() == REAL_ANTHROPIC
+    assert time.monotonic() - started >= 0.3
+
+
+def test_a_key_to_strike_is_read_only_from_a_file_of_ours(
+    layout: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 40dfd53, finding 5: read_strike_only reads only a regular file of the
+    service's own user, never through a link."""
+    from backtide.service import config as config_module
+    from backtide.service.config import read_strike_only
+
+    path = write_key(layout, "anthropic", REAL_ANTHROPIC, mode=0o644)
+    folder = keys_dir(layout)
+    struck = read_strike_only(folder, "anthropic")
+    assert struck is not None and struck.reveal() == REAL_ANTHROPIC
+    real_uid = os.geteuid()
+    monkeypatch.setattr(config_module.os, "geteuid", lambda: real_uid + 1)
+    assert read_strike_only(folder, "anthropic") is None  # someone else's file
+    monkeypatch.undo()
+    path.unlink()
+    target = layout / "elsewhere.key"
+    target.write_text(REAL_ANTHROPIC + "\n")
+    path.symlink_to(target)
+    assert read_strike_only(folder, "anthropic") is None  # a link
+    path.unlink()
+    os.mkfifo(path)
+    assert read_strike_only(folder, "anthropic") is None  # not a regular file
 
 
 def test_a_fake_file_that_is_not_a_fake_key_is_refused(layout: Path) -> None:

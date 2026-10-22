@@ -218,6 +218,25 @@ def test_a_key_is_set_with_its_confirmation_and_nothing_comes_back(
     assert len(fake.sets) == 1
 
 
+def test_a_key_the_proxy_could_not_take_is_said_plainly(
+    web: TestClient, fake: FakeSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of 40dfd53, finding 3: a reload that failed closed is not "it applies at the
+    next start": the model stays stopped until a reload or a restart."""
+    message = (
+        "Guardada, pero no se ha podido entregar al proxy: el modelo queda parado hasta que se "
+        "recargue o se reinicie el servicio."
+    )
+    reply_of = {"ok": True, "outcome": "saved", "message": message, "applied": "failed_closed"}
+    monkeypatch.setattr(fake, "set_secret", lambda kind, value, chat_id: reply_of)
+    fields = confirm(web, "set", "openai")
+    reply = post(web, {**fields, "valor": "sk-proj-TEST" + secrets.token_urlsafe(40)})
+    shown = text_of(reply.text)
+    assert reply.status_code == 200 and 'data-outcome="saved"' in reply.text
+    assert "Pero no se ha podido entregar al proxy: el modelo queda parado" in shown
+    assert "Se aplica al reiniciar" not in shown
+
+
 def test_replacing_a_key_needs_the_box_ticked(web: TestClient, fake: FakeSettings) -> None:
     page = web.get("/ajustes/cambiar?tipo=anthropic").text
     assert re.search(r'<input type="checkbox" name="confirmo" value="si" required>', page)

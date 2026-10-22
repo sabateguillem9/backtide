@@ -19,8 +19,13 @@ the gate's times are shortened, in seconds (5 min, 90 s, 10 min and 10 min in pr
 config file can set them, so a scenario does not wait 5 minutes for a hold to expire. The fifth
 (T10-5) is the Retry-After of Telegram's "pending".
 
+With ``--reload-fails-when <file>`` (review of 40dfd53, finding 7) the service's reload of the
+providers' keys (``runner.providers_now``, what the Settings page triggers) raises while
+``<file>`` exists, so a scenario sees the real service fail closed. Nothing else changes.
+
     python -m tests.integration.service_main <config.toml> [--with-sensor]
         [--egress-grants <file.json>] [--hold-timings <life>,<wait>,<preapproval>,<remember>]
+        [--reload-fails-when <file>]
 """
 
 import sys
@@ -37,6 +42,7 @@ from tests.integration.proxy_kit import read_grants, test_proxy
 WITH_SENSOR = "--with-sensor"
 EGRESS_GRANTS = "--egress-grants"
 HOLD_TIMINGS = "--hold-timings"
+RELOAD_FAILS_WHEN = "--reload-fails-when"
 
 
 def hold_timings(text: str) -> HoldTimings:
@@ -48,6 +54,18 @@ def hold_timings(text: str) -> HoldTimings:
     if len(parts) == 5:
         timings = replace(timings, telegram_retry_after=int(parts[4]))
     return timings
+
+
+def fail_reloads_when(marker: Path) -> None:
+    """The keys' reload raises while ``marker`` exists (the test makes and removes it)."""
+    production = runner.providers_now
+
+    def providers_now(config: ServiceConfig) -> object:
+        if marker.exists():
+            raise RuntimeError("the test makes the keys' reload fail")
+        return production(config)
+
+    runner.providers_now = providers_now  # type: ignore[assignment]
 
 
 def serve_without_root(
@@ -75,6 +93,8 @@ if __name__ == "__main__":
     timings = None
     if HOLD_TIMINGS in options:
         timings = hold_timings(options[options.index(HOLD_TIMINGS) + 1])
+    if RELOAD_FAILS_WHEN in options:
+        fail_reloads_when(Path(options[options.index(RELOAD_FAILS_WHEN) + 1]))
     cli.serve = lambda config: serve_without_root(  # type: ignore[attr-defined]
         config, with_sensor=sensor, grants=grants, timings=timings
     )

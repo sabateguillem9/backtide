@@ -5,6 +5,7 @@ Every key here is made up by the test (``sk-ant-api03-TEST…``): never a real o
 most is what must NOT happen: a key in a message, a log line or a black-box event, a file that is
 not 0600, a write that follows a link, a change that is not recorded first."""
 
+import dataclasses
 import json
 import logging
 import os
@@ -802,8 +803,8 @@ def test_a_reload_that_fails_during_a_removal_fails_closed(
     # A set that fails the same way never hands over the new key, and the old one stops too.
     new = openai_key()
     outcome = settings.set_secret("openai", new, requested_by="web")
-    assert (outcome.status, outcome.applied) == (Outcome.SAVED, Applied.RESTART)
-    assert egress.waiting() == {"anthropic": "missing", "openai": "unusable"}
+    assert (outcome.status, outcome.applied) == (Outcome.SAVED, Applied.FAILED_CLOSED)
+    assert egress.waiting() == {"anthropic": "missing", "openai": "not_applied"}
     assert sent_keys(configs[-1]) == {"anthropic": None, "openai": None}
     assert {old, other, new} <= set(egress.policy.providers.strike_only)
 
@@ -816,6 +817,8 @@ def test_a_failed_reload_with_the_proxy_down_still_makes_the_provider_wait(
     config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
     egress, _, _ = running_egress(config)
     egress._up = False  # noqa: SLF001
+    channel = egress._channel  # noqa: SLF001 - still open: a proxy that serves (silent, say)
+    assert channel is not None and not channel.closed
     monkeypatch.setattr(runner, "providers_now", lambda config: 1 / 0)
     outcome = make(state, box, key_reloader(config, egress)).clear_secret(
         "anthropic", requested_by="web"
@@ -823,6 +826,175 @@ def test_a_failed_reload_with_the_proxy_down_still_makes_the_provider_wait(
     assert outcome.applied is Applied.WHEN_UP
     assert egress.waiting() == {"anthropic": "missing", "openai": "missing"}
     assert decision(egress.policy, box) == ("deny", "no_key")
+    # Review of 40dfd53, finding 1: the old channel (and the config with the removed key that
+    # came with it) is closed, so a proxy still serving refuses until it has the new one.
+    assert channel.closed and egress._channel is None  # noqa: SLF001
+
+
+def test_a_new_policy_while_the_proxy_is_down_closes_its_open_channel(
+    tmp_path: Path, state: Path, box: BlackBox
+) -> None:
+    """Finding 1 without a failure: the watch said down (silent, restarts used up) but the
+    channel is still open. A removal closes it at once instead of leaving it with the key."""
+    config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
+    egress, _, records = running_egress(config)
+    egress._up = False  # noqa: SLF001
+    channel = egress._channel  # noqa: SLF001
+    outcome = make(state, box, key_reloader(config, egress)).clear_secret(
+        "anthropic", requested_by="web"
+    )
+    assert outcome.applied is Applied.WHEN_UP
+    assert channel is not None and channel.closed and egress._channel is None  # noqa: SLF001
+    assert (
+        "proxy_reconfigured",
+        {"providers": ["anthropic", "openai"], "now": False},
+        1,
+    ) in records
+
+
+class BrokenScrub:
+    """A process sensor's list of secrets whose ``replace`` fails."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def replace(self, secrets: Any) -> None:
+        self.calls += 1
+        raise RuntimeError("the sensor's list is broken")
+
+
+def test_a_failed_reload_cuts_the_key_even_if_the_sensors_list_fails(
+    tmp_path: Path, state: Path, box: BlackBox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 2: in the failure path the proxy gets the fail-closed policy first, and the
+    sensor's list is refreshed after, its error logged: it never skips the cut."""
+    from backtide.service import runner
+
+    old, other = anthropic_key(), openai_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
+    egress, configs, _ = running_egress(config)
+    channel = egress._channel  # noqa: SLF001
+    monkeypatch.setattr(runner, "providers_now", lambda config: 1 / 0)
+    scrub = BrokenScrub()
+    settings = make(state, box, key_reloader(config, egress, scrub))  # type: ignore[arg-type]
+    outcome = settings.clear_secret("anthropic", requested_by="web")
+    assert (outcome.status, outcome.applied) == (Outcome.CLEARED, Applied.NOW)
+    assert scrub.calls == 1
+    assert egress.waiting() == {"anthropic": "missing"}
+    assert channel is not None and channel.closed
+    assert sent_keys(configs[-1]) == {"anthropic": None, "openai": other}
+    assert decision(egress.policy, box) == ("deny", "no_key")
+
+
+def test_a_sensors_list_that_fails_on_a_good_reload_fails_closed(
+    tmp_path: Path, state: Path, box: BlackBox, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding 2, the success path: if the sensor cannot strike the new key, the proxy never
+    gets it (fail closed instead of an error that leaves the old key in use)."""
+    old, other = anthropic_key(), openai_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
+    egress, configs, _ = running_egress(config)
+    settings = make(state, box, key_reloader(config, egress, BrokenScrub()))  # type: ignore[arg-type]
+    new = anthropic_key()
+    outcome = settings.set_secret("anthropic", new, requested_by="web")
+    assert (outcome.status, outcome.applied) == (Outcome.SAVED, Applied.FAILED_CLOSED)
+    assert egress.waiting() == {"anthropic": "not_applied"}
+    assert sent_keys(configs[-1]) == {"anthropic": None, "openai": other}
+    assert {old, new} <= set(egress.policy.providers.strike_only)
+    texts = everything_said(box, caplog, outcome)
+    assert leaks(new, *texts) == [] and leaks(old, *texts) == []
+    # A removal that meets the same broken list still cuts the key at once.
+    outcome = settings.clear_secret("openai", requested_by="web")
+    assert (outcome.status, outcome.applied) == (Outcome.CLEARED, Applied.NOW)
+    assert sent_keys(configs[-1]) == {"anthropic": None, "openai": None}
+
+
+def test_a_new_key_that_cannot_be_handed_over_says_so_and_does_not_blame_the_file(
+    tmp_path: Path, state: Path, box: BlackBox, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """Finding 3: the reply is honest (the model stays stopped until a reload or a restart, not
+    "it applies at the next start"), and the alert and the log say the key did not reach the
+    proxy, not that its file cannot be used."""
+    from backtide.service import runner
+
+    config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
+    egress, _, records = running_egress(config)
+    alerts: list[tuple[str, str]] = []
+    egress._hooks = EgressHooks(  # noqa: SLF001
+        record=egress._hooks.record,  # type: ignore[union-attr]  # noqa: SLF001
+        alert=lambda level, title, body, event: alerts.append((title, body)),
+    )
+    monkeypatch.setattr(runner, "providers_now", lambda config: 1 / 0)
+    outcome = make(state, box, key_reloader(config, egress)).set_secret(
+        "anthropic", anthropic_key(), requested_by="web"
+    )
+    assert (outcome.status, outcome.applied) == (Outcome.SAVED, Applied.FAILED_CLOSED)
+    assert outcome.message == (
+        "Guardada, pero no se ha podido entregar al proxy: el modelo queda parado hasta que se "
+        "recargue o se reinicie el servicio."
+    )
+    assert egress.waiting() == {"anthropic": "not_applied", "openai": "missing"}
+    waits = [(d, r) for a, d, r in records if a == "provider_waiting"]
+    assert ({"provider": "anthropic", "problem": "not_applied"}, 2) in waits
+    assert [title for title, _ in alerts] == ["La clave nueva de anthropic no ha llegado al proxy"]
+    assert all("no se puede usar" not in body for _, body in alerts)
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "cannot be used" not in logged and "could not be handed" in logged
+
+
+def test_failed_reloads_never_strike_more_than_the_proxy_can_take(
+    tmp_path: Path, state: Path, box: BlackBox, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """Finding 4: every failed reload adds the keys it stops using to strike_only. They are
+    capped (the most recent kept, the drop logged without a value), so the proxy's config
+    always fits the protocol."""
+    from backtide.service import runner
+
+    config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
+    egress, configs, _ = running_egress(config)
+    monkeypatch.setattr(runner, "providers_now", lambda config: 1 / 0)
+    settings = make(state, box, key_reloader(config, egress))
+    written = []
+    for _ in range(protocol.MAX_STRIKE_ONLY + 6):
+        key = anthropic_key()
+        written.append(key)
+        settings.set_secret("anthropic", key, requested_by="web")
+    struck = egress.policy.providers.strike_only
+    assert len(struck) == protocol.MAX_STRIKE_ONLY
+    assert set(struck) == set(written[-protocol.MAX_STRIKE_ONLY :]), "the most recent are kept"
+    assert sum(len(key) for key in struck) <= protocol.STRIKE_ONLY_CHARS
+    # The proxy still gets a config it accepts (the last handshake carried all of them).
+    assert configs[-1]["strike_only"] == list(struck)
+    dropped = [r.getMessage() for r in caplog.records if "no longer struck" in r.getMessage()]
+    assert dropped
+    texts = everything_said(box, caplog)
+    assert all(leaks(key, *texts) == [] for key in written)
+
+
+def test_failed_reloads_keep_the_struck_keys_within_the_line(
+    tmp_path: Path, state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 4, long keys: fewer than MAX_STRIKE_ONLY, but never more characters than
+    STRIKE_ONLY_CHARS, so the config line stays under MAX_LINE_BYTES."""
+    from backtide.service.runner import fail_closed
+
+    config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
+    current = egress_policy(config, *config.model_providers_and_problems())
+    long_keys = ["sk-ant-api03-TEST" + secrets.token_urlsafe(2000)[:2000] for _ in range(20)]
+    current = dataclasses.replace(
+        current, providers=Providers(current.providers.items, strike_only=long_keys)
+    )
+    policy = fail_closed(config, current)
+    struck = policy.providers.strike_only
+    assert struck and sum(len(key) for key in struck) <= protocol.STRIKE_ONLY_CHARS
+    assert struck[-1] == long_keys[-1]
+    message = protocol.config(["example.com"], policy.providers, {})
+    line = protocol.encode(message, Sender.BACKTIDE)
+    assert len(line) <= protocol.MAX_LINE_BYTES
+    decoded = protocol.decode(line, Sender.BACKTIDE)
+    assert protocol.providers_from_config(decoded).strike_only == struck
 
 
 def test_a_key_whose_file_cannot_be_used_is_still_struck_by_the_sensor(

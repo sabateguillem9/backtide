@@ -163,6 +163,9 @@ EVENT_BYTES_BURST = 8 * 1024 * 1024
 DAILY_EVENT_BYTES = 512 * 1024 * 1024
 DROPPED_EVERY = 10.0
 NO_KEY_EVERY = 10.0  # at most one llm/blocked {reason: no_key} per provider this often
+# Why a provider waits when its new key was read but a failed reload could not hand it to the
+# proxy (``runner.fail_closed``): not its file's fault, unlike "unusable" (review of 40dfd53).
+KEY_NOT_APPLIED = "not_applied"
 _CREDENTIALS = struct.Struct("3i")
 _OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -302,9 +305,10 @@ class Policy:
     # [gate] read_budget_host_kib and read_budget_total_kib (review of T10-3, M5), in bytes.
     read_budget_host: int = DEFAULT_HOST_BYTES
     read_budget_total: int = DEFAULT_TOTAL_BYTES
-    # Why each provider without its key waits: ("missing", why) for no key file yet, or
-    # ("unusable", why) for a file that cannot be used; ``why`` says what the file IS, never
-    # what it holds. Only the names ``providers`` has without a key count.
+    # Why each provider without its key waits: ("missing", why) for no key file yet,
+    # ("unusable", why) for a file that cannot be used, or (KEY_NOT_APPLIED, why) for a key a
+    # failed reload could not hand over (``runner.fail_closed``); ``why`` says what the file IS,
+    # never what it holds. Only the names ``providers`` has without a key count.
     key_problems: Mapping[str, tuple[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -312,11 +316,14 @@ class Policy:
             raise ValueError("unknown_hosts is 'hold' or 'deny'")
 
     def waiting(self) -> dict[str, str]:
-        """The providers that wait for their key, and why ("missing" or "unusable")."""
+        """The providers that wait for their key, and why ("missing", "unusable" or
+        KEY_NOT_APPLIED)."""
+        shown = {"unusable", KEY_NOT_APPLIED}
         return {
-            name: "unusable" if self.key_problems.get(name, ("",))[0] == "unusable" else "missing"
+            name: problem if (problem := self.key_problems.get(name, ("",))[0]) in shown
+            else "missing"
             for name in self.providers.waiting()
-        }
+        }  # fmt: skip
 
     def key_note(self, name: str) -> str:
         """What is wrong with the key of ``name``, for the log (never a key)."""

@@ -98,6 +98,9 @@ MAX_KEY_BYTES = 4096
 # A real key file is read twice, this long apart, and taken only if neither the file nor what it
 # holds changed in between (review of T09b, finding 3: a key written by hand may be half written).
 KEY_SETTLE_S = 0.01
+# And only once it has not changed for this long (review of 40dfd53, finding 6): a fresher one is
+# waited for, once; one that changes again meanwhile waits until the next reload. 0 turns it off.
+KEY_STILL_S = 0.5
 
 STATE_DB = "blackbox.db"
 STATE_KEY = "blackbox.key"
@@ -992,7 +995,11 @@ def read_real_keys(
 
 
 def read_real_key(
-    folder: Path, name: str, *, pause: Callable[[float], None] = time.sleep
+    folder: Path,
+    name: str,
+    *,
+    pause: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.time,
 ) -> tuple[Secret | None, str | None, str | None]:
     """``(key, None, None)`` from ``<folder>/<name>.key``, or ``(None, problem, why)`` when
     there is none (``KEY_MISSING``) or it cannot be used (``KEY_UNUSABLE``: not 0600 and ours,
@@ -1002,18 +1009,40 @@ def read_real_key(
     The file is read twice, ``KEY_SETTLE_S`` apart (``pause``), and taken only if it is the same
     file with the same size, times and bytes both times: a key written by hand may be half
     written (review of T09b, finding 3). A change waits; the next reload reads it again. The
-    Settings page writes atomically, and so does ``mv`` from a temporary file."""
+    Settings page writes atomically, and so does ``mv`` from a temporary file.
+
+    Before that, the file must not have changed (its contents nor its inode: mtime and ctime)
+    for ``KEY_STILL_S`` by ``clock`` (review of 40dfd53, finding 6): a hand that writes a key in
+    two goes with a pause between them is not caught by the double read alone. A fresher file
+    is waited for once, at most ``KEY_STILL_S`` (the Settings page's own reload meets that);
+    if it is still fresh after it (written again, or a time in the future), it waits until the
+    next reload."""
     path = folder / f"{name}.key"
+    still = KEY_STILL_S  # read now: the unit tests turn it off
     try:
         if not os.path.lexists(path):
             return None, KEY_MISSING, f"there is no {path} yet"
         first, before = _read_file_info(path, "real key file", MAX_KEY_BYTES, private=True)
+        if still > 0 and (fresh := still - _age(before, clock)) > 0:
+            pause(min(fresh, still))
+            first, before = _read_file_info(path, "real key file", MAX_KEY_BYTES, private=True)
+        settled = still <= 0 or _age(before, clock) >= still
         pause(KEY_SETTLE_S)
         second, after = _read_file_info(path, "real key file", MAX_KEY_BYTES, private=True)
     except ConfigError as error:
         return None, KEY_UNUSABLE, str(error)
     except OSError as error:
         return None, KEY_UNUSABLE, f"cannot read {path}: {os.strerror(error.errno or 0)}"
+    if not settled:
+        return (
+            None,
+            KEY_UNUSABLE,
+            (
+                f"real key file {path} of provider {name} changed a moment ago (or its time is "
+                "in the future): write keys with the Settings page, or with mv from a temporary "
+                "file; it is read again at the next reload"
+            ),
+        )
     if first != second or _identity(before) != _identity(after):
         return (
             None,
@@ -1037,9 +1066,9 @@ def read_real_key(
 def read_strike_only(folder: Path, name: str) -> Secret | None:
     """What ``<folder>/<name>.key`` holds although it cannot be used as a key (open to others,
     of the wrong shape, changed while read), to strike wherever it shows and never to swap in
-    (review of T09b, finding 2). Only a regular file, never through a link, at most
-    MAX_KEY_BYTES of UTF-8; None if there is nothing of MIN_KNOWN_SECRET characters or more.
-    Never raises, never says what it read."""
+    (review of T09b, finding 2). Only a regular file of the service's own user (review of
+    40dfd53, finding 5), never through a link, at most MAX_KEY_BYTES of UTF-8; None if there is
+    nothing of MIN_KNOWN_SECRET characters or more. Never raises, never says what it read."""
     path = folder / f"{name}.key"
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
@@ -1048,7 +1077,11 @@ def read_strike_only(folder: Path, name: str) -> Secret | None:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_KEY_BYTES:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_size > MAX_KEY_BYTES
+        ):
             return None
         data = os.read(fd, MAX_KEY_BYTES + 1)
     except OSError:
@@ -1062,6 +1095,11 @@ def read_strike_only(folder: Path, name: str) -> Secret | None:
     except UnicodeDecodeError:
         return None
     return Secret(value) if len(value) >= MIN_KNOWN_SECRET else None
+
+
+def _age(info: os.stat_result, clock: Callable[[], float]) -> float:
+    """Seconds since the file last changed (its contents or its inode), by ``clock``."""
+    return clock() - max(info.st_mtime, info.st_ctime)
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:

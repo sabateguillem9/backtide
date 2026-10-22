@@ -71,6 +71,11 @@ _MAX_ID = 2**53 - 1  # exact in any JSON reader
 _MAX_SEQ = 2**63 - 1
 _MAX_ALLOW_HOSTS = 1000
 _MAX_PROVIDERS = 32
+# config.strike_only: real keys never swapped in (review of T09b), which failed reloads add to
+# (review of 40dfd53, finding 4). Their own cap, not the providers'; backtide keeps the most
+# recent within it and within STRIKE_ONLY_CHARS, so the config line stays under MAX_LINE_BYTES.
+MAX_STRIKE_ONLY = 64
+STRIKE_ONLY_CHARS = 16 * 1024
 MAX_PROVIDER_TOOLS = 64
 MAX_WAIT_MS = 90_000  # a held request keeps its connection 90 s at most (decision 1)
 MAX_WAIT_HINT_S = 90
@@ -545,7 +550,7 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
     struck = message.get("strike_only", [])
     if (
         not isinstance(struck, list)
-        or len(struck) > _MAX_PROVIDERS
+        or len(struck) > MAX_STRIKE_ONLY
         or not all(
             isinstance(key, str) and MIN_KNOWN_SECRET <= len(key) <= _MAX_STRUCK_KEY
             for key in struck

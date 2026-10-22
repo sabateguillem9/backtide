@@ -37,6 +37,19 @@ class FakeClock:
         self._now += delta
 
 
+@pytest.fixture(autouse=True)
+def _key_files_need_not_settle(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real key file is taken only once it has been still for KEY_STILL_S (review of 40dfd53,
+    finding 6): the unit tests write their key files and read them at once, so there it is off
+    (tests/test_service_provider_keys.py turns it back on). The VM's tests keep it."""
+    if not any(request.node.get_closest_marker(mark) for mark in ("integration", "ataques")):
+        from backtide.service import config
+
+        monkeypatch.setattr(config, "KEY_STILL_S", 0.0)
+
+
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock(datetime(2026, 10, 5, 8, 0, tzinfo=UTC))

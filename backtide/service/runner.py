@@ -43,6 +43,7 @@ from backtide.analyzer import (
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
 from backtide.blackbox.redact import MIN_KNOWN_SECRET
+from backtide.gate import protocol
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import MAIL_TRANSLATORS
 from backtide.jail import AgentJail, JailError, ca
@@ -69,7 +70,7 @@ from backtide.service.holds import HoldTimings, HoldWatch
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.price_update import PriceUpdater
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
-from backtide.service.proxy_channel import Policy, known_secrets
+from backtide.service.proxy_channel import KEY_NOT_APPLIED, Policy, known_secrets
 from backtide.service.settings import Applied, ReloadFailedClosed, Settings
 from backtide.service.spend import Budget
 from backtide.service.telegram_config import load_telegram
@@ -538,8 +539,9 @@ def key_reloader(
 
     Only the providers change: the rest of the policy is the one the proxy has (nothing else is
     read again, not telegram.toml nor ``[gate]``: review of T09b, finding 1). If even that fails,
-    it fails closed (``fail_closed``): every provider whose key is no longer the one in keys/
-    waits, the proxy's connection is replaced so it refuses until it has that config, and
+    or the sensor's list cannot take the new keys, it fails closed (``fail_closed``): every
+    provider whose key is no longer the one in keys/ waits, the proxy's connection is replaced
+    (first: nothing else may skip it) so it refuses until it has that config, and
     ReloadFailedClosed says so."""
 
     def reload() -> Applied:
@@ -547,16 +549,25 @@ def key_reloader(
         try:
             providers, problems = providers_now(config)
             policy = dataclasses.replace(current, providers=providers, key_problems=problems)
+            # The sensor strikes the new keys before the proxy can use them; if it cannot, the
+            # proxy never gets them (review of 40dfd53, finding 2).
+            _refresh(scrub, config, providers)
         except Exception as error:
             logger.error(
-                "the providers' keys cannot be read again (%s): the keys that changed are not "
-                "used until the next reload", type(error).__name__,
+                "the providers' keys cannot be read again or struck (%s): the keys that "
+                "changed are not used until the next reload", type(error).__name__,
             )  # fmt: skip
             policy = fail_closed(config, current)
-            _refresh(scrub, config, policy.providers)
+            # The cut first: nothing here may skip it (review of 40dfd53, finding 2).
             applied = Applied.NOW if egress.reload(policy) else Applied.WHEN_UP
+            try:
+                _refresh(scrub, config, policy.providers)
+            except Exception as refresh_error:  # the proxy has the cut already
+                logger.error(
+                    "the process sensor's list of secrets cannot be refreshed (%s): it keeps "
+                    "the keys it had", type(refresh_error).__name__,
+                )  # fmt: skip
             raise ReloadFailedClosed(applied) from error
-        _refresh(scrub, config, providers)
         return Applied.NOW if egress.reload(policy) else Applied.WHEN_UP
 
     return reload
@@ -572,7 +583,9 @@ def fail_closed(config: ServiceConfig, current: Policy) -> Policy:
     """``current`` with every provider whose real key is not exactly the one in keys/ now (it was
     removed, replaced or cannot be read) waiting for its key: a failed reload never keeps a key
     the owner took away. The keys it stops using, and the new ones it does not take, are struck
-    only from now on. If keys/ cannot even be read, every provider waits. Never raises."""
+    only from now on; a new key that reads well waits as ``KEY_NOT_APPLIED`` (not its file's
+    fault). If keys/ cannot even be read, every provider waits. The keys struck only are capped
+    (``_capped_strikes``). Never raises."""
     items = current.providers.items
     try:
         on_disk = read_real_keys(config.keys_dir, [p.name for p in items])
@@ -583,33 +596,60 @@ def fail_closed(config: ServiceConfig, current: Policy) -> Policy:
     struck = list(current.providers.strike_only)
     kept = []
     for provider in items:
-        real, problem, why = on_disk.get(provider.name, (None, KEY_UNUSABLE, "keys/ unreadable"))
-        same = (
-            provider.real_key is not None
-            and real is not None
-            and real.reveal() == provider.real_key.reveal()
-        )
-        if provider.real_key is None or same:
-            kept.append(provider)
+        real, problem, why = on_disk.get(provider.name, (None, KEY_NOT_APPLIED, "keys/ unread"))
+        used = None if provider.real_key is None else provider.real_key.reveal()
+        if real is not None and real.reveal() == used:
+            kept.append(provider)  # unchanged: it keeps its key
             continue
-        struck.append(provider.real_key.reveal())
+        if used is None and real is None:
+            kept.append(provider)  # it waited already, and there is nothing new to take
+            continue
+        if used is not None:
+            struck.append(used)
         if real is not None:
             struck.append(real.reveal())  # the new key, never swapped in by this policy
         kept.append(dataclasses.replace(provider, real_key=None))
         problems[provider.name] = (
-            problem or KEY_UNUSABLE,
+            problem or KEY_NOT_APPLIED,
             why
             or "its key changed and the new one could not be handed over: it is read "
             "again at the next reload",
         )
     fakes = [p.fake_key for p in items]
-    struck = [k for k in struck if len(k) >= MIN_KNOWN_SECRET and not holds_fake(k, fakes)]
+    reals = {p.real_key.reveal() for p in kept if p.real_key is not None}
+    struck = [
+        k
+        for k in struck
+        if len(k) >= MIN_KNOWN_SECRET and not holds_fake(k, fakes) and k not in reals
+    ]
     try:
-        providers = Providers(kept, strike_only=struck)
+        providers = Providers(kept, strike_only=_capped_strikes(struck))
     except ValueError:  # cannot happen (fewer keys than before): then nothing is struck anew
         logger.exception("the keys that stopped being used cannot be struck")
         providers = Providers(kept, strike_only=current.providers.strike_only)
     return dataclasses.replace(current, providers=providers, key_problems=problems)
+
+
+def _capped_strikes(struck: list[str]) -> list[str]:
+    """``struck`` without repeats, cut to the most recent (its end) that fit in
+    ``protocol.MAX_STRIKE_ONLY`` keys and ``protocol.STRIKE_ONLY_CHARS`` characters, so the
+    proxy's config always fits in one line (review of 40dfd53, finding 4). What is dropped is
+    logged by count, never by value."""
+    newest_first = list(dict.fromkeys(reversed(struck)))
+    kept: list[str] = []
+    chars = 0
+    for key in newest_first:
+        if len(kept) == protocol.MAX_STRIKE_ONLY or chars + len(key) > protocol.STRIKE_ONLY_CHARS:
+            break
+        kept.append(key)
+        chars += len(key)
+    if len(kept) < len(newest_first):
+        logger.error(
+            "%d keys that stopped being used are no longer struck: only the %d most recent are "
+            "kept (at most %d keys and %d characters)", len(newest_first) - len(kept), len(kept),
+            protocol.MAX_STRIKE_ONLY, protocol.STRIKE_ONLY_CHARS,
+        )  # fmt: skip
+    return list(reversed(kept))
 
 
 def prepare_egress(config: ServiceConfig) -> None:

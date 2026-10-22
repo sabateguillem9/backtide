@@ -311,6 +311,17 @@ def test_a_provider_without_its_key_is_told_plainly() -> None:
                                                          "problem": "unusable"})  # fmt: skip
     html = say(broken)
     assert "&lt;b&gt;" in html and "<b>x" not in html and "no se puede usar" in html
+    # Review of 40dfd53, finding 3: a key that did not reach the proxy is not blamed on its file.
+    pending = ev(6, "system", "provider_waiting", details={"provider": "anthropic",
+                                                          "problem": "not_applied"})  # fmt: skip
+    assert plain(say(pending)) == (
+        "La clave nueva de anthropic no ha llegado al proxy: el agente no puede usar el modelo "
+        "hasta que se recargue o se reinicie el servicio"
+    )
+    assert plain(say(pending, EN)) == (
+        "The new key of anthropic did not reach the proxy: the agent cannot use the model until "
+        "the keys are reloaded or the service restarts"
+    )
     assert plain(say(ev(5, "system", "provider_ready", details={"provider": "openai"}), EN)) == (
         "openai has its key now"
     )

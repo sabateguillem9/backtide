@@ -31,7 +31,9 @@ The rules:
   usable key waits for it (``waiting``): the service runs, the proxy refuses its model calls,
   and ``status`` says so (``waiting``) until the key is set; removing it makes it wait again.
   If the keys cannot be handed over, the reload fails closed (``ReloadFailedClosed``): a
-  removed key is no longer used already, a new one is used from the next start.
+  removed key is no longer used already, and a new one is not used either: its provider waits
+  until the keys are reloaded (set again) or the service restarts, and the reply says so
+  (``FAILED_CLOSED``).
   The Telegram bot reads its file when the service starts, so a change there applies at the
   next start, and the reply says so.
 - One change at a time (a lock), and the value is dropped as soon as it is written. Python cannot
@@ -97,6 +99,9 @@ class Applied(StrEnum):
     WHEN_UP = "when_up"  # the proxy is down right now: it gets it when the watch brings it back
     UNUSED = "unused"  # no [proxy] provider has that name: saved, used by nobody yet
     RESTART = "restart"  # read when the service starts (the Telegram bot)
+    # Saved, but the reload failed closed: the proxy did not get it and its provider waits until
+    # the keys are reloaded or the service restarts (review of 40dfd53, finding 3).
+    FAILED_CLOSED = "failed_closed"
     NONE = "none"  # nothing changed
 
 
@@ -421,7 +426,8 @@ class Settings:
     def _apply(self, kind: str, *, removed: bool = False) -> Applied:
         """Hand the providers' keys to the proxy again, if this one is a provider of [proxy].
         If that fails closed, a removed key is no longer used already (its provider waits);
-        a new one is used from the next start."""
+        a new one is not used either, and its provider waits until the next reload or start
+        (``FAILED_CLOSED``)."""
         if kind not in self._in_use:
             return Applied.UNUSED
         if self._reload is None:
@@ -431,7 +437,7 @@ class Settings:
         except ReloadFailedClosed as error:
             logger.error("settings: the proxy could not take the new keys, so the ones that "
                          "changed wait: %s", _what(error.__cause__ or error))  # fmt: skip
-            return error.applied if removed else Applied.RESTART
+            return error.applied if removed else Applied.FAILED_CLOSED
         except Exception as error:  # the file is written: it applies at the next start
             logger.error("settings: the proxy could not take the new keys: %s", _what(error))
             return Applied.RESTART
@@ -531,6 +537,8 @@ _SAVED = {
     Applied.UNUSED: "Guardada, pero ningún proveedor de [proxy] se llama así: nadie la usa "
     "todavía.",
     Applied.RESTART: "Guardada. Se aplica al reiniciar el servicio.",
+    Applied.FAILED_CLOSED: "Guardada, pero no se ha podido entregar al proxy: el modelo queda "
+    "parado hasta que se recargue o se reinicie el servicio.",
     Applied.NONE: "Guardada.",
 }
 _CLEARED = {
@@ -539,5 +547,7 @@ _CLEARED = {
     Applied.WHEN_UP: "Quitada. El proxy está caído ahora mismo y vuelve sin ella.",
     Applied.UNUSED: "Quitada.",
     Applied.RESTART: "Quitada. Se aplica al reiniciar el servicio.",
+    Applied.FAILED_CLOSED: "Quitada. El proxy ya no la usa: el modelo queda parado hasta que se "
+    "recargue o se reinicie el servicio.",
     Applied.NONE: "Quitada.",
 }

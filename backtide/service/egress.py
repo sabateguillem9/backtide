@@ -31,7 +31,8 @@ a few points of its life; the watch runs on this module's own thread.
 - **Providers waiting for their key** (docs/21, section 6): at the start, and each time the
   Settings page hands new keys (``reload``), a provider that waits is recorded once as
   ``system/provider_waiting {provider, problem}`` (``missing``, risk 1; ``unusable``, risk 2,
-  with a warning in the log and an alert), and one that gets its key back as
+  with a warning in the log and an alert; ``not_applied``, a new key a failed reload could not
+  hand over, risk 2, with its own warning and alert), and one that gets its key back as
   ``system/provider_ready``. ``waiting()`` says which wait now (Settings, /estado, the panel).
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
 """
@@ -66,6 +67,7 @@ from backtide.service.holds import (
 from backtide.service.pause import Ticker
 from backtide.service.price_update import PriceUpdater
 from backtide.service.proxy_channel import (
+    KEY_NOT_APPLIED,
     Budgets,
     ChannelError,
     Peer,
@@ -173,7 +175,8 @@ class Egress:
         self._key_states: dict[str, str] = {}  # the providers that wait, as last recorded
 
     def waiting(self) -> dict[str, str]:
-        """The providers that wait for their key now, and why ("missing" or "unusable")."""
+        """The providers that wait for their key now, and why ("missing", "unusable" or
+        "not_applied")."""
         return self._policy.waiting()
 
     @property
@@ -382,6 +385,10 @@ class Egress:
             self._note_keys()
             names = [p.name for p in policy.providers.items]
             if not self._up or self._channel is None or self._channel.closed:
+                # Down for the watch (silent, out of restarts) but maybe still serving: its
+                # channel goes, and with it the config it had (a removed key, say), so the proxy
+                # refuses until it connects again and gets ``policy`` (review of 40dfd53).
+                self._close_channel("reload")
                 self._record("proxy_reconfigured", {"providers": names, "now": False}, risk=1)
                 return False
             try:
@@ -410,6 +417,12 @@ class Egress:
                         "the key of provider %s cannot be used, so its model calls are refused "
                         "until it is set again: %s", name, note,
                     )  # fmt: skip
+                elif problem == KEY_NOT_APPLIED:
+                    logger.warning(
+                        "the new key of provider %s could not be handed to the proxy, so its "
+                        "model calls are refused until the keys are reloaded or the service "
+                        "restarts", name,
+                    )  # fmt: skip
                 else:
                     logger.warning(
                         "provider %s has no key yet: its model calls are refused until the "
@@ -417,9 +430,18 @@ class Egress:
                     )  # fmt: skip
                 details = {"provider": name, "problem": problem}
                 event = self._record(
-                    "provider_waiting", details, risk=2 if problem == "unusable" else 1
+                    "provider_waiting", details, risk=1 if problem == "missing" else 2
                 )
-                if problem == "unusable":
+                if problem == KEY_NOT_APPLIED:
+                    self._alert(
+                        AlertLevel.WARNING,
+                        f"La clave nueva de {name} no ha llegado al proxy",
+                        "Se ha guardado, pero no se ha podido entregar al proxy (mira el registro "
+                        "del servicio). El agente no puede usar ese modelo hasta que se recarguen "
+                        "las claves (guárdala otra vez en Ajustes) o se reinicie el servicio.",
+                        event,
+                    )
+                elif problem == "unusable":
                     self._alert(
                         AlertLevel.WARNING,
                         f"La clave de {name} no se puede usar",

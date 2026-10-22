@@ -20,7 +20,13 @@
   Then (review of T09b) the same with a telegram.toml that cannot be used: removing the key
   still refuses the calls at once; and a key file written by hand that cannot be used (open to
   others, then a link) keeps the provider waiting when the keys are read again (a key set for
-  the second provider, ``openai``): nothing reaches the provider with it.
+  the second provider, ``openai``): nothing reaches the provider with it. Last (review of
+  40dfd53, finding 7), a reload that really fails in the service (its launcher makes the reader
+  of keys/ raise while a file of the test exists): removing the key still refuses the calls at
+  once, the removed key is blocked as a real key wherever the agent puts it (the provider's
+  header, another host's header, its query and its body), a key set meanwhile is said not to
+  have reached the proxy and is never used, and the next reload that works brings the model
+  back.
 
 In the VM the agent runs with the service's own uid (``allow_shared_ids``, a concession of the
 tests), so the control socket's ``SO_PEERCRED`` check would let it in: what keeps it out is that
@@ -86,6 +92,7 @@ class Lab:
     service: Service
     internet: FakeInternet
     old_key: str  # the made-up key the service starts with
+    reload_fails: Path | None = None  # while it exists, the service's reload of keys/ raises
 
     @property
     def proxy_name(self) -> str:
@@ -143,12 +150,15 @@ def start_settings_lab(
         real_keys={PROVIDER: old} if with_key else {OTHER_PROVIDER: made_up_key(OTHER_PROVIDER)},
     )
     internet: FakeInternet | None = None
+    # Only modelo-sin-clave makes its reload fail (tests/integration/service_main.py).
+    marker = None if with_key else tmp_path_factory.mktemp("reload-fault") / "fail"
+    fault = () if marker is None else ("--reload-fails-when", str(marker))
     try:
         internet = start_fake_internet(service, tmp_path_factory.mktemp("t12e-internet"))
-        service.main_args = (*internet.service_args(), *HOLD_TIMINGS)
+        service.main_args = (*internet.service_args(), *HOLD_TIMINGS, *fault)
         service.start()
         service.wait_ready()
-        yield Lab(service, internet, old if with_key else "")
+        yield Lab(service, internet, old if with_key else "", marker)
     finally:
         stop_with_internet(service, internet)
 
@@ -651,6 +661,63 @@ def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: 
     with_link = insist(attack, lab, lab.fake, 2)
     unusable_keys = {c["headers"].get("x-api-key") for c in provider_calls(lab)}
     reached_unusable = len(provider_calls(lab))
+    step5 = lab.head()
+
+    # 5. Review of 40dfd53, finding 7: a reload that really fails in the service. The removal
+    # still cuts the key at once, and the removed key, struck only now, is a real key for the
+    # gate wherever the agent puts it.
+    assert lab.reload_fails is not None
+    cut_key, unsent_key, back_key = new_test_key(), new_test_key(), new_test_key()
+    saved_cut = ask_set_secret(socket_path, PROVIDER, cut_key, via="web")
+    with_cut = insist(attack, lab, lab.fake, 1)
+    lab.reload_fails.touch()
+    try:
+        cleared_failed = ask_clear_secret(socket_path, PROVIDER, via="web")
+        after_failed = insist(attack, lab, lab.fake, 2)
+        set_failed = ask_set_secret(socket_path, PROVIDER, unsent_key, via="web")
+        after_set_failed = insist(attack, lab, lab.fake, 2)
+        tag = f"t17-{uuid4().hex[:10]}"
+        stolen = attack.run_script(
+            service.jail, "clave_falsa_del_modelo", ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST,
+            cut_key, tag, timeout=PROBE_TIMEOUT,
+        )  # fmt: skip
+    finally:
+        lab.reload_fails.unlink()
+    saved_back = ask_set_secret(socket_path, PROVIDER, back_key, via="web")
+    with_back = insist(attack, lab, lab.fake, 1)
+    step5_keys = [c["headers"].get("x-api-key") for c in provider_calls(lab)][reached_unusable:]
+    real_key_uses = {
+        name: status
+        for name, status in stolen["uses"].items()
+        if name.endswith("_real_key") or name.startswith("elsewhere_")
+    }
+    stolen_reached = [
+        r["path"]
+        for r in lab.internet.requests()
+        if r["path"].startswith(f"/{tag}/") and not r["path"].startswith(f"/{tag}/echo")
+    ]
+    real_key_blocks = [
+        e
+        for e in lab.since(step5, "blocked", "net")
+        if e.details.get("reason") == "real_key"
+        and str(e.details.get("path", "")).startswith(f"/{tag}/")
+    ]
+    cut_at_once = (
+        saved_cut["applied"] == "now"
+        and [c["status"] for c in with_cut] == [200]
+        and cleared_failed["ok"]
+        and cleared_failed["applied"] == "now"
+        and refused_for_want_of_a_key(after_failed)
+        and set_failed["ok"]
+        and set_failed["applied"] == "failed_closed"
+        and refused_for_want_of_a_key(after_set_failed)
+        and len(real_key_uses) == 5
+        and set(real_key_uses.values()) == {403}
+        and stolen_reached == []
+        and saved_back["applied"] == "now"
+        and [c["status"] for c in with_back] == [200]
+        and step5_keys == [cut_key, back_key]
+    )
     alive = service.require_process().poll() is None and service.process.pid == pid
 
     attack.check(
@@ -678,6 +745,7 @@ def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: 
         and refused_for_want_of_a_key(with_link)
         and reached_unusable == 2
         and not {open_key, linked_key} & unusable_keys
+        and cut_at_once
         and alive,
         f"sin clave, con su clave falsa: {[c['status'] for c in with_fake]} "
         f"({with_fake[0].get('type')}: {with_fake[0].get('message')}); con una clave suya: "
@@ -691,14 +759,23 @@ def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: 
         f"{[c['status'] for c in after_broken]} al momento (al proveedor, {reached_broken} en "
         f"total). Una clave escrita a mano abierta a otros y luego un enlace: "
         f"{[c['status'] for c in with_open_file]} y {[c['status'] for c in with_link]}; al "
-        f"proveedor no llegó ninguna de las dos ({reached_unusable} en total). El servicio sigue "
-        f"(pid {pid}): {alive}",
+        f"proveedor no llegó ninguna de las dos ({reached_unusable} en total). Con la recarga "
+        f"rota de verdad: la pone ({saved_cut.get('applied')}, "
+        f"{[c['status'] for c in with_cut]}) y la quita ({cleared_failed.get('applied')}): "
+        f"{[c['status'] for c in after_failed]} al momento; pone otra "
+        f"({set_failed.get('applied')}): {[c['status'] for c in after_set_failed]}; la quitada, "
+        f"en la cabecera del proveedor, en otro host (cabecera, query y cuerpo): "
+        f"{real_key_uses}, y al internet falso no llegó {stolen_reached or 'nada'}. Arreglada la "
+        f"recarga, otra clave: {saved_back.get('applied')}, {[c['status'] for c in with_back]}; "
+        f"al proveedor llegaron solo la primera y la última ({step5_keys == [cut_key, back_key]})"
+        f". El servicio sigue (pid {pid}): {alive}",
     )
     counted = sum(int(e.details.get("count", 0)) for e in blocked)
     ready = lab.since(mark, "provider_ready", "system")
     waits = lab.since(mark, "provider_waiting", "system")
     waiting_again = [e.details for e in waits if e.seq <= step3]
-    later = [(e.details, e.risk) for e in waits if e.seq > step3]
+    later = [(e.details, e.risk) for e in waits if step3 < e.seq <= step5]
+    failed = [(e.details, e.risk) for e in waits if e.seq > step5]
     attack.check(
         "recorded",
         bool(blocked)
@@ -710,12 +787,21 @@ def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: 
         == [
             ({"provider": PROVIDER, "problem": "missing"}, 1),
             ({"provider": PROVIDER, "problem": "unusable"}, 2),
-        ],
+        ]
+        and failed
+        == [
+            ({"provider": PROVIDER, "problem": "missing"}, 1),
+            ({"provider": PROVIDER, "problem": "not_applied"}, 2),
+        ]
+        and len(real_key_blocks) == 5
+        and {e.risk for e in real_key_blocks} == {3},
         f"{len(blocked)} llm/blocked no_key (que cuentan {counted} de las {len(with_fake)} "
         f"primeras llamadas; el resto, en el siguiente), {len(foreign)} net/blocked "
         "foreign_credential, "
         f"system/provider_ready {len(ready)} y system/provider_waiting otra vez "
-        f"{waiting_again}; después, con telegram.toml roto y con el archivo que no vale: {later}",
+        f"{waiting_again}; después, con telegram.toml roto y con el archivo que no vale: {later}; "
+        f"con la recarga rota: {failed}, y {len(real_key_blocks)} net/blocked real_key de la "
+        f"clave quitada (riesgo {sorted({e.risk for e in real_key_blocks})})",
     )
     attack.check(
         "risk",

@@ -252,7 +252,8 @@ def _tell_system(event: Event) -> tuple[str, dict[str, Any], bool]:
         return f"system.space_pause.{'frozen' if frozen else 'stopped'}", {}, False
     provider = _text(details.get("provider"))
     if action in ("provider_waiting", "provider_ready") and provider:
-        problem = "unusable" if details.get("problem") == "unusable" else "missing"
+        problem = details.get("problem")
+        problem = problem if problem in ("unusable", "not_applied") else "missing"
         key = f"system.{action}" + (f".{problem}" if action == "provider_waiting" else "")
         return key, {"target": Name(provider)}, False
     return _generic(event)
