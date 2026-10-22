@@ -24,6 +24,8 @@ from backtide.service.control import (
     ControlUnavailable,
     ask_rewind,
 )
+from backtide.service.gasto import caps as spending_caps
+from backtide.service.gasto import spending
 from backtide.service.guardian import BOOT_STOP_FAILED_NOTE
 from backtide.service.notice import ago, rewind_notice
 from backtide.service.offline import rewind_without_service
@@ -131,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config(resume)
     resume.set_defaults(handler=_resume)
     _add_holds(commands)
+    _add_spending(commands)
     _add_web(commands)
     _add_shell(commands)
     return parser
@@ -294,6 +297,32 @@ def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         _add_config(command)
         command.add_argument("hold", metavar="id", help="identificador de la petición (h-…)")
         command.set_defaults(handler=_decide_hold, verdict=verdict)
+
+
+def _add_spending(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """`backtide gasto` and `backtide tope` (T11): the spending cap, through the running service."""
+    spent = commands.add_parser(
+        "gasto",
+        help="lo gastado hoy y este mes en el modelo, frente al tope",
+        description="Dice cuánto ha gastado el agente en llamadas al modelo hoy y este mes, "
+        "frente a los topes, y si alguno está alcanzado. Se lo pregunta al servicio en marcha. "
+        "Sale con 0 si lo dice, 1 si no hay servicio o no puede contar, 2 si hay un error.",
+    )
+    _add_config(spent)
+    spent.set_defaults(handler=_spending)
+    caps = commands.add_parser(
+        "tope",
+        help="muestra o cambia el tope de gasto diario y mensual",
+        description="Sin opciones, muestra el tope diario y el mensual. Con `--dia` y/o `--mes` "
+        "(dólares, con dos decimales como mucho) los cambia por el mismo camino que la página "
+        "Ajustes de la web: el servicio lo apunta en la caja negra antes de cambiar nada y se "
+        "aplica a la siguiente llamada al modelo. Sale con 0 si lo hizo, 1 si no hay servicio o "
+        "no se guardó, 2 si el importe no vale o hay un error y 3 si no se sabe.",
+    )
+    _add_config(caps)
+    caps.add_argument("--dia", dest="day", metavar="N", help="nuevo tope diario, en dólares")
+    caps.add_argument("--mes", dest="month", metavar="N", help="nuevo tope mensual, en dólares")
+    caps.set_defaults(handler=_caps)
 
 
 def _add_config(parser: argparse.ArgumentParser) -> None:
@@ -493,6 +522,26 @@ def _decide_hold(args: argparse.Namespace) -> int:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
     return decide_hold(config, args.hold, args.verdict)
+
+
+def _spending(args: argparse.Namespace) -> int:
+    """`backtide gasto`: everything but reading the config is in service/gasto.py."""
+    config = _load_config(args)
+    return EXIT_ERROR if config is None else spending(config)
+
+
+def _caps(args: argparse.Namespace) -> int:
+    """`backtide tope`."""
+    config = _load_config(args)
+    return EXIT_ERROR if config is None else spending_caps(config, args.day, args.month)
+
+
+def _load_config(args: argparse.Namespace) -> ServiceConfig | None:
+    try:
+        return ServiceConfig.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return None
 
 
 def _rewind_notice(
