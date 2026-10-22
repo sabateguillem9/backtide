@@ -168,6 +168,10 @@ def test_the_settings_are_exactly_the_measured_ones(layout: Path) -> None:
         {"permissions": {"deny": ["WebSearch"], "allow": ["Bash"]}},
         {"skipWebFetchPreflight": False},
         {"skipDangerousModePermissionPrompt": None},
+        # Equal for Python, not the reviewed value (B2 of the review of T17a-4).
+        {"skipWebFetchPreflight": 1},
+        {"skipDangerousModePermissionPrompt": 1.0},
+        {"permissions": {"deny": ["WebSearch"], "allow": []}},
     ],
 )
 def test_anything_else_in_the_settings_is_refused(change: dict[str, object]) -> None:

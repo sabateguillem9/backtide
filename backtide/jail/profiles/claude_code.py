@@ -201,10 +201,26 @@ def check_settings(files: Mapping[str, str]) -> None:
     if not isinstance(settings, dict):
         raise UnsafeSettings(("<root>",))
     wrong = sorted(
-        key for key in settings.keys() | SETTINGS.keys() if settings.get(key) != SETTINGS.get(key)
+        str(key)
+        for key in settings.keys() | SETTINGS.keys()
+        if key not in settings or key not in SETTINGS or not _same(settings[key], SETTINGS[key])
     )
     if wrong:
         raise UnsafeSettings(tuple(wrong))
+
+
+def _same(found: object, reviewed: object) -> bool:
+    """Equal and of the same types all the way down (B2 of the review of T17a-4): ``1`` is not
+    ``true``, nor ``1.0``, even though Python says they are equal."""
+    if type(found) is not type(reviewed):
+        return False
+    if isinstance(reviewed, dict) and isinstance(found, dict):
+        return found.keys() == reviewed.keys() and all(
+            _same(found[key], reviewed[key]) for key in reviewed
+        )
+    if isinstance(reviewed, list | tuple) and isinstance(found, list | tuple):
+        return len(found) == len(reviewed) and all(map(_same, found, reviewed))
+    return found == reviewed
 
 
 def check_providers(providers: tuple[ModelProvider, ...]) -> None:

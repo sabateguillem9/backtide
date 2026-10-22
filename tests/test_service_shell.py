@@ -38,6 +38,7 @@ def test_a_running_shell_agent_is_opened_and_recorded(shell_world: World) -> Non
         "61000:61000",
         "/workspace/work",
     )
+    assert outcome.container_id == "c0de" * 16  # the container it started and checked (B4)
     event = shell_world.only("agent_shell")
     assert (event.source, event.target) == ("system", "task")
     assert event.details == {"kind": "task", "continue": True, "requested_by": "cli (uid 1)"}
@@ -151,3 +152,118 @@ def test_no_snapshot_no_export(shell_world: World, tmp_path: Path) -> None:
     outcome = shell_world.guardian.export(str(tmp_path / "out"), requested_by="cli")
     assert outcome.status is ExportStatus.FAILED and "instantánea" in outcome.message
     assert not (tmp_path / "out").exists()
+
+
+def test_a_container_this_service_did_not_check_is_never_opened(shell_world: World) -> None:
+    shell_world.jail.checked_id = None  # running, but not the one start() checked
+    outcome = shell_world.guardian.open_shell("session", requested_by="cli")
+    assert outcome.status is ShellStatus.FAILED and outcome.container_id == ""
+
+
+def test_an_export_is_recorded_as_started_before_anything_is_copied(
+    shell_world: World, tmp_path: Path
+) -> None:
+    with_work(shell_world, {"notes.txt": "uno\n"})
+    out = tmp_path / "out"
+    seen: list[bool] = []
+    from backtide.service import guardian as guardian_module
+
+    real = guardian_module.export_tree
+
+    def copying(source: Path, target: Path) -> object:
+        seen.append(bool(shell_world.events("export_started")))
+        return real(source, target)
+
+    guardian_module.export_tree = copying  # type: ignore[assignment]
+    try:
+        outcome = shell_world.guardian.export(str(out), requested_by="cli")
+    finally:
+        guardian_module.export_tree = real  # type: ignore[assignment]
+    assert outcome.status is ExportStatus.DONE and seen == [True]
+    started = shell_world.only("export_started")
+    assert started.details == {"kind": "tree", "requested_by": "cli"}
+    assert started.snapshot_id == outcome.snapshot
+    assert shell_world.only("export").details["kind"] == "tree"
+
+
+def test_without_a_black_box_nothing_is_exported(shell_world: World, tmp_path: Path) -> None:
+    from backtide.blackbox import BlackBoxError
+
+    with_work(shell_world, {"notes.txt": "uno\n"})
+    shell_world.box.append_error = BlackBoxError("disk full")  # the snapshot is still taken
+    outcome = shell_world.guardian.export(str(tmp_path / "out"), requested_by="cli")
+    assert outcome.status is ExportStatus.FAILED and "caja negra" in outcome.message
+    assert outcome.snapshot  # taken, kept: nothing copied from it
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_planted_git_folder_never_leaves(shell_world: World, tmp_path: Path) -> None:
+    with_work(shell_world, {"main.py": "print(1)\n"})
+    volume = shell_world.volume
+    take = volume.take
+
+    def planting(reason: Reason) -> Snapshot:
+        snapshot = take(reason)
+        git = volume.snapshots_dir / snapshot.id / "agente" / "work" / ".git"
+        git.mkdir()
+        (git / "config").write_text("[core]\n\tfsmonitor = touch /tmp/pwned\n")
+        return snapshot
+
+    volume.take = planting  # type: ignore[method-assign]
+    out = tmp_path / "out"
+    outcome = shell_world.guardian.export(str(out), requested_by="cli")
+    assert outcome.status is ExportStatus.DONE
+    assert sorted(p.name for p in out.iterdir()) == ["main.py"]
+    assert outcome.details["skipped_git"] == 1 and outcome.details["skipped"] == [["git", ".git"]]
+    assert shell_world.only("export").details["skipped_git"] == 1
+
+
+BUNDLE = "export-" + "0f" * 16 + ".bundle"
+
+
+def with_bundle(world: World, body: bytes) -> None:  # noqa: F811
+    volume = world.volume
+    take = volume.take
+
+    def taking(reason: Reason) -> Snapshot:
+        snapshot = take(reason)
+        folder = volume.snapshots_dir / snapshot.id / "agente" / "home" / ".backtide-export"
+        folder.mkdir(parents=True)
+        (folder / BUNDLE).write_bytes(body)
+        return snapshot
+
+    volume.take = taking  # type: ignore[method-assign]
+
+
+def test_a_bundle_export_copies_only_the_bundle(shell_world: World, tmp_path: Path) -> None:
+    with_bundle(shell_world, b"# v2 git bundle\nabc refs/heads/main\n\nPACK")
+    out = tmp_path / "proyecto.bundle"
+    outcome = shell_world.guardian.export(
+        str(out), requested_by="cli", bundle=BUNDLE, repo="proyecto"
+    )
+    assert outcome.status is ExportStatus.DONE, outcome.message
+    assert out.read_bytes().startswith(b"# v2 git bundle")
+    event = shell_world.only("export")
+    assert (event.details["kind"], event.details["repo"], event.details["files"]) == (
+        "bundle",
+        "proyecto",
+        1,
+    )
+
+
+@pytest.mark.parametrize("name", ["../../etc/passwd", "x.bundle", ""])
+def test_an_odd_bundle_name_is_refused_before_a_snapshot(
+    shell_world: World, tmp_path: Path, name: str
+) -> None:
+    before = len(shell_world.events("take"))
+    outcome = shell_world.guardian.export(str(tmp_path / "x"), requested_by="cli", bundle=name)
+    assert outcome.status is ExportStatus.INVALID
+    assert len(shell_world.events("take")) == before
+
+
+def test_what_is_not_a_bundle_is_not_exported(shell_world: World, tmp_path: Path) -> None:
+    with_bundle(shell_world, b"[core]\n\tfsmonitor = touch /tmp/pwned\n")
+    out = tmp_path / "x.bundle"
+    outcome = shell_world.guardian.export(str(out), requested_by="cli", bundle=BUNDLE, repo=".")
+    assert outcome.status is ExportStatus.FAILED and not out.exists()
+    assert shell_world.only("export_failed").details["kind"] == "bundle"

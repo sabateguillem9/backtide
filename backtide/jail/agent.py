@@ -350,6 +350,13 @@ class AgentJail:
         state = self._state()
         return state is not None and state.get("Running") is True
 
+    @property
+    def started_id(self) -> str | None:
+        """The full id of the container this jail last started and checked, or None (none, or
+        its checks failed). `backtide entrar` and `tarea` exec into this id, never a name that
+        another container could have taken (B4 of the review of T17a-4)."""
+        return self._started.container_id if self._started is not None else None
+
     def container_id(self) -> str | None:
         """The container's full id (64 hex characters), or None if it does not exist. The
         process sensor attributes events by it (T07-3)."""

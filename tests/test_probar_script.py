@@ -255,12 +255,16 @@ def test_the_claude_code_commands_go_to_backtides_own(
     assert probar.main(["entrar", "--continue"]) == 0
     assert probar.main(["tarea", encoded("-haz esto"), "--continue"]) == 0
     assert probar.main(["importar", "/home/me/repo", "--reemplazar"]) == 0
+    assert probar.main(["importar", "/home/me/repo", "--incluir-secretos"]) == 0
     assert probar.main(["exportar", "/home/me/salida"]) == 0
+    assert probar.main(["exportar", "/home/me/p.bundle", "--git", "proyecto"]) == 0
     assert ran == [
         ("entrar", *config, "--continue"),
         ("tarea", *config, "--continue", "--", "-haz esto"),  # a task that looks like an option
-        ("importar", *config, "--reemplazar", "/home/me/repo"),
-        ("exportar", *config, "/home/me/salida"),
+        ("importar", *config, "--reemplazar", "--", "/home/me/repo"),
+        ("importar", *config, "--incluir-secretos", "--", "/home/me/repo"),
+        ("exportar", *config, "--", "/home/me/salida"),
+        ("exportar", *config, "--git", "proyecto", "--", "/home/me/p.bundle"),
     ]
     assert probar.main(["pedir", encoded("hola")]) == 1  # that one is OpenClaw's
 

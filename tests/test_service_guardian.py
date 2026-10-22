@@ -265,6 +265,11 @@ class FakeJail:
         self.on_wait_ready: Callable[[], None] | None = None  # ... and of `wait_ready`
         self.exposure: list[str] = []  # what running_exposure() answers while it runs (T14a)
         self.exposure_error: Exception | None = None  # ... or what it raises
+        self.checked_id: str | None = "c0de" * 16  # the container start() checked (B4)
+
+    @property
+    def started_id(self) -> str | None:
+        return self.checked_id if self.running else None
 
     def ensure_network(self) -> None:
         self.log.append("jail.ensure_network")

@@ -102,14 +102,16 @@ probar-tarea: ## Prueba con Claude Code: una tarea y su respuesta (MSG="..."; CO
 	@m=$$(printf '%s' "$$MSG" | base64 | tr -d '\n'); \
 	$(VM_SH) '$(PROBAR_VM) tarea '"$$m"' $(if $(CONTINUAR),--continue)'
 
-probar-importar: ## Prueba con Claude Code: copia una carpeta de la VM a su carpeta de trabajo (RUTA=...; REEMPLAZAR=1 escribe encima)
+probar-importar: ## Prueba con Claude Code: copia una carpeta de la VM a su carpeta de trabajo (RUTA=...; REEMPLAZAR=1 escribe encima; SECRETOS=1 incluye lo que parece un secreto)
 	@case "$(RUTA)" in ""|*[!0-9A-Za-z._/~+-]*) echo "Di la carpeta: make probar-importar RUTA=<ruta, sin espacios ni comillas>" >&2; exit 2;; esac
 	@case "$(REEMPLAZAR)" in ""|1) ;; *) echo "REEMPLAZAR solo puede valer 1" >&2; exit 2;; esac
-	$(VM_SH) '$(PROBAR_VM) importar $(if $(REEMPLAZAR),--reemplazar) -- $(RUTA)'
+	@case "$(SECRETOS)" in ""|1) ;; *) echo "SECRETOS solo puede valer 1" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) importar $(if $(REEMPLAZAR),--reemplazar) $(if $(SECRETOS),--incluir-secretos) -- $(RUTA)'
 
-probar-exportar: ## Prueba con Claude Code: copia su carpeta de trabajo a una carpeta nueva de la VM (RUTA=...)
+probar-exportar: ## Prueba con Claude Code: copia su carpeta de trabajo a una carpeta nueva de la VM (RUTA=...; GIT=<carpeta> saca solo los commits de ese repositorio, como un bundle)
 	@case "$(RUTA)" in ""|*[!0-9A-Za-z._/~+-]*) echo "Di la carpeta nueva: make probar-exportar RUTA=<ruta, sin espacios ni comillas>" >&2; exit 2;; esac
-	$(VM_SH) '$(PROBAR_VM) exportar -- $(RUTA)'
+	@case "$(GIT)" in *[!0-9A-Za-z._/-]*) echo "GIT es una carpeta de /workspace/work, sin espacios ni comillas" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) exportar $(if $(GIT),--git $(GIT)) -- $(RUTA)'
 
 probar-instantaneas: ## Prueba real: lista las instantáneas
 	$(VM_SH) '$(PROBAR_VM) instantaneas'

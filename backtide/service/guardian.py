@@ -95,12 +95,24 @@ import backtide
 from backtide.blackbox import BlackBox, BlackBoxError, Event, redact
 from backtide.jail import AgentJail, ExposedJail, JailError
 from backtide.jail.config import AGENT_DIR
-from backtide.jail.profile import CONTAINER_WORK, CONTAINER_WORKSPACE, SHELL_MODE, ProfileError
+from backtide.jail.profile import (
+    CONTAINER_WORK,
+    CONTAINER_WORKSPACE,
+    HOME_DIR,
+    SHELL_MODE,
+    ProfileError,
+)
 from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProblem
 from backtide.service.clock import clock_synced as kernel_clock_synced
 from backtide.service.config import ServiceConfig
 from backtide.service.egress import EgressHooks
-from backtide.service.export import ExportError, check_destination, export_tree
+from backtide.service.export import (
+    BUNDLE_RE,
+    ExportError,
+    check_destination,
+    export_bundle,
+    export_tree,
+)
 from backtide.service.holds import (
     BatchOutcome,
     BatchStatus,
@@ -2295,25 +2307,51 @@ class Guardian:
                     "hay vigilancia.",
                 )
             config = self._jail.config
+            container_id = self._jail.started_id
+            if container_id is None:  # running, but not the container this service checked
+                return ShellOutcome(
+                    ShellStatus.FAILED,
+                    "El contenedor del agente no es el que arrancó y comprobó este servicio: no "
+                    "se abre nada. Reinicia `backtide vigilar`.",
+                )
             return ShellOutcome(
                 ShellStatus.READY,
                 "",
                 container=config.name,
                 user=f"{config.uid}:{config.gid}",
                 workdir=str(profile.workdir or CONTAINER_WORK),
+                container_id=container_id,
             )
 
-    def export(self, destination: str, *, requested_by: str) -> ExportOutcome:
+    def export(
+        self,
+        destination: str,
+        *,
+        requested_by: str,
+        bundle: str | None = None,
+        repo: str | None = None,
+    ) -> ExportOutcome:
         """`backtide exportar`: a snapshot of the workspace (``Reason.MANUAL``, trigger
         "export": kept, the record of what left) and a copy of its work folder into the owner's
         new folder ``destination`` (backtide/service/export.py: never overwriting, never
-        following a link). Recorded as ``system/export`` (or ``export_failed``). Never raises."""
+        following a link, never a git repository). With ``bundle`` (`exportar --git`), only that
+        git bundle, which the agent made in ``~/.backtide-export/`` of its HOME (``repo`` is the
+        folder it bundled, for the record), into the new file ``destination``. Recorded as
+        ``system/export_started`` before anything is copied (nothing is copied if that cannot
+        be recorded), then ``system/export`` or ``export_failed``. Never raises."""
         profile = self._jail.config.profile
         if profile.mode != SHELL_MODE:
             return ExportOutcome(
                 ExportStatus.NOT_SHELL, NOT_SHELL_MESSAGE.format(profile=profile.name)
             )
+        if bundle is not None and (not isinstance(bundle, str) or not BUNDLE_RE.fullmatch(bundle)):
+            return ExportOutcome(
+                ExportStatus.INVALID, "No se ha exportado nada: ese no es un bundle."
+            )
         requester = str(requested_by)[:MAX_REQUESTER_CHARS] or "unknown"
+        what: dict[str, Any] = {"kind": "tree" if bundle is None else "bundle"}
+        if bundle is not None:
+            what["repo"] = str(repo or ".")[:MAX_REQUESTER_CHARS]
         config = self._config
         protected = (
             config.volume,
@@ -2343,23 +2381,42 @@ class Guardian:
                 "No se ha podido hacer la instantánea de la que se exporta: no se ha exportado "
                 "nada. Inténtalo de nuevo en un momento.",
             )
-        work = CONTAINER_WORK.relative_to(CONTAINER_WORKSPACE)
-        source = self._store.snapshots_dir / snapshot.id / AGENT_DIR / work
+        started = self._record(
+            "system",
+            "export_started",
+            str(target),
+            details={**what, "requested_by": requester},
+            risk=1,
+            snapshot_id=snapshot.id,
+        )
+        if started is None:
+            return ExportOutcome(
+                ExportStatus.FAILED,
+                "No se puede grabar en la caja negra, así que no se exporta nada: lo que sale "
+                "tiene que quedar grabado.",
+                str(target),
+                snapshot.id,
+            )
+        agent = self._store.snapshots_dir / snapshot.id / AGENT_DIR
         try:
-            result = export_tree(source, target)
+            if bundle is None:
+                work = CONTAINER_WORK.relative_to(CONTAINER_WORKSPACE)
+                result = export_tree(agent / work, target)
+            else:
+                result = export_bundle(agent / HOME_DIR, bundle, target)
         except ExportError as error:
             self._record(
                 "system",
                 "export_failed",
                 str(target),
-                details={"error": _short(error), "requested_by": requester},
+                details={**what, "error": _short(error), "requested_by": requester},
                 risk=1,
                 snapshot_id=snapshot.id,
             )
             return ExportOutcome(
                 ExportStatus.FAILED, f"No se ha exportado: {error}.", str(target), snapshot.id
             )
-        details = {**result.details(), "requested_by": requester}
+        details = {**what, **result.details(), "requested_by": requester}
         self._record(
             "system", "export", str(target), details=details, risk=1, snapshot_id=snapshot.id
         )

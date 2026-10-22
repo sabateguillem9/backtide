@@ -5,8 +5,8 @@ thinking with Claude through the proxy, the gate asking on Telegram and on the w
     python -m scripts.demo.probar pedir <message in base64>          # OpenClaw
     python -m scripts.demo.probar entrar [--continue]                # Claude Code (T17a-4)
     python -m scripts.demo.probar tarea <message in base64> [--continue]
-    python -m scripts.demo.probar importar <folder> [--reemplazar]
-    python -m scripts.demo.probar exportar <new folder>
+    python -m scripts.demo.probar importar <folder> [--reemplazar] [--incluir-secretos]
+    python -m scripts.demo.probar exportar <new folder> [--git <repository folder>]
 
 With ``--perfil claude-code`` the agent is Claude Code (backtide/jail/profiles/claude_code.py)
 instead of OpenClaw: the same volume, proxy, gate, Settings page and Telegram, and the owner
@@ -427,8 +427,10 @@ def build_parser() -> argparse.ArgumentParser:
     bring = commands.add_parser("importar", help="una carpeta de la VM al agente")
     bring.add_argument("ruta")
     bring.add_argument("--reemplazar", action="store_true")
+    bring.add_argument("--incluir-secretos", dest="secretos", action="store_true")
     take = commands.add_parser("exportar", help="la carpeta de trabajo del agente, a la VM")
     take.add_argument("ruta")
+    take.add_argument("--git", help="solo los commits de ese repositorio, como un bundle")
     ask = commands.add_parser("pedir", help="un mensaje al agente, y su respuesta")
     ask.add_argument("mensaje", help="el mensaje, en base64 (lo hace el Makefile)")
     commands.add_parser("instantaneas", help="lista las instantáneas")
@@ -454,9 +456,11 @@ def main(argv: list[str] | None = None) -> int:
             return command_shell(paths, args.command, *resume, *more)
         if args.command == "importar":
             extra = ["--reemplazar"] if args.reemplazar else []
-            return command_shell(paths, "importar", *extra, args.ruta)
+            extra += ["--incluir-secretos"] if args.secretos else []
+            return command_shell(paths, "importar", *extra, "--", args.ruta)
         if args.command == "exportar":
-            return command_shell(paths, "exportar", args.ruta)
+            extra = ["--git", args.git] if args.git else []
+            return command_shell(paths, "exportar", *extra, "--", args.ruta)
         # The demo's own commands (a test without its key yet can list and rewind too).
         demo.require_demo_mount(paths)
         if args.command == "instantaneas":

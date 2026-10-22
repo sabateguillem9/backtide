@@ -15,6 +15,7 @@ Only fake keys and made-up ones: nothing reaches Anthropic, GitHub or Telegram (
 
 import json
 import os
+import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -257,7 +258,7 @@ def test_entrar_opens_claude_code_on_a_terminal(lab: Lab) -> None:
     finally:
         term.close()
     assert code == 0, term.text()[-2000:]
-    assert "Sesión cerrada." in term.text()
+    assert "Sesión de Claude Code cerrada. Estás otra vez en tu terminal." in term.text()
     seeded = json.loads((service.store.workspace / "agente" / "home" / ".claude.json").read_text())
     assert seeded["hasCompletedOnboarding"] is True
     assert seeded["projects"]["/workspace/work"]["hasTrustDialogAccepted"] is True
@@ -296,12 +297,58 @@ def test_importar_and_exportar(lab: Lab, tmp_path: Path) -> None:
     assert (out / "proyecto" / "README.md").read_text() == "hola\n"
     assert not os.path.lexists(out / "link") and not os.path.lexists(out / "p")
     assert "1 enlaces simbólicos" in taken.stdout
+    assert "Lo exportado lo escribió el agente" in taken.stdout  # A1 of the review
     event = service.events("export")[-1]
     assert event.target == str(out) and event.snapshot_id
     twice = run_cli(service, "exportar", str(out))
     assert twice.returncode == 2 and "ya existe" in twice.stderr
     inward = run_cli(service, "exportar", str(service.config.state_dir / "x"))
     assert inward.returncode == 2 and "protege" in inward.stderr
+
+
+def test_exportar_git_takes_the_commits_out_as_a_bundle(lab: Lab, tmp_path: Path) -> None:
+    """A1 of the review: the agent makes the bundle inside the jail and only that file leaves;
+    a clone of it on this side has the commits and a config of its own."""
+    service = lab.service
+    exec_in_agent(
+        service,
+        "mkdir -p /workspace/work/conbundle && cd /workspace/work/conbundle && git init -q "
+        "&& echo hola > README.md && git add README.md "
+        "&& git -c user.email=a@example.invalid -c user.name=a commit -qm primero",
+    )
+    out = tmp_path / "conbundle.bundle"
+    taken = run_cli(service, "exportar", "--git", "conbundle", str(out))
+    assert taken.returncode == 0, (taken.stdout, taken.stderr)
+    assert "Lo exportado lo escribió el agente" in taken.stdout
+    assert out.read_bytes().startswith(b"# v")
+    event = service.events("export")[-1]
+    assert event.details["kind"] == "bundle" and event.details["repo"] == "conbundle"
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    clone = tmp_path / "clon"
+    subprocess.run(
+        ["git", "clone", "-q", "--no-checkout", str(out), str(clone)], env=env, check=True
+    )
+    log = subprocess.run(
+        ["git", "-C", str(clone), "log", "--format=%s"], env=env, check=True,
+        capture_output=True, text=True,
+    )  # fmt: skip
+    assert log.stdout.strip() == "primero"
+    left = exec_in_agent(service, "ls -A /workspace/home/.backtide-export").split()
+    assert left == []  # tidied up inside; the snapshot keeps it as the record
+
+
+def test_a_task_past_its_time_is_stopped_inside(lab: Lab) -> None:
+    """M4 of the review: the run goes under timeout inside the container, so a task past
+    --minutos stops there, with what it launched."""
+    service = lab.service
+    cut = lab.task("T17-BASH:[[sleep 97531]] espera", "--minutos", "0.25")
+    assert cut.returncode == 1 and "se ha cortado" in cut.stderr, (cut.stdout, cut.stderr)
+    wait_until(
+        lambda: exec_in_agent(service, "pgrep -f 'slee[p] 97531' || true").strip() == "",
+        60,
+        "the task's command to be gone",
+        context=service.diagnosis,
+    )
 
 
 # --- the space cap ------------------------------------------------------------------------------

@@ -20,14 +20,30 @@ copies, never the agent: the agent cannot choose where its files land, nor see t
 - Bounded before anything is written: a first pass counts the files and their bytes and refuses
   an export of more than ``MAX_BYTES`` (a sparse file of a terabyte takes no space in the
   workspace) or ``MAX_ENTRIES`` entries, and folders deeper than ``MAX_DEPTH`` are skipped.
+
+After the security review of T17a-4 (finding A1): what the agent writes must never run by
+itself on the host. Git runs code from a repository's config (``core.fsmonitor``, the pager,
+hooks) as soon as the owner runs git, or a prompt that shows the branch, inside it. So the copy
+never takes a ``.git`` folder or file (compared without case: APFS would open ``.GIT`` as
+``.git``), nor a folder shaped like a repository (``HEAD`` and ``objects``, ``refs`` or
+``commondir``: a bare one hidden in a subfolder); a work folder shaped like one loses its
+``HEAD``. Commits leave as a git bundle instead (``export_bundle``): one plain file that the
+agent made inside the jail, which is data (``git clone`` of it takes no config nor hooks). A
+name that is not printable is skipped (B6), and so is one that the destination already has
+because it ignores case (APFS: ``readme`` after ``README``). What is skipped is counted and the
+first ``MAX_NAMED`` are named, escaped. And the destination is never where code is loaded from
+(B5): backtide's own checkout, a Python environment, any folder of ``sys.path``.
 """
 
 import errno
 import os
+import re
 import stat
+import sys
 from collections.abc import Iterable
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
+from typing import Any
 
 MAX_BYTES = 8 * 1024**3  # 8 GiB: a repository, not a disk
 MAX_ENTRIES = 500_000
@@ -38,6 +54,17 @@ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _KEPT_BITS = 0o755  # rwx for the owner, r-x for the rest: never setuid, setgid or sticky
+MAX_NAMED = 20  # how many skipped names an export reports
+MAX_SHOWN = 200  # characters of each
+GIT = ".git"
+# A folder is a repository for git with HEAD and its objects and refs, or a commondir that
+# points at them; any of the three with HEAD is enough here (it skips more, never less).
+_REPO_HEAD = "head"
+_REPO_PARTS = frozenset({"objects", "refs", "commondir"})
+# `backtide exportar --git`: the bundle the agent makes inside the jail, in its HOME.
+BUNDLE_DIR = ".backtide-export"
+BUNDLE_RE = re.compile(r"export-[0-9a-f]{32}\.bundle", re.ASCII)
+BUNDLE_HEADERS = (b"# v2 git bundle\n", b"# v3 git bundle\n")
 
 
 class ExportError(Exception):
@@ -52,14 +79,22 @@ class ExportResult:
     bytes: int
     skipped_links: int
     skipped_other: int  # FIFOs, sockets, devices, and folders deeper than MAX_DEPTH
+    skipped_git: int = 0  # .git folders and files, and folders shaped like a repository
+    skipped_names: int = 0  # names that are not printable
+    skipped_collisions: int = 0  # names the destination already had, ignoring case
+    named: tuple[tuple[str, str], ...] = ()  # ("git" | "name" | "case", relative path, escaped)
 
-    def details(self) -> dict[str, int]:
+    def details(self) -> dict[str, Any]:
         return {
             "files": self.files,
             "folders": self.folders,
             "bytes": self.bytes,
             "skipped_links": self.skipped_links,
             "skipped_other": self.skipped_other,
+            "skipped_git": self.skipped_git,
+            "skipped_names": self.skipped_names,
+            "skipped_collisions": self.skipped_collisions,
+            "skipped": [list(item) for item in self.named],
         }
 
 
@@ -84,6 +119,7 @@ def check_destination(text: object, protected: Iterable[Path]) -> Path:
     if os.path.lexists(path):
         raise ExportError(f"ya existe {path}: elige una carpeta nueva (nunca se sobrescribe nada)")
     target = parent / path.name
+    _refuse_code_places(target, path)
     for folder in protected:
         guarded = Path(os.path.realpath(folder))
         if target == guarded or target.is_relative_to(guarded) or guarded.is_relative_to(target):
@@ -92,6 +128,39 @@ def check_destination(text: object, protected: Iterable[Path]) -> Path:
                 "otra carpeta"
             )
     return target
+
+
+def code_places() -> list[Path]:
+    """Where this Python loads code from: every folder of ``sys.path`` (``""`` is the current
+    folder), its prefixes, and backtide's own checkout (or the folder that holds it)."""
+    places = [Path(__file__).resolve().parents[2]]
+    for entry in (*sys.path, sys.prefix, sys.exec_prefix, sys.base_prefix):
+        if isinstance(entry, str):
+            places.append(Path(os.path.realpath(entry or os.curdir)))
+    return places
+
+
+def _folded(path: Path) -> PurePath:
+    return PurePath(str(path).casefold())
+
+
+def _refuse_code_places(target: Path, shown: Path) -> None:
+    """ExportError if ``target`` (its parent resolved) is inside a place code is loaded from:
+    a file there could run with the next import (B5 of the review). Compared without case."""
+    folded = _folded(target)
+    for place in code_places():
+        if folded.is_relative_to(_folded(place)):
+            raise ExportError(
+                f"{shown} está dentro de una carpeta de la que se carga código ({place}): lo que "
+                "escribió el agente podría ejecutarse solo. Elige una carpeta fuera del "
+                "repositorio y de cualquier entorno de Python"
+            )
+    for folder in target.parents:
+        if os.path.lexists(folder / "pyvenv.cfg"):
+            raise ExportError(
+                f"{shown} está dentro de un entorno de Python ({folder}), una carpeta de la que se "
+                "carga código: elige otra"
+            )
 
 
 def export_tree(source: Path, destination: Path) -> ExportResult:
@@ -108,7 +177,8 @@ def export_tree(source: Path, destination: Path) -> ExportResult:
             f"({os.strerror(error.errno or 0)}): ¿es un enlace?"
         ) from None
     try:
-        counted = _count(source_fd)
+        root_is_repo = _shaped_like_a_repo(source_fd)
+        counted = _count(source_fd, root_is_repo)
         if counted.bytes > MAX_BYTES or counted.files + counted.folders > MAX_ENTRIES:
             raise ExportError(
                 f"la carpeta de trabajo es demasiado grande para exportarla ({counted.bytes} "
@@ -130,7 +200,7 @@ def export_tree(source: Path, destination: Path) -> ExportResult:
                 f"no se puede abrir {destination}: {os.strerror(error.errno or 0)}"
             ) from None
         try:
-            return _copy(source_fd, destination_fd)
+            return _copy(source_fd, destination_fd, root_is_repo)
         except OSError as error:
             raise ExportError(
                 f"la copia a {destination} se ha quedado a medias "
@@ -149,11 +219,67 @@ class _Tally:
     bytes: int = 0
     skipped_links: int = 0
     skipped_other: int = 0
+    skipped_git: int = 0
+    skipped_names: int = 0
+    skipped_collisions: int = 0
+    named: list[tuple[str, str]] = field(default_factory=list)
+
+    def skip(self, why: str, relative: str) -> None:
+        if why == "git":
+            self.skipped_git += 1
+        elif why == "name":
+            self.skipped_names += 1
+        else:
+            self.skipped_collisions += 1
+        if len(self.named) < MAX_NAMED:
+            self.named.append((why, _shown(relative)))
 
     def result(self) -> ExportResult:
         return ExportResult(
-            self.files, self.folders, self.bytes, self.skipped_links, self.skipped_other
+            self.files,
+            self.folders,
+            self.bytes,
+            self.skipped_links,
+            self.skipped_other,
+            self.skipped_git,
+            self.skipped_names,
+            self.skipped_collisions,
+            tuple(self.named),
         )
+
+
+def _shown(relative: str) -> str:
+    """A workspace path for the owner: control characters, invisible ones and undecodable
+    bytes escaped, bounded."""
+    text = "".join(c if c.isprintable() else repr(c)[1:-1] for c in relative)
+    return text if len(text) <= MAX_SHOWN else text[: MAX_SHOWN - 1] + "…"
+
+
+def _shaped_like_a_repo(dir_fd: int) -> bool:
+    """Whether git would take the folder open at ``dir_fd`` for a repository (a bare one, or a
+    worktree's gitdir): ``HEAD`` with ``objects``, ``refs`` or ``commondir``, without case."""
+    names = {name.casefold() for name in os.listdir(dir_fd)}
+    return _REPO_HEAD in names and bool(names & _REPO_PARTS)
+
+
+def _git_skip(name: str, kind: str, parent_fd: int, depth: int, root_is_repo: bool) -> str | None:
+    """Why an entry of a folder at ``depth`` is not copied ("name" or "git"), or None. Links
+    are counted apart, before this."""
+    if not name.isprintable():
+        return "name"
+    folded = name.casefold()
+    if folded == GIT:
+        return "git"
+    if depth == 0 and root_is_repo and (folded == _REPO_HEAD or folded == "commondir"):
+        return "git"
+    if kind == "dir":
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+        try:
+            if _shaped_like_a_repo(fd):
+                return "git"
+        finally:
+            os.close(fd)
+    return None
 
 
 def _kind(dir_fd: int, name: str) -> tuple[str, os.stat_result]:
@@ -167,8 +293,8 @@ def _kind(dir_fd: int, name: str) -> tuple[str, os.stat_result]:
     return "other", info
 
 
-def _count(root_fd: int) -> ExportResult:
-    """What the copy would take, without writing anything."""
+def _count(root_fd: int, root_is_repo: bool) -> ExportResult:
+    """What the copy would take, without writing anything (nor counting what it skips)."""
     tally = _Tally()
     stack = [(os.dup(root_fd), 0)]
     try:
@@ -177,6 +303,8 @@ def _count(root_fd: int) -> ExportResult:
             try:
                 for name in sorted(os.listdir(fd)):
                     kind, info = _kind(fd, name)
+                    if kind == "link" or _git_skip(name, kind, fd, depth, root_is_repo):
+                        continue
                     if kind == "file":
                         tally.files += 1
                         tally.bytes += info.st_size
@@ -193,17 +321,20 @@ def _count(root_fd: int) -> ExportResult:
     return tally.result()
 
 
-def _copy(source_fd: int, destination_fd: int) -> ExportResult:
+def _copy(source_fd: int, destination_fd: int, root_is_repo: bool) -> ExportResult:
     tally = _Tally()
-    stack = [(os.dup(source_fd), os.dup(destination_fd), 0)]
+    stack = [(os.dup(source_fd), os.dup(destination_fd), 0, "")]
     try:
         while stack:
-            src, dst, depth = stack.pop()
+            src, dst, depth, prefix = stack.pop()
             try:
                 for name in sorted(os.listdir(src)):
                     kind, info = _kind(src, name)
+                    relative = f"{prefix}{name}"
                     if kind == "link":
                         tally.skipped_links += 1
+                    elif why := _git_skip(name, kind, src, depth, root_is_repo):
+                        tally.skip(why, relative)
                     elif kind == "dir":
                         if depth + 1 > MAX_DEPTH:
                             tally.skipped_other += 1
@@ -212,14 +343,23 @@ def _copy(source_fd: int, destination_fd: int) -> ExportResult:
                         try:
                             os.mkdir(name, 0o700, dir_fd=dst)
                             made = os.open(name, _DIR_FLAGS, dir_fd=dst)
+                        except FileExistsError:  # the destination ignores case (APFS)
+                            os.close(child)
+                            tally.skip("case", relative)
+                            continue
                         except BaseException:
                             os.close(child)
                             raise
                         os.fchmod(made, info.st_mode & _KEPT_BITS | 0o700)
                         tally.folders += 1
-                        stack.append((child, made, depth + 1))
+                        stack.append((child, made, depth + 1, f"{relative}/"))
                     elif kind == "file":
-                        if _copy_file(src, dst, name):
+                        try:
+                            copied = _copy_file(src, dst, name)
+                        except FileExistsError:  # the destination ignores case (APFS)
+                            tally.skip("case", relative)
+                            continue
+                        if copied:
                             tally.files += 1
                             tally.bytes += info.st_size
                         else:
@@ -230,7 +370,7 @@ def _copy(source_fd: int, destination_fd: int) -> ExportResult:
                 os.close(src)
                 os.close(dst)
     finally:
-        for src, dst, _ in stack:
+        for src, dst, _, _ in stack:
             os.close(src)
             os.close(dst)
     return tally.result()
@@ -260,3 +400,72 @@ def _copy_file(src_dir: int, dst_dir: int, name: str) -> bool:
     finally:
         os.close(source)
     return True
+
+
+def export_bundle(home: Path, name: str, destination: Path) -> ExportResult:
+    """`backtide exportar --git`: copy the git bundle ``name`` that the agent made in
+    ``<HOME>/.backtide-export/`` (``home`` is that HOME in a read-only snapshot) into the new
+    file ``destination`` (checked with check_destination), 0644. Each folder is opened without
+    following a link, the file must be a regular one no bigger than ``MAX_BYTES`` and start
+    like a git bundle (v2 or v3). Raises ExportError, with nothing created, if not."""
+    if not isinstance(name, str) or not BUNDLE_RE.fullmatch(name):
+        raise ExportError("el nombre del bundle no tiene la forma esperada")
+    try:
+        home_fd = os.open(home, _DIR_FLAGS)
+    except OSError as error:
+        raise ExportError(
+            f"no se puede abrir el HOME del agente en la instantánea "
+            f"({os.strerror(error.errno or 0)}): ¿es un enlace?"
+        ) from None
+    try:
+        folder_fd = os.open(BUNDLE_DIR, _DIR_FLAGS, dir_fd=home_fd)
+    except OSError as error:
+        raise ExportError(
+            f"no está la carpeta del bundle en la instantánea ({os.strerror(error.errno or 0)})"
+        ) from None
+    finally:
+        os.close(home_fd)
+    try:
+        try:
+            source = os.open(name, _FILE_FLAGS, dir_fd=folder_fd)
+        except OSError as error:
+            raise ExportError(
+                f"no está el bundle en la instantánea ({os.strerror(error.errno or 0)})"
+            ) from None
+    finally:
+        os.close(folder_fd)
+    try:
+        info = os.fstat(source)
+        if not stat.S_ISREG(info.st_mode):
+            raise ExportError("lo que hay en el sitio del bundle no es un archivo normal")
+        if info.st_size > MAX_BYTES:
+            raise ExportError(f"el bundle pasa de {MAX_BYTES} bytes")
+        head = os.pread(source, max(len(h) for h in BUNDLE_HEADERS), 0)
+        if not any(head.startswith(header) for header in BUNDLE_HEADERS):
+            raise ExportError("el archivo no empieza como un bundle de git: no se exporta")
+        try:
+            target = os.open(destination, _NEW_FILE_FLAGS, 0o600)
+        except FileExistsError:
+            raise ExportError(f"ya existe {destination}: nunca se sobrescribe nada") from None
+        except OSError as error:
+            raise ExportError(
+                f"no se puede crear {destination}: {os.strerror(error.errno or 0)}"
+            ) from None
+        try:
+            copied = 0
+            while chunk := os.read(source, _CHUNK):
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(target, view) :]
+                copied += len(chunk)
+            os.fchmod(target, 0o644)
+        except OSError as error:
+            raise ExportError(
+                f"la copia a {destination} se ha quedado a medias "
+                f"({os.strerror(error.errno or 0)}): no uses ese archivo"
+            ) from None
+        finally:
+            os.close(target)
+    finally:
+        os.close(source)
+    return ExportResult(1, 0, copied, 0, 0)

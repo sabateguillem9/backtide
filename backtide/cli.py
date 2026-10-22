@@ -184,7 +184,9 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         description="Copia una carpeta del anfitrión a /workspace/work/<nombre> del agente, como "
         "el usuario del agente. No sigue enlaces simbólicos (los salta y dice cuáles), solo "
         "copia archivos y carpetas, tiene un tope de tamaño y nunca escribe encima de una "
-        "carpeta que ya existe salvo con --reemplazar. El servicio lo graba antes. Sale con 0 si "
+        "carpeta que ya existe salvo con --reemplazar. Deja fuera lo que parece un secreto salvo "
+        "con --incluir-secretos, y nunca importa tu carpeta personal ni ~/.ssh o ~/.aws. El "
+        "servicio lo graba antes. Sale con 0 si "
         "se importó, 1 si no se pudo, 2 si hay un error de uso y 3 si quedó a medias.",
     )
     _add_config(bring)
@@ -193,6 +195,13 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     bring.add_argument(
         "--reemplazar", action="store_true", help="escribe encima si la carpeta ya existe"
     )
+    bring.add_argument(
+        "--incluir-secretos",
+        action="store_true",
+        dest="incluir_secretos",
+        help="copia también lo que parece un secreto (.env, claves, .npmrc, una URL de git con "
+        "contraseña…): por defecto se deja fuera y se dice qué",
+    )
     bring.set_defaults(handler=_import)
 
     take = commands.add_parser(
@@ -200,11 +209,21 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         help="copia la carpeta de trabajo del agente a una carpeta nueva de este ordenador",
         description="El servicio hace una instantánea y copia de ella /workspace/work a la "
         "carpeta que digas, que no puede existir (nunca se sobrescribe nada). No sigue enlaces "
-        "simbólicos ni copia lo que no es un archivo o una carpeta. Queda grabado. Sale con 0 si "
-        "se exportó, 1 si no se pudo, 2 si hay un error de uso y 3 si no se sabe.",
+        "simbólicos ni copia lo que no es un archivo o una carpeta, ni ningún repositorio de git "
+        "(su configuración podría ejecutar código aquí). Con --git <carpeta>, el agente hace "
+        "dentro de la jaula un bundle de git de ese repositorio y solo sale ese archivo, a la "
+        "ruta nueva que digas: los commits, sin configuración ni hooks. Lo exportado lo escribió "
+        "el agente: revísalo antes de ejecutar nada de ahí. Queda grabado. Sale con 0 si se "
+        "exportó, 1 si no se pudo, 2 si hay un error de uso y 3 si no se sabe.",
     )
     _add_config(take)
-    take.add_argument("destination", metavar="ruta", help="carpeta nueva donde copiarla")
+    take.add_argument("destination", metavar="ruta", help="carpeta (o bundle) nueva donde copiarla")
+    take.add_argument(
+        "--git",
+        metavar="carpeta",
+        help="saca solo los commits de ese repositorio de /workspace/work, como un bundle de git "
+        "(`.` para la carpeta de trabajo entera)",
+    )
     take.set_defaults(handler=_export)
 
 
@@ -232,12 +251,20 @@ def _import(args: argparse.Namespace) -> int:
     config = _shell_config(args)
     if config is None:
         return EXIT_ERROR
-    return shell_cli.importar(config, args.source, name=args.nombre, replace=args.reemplazar)
+    return shell_cli.importar(
+        config,
+        args.source,
+        name=args.nombre,
+        replace=args.reemplazar,
+        include_secrets=args.incluir_secretos,
+    )
 
 
 def _export(args: argparse.Namespace) -> int:
     config = _shell_config(args)
-    return EXIT_ERROR if config is None else shell_cli.exportar(config, args.destination)
+    if config is None:
+        return EXIT_ERROR
+    return shell_cli.exportar(config, args.destination, git=args.git)
 
 
 def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:

@@ -15,11 +15,17 @@ the ``shell`` mode (Claude Code): its container waits, and the owner runs the ag
 The outcomes' messages are Spanish, for the owner, and never carry the agent's text.
 """
 
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-SHELL_KINDS = frozenset({"session", "task", "import"})  # `entrar`, `tarea`, `importar`
+# `entrar`, `tarea`, `importar`, and `exportar --git` (the agent makes a bundle in the jail)
+SHELL_KINDS = frozenset({"session", "task", "import", "bundle"})
+# `exportar --git <repo>`: a folder of the work folder ("." is the work folder itself), by
+# parts of letters, digits, '.', '_' and '-', never "." or ".." as a part.
+_PART = r"(?!\.\.?(?:/|$))[A-Za-z0-9._-]{1,100}"
+REPO_RE = re.compile(rf"\.|{_PART}(?:/{_PART}){{0,15}}", re.ASCII)
 
 
 class ShellStatus(StrEnum):
@@ -36,6 +42,7 @@ class ShellOutcome:
     container: str = ""
     user: str = ""
     workdir: str = ""
+    container_id: str = ""  # the full id of the container this service started and checked
 
     @property
     def ready(self) -> bool:

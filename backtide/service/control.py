@@ -88,7 +88,13 @@ from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
-from backtide.service.shell import ExportOutcome, ExportStatus, ShellOutcome, ShellStatus
+from backtide.service.shell import (
+    REPO_RE,
+    ExportOutcome,
+    ExportStatus,
+    ShellOutcome,
+    ShellStatus,
+)
 from backtide.service.spend import CAP_SHAPE, CapOutcome, check_cap
 from backtide.service.trust import TRUST_ID_RE
 from backtide.snapshots import Snapshot
@@ -153,15 +159,20 @@ SETTINGS_OUTCOMES = frozenset({*(str(status) for status in Outcome), REFUSED})
 APPLIED = frozenset(str(applied) for applied in Applied)
 MAX_SECRET_CHARS = 256
 # The shell mode (T17a-4): what `backtide entrar`/`tarea` and `importar` may say.
-SHELL_REQUEST_KINDS = frozenset({"session", "task"})
+SHELL_REQUEST_KINDS = frozenset({"session", "task", "bundle"})
 SHELL_OUTCOMES = frozenset({*(str(status) for status in ShellStatus), REFUSED})
 EXPORT_OUTCOMES = frozenset({*(str(status) for status in ExportStatus), REFUSED})
-IMPORT_KEYS = frozenset({"name", "source", "files", "bytes", "replace"})
+IMPORT_KEYS = frozenset(
+    {"name", "source", "files", "bytes", "replace", "secrets_left_out", "include_secrets"}
+)
 MAX_IMPORT_TEXT = 1024
 # What a ready reply may name for docker exec: a container, uid:gid, a folder of /workspace.
 _CONTAINER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", re.ASCII)
 _USER_RE = re.compile(r"[0-9]{1,10}:[0-9]{1,10}", re.ASCII)
 _WORKDIR_RE = re.compile(r"/workspace(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*", re.ASCII)
+_CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+MAX_SKIPPED_NAMES = 20
+MAX_SKIPPED_TEXT = 300
 
 
 class ControlError(Exception):
@@ -209,7 +220,14 @@ class RewindService(Protocol):
         details: dict[str, Any] | None = None,
     ) -> ShellOutcome: ...
 
-    def export(self, destination: str, *, requested_by: str) -> ExportOutcome: ...
+    def export(
+        self,
+        destination: str,
+        *,
+        requested_by: str,
+        bundle: str | None = None,
+        repo: str | None = None,
+    ) -> ExportOutcome: ...
 
 
 class SettingsService(Protocol):
@@ -472,18 +490,35 @@ class ControlServer:
             "outcome": str(outcome.status),
             "message": redact(outcome.message),
             "container": outcome.container,
+            "container_id": outcome.container_id,
             "user": outcome.user,
             "workdir": outcome.workdir,
         }
 
     def _export(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
-        if set(request) != {"cmd", "dest"}:
-            raise _BadRequest("Una petición de exportar lleva `cmd` y `dest`, y nada más.")
+        keys = set(request)
+        if keys != {"cmd", "dest"} and keys != {"cmd", "dest", "bundle", "repo"}:
+            raise _BadRequest(
+                "Una petición de exportar lleva `cmd` y `dest` (y, con --git, `bundle` y `repo`), "
+                "y nada más."
+            )
         destination = request["dest"]
         if not isinstance(destination, str):
             raise _BadRequest("`dest` tiene que ser una ruta.")
+        bundle, repo = request.get("bundle"), request.get("repo")
+        if "bundle" in request and (
+            not isinstance(bundle, str)
+            or not isinstance(repo, str)
+            or len(bundle) > 100
+            or not REPO_RE.fullmatch(repo)
+        ):
+            raise _BadRequest("`bundle` y `repo` no tienen la forma esperada.")
         try:
-            outcome = self._guardian.export(destination, requested_by=f"cli (uid {uid}, pid {pid})")
+            outcome = self._guardian.export(
+                destination,
+                requested_by=f"cli (uid {uid}, pid {pid})",
+                **({"bundle": bundle, "repo": repo} if "bundle" in request else {}),
+            )
         except Exception:
             logger.exception("an export raised instead of answering")
             outcome = ExportOutcome(
@@ -498,6 +533,7 @@ class ControlServer:
             "destination": outcome.destination,
             "snapshot": outcome.snapshot,
             "details": {k: v for k, v in outcome.details.items() if isinstance(v, int)},
+            "skipped": _skipped_names(outcome.details.get("skipped")),
         }
 
     def _budget_command(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
@@ -1705,16 +1741,47 @@ def _import_details(request: dict[str, Any]) -> dict[str, Any]:
     """The counts of `backtide importar`, for the black box: checked shapes, nothing more."""
     name, source = request["name"], request["source"]
     files, size, replace = request["files"], request["bytes"], request["replace"]
+    left_out, include = request["secrets_left_out"], request["include_secrets"]
     if (
         not isinstance(name, str)
         or not isinstance(source, str)
         or not 0 < len(name) <= MAX_IMPORT_TEXT
         or not 0 < len(source) <= MAX_IMPORT_TEXT
-        or any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in (files, size))
+        or any(
+            isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in (files, size, left_out)
+        )
         or not isinstance(replace, bool)
+        or not isinstance(include, bool)
     ):
         raise _BadRequest("Los datos de la importación no tienen la forma esperada.")
-    return {"name": name, "source": source, "files": files, "bytes": size, "replace": replace}
+    return {
+        "name": name,
+        "source": source,
+        "files": files,
+        "bytes": size,
+        "replace": replace,
+        "secrets_left_out": left_out,
+        "include_secrets": include,
+    }
+
+
+def _skipped_names(value: object) -> list[list[str]]:
+    """What an export skipped, by name: ``[why, path]`` pairs of short printable text (the
+    paths are the agent's, escaped by export.py; checked again on both sides)."""
+    if not isinstance(value, list):
+        return []
+    named = []
+    for item in value[:MAX_SKIPPED_NAMES]:
+        if (
+            isinstance(item, list | tuple)
+            and len(item) == 2
+            and all(isinstance(part, str) for part in item)
+            and item[0] in ("git", "name", "case")
+            and 0 < len(item[1]) <= MAX_SKIPPED_TEXT
+            and item[1].isprintable()
+        ):
+            named.append([item[0], item[1]])
+    return named
 
 
 def ask_shell(
@@ -1729,7 +1796,8 @@ def ask_shell(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Ask the service whether `backtide entrar` (``kind`` "session"), `tarea` ("task") or
-    `importar` ("import", with ``import_details``: name, source, files, bytes, replace) may run
+    `importar` ("import", with ``import_details``: name, source, files, bytes, replace, and the
+    secrets it left out or took) or `exportar --git` ("bundle": the agent makes it) may run
     now, recorded. Returns ``ok``, ``outcome``, ``message`` and, when ``ok``, the ``container``,
     ``user`` and ``workdir`` for docker exec, checked. Same retries and errors as ask_rewind."""
     if kind == "import":
@@ -1759,9 +1827,12 @@ def ask_shell(
     checked = {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
     if reply["ok"]:
         container, user, workdir = reply.get("container"), reply.get("user"), reply.get("workdir")
+        container_id = reply.get("container_id")
         if (
             not isinstance(container, str)
             or not _CONTAINER_RE.fullmatch(container)
+            or not isinstance(container_id, str)
+            or not _CONTAINER_ID_RE.fullmatch(container_id)
             or not isinstance(user, str)
             or not _USER_RE.fullmatch(user)
             or not isinstance(workdir, str)
@@ -1770,7 +1841,12 @@ def ask_shell(
             raise ControlOutcomeUnknown(
                 "La respuesta del servicio no es la esperada: no se abre nada."
             )
-        checked |= {"container": container, "user": user, "workdir": workdir}
+        checked |= {
+            "container": container,
+            "container_id": container_id,
+            "user": user,
+            "workdir": workdir,
+        }
     return checked
 
 
@@ -1778,6 +1854,8 @@ def ask_export(
     path: Path,
     destination: str,
     *,
+    bundle: str | None = None,
+    repo: str | None = None,
     wait: float = WAIT_FOR_SERVICE,
     reply_timeout: float = CLIENT_REPLY_TIMEOUT,
     peer: PeerCredentials = peer_credentials,
@@ -1786,10 +1864,15 @@ def ask_export(
 ) -> dict[str, Any]:
     """Ask the service to export the agent's work folder into ``destination`` (`backtide
     exportar`). Returns ``ok``, ``outcome``, ``message``, ``destination``, ``snapshot`` and
-    ``details`` (counts), checked."""
+    ``details`` (counts) and ``skipped`` (what it skipped by name: ``[why, path]``), checked.
+    With ``bundle`` (and ``repo``, the folder it came from), only that git bundle of the agent's
+    HOME is exported, into the new file ``destination`` (`backtide exportar --git`)."""
+    request: dict[str, Any] = {"cmd": "export", "dest": destination}
+    if bundle is not None:
+        request |= {"bundle": bundle, "repo": repo or "."}
     raw = _ask(
         Path(path),
-        {"cmd": "export", "dest": destination},
+        request,
         what="la exportación",
         wait=wait,
         reply_timeout=reply_timeout,
@@ -1823,4 +1906,5 @@ def ask_export(
             for key, value in (details if isinstance(details, dict) else {}).items()
             if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool)
         },
+        "skipped": _skipped_names(reply.get("skipped")),
     }
