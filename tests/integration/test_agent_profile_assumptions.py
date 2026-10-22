@@ -665,9 +665,9 @@ def test_the_image_user_and_its_sudo_mean_nothing_in_the_jail(
 def test_the_jail_variables_override_the_image_ones(
     lab: Lab, record_property: Callable[[str, object], None]
 ) -> None:
-    """HOME and NO_PROXY are the jail's, not the image's. The image's own BASH_ENV and
-    CLAUDE_ENV_FILE are NOT among the jail's variables, so they survive (and verify.py accepts
-    them, since create() and start() passed): pinned here so that T17a-3 blanks them."""
+    """HOME and NO_PROXY are the jail's, not the image's. The image sets BASH_ENV and
+    CLAUDE_ENV_FILE to a file of its own; since T17a-3 the jail sets both to /dev/null for every
+    profile (and verify.py checks the final values), so the image's do not survive."""
     image_env = dict(
         e.split("=", 1)
         for e in json.loads(docker("image", "inspect", CC_IMAGE).stdout)[0]["Config"]["Env"]
@@ -688,11 +688,10 @@ def test_the_jail_variables_override_the_image_ones(
         n for n in image_env if n in env and n not in dict(container_env(lab.jail.config))
     )
     report(record_property, "image variables left as they are", survivors)
-    # The two that matter: reserved for a profile, but the jail does not set them either.
-    assert is_reserved_env("BASH_ENV")
-    assert env["BASH_ENV"] == IMAGE_ENV_FILE
-    assert env["CLAUDE_ENV_FILE"] == IMAGE_ENV_FILE
-    # Today the file is empty and the jail's user cannot write it (read-only root).
+    # The two that matter: reserved for a profile, and set by the jail itself.
+    assert is_reserved_env("BASH_ENV") and is_reserved_env("CLAUDE_ENV_FILE")
+    assert env["BASH_ENV"] == env["CLAUDE_ENV_FILE"] == "/dev/null"
+    # A login shell still re-exports the image's file; it is empty and on the read-only root.
     size = lab.exec("stat", "-c", "%s %U %a", IMAGE_ENV_FILE)
     report(record_property, f"{IMAGE_ENV_FILE}", size.stdout.strip())
     assert size.stdout.split()[0] == "0"
