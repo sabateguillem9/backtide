@@ -65,7 +65,7 @@ from backtide.gate.providers import Secret as GateSecret
 from backtide.gate.translate.base import Trusted, normalize_trusted
 from backtide.gate.translate.read_post import check_read_endpoint
 from backtide.jail.ca import CaPaths
-from backtide.jail.config import AgentJailConfig, Protected
+from backtide.jail.config import AGENT_DIR, AgentJailConfig, Protected
 from backtide.jail.openclaw import MODEL_ID, ModelProvider
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
@@ -515,10 +515,16 @@ class ServiceConfig:
 
     def agent_protected(self) -> tuple[Protected, ...]:
         """What the agent must never see (T14a, backtide/jail/mounts.py). Its config and CA
-        folders live in ``state_dir`` by default, and its workspace in ``volume``: nothing
-        else may be mounted from either."""
+        folders live in ``state_dir`` by default, and its workspace in ``volume``: exactly
+        those may be mounted from there, and nothing else (a restore in progress, a folder a
+        later version adds)."""
+        in_state = tuple(
+            folder
+            for folder in (self.agent_config_dir, self.agent_ca_dir)
+            if folder.is_relative_to(self.state_dir) and folder != self.state_dir
+        )
         protected = [
-            Protected("backtide's state folder", self.state_dir, inside_ok=True),
+            Protected("backtide's state folder", self.state_dir, allowed_inside=in_state),
             Protected("the black box", self.blackbox_db),
             Protected("the black box's key", self.blackbox_key),
             Protected("the black box's checkpoint", self.blackbox_checkpoint),
@@ -530,7 +536,11 @@ class ServiceConfig:
             Protected("the proxy's channel", self.proxy_channel_dir),
             Protected("the proxy's CA and its key", self.proxy_ca_dir),
             Protected("the sensor's folder", self.sensor_dir),
-            Protected("the snapshot volume", self.volume, inside_ok=True),
+            Protected(
+                "the snapshot volume",
+                self.volume,
+                allowed_inside=(self.workspace / AGENT_DIR,),
+            ),
             Protected("the snapshots", self.volume / SNAPSHOTS),
         ]
         if self.volume_image is not None:

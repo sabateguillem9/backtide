@@ -254,6 +254,9 @@ class FileWatcher(Protocol):
 
 # How many of the mount check's problems an event keeps (T14a): the first say enough.
 MAX_EXPOSURE_PROBLEMS = 20
+# How the note a failed boot adds to its error begins when the agent could not be stopped
+# (cli.py reads it to say that the agent is still running).
+BOOT_STOP_FAILED_NOTE = "stopping the agent after the failed boot also failed"
 
 # Why a required sensor stops the agent (``agent_stop {reason}``).
 _SENSOR_REASONS = frozenset(
@@ -706,9 +709,7 @@ class Guardian:
             else:
                 self._stopped = False  # stop() may try again
                 self._wound_down = False
-                error.add_note(
-                    f"stopping the agent after the failed boot also failed: {stop_error}"
-                )
+                error.add_note(f"{BOOT_STOP_FAILED_NOTE}: {stop_error}")
                 logger.error("cannot stop the agent after a failed boot: %s", stop_error)
                 return
         self._stop_sensor("boot_failed")
@@ -1142,7 +1143,11 @@ class Guardian:
             self.agent_lock.release()
 
     def _cycle_locked(self) -> CycleResult:
-        self._check_exposure()
+        try:
+            self._check_exposure()
+        except Exception as error:  # recorded and alerted; the watcher and snapshot go on
+            logger.exception("the mount check of the cycle failed")
+            self._cycle_problem("exposure", error)
         try:
             workspace_id = self._store.workspace_id()
         except SnapshotError as error:
@@ -1163,12 +1168,18 @@ class Guardian:
         )
 
     def _check_exposure(self) -> None:
-        """T14a: the running agent's container still shows it nothing it must not see
-        (``AgentJail.running_exposure``, backtide/jail/mounts.py); one that cannot be inspected
-        counts as one that does. One changed under the service (recreated by hand with one
-        more mount, say) is killed at once and stays stopped: a start refuses it until it is
-        removed and backtide creates it again."""
-        problems = self._jail.running_exposure()
+        """T14a: the running agent's container still shows it nothing it must not see, and is
+        still the jail backtide started (``AgentJail.running_exposure``: the same container,
+        the same settings, nothing mounted inside it from the host); one that cannot be
+        inspected, or whose check fails, counts as one that does. One changed under the service
+        (recreated by hand with one more mount or on another network, ``docker update``...) is
+        killed at once and stays stopped: a start refuses it until it is removed and backtide
+        creates it again."""
+        try:
+            problems = self._jail.running_exposure()
+        except Exception as error:  # a check that fails is never a pass
+            logger.exception("the check of the agent's container failed")
+            problems = [f"the check of the agent's container failed: {_short(error)}"]
         if not problems:
             return
         details: dict[str, Any] = {
@@ -1176,17 +1187,22 @@ class Guardian:
             "problems": problems[:MAX_EXPOSURE_PROBLEMS],
         }
         self._set_state(AgentState.STOPPING)
-        error = self._halt(kill_first=True)
+        try:
+            error = self._halt(kill_first=True)
+        except Exception as unexpected:  # it may still run: said as a failed stop
+            logger.exception("stopping the exposed agent failed unexpectedly")
+            error = JailError(f"stopping it failed unexpectedly: {_short(unexpected)}")
         if error is not None:
             self._set_state(AgentState.RUNNING)
             event = self._record(
                 "system", "agent_stop_failed", details={**details, "error": _short(error)}, risk=3
             )
-            self._alert(
+            self._alert_throttled(  # every cycle tries again and records it: alert now and then
+                "exposed_stop_failed",
                 AlertLevel.ERROR,
                 "El agente ve lo que no debe y sigue en marcha",
-                "El contenedor del agente ve algo del anfitrión que no debe ver y no se ha "
-                "podido parar. Detalles en el evento.",
+                "El contenedor del agente ve algo del anfitrión que no debe ver, o ya no es la "
+                "jaula que backtide arrancó, y no se ha podido parar. Detalles en el evento.",
                 event,
             )
             return
@@ -1195,9 +1211,10 @@ class Guardian:
         self._alert(
             AlertLevel.ERROR,
             "Agente parado: su contenedor ve lo que no debe",
-            "El contenedor del agente ve algo del anfitrión que no debe ver (detalles en el "
-            "evento). backtide lo ha parado y no lo arrancará así: bórralo y deja que backtide "
-            "lo cree de nuevo.",
+            "El contenedor del agente ve algo del anfitrión que no debe ver, o ya no es la "
+            "jaula que backtide arrancó (lo han recreado o cambiado; detalles en el evento). "
+            "backtide lo ha parado y no lo arrancará así: bórralo y deja que backtide lo cree "
+            "de nuevo.",
             event,
         )
 

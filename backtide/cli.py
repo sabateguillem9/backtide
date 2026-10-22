@@ -23,6 +23,7 @@ from backtide.service.control import (
     ControlUnavailable,
     ask_rewind,
 )
+from backtide.service.guardian import BOOT_STOP_FAILED_NOTE
 from backtide.service.notice import ago, rewind_notice
 from backtide.service.offline import rewind_without_service
 from backtide.service.retenidas import decide as decide_hold
@@ -234,10 +235,20 @@ def _watch(args: argparse.Namespace) -> int:
             _error(note)
         return EXIT_FAILED
     except ExposedJail as error:  # T14a: refused before the agent could see anything
+        notes = list(getattr(error, "__notes__", []))
+        running = error.still_running or any(n.startswith(BOOT_STOP_FAILED_NOTE) for n in notes)
         _error(
             "backtide no arranca al agente: su contenedor vería algo del anfitrión que no debe "
             f"ver (invariantes 1 y 2). Corrige la configuración y vuelve a arrancar: {error}"
         )
+        for note in notes:
+            _error(note)
+        if running:
+            _error(
+                "EL AGENTE SIGUE EN MARCHA y backtide no ha podido pararlo. Páralo con "
+                f"`docker kill {config.jail_config().name}`."
+            )
+            return EXIT_FAILED
         return EXIT_ERROR
     except JailError as error:
         _error(f"EL AGENTE SIGUE EN MARCHA y backtide no ha podido pararlo: {error}")

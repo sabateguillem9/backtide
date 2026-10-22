@@ -140,21 +140,27 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,256}", re.ASCII)
 class Protected:
     """A host path the agent must never see (T14a, backtide/jail/mounts.py): backtide's state
     folder, the black box, the keys, the control socket, the snapshots... No folder mounted
-    into the agent may be it or contain it. ``inside_ok`` says whether one of the agent's own
-    folders may live inside it: backtide's state folder holds the agent's config and CA folders
-    by default, and the snapshot volume holds its workspace; nothing else may be mounted from
-    there."""
+    into the agent may be it or contain it, or lie inside it, except exactly the folders of
+    ``allowed_inside``: backtide's state folder holds the agent's config and CA folders by
+    default, and the snapshot volume holds its workspace. Anything else there (a restore in
+    progress, a folder some later version adds) is protected without having to be listed."""
 
     label: str
     path: Path
-    inside_ok: bool = False
+    allowed_inside: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label:
             raise ValueError(f"a protected path needs a label, got {self.label!r}")
         _require_absolute(f"protected path {self.label!r}", self.path)
-        if not isinstance(self.inside_ok, bool):
-            raise ValueError(f"inside_ok must be a bool, got {self.inside_ok!r}")
+        if not isinstance(self.allowed_inside, tuple):
+            raise ValueError(f"allowed_inside must be a tuple, got {self.allowed_inside!r}")
+        for folder in self.allowed_inside:
+            _require_absolute(f"a folder allowed inside {self.label!r}", folder)
+            if folder == self.path or not folder.is_relative_to(self.path):
+                raise ValueError(
+                    f"{folder} is allowed inside {self.label} ({self.path}) but is not inside it"
+                )
 
 
 @dataclass(frozen=True)
@@ -251,13 +257,14 @@ class AgentJailConfig:
         self._check_protected()
 
     def _check_protected(self) -> None:
-        """No folder mounted into the agent is, contains or (unless ``inside_ok``) lies inside a
-        protected path. By name only: mounts.py checks again with symlinks resolved, right
-        before Docker gets it."""
+        """No folder mounted into the agent is, contains or lies inside a protected path, unless
+        it is exactly one of the folders that path allows inside. By name only: mounts.py checks
+        again with symlinks resolved, right before Docker gets it."""
         if not isinstance(self.protected, tuple) or not all(
             isinstance(p, Protected) for p in self.protected
         ):
             raise ValueError("protected must be a tuple of Protected")
+        problems = []
         for label, folder in (
             ("the agent's folder", self.agent_dir),
             ("config_dir", self.config_dir),
@@ -265,15 +272,17 @@ class AgentJailConfig:
         ):
             for item in self.protected:
                 if item.path.is_relative_to(folder):
-                    raise ValueError(
+                    problems.append(
                         f"{label} {folder} is mounted into the agent and would show it "
                         f"{item.label} ({item.path})"
                     )
-                if not item.inside_ok and folder.is_relative_to(item.path):
-                    raise ValueError(
+                elif folder.is_relative_to(item.path) and folder not in item.allowed_inside:
+                    problems.append(
                         f"{label} {folder} is mounted into the agent and lies inside "
                         f"{item.label} ({item.path})"
                     )
+        if problems:
+            raise ValueError("; ".join(problems))
 
     @property
     def agent_dir(self) -> Path:

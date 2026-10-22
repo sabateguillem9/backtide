@@ -17,7 +17,12 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
 - The mount check (T14a, backtide/jail/mounts.py): create() refuses a planned container, and
   start() an existing one, that would show the agent what it must not (ExposedJail); right
   after ``docker start`` the running container is checked again and killed if it does.
-  running_exposure() is the same check for the Guardian's cycle.
+  running_exposure() is the same check for the Guardian's cycle. A running container must also
+  still be the very container start() checked (its Id: one recreated by hand under backtide,
+  even with the same mounts, is not), still be this config's jail (verify.py, against the
+  seccomp profile and image environment start() used: ``docker update`` changes some fields)
+  and have nothing mounted inside it that Docker does not know about (mounts.py,
+  live_mount_problems).
 - Whatever comes out of the container (exec output, logs) is the agent's: bounded in size,
   sanitized before it reaches a message, and never trusted to configure backtide's own probes.
 """
@@ -31,10 +36,12 @@ import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from backtide.jail import docker
+from backtide.jail.ca import certificates_only
 from backtide.jail.config import (
     AGENT_DIR,
     AGENT_SUBDIRS,
@@ -49,7 +56,12 @@ from backtide.jail.config import (
     token_env,
 )
 from backtide.jail.docker import JailError
-from backtide.jail.mounts import agent_policy, exposure_problems, planned_info
+from backtide.jail.mounts import (
+    agent_policy,
+    exposure_problems,
+    live_mount_problems,
+    planned_info,
+)
 from backtide.jail.openclaw import check_rewindable
 from backtide.jail.verify import container_problems
 
@@ -87,20 +99,34 @@ type StartIf = Callable[[BaseException | None], bool]
 
 
 class ExposedJail(JailError):
-    """The agent's container would see, or sees, what it must not (T14a, mounts.py): it is not
-    created, not started, or killed. ``problems`` says what, one sentence each."""
+    """The agent's container would see, or sees, what it must not (T14a, mounts.py), or is no
+    longer the jail backtide started: it is not created, not started, or killed. ``problems``
+    says what, one sentence each; ``still_running`` that the kill failed too."""
 
-    def __init__(self, message: str, problems: list[str]) -> None:
+    def __init__(self, message: str, problems: list[str], *, still_running: bool = False) -> None:
         super().__init__(message)
         self.problems = list(problems)
+        self.still_running = still_running
+
+
+@dataclass(frozen=True)
+class _Checked:
+    """A container start() checked: its Id, and the seccomp profile and image environment it
+    was checked against (both fixed for the container's whole life)."""
+
+    container_id: str
+    seccomp_profile: object
+    image_env: list[str]
 
 
 class AgentJail:
-    """One agent container, described by an AgentJailConfig. Holds no state of its own:
-    every method asks Docker or the disk, so two instances with the same config agree."""
+    """One agent container, described by an AgentJailConfig. Holds no state of its own but
+    one thing: the container it last started and checked (``running_exposure`` compares the
+    running one with it). Everything else is asked of Docker or the disk."""
 
     def __init__(self, config: AgentJailConfig) -> None:
         self.config = config
+        self._started: _Checked | None = None
 
     # Setup
 
@@ -197,14 +223,21 @@ class AgentJail:
         create it again). Returns before OpenClaw is ready."""
         self._check_ids_not_shared()
         self._check_mount_sources()
-        self._check_container()
+        checked = self._check_container()
+        self._started = None  # whatever ran before is not what runs now
         docker.run(["start", self.config.name])
-        self._check_started()
+        self._check_started(checked)
 
     def running_exposure(self) -> list[str]:
-        """What the running container shows the agent that it must not (T14a); empty if it
-        shows nothing of the sort, or if no container runs. A container that cannot be
-        inspected is a problem: what cannot be checked does not run."""
+        """What is wrong with the running container (T14a): it shows the agent what it must
+        not, it is not the container start() checked (recreated under backtide), it is no
+        longer this config's jail (``docker update``), or something is mounted inside it that
+        Docker does not know about. Empty if nothing is, or if no container runs. A container
+        that cannot be inspected, and a check that fails, are problems: what cannot be checked
+        does not run."""
+        return self._running_problems(self._started)
+
+    def _running_problems(self, checked: _Checked | None) -> list[str]:
         try:
             info = self._inspect_container("{{json .}}", "the settings of")
         except JailError as error:
@@ -214,7 +247,37 @@ class AgentJail:
         state = info.get("State")
         if isinstance(state, dict) and state.get("Running") is False:
             return []
-        return self._exposure(info)
+        try:
+            return self._problems_of_running(info, checked)
+        except Exception as error:  # a check that fails is never a pass (B1 of the review)
+            logger.exception("the check of the agent's running container failed")
+            return [f"the check of the agent's container failed: {type(error).__name__}: {error}"]
+
+    def _problems_of_running(self, info: dict[str, Any], checked: _Checked | None) -> list[str]:
+        if checked is None:
+            return [
+                "it runs, but this backtide did not start it (or its checks failed when it did)",
+                *self._exposure(info),
+            ]
+        problems = []
+        running_id = info.get("Id")
+        if running_id != checked.container_id:
+            problems.append(
+                "it is not the container backtide started and checked: it was recreated "
+                f"(Id {checked.container_id[:12]} is now {str(running_id)[:12]})"
+            )
+        problems += self._exposure(info)
+        problems += live_mount_problems(info, agent_policy(self.config))
+        problems += [
+            f"it is no longer the jail: {problem}"
+            for problem in container_problems(
+                self.config,
+                info,
+                seccomp_profile=checked.seccomp_profile,
+                image_env=checked.image_env,
+            )
+        ]
+        return list(dict.fromkeys(problems))
 
     def stop(self) -> None:
         """Stop the container: SIGTERM, then SIGKILL after ``stop_timeout`` seconds."""
@@ -459,7 +522,9 @@ class AgentJail:
     def _exposure(self, info: dict[str, Any]) -> list[str]:
         return exposure_problems(info, agent_policy(self.config))
 
-    def _refuse_exposure(self, problems: list[str], what: str) -> None:
+    def _refuse_exposure(
+        self, problems: list[str], what: str, *, still_running: bool = False
+    ) -> None:
         if problems:
             name = self.config.name
             raise ExposedJail(
@@ -467,40 +532,52 @@ class AgentJail:
                 f"{'; '.join(problems)}. Remove it (docker rm -f {name}), check backtide's "
                 "config, and let backtide create it again",
                 problems,
+                still_running=still_running,
             )
 
-    def _check_started(self) -> None:
-        """Right after ``docker start``: the container that runs is still one that shows the
-        agent nothing it must not (it could have been swapped since the check before). If it
-        is not, or it cannot be told, it is killed."""
-        problems = self.running_exposure()
+    def _check_started(self, checked: _Checked) -> None:
+        """Right after ``docker start``: the container that runs is the very one checked before
+        (it could have been swapped since), and it is still the jail and shows the agent
+        nothing it must not. Then it is the one ``running_exposure`` compares with. If it is
+        not, or it cannot be told, it is killed."""
+        problems = self._running_problems(checked)
         if not problems:
+            self._started = checked
             return
+        still_running = False
         try:
             self.kill()
         except JailError as error:
             problems.append(f"and it could not be killed: {error}")
-        self._refuse_exposure(problems, "was killed right after it started")
+            still_running = True
+        self._refuse_exposure(
+            problems, "was killed right after it started", still_running=still_running
+        )
 
-    def _check_container(self) -> None:
+    def _check_container(self) -> _Checked:
         """The existing container must show the agent nothing it must not (mounts.py) and be
-        exactly the jail of this config (verify.py)."""
+        exactly the jail of this config (verify.py). Returns what it was checked with."""
         name = self.config.name
         info = self._inspect_container("{{json .}}", "the settings of")
         if info is None:
             raise JailError(f"container {name} does not exist: create() it first")
         self._refuse_exposure(self._exposure(info), "is not started")
+        container_id = info.get("Id")
+        if not isinstance(container_id, str) or not _CONTAINER_ID_RE.fullmatch(container_id):
+            raise JailError(f"unexpected id for container {name}: {container_id!r:.100}")
+        checked = _Checked(container_id, self._seccomp_profile(), self._image_env())
         problems = container_problems(
             self.config,
             info,
-            seccomp_profile=self._seccomp_profile(),
-            image_env=self._image_env(),
+            seccomp_profile=checked.seccomp_profile,
+            image_env=checked.image_env,
         )
         if problems:
             raise JailError(
                 f"container {name} is not the jail this backtide expects: {'; '.join(problems)}. "
                 f"Remove it (docker rm -f {name}) and let backtide create it again"
             )
+        return checked
 
     def _seccomp_profile(self) -> object:
         path = self.config.seccomp_profile
@@ -667,6 +744,11 @@ class AgentJail:
             raise JailError(f"{self.config.config_file} is missing: run write_config()") from e
         if not stat.S_ISREG(st.st_mode):
             raise JailError(f"{self.config.config_file} is not a regular file")
+        if st.st_nlink != 1:
+            raise JailError(
+                f"{self.config.config_file} has {st.st_nlink} names (a hard link to another "
+                "file?): run write_config()"
+            )
 
 
 def _require_owned_by_backtide(dir_fd: int, path: Path) -> None:
@@ -709,10 +791,16 @@ def _check_ca_dir(path: Path) -> None:
                 raise JailError(f"{path / CA_CERT_FILE} is not a regular file")
             if file_stat.st_uid != os.geteuid() or stat.S_IMODE(file_stat.st_mode) & 0o022:
                 raise JailError(f"{path / CA_CERT_FILE} may be changed by someone but backtide")
+            if file_stat.st_nlink != 1:
+                raise JailError(
+                    f"{path / CA_CERT_FILE} has {file_stat.st_nlink} names (a hard link to "
+                    "another file?): let backtide write it again"
+                )
             content = os.read(file_fd, _CA_CERT_MAX + 1)
         finally:
             os.close(file_fd)
-        if len(content) > _CA_CERT_MAX or b"PRIVATE KEY" in content:
+        # PEM CERTIFICATE blocks and nothing else: no key, no parameters, no stray text.
+        if len(content) > _CA_CERT_MAX or not content or certificates_only(content) != content:
             raise JailError(
                 f"{path / CA_CERT_FILE} is not just a certificate: refusing to show it to the agent"
             )

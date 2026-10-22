@@ -15,6 +15,7 @@ from backtide.cli import main
 from backtide.jail import ExposedJail, JailError
 from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
 from backtide.service.config import ConfigError
+from backtide.service.guardian import BOOT_STOP_FAILED_NOTE
 from backtide.service.runner import ServiceLocked
 from backtide.snapshots import Reason, Snapshot, SnapshotError
 
@@ -191,6 +192,51 @@ def test_a_jail_that_would_see_too_much_is_refused_without_saying_it_runs(
     assert code == 2
     assert "no arranca al agente" in err
     assert "is not prepared" in err
+    assert "SIGUE EN MARCHA" not in err
+
+
+def test_a_refused_agent_s_notes_are_printed_and_a_running_one_is_said(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B2 of the review: what _abort_boot adds is not hidden, and an agent that could not be
+    stopped is said in capitals, with exit code 1."""
+
+    def serve(config: object) -> None:
+        error = ExposedJail("is not created: it would see what it must not: x", ["x"])
+        error.add_note(f"{BOOT_STOP_FAILED_NOTE}: docker kill timed out")
+        raise error
+
+    monkeypatch.setattr(cli, "serve", serve)
+    code, _, err = run(capsys, "vigilar", "--config", config_file)
+    assert code == 1
+    assert "docker kill timed out" in err
+    assert "EL AGENTE SIGUE EN MARCHA" in err
+
+
+def test_an_exposed_agent_that_could_not_be_killed_is_said(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def serve(config: object) -> None:
+        raise ExposedJail("was killed right after it started: x", ["x"], still_running=True)
+
+    monkeypatch.setattr(cli, "serve", serve)
+    code, _, err = run(capsys, "vigilar", "--config", config_file)
+    assert code == 1
+    assert "EL AGENTE SIGUE EN MARCHA" in err
+
+
+def test_a_refused_agent_s_other_notes_are_printed_too(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def serve(config: object) -> None:
+        error = ExposedJail("is not prepared: it would see what it must not: x", ["x"])
+        error.add_note("closing the watcher failed too")
+        raise error
+
+    monkeypatch.setattr(cli, "serve", serve)
+    code, _, err = run(capsys, "vigilar", "--config", config_file)
+    assert code == 2
+    assert "closing the watcher failed too" in err
     assert "SIGUE EN MARCHA" not in err
 
 

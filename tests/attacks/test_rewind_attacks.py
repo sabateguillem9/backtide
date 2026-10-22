@@ -18,6 +18,7 @@ from attack_kit import CONTAINER_WORK, Attack, files_under, is_healthy, scenario
 from risk_kit import peak, rules_of, summary
 
 from backtide.blackbox import Event
+from backtide.sensors.files import WatcherConfig
 from backtide.service.rewind import RewindStatus, read_pending
 from backtide.snapshots import btrfs
 from tests.integration.service_kit import (
@@ -45,12 +46,19 @@ def digest_of(path: Path) -> str | None:
 
 def about_the_project(event: Event) -> bool:
     """A file event that tells of the project's destruction: one of its paths, or a summary
-    that folded some of them."""
+    that folded some of them. A summary names them in its ``dirs`` (counts per folder, two
+    levels deep) even when its ``sample`` (the first 20 folded paths) holds none: the wreck
+    also wipes OpenClaw's own ``state/``, and its cache alone may fill the sample."""
     if event.action in ("delete", "modify", "move"):
-        return event.target == PROJECT or event.target.startswith(PROJECT + "/")
+        return _in_project(event.target)
     if event.action == "summary":
-        return any(str(path).startswith(PROJECT) for path in event.details.get("sample", []))
+        dirs = [entry.get("dir") for entry in event.details.get("dirs", [])]
+        return any(_in_project(str(path)) for path in [*event.details.get("sample", []), *dirs])
     return False
+
+
+def _in_project(path: str) -> bool:
+    return path == PROJECT or path.startswith(PROJECT + "/")
 
 
 @scenario("borrado-masivo-y-rebobinado")
@@ -75,6 +83,12 @@ def test_mass_delete_then_rewind(
             "a snapshot of the whole project",
             context=service.diagnosis,
         )
+        # The build's last records may still wait in the watcher (it writes them every
+        # dump_interval s; a snapshot does not). A change that keeps going past a snapshot
+        # stays one record, pointing to the snapshot from before its start: had the wreck come
+        # now, the delete of app.db would point to the snapshot before the build, without the
+        # project. Let them go out first: that is the attack this scenario is about.
+        time.sleep(2 * WatcherConfig().dump_interval + 1)
         snapshots_before = service.snapshots()
         workspace_before = service.store.workspace_id()
         wrecked_at = len(service.events())
@@ -105,8 +119,11 @@ def test_mass_delete_then_rewind(
         told: list[Event] = []
 
         def recorded() -> bool:
+            # Sliced before filtering: wrecked_at counts every event, not only the file ones.
             told[:] = [
-                e for e in service.events(source="file")[wrecked_at:] if about_the_project(e)
+                e
+                for e in service.events()[wrecked_at:]
+                if e.source == "file" and about_the_project(e)
             ]
             return any(e.target == PROJECT and e.action == "delete" for e in told) or any(
                 e.action == "summary" for e in told

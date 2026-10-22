@@ -6,6 +6,9 @@ vigilar` as a process and the real OpenClaw:
   agent folder resolves into it through a symlink: the service refuses to start, and no
   container is ever made. And a container recreated under a running service with one more
   ``-v`` of the state folder: the Guardian's next cycle kills it, and a later start refuses it.
+  After the review, two that keep the very same mounts: the container recreated on Docker's
+  default ``bridge`` network (a way out that skips the proxy, invariant 3), and the running one
+  altered with ``docker update --restart always``. The next cycle kills both.
 
 The agent itself cannot do either (it has no Docker and no host): this is the check that
 backtide does not trust its own config, or a container it did not make, to be the jail.
@@ -19,6 +22,7 @@ from collections.abc import Callable
 from attack_kit import Attack, scenario
 from risk_kit import summary
 
+from backtide.blackbox import Event
 from backtide.jail import docker as jail_docker
 from backtide.jail.config import docker_create_argv, token_env
 from tests.integration.service_kit import Service, wait_until
@@ -88,15 +92,14 @@ def test_mounting_what_the_agent_must_not_see(
     never_restarted = not service.jail.is_running() and _started_at(name) == started_at
     assert service.stop() == 0
 
-    attack.check(
-        "stopped",
-        refused_config and len(exposed_stop) == 1 and never_restarted,
+    stopped_ok = refused_config and len(exposed_stop) == 1 and never_restarted
+    stopped_evidence = (
         "con un config_dir que por un enlace simbólico es la carpeta de estado, `backtide "
         f"vigilar` sale con código {code} y dice qué vería el agente; no se crea ningún "
         "contenedor ni se escribe nada allí. Con el contenedor recreado con "
         f"`-v <estado>:/mnt/caja`, el Guardian lo mata en {killed_after:.1f} s; al volver a "
         "arrancar, el servicio se niega a arrancarlo (sigue parado y Docker no lo ha vuelto a "
-        "arrancar)",
+        "arrancar)."
     )
     stop_problems = exposed_stop[0].details["problems"] if exposed_stop else []
     refused_problems = refused[0].details.get("exposed", []) if refused else []
@@ -111,12 +114,77 @@ def test_mounting_what_the_agent_must_not_see(
         f"caja negra sigue íntegra. {len(stop_problems)} problemas, p. ej.: "
         f"{stop_problems[:1]}",
     )
-    risky = exposed_stop + refused[:1]
+
+    # 4. The same mounts, on Docker's default network: a way out without the proxy.
+    bridged = _tamper(
+        service,
+        lambda: _recreate(service, network="bridge"),
+        "the Guardian to kill the agent recreated on the bridge network",
+    )
+    # 5. The same container, altered: Docker would start it again on its own.
+    updated = _tamper(
+        service,
+        lambda: jail_docker.run(["update", "--restart", "always", name]),
+        "the Guardian to kill the agent altered with docker update",
+    )
+    time.sleep(5)  # a restart policy that took would show by now
+    came_back = service.jail.is_running()
+    assert service.stop() == 0
+    bridged_problems = bridged.details["problems"] if bridged else []
+    updated_problems = updated.details["problems"] if updated else []
+    attack.check(
+        "stopped",
+        stopped_ok
+        and bridged is not None
+        and any("not the container backtide started" in p for p in bridged_problems)
+        and any("networks are 'bridge'" in p for p in bridged_problems)
+        and updated is not None
+        and any("RestartPolicy.Name is 'always'" in p for p in updated_problems)
+        and not came_back,
+        "con los mismos montajes: recreado en la red `bridge` de Docker (salida directa sin "
+        "proxy, invariante 3), el Guardian lo mata porque ya no es el contenedor que arrancó y "
+        "no está solo en su red; alterado con `docker update --restart always`, lo mata porque "
+        "ya no es la jaula, y Docker no lo vuelve a arrancar. Problemas: "
+        f"{bridged_problems[:2]} / {updated_problems[:1]}. " + stopped_evidence,
+    )
+    risky = exposed_stop + refused[:1] + [e for e in (bridged, updated) if e is not None]
     attack.check(
         "risk",
-        len(risky) == 2 and all(e.risk == 3 for e in risky),
-        f"los dos eventos con riesgo 3 (lo fija el propio servicio). {summary(risky)}",
+        len(risky) == 4 and all(e.risk == 3 for e in risky),
+        f"los cuatro eventos con riesgo 3 (lo fija el propio servicio). {summary(risky)}",
     )
+
+
+def _recreate(service: Service, *, network: str) -> None:
+    """The agent's container removed and made again by hand, as backtide would, but on
+    ``network``; then started."""
+    name = service.jail.config.name
+    jail_docker.run(["rm", "--force", name])
+    argv = docker_create_argv(service.jail.config)
+    argv[argv.index("--network") + 1] = network
+    jail_docker.run(argv, env=token_env(service.jail.config))
+    jail_docker.run(["start", name])
+
+
+def _tamper(service: Service, tamper: Callable[[], object], what: str) -> Event | None:
+    """A fresh service and agent (the container made again by backtide), ``tamper`` under it,
+    and the Guardian's ``agent_stop {reason: exposed}`` that follows (None if none came)."""
+    name = service.jail.config.name
+    if service.process is not None and service.process.poll() is None:
+        assert service.stop() == 0
+    jail_docker.run(["rm", "--force", name])
+    service.start()
+    service.wait_ready()
+    before = len(service.events("agent_stop"))
+    tamper()
+    wait_until(
+        lambda: len(service.events("agent_stop")) > before and not service.jail.is_running(),
+        KILL_TIMEOUT,
+        what,
+        context=service.diagnosis,
+    )
+    stops = service.events("agent_stop")[before:]
+    return next((e for e in stops if e.details.get("reason") == "exposed"), None)
 
 
 def _started_at(name: str) -> str:

@@ -10,7 +10,9 @@ anything it must not see?** It is asked three times (agent.py):
 - before ``docker create``, of the planned argv (``planned_info``);
 - before ``docker start``, of ``docker container inspect``;
 - right after it, and at every cycle of the Guardian, of the running container (a container
-  recreated under backtide with one more ``-v`` is killed).
+  recreated under backtide with one more ``-v`` is killed). For a running container,
+  ``live_mount_problems`` also reads its own mount table (``/proc/<pid>/mountinfo``): a mount
+  made inside it from the host (``nsenter``) never shows in ``docker inspect``.
 
 ``exposure_problems`` returns the problems as sentences, empty when there is none. Paths are
 compared with symlinks resolved, on the host (``HostView``): a bind of ``/srv/link`` that
@@ -19,13 +21,21 @@ mount below a mounted folder would show too: the host's mount table is read for 
 it cannot be read on Linux that is a problem as well (fail closed).
 
 Only bind mounts can show the host. tmpfs mounts are private memory and are fine wherever
-they land; a Docker volume is refused (the agent gets none), and so is any other kind.
+they land; a Docker volume is refused (the agent gets none), and so is any other kind. A bind
+must be private (no mount propagation): with ``rslave`` or ``rshared`` a mount made later on
+the host would show inside.
+
+Out of scope: another container that joins the agent's namespaces (``--pid container:...``).
+Only someone with Docker can make one, and the agent has no Docker; backtide does not look
+for it.
 """
 
+import functools
 import os
-import pwd
+import posixpath
 import stat
 import sys
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -75,8 +85,26 @@ _UNCONFINED = (
     "apparmor:unconfined",
     "label=disable",
     "label:disable",
+    "label=type:spc_t",
+    "label:type:spc_t",
+    "label=type:unconfined_t",
+    "label:type:unconfined_t",
     "systempaths=unconfined",
 )
+# Mount propagation a bind may have: none. With (r)slave or (r)shared, mounts made later on the
+# host would appear inside the container.
+_PRIVATE_PROPAGATION = ("", "rprivate", "private")
+_PROPAGATIONS = frozenset({"shared", "rshared", "slave", "rslave", "private", "rprivate"})
+# What Docker itself mounts in every container (seen in the VM with Docker 29.8.2): the image,
+# the kernel's views, its own /dev and three files of /etc. Its masks of /proc and /sys come
+# from HostConfig.MaskedPaths and ReadonlyPaths. All of them inside the container.
+_CONTAINER_SHM = "/dev/shm"  # noqa: S108 - the container's own, not a temporary file
+DOCKER_OWN_MOUNTS = frozenset(
+    {
+        "/", "/proc", "/dev", "/dev/pts", "/dev/mqueue", _CONTAINER_SHM, "/sys",
+        "/sys/fs/cgroup", "/etc/hostname", "/etc/hosts", "/etc/resolv.conf",
+    }
+)  # fmt: skip
 _KERNEL_VIEWS = (PurePosixPath("/proc"), PurePosixPath("/sys"))
 
 
@@ -109,6 +137,16 @@ def agent_policy(config: AgentJailConfig) -> MountPolicy:
     )
 
 
+@dataclass(frozen=True)
+class MountEntry:
+    """One line of a ``/proc/<pid>/mountinfo``: the device (``major:minor``), the folder of
+    that device it shows (``root``) and where (``point``)."""
+
+    dev: str
+    root: str
+    point: str
+
+
 def _file_kind(path: str) -> str | None:
     """``dir``, ``file``, ``socket``, ``device`` or ``other``; None when it is not there."""
     try:
@@ -130,24 +168,46 @@ def _mount_points() -> list[str] | None:
     """Every mount point of the host (``/proc/self/mountinfo``: backtide runs in the host's
     mount namespace). None if it cannot be read on Linux; [] elsewhere (the Mac's unit tests:
     backtide only runs agents on Linux)."""
+    entries = _host_mounts()
+    return None if entries is None else [entry.point for entry in entries]
+
+
+def _host_mounts() -> list[MountEntry] | None:
+    """The host's mount table (``/proc/self/mountinfo``); see _mount_points."""
+    return _read_mountinfo("/proc/self/mountinfo")
+
+
+def _container_mounts(pid: int) -> list[MountEntry] | None:
+    """The mount table of the container whose first process is ``pid`` on the host. None if it
+    cannot be read on Linux; [] elsewhere."""
+    return _read_mountinfo(f"/proc/{pid}/mountinfo")
+
+
+def _read_mountinfo(path: str) -> list[MountEntry] | None:
     if not sys.platform.startswith("linux"):
         return []
     try:
-        with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as f:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
             text = f.read()
     except OSError:
         return None
-    return parse_mountinfo(text)
+    return parse_mountinfo_entries(text) or None  # a real mount table is never empty
 
 
 def parse_mountinfo(text: str) -> list[str]:
     """The mount points of a ``/proc/<pid>/mountinfo`` (field 5, octal escapes undone)."""
-    points = []
+    return [entry.point for entry in parse_mountinfo_entries(text)]
+
+
+def parse_mountinfo_entries(text: str) -> list[MountEntry]:
+    """Device, root and mount point of each line of a ``/proc/<pid>/mountinfo`` (fields 3 to 5,
+    octal escapes undone)."""
+    entries = []
     for line in text.splitlines():
         fields = line.split(" ")
         if len(fields) > 4:
-            points.append(_unescape(fields[4]))
-    return points
+            entries.append(MountEntry(fields[2], _unescape(fields[3]), _unescape(fields[4])))
+    return entries
 
 
 def _unescape(field_text: str) -> str:
@@ -164,12 +224,31 @@ def _unescape(field_text: str) -> str:
 
 
 def _homes() -> list[str]:
-    homes = {os.path.expanduser("~")}
-    try:
-        homes.update(entry.pw_dir for entry in pwd.getpwall())
-    except OSError:
-        pass  # the explicit list (/home, /root) still stands
+    """The homes of the local users (``/etc/passwd``) and backtide's own. Never NSS: a
+    directory service (LDAP, sssd) could be huge, slow or down, and this runs every cycle."""
+    homes = {os.path.expanduser("~"), *_local_homes()}
     return sorted(h for h in homes if h.startswith("/") and h != "/")
+
+
+@functools.cache
+def _local_homes() -> tuple[str, ...]:
+    """Read once per process: users are not added under a running service often, and the
+    explicit list (/home, /root) stands anyway."""
+    try:
+        with open("/etc/passwd", encoding="utf-8", errors="surrogateescape") as f:
+            return tuple(passwd_homes(f.read()))
+    except OSError:
+        return ()
+
+
+def passwd_homes(text: str) -> list[str]:
+    """The home folders of a ``passwd`` file (field 6), absolute and other than ``/``."""
+    homes = set()
+    for line in text.splitlines():
+        fields = line.split(":")
+        if len(fields) == 7 and fields[5].startswith("/") and fields[5] != "/":
+            homes.add(fields[5])
+    return sorted(homes)
 
 
 @dataclass(frozen=True)
@@ -180,6 +259,8 @@ class HostView:
     kind: Callable[[str], str | None] = _file_kind
     mount_points: Callable[[], list[str] | None] = _mount_points
     homes: Callable[[], list[str]] = _homes
+    host_mounts: Callable[[], list[MountEntry] | None] = _host_mounts
+    container_mounts: Callable[[int], list[MountEntry] | None] = _container_mounts
 
 
 @dataclass
@@ -190,6 +271,7 @@ class _Mount:
     read_only: bool
     name: str = ""
     origin: str = field(default="Mounts", compare=False)
+    propagation: str = ""
 
 
 def exposure_problems(
@@ -270,6 +352,7 @@ def _mounts(info: dict[str, Any], host: dict[str, Any]) -> tuple[list[_Mount], l
                 destination=str(entry.get("Destination") or ""),
                 read_only=entry.get("RW") is False,
                 name=str(entry.get("Name") or ""),
+                propagation=str(entry.get("Propagation") or ""),
             )
         )
     for bind in host.get("Binds") or []:
@@ -289,6 +372,7 @@ def _mounts(info: dict[str, Any], host: dict[str, Any]) -> tuple[list[_Mount], l
                 destination=str(entry.get("Target") or ""),
                 read_only=entry.get("ReadOnly") is True,
                 origin="HostConfig.Mounts",
+                propagation=str((entry.get("BindOptions") or {}).get("Propagation") or ""),
             )
         )
     tmpfs = host.get("Tmpfs") or {}
@@ -309,6 +393,7 @@ def parse_volume(spec: str) -> _Mount | None:
         return None
     options = parts[2].split(",") if len(parts) == 3 else []
     kind = "bind" if parts[0].startswith("/") else "volume"
+    propagation = [option for option in options if option in _PROPAGATIONS]
     return _Mount(
         kind,
         parts[0] if kind == "bind" else "",
@@ -316,6 +401,7 @@ def parse_volume(spec: str) -> _Mount | None:
         "ro" in options,
         name="" if kind == "bind" else parts[0],
         origin="-v",
+        propagation=propagation[-1] if propagation else "",
     )
 
 
@@ -330,8 +416,8 @@ class _Context:
         if mount.kind == "tmpfs":
             return []  # private memory: it shows nothing of the host, wherever it lands
         problems = []
-        dest = mount.destination
-        if PurePosixPath(dest or "/") == PurePosixPath("/"):
+        dest = _normal(mount.destination)
+        if dest in ("", "/"):
             problems.append(f"something is mounted over the container's root: {mount.source!r}")
         if any(_within(dest, view) for view in _KERNEL_VIEWS):
             problems.append(f"{dest} is mounted from the host over the kernel's /proc or /sys")
@@ -345,6 +431,11 @@ class _Context:
             return problems
         if mount.kind != "bind":
             return [*problems, f"a {mount.kind or 'mount of no type'} is mounted at {dest}"]
+        if mount.propagation not in _PRIVATE_PROPAGATION:
+            problems.append(
+                f"{dest} is mounted with propagation {mount.propagation}: mounts made later on "
+                "the host would show inside"
+            )
         expected = self._expected(mount)
         if expected is None:
             problems.append(
@@ -356,24 +447,28 @@ class _Context:
         return problems + self._path_problems(mount.source, dest, expected=expected is not None)
 
     def _expected(self, mount: _Mount) -> ExpectedBind | None:
-        real = self.host.realpath(mount.source)
+        real = self.host.realpath(_normal(mount.source))
+        dest = _normal(mount.destination)
         for bind in self.policy.binds:
-            if bind.destination == mount.destination and self.host.realpath(bind.source) == real:
+            if _normal(bind.destination) == dest and self.host.realpath(bind.source) == real:
                 return bind
         return None
 
     def _path_problems(self, source: str, dest: str, *, expected: bool) -> list[str]:
         """What a host path mounted at ``dest`` would show, symlinks resolved."""
-        real = self.host.realpath(source)
+        real = self.host.realpath(_normal(source))
         shown = f"{source}" if real == source else f"{source} (really {real})"
         problems = []
         for item in self.policy.protected:
             protected = self.host.realpath(str(item.path))
             if _within(protected, real):
                 problems.append(f"{shown}, mounted at {dest}, holds {item.label} ({item.path})")
-            elif _within(real, protected) and not (item.inside_ok and expected):
+            elif _within(real, protected) and not (expected and _allowed(item, protected, real)):
                 problems.append(f"{shown}, mounted at {dest}, is inside {item.label}")
-        for root in (*SENSITIVE_ROOTS, *self.host.homes()):
+        # A home inside one of the agent's own folders (an account made for the agent) is the
+        # agent's own: it already sees it.
+        homes = [home for home in self.host.homes() if not (expected and _within(home, real))]
+        for root in (*SENSITIVE_ROOTS, *homes):
             if _within(root, real):
                 problems.append(f"{shown}, mounted at {dest}, would show the host's {root}")
                 break
@@ -409,12 +504,106 @@ class _Context:
         return self._points
 
 
+def _allowed(item: Protected, protected: str, real: str) -> bool:
+    """``real`` is exactly one of the folders ``item`` allows inside it: at the same place
+    below the protected folder (``protected``, resolved) as by name. A folder allowed by name
+    that resolves to another one of the protected folder is not allowed."""
+    for folder in item.allowed_inside:
+        place = PurePosixPath(protected) / PurePosixPath(folder).relative_to(str(item.path))
+        if real == str(place):
+            return True
+    return False
+
+
+def _normal(path: str) -> str:
+    """``path`` without ``.``, ``..``, repeated or trailing slashes (``//proc/`` is ``/proc``).
+    Empty stays empty."""
+    if not path:
+        return path
+    normal = posixpath.normpath(path)
+    return "/" + normal.lstrip("/") if normal.startswith("/") else normal
+
+
 def _within(path: str, folder: object) -> bool:
     """``path`` is ``folder`` or inside it (by name: both resolved already)."""
     try:
         return PurePosixPath(path).is_relative_to(PurePosixPath(str(folder)))
     except (TypeError, ValueError):
         return False
+
+
+# --- the running container: what its own mount table shows -------------------------------
+
+
+def live_mount_problems(
+    info: dict[str, Any], policy: MountPolicy, host: HostView | None = None
+) -> list[str]:
+    """What the running container of ``info`` (``docker container inspect``) really has
+    mounted, read from ``/proc/<State.Pid>/mountinfo``, that it must not: a mount point
+    nothing asked for, one mounted over another, or one of the agent's folders that is not
+    the host folder it should be. Mounts made inside the container from the host (``nsenter
+    -t <pid> -m mount ...``) never show in ``docker inspect``: they do here. Empty when nothing
+    is wrong; what cannot be read is a problem (on Linux: elsewhere there is nothing to read)."""
+    host = host or HostView()
+    state = info.get("State")
+    pid = state.get("Pid") if isinstance(state, dict) else None
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return [f"the running container has no process to look at (State.Pid is {pid!r})"]
+    entries = host.container_mounts(pid)
+    if entries is None:
+        return [f"the container's own mount table (/proc/{pid}/mountinfo) cannot be read"]
+    if not entries:
+        return []  # not Linux: the Mac's unit tests
+    hostconfig = info.get("HostConfig")
+    hostconfig = hostconfig if isinstance(hostconfig, dict) else {}
+    allowed = set(DOCKER_OWN_MOUNTS)
+    allowed.update(_normal(bind.destination) for bind in policy.binds)
+    for key in ("Tmpfs", "MaskedPaths", "ReadonlyPaths"):
+        value = hostconfig.get(key) or ()
+        allowed.update(_normal(str(path)) for path in value if isinstance(path, str))
+    problems = []
+    counts = Counter(_normal(entry.point) for entry in entries)
+    for point, times in sorted(counts.items()):
+        if point not in allowed:
+            problems.append(
+                f"{point} is mounted inside the container and nothing asked for it (a mount "
+                "made from the host, with nsenter?)"
+            )
+        elif times > 1:
+            problems.append(f"{point} is mounted {times} times inside the container")
+    by_point = {_normal(entry.point): entry for entry in entries}
+    host_table = host.host_mounts()
+    for bind in policy.binds:
+        dest = _normal(bind.destination)
+        entry = by_point.get(dest)
+        if entry is None:
+            problems.append(f"{dest} is not mounted in the container")
+            continue
+        where = _host_location(host.realpath(bind.source), host_table)
+        if where is None:
+            problems.append(f"cannot tell where {bind.source} is on the host: its mounts unread")
+        elif (entry.dev, _normal(entry.root)) != where:
+            problems.append(
+                f"{dest} in the container is not {bind.source}: it shows {entry.root} of "
+                f"device {entry.dev}"
+            )
+    return problems
+
+
+def _host_location(real: str, table: list[MountEntry] | None) -> tuple[str, str] | None:
+    """The device and folder of that device (``mountinfo``'s root) that the host path ``real``
+    is: what a bind of it shows as root in the container's mount table."""
+    if not table:
+        return None
+    best: MountEntry | None = None
+    for entry in table:  # the last of the longest: the mount on top
+        point = _normal(entry.point)
+        if _within(real, point) and (best is None or len(point) >= len(_normal(best.point))):
+            best = entry
+    if best is None:
+        return None
+    below = PurePosixPath(real).relative_to(_normal(best.point))
+    return best.dev, _normal(str(PurePosixPath(best.root) / below))
 
 
 # --- the planned container: docker_create_argv as docker inspect would show it ---------------
@@ -524,6 +713,7 @@ def _listed(mount: _Mount) -> dict[str, Any]:
         "Destination": mount.destination,
         "RW": not mount.read_only,
         "Name": mount.name,
+        "Propagation": mount.propagation,
     }
 
 
@@ -544,4 +734,5 @@ def _mount_option(value: str) -> dict[str, Any]:
         "Destination": fields.get("target", fields.get("destination", fields.get("dst", ""))),
         "RW": not read_only,
         "Name": source if kind == "volume" else "",
+        "Propagation": fields.get("bind-propagation", ""),
     }

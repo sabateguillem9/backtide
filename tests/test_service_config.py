@@ -680,24 +680,39 @@ def test_the_agent_is_told_what_it_must_never_see(layout: Path) -> None:
         volume_image=layout / "volume.img",
         max_volume_bytes=10**9,
     )
-    protected = {item.path: item.inside_ok for item in config.jail_config().protected}
+    protected = {item.path: item.allowed_inside for item in config.jail_config().protected}
     assert protected == {
-        state: True,  # its config and CA folders live there
-        state / "blackbox.db": False,
-        state / "blackbox.key": False,
-        state / "blackbox.checkpoint": False,
-        state / "gateway.token": False,
-        state / "control.sock": False,
-        state / "backtide.lock": False,
-        state / "rules.toml": False,
-        state / "keys": False,
-        state / "proxy-channel": False,
-        state / "proxy-ca": False,
-        state / "sensor": False,
-        layout / "volume": True,  # its workspace lives there
-        layout / "volume" / "snapshots": False,
-        layout / "volume.img": False,
+        state: (state / "openclaw", state / "agent-ca"),  # exactly its config and CA folders
+        state / "blackbox.db": (),
+        state / "blackbox.key": (),
+        state / "blackbox.checkpoint": (),
+        state / "gateway.token": (),
+        state / "control.sock": (),
+        state / "backtide.lock": (),
+        state / "rules.toml": (),
+        state / "keys": (),
+        state / "proxy-channel": (),
+        state / "proxy-ca": (),
+        state / "sensor": (),
+        layout / "volume": (layout / "volume" / "workspace" / "agente",),  # its workspace only
+        layout / "volume" / "snapshots": (),
+        layout / "volume.img": (),
     }
+
+
+def test_an_agent_config_folder_outside_the_state_folder_is_not_allowed_inside_it(
+    layout: Path,
+) -> None:
+    state = layout / "state"
+    config = ServiceConfig(
+        state_dir=state,
+        volume=layout / "volume",
+        gateway_token=Secret(TOKEN),
+        agent={"config_dir": layout / "elsewhere" / "openclaw"},
+    )
+    (first, *_) = config.jail_config().protected
+    assert first.path == state
+    assert first.allowed_inside == (state / "agent-ca",)
 
 
 # --- [sensor] (T07-3, docs/23) -----------------------------------------------------------------

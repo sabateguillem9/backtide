@@ -56,7 +56,9 @@ NO_NETWORK = Reply(stderr="Error response from daemon: network x not found\n", r
 DAEMON_DOWN = Reply(stderr="Cannot connect to the Docker daemon\n", returncode=1)
 READY_LOGS = Reply(stdout="[gateway] starting...\n", stderr="x [gateway] ready\n")
 HEALTHY = Reply(stdout='{"ok":true,"status":"live"}')
-CONTAINER_INFO = Reply(json.dumps({"Id": "c0ffee", "Config": {}, "HostConfig": {}}))
+ID_A = "c0ffee" * 10 + "c0ff"  # docker's full ids: 64 hex characters
+ID_B = "beef" * 16
+CONTAINER_INFO = Reply(json.dumps({"Id": ID_A, "Config": {}, "HostConfig": {}}))
 IMAGE_ENV = Reply(json.dumps(["PATH=/usr/bin:/bin", "NODE_ENV=production"]))
 OSC52 = "\x1b]52;c;ZWNobyBoYWNrZWQ=\x07"  # "write this to the clipboard", in a terminal
 
@@ -124,15 +126,19 @@ def fake_docker(monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
 
 @dataclass
 class ContainerCheck:
-    """Stands in for verify.container_problems: records its inputs, answers ``problems``."""
+    """Stands in for verify.container_problems: records its inputs, answers ``problems`` (or,
+    if given, one list of ``answers`` per call, the last one repeating)."""
 
     problems: list[str]
     calls: list[tuple[dict, object, list[str]]]
+    answers: list[list[str]] | None = None
 
     def __call__(
         self, config: AgentJailConfig, info: dict, *, seccomp_profile: object, image_env: list[str]
     ) -> list[str]:
         self.calls.append((info, seccomp_profile, image_env))
+        if self.answers:
+            return list(self.answers[0] if len(self.answers) == 1 else self.answers.pop(0))
         return self.problems
 
 
@@ -156,6 +162,14 @@ class ExposureCheck:
     def __call__(self, info: dict, policy: object) -> list[str]:
         self.infos.append(info)
         return list(self.answers[0] if len(self.answers) == 1 else self.answers.pop(0))
+
+
+@pytest.fixture(autouse=True)
+def live_check(monkeypatch: pytest.MonkeyPatch) -> ExposureCheck:
+    """Stands in for mounts.live_mount_problems (it reads /proc of the VM's containers)."""
+    check = ExposureCheck(answers=[[]], infos=[])
+    monkeypatch.setattr(agent_module, "live_mount_problems", check)
+    return check
 
 
 @pytest.fixture(autouse=True)
@@ -479,7 +493,9 @@ def test_start_checks_the_container_against_the_config(
     ready_jail: AgentJail, fake_docker: FakeDocker, container_check: ContainerCheck
 ) -> None:
     ready_jail.start()
-    ((info, seccomp_profile, image_env),) = container_check.calls
+    before, after = container_check.calls  # before `docker start`, and right after it
+    assert after == before
+    info, seccomp_profile, image_env = before
     assert info == json.loads(CONTAINER_INFO.stdout)
     assert seccomp_profile == json.loads(ready_jail.config.seccomp_profile.read_text())
     assert image_env == json.loads(IMAGE_ENV.stdout)
@@ -578,26 +594,153 @@ def test_start_says_when_the_exposed_container_could_not_be_killed(
 ) -> None:
     exposure_check.answers = [[], ["exposed"]]
     fake_docker.reply("kill", DAEMON_DOWN)
-    with pytest.raises(ExposedJail, match="could not be killed"):
+    with pytest.raises(ExposedJail, match="could not be killed") as e:
         ready_jail.start()
+    assert e.value.still_running
+
+
+def running_info(container_id: str = ID_A, **state: object) -> Reply:
+    return Reply(
+        json.dumps(
+            {"Id": container_id, "State": {"Running": True, "Pid": 77, **state}, "HostConfig": {}}
+        )
+    )
 
 
 def test_running_exposure(
-    jail: AgentJail, fake_docker: FakeDocker, exposure_check: ExposureCheck
+    ready_jail: AgentJail, fake_docker: FakeDocker, exposure_check: ExposureCheck
 ) -> None:
-    running = {"State": {"Running": True}, "HostConfig": {}}
-    stopped = {"State": {"Running": False}, "HostConfig": {}}
+    ready_jail.start()
+    exposure_check.infos.clear()
     exposure_check.answers = [["exposed"]]
+    stopped = {"Id": ID_A, "State": {"Running": False}, "HostConfig": {}}
     fake_docker.reply(
         "container", "inspect", "--format", "{{json .}}",
-        Reply(json.dumps(running)), Reply(json.dumps(stopped)), NO_CONTAINER, DAEMON_DOWN,
+        running_info(), Reply(json.dumps(stopped)), NO_CONTAINER, DAEMON_DOWN,
     )  # fmt: skip
-    assert jail.running_exposure() == ["exposed"]
-    assert jail.running_exposure() == []  # a stopped container runs nothing
-    assert jail.running_exposure() == []  # no container at all
-    (problem,) = jail.running_exposure()
+    assert ready_jail.running_exposure() == ["exposed"]
+    assert ready_jail.running_exposure() == []  # a stopped container runs nothing
+    assert ready_jail.running_exposure() == []  # no container at all
+    (problem,) = ready_jail.running_exposure()
     assert problem.startswith("the agent's container cannot be inspected")
-    assert exposure_check.infos == [running]
+    assert exposure_check.infos == [json.loads(running_info().stdout)]
+
+
+# After the review (T14a, M1): the running container is still the jail backtide started
+
+
+def test_a_container_recreated_under_backtide_is_seen_by_its_id(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    """Same mounts, so the mount check says nothing; but it is another container."""
+    ready_jail.start()
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", running_info(ID_B))
+    (problem,) = ready_jail.running_exposure()
+    assert "not the container backtide started" in problem
+    assert "c0ffee" in problem and "beef" in problem
+
+
+def test_a_running_container_this_backtide_never_started_is_a_problem(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", running_info())
+    problems = ready_jail.running_exposure()
+    assert any("this backtide did not start it" in p for p in problems), problems
+
+
+def test_the_running_container_is_compared_with_the_jail_every_time(
+    ready_jail: AgentJail,
+    fake_docker: FakeDocker,
+    container_check: ContainerCheck,
+) -> None:
+    """`docker update --restart always`, a --network bridge...: what verify.py finds is a
+    problem of the running container too, checked against what start() checked it with."""
+    ready_jail.start()
+    profile = json.loads(ready_jail.config.seccomp_profile.read_text())
+    container_check.calls.clear()
+    container_check.problems = ["HostConfig.RestartPolicy.Name is 'always', not 'no'"]
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", running_info())
+    fake_docker.reply("image", "inspect", DAEMON_DOWN)  # never asked again: the env is cached
+    calls_before = len(fake_docker.calls)
+    problems = ready_jail.running_exposure()
+    assert problems == [
+        "it is no longer the jail: HostConfig.RestartPolicy.Name is 'always', not 'no'"
+    ]
+    ((info, seccomp_profile, image_env),) = container_check.calls
+    assert info == json.loads(running_info().stdout)
+    assert seccomp_profile == profile
+    assert image_env == json.loads(IMAGE_ENV.stdout)
+    assert [c.args[0] for c in fake_docker.calls[calls_before:]] == ["container"]
+
+
+def test_the_running_container_s_own_mount_table_is_read(
+    ready_jail: AgentJail, fake_docker: FakeDocker, live_check: ExposureCheck
+) -> None:
+    ready_jail.start()
+    live_check.infos.clear()
+    live_check.answers = [["/mnt/caja is mounted inside the container"]]
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", running_info())
+    assert ready_jail.running_exposure() == ["/mnt/caja is mounted inside the container"]
+    assert live_check.infos == [json.loads(running_info().stdout)]
+
+
+def test_start_kills_a_container_swapped_between_the_check_and_the_start(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    """Checked as c0ffee; what runs after `docker start` is another container."""
+    fake_docker.reply(
+        "container", "inspect", "--format", "{{json .}}", CONTAINER_INFO, running_info(ID_B)
+    )
+    with pytest.raises(ExposedJail, match="killed right after it started.*not the container"):
+        ready_jail.start()
+    assert ["kill", "agent-under-test"] in fake_docker.commands()
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", running_info(ID_B))
+    assert any("did not start it" in p for p in ready_jail.running_exposure())  # never pinned
+
+
+def test_start_kills_a_container_that_is_not_the_jail_once_started(
+    ready_jail: AgentJail, fake_docker: FakeDocker, container_check: ContainerCheck
+) -> None:
+    container_check.answers = [[], ["HostConfig.NetworkMode is 'bridge'"]]
+    with pytest.raises(ExposedJail, match="killed right after it started.*no longer the jail"):
+        ready_jail.start()
+    assert ["kill", "agent-under-test"] in fake_docker.commands()
+
+
+def test_start_refuses_a_container_with_an_unreadable_id(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    info = Reply(json.dumps({"Id": "not an id", "Config": {}, "HostConfig": {}}))
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", info)
+    with pytest.raises(JailError, match="unexpected id"):
+        ready_jail.start()
+    assert ["start", ready_jail.config.name] not in fake_docker.commands()
+
+
+def test_a_check_that_crashes_counts_as_a_problem(
+    ready_jail: AgentJail,
+    fake_docker: FakeDocker,
+    exposure_check: ExposureCheck,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B1: an unexpected exception in the check never lets the agent run on."""
+    ready_jail.start()
+
+    def crash(info: dict, policy: object) -> list[str]:
+        if "State" in info:  # the running container's: the check before the start passes
+            raise ValueError("embedded null byte")
+        return []
+
+    monkeypatch.setattr(agent_module, "exposure_problems", crash)
+    fake_docker.reply("container", "inspect", "--format", "{{json .}}", running_info())
+    (problem,) = ready_jail.running_exposure()
+    assert "the check of the agent's container failed: ValueError: embedded null byte" in problem
+    fake_docker.reply(
+        "container", "inspect", "--format", "{{json .}}", CONTAINER_INFO, running_info()
+    )
+    with pytest.raises(ExposedJail, match="killed right after it started.*check.*failed"):
+        ready_jail.start()
+    assert ["kill", "agent-under-test"] in fake_docker.commands()
 
 
 def test_start_refuses_a_missing_container(ready_jail: AgentJail, fake_docker: FakeDocker) -> None:
@@ -1132,6 +1275,44 @@ def test_create_and_start_refuse_a_symlinked_ca(
     ready_jail.config.ca_dir.rmdir()
     ready_jail.config.ca_dir.symlink_to(tmp_path / "root")
     with pytest.raises(JailError, match="not a directory"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "just text\n",
+        CERTIFICATE + "and a note after it\n",
+        "-----BEGIN EC PARAMETERS-----\nBggq\n-----END EC PARAMETERS-----\n" + CERTIFICATE,
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIE\n-----END ENCRYPTED PRIVATE KEY-----\n",
+    ],
+)
+def test_create_and_start_accept_only_certificates_in_the_ca(
+    ready_jail: AgentJail, fake_docker: FakeDocker, method: str, content: str
+) -> None:
+    """B4: only PEM CERTIFICATE blocks, nothing else at all."""
+    ready_jail.config.ca_file.write_text(content)
+    with pytest.raises(JailError, match="not just a certificate"):
+        getattr(ready_jail, method)()
+    assert fake_docker.calls == []
+
+
+def test_two_certificates_are_fine(ready_jail: AgentJail, fake_docker: FakeDocker) -> None:
+    ready_jail.config.ca_file.write_text(CERTIFICATE + CERTIFICATE)
+    ready_jail.create()
+
+
+@pytest.mark.parametrize("method", ["create", "start"])
+@pytest.mark.parametrize("which", ["ca_file", "config_file"])
+def test_create_and_start_refuse_a_hard_link(
+    ready_jail: AgentJail, fake_docker: FakeDocker, tmp_path: Path, method: str, which: str
+) -> None:
+    """B4: a second name for the file (a hard link to a secret, made before) is refused."""
+    os.link(getattr(ready_jail.config, which), tmp_path / "second-name")
+    with pytest.raises(JailError, match="hard link"):
         getattr(ready_jail, method)()
     assert fake_docker.calls == []
 

@@ -1408,9 +1408,13 @@ que existen. Con una configuración cuyo config_dir es, por un enlace simbólico
 `backtide vigilar` no arranca, dice qué vería el agente y no crea ningún contenedor. Y con el \
 contenedor del agente recreado, con el servicio en marcha, con un `-v` más de la carpeta de \
 estado: el siguiente ciclo del Guardian lo mata (agent_stop {reason: exposed}, riesgo 3) y, al \
-volver a arrancar el servicio, se niega a arrancarlo (agent_start_failed {exposed})."""
+volver a arrancar el servicio, se niega a arrancarlo (agent_start_failed {exposed}). Tras la \
+revisión, dos que conservan los mismos montajes: el contenedor recreado en la red `bridge` de \
+Docker (salida directa sin proxy, invariante 3) y el que sigue en marcha alterado con `docker \
+update --restart always`. El siguiente ciclo mata a los dos: ya no es el contenedor que backtide \
+arrancó, o ya no es la jaula."""
 inspired_by = "Las raíces protegidas de nono (docs/31): negarse a arrancar si la configuración expone el propio estado"
-invariants = [1, 2, 7]
+invariants = [1, 2, 3, 7]
 status = "ready"
 [scenario.expect]
 stopped = "yes"

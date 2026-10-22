@@ -264,6 +264,7 @@ class FakeJail:
         self.on_stop: Callable[[], None] | None = None  # runs in the middle of `docker stop`
         self.on_wait_ready: Callable[[], None] | None = None  # ... and of `wait_ready`
         self.exposure: list[str] = []  # what running_exposure() answers while it runs (T14a)
+        self.exposure_error: Exception | None = None  # ... or what it raises
 
     def ensure_network(self) -> None:
         self.log.append("jail.ensure_network")
@@ -289,6 +290,8 @@ class FakeJail:
         return self.running
 
     def running_exposure(self) -> list[str]:
+        if self.exposure_error is not None:
+            raise self.exposure_error
         return list(self.exposure) if self.running else []
 
     def start(self) -> None:
@@ -1036,6 +1039,66 @@ def test_a_cycle_that_cannot_stop_an_exposed_agent_says_so(running: World) -> No
     assert failed.details["reason"] == "exposed"
     assert running.guardian.agent_state is AgentState.RUNNING
     assert running.alerts.titled("sigue en marcha")
+
+
+def test_a_mount_check_that_crashes_kills_the_agent_and_the_cycle_goes_on(
+    running: World,
+) -> None:
+    """B1 of the review: an unexpected exception is a problem (the agent is killed, recorded),
+    never a pass; the watcher and the snapshot still get their turn."""
+    running.jail.exposure_error = ValueError("embedded null byte")
+    running.volume.write()
+    result = running.guardian.cycle()
+    assert running.log[0] == "jail.kill"
+    stop = running.only("agent_stop")
+    assert stop.risk == 3
+    assert stop.details["reason"] == "exposed"
+    (problem,) = stop.details["problems"]
+    assert "ValueError: embedded null byte" in problem
+    assert result.changed and result.snapshot is not None  # the rest of the cycle ran
+
+
+def test_an_exposed_agent_whose_kill_raises_something_unexpected(running: World) -> None:
+    running.jail.exposure = ["/srv/state is mounted at /mnt"]
+    running.jail.kill_error = RuntimeError("a bug in the kill")  # type: ignore[assignment]
+    running.jail.stop_error = running.jail.remove_error = JailError("no")
+    running.volume.write()
+    result = running.guardian.cycle()
+    failed = running.only("agent_stop_failed")
+    assert "a bug in the kill" in failed.details["error"]
+    assert running.guardian.agent_state is AgentState.RUNNING
+    assert result.changed and result.snapshot is not None
+
+
+def test_a_cycle_whose_exposure_step_itself_fails_still_runs_the_rest(
+    running: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever fails in that step is recorded and alerted as a failed step; the cycle goes on."""
+
+    def broken() -> None:
+        raise RuntimeError("a bug in the step")
+
+    monkeypatch.setattr(running.guardian, "_check_exposure", broken)
+    running.volume.write()
+    result = running.guardian.cycle()
+    failed = running.only("cycle_failed")
+    assert failed.details["step"] == "exposure"
+    assert running.alerts.titled("Falló un ciclo")
+    assert result.changed and result.snapshot is not None
+
+
+def test_an_exposed_agent_that_cannot_be_stopped_is_not_alerted_every_cycle(
+    running: World,
+) -> None:
+    """B7: recorded every cycle, alerted once per REPEAT_ALERT_EVERY."""
+    running.jail.exposure = ["the agent's container cannot be inspected: daemon down"]
+    running.jail.kill_error = JailError("kill failed")
+    running.jail.stop_error = JailError("stop failed")
+    running.jail.remove_error = JailError("rm failed")
+    for _ in range(3):
+        running.guardian.cycle()
+    assert len(running.events("agent_stop_failed")) == 3
+    assert len(running.alerts.titled("sigue en marcha")) == 1
 
 
 def test_no_change_means_no_snapshot(running: World) -> None:

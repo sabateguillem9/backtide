@@ -22,7 +22,7 @@ from uuid import uuid4
 
 import pytest
 
-from backtide.jail import AgentJail, JailError, docker
+from backtide.jail import AgentJail, JailError, docker, mounts
 from backtide.jail.config import (
     AGENT_DIR,
     AGENT_SUBDIRS,
@@ -316,6 +316,18 @@ def test_only_the_workspace_the_config_tmp_and_the_sys_masks_are_added(running_a
     for mask in sys_masks:  # also fresh tmpfs: no host path shows in the mount table
         assert by_point[mask]["fs"] == "tmpfs" and by_point[mask]["root"] == "/", mask
         assert {"ro", "nosuid", "nodev", "noexec"} <= set(by_point[mask]["options"]), mask
+
+
+def test_the_running_jail_passes_the_check_of_every_cycle(running_agent) -> None:
+    """T14a, after the review: the real container is the very one start() checked, still the
+    jail, and its own mount table, read from the host without root, holds only what Docker and
+    the jail asked for. So the check every Guardian cycle runs finds nothing."""
+    assert running_agent.jail.running_exposure() == []
+    info = _inspect_container(running_agent.name)
+    entries = mounts._container_mounts(info["State"]["Pid"])
+    assert entries, "the container's mount table must be readable from the host"
+    assert {str(CONTAINER_WORKSPACE), str(CONTAINER_CONFIG_DIR)} <= {e.point for e in entries}
+    assert mounts.live_mount_problems(info, mounts.agent_policy(running_agent.jail.config)) == []
 
 
 # What the agent could read about its own volume in /sys. Prints four sections separated by

@@ -18,9 +18,13 @@ import pytest
 from backtide.jail.config import AgentJailConfig, Protected, docker_create_argv
 from backtide.jail.mounts import (
     HostView,
+    MountEntry,
     agent_policy,
     exposure_problems,
+    live_mount_problems,
     parse_mountinfo,
+    parse_mountinfo_entries,
+    passwd_homes,
     planned_info,
 )
 
@@ -33,14 +37,14 @@ CONFIG_DIR = STATE / "openclaw"
 CA_DIR = STATE / "agent-ca"
 AGENT_DIR = WORKSPACE / "agente"
 PROTECTED = (
-    Protected("backtide's state folder", STATE, inside_ok=True),
+    Protected("backtide's state folder", STATE, allowed_inside=(CONFIG_DIR, CA_DIR)),
     Protected("the black box", STATE / "blackbox.db"),
     Protected("the black box's key", STATE / "blackbox.key"),
     Protected("the control socket", STATE / "control.sock"),
     Protected("the providers' real keys", STATE / "keys"),
     Protected("the proxy's channel", STATE / "proxy-channel"),
     Protected("the proxy's CA and its key", STATE / "proxy-ca"),
-    Protected("the snapshot volume", VOLUME, inside_ok=True),
+    Protected("the snapshot volume", VOLUME, allowed_inside=(AGENT_DIR,)),
     Protected("the snapshots", VOLUME / "snapshots"),
 )
 
@@ -104,6 +108,39 @@ GOOD: dict[str, Any] = {
 }
 
 
+# The host: the system disk at /, the snapshot volume (its own btrfs) at VOLUME.
+HOST_TABLE = (
+    MountEntry("0:35", "/root", "/"),
+    MountEntry("0:22", "/", "/proc"),
+    MountEntry("0:54", "/", str(VOLUME)),
+)
+# What /proc/<pid>/mountinfo of the jail shows (Docker 29.8.2 in the VM): Docker's own mounts,
+# the three binds, the tmpfs and the masks of /proc and /sys.
+JAIL_PID = 4242
+JAIL_TABLE = [
+    MountEntry("0:64", "/", "/"),
+    MountEntry("0:76", "/", "/proc"),
+    MountEntry("0:77", "/", "/dev"),
+    MountEntry("0:78", "/", "/dev/pts"),
+    MountEntry("0:79", "/", "/sys"),
+    MountEntry("0:30", "/system.slice/docker-x.scope", "/sys/fs/cgroup"),
+    MountEntry("0:74", "/", "/dev/mqueue"),
+    MountEntry("0:80", "/", "/dev/shm"),
+    MountEntry("0:81", "/", "/tmp"),
+    MountEntry("0:54", "/workspace/agente", "/workspace"),
+    MountEntry("0:35", "/root/srv/bt/state/openclaw", "/config"),
+    MountEntry("0:35", "/root/srv/bt/state/agent-ca", "/etc/backtide-ca"),
+    MountEntry("0:35", "/var/lib/docker/containers/x/hostname", "/etc/hostname"),
+    MountEntry("0:35", "/var/lib/docker/containers/x/hosts", "/etc/hosts"),
+    MountEntry("0:35", "/var/lib/docker/containers/x/resolv.conf", "/etc/resolv.conf"),
+    MountEntry("0:82", "/", "/sys/fs/btrfs"),
+    MountEntry("0:83", "/", "/sys/devices/virtual/block"),
+    MountEntry("0:76", "/sys", "/proc/sys"),
+    MountEntry("0:77", "/null", "/proc/kcore"),
+    MountEntry("0:84", "/", "/sys/firmware"),
+]
+
+
 @dataclass
 class FakeHost:
     """The host as mounts.py sees it: symlinks (path prefix -> target), kinds and mounts."""
@@ -112,6 +149,9 @@ class FakeHost:
     kinds: dict[str, str] = field(default_factory=dict)
     points: list[str] | None = field(default_factory=lambda: ["/", "/proc", "/srv/bt/volume"])
     home_dirs: list[str] = field(default_factory=lambda: ["/home/alice", "/root"])
+    # The host's mount table (device, root, mount point) and the container's, by its pid.
+    table: list[MountEntry] | None = field(default_factory=lambda: list(HOST_TABLE))
+    inside: dict[int, list[MountEntry] | None] = field(default_factory=dict)
 
     def realpath(self, path: str) -> str:
         for link, target in self.links.items():
@@ -125,6 +165,8 @@ class FakeHost:
             kind=lambda path: self.kinds.get(path, "dir"),
             mount_points=lambda: self.points,
             homes=lambda: self.home_dirs,
+            host_mounts=lambda: self.table,
+            container_mounts=lambda pid: self.inside.get(pid),
         )
 
 
@@ -275,7 +317,11 @@ def test_real_symlinks_on_disk(tmp_path: Path) -> None:
                 ca_dir=state / "agent-ca",
                 gateway_token=TOKEN,
                 protected=(
-                    Protected("backtide's state folder", state, inside_ok=True),
+                    Protected(
+                        "backtide's state folder",
+                        state,
+                        allowed_inside=(state / "openclaw", state / "agent-ca"),
+                    ),
                     Protected("the keys", state / "keys"),
                 ),
             )
@@ -527,3 +573,250 @@ def test_protected_must_be_protected_paths() -> None:
         )
     with pytest.raises(ValueError, match="absolute"):
         Protected("x", Path("relative"))
+
+
+# --- after the review (T14a) ----------------------------------------------------------------
+
+# B3: inside the state folder and the volume only the agent's own folders, by exact path.
+
+
+@pytest.mark.parametrize(
+    "inside",
+    [
+        STATE / "workspace.restore",
+        STATE / ".incoming-1",
+        STATE / ".trash-2",
+        STATE / "something-new",
+        VOLUME / "workspace",  # the whole workspace, not only agente/
+        VOLUME / ".incoming-3",
+    ],
+)
+def test_nothing_but_the_agent_s_own_folders_may_come_from_inside_backtide_s(
+    cfg: AgentJailConfig, inside: Path
+) -> None:
+    found = check(cfg, with_mount(str(inside), "/mnt/x"))
+    assert any("is inside" in p for p in found), found
+
+
+def test_the_agent_s_config_folder_redirected_to_another_folder_of_the_state(
+    cfg: AgentJailConfig,
+) -> None:
+    """By name it is the allowed folder, but it resolves to another one of the state folder."""
+    host = FakeHost(links={str(CONFIG_DIR): str(STATE / ".incoming-1")})
+    found = check(cfg, GOOD, host)
+    assert any("is inside backtide's state folder" in p for p in found), found
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({"config_dir": STATE / "workspace.restore"}, "lies inside backtide's state folder"),
+        ({"ca_dir": STATE / ".trash-1"}, "lies inside backtide's state folder"),
+        ({"workspace": VOLUME / "other"}, "lies inside the snapshot volume"),
+    ],
+)
+def test_the_jail_config_allows_only_the_agent_s_own_folders_inside(
+    changes: dict[str, Path], expected: str
+) -> None:
+    options: dict[str, Any] = {
+        "workspace": WORKSPACE,
+        "config_dir": CONFIG_DIR,
+        "ca_dir": CA_DIR,
+        "gateway_token": TOKEN,
+        "protected": PROTECTED,
+        **changes,
+    }
+    with pytest.raises(ValueError, match=expected):
+        AgentJailConfig(**options)
+
+
+def test_allowed_inside_must_be_inside() -> None:
+    with pytest.raises(ValueError, match="inside"):
+        Protected("x", STATE, allowed_inside=(ROOT / "elsewhere",))
+    with pytest.raises(ValueError, match="inside"):
+        Protected("x", STATE, allowed_inside=(STATE,))
+
+
+# B5: the propagation of each bind, and what the container's own mount table shows.
+
+
+@pytest.mark.parametrize("propagation", ["rshared", "shared", "rslave", "slave"])
+def test_a_bind_that_propagates_mounts_is_refused(cfg: AgentJailConfig, propagation: str) -> None:
+    info = copy.deepcopy(GOOD)
+    info["Mounts"][1]["Propagation"] = propagation  # /workspace
+    found = check(cfg, info)
+    assert any(f"propagation {propagation}" in p and "/workspace" in p for p in found), found
+
+
+@pytest.mark.parametrize("propagation", ["", "rprivate", "private"])
+def test_a_private_bind_is_fine(cfg: AgentJailConfig, propagation: str) -> None:
+    info = copy.deepcopy(GOOD)
+    info["Mounts"][1]["Propagation"] = propagation
+    assert check(cfg, info) == []
+
+
+def test_the_planned_container_with_a_propagating_bind(cfg: AgentJailConfig) -> None:
+    argv = docker_create_argv(cfg)
+    argv[argv.index(f"{AGENT_DIR}:/workspace:z")] = f"{AGENT_DIR}:/workspace:z,rshared"
+    info, unreadable = planned_info(argv)
+    assert unreadable == []
+    found = check(cfg, info)
+    assert any("propagation rshared" in p for p in found), found
+    argv = docker_create_argv(cfg)
+    argv[1:1] = ["--mount", f"type=bind,source={AGENT_DIR},target=/w,bind-propagation=rslave"]
+    found = check(cfg, planned_info(argv)[0])
+    assert any("propagation rslave" in p for p in found), found
+
+
+@pytest.mark.parametrize(
+    "option", ["label=type:spc_t", "label:type:spc_t", "label=type:unconfined_t"]
+)
+def test_an_unconfined_selinux_type_is_refused(cfg: AgentJailConfig, option: str) -> None:
+    found = check(cfg, changed("SecurityOpt", ["no-new-privileges=true", option]))
+    assert any(f"--security-opt {option}" in p for p in found), found
+
+
+RUNNING: dict[str, Any] = {**GOOD, "State": {"Running": True, "Pid": JAIL_PID}}
+
+
+def live(cfg: AgentJailConfig, info: dict[str, Any], inside: list[MountEntry] | None) -> list[str]:
+    host = FakeHost(inside={JAIL_PID: inside})
+    return live_mount_problems(info, agent_policy(cfg), host.view())
+
+
+def test_the_running_jail_s_own_mount_table_passes(cfg: AgentJailConfig) -> None:
+    assert live(cfg, RUNNING, JAIL_TABLE) == []
+
+
+def test_a_mount_made_inside_the_running_container_is_seen(cfg: AgentJailConfig) -> None:
+    """``nsenter -t <pid> -m mount --bind ...``: Docker's inspect does not know about it."""
+    table = [*JAIL_TABLE, MountEntry("0:35", "/root/srv/bt/state", "/mnt/caja")]
+    found = live(cfg, RUNNING, table)
+    assert any("/mnt/caja is mounted inside the container" in p for p in found), found
+
+
+def test_a_mount_over_an_expected_one_inside_the_container_is_seen(cfg: AgentJailConfig) -> None:
+    table = [*JAIL_TABLE, MountEntry("0:35", "/root/srv/bt/state", "/workspace")]
+    found = live(cfg, RUNNING, table)
+    assert any("/workspace is mounted 2 times" in p for p in found), found
+
+
+def test_a_bind_swapped_for_another_folder_inside_the_container_is_seen(
+    cfg: AgentJailConfig,
+) -> None:
+    """Unmounted and mounted again, from the state folder: one entry, but not the workspace."""
+    table = [m for m in JAIL_TABLE if m.point != "/workspace"]
+    table.append(MountEntry("0:35", "/root/srv/bt/state", "/workspace"))
+    found = live(cfg, RUNNING, table)
+    assert any("/workspace in the container is not" in p for p in found), found
+
+
+def test_a_missing_bind_inside_the_container_is_seen(cfg: AgentJailConfig) -> None:
+    table = [m for m in JAIL_TABLE if m.point != "/config"]
+    found = live(cfg, RUNNING, table)
+    assert any("/config is not mounted in the container" in p for p in found), found
+
+
+@pytest.mark.parametrize(
+    ("state", "inside", "expected"),
+    [
+        ({"Running": True, "Pid": 0}, JAIL_TABLE, "no process to look at"),
+        ({"Running": True}, JAIL_TABLE, "no process to look at"),
+        ({"Running": True, "Pid": JAIL_PID}, None, "cannot be read"),
+    ],
+)
+def test_a_container_mount_table_that_cannot_be_read_fails_closed(
+    cfg: AgentJailConfig, state: dict[str, Any], inside: list[MountEntry] | None, expected: str
+) -> None:
+    found = live(cfg, {**GOOD, "State": state}, inside)
+    assert any(expected in p for p in found), found
+
+
+def test_the_host_s_mount_table_unreadable_fails_closed_for_the_live_check(
+    cfg: AgentJailConfig,
+) -> None:
+    host = FakeHost(table=None, inside={JAIL_PID: JAIL_TABLE})
+    found = live_mount_problems(RUNNING, agent_policy(cfg), host.view())
+    assert any("cannot tell where" in p for p in found), found
+
+
+def test_parse_mountinfo_entries() -> None:
+    text = (
+        "584 575 0:54 /tmp.LGTk6Lhvnp /workspace rw,nosuid - tmpfs tmpfs rw\n"
+        "88 22 0:44 /a\\040b /srv/my\\040disk rw - tmpfs tmpfs rw\n"
+        "short line\n"
+    )
+    assert parse_mountinfo_entries(text) == [
+        MountEntry("0:54", "/tmp.LGTk6Lhvnp", "/workspace"),
+        MountEntry("0:44", "/a b", "/srv/my disk"),
+    ]
+
+
+# B6: the homes come from the local /etc/passwd, and one inside the agent's folder is its own.
+
+
+def test_passwd_homes() -> None:
+    text = (
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "# a comment\n"
+        "alice:x:1000:1000::/home/alice:/bin/zsh\n"
+        "nobody:x:65534:65534::/:/sbin/nologin\n"
+        "+@netgroup::::::\n"
+        "broken line\n"
+    )
+    assert passwd_homes(text) == ["/home/alice", "/root"]
+
+
+def test_homes_never_ask_nss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the local file: an LDAP or sssd directory could be huge, slow or down."""
+    import pwd
+
+    from backtide.jail import mounts
+
+    def getpwall() -> list[object]:
+        raise AssertionError("NSS was asked")
+
+    monkeypatch.setattr(pwd, "getpwall", getpwall)
+    mounts._local_homes.cache_clear()
+    try:
+        assert isinstance(mounts._homes(), list)
+    finally:
+        mounts._local_homes.cache_clear()
+
+
+def test_a_home_inside_the_agent_s_own_folder_does_not_block_it(cfg: AgentJailConfig) -> None:
+    host = FakeHost(home_dirs=[f"{AGENT_DIR}/home", str(AGENT_DIR), "/home/alice"])
+    assert check(cfg, GOOD, host) == []
+
+
+def test_a_home_inside_another_bind_still_counts(cfg: AgentJailConfig) -> None:
+    host = FakeHost(home_dirs=["/srv/users/bob"])
+    found = check(cfg, with_mount("/srv/users", "/users"), host)
+    assert any("would show the host's /srv/users/bob" in p for p in found), found
+
+
+# B7: destinations are compared normalised.
+
+
+@pytest.mark.parametrize(
+    ("destination", "expected"),
+    [
+        ("//proc", "over the kernel's /proc or /sys"),
+        ("/x/../proc", "over the kernel's /proc or /sys"),
+        ("/sys/./kernel", "over the kernel's /proc or /sys"),
+        ("//", "over the container's root"),
+        ("/./", "over the container's root"),
+    ],
+)
+def test_destinations_are_normalised(cfg: AgentJailConfig, destination: str, expected: str) -> None:
+    found = check(cfg, with_mount("/srv/x", destination))
+    assert any(expected in p for p in found), found
+
+
+def test_the_expected_bind_with_a_trailing_slash_is_still_the_expected_one(
+    cfg: AgentJailConfig,
+) -> None:
+    info = copy.deepcopy(GOOD)
+    info["Mounts"][1]["Destination"] = "/workspace/"
+    info["HostConfig"]["Binds"][0] = f"{AGENT_DIR}/:/workspace/:z"
+    assert check(cfg, info) == []
