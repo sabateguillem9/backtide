@@ -29,7 +29,7 @@
         "--security-opt",
         "no-new-privileges=true",
         "--security-opt",
-        "seccomp=/Users/guillemsabategoula/Documents/GitHub/SO/deploy/seccomp/agent.json",
+        "seccomp={REPO}/deploy/seccomp/agent.json",
         "--read-only",
         "--network",
         "backtide-agente-net",

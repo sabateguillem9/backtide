@@ -27,8 +27,12 @@ from backtide.jail.config import (
 from backtide.jail.profiles.openclaw import OPENCLAW, ModelProvider
 from backtide.jail.verify import container_problems
 
+# The default seccomp profile lives in the checkout, so its path is stored as {REPO}.
+REPO = str(Path(__file__).resolve().parent.parent)
 SNAPSHOT = json.loads(
-    (Path(__file__).parent / "fixtures" / "openclaw_jail_snapshot.json").read_text()
+    (Path(__file__).parent / "fixtures" / "openclaw_jail_snapshot.json")
+    .read_text()
+    .replace("{REPO}", REPO)
 )
 SECCOMP = SNAPSHOT["seccomp_profile"]
 IMAGE_ENV = SNAPSHOT["image_env"]
