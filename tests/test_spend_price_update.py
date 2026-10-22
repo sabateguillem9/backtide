@@ -27,7 +27,7 @@ from backtide.service.price_update import (
     parse_pricing,
     read_state,
 )
-from backtide.service.prices import DEFAULT_PRICES, PriceBook, price
+from backtide.service.prices import DEFAULT_PRICES, price
 from backtide.service.spend import Budget, BudgetSettings
 
 KEY = bytes(range(32))
@@ -118,17 +118,50 @@ def test_a_row_twice_is_not_trusted() -> None:
     assert {"model": "claude-opus-5-5", "why": "twice"} in parsed.rejected
 
 
-def test_changes_over_ten_times_are_refused() -> None:
-    book = PriceBook()
+def test_changes_over_ten_times_from_the_shipped_price_are_refused() -> None:
     cheap = price("0.30", "20", "0.20")  # Opus 5.5's input 4 -> 0.30: more than 10x down
     dear = price("5", "25", "0.25")
-    accepted, rejected = check_prices(
-        {"claude-opus-5-5": cheap, "claude-sonnet-5-5": dear, "claude-opus-6": dear}, book.current
+    checked = check_prices(
+        {"claude-opus-5-5": cheap, "claude-sonnet-5-5": dear, "claude-opus-6": dear},
+        DEFAULT_PRICES,
     )
-    assert set(accepted) == {"claude-sonnet-5-5", "claude-opus-6"}
-    assert rejected == [{"model": "claude-opus-5-5", "why": "changes more than 10x"}]
-    _, bad_id = check_prices({"gpt-6-sol": dear}, book.current)
-    assert bad_id == [{"model": "gpt-6-sol", "why": "id"}]
+    assert set(checked.accepted) == {"claude-sonnet-5-5"}  # a rise: applied at once
+    assert checked.pending == {"claude-opus-6": (dear, "new_model")}  # B3: the owner decides
+    assert checked.rejected == [{"model": "claude-opus-5-5", "why": "changes more than 10x"}]
+    bad_id = check_prices({"gpt-6-sol": dear}, DEFAULT_PRICES)
+    assert bad_id.rejected == [{"model": "gpt-6-sol", "why": "id"}]
+
+
+def test_m2_a_short_id_is_checked_against_every_model_it_would_shadow() -> None:
+    tiny = price("0.01", "0.01", "0.01")
+    checked = check_prices({"claude-sonnet-4": tiny}, DEFAULT_PRICES)
+    assert checked.accepted == {} and checked.pending == {}
+    assert checked.rejected == [
+        {"model": "claude-sonnet-4", "why": "changes more than 10x from claude-sonnet-4-5"}
+    ]
+    plausible = price("3", "15", "0.30")
+    again = check_prices({"claude-sonnet-4": plausible}, DEFAULT_PRICES)
+    assert again.pending == {"claude-sonnet-4": (plausible, "new_model")}  # never on its own
+
+
+def test_b3_the_check_is_anchored_to_the_shipped_prices() -> None:
+    """A forged page cannot walk a price down 10x a day: the anchor never moves, and more than
+    half below it waits for the owner."""
+    half = price("1.90", "20", "0.20")  # Opus 5.5's input 4 -> 1.90: past half
+    checked = check_prices({"claude-opus-5-5": half}, DEFAULT_PRICES)
+    assert checked.pending == {"claude-opus-5-5": (half, "drop")} and checked.accepted == {}
+    down = price("3", "15", "0.15")  # within half: applied
+    assert check_prices({"claude-opus-5-5": down}, DEFAULT_PRICES).accepted == {
+        "claude-opus-5-5": down
+    }
+    walked = price("0.30", "2", "0.02")  # yesterday's 3 was taken; the anchor is still 4
+    assert check_prices({"claude-opus-5-5": walked}, DEFAULT_PRICES).rejected
+    no_tier = price("0.10", "0.50", "0.01")  # Haiku 5.5 without its long-prompt tier
+    assert check_prices({"claude-haiku-5-5": no_tier}, DEFAULT_PRICES).pending == {
+        "claude-haiku-5-5": (no_tier, "drop")
+    }
+    accepted = check_prices({"claude-opus-6": half}, DEFAULT_PRICES, owned={"claude-opus-6": half})
+    assert accepted.accepted == {"claude-opus-6": half}  # what the owner accepted stays
 
 
 def test_urls() -> None:
@@ -210,16 +243,23 @@ def test_a_change_is_recorded_announced_stored_and_used(tmp_path: Path, box: Bla
     assert changes["claude-opus-5-5"]["new"]["input"] == "3"
     assert "claude-sonnet-5-5" not in changes  # the same as before: not a change
     assert updated[0].details["fetched_on"] == "2026-10-21"
-    assert [a.level for a in alerts] == [AlertLevel.INFO]
+    # Opus 4.1 and Haiku 3 are not shipped: new models wait for the owner (B3), said once.
+    pending = [e for e in box.events() if e.action == "prices_pending"]
+    assert [r["model"] for r in pending[0].details["rows"]] == ["claude-haiku-3", "claude-opus-4-1"]
+    assert budget.book.lookup("claude-opus-4-1") is None
+    assert [a.level for a in alerts] == [AlertLevel.INFO, AlertLevel.INFO]
     path = tmp_path / "state" / STATE_PRICES
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-    table, on = read_state(tmp_path / "state")
-    assert table["claude-opus-5-5"].input == Decimal("3") and on.isoformat() == "2026-10-21"
+    stored = read_state(tmp_path / "state")
+    assert stored.table["claude-opus-5-5"].input == Decimal("3")
+    assert stored.on.isoformat() == "2026-10-21"
+    assert set(stored.pending) == {"claude-haiku-3", "claude-opus-4-1"}
     assert budget.status()["prices"]["updated_on"] == "2026-10-21"
     # Again, the same page: no new event, no new alert.
     assert updater.run_once()
     assert len([e for e in box.events() if e.action == "prices_updated"]) == 1
-    assert len(alerts) == 1
+    assert len([e for e in box.events() if e.action == "prices_pending"]) == 1
+    assert len(alerts) == 2
 
 
 def test_the_owner_still_wins(tmp_path: Path, box: BlackBox) -> None:
@@ -299,3 +339,57 @@ def test_fetch_from_a_local_fake_page() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_b3_new_prices_wait_for_the_owner_and_are_applied_on_a_yes(
+    tmp_path: Path, box: BlackBox
+) -> None:
+    alerts: list[Alert] = []
+    page = PAGE.replace(
+        "| Claude Opus 5.5 | $4 / MTok | $5 / MTok | $8 / MTok",
+        "| Claude Opus 5.5 | $1 / MTok | $1.25 / MTok | $2 / MTok",
+    )
+    budget, updater = setup(tmp_path, box, page, alerts)
+    assert updater.run_once()
+    assert budget.book.lookup("claude-opus-5-5")[1] == "defaults"  # a drop past half: waits
+    shown = budget.status()["prices"]
+    whys = {row["model"]: row["why"] for row in shown["pending"]}
+    assert whys == {"claude-opus-5-5": "drop", "claude-opus-4-1": "new_model",
+                    "claude-haiku-3": "new_model"}  # fmt: skip
+    assert next(r for r in shown["pending"] if r["model"] == "claude-opus-5-5")["input"] == "1"
+    digest = shown["pending_digest"]
+    wrong = budget.accept_prices("0" * 16, requested_by="web (uid 1, pid 2)")
+    assert not wrong.ok and budget.book.lookup("claude-opus-5-5")[1] == "defaults"
+    done = budget.accept_prices(digest, requested_by="web (uid 1, pid 2)")
+    assert done.ok, done
+    assert budget.book.lookup("claude-opus-5-5")[1] == "anthropic"
+    assert budget.book.fetched["claude-opus-5-5"].input == Decimal("1")
+    assert budget.status()["prices"]["pending"] == []
+    [accepted] = [e for e in box.events() if e.action == "prices_accepted"]
+    assert accepted.source == "settings" and accepted.details["requested_by"].startswith("web")
+    assert sorted(c["model"] for c in accepted.details["changes"]) == sorted(whys)
+    # Kept: a restart loads them, and the same page again asks nothing.
+    budget2, again = setup(tmp_path, box, page, alerts)
+    again.load()
+    assert budget2.book.fetched["claude-opus-5-5"].input == Decimal("1")
+    told = len([e for e in box.events() if e.action == "prices_pending"])
+    assert again.run_once()
+    assert budget2.status()["prices"]["pending"] == []
+    assert len([e for e in box.events() if e.action == "prices_pending"]) == told
+
+
+def test_b3_a_stored_table_from_before_the_review_is_checked_again(
+    tmp_path: Path, box: BlackBox
+) -> None:
+    from backtide.service.price_update import write_state
+
+    alerts: list[Alert] = []
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    tiny = price("0.01", "0.01", "0.01")
+    write_state(state, {"claude-sonnet-4": tiny, "claude-sonnet-5-5": price("2.2", "10", "0.2")},
+                datetime(2026, 10, 20).date())  # fmt: skip
+    budget, updater = setup(tmp_path, box, PAGE, alerts)
+    updater.load()
+    assert set(budget.book.fetched) == {"claude-sonnet-5-5"}
+    assert [e for e in box.events() if e.action == "prices_rejected"]

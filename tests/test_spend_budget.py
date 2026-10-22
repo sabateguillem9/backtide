@@ -171,6 +171,7 @@ def test_raising_the_cap_lets_calls_through(tmp_path: Path, box: BlackBox) -> No
     out = budget.set_caps(Decimal("3"), None, requested_by="web (uid 1, pid 2)")
     assert out.ok
     assert budget.admit("b") is None
+    budget.forget("b")  # its reservation (M5) would hold the next one back
     events = box.events()
     names = [f"{e.source}/{e.action}" for e in events]
     assert names.index("settings/budget_set") < names.index("system/budget_unblocked")
@@ -252,8 +253,16 @@ def test_calls_in_flight_are_limited(tmp_path: Path, box: BlackBox) -> None:
     assert budget.admit("c") == "throttled"
     budget.forget("a")
     assert budget.admit("c") is None
-    clock.mono += 31 * 60  # a call never answered stops holding its place
+    clock.mono += 31 * 60  # B5: a call in flight keeps its place until it closes...
+    assert budget.admit("d") == "throttled"
+    clock.mono += 2 * 3600  # ...or its long safety TTL fires, which charges it
     assert budget.admit("d") is None
+    charged = [e for e in box.events() if e.action == "budget_charged"]
+    assert sorted(e.details["why"] for e in charged) == ["timeout", "timeout"]
+    assert all(e.details["cost"]["estimated"] for e in charged)
+    assert budget.status()["day"]["spent_micro"] == sum(
+        e.details["cost"]["usd_micro"] for e in charged
+    )
 
 
 def test_settle_uses_what_the_request_said(tmp_path: Path, box: BlackBox) -> None:
@@ -267,9 +276,16 @@ def test_settle_uses_what_the_request_said(tmp_path: Path, box: BlackBox) -> Non
     assert cost.micro == 300 * 100 + 10 * 100  # the dearest is the owner's 100/100
     assert budget.status()["inflight"] == 0
     priced = budget.settle(
-        "anthropic", {"flow_id": "g", "model": "fake-claude", "usage": {"input": 12, "output": 7}}
+        "anthropic",
+        {
+            "flow_id": "g",
+            "model": "fake-claude",
+            "status": 200,
+            "complete": True,
+            "usage": {"input": 12, "output": 7},
+        },
     )
-    assert priced.micro == 1900 and priced.priced_by == "owner"
+    assert priced.micro == 1900 and priced.priced_by == "owner" and not priced.estimated
 
 
 def test_many_threads_lose_nothing(tmp_path: Path, box: BlackBox) -> None:
@@ -284,7 +300,12 @@ def test_many_threads_lose_nothing(tmp_path: Path, box: BlackBox) -> None:
                 pass
             cost = budget.settle(
                 "anthropic",
-                {"flow_id": flow, "model": "fake-claude", "usage": {"input": 1, "output": 1}},
+                {
+                    "flow_id": flow,
+                    "model": "fake-claude",
+                    "complete": True,
+                    "usage": {"input": 1, "output": 1},
+                },
             )
             budget.book_cost(cost, None)
 
@@ -340,3 +361,155 @@ def test_an_error_without_usage_costs_nothing(tmp_path: Path, box: BlackBox) -> 
         },
     )
     assert with_usage.micro == 1000
+
+
+# --- after the security review of T11 (docs/33, "Tras la revisión de seguridad") ---------------
+
+
+def answer(flow: str, **extra: Any) -> dict[str, Any]:
+    return {"flow_id": flow, "model": "fake-claude", "status": 200} | extra
+
+
+def test_a1_a_2xx_that_did_not_end_is_charged_its_max_tokens(tmp_path: Path, box: BlackBox) -> None:
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="100", monthly="100")
+    for flow, complete in (("a", False), ("b", None)):
+        assert budget.admit(flow, model="fake-claude", request_bytes=50, max_tokens=1000) is None
+        extra = {} if complete is None else {"complete": complete}
+        cut = budget.settle("anthropic", answer(flow, usage={"input": 12, "output": 1}, **extra))
+        assert cut.estimated and cut.micro == 12 * 100 + 1000 * 100, flow
+    assert budget.admit("c", model="fake-claude", max_tokens=1000) is None
+    whole = budget.settle("anthropic", answer("c", complete=True, usage={"input": 12, "output": 1}))
+    assert not whole.estimated and whole.micro == 1300
+    # No flight (an unknown flow): the whole default max_tokens.
+    stray = budget.settle("anthropic", answer("zz", complete=False, usage={"input": 1}))
+    assert stray.micro == 100 + 128_000 * 100
+
+
+def test_m1_a_call_without_an_answer_is_charged_its_estimate(tmp_path: Path, box: BlackBox) -> None:
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="100", monthly="100")
+    assert budget.admit("a", model="fake-claude", request_bytes=300, max_tokens=10) is None
+    cost = budget.charge_unanswered("a", why="error")
+    assert cost is not None and cost.estimated
+    assert cost.micro == 300 * 200 + 10 * 100  # bytes at the 1 h cache write, max_tokens
+    [charged] = [e for e in box.events() if e.action == "budget_charged"]
+    assert charged.details == {"flow_id": "a", "why": "error", "cost": cost.details()}
+    assert charged.risk == 1
+    assert budget.status()["day"]["spent_micro"] == cost.micro
+    assert budget.status()["inflight"] == 0
+    assert budget.charge_unanswered("a", why="error") is None  # once
+    assert budget.admit("b") is None
+    budget.forget("b")  # never sent: free
+    assert budget.status()["day"]["spent_micro"] == cost.micro
+
+
+def test_m1_a_new_proxy_charges_what_the_old_one_had_in_flight(
+    tmp_path: Path, box: BlackBox
+) -> None:
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="100", monthly="100")
+    assert budget.admit("a", model="fake-claude", request_bytes=10, max_tokens=10) is None
+    assert budget.admit("free", model="fake-claude", free=True) is None
+    budget.forget_all()
+    charged = [e for e in box.events() if e.action == "budget_charged"]
+    assert [(e.details["flow_id"], e.details["why"]) for e in charged] == [("a", "proxy_restart")]
+    assert budget.status()["inflight"] == 0
+
+
+def test_m4_free_endpoints_cost_nothing_but_hold_a_place(tmp_path: Path, box: BlackBox) -> None:
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="100", monthly="100", inflight=1)
+    assert budget.admit("m", free=True) is None
+    assert budget.admit("x") == "throttled"
+    cost = budget.settle("anthropic", {"flow_id": "m", "status": 200, "usage_missing": True})
+    assert (cost.micro, cost.priced_by, cost.estimated) == (0, "free", False)
+
+
+def test_m5_calls_in_flight_reserve_their_estimate(tmp_path: Path, box: BlackBox) -> None:
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="1", monthly="100", inflight=8)
+    big = {"model": "fake-claude", "request_bytes": 1000, "max_tokens": 4000}
+    assert budget.admit("a", **big) is None  # reserves 1000*200 + 4000*100 = 600,000
+    assert budget.admit("b", **big) is None  # 600,000 in flight < 1,000,000
+    assert budget.admit("c", **big) == "throttled"  # 1,200,000 in flight >= the cap
+    assert budget.admit("free", free=True) is None  # reserves nothing
+    budget.settle("anthropic", answer("a", complete=True, usage={"input": 1, "output": 1}))
+    assert budget.admit("c", **big) is None
+    # The overshoot is bounded by one call: what is spent plus what is reserved.
+    assert budget.status()["reserved_micro"] == 1_200_000
+
+
+def test_b1_a_file_behind_the_black_box_is_caught_up(tmp_path: Path, box: BlackBox) -> None:
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="100", monthly="1000")
+    spend(budget, box, 300_000, "a")
+    path = tmp_path / "state" / STATE_BUDGET
+    old = path.read_bytes()
+    spend(budget, box, 200_000, "b")
+    assert budget.charge_unanswered("nobody", why="error") is None
+    assert budget.admit("c", model="fake-claude", request_bytes=1, max_tokens=1) is None
+    charged = budget.charge_unanswered("c", why="error")
+    path.write_bytes(old)  # an older budget.json (a crash before it was written, a restore)
+    os.chmod(path, 0o600)
+    again = make(tmp_path, box, clock, daily="100", monthly="1000")
+    expected = 500_000 + charged.micro
+    assert again.status()["day"]["spent_micro"] == expected
+    assert again.status()["month"]["spent_micro"] == expected
+    behind = [e for e in box.events() if e.action == "budget_rebuilt"]
+    assert behind[-1].details["why"] == "behind"
+    third = make(tmp_path, box, clock, daily="100", monthly="1000")  # caught up: nothing more
+    assert third.status()["month"]["spent_micro"] == expected
+
+
+def test_b1_an_old_file_without_a_seq_takes_the_larger_count(tmp_path: Path, box: BlackBox) -> None:
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="100", monthly="1000")
+    spend(budget, box, 300_000, "a")
+    path = tmp_path / "state" / STATE_BUDGET
+    state = json.loads(path.read_text())
+    state.pop("last_seq")
+    state["day_micro"] = state["month_micro"] = 100_000
+    path.write_text(json.dumps(state))
+    os.chmod(path, 0o600)
+    again = make(tmp_path, box, clock, daily="100", monthly="1000")
+    assert again.status()["month"]["spent_micro"] == 300_000
+
+
+def test_b2_a_price_that_cannot_be_worked_out_is_estimated(
+    tmp_path: Path, box: BlackBox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import backtide.service.spend as spend_module
+
+    clock = Clock(datetime.now(UTC))
+    budget = make(tmp_path, box, clock, daily="100", monthly="100")
+    assert budget.admit("a", model="fake-claude", request_bytes=10, max_tokens=10) is None
+
+    def broken(*_: Any, **__: Any) -> Any:
+        raise ArithmeticError("boom")
+
+    monkeypatch.setattr(spend_module, "cost_of", broken)
+    cost = budget.settle("anthropic", answer("a", complete=True, usage={"input": 1}))
+    assert cost.estimated and cost.micro == 10 * 200 + 10 * 100
+    assert budget.status()["inflight"] == 0
+    fallback = budget.fallback_cost({"flow_id": "gone"})
+    assert fallback.estimated and fallback.micro > 0
+
+
+def test_b4_local_time_follows_the_system_zone(tmp_path: Path) -> None:
+    from backtide.service.spend import local_zone
+
+    zones = tmp_path / "usr" / "share" / "zoneinfo" / "Europe"
+    zones.mkdir(parents=True)
+    madrid = zones / "Madrid"
+    madrid.write_bytes(b"not read")
+    link = tmp_path / "localtime"
+    link.symlink_to(madrid)
+    zone = local_zone(localtime=link, env={})
+    assert isinstance(zone, ZoneInfo) and zone.key == "Europe/Madrid"
+    assert local_zone(localtime=link, env={"TZ": "America/New_York"}).key == "America/New_York"
+    summer = datetime(2026, 7, 1, 12, tzinfo=UTC).astimezone(zone)
+    winter = datetime(2026, 12, 1, 12, tzinfo=UTC).astimezone(zone)
+    assert summer.utcoffset() != winter.utcoffset()  # it follows the change of time
+    nothing = local_zone(localtime=tmp_path / "missing", env={"TZ": "Not/AZone"})
+    assert nothing is not None  # a fixed offset, with a warning

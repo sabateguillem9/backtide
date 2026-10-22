@@ -34,6 +34,7 @@ from typing import Any, Protocol
 from backtide.service.control import (
     ControlError,
     PeerCredentials,
+    ask_accept_prices,
     ask_budget,
     ask_clear_secret,
     ask_secrets,
@@ -59,6 +60,10 @@ _TAIL_RE = re.compile(r"[A-Za-z0-9_-]{4}", re.ASCII)
 _CHAT_TAIL_RE = re.compile(r"[0-9]{4}", re.ASCII)
 _DAY_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 BUDGET = "tope"  # the Settings page's "kind" for the spending caps (T11)
+PRICES = "precios"  # ... and for accepting the new prices that wait for the owner (T11, B3)
+_MODEL_RE = re.compile(r"claude-[a-z]+-[0-9]{1,2}(?:-[0-9]{1,2})?", re.ASCII)
+_PRICE_RE = re.compile(r"[0-9]{1,5}(?:\.[0-9]{1,8})?", re.ASCII)
+_DIGEST_RE = re.compile(r"[0-9a-f]{16}", re.ASCII)
 
 
 class SettingsClient(Protocol):
@@ -74,6 +79,8 @@ class SettingsClient(Protocol):
     def clear_secret(self, kind: str) -> dict[str, Any]: ...
 
     def set_budget(self, daily: str | None, monthly: str | None) -> dict[str, Any]: ...
+
+    def accept_prices(self, digest: str) -> dict[str, Any]: ...
 
 
 class ControlSettings:
@@ -127,6 +134,13 @@ class ControlSettings:
             peer=self._peer,
         )
 
+    def accept_prices(self, digest: str) -> dict[str, Any]:
+        """Accept the new prices waiting that the page showed (``digest``, T11 B3)."""
+        self._require()
+        return ask_accept_prices(
+            self._path, digest=digest, via="web", wait=self._wait, peer=self._peer
+        )
+
 
 class SpendClient(Protocol):
     """What the panel and Settings read of the spending (T11). Raises the control socket's
@@ -162,6 +176,18 @@ class ControlSpend:
 
 
 @dataclass(frozen=True)
+class PendingPrice:
+    """One new price waiting for the owner (B3), checked field by field."""
+
+    model: str
+    why: str  # "new_model" | "drop"
+    input: str
+    output: str
+    old_input: str | None = None
+    old_output: str | None = None
+
+
+@dataclass(frozen=True)
 class SpendView:
     """The spending as a page shows it, checked field by field (dollars with a comma)."""
 
@@ -175,6 +201,8 @@ class SpendView:
     blocked: str | None = None  # "day" | "month"
     prices_on: str | None = None  # the date of the last good table from Anthropic
     defaults_on: str | None = None
+    pending: tuple[PendingPrice, ...] = ()  # B3: what waits for "Aceptar los precios nuevos"
+    pending_digest: str | None = None
 
 
 def spend_view(raw: object) -> SpendView | None:
@@ -203,7 +231,37 @@ def spend_view(raw: object) -> SpendView | None:
         blocked=blocked if blocked in ("day", "month") else None,
         prices_on=_day(prices.get("updated_on")),
         defaults_on=_day(prices.get("defaults_on")),
+        **_pending(prices),
     )
+
+
+def _pending(prices: dict[str, Any]) -> dict[str, Any]:
+    """The new prices waiting, or none at all when any of them does not make sense."""
+    digest, rows = prices.get("pending_digest"), prices.get("pending")
+    if not isinstance(rows, list) or not rows or not isinstance(digest, str):
+        return {}
+    if not _DIGEST_RE.fullmatch(digest) or len(rows) > 64:
+        return {}
+    found = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("why") not in ("new_model", "drop"):
+            return {}
+        model = row.get("model")
+        values = [row.get(name) for name in ("input", "output", "old_input", "old_output")]
+        if not isinstance(model, str) or not _MODEL_RE.fullmatch(model):
+            return {}
+        if not all(isinstance(v, str) and _PRICE_RE.fullmatch(v) for v in values[:2]):
+            return {}
+        if not all(
+            v is None or (isinstance(v, str) and _PRICE_RE.fullmatch(v)) for v in values[2:]
+        ):
+            return {}
+        found.append(PendingPrice(model, row["why"], *values))  # type: ignore[arg-type]
+    return {"pending": tuple(found), "pending_digest": digest}
+
+
+def digest_ok(value: str) -> bool:
+    return bool(_DIGEST_RE.fullmatch(value))
 
 
 def _money(micro: int) -> str:
@@ -322,6 +380,9 @@ class SettingTickets:
 __all__ = [
     "ACTIONS",
     "BUDGET",
+    "PRICES",
+    "PendingPrice",
+    "digest_ok",
     "ControlSpend",
     "SpendClient",
     "SpendView",

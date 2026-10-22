@@ -300,3 +300,116 @@ def test_openai_responses_json_answer() -> None:
         }
     ).encode()
     assert summarize_json("openai", body).usage == {"input": 7, "output": 3, "cache_read": 2}
+
+
+# --- after the security review of T11 (docs/33, "Tras la revisión de seguridad") ---------------
+
+
+def test_a1_an_answer_cut_short_is_charged_its_whole_max_tokens() -> None:
+    """A stream the client closed after the text but before message_delta: message_start's usage
+    (output 1) is all there is, and the provider bills what it generated."""
+    book = PriceBook()
+    row = DEFAULT_PRICES["claude-opus-5-5"]
+    cut = cost_of(
+        book,
+        kind="anthropic",
+        model="claude-opus-5-5",
+        usage={"input": 12, "output": 1},
+        max_tokens=128_000,
+        complete=False,
+    )
+    assert cut.estimated and not cut.unknown_model
+    assert cut.micro == call_cost(row, Usage(input=12, output=128_000), "anthropic")
+    without_max = cost_of(
+        book, kind="anthropic", model="claude-opus-5-5", usage={"input": 12}, complete=False
+    )
+    assert without_max.micro == call_cost(
+        row, Usage(input=12, output=ESTIMATE_MAX_OUTPUT), "anthropic"
+    )
+    more = cost_of(  # what was reported, when it is more, stays
+        book,
+        kind="anthropic",
+        model="claude-opus-5-5",
+        usage={"input": 12, "output": 900},
+        max_tokens=10,
+        complete=False,
+    )
+    assert more.micro == call_cost(row, Usage(input=12, output=900), "anthropic")
+    whole = cost_of(
+        book, kind="anthropic", model="claude-opus-5-5", usage={"input": 12, "output": 1},
+        max_tokens=128_000,
+    )  # fmt: skip
+    assert not whole.estimated and whole.micro == call_cost(row, Usage(12, 1), "anthropic")
+
+
+def test_m2_an_exact_id_wins_over_a_shorter_one_in_any_layer() -> None:
+    cheap = price("0.01", "0.01", "0.01")
+    book = PriceBook().with_fetched({"claude-sonnet-4": cheap}, TODAY)
+    assert book.lookup("claude-sonnet-4-6") == (DEFAULT_PRICES["claude-sonnet-4-6"], "defaults")
+    dated = book.lookup("claude-sonnet-4-6-20260101")
+    assert dated == (DEFAULT_PRICES["claude-sonnet-4-6"], "defaults")  # the longest prefix
+    assert book.lookup("claude-sonnet-4-9") == (cheap, "anthropic")  # only it covers this one
+    owner = PriceBook(owner={"claude-opus-5": cheap})
+    assert owner.lookup("claude-opus-5-5")[1] == "defaults"
+    assert owner.lookup("claude-opus-5") == (cheap, "owner")
+    assert owner.lookup("claude-opus-5-20260601") == (cheap, "owner")  # same length: owner first
+
+
+def test_m2_an_owner_price_that_a_more_specific_row_shadows_is_named() -> None:
+    from backtide.service.prices import owner_shadowed
+
+    book = PriceBook(
+        owner={"claude-sonnet-4": price("1", "1", "0.1"), "x-model": price("1", "1", "0.1")}
+    )
+    shadowed = owner_shadowed(book)
+    assert shadowed == {"claude-sonnet-4": ["claude-sonnet-4-5", "claude-sonnet-4-6"]}
+
+
+def test_m3_several_choices_multiply_the_estimated_output() -> None:
+    book = PriceBook()
+    one = cost_of(book, kind="openai", model="gpt-6-sol", usage=None, max_tokens=1000)
+    four = cost_of(book, kind="openai", model="gpt-6-sol", usage=None, max_tokens=1000, choices=4)
+    assert four.micro - one.micro == 3 * 1000 * 10  # three more outputs at 10 $/MTok
+    cut = cost_of(
+        book, kind="openai", model="gpt-6-sol", usage={"input": 5, "output": 3}, max_tokens=100,
+        choices=3, complete=False,
+    )  # fmt: skip
+    assert cut.micro == 5 * 2 + 300 * 10
+
+
+def test_m3_a_conversation_without_usage_is_charged_a_whole_context() -> None:
+    from backtide.service.prices import ESTIMATE_CONTEXT
+
+    book = PriceBook()
+    short = cost_of(book, kind="openai", model="gpt-6-sol", usage=None, request_bytes=100,
+                    max_tokens=10)  # fmt: skip
+    chained = cost_of(book, kind="openai", model="gpt-6-sol", usage=None, request_bytes=100,
+                      max_tokens=10, context=True)  # fmt: skip
+    assert chained.micro >= ESTIMATE_CONTEXT * 2 + 10 * 10 > short.micro
+
+
+def test_m3_an_unknown_model_with_usage_is_never_below_the_dearest_price() -> None:
+    from backtide.service.prices import estimate
+
+    book = PriceBook()
+    usage = {"input": 1_000_000, "output": 1_000_000, "cache_read": 0}
+    cost = cost_of(book, kind="anthropic", model="claude-new-9", usage=usage, request_bytes=10,
+                   max_tokens=10)  # fmt: skip
+    assert cost.unknown_model and cost.estimated
+    assert cost.micro >= 1_000_000 * 10 + 1_000_000 * 50  # Fable's 10/50, the dearest
+    small = cost_of(book, kind="anthropic", model="claude-new-9", usage={"input": 1, "output": 1},
+                    request_bytes=3000, max_tokens=1000)  # fmt: skip
+    assert small.micro == estimate(book, model="claude-new-9", request_bytes=3000,
+                                   max_tokens=1000)  # fmt: skip
+
+
+def test_m3_a_dearer_service_tier_is_priced_up() -> None:
+    book = PriceBook()
+    usage = {"input": 100, "output": 100}
+    plain = cost_of(book, kind="openai", model="gpt-6-sol", usage=usage)
+    for tier in ("default", "auto", "flex", "standard_only", None):
+        assert cost_of(book, kind="openai", model="gpt-6-sol", usage=usage,
+                       service_tier=tier).micro == plain.micro  # fmt: skip
+    for tier in ("priority", "scale", "something-new", 3):
+        dear = cost_of(book, kind="openai", model="gpt-6-sol", usage=usage, service_tier=tier)
+        assert dear.micro == 2 * plain.micro and dear.estimated

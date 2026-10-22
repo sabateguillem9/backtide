@@ -47,10 +47,15 @@ class BudgetFake(FakeSettings):
     def __init__(self, state: Availability = Availability.READY) -> None:
         super().__init__(state)
         self.caps: list[tuple[str | None, str | None]] = []
+        self.accepted: list[str] = []
 
     def set_budget(self, daily: str | None, monthly: str | None) -> dict[str, Any]:
         self.caps.append((daily, monthly))
         return {"ok": True, "outcome": "saved", "message": "Guardado."}
+
+    def accept_prices(self, digest: str) -> dict[str, Any]:
+        self.accepted.append(digest)
+        return {"ok": True, "outcome": "saved", "message": "Precios nuevos aplicados."}
 
 
 @pytest.fixture
@@ -194,3 +199,77 @@ def test_end_to_end_through_the_control_socket(tmp_path: Path, short_folder: Pat
     finally:
         server.close()
         box.close()
+
+
+# --- after the security review of T11: new prices wait for the owner (B3) ----------------------
+
+PENDING = dict(
+    STATUS,
+    prices={
+        "updated_on": "2026-10-20",
+        "defaults_on": "2026-10-06",
+        "pending": [
+            {"model": "claude-opus-5-5", "why": "drop", "input": "1", "output": "20",
+             "old_input": "4", "old_output": "20"},
+            {"model": "claude-opus-6", "why": "new_model", "input": "6", "output": "30",
+             "old_input": None, "old_output": None},
+        ],
+        "pending_digest": "0123456789abcdef",
+    },
+)  # fmt: skip
+
+
+def prices_client(tmp_path: Path, fake: BudgetFake, status: dict[str, Any] = PENDING) -> TestClient:
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    return new_client(tmp_path, settings=fake, spend=FakeSpend(status), clock=lambda: NOW)
+
+
+def test_b3_settings_offers_the_new_prices(tmp_path: Path, fake: BudgetFake) -> None:
+    web = prices_client(tmp_path, fake)
+    page = web.get("/ajustes").text
+    said = text_of(page)
+    assert "Precios nuevos por aceptar: claude-opus-5-5, claude-opus-6." in said
+    assert "/ajustes/cambiar?tipo=precios" in page
+    step = web.get("/ajustes/cambiar?tipo=precios")
+    shown = text_of(step.text)
+    assert "claude-opus-5-5" in shown and "4 → 1" in shown and "modelo nuevo" in shown
+    fields = hidden(step.text)
+    assert set(fields) == {"csrf", "ticket", "tipo", "accion", "huella"}
+    assert fields["huella"] == "0123456789abcdef"
+    reply = post(web, fields)
+    assert reply.status_code == 200 and "Precios nuevos aplicados" in text_of(reply.text)
+    assert fake.accepted == ["0123456789abcdef"]
+    assert post(web, fields).status_code == 400  # the ticket is spent
+    assert fake.accepted == ["0123456789abcdef"]
+
+
+def test_b3_accepting_has_the_same_protections(tmp_path: Path, fake: BudgetFake) -> None:
+    web = prices_client(tmp_path, fake)
+    fields = hidden(web.get("/ajustes/cambiar?tipo=precios").text)
+    assert post(web, {**fields, "csrf": "nope"}).status_code == 403
+    other = hidden(web.get("/ajustes/cambiar?tipo=precios").text)
+    assert post(web, {**other, "huella": "<b>"}).status_code == 400
+    assert post(web, {**other, "diario": "9"}).status_code == 400
+    cap_ticket = budget_confirm(web)  # a ticket for the caps does not accept prices
+    assert (
+        post(web, {**cap_ticket, "tipo": "precios", "huella": "0123456789abcdef"}).status_code
+        == 400
+    )
+    fresh = hidden(web.get("/ajustes/cambiar?tipo=precios").text)
+    evil = web.post("/ajustes/guardar", data=fresh, headers={"origin": "https://evil.test"})
+    assert evil.status_code == 403
+    assert fake.accepted == []
+
+
+def test_b3_without_ajustes_or_without_new_prices_nothing_is_offered(
+    tmp_path: Path, fake: BudgetFake
+) -> None:
+    off = new_client(tmp_path, settings=BudgetFake(Availability.DISABLED), spend=FakeSpend(PENDING))
+    page = off.get("/ajustes").text
+    assert "Precios nuevos por aceptar" in text_of(page)
+    assert "/ajustes/cambiar?tipo=precios" not in page
+    assert "<form" not in off.get("/ajustes/cambiar?tipo=precios").text
+    (tmp_path / "plain").mkdir()
+    plain = prices_client(tmp_path / "plain", fake, STATUS)
+    assert "tipo=precios" not in plain.get("/ajustes").text
+    assert "<form" not in plain.get("/ajustes/cambiar?tipo=precios").text

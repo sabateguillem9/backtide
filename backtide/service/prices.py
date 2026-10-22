@@ -7,13 +7,19 @@ Design: docs/33-diseno-t11-tope-de-gasto.md (on top of docs/24, sections 1 and 2
   ``tokens × price`` in µ$, rounded UP to a whole µ$ once per call. Totals are integers.
 - **Layers** (``PriceBook``): the owner's ``[budget.prices]`` win, then the last good table
   fetched from Anthropic's pricing page (``price_update.py``), then the defaults that ship here
-  (``DEFAULT_PRICES``, dated ``DEFAULTS_AS_OF``). A model is looked up by its exact id, then by
-  the longest id it starts with followed by ``-`` (a dated snapshot, ``claude-haiku-4-5-2025…``).
-- **Fail safe.** A model no layer knows, or an answer without usage, is charged a conservative
-  estimate: the request's size in bytes as input tokens (a token is 3-4 bytes, so this counts
-  at least three times too many) plus its ``max_tokens`` as output (``ESTIMATE_MAX_OUTPUT`` when it
-  did not say), all at the dearest input and output prices of the table. The call is marked
-  ``estimated``.
+  (``DEFAULT_PRICES``, dated ``DEFAULTS_AS_OF``). A model is looked up by its exact id in every
+  layer first, then by the longest id it starts with followed by ``-`` in any layer (a dated
+  snapshot, ``claude-haiku-4-5-2025…``): a shorter id never wins over a more specific one
+  (security review of T11, M2).
+- **Fail safe: what backtide does not know is charged high, never low.** A model no layer knows,
+  or an answer without usage, is charged a conservative estimate (``estimate``): the request's
+  size in bytes as input tokens (a token is 3-4 bytes, so this counts at least three times too
+  many; a whole ``ESTIMATE_CONTEXT`` for an OpenAI Responses call that continues a conversation)
+  plus its ``max_tokens`` as output (``ESTIMATE_MAX_OUTPUT`` when it did not say) times its
+  choices (``n``, ``best_of``), at the model's own dearest prices (the dearest of the table for an
+  unknown model). An answer cut short (``complete`` false) is charged at least its whole
+  ``max_tokens`` of output; an unknown model's usage at the dearest prices of the table; a service
+  tier other than the standard ones at ``DEAR_TIER`` times. The call is marked ``estimated``.
 - **Provider shapes.** Anthropic's ``input`` leaves the cache out (``cache_read`` and
   ``cache_write`` are apart); OpenAI's ``input`` includes its cached part, so the plain input is
   ``input - cache_read`` (``sse.LlmSummary``). An Anthropic cache write without its 5 min / 1 h
@@ -35,6 +41,16 @@ CACHE_5M = Decimal("1.25")
 CACHE_1H = Decimal("2")
 CACHE_READ = Decimal("0.1")  # when an owner's price gives none
 ESTIMATE_MAX_OUTPUT = 128_000  # output tokens charged when a request did not say its max_tokens
+# Input tokens charged for an OpenAI Responses call that continues a stored conversation
+# (previous_response_id, conversation) and brought no usage: the provider bills the whole history,
+# which the request does not carry. The shipped table has no context windows: this is above any.
+ESTIMATE_CONTEXT = 1_000_000
+MAX_CHOICES = 128  # n / best_of: OpenAI's own limit
+# Service tiers priced as the table says ("flex" is cheaper: charged as standard, never less).
+STANDARD_TIERS = frozenset({"default", "auto", "standard_only", "flex"})
+# Any other tier ("priority", OpenAI's "fast", is 2x everything per docs/24; "scale" or one that
+# is new is not known): 2x, and the call is marked estimated.
+DEAR_TIER = Decimal(2)
 MAX_TOKENS = 10**9  # what a usage field may say (sse.py keeps 10**12; past this is nonsense)
 # Sane prices: anything outside is refused (an owner's override or a fetched one).
 MIN_PRICE = Decimal("0.001")
@@ -285,22 +301,23 @@ class PriceBook:
     defaults_on: date = DEFAULTS_AS_OF
 
     def lookup(self, model: object) -> tuple[Price, str] | None:
-        """(price, layer) for ``model``, or None if no layer knows it."""
+        """(price, layer) for ``model``, or None if no layer knows it: its exact id in any layer
+        (owner first), else the longest id it starts with in any layer (M2)."""
         if not isinstance(model, str) or not model:
             return None
-        for layer, table in (
+        return _match_layers(self._layers(), model)
+
+    def current(self, model: str) -> Price | None:
+        """The price in use today without the owner's (what a change is reported against)."""
+        found = _match_layers(self._layers()[1:], model)
+        return None if found is None else found[0]
+
+    def _layers(self) -> tuple[tuple[str, dict[str, Price]], ...]:
+        return (
             ("owner", self.owner),
             ("anthropic", self.fetched),
             (DEFAULTS_SOURCE, self.defaults),
-        ):
-            found = _match(table, model)
-            if found is not None:
-                return found, layer
-        return None
-
-    def current(self, model: str) -> Price | None:
-        """What a fetched price is compared with: the table in use today without the owner's."""
-        return _match(self.fetched, model) or _match(self.defaults, model)
+        )
 
     def dearest(self) -> tuple[Decimal, Decimal]:
         """The highest input and output prices of every layer (the estimate's prices)."""
@@ -308,27 +325,89 @@ class PriceBook:
         expanded = rows + [row.long for row in rows if row.long is not None]
         return max(row.input for row in expanded), max(row.output for row in expanded)
 
+    def dearest_row(self) -> Price:
+        """Every field at its highest of every layer (an unknown model's usage is priced so)."""
+        rows = [*self.owner.values(), *self.fetched.values(), *self.defaults.values()]
+        rows += [row.long for row in rows if row.long is not None]
+        names = ("input", "output", "cache_write_5m", "cache_write_1h", "cache_read")
+        return Price(**{name: max(getattr(row, name) for row in rows) for name in names})
+
     def with_fetched(self, table: dict[str, Price], on: date) -> "PriceBook":
         return replace(self, fetched=dict(table), fetched_on=on)
 
 
-def _match(table: dict[str, Price], model: str) -> Price | None:
-    if model in table:
-        return table[model]
-    best = None
-    for name in table:
-        if model.startswith(name + "-") and (best is None or len(name) > len(best)):
-            best = name
-    return None if best is None else table[best]
+def _match_layers(
+    layers: tuple[tuple[str, dict[str, Price]], ...], model: str
+) -> tuple[Price, str] | None:
+    for layer, table in layers:
+        if model in table:
+            return table[model], layer
+    best: tuple[int, Price, str] | None = None
+    for layer, table in layers:
+        for name, row in table.items():
+            if model.startswith(name + "-") and (best is None or len(name) > best[0]):
+                best = (len(name), row, layer)
+    return None if best is None else (best[1], best[2])
 
 
-def estimate(book: PriceBook, *, request_bytes: int | None, max_tokens: int | None) -> int:
-    """µ$ of a call whose usage is unknown, by excess (see the module's text)."""
-    top_input, top_output = book.dearest()
-    tokens_in = request_bytes if type(request_bytes) is int and request_bytes > 0 else 0
+def owner_shadowed(book: PriceBook) -> dict[str, list[str]]:
+    """The owner's ids that a more specific shipped or fetched id overrides for its own models
+    (``claude-sonnet-4`` does not price ``claude-sonnet-4-6``): said when the config is read."""
+    others = sorted({*book.fetched, *book.defaults})
+    found: dict[str, list[str]] = {}
+    for name in sorted(book.owner):
+        deeper = [other for other in others if other.startswith(name + "-")]
+        if deeper:
+            found[name] = deeper
+    return found
+
+
+def tier_factor(service_tier: object) -> Decimal:
+    """1 for no tier or a standard one, DEAR_TIER for any other (M3)."""
+    if service_tier is None or (isinstance(service_tier, str) and service_tier in STANDARD_TIERS):
+        return Decimal(1)
+    return DEAR_TIER
+
+
+def choices_of(value: object) -> int:
+    """How many answers a call asks for (``n``, ``best_of``): 1 to MAX_CHOICES."""
+    if type(value) is not int or value < 1:
+        return 1
+    return min(value, MAX_CHOICES)
+
+
+def output_ceiling(max_tokens: object, choices: object = None) -> int:
+    """The most output a call may be billed: its ``max_tokens`` (ESTIMATE_MAX_OUTPUT when it did
+    not say) times its choices."""
     out = max_tokens if type(max_tokens) is int and 0 < max_tokens <= MAX_TOKENS else None
-    tokens_out = out if out is not None else ESTIMATE_MAX_OUTPUT
-    return _ceil((Decimal(tokens_in) * top_input + Decimal(tokens_out) * top_output) * MTOK)
+    return (out if out is not None else ESTIMATE_MAX_OUTPUT) * choices_of(choices)
+
+
+def estimate(
+    book: PriceBook,
+    *,
+    model: object = None,
+    request_bytes: object = None,
+    max_tokens: object = None,
+    choices: object = None,
+    context: bool = False,
+    service_tier: object = None,
+) -> int:
+    """µ$ of a call whose usage is unknown, by excess (see the module's text): at the model's own
+    dearest prices when a layer knows it, else at the dearest of the table."""
+    tokens_in = request_bytes if type(request_bytes) is int and request_bytes > 0 else 0
+    if context:
+        tokens_in = max(tokens_in, ESTIMATE_CONTEXT)
+    tokens_out = output_ceiling(max_tokens, choices)
+    found = book.lookup(model)
+    if found is None:
+        top_input, top_output = book.dearest()
+    else:
+        rows = [found[0]] + ([found[0].long] if found[0].long is not None else [])
+        top_input = max(max(row.input, row.cache_write_1h) for row in rows)
+        top_output = max(row.output for row in rows)
+    total = Decimal(tokens_in) * top_input + Decimal(tokens_out) * top_output
+    return _ceil(total * MTOK * tier_factor(service_tier))
 
 
 def cost_of(
@@ -337,28 +416,39 @@ def cost_of(
     kind: str,
     model: object,
     usage: object,
-    request_bytes: int | None = None,
-    max_tokens: int | None = None,
+    request_bytes: object = None,
+    max_tokens: object = None,
+    choices: object = None,
+    context: bool = False,
+    service_tier: object = None,
+    complete: bool = True,
 ) -> Cost:
     """The cost of one ``llm/response``: priced when the model is known and the usage came,
-    estimated by excess otherwise (``estimated``; ``unknown_model`` when no layer knew it)."""
+    estimated by excess otherwise (``estimated``; ``unknown_model`` when no layer knew it). An
+    answer that did not end (``complete`` false: the client hung up, the stream was cut) is
+    charged at least its whole ``max_tokens`` of output (A1)."""
     found = book.lookup(model)
     tokens = Usage.from_details(usage)
-    if found is None or tokens is None:
-        micro = estimate(book, request_bytes=request_bytes, max_tokens=max_tokens)
-        if found is not None and tokens is None and type(max_tokens) is int and max_tokens > 0:
-            # The model is known: its own prices give a smaller (still excessive) estimate.
-            row = found[0]
-            micro = min(
-                micro,
-                _ceil(
-                    Decimal(request_bytes or 0) * max(row.input, row.cache_write_1h)
-                    + Decimal(max_tokens) * row.output
-                ),
-            )
-        return Cost(micro, estimated=True, unknown_model=found is None, priced_by="estimate")
+    factor = tier_factor(service_tier)
+    guess = estimate(
+        book,
+        model=model,
+        request_bytes=request_bytes,
+        max_tokens=max_tokens,
+        choices=choices,
+        context=context,
+        service_tier=service_tier,
+    )
+    if tokens is None:
+        return Cost(guess, estimated=True, unknown_model=found is None, priced_by="estimate")
+    if not complete:
+        tokens = replace(tokens, output=max(tokens.output, output_ceiling(max_tokens, choices)))
+    if found is None:
+        dearest = _ceil(call_cost(book.dearest_row(), tokens, kind) * factor)
+        return Cost(max(guess, dearest), estimated=True, unknown_model=True, priced_by="estimate")
     row, layer = found
-    return Cost(call_cost(row, tokens, kind), priced_by=layer)
+    micro = _ceil(call_cost(row, tokens, kind) * factor)
+    return Cost(micro, estimated=not complete or factor != 1, priced_by=layer)
 
 
 def usd(micro: int) -> str:

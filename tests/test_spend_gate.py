@@ -3,6 +3,7 @@ out and charges each answer (backtide/service/proxy_channel.py); the proxy answe
 in the provider's own error shape (backtide/gate/providers.py, addon.py)."""
 
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -18,7 +19,14 @@ from backtide.gate.sse import LlmSummary
 from backtide.service.prices import price
 from backtide.service.proxy_channel import ProxyChannel
 from backtide.service.spend import Budget, BudgetSettings
-from tests.test_gate_addon import FakeChannel, make_gate, model_flow, send, tool_body
+from tests.test_gate_addon import (
+    FakeChannel,
+    FlowError,
+    make_gate,
+    model_flow,
+    send,
+    tool_body,
+)
 from tests.test_service_proxy_channel import Proxy, make_channel
 
 KEY = b"k" * 32
@@ -98,22 +106,31 @@ def budget_for(tmp_path: Path, box: BlackBox, daily: str = "0.01", **kw: Any) ->
     return budget
 
 
-def llm_request(flow_id: str) -> dict[str, Any]:
+def llm_request(
+    flow_id: str,
+    *,
+    path: str = "/v1/messages",
+    method: str = "POST",
+    endpoint: str | None = "messages",
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     flow = {
         "flow_id": flow_id,
-        "method": "POST",
+        "method": method,
         "scheme": "https",
         "host": "api.anthropic.com",
         "port": 443,
-        "path": "/v1/messages",
+        "path": path,
         "headers": [],
-        "body": json.dumps({"model": "m", "max_tokens": 10, "messages": []}).encode(),
+        "body": json.dumps(body or {"model": "m", "max_tokens": 10, "messages": []}).encode(),
     }
-    return record.llm_request_event(flow, "anthropic", ())
+    return record.llm_request_event(flow, "anthropic", (), endpoint=endpoint)
 
 
-def llm_response(flow_id: str, usage: dict[str, int] | None) -> dict[str, Any]:
-    summary = LlmSummary(model="m", usage=dict(usage or {}), complete=True)
+def llm_response(
+    flow_id: str, usage: dict[str, int] | None, *, complete: bool = True
+) -> dict[str, Any]:
+    summary = LlmSummary(model="m", usage=dict(usage or {}), complete=complete)
     flow = {
         "flow_id": flow_id,
         "scheme": "https",
@@ -126,8 +143,10 @@ def llm_response(flow_id: str, usage: dict[str, int] | None) -> dict[str, Any]:
     )
 
 
-def ask(channel: ProxyChannel, proxy: Proxy, request_id: int, flow_id: str) -> dict[str, Any]:
-    channel.handle({"type": "request", "id": request_id, "event": llm_request(flow_id)})
+def ask(
+    channel: ProxyChannel, proxy: Proxy, request_id: int, flow_id: str, **request: Any
+) -> dict[str, Any]:
+    channel.handle({"type": "request", "id": request_id, "event": llm_request(flow_id, **request)})
     return proxy.receive_type("ack")
 
 
@@ -152,17 +171,19 @@ def test_over_the_cap_nothing_more_goes_out(tmp_path: Path, box: BlackBox) -> No
     assert len([e for e in box.events() if e.action == "request"]) == 6  # the refused one: none
 
 
-def test_a_burst_overshoots_by_the_calls_in_flight_only(tmp_path: Path, box: BlackBox) -> None:
+def test_a_burst_overshoots_by_one_call_at_most(tmp_path: Path, box: BlackBox) -> None:
+    """M5: each call in flight reserves its estimate, so a burst cannot all go out under the
+    cap and land far past it: the second waits while the first may reach the cap alone."""
     budget = budget_for(tmp_path, box, max_inflight=3)
     channel, proxy = make_channel(box, budget=budget)
-    acks = [ask(channel, proxy, n, f"b{n}") for n in range(1, 6)]
-    assert [a["verdict"] for a in acks] == ["allow"] * 3 + ["deny"] * 2
-    assert {a.get("reason") for a in acks[3:]} == {"throttled"}
-    for n in range(1, 4):  # the three in flight finish and are all charged
-        channel.handle(
-            {"type": "event", "event": llm_response(f"b{n}", {"input": 40, "output": 40})}
-        )
-    assert budget.status()["day"]["spent_micro"] == 3 * 8000  # past 10,000 by what was in flight
+    acks = [ask(channel, proxy, n, f"b{n}") for n in range(1, 4)]
+    assert [a["verdict"] for a in acks] == ["allow", "deny", "deny"]
+    assert {a.get("reason") for a in acks[1:]} == {"throttled"}
+    assert budget.status()["reserved_micro"] > 10_000  # one call may cost more than the cap
+    channel.handle({"type": "event", "event": llm_response("b1", {"input": 40, "output": 40})})
+    assert ask(channel, proxy, 4, "b4")["verdict"] == "allow"  # 8,000 spent, nothing reserved
+    channel.handle({"type": "event", "event": llm_response("b4", {"input": 40, "output": 40})})
+    assert budget.status()["day"]["spent_micro"] == 2 * 8000  # past 10,000 by one call
     assert ask(channel, proxy, 9, "late")["reason"] == "spend_cap"
 
 
@@ -199,3 +220,181 @@ def test_without_a_count_model_calls_are_refused(tmp_path: Path, box: BlackBox) 
     budget.open()
     channel, proxy = make_channel(box, budget=budget)
     assert ask(channel, proxy, 1, "x")["reason"] == "spend_unavailable"
+
+
+# --- after the security review of T11 (docs/33, "Tras la revisión de seguridad") ---------------
+
+
+def costs(box: BlackBox) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (f"{e.source}/{e.action}", e.details["cost"])
+        for e in box.events()
+        if isinstance(e.details.get("cost"), dict)
+    ]
+
+
+def test_a1_an_answer_the_client_cut_short_is_charged_its_max_tokens(
+    tmp_path: Path, box: BlackBox
+) -> None:
+    budget = budget_for(tmp_path, box, daily="100")
+    channel, proxy = make_channel(box, budget=budget)
+    assert ask(channel, proxy, 1, "cut")["verdict"] == "allow"
+    # message_start's usage only: the client closed before message_delta.
+    channel.handle(
+        {"type": "event", "event": llm_response("cut", {"input": 12, "output": 1}, complete=False)}
+    )
+    [(name, cost)] = costs(box)
+    assert name == "llm/response" and cost["estimated"] is True
+    assert cost["usd_micro"] == 12 * 100 + 10 * 100  # max_tokens 10, not the 1 reported
+
+
+@pytest.mark.parametrize(
+    ("error", "charged"),
+    [
+        ({"stage": "flow", "upstream": True}, True),
+        ({"stage": "flow"}, True),  # nothing said: it may have gone out
+        ({"stage": "response_transfer_encoding", "upstream": True}, True),
+        ({"stage": "not_sent", "upstream": False}, False),
+        ({"stage": "flow", "upstream": False}, False),
+    ],
+)
+def test_m1_a_call_that_ends_without_an_answer(
+    tmp_path: Path, box: BlackBox, error: dict[str, Any], charged: bool
+) -> None:
+    budget = budget_for(tmp_path, box, daily="100", max_inflight=1)
+    channel, proxy = make_channel(box, budget=budget)
+    assert ask(channel, proxy, 1, "gone")["verdict"] == "allow"
+    event = record.error_event(
+        error["stage"],
+        flow_id="gone",
+        host="api.anthropic.com",
+        port=443,
+        secrets=(),
+        upstream=error.get("upstream"),
+    )
+    channel.handle({"type": "event", "event": event})
+    found = costs(box)
+    if charged:
+        [(name, cost)] = found
+        size = len(json.dumps({"model": "m", "max_tokens": 10, "messages": []}))
+        assert name == "system/budget_charged" and cost["estimated"] is True
+        assert cost["usd_micro"] == size * 200 + 10 * 100  # bytes at the 1 h write, max_tokens
+        [charge] = [e for e in box.events() if e.action == "budget_charged"]
+        assert charge.details["seq"] == [e for e in box.events() if e.action == "error"][0].seq
+    else:
+        assert found == []
+    assert budget.status()["day"]["spent_micro"] == (found[0][1]["usd_micro"] if charged else 0)
+    assert ask(channel, proxy, 2, "next")["verdict"] == "allow"  # its place is free again
+
+
+def test_m1_an_answer_the_proxy_stopped_is_charged_a_refused_request_is_not(
+    tmp_path: Path, box: BlackBox
+) -> None:
+    budget = budget_for(tmp_path, box, daily="100")
+    channel, proxy = make_channel(box, budget=budget)
+    fields = {"flow_id": "k", "host": "api.anthropic.com", "port": 443}
+    assert ask(channel, proxy, 1, "k")["verdict"] == "allow"
+    key = record.blocked_event("real_key", fields, (), side="response")
+    channel.handle({"type": "event", "event": key})
+    assert [name for name, _ in costs(box)] == ["system/budget_charged"]
+    assert ask(channel, proxy, 2, "r")["verdict"] == "allow"
+    refused = record.blocked_event("not_recorded", fields | {"flow_id": "r"}, ())
+    channel.handle({"type": "event", "event": refused})
+    assert len(costs(box)) == 1 and budget.status()["inflight"] == 0
+
+
+def test_m4_the_free_endpoints_cost_nothing(tmp_path: Path, box: BlackBox) -> None:
+    budget = budget_for(tmp_path, box, daily="100", max_inflight=1)
+    channel, proxy = make_channel(box, budget=budget)
+    listing = {"path": "/v1/models", "method": "GET", "endpoint": "models", "body": {}}
+    assert ask(channel, proxy, 1, "list", **listing)["verdict"] == "allow"
+    assert ask(channel, proxy, 2, "busy")["reason"] == "throttled"  # it holds a place
+    channel.handle({"type": "event", "event": llm_response("list", None)})
+    counting = {"path": "/v1/messages/count_tokens", "endpoint": "count_tokens"}
+    assert ask(channel, proxy, 3, "count", **counting)["verdict"] == "allow"
+    channel.handle({"type": "event", "event": llm_response("count", None)})
+    assert [cost["usd_micro"] for _, cost in costs(box)] == [0, 0]
+    assert {cost["priced_by"] for _, cost in costs(box)} == {"free"}
+    # The proxy's word alone is not enough: a model call said to be free is charged.
+    lying = {"path": "/v1/messages", "endpoint": "count_tokens"}
+    assert ask(channel, proxy, 4, "lie", **lying)["verdict"] == "allow"
+    channel.handle({"type": "event", "event": llm_response("lie", None)})
+    assert costs(box)[-1][1]["usd_micro"] > 0
+
+
+def test_m3_the_request_says_what_the_cap_needs() -> None:
+    body = {"model": "gpt-6-sol", "input": "hi", "max_output_tokens": 50, "n": 3,
+            "previous_response_id": "resp_1", "service_tier": "priority"}  # fmt: skip
+    event = llm_request("x", path="/v1/responses", endpoint="responses", body=body)
+    details = event["details"]
+    assert (details["endpoint"], details["choices"], details["context"]) == ("responses", 3, True)
+    assert details["service_tier"] == "priority" and details["max_tokens"] == 50
+    plain = llm_request("y")["details"]
+    assert (plain["choices"], plain["context"], plain["service_tier"]) == (None, False, None)
+    assert protocol.validate_event(event) == event
+
+
+def test_b2_an_answer_that_cannot_be_priced_is_still_charged(
+    tmp_path: Path, box: BlackBox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    budget = budget_for(tmp_path, box, daily="100")
+    channel, proxy = make_channel(box, budget=budget)
+    assert ask(channel, proxy, 1, "p")["verdict"] == "allow"
+
+    def broken(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(budget, "settle", broken)
+    channel.handle({"type": "event", "event": llm_response("p", {"input": 1, "output": 1})})
+    [(name, cost)] = costs(box)
+    assert name == "llm/response" and cost["estimated"] is True and cost["usd_micro"] > 0
+    assert budget.status()["day"]["spent_micro"] == cost["usd_micro"]
+
+
+# --- the proxy's side: what it says of a call that ends without an answer ----------------------
+
+
+@dataclass
+class _ServerConn:
+    timestamp_start: float | None = None
+    timestamp_tcp_setup: float | None = None
+
+
+def test_m1_the_proxy_says_whether_a_call_reached_the_provider() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = model_flow(tool_body())
+    send(gate, flow)
+    assert "backtide" in flow.metadata  # let through
+    flow.server_conn = _ServerConn()  # type: ignore[attr-defined]
+    gate.error(flow)
+    assert channel.told[-1]["details"]["upstream"] is False
+    connected = model_flow(tool_body())
+    connected.id = "flow-2"
+    send(gate, connected)
+    connected.server_conn = _ServerConn(1.0, 1.1)  # type: ignore[attr-defined]
+    gate.error(connected)
+    assert channel.told[-1]["details"]["upstream"] is True
+    unknown = model_flow(tool_body())
+    unknown.id = "flow-3"
+    send(gate, unknown)  # the fakes have no server_conn: it may have gone out
+    gate.error(unknown)
+    assert channel.told[-1]["details"]["upstream"] is True
+    request = channel.asked[-1]["details"]
+    assert request["endpoint"] == "messages"
+
+
+def test_m1_a_call_whose_client_left_while_backtide_answered_never_goes_out() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    flow = model_flow(tool_body())
+    flow.error = FlowError("Client disconnected.")
+    send(gate, flow)
+    assert flow.killed and "backtide" not in flow.metadata
+    [told] = channel.told
+    assert (told["action"], told["details"]["stage"], told["details"]["upstream"]) == (
+        "error",
+        "not_sent",
+        False,
+    )
+    assert told["details"]["flow_id"] == flow.id

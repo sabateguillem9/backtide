@@ -68,7 +68,7 @@ from backtide.gate.policy import (
     numeric_ipv4,
     port_allowed,
 )
-from backtide.gate.provider_tools import check_request
+from backtide.gate.provider_tools import check_request, endpoint_of
 from backtide.gate.providers import CREDENTIAL_HEADERS, Provider, blocked_response, swap_key
 from backtide.gate.sse import UsageStream, summarize_json
 from backtide.gate.translate import credential_free_path, shapes, translate
@@ -467,7 +467,11 @@ class Gate:
                     logger.warning("a model request with provider-side tools: refused")
                 return
             event = record.llm_request_event(
-                fields, provider.name, config.scrubber, provider_tools=verdict.tools
+                fields,
+                provider.name,
+                config.scrubber,
+                provider_tools=verdict.tools,
+                endpoint=endpoint_of(str(provider.kind), request.method, request.path, headers),
             )
             gate = None  # a provider's host is never held (docs/32, section 5, rule 1)
             shape = None
@@ -484,6 +488,21 @@ class Gate:
         ack = await self._channel.ask(event, gate)
         if ack.held:
             await self._hold(flow, ack, fields, shape)
+            return
+        if provider is not None and ack.allowed and (flow.response is not None or _gone(flow)):
+            # T11 (security review, M1): a model call backtide let out whose client went (or that
+            # was answered) while it waited: it never goes out, and backtide frees its place and
+            # charges nothing only because it is told so.
+            if flow.response is None:
+                flow.kill()
+            self._tell_error(
+                "not_sent",
+                None,
+                flow_id=fields["flow_id"],
+                host=fields["host"],
+                port=fields["port"],
+                upstream=False,
+            )
             return
         if flow.response is not None:
             return  # killed or answered meanwhile
@@ -874,7 +893,12 @@ class Gate:
         flow.kill()
         fields = flow.metadata["backtide"]["fields"]
         self._tell_error(
-            stage, None, flow_id=fields["flow_id"], host=fields["host"], port=fields["port"]
+            stage,
+            None,
+            flow_id=fields["flow_id"],
+            host=fields["host"],
+            port=fields["port"],
+            upstream=True,  # the provider answered: it bills what it generated (T11)
         )
 
     def _key_in_answer(self, flow: Any) -> None:
@@ -961,6 +985,9 @@ class Gate:
                 host=fields["host"],
                 port=fields["port"],
                 secrets=self._channel.scrubber,
+                # T11 (M1): a model call that ends without an answer is charged its estimate
+                # unless it provably never reached the provider.
+                upstream=None if meta["provider"] is None else _upstream(flow),
             )
         )
 
@@ -1093,7 +1120,7 @@ class Gate:
 
     def _tell_error(
         self, stage: str, error: BaseException | None, *, host: str | None = None,
-        port: int | None = None, flow_id: str | None = None,
+        port: int | None = None, flow_id: str | None = None, upstream: bool | None = None,
     ) -> None:  # fmt: skip
         try:
             self._channel.tell(
@@ -1104,6 +1131,7 @@ class Gate:
                     host=host,
                     port=port if isinstance(port, int) else None,
                     secrets=self._channel.scrubber,
+                    upstream=upstream,
                 )
             )
         except Exception:
@@ -1127,7 +1155,16 @@ class Gate:
                 self._die()
                 return
         flow_id = getattr(flow, "id", None)
-        self._tell_error(stage, error, flow_id=flow_id if isinstance(flow_id, str) else None)
+        meta = getattr(flow, "metadata", None)
+        provider_flow = isinstance(meta, dict) and bool(meta.get("backtide", {}).get("provider"))
+        self._tell_error(
+            stage,
+            error,
+            flow_id=flow_id if isinstance(flow_id, str) else None,
+            # T11: a model call stopped by a failed hook after it went out is charged; before,
+            # it never left (the request phase answers 502 itself).
+            upstream=(not before) if provider_flow or before else None,
+        )
 
 
 def _wire_reading(reading: Reading) -> dict[str, Any]:
@@ -1218,6 +1255,25 @@ _BODY_LIMIT_ERROR = "body_size_limit"  # in mitmproxy 12.2.3's message for a bod
 def _over_body_limit(flow: Any) -> bool:
     error = getattr(flow, "error", None)
     return _BODY_LIMIT_ERROR in str(getattr(error, "msg", "") or "")
+
+
+def _gone(flow: Any) -> bool:
+    """Whether a flow's client went or mitmproxy marked it failed (a kill, a reset)."""
+    return (
+        getattr(flow, "error", None) is not None
+        or getattr(flow.client_conn, "timestamp_end", None) is not None
+    )
+
+
+def _upstream(flow: Any) -> bool:
+    """Whether a request may have reached its server: False only when the flow's server
+    connection never even started (mitmproxy's ``timestamp_start`` and ``timestamp_tcp_setup``
+    both unset). Anything that cannot be told counts as reached (T11: charged, never free)."""
+    conn = getattr(flow, "server_conn", None)
+    if conn is None or not hasattr(conn, "timestamp_tcp_setup"):
+        return True
+    started = getattr(conn, "timestamp_start", None)
+    return conn.timestamp_tcp_setup is not None or started is not None
 
 
 def _utf8(text: str) -> bytes:

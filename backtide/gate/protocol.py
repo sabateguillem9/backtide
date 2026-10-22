@@ -175,7 +175,11 @@ EVENT_SCHEMA: dict[tuple[str, str], tuple[int | None, frozenset[str]]] = {
     # tools: the provider-side ones refused (provider_side_tool); side: "response" when what
     # was refused is the provider's answer (a real key in it: real_key, T06-6).
     ("net", "blocked"): (None, _REQUEST_KEYS | {"reason", "tools", "side"}),
-    ("net", "error"): (1, frozenset({"stage", "error", "sni", "flow_id", "host", "port"})),
+    # upstream: whether the request may have reached the server (T11: what the cap charges).
+    ("net", "error"): (
+        1,
+        frozenset({"stage", "error", "sni", "flow_id", "host", "port", "upstream"}),
+    ),
     ("net", "tls_failed"): (1, frozenset({"sni", "host", "port"})),
     ("net", "websocket_start"): (0, _WEBSOCKET_KEYS),
     ("net", "websocket_summary"): (0, _WEBSOCKET_KEYS),
@@ -195,6 +199,11 @@ EVENT_SCHEMA: dict[tuple[str, str], tuple[int | None, frozenset[str]]] = {
             "key",
             "body",
             "provider_tools",
+            # T11, security review (M3, M4): what the spending cap needs of the request.
+            "endpoint",
+            "choices",
+            "context",
+            "service_tier",
         },
     ),
     ("llm", "response"): (0, _LLM_RESPONSE_KEYS),

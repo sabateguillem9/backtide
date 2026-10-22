@@ -548,6 +548,20 @@ ES: dict[str, str] = {
     "decimales como mucho: no se ha cambiado nada.",
     "settings.err.spend": "El servicio no ha dicho cuánto se ha gastado: prueba otra vez en un "
     "momento.",
+    "settings.prices": "Precios nuevos",
+    "settings.prices.pending": "Precios nuevos por aceptar: {models}.",
+    "settings.prices.note": "La página de precios de Anthropic trae modelos nuevos o precios de "
+    "más de la mitad por debajo de los de fábrica: backtide no los aplica sin tu sí.",
+    "settings.prices.accept": "Aceptar los precios nuevos",
+    "settings.prices.drop": "entrada {old_in} → {new_in} $/MTok, salida {old_out} → {new_out} "
+    "$/MTok",
+    "settings.prices.new": "modelo nuevo: entrada {new_in} $/MTok, salida {new_out} $/MTok",
+    "settings.confirm.prices.note": "Compáralos con la página de precios de Anthropic antes de "
+    "aceptarlos: a partir de la siguiente llamada se cobra con ellos. Si han cambiado desde que "
+    "abriste esta página, no se acepta nada.",
+    "settings.kind.precios": "Precios nuevos",
+    "settings.out.saved.precios": "Aceptados",
+    "settings.err.no_prices": "No hay precios nuevos por aceptar.",
     "panel.spend": "Gasto de los modelos",
     "settings.agent": "El agente nunca ve esta página ni las claves de verdad: sigue con su clave "
     "falsa, y el proxy pone la real al salir.",
@@ -1156,6 +1170,19 @@ EN: dict[str, str] = {
     "settings.err.cap": "A cap is an amount of dollars above zero, two decimals at most: nothing "
     "was changed.",
     "settings.err.spend": "The service did not say how much was spent: try again in a moment.",
+    "settings.prices": "New prices",
+    "settings.prices.pending": "New prices to accept: {models}.",
+    "settings.prices.note": "Anthropic's pricing page has new models or prices more than half "
+    "below the built-in ones: backtide does not use them without your yes.",
+    "settings.prices.accept": "Accept the new prices",
+    "settings.prices.drop": "input {old_in} → {new_in} $/MTok, output {old_out} → {new_out} $/MTok",
+    "settings.prices.new": "new model: input {new_in} $/MTok, output {new_out} $/MTok",
+    "settings.confirm.prices.note": "Compare them with Anthropic's pricing page before accepting "
+    "them: the next call is charged with them. If they changed since you opened this page, "
+    "nothing is accepted.",
+    "settings.kind.precios": "New prices",
+    "settings.out.saved.precios": "Accepted",
+    "settings.err.no_prices": "There are no new prices to accept.",
     "panel.spend": "Model spending",
     "settings.agent": "The agent never sees this page nor the real keys: it keeps its fake key, "
     "and the proxy puts the real one in on the way out.",

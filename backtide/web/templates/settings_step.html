@@ -65,6 +65,25 @@
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>
+  {% elif view == 'confirm_prices' %}
+    <h2 id="settings-step-title">{{ t('settings.prices.accept') }}</h2>
+    <p class="note">{{ t('settings.confirm.prices.note') }}</p>
+    <ul class="settings-prices">
+      {% for row in spend.pending %}
+      <li><span class="setting-name">{{ row.model }}</span> <span>{% if row.why == 'drop' %}{{ t('settings.prices.drop', old_in=row.old_input, new_in=row.input, old_out=row.old_output, new_out=row.output) }}{% else %}{{ t('settings.prices.new', new_in=row.input, new_out=row.output) }}{% endif %}</span></li>
+      {% endfor %}
+    </ul>
+    <form class="settings-form" method="post" action="{{ base }}/ajustes/guardar" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="ticket" value="{{ ticket }}">
+      <input type="hidden" name="tipo" value="precios">
+      <input type="hidden" name="accion" value="set">
+      <input type="hidden" name="huella" value="{{ spend.pending_digest }}">
+      <div class="settings-actions">
+        <button class="settings-yes" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('settings.prices.accept') }}</span></button>
+        <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
+      </div>
+    </form>
   {% elif view == 'confirm_clear' %}
     {% set consequence = 'telegram' if row.kind == 'telegram' else ('in_use' if row.in_use else 'unused') %}
     <h2 id="settings-step-title">{{ t('settings.confirm.clear', what=t('settings.what.' ~ row.kind)) }}</h2>

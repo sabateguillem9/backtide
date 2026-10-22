@@ -365,13 +365,17 @@ def llm_request_event(
     secrets: Secrets,
     *,
     provider_tools: Sequence[str] = (),
+    endpoint: str | None = None,
 ) -> dict[str, Any]:
     """``llm/request``: a request to a provider's host. Of its body, only metadata, and the
-    provider-side tools that ``allow_provider_tools`` let through (T06-6), by name."""
+    provider-side tools that ``allow_provider_tools`` let through (T06-6), by name. ``endpoint``:
+    which of the provider's endpoints it is (``provider_tools.endpoint_of``; the spending cap
+    does not charge the free ones, T11)."""
     scrub = _scrubber(secrets)
     details = _request_details(flow, scrub)
     details["body"] = _body(flow, scrub, excerpt=False)
     details["provider"] = _clean(provider, scrub, _LIMIT_SHORT)
+    details["endpoint"] = _opt_text(endpoint, scrub, _LIMIT_SHORT)
     details |= _llm_metadata(flow.get("body"), scrub)
     details["key"] = "swapped"
     if provider_tools:
@@ -380,8 +384,13 @@ def llm_request_event(
 
 
 def _llm_metadata(body: object, scrub: KnownScrubber) -> dict[str, Any]:
+    """What the spending cap needs of a model request (T11): its model, ``max_tokens``, how
+    many answers it asks for (``choices``: ``n`` or ``best_of``), whether it continues a stored
+    conversation (``context``: OpenAI's ``previous_response_id`` or ``conversation``) and its
+    ``service_tier``; and some shape for a person."""
     meta: dict[str, Any] = {"model": None, "stream": None, "max_tokens": None,
-                            "messages": None, "tools": None}  # fmt: skip
+                            "messages": None, "tools": None, "choices": None,
+                            "context": False, "service_tier": None}  # fmt: skip
     try:
         data = json.loads(body) if isinstance(body, bytes | bytearray | str) else None
     except (ValueError, RecursionError):  # RecursionError: nested too deep
@@ -404,6 +413,16 @@ def _llm_metadata(body: object, scrub: KnownScrubber) -> dict[str, Any]:
         meta["messages"] = 1
     if isinstance(data.get("tools"), list):
         meta["tools"] = len(data["tools"])
+    choices = [data.get(name) for name in ("n", "best_of")]
+    counts = [value for value in choices if type(value) is int and value >= 0]
+    if counts:
+        meta["choices"] = min(max(counts), 10**6)
+    meta["context"] = any(data.get(name) is not None for name in ("previous_response_id",
+                                                                  "conversation"))  # fmt: skip
+    tier = data.get("service_tier")
+    if tier is not None:
+        # Any value but a known name counts as an unknown tier (priced up): kept as text.
+        meta["service_tier"] = _clean(tier if isinstance(tier, str) else "?", scrub, _LIMIT_SHORT)
     return meta
 
 
@@ -494,11 +513,14 @@ def error_event(
     host: str | None = None,
     port: int | None = None,
     secrets: Secrets,
+    upstream: bool | None = None,
 ) -> dict[str, Any]:
     """``net/error``: a transport failure, or a hook that failed (the flow was killed).
-    ``error`` is the kind of error (its class name), never its message."""
+    ``error`` is the kind of error (its class name), never its message. ``upstream``: whether
+    the request may have reached the server (False only when no connection to it was ever made:
+    the spending cap then charges nothing, T11), left out when it does not apply."""
     scrub = _scrubber(secrets)
-    details = {
+    details: dict[str, Any] = {
         "stage": _clean(stage, scrub, _LIMIT_SHORT),
         "error": _opt_text(error, scrub, _LIMIT_SHORT),
         "sni": _opt_text(sni, scrub, _LIMIT_NAME),
@@ -506,6 +528,8 @@ def error_event(
         "host": None if host is None else _host(host, scrub),
         "port": _opt_int(port),
     }
+    if upstream is not None:
+        details["upstream"] = upstream is True
     target = details["host"] or details["sni"] or ""
     return _finish("net", "error", target, details, scrub)
 

@@ -106,6 +106,7 @@ from backtide.gate.protocol import (
     ProtocolError,
     Sender,
 )
+from backtide.gate.provider_tools import FREE_ENDPOINTS, endpoint_of
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import (
     OVERRIDE_HEADERS,
@@ -854,6 +855,10 @@ class ProxyChannel:
                 model=details.get("model"),
                 request_bytes=body.get("size") if isinstance(body, dict) else None,
                 max_tokens=details.get("max_tokens"),
+                choices=details.get("choices"),
+                context=details.get("context") is True,
+                service_tier=details.get("service_tier"),
+                free=self._free_call(details),
             )
         except Exception:  # without a count nothing goes out
             logger.exception("the spending cap could not be asked: the model call is refused")
@@ -865,34 +870,61 @@ class ProxyChannel:
             return protocol.ack(request_id, "deny", reason=why)
         ack = self._let_out(request_id, event)
         if ack["verdict"] != "allow":
-            self._budget.forget(flow_id)
+            self._budget.forget(flow_id)  # never sent: it costs nothing
         return ack
+
+    def _kind(self, details: Mapping[str, Any]) -> str:
+        provider = self._policy.providers.by_name(details.get("provider"))
+        return str(provider.kind) if provider is not None else "anthropic"
+
+    def _free_call(self, details: Mapping[str, Any]) -> bool:
+        """M4: the list of models or Anthropic's token count, which the providers do not bill:
+        only when what the proxy says (``endpoint``) is what backtide reads of the recorded
+        method and path itself."""
+        said = details.get("endpoint")
+        if said not in FREE_ENDPOINTS:
+            return False
+        method, path = details.get("method"), details.get("path")
+        if not (isinstance(method, str) and isinstance(path, str)):
+            return False
+        return endpoint_of(self._kind(details), method, path) == said
 
     def _charge(self, event: dict[str, Any]) -> None:
         """An ``llm/response``: priced, recorded with its cost, then added to the spending (also
         when the event cannot be recorded or is over the event budget: the money was spent).
-        Anything that ends a call without an answer frees its place in flight."""
+        A call let out that ends without an answer is charged its estimate (M1): a ``net/error``
+        unless the proxy says it never reached the provider (``upstream: false``), and the
+        proxy's ``net/blocked`` of an answer (``side: response``); a ``net/blocked`` of a request
+        the proxy refused before sending frees it."""
         details = event["details"]
+        budget = self._budget
+        if budget is None:  # cannot be: _event only comes here with a budget
+            self._event_plain(event)
+            return
         if event["source"] == "llm" and event["action"] == "response":
-            provider = self._policy.providers.by_name(details.get("provider"))
-            kind = str(provider.kind) if provider is not None else "anthropic"
             try:
-                cost = self._budget.settle(kind, details)  # type: ignore[union-attr]
-            except Exception:
-                logger.exception("pricing a model answer failed")
-                self._event_plain(event)
-                return
+                cost = budget.settle(self._kind(details), details)
+            except Exception:  # B2: never fail open, never uncharged
+                logger.exception("pricing a model answer failed: it is charged its estimate")
+                cost = budget.fallback_cost(details)
             size = len(json.dumps(event, separators=(",", ":")))
             stored = None
             if self._budgets.take_event(size, self._mono()):
                 stored = self._append(event, {"cost": cost.details()})
             else:
                 self._dropped += 1
-            self._budget.book_cost(cost, stored)  # type: ignore[union-attr]
+            budget.book_cost(cost, stored)
             return
-        if event["source"] == "net" and event["action"] in ("error", "blocked"):
-            self._budget.forget(details.get("flow_id"))  # type: ignore[union-attr]
-        self._event_plain(event)
+        stored = self._event_plain(event)
+        if event["source"] != "net" or event["action"] not in ("error", "blocked"):
+            return
+        flow_id = details.get("flow_id")
+        if event["action"] == "error" and details.get("upstream") is False:
+            budget.forget(flow_id)
+        elif event["action"] == "error" or details.get("side") == "response":
+            budget.charge_unanswered(flow_id, why=str(event["action"]), cause=stored)
+        else:
+            budget.forget(flow_id)  # the proxy refused the request itself: it never went out
 
     def _refuse(
         self, request_id: int, event: dict[str, Any], reason: str, *, fp: str | None = None
@@ -1282,12 +1314,12 @@ class ProxyChannel:
             return
         self._event_plain(event)
 
-    def _event_plain(self, event: dict[str, Any]) -> None:
+    def _event_plain(self, event: dict[str, Any]) -> Event | None:
         size = len(json.dumps(event, separators=(",", ":")))
         if not self._budgets.take_event(size, self._mono()):
             self._dropped += 1
-            return
-        self._append(event)
+            return None
+        return self._append(event)
 
     def _report_counts(self) -> None:
         now = self._mono()

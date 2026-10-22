@@ -107,3 +107,32 @@ def test_status_in_telegram_says_the_spending(budget: Budget, box: BlackBox) -> 
     assert "Gasto hoy: 0,00 $ de 1,00 $." in text
     assert "Gasto este mes: 0,00 $ de 50,00 $." in text
     assert "Precios de fábrica del 2026-10-06." in text
+
+
+def test_b3_new_prices_are_accepted_through_the_socket(
+    folder: Path, budget: Budget, box: BlackBox, server: ControlServer
+) -> None:
+    from backtide.service.control import ask_accept_prices
+    from backtide.service.price_update import PriceUpdater
+    from tests.test_spend_price_update import PAGE
+
+    updater = PriceUpdater(
+        budget, state_dir=folder, record=box.append, fetch=lambda _: PAGE,
+        url="http://127.0.0.1:1/pricing.md", now=lambda: datetime(2026, 10, 21, tzinfo=UTC),
+    )  # fmt: skip
+    assert updater.run_once()
+    status = ask_budget(server.path, peer=me)
+    digest = status["prices"]["pending_digest"]
+    assert {row["model"] for row in status["prices"]["pending"]} == {
+        "claude-opus-4-1",
+        "claude-haiku-3",
+    }
+    stale = ask_accept_prices(server.path, digest="f" * 16, via="web", peer=me)
+    assert stale["ok"] is False and stale["outcome"] == "invalid"
+    done = ask_accept_prices(server.path, digest=digest, via="web", peer=me)
+    assert done["ok"] is True and done["outcome"] == "saved"
+    assert budget.book.lookup("claude-opus-4-1")[1] == "anthropic"
+    [accepted] = [e for e in box.events() if e.action == "prices_accepted"]
+    assert accepted.details["requested_by"].startswith("web (uid")
+    with pytest.raises(ValueError):
+        ask_accept_prices(server.path, digest=digest, via="telegram", peer=me)

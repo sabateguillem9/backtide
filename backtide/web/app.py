@@ -108,6 +108,7 @@ from backtide.web.settings import (
     ACTIONS,
     BUDGET,
     KINDS,
+    PRICES,
     TELEGRAM,
     SecretView,
     SettingsClient,
@@ -115,6 +116,7 @@ from backtide.web.settings import (
     SpendClient,
     SpendView,
     cap_ok,
+    digest_ok,
     spend_view,
     views,
 )
@@ -144,8 +146,8 @@ MAX_FIELD_CHARS = 128
 # The Settings page's form (T12e): these always; ``valor`` (and ``chat`` for Telegram) to set a key;
 # ``confirmo`` when it replaces one that is set. A pasted key may bring spaces around it.
 SETTINGS_FIELDS = ("csrf", "ticket", "tipo", "accion")
-SETTINGS_OPTIONAL = ("valor", "chat", "confirmo", "diario", "mensual")
-SETTINGS_LIMITS = {"valor": 320, "chat": 32, "diario": 16, "mensual": 16}
+SETTINGS_OPTIONAL = ("valor", "chat", "confirmo", "diario", "mensual", "huella")
+SETTINGS_LIMITS = {"valor": 320, "chat": 32, "diario": 16, "mensual": 16, "huella": 32}
 FROM_THE_BOX = "list"  # the rewind state when the list did not come from the volume
 NOT_MAIN = "agent"  # the rewind state of an agent the service does not run (until T17)
 SUMMARY_TTL = 3.0  # an agent's card is read again at most this often...
@@ -1029,6 +1031,8 @@ def create_app(
         kind = request.query_params.get("tipo", "")
         if kind == BUDGET and action == "set":
             return _budget_confirm(request, t)
+        if kind == PRICES and action == "set":
+            return _prices_confirm(request, t)
         if kind not in KINDS:
             return _settings_refused(request, t, 200, "settings.err.kind")
         state, rows = _settings_rows()
@@ -1065,6 +1069,60 @@ def create_app(
             spend=shown,
             csrf=access.csrf,
             ticket=setting_tickets.issue("set", BUDGET),
+        )
+
+    def _prices_confirm(request: Request, t: Translator) -> Response:
+        """The new prices waiting for the owner (T11, security review B3), with a one-time
+        ticket and the digest of what is shown: only those are accepted. Changes nothing."""
+        state = str(_settings_state())
+        if state != str(Availability.READY):
+            return _settings_refused(request, t, 200, f"settings.off.{state}")
+        shown = _spend()
+        if shown is None or not shown.available or not shown.pending:
+            return _settings_refused(request, t, 200, "settings.err.no_prices")
+        return _settings_view(
+            request,
+            t,
+            200,
+            "confirm_prices",
+            spend=shown,
+            csrf=access.csrf,
+            ticket=setting_tickets.issue("set", PRICES),
+        )
+
+    async def _prices_save(request: Request, t: Translator, digest: str) -> Response:
+        """The owner's yes. The Guard, the form's shape, CSRF and the ticket were checked by
+        ``settings_save``; the service checks the digest against what waits now."""
+        state = await asyncio.to_thread(_settings_state)
+        if state is not Availability.READY or settings is None:
+            return _settings_refused(request, t, 503, f"settings.off.{state}")
+        client = settings
+
+        def run() -> tuple[str, dict[str, Any] | None]:
+            try:
+                return "asked", client.accept_prices(digest)
+            except ControlUnavailable:
+                return "no_service", None
+            except ControlOutcomeUnknown:
+                logger.warning("accepting the new prices from the web has no known outcome")
+                return "unknown", None
+            except ControlError as error:
+                logger.error("accepting the new prices was not sent: %s", type(error).__name__)
+                return "untrusted", None
+
+        what, reply = await asyncio.to_thread(run)
+        row = SecretView(PRICES)
+        if reply is None:
+            status = 503 if what == "no_service" else 200
+            return _settings_view(request, t, status, "result", row=row, outcome=what)
+        return _settings_view(
+            request,
+            t,
+            200 if reply["ok"] or reply["outcome"] != "invalid" else 409,
+            "result",
+            row=row,
+            outcome=reply["outcome"],
+            message=reply["message"],
         )
 
     async def _budget_save(request: Request, t: Translator, form: dict[str, str]) -> Response:
@@ -1137,6 +1195,24 @@ def create_app(
                 reason = "settings.err.used" if spent else "settings.err.expired"
                 return _settings_refused(request, t, 400, reason)
             return await _budget_save(request, t, form)
+        if form is not None and form["tipo"] == PRICES:
+            # T11 (B3): accepting the new prices, with the same checks as a key.
+            digest = form.get("huella", "")
+            shape = set(form) == {*SETTINGS_FIELDS, "huella"}
+            if form["accion"] != "set" or not shape or not digest_ok(digest):
+                form.clear()
+                return _settings_refused(request, t, 400, "settings.err.form")
+            if not access.csrf_is(form["csrf"]):
+                form.clear()
+                logger.warning("accepting the new prices was refused: wrong form token")
+                return _settings_refused(request, t, 403, "settings.err.form")
+            redeemed, _ = setting_tickets.redeem(form["ticket"], "set", PRICES)
+            form.clear()
+            if redeemed is not Redeemed.OK:
+                spent = redeemed is Redeemed.SPENT
+                reason = "settings.err.used" if spent else "settings.err.expired"
+                return _settings_refused(request, t, 400, reason)
+            return await _prices_save(request, t, digest)
         if form is None or form["accion"] not in ACTIONS or form["tipo"] not in KINDS:
             return _settings_refused(request, t, 400, "settings.err.form")
         action, kind = form["accion"], form["tipo"]

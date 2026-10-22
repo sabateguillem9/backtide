@@ -30,7 +30,9 @@ The server (inside the service):
   The spending cap (T11, ``backtide.service.spend``): ``{"cmd": "budget"}`` (today's and this
   month's spending, the caps and the prices' date: no secret) and ``{"cmd": "set_budget",
   "daily_usd": ..., "monthly_usd": ...}`` (either may be left out; plus ``via``: ``cli`` or
-  ``web``), recorded by the service before it changes anything.
+  ``web``), recorded by the service before it changes anything; ``{"cmd": "accept_prices",
+  "digest": ...}`` (plus ``via``) accepts the new prices the page offered that wait for the owner
+  (security review of T11, B3), only those whose digest the page showed.
   The web's holds page (T10-5, docs/32 section 11 and decision 9): ``{"cmd": "trust",
   "hold_id": ..., "via": "web"}`` ("aprobar y confiar en este destinatario": only ``web``),
   ``{"cmd": "untrust", "trust_id": ...}`` and ``{"cmd": "end_batch", "rule_id": ...}`` (plus
@@ -402,7 +404,7 @@ class ControlServer:
             return self._listing(request)
         if command in ("secrets", "set_secret", "clear_secret"):
             return self._settings_command(request, pid, uid)
-        if command in ("budget", "set_budget"):
+        if command in ("budget", "set_budget", "accept_prices"):
             return self._budget_command(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
 
@@ -419,6 +421,8 @@ class ControlServer:
                 logger.error("reading the spending raised: %s", type(error).__name__)
                 return {"ok": False, "outcome": "failed", "message": "No se ha podido leer."}
             return {"ok": True, "outcome": "listed", "budget": status, "message": ""}
+        if request["cmd"] == "accept_prices":
+            return self._accept_prices(request, pid, uid)
         if set(request) - {"cmd", "daily_usd", "monthly_usd", "via"}:
             raise _BadRequest("La petición de tope no lleva lo que debe.")
         via = request.get("via", "cli")
@@ -436,6 +440,22 @@ class ControlServer:
             )
         except Exception as error:
             logger.error("changing the spending cap raised: %s", type(error).__name__)
+            return {"ok": False, "outcome": "failed", "message": "Ha fallado algo inesperado."}
+        return {"ok": outcome.ok, "outcome": outcome.outcome, "message": outcome.message}
+
+    def _accept_prices(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """B3: the owner's yes to the new prices waiting (the digest says which ones)."""
+        if set(request) - {"cmd", "digest", "via"} or not isinstance(request.get("digest"), str):
+            raise _BadRequest("La petición de precios no lleva lo que debe.")
+        via = request.get("via", "cli")
+        if not isinstance(via, str) or via not in SETTINGS_REQUESTERS:
+            raise _BadRequest("Los precios solo se aceptan desde la web o la terminal.")
+        try:
+            outcome = self._budget.accept_prices(  # type: ignore[union-attr]
+                request["digest"][:64], requested_by=f"{via} (uid {uid}, pid {pid})"
+            )
+        except Exception as error:
+            logger.error("accepting the new prices raised: %s", type(error).__name__)
             return {"ok": False, "outcome": "failed", "message": "Ha fallado algo inesperado."}
         return {"ok": outcome.ok, "outcome": outcome.outcome, "message": outcome.message}
 
@@ -1393,6 +1413,47 @@ def ask_set_budget(
         raise ControlOutcomeUnknown(
             "La respuesta del servicio no es la esperada. No se sabe si el tope ha cambiado: "
             "mira la página de Ajustes y la caja negra."
+        )
+    return {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
+
+
+def ask_accept_prices(
+    path: Path,
+    *,
+    digest: str,
+    via: str = "cli",
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Accept the new prices waiting whose digest is ``digest`` (B3). The reply, checked: ``ok``,
+    ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
+    if via not in SETTINGS_REQUESTERS:
+        raise ValueError("unknown via")
+    request: dict[str, Any] = {"cmd": "accept_prices", "digest": digest}
+    if via != "cli":
+        request["via"] = via
+    raw = _ask(
+        Path(path),
+        request,
+        what="la aceptación de los precios nuevos",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in BUDGET_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si los precios han "
+            "cambiado: mira la página de Ajustes y la caja negra."
         )
     return {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
 

@@ -237,6 +237,18 @@ def check_request(
 
 # --- the endpoint ---------------------------------------------------------------------------------
 
+# The endpoints the providers do not bill (T11, security review M4): the list of models and
+# Anthropic's token count. They still hold a place among the calls in flight.
+FREE_ENDPOINTS = frozenset({"models", "count_tokens"})
+
+
+def endpoint_of(
+    kind: str, method: str, path: str, headers: Sequence[tuple[str, str]] = ()
+) -> str | None:
+    """Which model endpoint a request is (``messages``, ``count_tokens``, ``chat``,
+    ``responses``, ``completions``, ``embeddings`` or ``models``), or None."""
+    return _endpoint(kind, method, path, headers)
+
 
 def _endpoint(kind: str, method: str, path: str, headers: Sequence[tuple[str, str]]) -> str | None:
     """Which model endpoint this is, or None."""

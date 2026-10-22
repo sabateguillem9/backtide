@@ -23,6 +23,10 @@ the pinned mitmproxy image. Never contacted from the Mac and never with a real k
 - T06-7, a provider whose answers are big: a model request with ``T06-BIG`` in it gets a
   JSON answer of BIG_ANSWER bytes (with its length), sent slowly over a few seconds, so several
   are held whole in the proxy at once (its HELD_BUDGET).
+- T11's security review (evadir-el-tope): a model request with ``T11-CUT-TAIL`` in it gets a
+  stream that stops for CUT_PAUSE seconds after its last ``content_block_stop``, before
+  ``message_delta`` and ``message_stop`` (the agent hangs up there); with ``T11-NO-HEAD``, the
+  answer waits SLOW_HEAD seconds before its status line (the agent hangs up before it).
 - 53 (UDP and TCP): a resolver that logs every query and answers NXDOMAIN. The VM tests make it
   the proxy's upstream DNS (``test_dns``, T06-7): any name the proxy resolves that is not a
   container on its networks lands here, so a test sees which names left (``dns-tunel``).
@@ -58,6 +62,10 @@ BIG_MARK = b"T06-BIG"
 BIG_ANSWER = 15 * 1024 * 1024  # under the proxy's body_size_limit (16 MiB)
 BIG_CHUNK = 1024 * 1024
 BIG_PAUSE = 0.4  # seconds between chunks: about 6 s for the whole answer
+CUT_MARK = b"T11-CUT-TAIL"
+CUT_PAUSE = 6.0
+SLOW_MARK = b"T11-NO-HEAD"
+SLOW_HEAD = 8.0
 DNS_QUERIES: list[dict] = []
 DNS_ERRORS = {"udp": 0, "tcp": 0}  # a resolver that fails must show it, never prove "nothing came"
 
@@ -128,6 +136,14 @@ class Handler(BaseHTTPRequestHandler):
         echo = ECHO_MARK.search(body)
         if BIG_MARK in body and path.endswith("/v1/messages"):
             self._big()
+        elif CUT_MARK in body and path.endswith("/v1/messages"):
+            self._anthropic_cut(_json_or_empty(body).get("model", "fake-model"))
+        elif SLOW_MARK in body and path.endswith("/v1/messages"):
+            time.sleep(SLOW_HEAD)
+            try:
+                self._anthropic(body)
+            except OSError:
+                self.close_connection = True  # the proxy hung up meanwhile
         elif echo is not None and path.endswith(("/v1/messages", "/chat/completions")):
             self._echo(echo.group(1).decode(), anthropic=path.endswith("/v1/messages"))
         elif path.endswith("/v1/messages"):
@@ -381,6 +397,33 @@ class Handler(BaseHTTPRequestHandler):
                 ("message_stop", {"type": "message_stop"}),
             ]
         )
+
+    def _anthropic_cut(self, model: str) -> None:
+        """A stream whose text is all there, then a pause before the usage that ends it."""
+        message = {"id": "msg_t11", "type": "message", "role": "assistant", "model": model,
+                   "content": [], "stop_reason": None, "stop_sequence": None,
+                   "usage": {"input_tokens": 12, "output_tokens": 1}}  # fmt: skip
+        head = [
+            ("message_start", {"type": "message_start", "message": message}),
+            ("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "text", "text": ""}}),
+            ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "text_delta", "text": REPLY_TEXT}}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ]  # fmt: skip
+        tail = [
+            ("message_delta", {"type": "message_delta", "usage": {"output_tokens": 900},
+                               "delta": {"stop_reason": "end_turn", "stop_sequence": None}}),
+            ("message_stop", {"type": "message_stop"}),
+        ]  # fmt: skip
+        try:
+            self._sse(head)
+            time.sleep(CUT_PAUSE)
+            for name, data in tail:
+                self.wfile.write(f"event: {name}\ndata: {json.dumps(data)}\n\n".encode())
+                self.wfile.flush()
+        except OSError:
+            self.close_connection = True  # the proxy hung up: nothing more to send
 
     def _anthropic_tool_use(self, model: str, command: str) -> None:
         message = {

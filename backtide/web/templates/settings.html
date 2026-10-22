@@ -62,6 +62,24 @@
           {% endif %}
         </div>
       </li>
+      {# T11, security review B3: prices the page offers that only apply with the owner's yes
+         (new models, or more than half below the shipped price). #}
+      {% if spend and spend.available and spend.pending %}
+      <li class="setting is-problem" data-kind="precios">
+        <div class="setting-info">
+          <span class="setting-name">{{ t('settings.prices') }}</span>
+          <span class="setting-state"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('settings.prices.pending', models=spend.pending | map(attribute='model') | join(', ')) }}</span></span>
+          <span class="setting-note">{{ t('settings.prices.note') }}</span>
+        </div>
+        <div class="setting-actions">
+          {% if ready %}
+          <a class="setting-go" href="{{ base }}/ajustes/cambiar?tipo=precios">{{ t('settings.prices.accept') }}</a>
+          {% else %}
+          <span class="setting-go is-off" aria-disabled="true">{{ t('settings.prices.accept') }}</span>
+          {% endif %}
+        </div>
+      </li>
+      {% endif %}
     </ul>
   </section>
   <p class="note settings-agent">{{ t('settings.agent') }}</p>
