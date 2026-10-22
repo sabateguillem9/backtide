@@ -30,7 +30,7 @@ from subprocess import CompletedProcess
 from typing import TYPE_CHECKING, Any, Protocol
 
 import pytest
-from attack_manifest import DIMENSIONS, SCRIPTS_DIR, Scenario, load_manifest
+from attack_manifest import DIMENSIONS, PROFILES, SCRIPTS_DIR, Scenario, load_manifest
 from attack_report import Result
 
 if TYPE_CHECKING:
@@ -57,6 +57,10 @@ CANARY_VARIABLES = (
     "TELEGRAM_BOT_TOKEN",
 )
 
+# The agent the battery runs with: `make ataques PERFIL=claude-code` sets it (T17a-5). A
+# scenario whose manifest entry does not list it is skipped, saying so (conftest.py).
+PROFILE_ENV = "BACKTIDE_ATK_PERFIL"
+
 # The report reads these at the end of the session (one process: a module-level dict is enough).
 RESULTS: dict[str, Result] = {}
 _SCENARIOS: dict[str, Scenario] | None = None
@@ -74,12 +78,33 @@ class Agent(Protocol):
     ) -> CompletedProcess[str]: ...
 
 
+class _BoxSensor:
+    """A ``BatterySensor``-shaped view over a service's black box, for ``Attack.watch_service``:
+    the service's own process sensor already watches its agent, so the events are already in the
+    box (``recorded_exec``/``recorded_connect`` only need ``events(source, action, since)``)."""
+
+    def __init__(self, box: Any) -> None:
+        self._box = box
+
+    def events(self, source: str, *, action: str | None = None, since: int = 0) -> list["Event"]:
+        found = self._box.events(source=source, since_seq=since)
+        return [e for e in found if action in (None, e.action)]
+
+
 def scenarios() -> dict[str, Scenario]:
     """The manifest by id (read once)."""
     global _SCENARIOS  # noqa: PLW0603 - a read-once cache of an immutable file
     if _SCENARIOS is None:
         _SCENARIOS = {s.id: s for s in load_manifest()}
     return _SCENARIOS
+
+
+def battery_profile() -> str:
+    """The profile this run of the battery is for (``openclaw`` when nothing says otherwise)."""
+    profile = os.environ.get(PROFILE_ENV, "") or PROFILES[0]
+    if profile not in PROFILES:
+        raise AttackError(f"{PROFILE_ENV}={profile!r}: the battery's profiles are {PROFILES}")
+    return profile
 
 
 def scenario(scenario_id: str) -> Callable[[Any], Any]:
@@ -152,6 +177,19 @@ class Attack:
         self._sensor = sensor
         self._container = container
         self._since = sensor.watch(container, jail.exec)
+        return self._since
+
+    def watch_service(self, service: Any) -> int:
+        """Like ``watch``, but over a real service's own process sensor (its reader already
+        watches its agent, so there is no probe to run): the T17a-5 claude-code labs. Makes
+        ``recorded_exec`` and ``recorded_connect`` read the service's black box. Returns the seq
+        just before the attack. Call it right before running the attack."""
+        container = service.jail.container_id()
+        assert container is not None, "the service's agent container must exist to be watched"
+        head = service.box.head()
+        self._sensor = _BoxSensor(service.box)
+        self._container = container
+        self._since = head[0] if head is not None else 0
         return self._since
 
     @property

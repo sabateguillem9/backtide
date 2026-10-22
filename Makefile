@@ -43,9 +43,10 @@ it: ## Integration tests inside the VM (only some: make it IT=tests/integration/
 # Where `make ataques` looks for scenarios: ATK_PATH=tests/attacks/test_x.py runs one file only.
 ATK_PATH ?= tests/attacks
 
-ataques: ## Evil-agent battery inside the VM (only some: make ataques ATK="-k nested" or ATK_PATH=tests/attacks/test_x.py; no ' in either)
+ataques: ## Evil-agent battery inside the VM (PERFIL=claude-code for Claude Code; only some: ATK="-k nested" or ATK_PATH=tests/attacks/test_x.py; no ' in either)
 	@case "$(ATK)$(ATK_PATH)" in *"'"*) echo "ATK and ATK_PATH cannot contain single quotes: they go inside sh -c '...'" >&2; exit 2;; esac
-	$(VM_SH) '$(UV_VM) pytest -m ataques -q --tb=short $(ATK_PATH) $(ATK)'
+	@case "$(PERFIL)" in ""|openclaw|claude-code) ;; *) echo "PERFIL es openclaw o claude-code" >&2; exit 2;; esac
+	$(VM_SH) 'BACKTIDE_ATK_PERFIL=$(or $(PERFIL),openclaw) $(UV_VM) pytest -m ataques -q --tb=short $(ATK_PATH) $(ATK)'
 
 demo: ## Demo: volume + `backtide vigilar` in front (terminal 1; docs/demo.md)
 	$(VM_SH) '$(DEMO_VM) up'
@@ -77,8 +78,8 @@ demo-web: ## Demo: the web of the running demo, in the VM (open the link on the 
 
 probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5; PERFIL=claude-code para Claude Code; LOCAL=<modelo de tu Ollama> en vez de Claude), en primer plano (terminal 1; docs/probar.md)
 	@case "$(MODEL)" in ""|*[!0-9A-Za-z._:/@+-]*) echo "MODEL tiene caracteres raros" >&2; exit 2;; esac
-	@case "$(FALSO)" in ""|1) ;; *) echo "FALSO solo puede valer 1" >&2; exit 2;; esac
 	@case "$(LOCAL)" in *[!0-9A-Za-z._:/@+-]*) echo "LOCAL tiene caracteres raros" >&2; exit 2;; esac
+	@case "$(FALSO)" in ""|1) ;; *) echo "FALSO solo puede valer 1" >&2; exit 2;; esac
 	@case "$(PERFIL)" in ""|openclaw|claude-code) ;; *) echo "PERFIL es openclaw o claude-code" >&2; exit 2;; esac
 	$(VM_SH) '$(PROBAR_VM) up --modelo $(MODEL) $(if $(FALSO),--internet-falso) $(if $(PERFIL),--perfil $(PERFIL)) $(if $(LOCAL),--local $(LOCAL))'
 

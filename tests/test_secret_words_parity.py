@@ -243,6 +243,8 @@ KNOWN_LEAKS = [
     ("/usr/bin/x", f"--token Bearer {_P}"),
     ("/usr/bin/x", f"--token=bearer {_P}"),
     ("/usr/bin/x", f"--password --password {_P}"),
+    ("/usr/bin/x", f"--no-token --token {_P}"),
+    ("/bin/true", f'--no-token --token "{_P} x"'),
     ("/usr/bin/x", f"--pass=Basic {_P}"),
     ("/usr/bin/x", f"token=Bearer {_P}"),
     ("/usr/bin/x", f"MYSQL_PWD=Basic {_P} mysql"),

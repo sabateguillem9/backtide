@@ -23,6 +23,11 @@ DIMENSIONS: Mapping[str, tuple[str, ...]] = {
     "held": ("yes", "no", "n/a"),
 }
 STATUSES = ("ready", "pending")
+# The agents a scenario runs with (`make ataques PERFIL=<name>`; backtide.jail.profiles.NAMED).
+# Without ``profiles`` a scenario is OpenClaw's: every scenario before T17a-5 starts its own
+# OpenClaw (its Gateway, its jail, its fake providers).
+PROFILES = ("openclaw", "claude-code")
+DEFAULT_PROFILES = ("openclaw",)
 INVARIANTS = range(1, 9)  # CLAUDE.md, "Invariantes de seguridad"
 _ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*", re.ASCII)
 _TASK_RE = re.compile(r"T[0-9]{2}(?:[a-e](?:-[1-9])?)?", re.ASCII)
@@ -65,6 +70,7 @@ class Scenario:
     status: str  # "ready" (a test runs it today) or "pending" (waits for ``task``)
     task: str | None  # for pending scenarios: the task that makes them possible
     expect: Mapping[str, Expectation]
+    profiles: tuple[str, ...] = DEFAULT_PROFILES  # the agents it runs with (PROFILES)
 
     @property
     def is_ready(self) -> bool:
@@ -141,7 +147,19 @@ def _parse(entry: object, index: int) -> Scenario:
         status=status,
         task=task,
         expect=_parse_expect(entry.get("expect"), where),
+        profiles=_parse_profiles(entry.get("profiles", list(DEFAULT_PROFILES)), where),
     )
+
+
+def _parse_profiles(value: object, where: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(name, str) and name in PROFILES for name in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ManifestError(f"{where}: profiles must be a list of different names from {PROFILES}")
+    return tuple(value)
 
 
 def _parse_expect(table: object, where: str) -> dict[str, Expectation]:

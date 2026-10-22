@@ -6,6 +6,8 @@
 - Every test marked ``ataques`` refuses to run anywhere but the vigia-dev VM (invariant 8).
 - Puts fake secrets ("canaries") in the environment of the test process before the agent
   starts: if the jail ever forwarded the host's environment, the scenarios would find them.
+- Runs the battery for one agent (`make ataques PERFIL=claude-code`, T17a-5): a scenario whose
+  manifest entry does not list that profile is skipped, with the reason.
 - Collects the result of each scenario and prints the report at the end (attack_report.py).
 """
 
@@ -17,12 +19,20 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-from attack_kit import CANARY_PREFIX, CANARY_VARIABLES, RESULTS, Attack, scenarios
+from attack_kit import (
+    CANARY_PREFIX,
+    CANARY_VARIABLES,
+    RESULTS,
+    Attack,
+    AttackError,
+    battery_profile,
+    scenarios,
+)
 from attack_manifest import Scenario
 from attack_report import Result, format_report
 
 from tests import docker_leaks
-from tests.docker_leaks import pytest_collection_finish, pytest_sessionfinish  # noqa: F401 - hooks
+from tests.docker_leaks import pytest_collection_finish  # noqa: F401 - a hook
 
 _INTEGRATION = Path(__file__).resolve().parent.parent / "integration"
 
@@ -63,14 +73,51 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "scenario(id): the manifest scenario this test runs")
 
 
+# Split for the report and the "nothing ran" guard: scenario ids collected for THIS run, and of
+# those which match the battery's profile and which are only for another agent (set in collection).
+_COLLECTED_IDS: set[str] = set()
+_WRONG_PROFILE_IDS: set[str] = set()
+WRONG_PROFILE_PREFIX = (
+    "otro-perfil: "  # the skip reason of a profile mismatch (the report reads it)
+)
+
+
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Make each scenario selectable by its manifest id, which is Spanish while the test names
     are English: `make ataques ATK="-k rebobinado-matado"` (or any part of an id, such as
-    `-k rebobin`) runs the tests of the scenarios whose id contains it."""
+    `-k rebobin`) runs the tests of the scenarios whose id contains it. And skip, saying why,
+    the scenarios that are not for this run's agent (manifest ``profiles``)."""
+    try:
+        profile = battery_profile()
+    except AttackError as problem:
+        raise pytest.UsageError(str(problem)) from problem
     for item in items:
         marker = item.get_closest_marker("scenario")
-        if marker is not None:
-            item.extra_keyword_matches.add(marker.args[0])
+        if marker is None:
+            continue
+        scenario_id = marker.args[0]
+        item.extra_keyword_matches.add(scenario_id)
+        _COLLECTED_IDS.add(scenario_id)
+        profiles = scenarios()[scenario_id].profiles
+        if profile not in profiles:
+            _WRONG_PROFILE_IDS.add(scenario_id)
+            item.add_marker(
+                pytest.mark.skip(
+                    reason=f"{WRONG_PROFILE_PREFIX}solo con el perfil {' o '.join(profiles)}: esta "
+                    f"batería es la de {profile} (make ataques PERFIL=...)"
+                )
+            )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Invariant 7 cannot be proved by a run that only skipped: if every scenario collected for
+    this run was skipped because it is for another agent (e.g. `PERFIL=claude-code
+    ATK_PATH=tests/attacks/test_proxy_attacks.py`), fail loudly instead of a green "all skipped".
+    Calls the docker-leak guard's own sessionfinish too (this module owns the single hook)."""
+    docker_leaks.pytest_sessionfinish(session, exitstatus)
+    matched = _COLLECTED_IDS - _WRONG_PROFILE_IDS
+    if _COLLECTED_IDS and not matched and session.exitstatus == 0:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.hookimpl(wrapper=True)
@@ -102,9 +149,20 @@ def _first_line(report: pytest.TestReport) -> str:
 
 def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
     if RESULTS:
-        terminalreporter.section("agente malvado: resumen")
+        profile = battery_profile()
+        terminalreporter.section(f"agente malvado: resumen (perfil {profile})")
         for line in format_report(list(scenarios().values()), RESULTS):
             terminalreporter.write_line(line)
+        matched = _COLLECTED_IDS - _WRONG_PROFILE_IDS
+        terminalreporter.write_line(
+            f"Perfil {profile}: {len(matched)} escenarios de este perfil ejecutados, "
+            f"{len(_WRONG_PROFILE_IDS)} saltados por ser de otro perfil."
+        )
+        if _COLLECTED_IDS and not matched:
+            terminalreporter.write_line(
+                "ATENCIÓN: ningún escenario de este perfil se ejecutó (todos los recogidos son de "
+                "otro perfil): la batería no prueba nada para este perfil (salida distinta de 0)."
+            )
     docker_leaks.pytest_terminal_summary(terminalreporter, exitstatus, config)  # the leak guard
 
 
@@ -134,6 +192,45 @@ def canary_environment() -> Iterator[dict[str, str]]:
 def agent(canary_environment: dict[str, str], running_agent: Any) -> Any:
     """The real OpenClaw in its jail on a shared Btrfs (one per test module)."""
     return running_agent
+
+
+@pytest.fixture(scope="module")
+def cc_lab(
+    canary_environment: dict[str, str],
+    btrfs_volume: Any,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Any]:
+    """The Claude Code lab for T17a-5 (one per module, deny mode): `backtide vigilar` with
+    ``profile = "claude-code"``, its process sensor and the fake internet. Used by the Claude
+    Code scenarios and by the claude-code branch of the shared ones (salida-directa, ...)."""
+    from cc_kit import DENY_ALLOW_HOSTS, build_cc_lab, stop_cc_lab  # noqa: PLC0415 - VM only
+
+    lab, sensor = build_cc_lab(
+        btrfs_volume, tmp_path_factory, unknown_hosts="deny", allow_hosts=DENY_ALLOW_HOSTS
+    )
+    try:
+        yield lab
+    finally:
+        stop_cc_lab(lab, sensor)
+
+
+@pytest.fixture(scope="module")
+def cc_lab_hold(
+    canary_environment: dict[str, str],
+    btrfs_volume: Any,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[Any]:
+    """The Claude Code lab in hold mode (reads to any host pass, writes are held): dns-tunel's
+    claude-code branch, which needs held writes, not a flat allow-list refusal."""
+    from cc_kit import HOLD_ALLOW_HOSTS, build_cc_lab, stop_cc_lab  # noqa: PLC0415 - VM only
+
+    lab, sensor = build_cc_lab(
+        btrfs_volume, tmp_path_factory, unknown_hosts="hold", allow_hosts=HOLD_ALLOW_HOSTS
+    )
+    try:
+        yield lab
+    finally:
+        stop_cc_lab(lab, sensor)
 
 
 @pytest.fixture

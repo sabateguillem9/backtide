@@ -39,7 +39,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from attack_kit import CONTAINER_WORK, Attack, scenario
+from attack_kit import CONTAINER_WORK, Attack, battery_profile, scenario
 from test_proxy_attacks import DNS_CANARY_DOMAIN, Lab, new_tag, pieces, start_lab, ts
 
 from backtide.blackbox import Event
@@ -854,8 +854,12 @@ def test_credentials_sent_to_an_unknown_host_are_held(attack: Attack, lab: Lab) 
 
 @scenario("dns-tunel")
 def test_a_name_leaves_only_once_recorded_and_the_guard_stops_the_rest(
-    attack: Attack, lab: Lab
+    attack: Attack, request: pytest.FixtureRequest
 ) -> None:
+    # Both agents (T17a-5): OpenClaw's gate lab, or the Claude Code lab in hold mode (cc_lab_hold).
+    # The DNS guard is agent-independent; the script is pure python. The cc lab exposes the same
+    # surface the body uses (``agent``, ``head``, ``service``, ``internet``, ``tagged``).
+    lab = request.getfixturevalue("cc_lab_hold" if battery_profile() == "claude-code" else "lab")
     tag = new_tag()
     marker = f"t10dns{uuid4().hex[:10]}"
     canary = f"{marker}-canary.{DNS_CANARY_DOMAIN}"

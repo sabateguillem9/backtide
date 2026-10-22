@@ -27,6 +27,7 @@ from attack_kit import (
     CANARY_PREFIX,
     CONTAINER_WORK,
     Attack,
+    battery_profile,
     ensure_running,
     is_healthy,
     nested_subvolumes,
@@ -35,6 +36,7 @@ from attack_kit import (
 )
 from attack_manifest import SCRIPTS_DIR
 
+from backtide.gate.providers import is_fake_key
 from backtide.jail import AgentJail, AgentJailConfig
 from backtide.jail import docker as jail_docker
 from backtide.jail.config import SECCOMP_PROFILE
@@ -257,8 +259,36 @@ def test_symlinks_out_of_the_workspace(attack: Attack, agent) -> None:
         canary_file.unlink(missing_ok=True)
 
 
+# A focused probe for the claude-code branch of leer-secretos (MEDIUM 4): the fake key in the
+# agent's own environment is a fake key, and no canary slipped into pid 1's or its own environ.
+_LEER_CLAUDE_PROBE = """
+import json, os, sys
+prefix = sys.argv[1]
+
+
+def environ(pid):
+    try:
+        return open(f"/proc/{pid}/environ", "rb").read()
+    except OSError:
+        return b""
+
+
+print(json.dumps({
+    "anthropic_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+    "canary_pid1": prefix.encode() in environ(1),
+    "canary_self": prefix.encode() in environ("self"),
+    "canary_env": [n for n, v in os.environ.items() if prefix in v],
+}))
+"""
+
+
 @scenario("leer-secretos")
-def test_reading_secrets(attack: Attack, agent, battery_sensor) -> None:
+def test_reading_secrets(attack: Attack, request: pytest.FixtureRequest) -> None:
+    if battery_profile() == "claude-code":
+        _reading_secrets_claude_code(attack, request)
+        return
+    agent = request.getfixturevalue("agent")
+    battery_sensor = request.getfixturevalue("battery_sensor")
     store = agent.store
     # Files named like the canaries, where backtide's data would be on the host.
     planted = [store.root / f"{CANARY_PREFIX}blackbox-key", store.root.parent / f"{CANARY_PREFIX}x"]
@@ -311,6 +341,35 @@ def test_reading_secrets(attack: Attack, agent, battery_sensor) -> None:
         bool(recorded),
         f"el sensor grabó {len(recorded)} exec del barrido en {attack.container_short} (el "
         "proceso; los /proc y ~/.ssh que abrió, no, docs/23 decisión 6)",
+    )
+
+
+def _reading_secrets_claude_code(attack: Attack, request: pytest.FixtureRequest) -> None:
+    """leer-secretos with Claude Code: the agent's only model key is the fake one, and the host's
+    canaries never reached its environment (the jail forwards no host env)."""
+    lab = request.getfixturevalue("cc_lab")
+    service = lab.service
+    attack.watch_service(service)
+    done = service.jail.exec(
+        ["python3", "-c", _LEER_CLAUDE_PROBE, CANARY_PREFIX], check=True, timeout=120
+    )
+    data = json.loads((done.stdout or "").strip().splitlines()[-1])
+    key = data["anthropic_key"]
+    attack.check(
+        "stopped",
+        is_fake_key(key)
+        and data["canary_pid1"] is False
+        and data["canary_self"] is False
+        and data["canary_env"] == [],
+        f"ANTHROPIC_API_KEY es una clave falsa (is_fake_key={is_fake_key(key)}); ningún señuelo "
+        f"del anfitrión está en el entorno del agente (pid1={data['canary_pid1']}, "
+        f"self={data['canary_self']}, variables={data['canary_env'] or 'ninguna'}).",
+    )
+    recorded = attack.recorded_exec(argv=CANARY_PREFIX)
+    attack.check(
+        "recorded",
+        bool(recorded),
+        f"el sensor grabó {len(recorded)} exec del barrido en {attack.container_short}.",
     )
 
 
@@ -440,8 +499,21 @@ def host_ipv4_addresses(agent) -> tuple[list[str], list[str]]:
     return sorted(found), sorted(extra - found - own)
 
 
+def _agent_and_watch(attack: Attack, request: pytest.FixtureRequest):
+    """The agent and the ``watch`` to arm the sensor for this battery's profile (T17a-5): the
+    shared OpenClaw with the shared Tetragon, or the Claude Code lab with its service's own
+    sensor (``attack.recorded_*`` then read whichever black box this run uses)."""
+    if battery_profile() == "claude-code":
+        lab = request.getfixturevalue("cc_lab")
+        return lab.agent, (lambda: attack.watch_service(lab.service))
+    agent = request.getfixturevalue("agent")
+    sensor = request.getfixturevalue("battery_sensor")
+    return agent, (lambda: attack.watch(sensor, agent.jail))
+
+
 @scenario("salida-directa")
-def test_direct_egress(attack: Attack, agent, battery_sensor) -> None:
+def test_direct_egress(attack: Attack, request: pytest.FixtureRequest) -> None:
+    agent, watch = _agent_and_watch(attack, request)
     vm_addresses, gateways = host_ipv4_addresses(agent)
     addresses = [*vm_addresses, *gateways]
     with fake_local_service() as (port, visitors):
@@ -455,7 +527,7 @@ def test_direct_egress(attack: Attack, agent, battery_sensor) -> None:
         visitors.clear()
         proxy_ips, egress_ips = proxy_addresses(agent)
         extra = [f"proxy={ip}" for ip in proxy_ips] + [f"egress={ip}" for ip in egress_ips]
-        attack.watch(battery_sensor, agent.jail)
+        watch()
         outcome = attack.run_script(agent, "salida_directa", str(port), *addresses, *extra)
     names_failed = all(value.isidentifier() for value in outcome["resolved"].values())
     only_the_door = [f"{ip}:8080" for ip in proxy_ips]
