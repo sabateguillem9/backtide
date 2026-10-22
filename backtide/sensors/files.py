@@ -2248,7 +2248,7 @@ class FileWatcher:
         self._flush_failed = False
         for record in batch.records:
             if self._budget.exhausted(mono):
-                self._announce_budget(mono)
+                self._announce_budget()
                 self._fold(record)
             elif not self._bucket.take(mono):
                 self._fold(record)
@@ -2267,7 +2267,7 @@ class FileWatcher:
         self._stats.folded += 1
         self._summary.add(record)
 
-    def _announce_budget(self, mono: float) -> None:
+    def _announce_budget(self) -> None:
         if self._budget_alerted == self._budget.window_start:
             return
         self._budget_alerted = self._budget.window_start

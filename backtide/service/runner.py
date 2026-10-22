@@ -83,7 +83,6 @@ logger = logging.getLogger(__name__)
 
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 LOCK_ATTEMPTS = 5
-_HANDLER = Callable[[int, FrameType | None], None]
 
 
 class ServiceLocked(RuntimeError):  # noqa: N818 - reads better than ServiceLockedError

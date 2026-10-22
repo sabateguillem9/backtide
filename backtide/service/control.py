@@ -254,7 +254,6 @@ class BudgetService(Protocol):
 
 
 BUDGET_OUTCOMES = frozenset({"saved", "invalid", "failed", REFUSED})
-MAX_BUDGET_REPLY_BYTES = 16 * 1024
 
 PeerCredentials = Callable[[socket.socket], tuple[int, int, int]]
 

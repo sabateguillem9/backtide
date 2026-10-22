@@ -1383,13 +1383,13 @@ class ProxyChannel:
         now = self._mono()
         budgets = self._budgets
         if budgets.daily.exhausted(now):
-            self._tell_budget(now)
+            self._tell_budget()
             return False
         if not budgets.bucket.take(now):
             return False
         return budgets.daily.try_spend(now)
 
-    def _tell_budget(self, now: float) -> None:
+    def _tell_budget(self) -> None:
         window_start = self._budgets.daily.window_start
         if self._budget_told == window_start:
             return

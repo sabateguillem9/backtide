@@ -35,7 +35,6 @@ from typing import Literal
 from backtide.snapshots import btrfs
 from backtide.snapshots.model import SnapshotError
 
-KIB = 1024
 MIB = 1024**2
 GIB = 1024**3
 

@@ -491,7 +491,7 @@ class ProcessSensor:
             logger.info("cannot tell whether the sensor runs: %s", error)
             running = None
         if running is False:
-            self._down("container_stopped", after)
+            self._down("container_stopped")
             return
         hooks = self._hooks
         if hooks is None or not hooks.agent_running():
@@ -542,7 +542,7 @@ class ProcessSensor:
         self._misses += 1
         logger.info("the sensor missed heartbeat %d of %d", self._misses, self._misses_for_down)
         if self._misses >= self._misses_for_down:
-            self._down("heartbeat", after)
+            self._down("heartbeat")
 
     def _not_launched(self, gone: _AgentGone, after: list[Callable[[], object]]) -> None:
         """A heartbeat docker exec did not launch. Nobody's fault if the agent is not running
@@ -859,7 +859,7 @@ class ProcessSensor:
         self._owes_back = False
         after.append(self._hooks.back)
 
-    def _down(self, reason: str, after: list[Callable[[], object]]) -> None:
+    def _down(self, reason: str) -> None:
         misses, self._misses = self._misses, 0
         self._state = SensorState.DOWN
         self._confirmed = False

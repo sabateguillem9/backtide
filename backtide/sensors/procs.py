@@ -434,10 +434,6 @@ class Context:
     def ids(self) -> tuple[str, ...]:
         return (self.agent_id, *self.previous)
 
-    @property
-    def short_id(self) -> str:
-        return self.agent_id[:MIN_PREFIX]
-
     def match(self, prefix: object) -> str | None:
         """The full id that ``prefix`` (a Tetragon ``docker`` field) is a prefix of, or None."""
         if not isinstance(prefix, str) or _PREFIX_RE.fullmatch(prefix) is None:

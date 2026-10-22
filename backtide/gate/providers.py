@@ -70,7 +70,6 @@ class Kind(StrEnum):
     OPENAI = "openai"  # Authorization: Bearer <key> (OpenAI and compatible APIs)
 
 
-DEFAULT_HOSTS = {Kind.ANTHROPIC: "api.anthropic.com", Kind.OPENAI: "api.openai.com"}
 _HEADER = {Kind.ANTHROPIC: "x-api-key", Kind.OPENAI: "authorization"}
 
 # T20 (docs/35, section 6.1): a local provider's virtual name, and where it may really be.

@@ -149,7 +149,6 @@ STATE_DB = "blackbox.db"
 STATE_KEY = "blackbox.key"
 STATE_CHECKPOINT = "blackbox.checkpoint"
 STATE_TOKEN = "gateway.token"  # noqa: S105 - the file's name, not a secret
-STATE_AGENT_CONFIG = "openclaw"  # OpenClaw's: each profile's config folder is named after it
 STATE_LOCK = "backtide.lock"
 STATE_PENDING = "rewind.pending"
 STATE_SOCKET = "control.sock"

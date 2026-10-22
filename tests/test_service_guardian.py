@@ -1190,6 +1190,22 @@ def test_a_space_condition_stops_the_snapshot_and_freezes_the_agent(running: Wor
     assert alert.event_seq == pause.seq
 
 
+def test_a_space_pause_on_an_agent_frozen_already_still_says_it_is_frozen(
+    running: World,
+) -> None:
+    # docs/19: every cycle records its space_pause. The agent is frozen by the first, so the
+    # next ones must not claim `frozen: False` (it is frozen, just not by this call).
+    running.volume.write()
+    running.violations.append(Violation("P3", "el uso pasa del tope", "space"))
+    running.guardian.cycle()
+    running.volume.write()
+    running.guardian.cycle()
+    pauses = running.events("space_pause")
+    assert len(pauses) == 2
+    assert [pause.details["frozen"] for pause in pauses] == [True, True]
+    assert running.log.count("jail.pause") == 1  # the second one froze nothing
+
+
 def test_the_space_check_comes_after_a_sync(running: World) -> None:
     running.volume.write()
     running.guardian.cycle()

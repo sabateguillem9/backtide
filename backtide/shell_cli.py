@@ -80,7 +80,6 @@ EXIT_PROBLEM = 3
 SEED_TIMEOUT = 30.0
 SEED_MAX_OUTPUT = 64 * 1024
 TASK_MAX_OUTPUT = 8 * 1024 * 1024  # the JSON of one `claude -p`: its answer and a few counters
-DEFAULT_TASK_MINUTES = 60
 MAX_IMPORT_BYTES = 1024**3  # 1 GiB: the workspace has its own cap anyway
 MAX_IMPORT_ENTRIES = 100_000
 MAX_IMPORT_DEPTH = 64

@@ -1457,8 +1457,13 @@ class Guardian:
         the space thread froze it to confirm the condition."""
         reasons = {violation.reason for violation in violations}
         held = self._freeze(reasons, freeze=freeze, frozen_already=frozen_already)
-        frozen, pause_error = held.frozen, held.pause_error
+        pause_error = held.pause_error
         killed, kill_error = held.killed, held.kill_error
+        # `held.frozen` means "this call froze it"; the event says what the agent is. Frozen by
+        # an earlier pause, it still is (the cycle records its space_pause again, docs/19).
+        frozen = held.frozen or (
+            freeze and pause_error is None and self.agent_state is AgentState.FROZEN
+        )
         details: dict[str, Any] = {
             "conditions": [violation.code for violation in violations],
             "reasons": sorted(reasons),

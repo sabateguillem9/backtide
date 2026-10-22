@@ -405,7 +405,7 @@ def create_app(
             )
         return response
 
-    def _status_view(t: Translator, agent: Agent) -> dict[str, Any]:
+    def _status_view(agent: Agent) -> dict[str, Any]:
         try:
             status = read_status(agent.reader)
         except BoxUnavailable:
@@ -652,7 +652,7 @@ def create_app(
             last_ts=last_ts,
             unreadable=unreadable,
             tide=_day_tide(agent),
-            **_status_view(t, agent),
+            **_status_view(agent),
         )
 
     @app.get("/ahora/preguntar", dependencies=protected)
@@ -1544,7 +1544,7 @@ def create_app(
             await asyncio.sleep(poll_interval)
 
     def _render_state(t: Translator, agent: Agent) -> str:
-        return env.get_template("state.html").render(t=t, **_status_view(t, agent))
+        return env.get_template("state.html").render(t=t, **_status_view(agent))
 
     def _render_tide(t: Translator, agent: Agent, fresh: bool = False) -> str:
         return env.get_template("tide.html").render(t=t, tide=_day_tide(agent, fresh=fresh))
