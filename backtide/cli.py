@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 
-from backtide import __version__
+from backtide import __version__, shell_cli
 from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, load_key, redact
 from backtide.jail import ExposedJail, JailError
 from backtide.jail.profile import ProfileError
@@ -132,7 +132,112 @@ def build_parser() -> argparse.ArgumentParser:
     resume.set_defaults(handler=_resume)
     _add_holds(commands)
     _add_web(commands)
+    _add_shell(commands)
     return parser
+
+
+def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """`backtide entrar`, `tarea`, `importar` and `exportar` (T17a-4): only for an agent of the
+    shell mode (Claude Code), through the running service (backtide/shell_cli.py)."""
+    enter = commands.add_parser(
+        "entrar",
+        help="abre el agente de programación en tu terminal (claude-code)",
+        description="Abre Claude Code dentro de su jaula, conectado a este terminal, como el "
+        "usuario del agente y en su carpeta de trabajo. Se lo pide antes al servicio en marcha, "
+        "que lo graba. Todo lo que haga el agente queda grabado y se puede rebobinar. Sale con "
+        "0 si la sesión terminó bien, 1 si no se pudo abrir o terminó con error y 2 si hay un "
+        "error de uso (por ejemplo, un agente que no es de modo shell).",
+    )
+    _add_config(enter)
+    enter.add_argument(
+        "--continue",
+        dest="resume",
+        action="store_true",
+        help="sigue la última conversación (la de la instantánea, tras un rebobinado)",
+    )
+    enter.set_defaults(handler=_enter)
+
+    task = commands.add_parser(
+        "tarea",
+        help='le da una tarea al agente de programación y enseña su respuesta: tarea "…"',
+        description="Lanza `claude -p` dentro de la jaula con la tarea como un solo argumento y "
+        "enseña la respuesta. Se lo pide antes al servicio en marcha, que lo graba. Sale con 0 si "
+        "la tarea terminó bien, 1 si no, 2 si hay un error de uso y 3 si no se sabe (por "
+        "ejemplo, se acabó el tiempo: la tarea puede seguir dentro).",
+    )
+    _add_config(task)
+    task.add_argument("prompt", metavar="tarea", help="lo que le pides, entre comillas")
+    task.add_argument(
+        "--continue",
+        dest="resume",
+        action="store_true",
+        help="sigue la última conversación (la de la instantánea, tras un rebobinado)",
+    )
+    task.add_argument(
+        "--minutos", type=float, default=60, help="tiempo máximo de espera (por defecto 60)"
+    )
+    task.set_defaults(handler=_task)
+
+    bring = commands.add_parser(
+        "importar",
+        help="copia una carpeta de este ordenador a la carpeta de trabajo del agente",
+        description="Copia una carpeta del anfitrión a /workspace/work/<nombre> del agente, como "
+        "el usuario del agente. No sigue enlaces simbólicos (los salta y dice cuáles), solo "
+        "copia archivos y carpetas, tiene un tope de tamaño y nunca escribe encima de una "
+        "carpeta que ya existe salvo con --reemplazar. El servicio lo graba antes. Sale con 0 si "
+        "se importó, 1 si no se pudo, 2 si hay un error de uso y 3 si quedó a medias.",
+    )
+    _add_config(bring)
+    bring.add_argument("source", metavar="carpeta", help="la carpeta del anfitrión")
+    bring.add_argument("--nombre", help="nombre de la carpeta en el agente (por defecto, el mismo)")
+    bring.add_argument(
+        "--reemplazar", action="store_true", help="escribe encima si la carpeta ya existe"
+    )
+    bring.set_defaults(handler=_import)
+
+    take = commands.add_parser(
+        "exportar",
+        help="copia la carpeta de trabajo del agente a una carpeta nueva de este ordenador",
+        description="El servicio hace una instantánea y copia de ella /workspace/work a la "
+        "carpeta que digas, que no puede existir (nunca se sobrescribe nada). No sigue enlaces "
+        "simbólicos ni copia lo que no es un archivo o una carpeta. Queda grabado. Sale con 0 si "
+        "se exportó, 1 si no se pudo, 2 si hay un error de uso y 3 si no se sabe.",
+    )
+    _add_config(take)
+    take.add_argument("destination", metavar="ruta", help="carpeta nueva donde copiarla")
+    take.set_defaults(handler=_export)
+
+
+def _shell_config(args: argparse.Namespace) -> ServiceConfig | None:
+    try:
+        return ServiceConfig.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return None
+
+
+def _enter(args: argparse.Namespace) -> int:
+    config = _shell_config(args)
+    return EXIT_ERROR if config is None else shell_cli.entrar(config, resume=args.resume)
+
+
+def _task(args: argparse.Namespace) -> int:
+    config = _shell_config(args)
+    if config is None:
+        return EXIT_ERROR
+    return shell_cli.tarea(config, args.prompt, resume=args.resume, minutes=args.minutos)
+
+
+def _import(args: argparse.Namespace) -> int:
+    config = _shell_config(args)
+    if config is None:
+        return EXIT_ERROR
+    return shell_cli.importar(config, args.source, name=args.nombre, replace=args.reemplazar)
+
+
+def _export(args: argparse.Namespace) -> int:
+    config = _shell_config(args)
+    return EXIT_ERROR if config is None else shell_cli.exportar(config, args.destination)
 
 
 def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:

@@ -13,6 +13,12 @@ the pinned mitmproxy image. Never contacted from the Mac and never with a real k
   message with ``T06-EXEC:[[<command>]]`` in it is answered with a call of the ``exec`` tool
   running that command (T06-5: what does a command of the agent see?); the turn that brings
   its result back gets the usual text.
+  T17a-4, Claude Code: ``T17-BASH:[[<command>]]`` is answered the same way with a call of
+  Claude Code's own ``Bash`` tool; ``model_turn`` keeps every ``T17-...`` marker of the user's
+  messages in the whole conversation (``markers``), so a test sees what a resumed one holds.
+- T17a-4, ``git push`` over smart HTTP: ``GET .../info/refs?service=git-receive-pack`` gets the
+  advertisement of an empty repository, so git goes on to its ``POST .../git-receive-pack``
+  (which the gate holds: a test checks it never arrives here).
 - ``.../chat/completions``: a fake OpenAI-compatible Chat Completions API (JSON or SSE).
 - T06-6, a provider that echoes the key it got: a model request with ``T06-ECHO-JSON`` in it is
   answered with a JSON error that quotes the key; with ``T06-ECHO-SSE``, a stream whose text
@@ -56,6 +62,8 @@ READY_LINE = "t06-internet-ready"
 SERVER_PEM = "/opt/internet/server.pem"
 REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"
 EXEC_MARK = re.compile(r"T06-EXEC:\[\[(.+?)\]\]", re.S)
+BASH_MARK = re.compile(r"T17-BASH:\[\[(.+?)\]\]", re.S)
+T17_MARK = re.compile(r"T17-[A-Z]+:\[\[(.+?)\]\]", re.S)
 ECHO_MARK = re.compile(rb"T06-ECHO-(JSON|SSE|B64|HEADER)")
 ECHO_END = "END-OF-ECHO"
 BIG_MARK = b"T06-BIG"
@@ -130,6 +138,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         bot = TG_PATH.fullmatch(path)
         host = (record["host"] or "").split(":")[0]
+        if path.endswith("/info/refs") and "service=git-receive-pack" in self.path:
+            self._git_advertisement("git-receive-pack")
+            return
         if host == TELEGRAM_HOST and bot is not None and bot.group(1) == FAKE_BOT_ID:
             self._telegram(bot.group(3), body, record)
             return
@@ -333,12 +344,49 @@ class Handler(BaseHTTPRequestHandler):
             events.append((None, "[DONE]"))
         self._sse(events)
 
+    def _git_advertisement(self, service: str) -> None:
+        """The refs of an empty repository (protocol v0): enough for git to send its pack."""
+        caps = f"{'0' * 40} capabilities^{{}}\0report-status delete-refs ofs-delta\n"
+        body = _pkt(f"# service={service}\n") + b"0000" + _pkt(caps) + b"0000"
+        self.send_response(200)
+        self.send_header("content-type", f"application/x-{service}-advertisement")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _anthropic(self, body: bytes) -> None:
         request = _json_or_empty(body)
         model = request.get("model", "fake-model")
         command = _exec_asked(request)
         if command is not None and request.get("stream"):
             self._anthropic_tool_use(model, command)
+            return
+        bash = _exec_asked(request, BASH_MARK)
+        if bash is not None and request.get("stream"):
+            self._anthropic_tool_use(model, bash, tool="Bash")
+            return
+        if bash is not None:  # Claude Code -p asks without streaming
+            self._json(
+                200,
+                {
+                    "id": f"msg_t17_{time.time_ns()}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"toolu_t17_{time.time_ns()}",
+                            "name": "Bash",
+                            "input": {"command": bash, "description": "t17 command"},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 12, "output_tokens": 9},
+                },
+            )
             return
         usage = {"input_tokens": 12, "output_tokens": 7}
         if not request.get("stream"):
@@ -425,7 +473,7 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True  # the proxy hung up: nothing more to send
 
-    def _anthropic_tool_use(self, model: str, command: str) -> None:
+    def _anthropic_tool_use(self, model: str, command: str, tool: str = "exec") -> None:
         message = {
             "id": "msg_t06_tool",
             "type": "message",
@@ -436,7 +484,11 @@ class Handler(BaseHTTPRequestHandler):
             "stop_sequence": None,
             "usage": {"input_tokens": 12, "output_tokens": 1},
         }
-        block = {"type": "tool_use", "id": "toolu_t06_exec", "name": "exec", "input": {}}
+        block = {"type": "tool_use", "id": f"toolu_t06_{tool}_{time.time_ns()}", "name": tool,
+                 "input": {}}  # fmt: skip
+        arguments = {"command": command}
+        if tool == "Bash":
+            arguments["description"] = "t17 command"
         self._sse(
             [
                 ("message_start", {"type": "message_start", "message": message}),
@@ -451,7 +503,7 @@ class Handler(BaseHTTPRequestHandler):
                         "index": 0,
                         "delta": {
                             "type": "input_json_delta",
-                            "partial_json": json.dumps({"command": command}),
+                            "partial_json": json.dumps(arguments),
                         },
                     },
                 ),
@@ -579,16 +631,28 @@ def _turn_summary(request: dict) -> dict:
     last_text = None
     if isinstance(messages, list) and messages and isinstance(messages[-1], dict):
         last_text = json.dumps(messages[-1].get("content"))[:300]
-    return {"tools": names, "exec": _exec_asked(request), "tool_result": result, "last": last_text}
+    markers = []
+    for message in messages if isinstance(messages, list) else []:
+        if isinstance(message, dict) and message.get("role") == "user":
+            markers += T17_MARK.findall(json.dumps(message.get("content")))
+    return {"tools": names, "exec": _exec_asked(request), "tool_result": result, "last": last_text,
+            "markers": markers, "bash": _exec_asked(request, BASH_MARK)}  # fmt: skip
 
 
-def _exec_asked(request: dict) -> str | None:
+def _pkt(text: str) -> bytes:
+    data = text.encode()
+    return f"{len(data) + 4:04x}".encode() + data
+
+
+def _exec_asked(request: dict, mark: re.Pattern[str] = EXEC_MARK) -> str | None:
     """The command of ``T06-EXEC:[[...]]`` in the user's latest messages (those after the last
     answer of the model), unless they bring a tool's result back (that ends the exchange)."""
     messages = request.get("messages")
     if not isinstance(messages, list):
         return None
     for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "system":
+            continue  # Claude Code 2.1.306 ends with a "system" message of its environment
         if not isinstance(message, dict) or message.get("role") != "user":
             return None
         content = message.get("content")
@@ -599,7 +663,7 @@ def _exec_asked(request: dict) -> str | None:
             return None
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "text":
-                found = EXEC_MARK.search(str(b.get("text", "")))
+                found = mark.search(str(b.get("text", "")))
                 if found:
                     return found.group(1)
     return None

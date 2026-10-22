@@ -20,7 +20,7 @@ from backtide.jail.config import (
     token_env,
 )
 from backtide.jail.profile import secret_shaped
-from backtide.jail.profiles import NAMED, OPENCLAW, profile_names
+from backtide.jail.profiles import CLAUDE_CODE, NAMED, OPENCLAW, profile_names
 from backtide.jail.profiles import openclaw as openclaw_profile
 from backtide.jail.profiles.custom import UNKNOWN_AGENT_NOTICE
 from backtide.jail.verify import container_problems
@@ -167,10 +167,10 @@ def test_the_defaults_of_a_custom_agent(layout: Path) -> None:
 def test_openclaw_is_still_the_default_and_takes_its_name(layout: Path) -> None:
     assert agent_profile_of({}) is OPENCLAW
     assert agent_profile_of({"profile": "openclaw"}) is OPENCLAW
-    assert profile_names() == ("openclaw", "custom")
-    assert dict(NAMED) == {"openclaw": OPENCLAW}
+    assert profile_names() == ("openclaw", "claude-code", "custom")
+    assert dict(NAMED) == {"openclaw": OPENCLAW, "claude-code": CLAUDE_CODE}
     with pytest.raises(TypeError):
-        NAMED["claude-code"] = OPENCLAW  # type: ignore[index] - T17a-4 adds it in code
+        NAMED["codex"] = OPENCLAW  # type: ignore[index] - a named profile is added in code
 
 
 def test_a_named_profile_may_still_change_its_image(layout: Path) -> None:
@@ -617,9 +617,11 @@ def test_a_named_profile_takes_none_of_a_custom_agents_tables(layout: Path, tabl
         load(layout, f"[agent]\n[agent.{table}]\n")
 
 
-@pytest.mark.parametrize("name", ['"claude-code"', '"OpenClaw"', '"../x"', "1"])
+@pytest.mark.parametrize("name", ['"claude"', '"OpenClaw"', '"../x"', "1"])
 def test_an_unknown_profile_is_refused(layout: Path, name: str) -> None:
-    with pytest.raises(ConfigError, match="profile must be one of 'openclaw', 'custom'"):
+    with pytest.raises(
+        ConfigError, match="profile must be one of 'openclaw', 'claude-code', 'custom'"
+    ):
         load(layout, custom(profile=name))
 
 

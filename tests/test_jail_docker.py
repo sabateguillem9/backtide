@@ -187,3 +187,18 @@ def test_no_process_is_left_behind(fake_cli: FakeCli) -> None:
     assert fake_cli.record()["argv"] == ["exec", "agent"]
     survivors = subprocess.run(["pgrep", "-f", str(fake_cli.path)], capture_output=True, text=True)
     assert survivors.stdout.split() == []
+
+
+def test_input_reaches_stdin_and_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17a-4: the seed of `backtide entrar` goes on stdin (``docker exec -i``), never in the
+    argv; without ``input`` stdin stays closed."""
+    cat = tmp_path / "cat-docker"
+    cat.write_text("#!/bin/sh\nexec cat\n")
+    cat.chmod(0o755)
+    monkeypatch.setattr(docker, "PROGRAM", str(cat))
+    assert docker.run(["exec"], input="línea\n").stdout == "línea\n"
+    assert docker.run(["exec"]).stdout == ""
+    with pytest.raises(ValueError):
+        docker.run(["exec"], input="x" * (docker.MAX_INPUT + 1))

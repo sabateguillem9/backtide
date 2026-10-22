@@ -20,7 +20,7 @@ MODEL ?= claude-sonnet-5-5
 
 .PHONY: help test lint fmt it ataques demo demo-crear demo-archivos demo-borrar demo-instantaneas \
 	demo-rebobinar demo-parar demo-web web-demo probar probar-web probar-pedir probar-instantaneas \
-	probar-rebobinar probar-parar vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
+	probar-rebobinar probar-parar probar-entrar probar-tarea probar-importar probar-exportar vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -75,10 +75,11 @@ demo-web: ## Demo: the web of the running demo, in the VM (open the link on the 
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
 	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --rebobinar --aprobar'
 
-probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5), en primer plano (terminal 1; docs/probar.md)
+probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5; PERFIL=claude-code para Claude Code), en primer plano (terminal 1; docs/probar.md)
 	@case "$(MODEL)" in ""|*[!0-9A-Za-z._:/@+-]*) echo "MODEL tiene caracteres raros" >&2; exit 2;; esac
 	@case "$(FALSO)" in ""|1) ;; *) echo "FALSO solo puede valer 1" >&2; exit 2;; esac
-	$(VM_SH) '$(PROBAR_VM) up --modelo $(MODEL) $(if $(FALSO),--internet-falso)'
+	@case "$(PERFIL)" in ""|openclaw|claude-code) ;; *) echo "PERFIL es openclaw o claude-code" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) up --modelo $(MODEL) $(if $(FALSO),--internet-falso) $(if $(PERFIL),--perfil $(PERFIL))'
 
 probar-web: ## Prueba real: la web con Ajustes, aprobar y rebobinar (abre el enlace en el Mac; docs/probar.md)
 	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
@@ -90,6 +91,25 @@ probar-pedir: ## Prueba real: un mensaje al agente y su respuesta (MSG="...")
 	@test -n "$$MSG" || { echo 'Di qué le pides: make probar-pedir MSG="..."' >&2; exit 2; }
 	@m=$$(printf '%s' "$$MSG" | base64 | tr -d '\n'); \
 	$(VM_SH) '$(PROBAR_VM) pedir '"$$m"
+
+probar-entrar: ## Prueba con Claude Code: ábrelo en tu terminal (CONTINUAR=1 sigue la última conversación)
+	@case "$(CONTINUAR)" in ""|1) ;; *) echo "CONTINUAR solo puede valer 1" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) entrar $(if $(CONTINUAR),--continue)'
+
+probar-tarea: ## Prueba con Claude Code: una tarea y su respuesta (MSG="..."; CONTINUAR=1 sigue la conversación)
+	@test -n "$$MSG" || { echo 'Di qué le pides: make probar-tarea MSG="..."' >&2; exit 2; }
+	@case "$(CONTINUAR)" in ""|1) ;; *) echo "CONTINUAR solo puede valer 1" >&2; exit 2;; esac
+	@m=$$(printf '%s' "$$MSG" | base64 | tr -d '\n'); \
+	$(VM_SH) '$(PROBAR_VM) tarea '"$$m"' $(if $(CONTINUAR),--continue)'
+
+probar-importar: ## Prueba con Claude Code: copia una carpeta de la VM a su carpeta de trabajo (RUTA=...; REEMPLAZAR=1 escribe encima)
+	@case "$(RUTA)" in ""|*[!0-9A-Za-z._/~+-]*) echo "Di la carpeta: make probar-importar RUTA=<ruta, sin espacios ni comillas>" >&2; exit 2;; esac
+	@case "$(REEMPLAZAR)" in ""|1) ;; *) echo "REEMPLAZAR solo puede valer 1" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) importar $(if $(REEMPLAZAR),--reemplazar) -- $(RUTA)'
+
+probar-exportar: ## Prueba con Claude Code: copia su carpeta de trabajo a una carpeta nueva de la VM (RUTA=...)
+	@case "$(RUTA)" in ""|*[!0-9A-Za-z._/~+-]*) echo "Di la carpeta nueva: make probar-exportar RUTA=<ruta, sin espacios ni comillas>" >&2; exit 2;; esac
+	$(VM_SH) '$(PROBAR_VM) exportar -- $(RUTA)'
 
 probar-instantaneas: ## Prueba real: lista las instantáneas
 	$(VM_SH) '$(PROBAR_VM) instantaneas'

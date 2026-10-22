@@ -94,11 +94,13 @@ from uuid import uuid4
 import backtide
 from backtide.blackbox import BlackBox, BlackBoxError, Event, redact
 from backtide.jail import AgentJail, ExposedJail, JailError
-from backtide.jail.profile import ProfileError
+from backtide.jail.config import AGENT_DIR
+from backtide.jail.profile import CONTAINER_WORK, CONTAINER_WORKSPACE, SHELL_MODE, ProfileError
 from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProblem
 from backtide.service.clock import clock_synced as kernel_clock_synced
 from backtide.service.config import ServiceConfig
 from backtide.service.egress import EgressHooks
+from backtide.service.export import ExportError, check_destination, export_tree
 from backtide.service.holds import (
     BatchOutcome,
     BatchStatus,
@@ -127,6 +129,14 @@ from backtide.service.rewind import (
     read_pending,
     remove_pending,
     write_pending,
+)
+from backtide.service.shell import (
+    NOT_SHELL_MESSAGE,
+    SHELL_KINDS,
+    ExportOutcome,
+    ExportStatus,
+    ShellOutcome,
+    ShellStatus,
 )
 from backtide.snapshots import (
     PruneIncomplete,
@@ -2225,6 +2235,135 @@ class Guardian:
             self._record("system", "cli_stop", details={"agent_state": str(self.agent_state)})
             logging.getLogger(_BRIDGED_LOGGERS).removeHandler(self._bridge)
             self._bridge.close()
+
+    # The shell mode (T17a-4, docs/34 section 7): `backtide entrar`, `tarea`, `importar` and
+    # `exportar` (backtide/service/shell.py)
+
+    def open_shell(
+        self,
+        kind: str,
+        *,
+        resume: bool = False,
+        requested_by: str,
+        details: dict[str, Any] | None = None,
+    ) -> ShellOutcome:
+        """Whether the owner may run the agent now (``kind``: "session" for `backtide entrar`,
+        "task" for `backtide tarea`, "import" for `backtide importar`), recorded first as
+        ``system/agent_shell``: only for a shell profile, with the agent running (not stopped,
+        starting, paused or being rewound: ``agent_lock`` waits for a rewind to end). The reply
+        names the container, the agent's user and its working folder for ``docker exec``.
+        ``details`` (the import's counts) go into the event as they are. Never raises."""
+        profile = self._jail.config.profile
+        if profile.mode != SHELL_MODE:
+            return ShellOutcome(
+                ShellStatus.NOT_SHELL, NOT_SHELL_MESSAGE.format(profile=profile.name)
+            )
+        if kind not in SHELL_KINDS:
+            return ShellOutcome(ShellStatus.FAILED, "Esa orden no existe.")
+        requester = str(requested_by)[:MAX_REQUESTER_CHARS] or "unknown"
+        with self.agent_lock:
+            if not self._serving:
+                return ShellOutcome(
+                    ShellStatus.NOT_RUNNING,
+                    "backtide no está en marcha: arranca `backtide vigilar`.",
+                )
+            state = self.agent_state
+            if state is not AgentState.RUNNING:
+                paused = state is AgentState.FROZEN or bool(self.pause_reasons)
+                return ShellOutcome(
+                    ShellStatus.NOT_RUNNING,
+                    "El agente está en pausa: mira por qué en Telegram o en la web, y "
+                    "reanúdalo con `backtide seguir`."
+                    if paused
+                    else f"El agente no está en marcha ahora mismo ({state}): espera un momento.",
+                )
+            event = self._record(
+                "system",
+                "agent_shell",
+                kind,
+                details={
+                    **(details or {}),
+                    "kind": kind,
+                    "continue": bool(resume),
+                    "requested_by": requester,
+                },
+            )
+            if event is None:
+                return ShellOutcome(
+                    ShellStatus.FAILED,
+                    "No se puede grabar en la caja negra, así que no se abre nada: sin grabar no "
+                    "hay vigilancia.",
+                )
+            config = self._jail.config
+            return ShellOutcome(
+                ShellStatus.READY,
+                "",
+                container=config.name,
+                user=f"{config.uid}:{config.gid}",
+                workdir=str(profile.workdir or CONTAINER_WORK),
+            )
+
+    def export(self, destination: str, *, requested_by: str) -> ExportOutcome:
+        """`backtide exportar`: a snapshot of the workspace (``Reason.MANUAL``, trigger
+        "export": kept, the record of what left) and a copy of its work folder into the owner's
+        new folder ``destination`` (backtide/service/export.py: never overwriting, never
+        following a link). Recorded as ``system/export`` (or ``export_failed``). Never raises."""
+        profile = self._jail.config.profile
+        if profile.mode != SHELL_MODE:
+            return ExportOutcome(
+                ExportStatus.NOT_SHELL, NOT_SHELL_MESSAGE.format(profile=profile.name)
+            )
+        requester = str(requested_by)[:MAX_REQUESTER_CHARS] or "unknown"
+        config = self._config
+        protected = (
+            config.volume,
+            config.state_dir,
+            config.agent_config_dir,
+            config.agent_ca_dir,
+            self._store.root,
+        )
+        try:
+            target = check_destination(destination, protected)
+        except ExportError as error:
+            return ExportOutcome(ExportStatus.INVALID, f"No se ha exportado nada: {error}.")
+        with self.agent_lock:
+            if not self._serving:
+                return ExportOutcome(
+                    ExportStatus.FAILED, "backtide no está en marcha: arranca `backtide vigilar`."
+                )
+            try:
+                workspace = self._info(self._store.workspace)
+            except SnapshotError as error:
+                logger.error("export: cannot read the workspace: %s", error)
+                workspace = None
+            snapshot = None if workspace is None else self._take(Reason.MANUAL, "export", workspace)
+        if snapshot is None:
+            return ExportOutcome(
+                ExportStatus.FAILED,
+                "No se ha podido hacer la instantánea de la que se exporta: no se ha exportado "
+                "nada. Inténtalo de nuevo en un momento.",
+            )
+        work = CONTAINER_WORK.relative_to(CONTAINER_WORKSPACE)
+        source = self._store.snapshots_dir / snapshot.id / AGENT_DIR / work
+        try:
+            result = export_tree(source, target)
+        except ExportError as error:
+            self._record(
+                "system",
+                "export_failed",
+                str(target),
+                details={"error": _short(error), "requested_by": requester},
+                risk=1,
+                snapshot_id=snapshot.id,
+            )
+            return ExportOutcome(
+                ExportStatus.FAILED, f"No se ha exportado: {error}.", str(target), snapshot.id
+            )
+        details = {**result.details(), "requested_by": requester}
+        self._record(
+            "system", "export", str(target), details=details, risk=1, snapshot_id=snapshot.id
+        )
+        return ExportOutcome(ExportStatus.DONE, "", str(target), snapshot.id, result.details())
 
     # Rewind (docs/19, section 4)
 

@@ -128,6 +128,31 @@ _SECRET_WORDS = ("KEY", "SECRET", "PASSWORD", "TOKEN", "CREDENTIAL")
 _PUBLIC_IMAGE_NAMES = ("GPG_KEY",)
 _PUBLIC_IMAGE_SUFFIXES = ("_SHA256", "_VERSION")
 MAX_NOTICE_LINE = 300  # characters of one line of the rewind notice: a sentence, not a page
+# Reserved names a NAMED profile may still set, each with exactly this value and nothing else
+# (T17a-4, "Decidido por defecto (revisable)" in docs/34, section 11). npm_config_* is a reserved
+# family because npm settings can point npm at other code or another registry; these three only
+# switch off what npm sends home after an install (the audit's POST, the funding message and the
+# update check). Reviewed one by one in code: the custom profile (``CUSTOM_NAME``), whose
+# variables come from the owner's TOML, never gets any of them.
+REVIEWED_RESERVED_ENV = frozenset(
+    {
+        ("npm_config_audit", "false"),
+        ("npm_config_fund", "false"),
+        ("npm_config_update_notifier", "false"),
+    }
+)
+CUSTOM_NAME = "custom"  # the profile put together from [agent] (profiles/custom.py)
+# How the agent runs in its container (docs/34, section 7 and decision 3):
+# - "service": the container's command IS the agent (OpenClaw's Gateway); if it ends, the agent
+#   is stopped.
+# - "shell": the container waits (``tini -- sleep infinity``) and the owner runs the agent inside
+#   it with ``docker exec``: `backtide entrar` (interactive) and `backtide tarea` (headless).
+SERVICE_MODE = "service"
+SHELL_MODE = "shell"
+MODES = (SERVICE_MODE, SHELL_MODE)
+MAX_PROMPT = 32 * 1024  # characters of a `backtide tarea` prompt: one argument of docker exec
+MAX_SEED_INPUT = 16 * 1024  # bytes of the seed's stdin: well under a pipe's buffer
+_FLAG_RE = re.compile(r"--[a-z][a-z0-9-]{0,40}", re.ASCII)
 
 # Never a first "-": docker would read the image as one of its own options.
 PINNED_IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}", re.ASCII)
@@ -246,6 +271,67 @@ def _any_providers(providers: "tuple[ModelProvider, ...]") -> None:
 
 
 @dataclass(frozen=True)
+class ShellCommands:
+    """How the owner reaches an agent of the ``shell`` mode (docs/34, decision 3), run with
+    ``docker exec`` as the agent's user, in the profile's working folder. Each is an argv inside
+    the container, never through a shell; the profile names the agent's program by its path.
+
+    - ``session``: `backtide entrar`, the agent's interactive program and its arguments.
+    - ``task``: `backtide tarea`, the headless run; ``--`` and the prompt go after it, so a
+      prompt that starts with ``-`` is never read as an option.
+    - ``resume``: the flag that resumes the last conversation (Claude Code's ``--continue``),
+      for both.
+    - ``seed`` and ``seed_input``: run before a session with ``seed_input`` on its stdin (Claude
+      Code: the first-run answers in ``~/.claude.json``). Inside the container, as the agent:
+      it has no more power than the agent itself, and it never decides anything about security."""
+
+    session: tuple[str, ...]
+    task: tuple[str, ...]
+    resume: str
+    seed: tuple[str, ...] = ()
+    seed_input: str = ""
+
+    def __post_init__(self) -> None:
+        for label, argv in (("session", self.session), ("task", self.task)):
+            _args(f"shell {label}", argv)
+            if not argv:
+                raise ValueError(f"shell {label} must name a program")
+            _match(f"shell {label} program", argv[0], _PROGRAM_RE)
+        _args("shell seed", self.seed)
+        if self.seed:
+            _match("shell seed program", self.seed[0], _PROGRAM_RE)
+        _match("shell resume flag", self.resume, _FLAG_RE)
+        if (
+            not isinstance(self.seed_input, str)
+            or "\0" in self.seed_input
+            or len(self.seed_input.encode()) > MAX_SEED_INPUT
+            or (self.seed_input and not self.seed)
+        ):
+            raise ValueError(
+                f"shell seed_input must be text of at most {MAX_SEED_INPUT} bytes, for a seed"
+            )
+
+    def session_argv(self, *, resume: bool = False) -> list[str]:
+        """The argv of `backtide entrar` inside the container."""
+        return [*self.session, *([self.resume] if resume else [])]
+
+    def task_argv(self, prompt: str, *, resume: bool = False) -> list[str]:
+        """The argv of `backtide tarea "<prompt>"` inside the container (ValueError for a prompt
+        that cannot be one argument: empty, too long, or with a NUL)."""
+        check_prompt(prompt)
+        return [*self.task, *([self.resume] if resume else []), "--", prompt]
+
+
+def check_prompt(prompt: object) -> str:
+    """A prompt for `backtide tarea`: one argument of docker exec. ValueError otherwise."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("the task is empty")
+    if len(prompt) > MAX_PROMPT or "\0" in prompt:
+        raise ValueError(f"the task must be text of at most {MAX_PROMPT} characters")
+    return prompt
+
+
+@dataclass(frozen=True)
 class AgentProfile:
     """One agent, as the jail needs to know it. Validated on creation (ValueError).
 
@@ -272,7 +358,11 @@ class AgentProfile:
     - ``provider_params``: top-level fields its model client sends that the gate's list does not
       know (``param:<name>``, decision 5 of docs/34); allowed for this profile only.
     - ``check_providers``: refuses (ValueError) model providers this agent cannot use (OpenClaw:
-      one it has no catalog of, without its model ids)."""
+      one it has no catalog of, without its model ids).
+    - ``mode``: ``"service"`` (the command is the agent) or ``"shell"`` (the container waits and
+      the owner runs the agent in it: ``shell`` says how, and only a shell profile has one).
+    - ``env`` may hold a reserved name only for a named profile, and only one of the exact pairs
+      of ``REVIEWED_RESERVED_ENV``."""
 
     name: str
     version: str
@@ -295,9 +385,17 @@ class AgentProfile:
     rewind_notice_lines: tuple[str, ...] = ()
     provider_params: tuple[str, ...] = ()
     check_providers: "Callable[[tuple[ModelProvider, ...]], None]" = _any_providers
+    mode: str = SERVICE_MODE
+    shell: ShellCommands | None = None
 
     def __post_init__(self) -> None:
         _match("profile name", self.name, _PROFILE_NAME_RE)
+        if self.mode not in MODES:
+            raise ValueError(f"mode must be one of {', '.join(MODES)}")
+        if self.shell is not None and not isinstance(self.shell, ShellCommands):
+            raise ValueError("shell must be ShellCommands")
+        if (self.mode == SHELL_MODE) != (self.shell is not None):
+            raise ValueError('a profile has shell commands if and only if its mode is "shell"')
         _text("version", self.version, allow_empty=False)
         _match("image (pinned by digest)", self.image, PINNED_IMAGE_RE)
         _match("entrypoint", self.entrypoint, _PROGRAM_RE)
@@ -379,6 +477,13 @@ class AgentProfile:
                 )
         for _, provider in self.fake_key_env:
             _match("a fake key's provider", provider, _PROVIDER_NAME_RE)
+        # Only a named profile, only these exact pairs (REVIEWED_RESERVED_ENV); the duplicate check
+        # below keeps the name from also being the fake key's or the token's.
+        reviewed = (
+            set()
+            if self.name == CUSTOM_NAME
+            else {name for name, value in self.env if (name, value) in REVIEWED_RESERVED_ENV}
+        )
         every = [
             *own,
             *self.proxy_url_env,
@@ -388,7 +493,7 @@ class AgentProfile:
         ]
         for name in every:
             _match("variable name", name, _ENV_NAME_RE)
-            if is_reserved_env(name):
+            if is_reserved_env(name) and name not in reviewed:
                 raise ValueError(f"{name} is set by the jail, never by a profile")
         # These reach `docker create` through the docker CLI's own environment on the host.
         for name in [*own, *(name for name, _ in self.fake_key_env)] + (

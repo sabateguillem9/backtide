@@ -212,3 +212,62 @@ def test_the_fake_internets_read_only_folders_are_removed(tmp_path: Path) -> Non
     demo._make_writable(paths.base / demo.FAKE_INTERNET_FOLDER)
 
     assert os.access(folder, os.W_OK) and os.access(folder.parent, os.W_OK)
+
+
+# --- with Claude Code (T17a-4: make probar PERFIL=claude-code) ----------------------------------
+
+
+def test_the_config_with_claude_code(paths: demo.Paths) -> None:
+    paths.config.write_text(probar.render_config(paths, 1000, 1000, profile=probar.CLAUDE_CODE))
+    paths.config.chmod(0o600)
+    config = ServiceConfig.from_file(paths.config)
+    assert config.agent_profile.name == "claude-code"
+    (provider,) = config.proxy_settings().providers
+    assert (provider.name, provider.host, provider.models) == ("anthropic", "api.anthropic.com", ())
+    allowed = config.proxy_settings().allow_provider_tools
+    assert "param:diagnostics" in allowed and "param:fallbacks" in allowed
+    assert config.jail_config().memory == "3g" and config.workspace_limit == 192 * 1024**2
+    assert config.gate_settings(owner_chat=4242).unknown_hosts == "hold"
+
+
+def test_an_unknown_profile_is_refused(paths: demo.Paths) -> None:
+    with pytest.raises(demo.DemoError, match="perfil"):
+        probar.render_config(paths, 1000, 1000, profile="codex")
+    with pytest.raises(SystemExit):
+        probar.build_parser().parse_args(["up", "--perfil", "codex"])
+
+
+def mounted(paths: demo.Paths, monkeypatch: pytest.MonkeyPatch, profile: str) -> list[tuple]:
+    paths.config.write_text(probar.render_config(paths, 1000, 1000, profile=profile))
+    paths.config.chmod(0o600)
+    monkeypatch.setattr(demo, "PATHS", paths)
+    monkeypatch.setattr(demo, "require_demo_mount", lambda p: None)
+    ran: list[tuple] = []
+    monkeypatch.setattr(probar, "run_backtide", lambda *argv, **kw: ran.append(argv) or 0)
+    return ran
+
+
+def test_the_claude_code_commands_go_to_backtides_own(
+    paths: demo.Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran = mounted(paths, monkeypatch, probar.CLAUDE_CODE)
+    config = ("--config", str(paths.config))
+    assert probar.main(["entrar", "--continue"]) == 0
+    assert probar.main(["tarea", encoded("-haz esto"), "--continue"]) == 0
+    assert probar.main(["importar", "/home/me/repo", "--reemplazar"]) == 0
+    assert probar.main(["exportar", "/home/me/salida"]) == 0
+    assert ran == [
+        ("entrar", *config, "--continue"),
+        ("tarea", *config, "--continue", "--", "-haz esto"),  # a task that looks like an option
+        ("importar", *config, "--reemplazar", "/home/me/repo"),
+        ("exportar", *config, "/home/me/salida"),
+    ]
+    assert probar.main(["pedir", encoded("hola")]) == 1  # that one is OpenClaw's
+
+
+def test_with_openclaw_the_claude_code_commands_say_how_to_start_it(
+    paths: demo.Paths, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ran = mounted(paths, monkeypatch, probar.OPENCLAW)
+    assert probar.main(["entrar"]) == 1
+    assert "PERFIL=claude-code" in capsys.readouterr().err and ran == []

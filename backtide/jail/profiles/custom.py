@@ -33,9 +33,9 @@ from collections.abc import Mapping
 from pathlib import PurePosixPath
 from typing import Any
 
-from backtide.jail.profile import CONTAINER_WORKSPACE, HOME_DIR, AgentProfile
+from backtide.jail.profile import CONTAINER_WORKSPACE, CUSTOM_NAME, HOME_DIR, AgentProfile
 
-CUSTOM = "custom"
+CUSTOM = CUSTOM_NAME
 WORKSPACE_DIRS = (HOME_DIR, "work")
 # The keys of [agent] that describe a custom agent (the others are the container's options).
 KEYS = frozenset({"entrypoint", "command", "workdir", "env", "model", "ready", "rewind"})

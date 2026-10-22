@@ -15,6 +15,7 @@
   module point ``PROGRAM`` at a fake CLI.
 """
 
+import contextlib
 import os
 import selectors
 import shlex
@@ -25,6 +26,7 @@ from collections.abc import Mapping, Sequence
 PROGRAM = "docker"
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_OUTPUT = 1024 * 1024  # bytes of stdout and stderr together
+MAX_INPUT = 16 * 1024  # bytes of run()'s input: under any pipe's buffer
 MESSAGE_LIMIT = 4000  # characters of agent-controlled text in one message
 _READ_SIZE = 64 * 1024
 
@@ -49,8 +51,12 @@ def run(
     env: Mapping[str, str] | None = None,
     check: bool = True,
     max_output: int = DEFAULT_MAX_OUTPUT,
+    input: str | None = None,  # noqa: A002 - subprocess's own name for it
 ) -> subprocess.CompletedProcess[str]:
     """Run ``docker *args`` and return the finished process.
+
+    ``input`` (at most MAX_INPUT bytes, so it fits in a pipe before anything is read back) is
+    written to its stdin, which is then closed; without it stdin is closed from the start.
 
     ``env`` is added to this process's environment (for secrets: see the module docstring).
     With ``check`` (the default) a non-zero exit raises JailError; without it the caller
@@ -59,12 +65,15 @@ def run(
     bad = [arg for arg in args if not isinstance(arg, str)]
     if bad:
         raise TypeError(f"docker arguments must be str, got {bad!r}")
+    data = None if input is None else input.encode()
+    if data is not None and len(data) > MAX_INPUT:
+        raise ValueError(f"input must be at most {MAX_INPUT} bytes")
     argv = [PROGRAM, *args]
     command = shlex.join(argv)
     try:
         process = subprocess.Popen(
             argv,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if data is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             # LC_ALL last: nothing in ``env`` changes the messages backtide reads back.
@@ -77,6 +86,12 @@ def run(
     except OSError as e:  # FileNotFoundError when the docker CLI is not installed
         raise JailError(f"cannot run {command}: {e}") from e
     with process:  # on the way out: pipes closed and the process reaped
+        if data is not None and process.stdin is not None:
+            # A child that does not read it closes the pipe: its exit code says so.
+            with contextlib.suppress(BrokenPipeError):
+                process.stdin.write(data)
+            with contextlib.suppress(BrokenPipeError):
+                process.stdin.close()
         try:
             stdout, stderr = _read_bounded(process, timeout, max_output)
         except subprocess.TimeoutExpired:

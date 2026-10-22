@@ -37,6 +37,12 @@ The server (inside the service):
   "hold_id": ..., "via": "web"}`` ("aprobar y confiar en este destinatario": only ``web``),
   ``{"cmd": "untrust", "trust_id": ...}`` and ``{"cmd": "end_batch", "rule_id": ...}`` (plus
   ``via``: ``cli`` or ``web``), and the lists ``{"cmd": "trusted"}`` and ``{"cmd": "batches"}``.
+  The shell mode (T17a-4, docs/34 section 7, ``backtide.service.shell``): ``{"cmd": "shell",
+  "kind": "session" | "task", "continue": bool}`` (`backtide entrar` and `tarea`: recorded, and
+  the container, user and folder for ``docker exec`` come back), ``{"cmd": "import", "name":
+  ..., "source": ..., "files": ..., "bytes": ..., "replace": bool}`` (`backtide importar`, the
+  same with the import's counts recorded) and ``{"cmd": "export", "dest": ...}`` (`backtide
+  exportar`: the service copies the agent's work folder into the owner's new folder).
   Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
   not a snapshot id) is refused WITHOUT calling the Guardian.
 - One thread per connection (``socketserver``), at most ``MAX_CONNECTIONS`` at a time, so a
@@ -56,6 +62,7 @@ import errno
 import json
 import logging
 import os
+import re
 import socket
 import socketserver
 import stat
@@ -81,6 +88,7 @@ from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
+from backtide.service.shell import ExportOutcome, ExportStatus, ShellOutcome, ShellStatus
 from backtide.service.spend import CAP_SHAPE, CapOutcome, check_cap
 from backtide.service.trust import TRUST_ID_RE
 from backtide.snapshots import Snapshot
@@ -144,6 +152,16 @@ SETTINGS_REQUESTERS = frozenset({"cli", "web"})
 SETTINGS_OUTCOMES = frozenset({*(str(status) for status in Outcome), REFUSED})
 APPLIED = frozenset(str(applied) for applied in Applied)
 MAX_SECRET_CHARS = 256
+# The shell mode (T17a-4): what `backtide entrar`/`tarea` and `importar` may say.
+SHELL_REQUEST_KINDS = frozenset({"session", "task"})
+SHELL_OUTCOMES = frozenset({*(str(status) for status in ShellStatus), REFUSED})
+EXPORT_OUTCOMES = frozenset({*(str(status) for status in ExportStatus), REFUSED})
+IMPORT_KEYS = frozenset({"name", "source", "files", "bytes", "replace"})
+MAX_IMPORT_TEXT = 1024
+# What a ready reply may name for docker exec: a container, uid:gid, a folder of /workspace.
+_CONTAINER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", re.ASCII)
+_USER_RE = re.compile(r"[0-9]{1,10}:[0-9]{1,10}", re.ASCII)
+_WORKDIR_RE = re.compile(r"/workspace(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*", re.ASCII)
 
 
 class ControlError(Exception):
@@ -181,6 +199,17 @@ class RewindService(Protocol):
     def batches(self) -> list[dict[str, Any]]: ...
 
     def end_batch(self, rule_id: str, *, via: str) -> bool: ...
+
+    def open_shell(
+        self,
+        kind: str,
+        *,
+        resume: bool = False,
+        requested_by: str,
+        details: dict[str, Any] | None = None,
+    ) -> ShellOutcome: ...
+
+    def export(self, destination: str, *, requested_by: str) -> ExportOutcome: ...
 
 
 class SettingsService(Protocol):
@@ -410,7 +439,66 @@ class ControlServer:
             return self._settings_command(request, pid, uid)
         if command in ("budget", "set_budget", "accept_prices"):
             return self._budget_command(request, pid, uid)
+        if command in ("shell", "import"):
+            return self._shell(request, pid, uid)
+        if command == "export":
+            return self._export(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
+
+    def _shell(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        details: dict[str, Any] | None = None
+        if request["cmd"] == "shell":
+            if set(request) != {"cmd", "kind", "continue"}:
+                raise _BadRequest("Una petición de shell lleva `cmd`, `kind` y `continue`.")
+            kind, resume = request["kind"], request["continue"]
+            if kind not in SHELL_REQUEST_KINDS or not isinstance(resume, bool):
+                raise _BadRequest("`kind` es session o task, y `continue` es true o false.")
+        else:
+            if set(request) != {"cmd", *IMPORT_KEYS}:
+                raise _BadRequest(
+                    "Una petición de importar lleva `cmd`, " + ", ".join(sorted(IMPORT_KEYS)) + "."
+                )
+            details = _import_details(request)
+            kind, resume = "import", False
+        try:
+            outcome = self._guardian.open_shell(
+                kind, resume=resume, requested_by=f"cli (uid {uid}, pid {pid})", details=details
+            )
+        except Exception:
+            logger.exception("opening a shell raised instead of answering")
+            outcome = ShellOutcome(ShellStatus.FAILED, "Ha fallado algo inesperado: no se abre.")
+        return {
+            "ok": outcome.ready,
+            "outcome": str(outcome.status),
+            "message": redact(outcome.message),
+            "container": outcome.container,
+            "user": outcome.user,
+            "workdir": outcome.workdir,
+        }
+
+    def _export(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        if set(request) != {"cmd", "dest"}:
+            raise _BadRequest("Una petición de exportar lleva `cmd` y `dest`, y nada más.")
+        destination = request["dest"]
+        if not isinstance(destination, str):
+            raise _BadRequest("`dest` tiene que ser una ruta.")
+        try:
+            outcome = self._guardian.export(destination, requested_by=f"cli (uid {uid}, pid {pid})")
+        except Exception:
+            logger.exception("an export raised instead of answering")
+            outcome = ExportOutcome(
+                ExportStatus.FAILED,
+                "Ha fallado algo inesperado al exportar: mira la carpeta de destino y la caja "
+                "negra.",
+            )
+        return {
+            "ok": outcome.done,
+            "outcome": str(outcome.status),
+            "message": redact(outcome.message),
+            "destination": outcome.destination,
+            "snapshot": outcome.snapshot,
+            "details": {k: v for k, v in outcome.details.items() if isinstance(v, int)},
+        }
 
     def _budget_command(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         """The spending cap (T11): what it says, or new caps (checked here and by the budget)."""
@@ -1610,4 +1698,129 @@ def _checked_reply(raw: bytes) -> dict[str, Any]:
         "undo": reply["undo"],
         "message": reply["message"],
         "agent_started": reply.get("agent_started") is True,
+    }
+
+
+def _import_details(request: dict[str, Any]) -> dict[str, Any]:
+    """The counts of `backtide importar`, for the black box: checked shapes, nothing more."""
+    name, source = request["name"], request["source"]
+    files, size, replace = request["files"], request["bytes"], request["replace"]
+    if (
+        not isinstance(name, str)
+        or not isinstance(source, str)
+        or not 0 < len(name) <= MAX_IMPORT_TEXT
+        or not 0 < len(source) <= MAX_IMPORT_TEXT
+        or any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in (files, size))
+        or not isinstance(replace, bool)
+    ):
+        raise _BadRequest("Los datos de la importación no tienen la forma esperada.")
+    return {"name": name, "source": source, "files": files, "bytes": size, "replace": replace}
+
+
+def ask_shell(
+    path: Path,
+    kind: str,
+    *,
+    resume: bool = False,
+    import_details: Mapping[str, Any] | None = None,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Ask the service whether `backtide entrar` (``kind`` "session"), `tarea` ("task") or
+    `importar` ("import", with ``import_details``: name, source, files, bytes, replace) may run
+    now, recorded. Returns ``ok``, ``outcome``, ``message`` and, when ``ok``, the ``container``,
+    ``user`` and ``workdir`` for docker exec, checked. Same retries and errors as ask_rewind."""
+    if kind == "import":
+        request: dict[str, Any] = {"cmd": "import", **dict(import_details or {})}
+    elif kind in SHELL_REQUEST_KINDS:
+        request = {"cmd": "shell", "kind": kind, "continue": resume}
+    else:
+        raise ValueError(f"unknown kind {kind!r}")
+    raw = _ask(
+        Path(path),
+        request,
+        what="la petición",
+        wait=wait,
+        reply_timeout=CLIENT_REPLY_TIMEOUT,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in SHELL_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown("La respuesta del servicio no es la esperada: no se abre nada.")
+    checked = {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
+    if reply["ok"]:
+        container, user, workdir = reply.get("container"), reply.get("user"), reply.get("workdir")
+        if (
+            not isinstance(container, str)
+            or not _CONTAINER_RE.fullmatch(container)
+            or not isinstance(user, str)
+            or not _USER_RE.fullmatch(user)
+            or not isinstance(workdir, str)
+            or not _WORKDIR_RE.fullmatch(workdir)
+        ):
+            raise ControlOutcomeUnknown(
+                "La respuesta del servicio no es la esperada: no se abre nada."
+            )
+        checked |= {"container": container, "user": user, "workdir": workdir}
+    return checked
+
+
+def ask_export(
+    path: Path,
+    destination: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    reply_timeout: float = CLIENT_REPLY_TIMEOUT,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Ask the service to export the agent's work folder into ``destination`` (`backtide
+    exportar`). Returns ``ok``, ``outcome``, ``message``, ``destination``, ``snapshot`` and
+    ``details`` (counts), checked."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "export", "dest": destination},
+        what="la exportación",
+        wait=wait,
+        reply_timeout=reply_timeout,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in EXPORT_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si se exportó: mira la "
+            "carpeta de destino y la caja negra."
+        )
+    details = reply.get("details")
+    snapshot = reply.get("snapshot")
+    return {
+        "ok": reply["ok"],
+        "outcome": reply["outcome"],
+        "message": reply["message"],
+        "destination": reply.get("destination")
+        if isinstance(reply.get("destination"), str)
+        else "",
+        "snapshot": snapshot if isinstance(snapshot, str) and Snapshot.parse(snapshot) else "",
+        "details": {
+            key: value
+            for key, value in (details if isinstance(details, dict) else {}).items()
+            if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool)
+        },
     }

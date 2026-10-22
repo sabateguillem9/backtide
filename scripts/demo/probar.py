@@ -1,8 +1,18 @@
 """The founder's first hands-on test (T09b, docs/probar.md): the real OpenClaw in its jail,
 thinking with Claude through the proxy, the gate asking on Telegram and on the web. In the VM.
 
-    python -m scripts.demo.probar up [--modelo <id>] [--internet-falso]
-    python -m scripts.demo.probar pedir <message in base64>
+    python -m scripts.demo.probar up [--modelo <id>] [--internet-falso] [--perfil claude-code]
+    python -m scripts.demo.probar pedir <message in base64>          # OpenClaw
+    python -m scripts.demo.probar entrar [--continue]                # Claude Code (T17a-4)
+    python -m scripts.demo.probar tarea <message in base64> [--continue]
+    python -m scripts.demo.probar importar <folder> [--reemplazar]
+    python -m scripts.demo.probar exportar <new folder>
+
+With ``--perfil claude-code`` the agent is Claude Code (backtide/jail/profiles/claude_code.py)
+instead of OpenClaw: the same volume, proxy, gate, Settings page and Telegram, and the owner
+talks to it with backtide's own `entrar`, `tarea`, `importar` and `exportar` (backtide/
+shell_cli.py), through the running service. Claude Code chooses its own models, so ``[proxy]
+providers`` lists none for it (the spending cap of ``[budget]`` still holds).
 
 It lives where the demo lives (scripts/demo/demo.py: ``~/backtide-demo-run``, the same volume,
 the same container names and the same sudo checks), so `make probar-parar`, `make
@@ -43,6 +53,7 @@ from backtide.blackbox import Event
 from backtide.jail import AgentJail
 from backtide.jail import docker as jail_docker
 from backtide.jail.openclaw import MODEL_ID
+from backtide.jail.profiles import NAMED
 from backtide.service.config import ConfigError, ServiceConfig
 from scripts.demo import demo
 from scripts.demo.demo import NETWORK, Paths
@@ -69,18 +80,40 @@ IMAGE_SIZE = 8 * demo.GIB
 CYCLE_INTERVAL = 10  # seconds between "did anything change?" checks (the demo's is 5)
 TURN_TIMEOUT = 660.0  # OpenClaw's own turn timeout is 600 s; a held write can wait 90 s in it
 MAX_MESSAGE_BYTES = 16 * 1024
+OPENCLAW = "openclaw"
+CLAUDE_CODE = "claude-code"
+PROFILES = (OPENCLAW, CLAUDE_CODE)
 
 
 # -- The config ----------------------------------------------------------------------------------
 
 
 def render_config(
-    paths: Paths, uid: int, gid: int, *, model: str = DEFAULT_MODEL, offline: bool = False
+    paths: Paths,
+    uid: int,
+    gid: int,
+    *,
+    model: str = DEFAULT_MODEL,
+    offline: bool = False,
+    profile: str = OPENCLAW,
 ) -> str:
     """The test's backtide.toml. ``offline`` (``--internet-falso``): the service does not fetch
-    Anthropic's pricing page (it would go out of the VM, outside the proxy)."""
+    Anthropic's pricing page (it would go out of the VM, outside the proxy). ``profile``: the
+    agent, OpenClaw or Claude Code (which picks its own models: none are listed for it)."""
     if not MODEL_ID.fullmatch(model):
         raise demo.DemoError(f"el modelo {model!r} no tiene forma de id de modelo")
+    if profile not in PROFILES:
+        raise demo.DemoError(f"el perfil {profile!r} no existe: {' o '.join(PROFILES)}")
+    if profile == CLAUDE_CODE:
+        agent_profile = 'profile = "claude-code"\n'
+        models = "# Claude Code picks its own models (the main one and a small one): none listed.\n"
+    else:
+        agent_profile = ""
+        models = (
+            "# The agent's model (make probar MODEL=...), then OpenClaw's utility model. Only\n"
+            "# these reach Anthropic: a call to any other model is refused by the proxy.\n"
+            f"models = {json.dumps(list(dict.fromkeys((model, UTILITY_MODEL))))}\n"
+        )
     budget = (
         "\n# The fake internet: nothing leaves the VM, Anthropic's pricing page neither.\n"
         "[budget]\nauto_prices = false\n"
@@ -94,6 +127,7 @@ def render_config(
         f"cycle_interval = {CYCLE_INTERVAL}\n"
         "\n"
         "[agent]\n"
+        f"{agent_profile}"
         f'name = "{demo.CONTAINER}"\n'
         f'network = "{NETWORK}"\n'
         f"uid = {uid}\n"
@@ -113,9 +147,7 @@ def render_config(
         f'name = "{PROVIDER}"\n'
         f'kind = "{PROVIDER}"\n'
         f'host = "{PROVIDER_HOST}"\n'
-        "# The agent's model (make probar MODEL=...), then OpenClaw's utility model. Only these\n"
-        "# reach Anthropic: a call to any other model is refused by the proxy.\n"
-        f"models = {json.dumps(list(dict.fromkeys((model, UTILITY_MODEL))))}\n"
+        f"{models}"
         "\n"
         "# The gate's defaults, written out: reads pass, writes to unknown hosts are held, and\n"
         "# the owner's Telegram chat (telegram.toml) is trusted.\n"
@@ -212,18 +244,32 @@ def _invisible(char: str) -> bool:
     return char in "​‌‍⁠﻿" or "‪" <= char <= "‮" or ("⁦" <= char <= "⁩")
 
 
-def command_up(paths: Paths, *, model: str, fake_internet: bool) -> int:
+def require_profile_image(profile: str) -> None:
+    """The pinned image of the agent, pulled by digest the first time (OpenClaw's: the demo's)."""
+    if profile == OPENCLAW:
+        demo.require_agent_image()
+        return
+    image = NAMED[profile].image
+    if jail_docker.run(["image", "inspect", image], check=False).returncode != 0:
+        print("Descargando la imagen de Claude Code (la primera vez son 750 MB)...", flush=True)
+        demo.run(["docker", "pull", "--quiet", image], timeout=demo.PULL_TIMEOUT)
+
+
+def command_up(paths: Paths, *, model: str, fake_internet: bool, profile: str = OPENCLAW) -> int:
     demo.require_dev_vm_user_with_sudo()
     if demo.service_pid(paths) is not None:
         raise demo.DemoError("ya hay una prueba o una demo en marcha; `make probar-parar` la quita")
-    render_config(paths, 0, 0, model=model, offline=fake_internet)  # refuses an odd model
-    demo.require_agent_image()
+    # Refuses an odd model or profile before anything is touched.
+    render_config(paths, 0, 0, model=model, offline=fake_internet, profile=profile)
+    require_profile_image(profile)
     if paths.base.exists() or demo.mount_at(paths.mnt) is not None:
         print("Quedaba una prueba o una demo anterior: la quito para empezar de cero.", flush=True)
     demo.teardown(paths)
     demo.create_volume(
         paths,
-        lambda p, uid, gid: render_config(p, uid, gid, model=model, offline=fake_internet),
+        lambda p, uid, gid: render_config(
+            p, uid, gid, model=model, offline=fake_internet, profile=profile
+        ),
         telegram=not fake_internet,  # the fake internet's run never reaches the real Telegram
         image_size=IMAGE_SIZE,
     )
@@ -236,9 +282,14 @@ def command_up(paths: Paths, *, model: str, fake_internet: bool) -> int:
             raise
         print("INTERNET FALSO: nada sale a Anthropic ni a Telegram (solo para verificar).")
     telegram = (paths.state / "telegram.toml").exists()
+    who = (
+        "Agente: Claude Code (elige él sus modelos de Anthropic, a través del proxy).\n"
+        if profile == CLAUDE_CODE
+        else f"Modelo del agente: {model} (de Anthropic, a través del proxy).\n"
+    )
     print(
         "Volumen de la prueba listo (Btrfs con cuotas, tope del agente: 192 MiB).\n"
-        f"Modelo del agente: {model} (de Anthropic, a través del proxy).\n"
+        f"{who}"
         "Arranco `backtide vigilar`: espera a ver `agent_start` y las primeras instantáneas.\n",
         flush=True,
     )
@@ -259,7 +310,7 @@ def command_up(paths: Paths, *, model: str, fake_internet: bool) -> int:
             "retenciones solo se ven en la web.\n",
             flush=True,
         )
-    print('Para hablarle: make probar-pedir MSG="...". Para parar: Ctrl-C aquí.\n', flush=True)
+    print(f"{TALK[profile]} Para parar: Ctrl-C aquí.\n", flush=True)
     paths.pid_file.write_text(f"{os.getpid()}\n")
     stop = threading.Event()
     feed = threading.Thread(
@@ -272,6 +323,14 @@ def command_up(paths: Paths, *, model: str, fake_internet: bool) -> int:
         stop.set()
         feed.join(10)
         paths.pid_file.unlink(missing_ok=True)
+
+
+TALK = {
+    OPENCLAW: 'Para hablarle: make probar-pedir MSG="...".',
+    CLAUDE_CODE: "Para trabajar con él: make probar-entrar (en tu terminal) o make probar-tarea "
+    'MSG="...". Para darle código: make probar-importar RUTA=...; para sacarlo: make '
+    "probar-exportar RUTA=....",
+}
 
 
 def run_backtide(*argv: str, grants: dict[str, Any] | None = None) -> int:
@@ -306,6 +365,10 @@ def command_pedir(paths: Paths, encoded: str) -> int:
     message = decode_message(encoded)
     demo.require_demo_mount(paths)
     config = _config(paths)
+    if config.agent_profile.name != OPENCLAW:
+        raise demo.DemoError(
+            'esta prueba es con Claude Code: usa make probar-tarea MSG="..." o make probar-entrar'
+        )
     jail = AgentJail(replace(config.jail_config(), allow_shared_ids=True))
     if not jail.is_running():
         raise demo.DemoError("el agente no está en marcha: arranca `make probar` en otra terminal")
@@ -319,6 +382,18 @@ def command_pedir(paths: Paths, encoded: str) -> int:
     if result.returncode != 0:
         raise demo.DemoError(f"OpenClaw terminó con código {result.returncode}")
     return 0
+
+
+def command_shell(paths: Paths, command: str, *argv: str) -> int:
+    """`backtide entrar`, `tarea`, `importar` or `exportar` for the running test (Claude Code):
+    backtide's own commands, through the running service (backtide/shell_cli.py)."""
+    demo.require_demo_mount(paths)
+    if _config(paths).agent_profile.name != CLAUDE_CODE:
+        raise demo.DemoError(
+            "esta prueba es con OpenClaw: arranca `make probar PERFIL=claude-code` para "
+            'usar Claude Code (con OpenClaw: make probar-pedir MSG="...")'
+        )
+    return run_backtide(command, "--config", str(paths.config), *argv)
 
 
 def _config(paths: Paths) -> ServiceConfig:
@@ -343,6 +418,17 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument(
         "--internet-falso", action="store_true", help="solo para verificar: nada sale de la VM"
     )
+    up.add_argument("--perfil", choices=PROFILES, default=OPENCLAW, help="el agente")
+    enter = commands.add_parser("entrar", help="Claude Code en tu terminal")
+    enter.add_argument("--continue", dest="resume", action="store_true")
+    task = commands.add_parser("tarea", help="una tarea a Claude Code, y su respuesta")
+    task.add_argument("mensaje", help="la tarea, en base64 (lo hace el Makefile)")
+    task.add_argument("--continue", dest="resume", action="store_true")
+    bring = commands.add_parser("importar", help="una carpeta de la VM al agente")
+    bring.add_argument("ruta")
+    bring.add_argument("--reemplazar", action="store_true")
+    take = commands.add_parser("exportar", help="la carpeta de trabajo del agente, a la VM")
+    take.add_argument("ruta")
     ask = commands.add_parser("pedir", help="un mensaje al agente, y su respuesta")
     ask.add_argument("mensaje", help="el mensaje, en base64 (lo hace el Makefile)")
     commands.add_parser("instantaneas", help="lista las instantáneas")
@@ -357,9 +443,20 @@ def main(argv: list[str] | None = None) -> int:
     paths = demo.PATHS
     try:
         if args.command == "up":
-            return command_up(paths, model=args.modelo, fake_internet=args.internet_falso)
+            return command_up(
+                paths, model=args.modelo, fake_internet=args.internet_falso, profile=args.perfil
+            )
         if args.command == "pedir":
             return command_pedir(paths, args.mensaje)
+        if args.command in ("entrar", "tarea"):
+            resume = ["--continue"] if args.resume else []
+            more = ["--", decode_message(args.mensaje)] if args.command == "tarea" else []
+            return command_shell(paths, args.command, *resume, *more)
+        if args.command == "importar":
+            extra = ["--reemplazar"] if args.reemplazar else []
+            return command_shell(paths, "importar", *extra, args.ruta)
+        if args.command == "exportar":
+            return command_shell(paths, "exportar", args.ruta)
         # The demo's own commands (a test without its key yet can list and rewind too).
         demo.require_demo_mount(paths)
         if args.command == "instantaneas":
