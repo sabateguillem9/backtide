@@ -19,7 +19,11 @@ the pinned mitmproxy image. Never contacted from the Mac and never with a real k
 - T17a-4, ``git push`` over smart HTTP: ``GET .../info/refs?service=git-receive-pack`` gets the
   advertisement of an empty repository, so git goes on to its ``POST .../git-receive-pack``
   (which the gate holds: a test checks it never arrives here).
-- ``.../chat/completions``: a fake OpenAI-compatible Chat Completions API (JSON or SSE).
+- ``.../chat/completions``: a fake OpenAI-compatible Chat Completions API (JSON or SSE). A
+  streamed call with ``stream_options.include_usage`` true gets ``"usage": null`` in each chunk
+  and one more chunk, ``"choices": []`` with the usage, before ``[DONE]``, as OpenAI documents
+  it. With ``T11-USAGE-CUT`` in it, the stream stops for CUT_PAUSE seconds right after that
+  chunk, before ``[DONE]`` (the agent hangs up there). Its record keeps ``stream_options``.
 - T06-6, a provider that echoes the key it got: a model request with ``T06-ECHO-JSON`` in it is
   answered with a JSON error that quotes the key; with ``T06-ECHO-SSE``, a stream whose text
   deltas spell the key in three pieces; with ``T06-ECHO-B64``, a stream with the key in base64;
@@ -71,6 +75,7 @@ BIG_ANSWER = 15 * 1024 * 1024  # under the proxy's body_size_limit (16 MiB)
 BIG_CHUNK = 1024 * 1024
 BIG_PAUSE = 0.4  # seconds between chunks: about 6 s for the whole answer
 CUT_MARK = b"T11-CUT-TAIL"
+USAGE_CUT_MARK = b"T11-USAGE-CUT"
 CUT_PAUSE = 6.0
 SLOW_MARK = b"T11-NO-HEAD"
 SLOW_HEAD = 8.0
@@ -161,7 +166,8 @@ class Handler(BaseHTTPRequestHandler):
             record["model_turn"] = _turn_summary(_json_or_empty(body))
             self._anthropic(body)
         elif path.endswith("/chat/completions"):
-            self._openai_chat(body)
+            record["stream_options"] = _json_or_empty(body).get("stream_options", "absent")
+            self._openai_chat(body, pause=USAGE_CUT_MARK in body)
         elif path.endswith("/responses"):
             self._openai_responses(body)
         else:
@@ -520,7 +526,7 @@ class Handler(BaseHTTPRequestHandler):
             ]
         )
 
-    def _openai_chat(self, body: bytes) -> None:
+    def _openai_chat(self, body: bytes, *, pause: bool = False) -> None:
         request = _json_or_empty(body)
         model = request.get("model", "fake-model")
         created = int(time.time())
@@ -544,23 +550,37 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        options = request.get("stream_options")
+        with_usage = isinstance(options, dict) and options.get("include_usage") is True
+
         def chunk(delta: dict, finish: str | None) -> dict:
-            return {
+            data = {
                 "id": "chatcmpl-t06",
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             }
+            return data | ({"usage": None} if with_usage else {})
 
-        self._sse(
-            [
-                (None, chunk({"role": "assistant", "content": ""}, None)),
-                (None, chunk({"content": REPLY_TEXT}, None)),
-                (None, chunk({}, "stop")),
-                (None, "[DONE]"),
-            ]
-        )
+        events: list[tuple[str | None, object]] = [
+            (None, chunk({"role": "assistant", "content": ""}, None)),
+            (None, chunk({"content": REPLY_TEXT}, None)),
+            (None, chunk({}, "stop")),
+        ]
+        if with_usage:
+            usage = {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
+            events.append((None, {**chunk({}, None), "choices": [], "usage": usage}))
+        if not pause:
+            self._sse([*events, (None, "[DONE]")])
+            return
+        try:
+            self._sse(events)
+            time.sleep(CUT_PAUSE)  # the agent hangs up here, before [DONE]
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except OSError:
+            self.close_connection = True
 
     def _openai_responses(self, body: bytes) -> None:
         request = _json_or_empty(body)

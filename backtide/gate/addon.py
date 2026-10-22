@@ -49,6 +49,14 @@ A redirection (3xx) or a protocol switch (101) of a local provider never reaches
 and ``net/blocked {reason: local_redirect, side: response}``. Every refusal toward it says
 ``local: true`` (risk 3 on one of Ollama's administration routes).
 
+**OpenAI's streamed usage** (T11, docs/33 "include_usage", stream_usage.py): a streamed Chat
+Completions call to a public ``openai`` provider whose body has no ``stream_options`` gets
+``"stream_options":{"include_usage":true}`` inserted after its opening brace, once the rewritten
+body passed the same provider check; backtide records it as sent (``include_usage: "added"``,
+the body's size as sent) and the rewrite is applied only after the ack. The extra usage chunk is
+read by the tap and dropped before it reaches the agent (``drop_usage_events``). Never toward a
+local provider, never on a compressed body or one the rewrite would take past BODY_LIMIT.
+
 **Any exception in a hook kills the flow** (mitmproxy carries on after a hook raises, T06-1
 P7): before the request has gone out the agent gets a 502, after it the flow is killed, and a
 ``net/error {stage}`` is queued. If even that fails the process exits: a dead proxy lets
@@ -94,6 +102,7 @@ from backtide.gate.providers import (
     swap_key,
 )
 from backtide.gate.sse import UsageStream, summarize_json
+from backtide.gate.stream_usage import drop_usage_events, usage_insert_at, with_include_usage
 from backtide.gate.translate import credential_free_path, shapes, translate
 from backtide.gate.translate.base import (
     OVERRIDE_HEADERS,
@@ -239,10 +248,14 @@ class _Tap:
         provider: Provider | None,
         media: str,
         guard: SseGuard | None = None,
+        *,
+        drop_usage: bool = False,
     ) -> None:
         self._gate = gate
         self._flow = flow
         self._guard = guard
+        # T11: the usage chunk the proxy asked for is read (count) and then not passed on.
+        self._drop_usage = drop_usage and guard is not None
         self.size = 0
         self.kind = None if provider is None else str(provider.kind)
         self._sse = UsageStream(self.kind) if self.kind and media == "text/event-stream" else None
@@ -256,7 +269,8 @@ class _Tap:
             self.count(chunk)
             if self._guard is None:
                 return chunk
-            return self._guard.feed(chunk) if chunk else self._guard.finish()
+            ready = self._guard.feed(chunk) if chunk else self._guard.finish()
+            return drop_usage_events(ready) if self._drop_usage and ready else ready
         except KeyEcho:
             self.stopped = True
             self._gate._key_in_answer(self._flow)
@@ -481,6 +495,7 @@ class Gate:
             self._block("private_address", flow, fields)
             return
         swapped = None
+        usage_at: int | None = None  # T11: where include_usage goes in the body, if it does
         if provider is not None:
             local = provider.local
             if local and provider.upstream is None:
@@ -525,6 +540,15 @@ class Gate:
                 exact=provider.exact_paths,
                 models=provider.models,
             )
+            if not local and not provider.waiting and provider.stream_usage:
+                usage_at = self._plan_usage(
+                    provider, endpoint, request, headers, body, verdict, trailers
+                )
+                if usage_at is not None:
+                    # Recorded as it will be sent (applied in _let_through, after the ack): the
+                    # body and its Content-Length.
+                    fields["body"] = with_include_usage(body or b"", usage_at)
+                    fields["headers"] = _with_length(fields["headers"], len(fields["body"]))
             event = record.llm_request_event(
                 fields,
                 provider.name,
@@ -532,6 +556,7 @@ class Gate:
                 provider_tools=verdict.tools,
                 endpoint=endpoint,
                 upstream=provider.upstream if local else None,
+                include_usage=usage_at is not None,
             )
             gate = None  # a provider's host is never held (docs/32, section 5, rule 1)
             shape = None
@@ -588,7 +613,43 @@ class Gate:
                 return
             self._denied(flow, ack, fields, shape)
             return
-        self._let_through(flow, fields, provider, swapped)
+        self._let_through(flow, fields, provider, swapped, usage_at)
+
+    def _plan_usage(
+        self,
+        provider: Provider,
+        endpoint: str | None,
+        request: Any,
+        headers: list[tuple[str, str]],
+        body: bytes | None,
+        verdict: Any,
+        trailers: list[tuple[str, str]],
+    ) -> int | None:
+        """T11 (stream_usage.py): where ``stream_options.include_usage`` goes in this call's
+        body, or None. The rewritten body must pass the same provider check with the same tools,
+        or the call goes as the agent wrote it (it passed already) and the error is logged."""
+        at = usage_insert_at(str(provider.kind), endpoint, headers, body, limit=BODY_LIMIT)
+        if at is None or body is None:
+            return None
+        config = self._channel.config
+        if config is None:
+            return None
+        again = check_request(
+            str(provider.kind),
+            request.method,
+            request.path,
+            headers,
+            with_include_usage(body, at),
+            allowed=config.provider_tools,
+            models=provider.models,
+            trailers=trailers,
+            exact=provider.exact_paths,
+            local=provider.local,
+        )
+        if again.reason is not None or again.tools != verdict.tools:
+            logger.error("the include_usage rewrite would change the provider check: not added")
+            return None
+        return at
 
     def _provider_refusal(self, flow: Any, provider: Provider, reason: str) -> None:
         """A model call refused in ``provider``'s own API's error shape."""
@@ -792,12 +853,18 @@ class Gate:
         fields: dict[str, Any],
         provider: Provider | None,
         swapped: list[tuple[str, str]] | None,
+        usage_at: int | None = None,
     ) -> None:
         """The request is recorded and may go out: the connection it needs is let open."""
         request = flow.request
         if provider is not None and swapped is None:
             # Never to a provider without the real key in its place (the guard answers 502).
             raise RuntimeError("a call to a provider without its key swapped")
+        if usage_at is not None and swapped is not None:
+            # T11: the body as backtide recorded it (with_include_usage raises, so the guard
+            # answers 502, if it is not the one the rewrite was planned on).
+            request.raw_content = with_include_usage(request.raw_content or b"", usage_at)
+            swapped = _with_length(swapped, len(request.raw_content))
         upstream = provider.upstream if provider is not None and provider.local else None
         if provider is not None and provider.local and upstream is None:
             raise RuntimeError("a local provider without its address")
@@ -829,6 +896,8 @@ class Gate:
             "start": self._clock(),
             "fields": {key: fields[key] for key in ("flow_id", "scheme", "host", "port", "path")},
         }
+        if usage_at is not None:
+            flow.metadata["backtide"]["drop_usage"] = True
 
     def _denied(
         self, flow: Any, ack: Ack, fields: dict[str, Any], shape: Shape | None = None
@@ -944,7 +1013,9 @@ class Gate:
                 self._hold_whole(flow, provider, media)
                 return
         guard = SseGuard(meta["scanner"]) if provider is not None else None
-        tap = _Tap(self, flow, provider, media, guard)
+        tap = _Tap(
+            self, flow, provider, media, guard, drop_usage=bool(meta and meta.get("drop_usage"))
+        )
         flow.metadata["backtide_tap"] = tap
         flow.response.stream = tap
 
@@ -1429,6 +1500,11 @@ def _upstream(flow: Any) -> bool:
         return True
     started = getattr(conn, "timestamp_start", None)
     return conn.timestamp_tcp_setup is not None or started is not None
+
+
+def _with_length(headers: list[tuple[str, str]], size: int) -> list[tuple[str, str]]:
+    """``headers`` with every ``Content-Length`` saying ``size`` (none is added)."""
+    return [(n, str(size) if n.lower() == "content-length" else v) for n, v in headers]
 
 
 def _utf8(text: str) -> bytes:

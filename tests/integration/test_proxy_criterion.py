@@ -159,12 +159,12 @@ def test_a_turn_reaches_the_provider_with_the_real_key(
     )
     answer = llm_events(lab, "response", provider)[-1]
     assert answer.details["status"] == 200
-    if provider == ANTHROPIC:
-        assert answer.details.get("usage"), answer.details
-    else:
-        # OpenAI streams its usage only if asked (stream_options.include_usage): T11 decides
-        # whether the proxy asks. Until then the answer says it is missing (docs/21, section 8).
-        assert answer.details.get("usage") or answer.details.get("usage_missing"), answer.details
+    # OpenAI streams its usage only if asked (stream_options.include_usage): OpenClaw does not
+    # ask this provider it does not know, so the proxy does (T11, docs/33 "include_usage").
+    assert answer.details.get("usage"), answer.details
+    if provider == OPENAI:
+        assert requests[-1].details.get("include_usage") == "added", requests[-1].details
+        assert answer.details["usage"] == {"input": 12, "output": 7}, answer.details
 
 
 def test_the_agent_only_ever_has_the_fake_keys(lab: Lab) -> None:

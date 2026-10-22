@@ -21,14 +21,14 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   contain the state.
 - Reading the configuration touches no Docker, no btrfs and no black box. backtide runs on the host,
   not in a container (docs/19), so these paths are host paths.
-- ``[proxy]`` (T06, docs/21): the egress proxy's container options, the allowed hosts and the
-  model providers (name, kind, host, models). NEVER a key: a key-like setting is refused. The
-  real key of each provider lives in ``<state_dir>/keys/<name>.key`` (0600, in a 0700 folder,
-  both ours, no symlinks), read here into a ``Secret`` that only the proxy's channel reveals
-  (T06-5). Its fake key, ``<name>.fake``, is made once per installation the first time it is
-  needed; only the fake one reaches the agent (in openclaw.json). The proxy's CA and channel
-  folders live in the state too, and the agent's config folder may never be or contain any of
-  them.
+- ``[proxy]`` (T06, docs/21): the egress proxy's container options, the allowed hosts and the model
+  providers (name, kind, host, models, and for a public ``openai`` one ``stream_usage``: whether the
+  proxy asks it for a streamed call's usage, T11; on by default). NEVER a key: a key-like setting is
+  refused. The real key of each provider lives in ``<state_dir>/keys/<name>.key`` (0600, in a 0700
+  folder, both ours, no symlinks), read here into a ``Secret`` that only the proxy's channel reveals
+  (T06-5). Its fake key, ``<name>.fake``, is made once per installation the first time it is needed;
+  only the fake one reaches the agent (in openclaw.json). The proxy's CA and channel folders live in
+  the state too, and the agent's config folder may never be or contain any of them.
 - ``[gate]`` (T10-3, docs/32 sections 5, 8 and 9): what the gate does with hosts off the allowed
   list (``unknown_hosts``: ``"hold"``, the default, lets reads pass with decision 1's guard and
   holds writes; ``"deny"`` is the optional strict mode of T06), the trusted recipients
@@ -202,7 +202,7 @@ _PROXY_CONTAINER_KEYS = frozenset(
     {"name", "network", "image", "uid", "gid", "memory", "cpus", "pids_limit"}
 )
 _PROXY_KEYS = _PROXY_CONTAINER_KEYS | {"allow_hosts", "providers", "allow_provider_tools"}
-_PROVIDER_KEYS = frozenset({"name", "kind", "host", "models", "local"})
+_PROVIDER_KEYS = frozenset({"name", "kind", "host", "models", "local", "stream_usage"})
 # T20: ``local = "http://<name or IPv4>:<port>"``, exactly (no path, user, query or https).
 _LOCAL_RE = re.compile(r"http://(?P<host>[A-Za-z0-9.-]{1,253}):(?P<port>[0-9]{1,5})", re.ASCII)
 MAX_PROVIDER_MODELS = 32
@@ -262,6 +262,10 @@ class Provider:
     # T20: a local provider's ``local`` (a host name or an IPv4, and a port), as written: the
     # service resolves a name (local_models.py). ``host`` is then its virtual name.
     local: tuple[str, int] | None = None
+    # T11 (docs/33, "include_usage"): ``stream_usage = false`` stops the proxy from asking this
+    # ``openai`` provider for the usage of a streamed call (a compatible API that refuses fields
+    # it does not know). On by default.
+    stream_usage: bool = True
 
 
 @dataclass(frozen=True)
@@ -743,6 +747,7 @@ class ServiceConfig:
                 "host": provider.host,
                 "fake_key": key.fake,
                 "models": provider.models,
+                "stream_usage": provider.stream_usage,
             }
             try:
                 waiting = GateProvider(**fields, real_key=None)  # type: ignore[arg-type]
@@ -1529,6 +1534,14 @@ def _provider(entry: object) -> Provider:
         raise ConfigError(
             f"[proxy] providers: {name} has kind {kind!r}, not one of {sorted(PROVIDER_HOSTS)}"
         )
+    stream_usage = entry.get("stream_usage", True)
+    if "stream_usage" in entry and (
+        not isinstance(stream_usage, bool) or kind != "openai" or "local" in entry
+    ):
+        raise ConfigError(
+            f"[proxy] providers: {name}'s stream_usage is true or false, and only for a provider "
+            'of kind "openai" that is not local (the proxy never asks the others)'
+        )
     if "local" in entry:
         return _local_provider(name, kind, entry)
     host = entry.get("host", PROVIDER_HOSTS[kind])
@@ -1556,7 +1569,9 @@ def _provider(entry: object) -> Provider:
             f"[proxy] providers: {name}'s models must be a list of at most "
             f"{MAX_PROVIDER_MODELS} model ids"
         )
-    return Provider(name=name, kind=kind, host=host, models=tuple(models))
+    return Provider(
+        name=name, kind=kind, host=host, models=tuple(models), stream_usage=stream_usage
+    )
 
 
 def _local_provider(name: str, kind: str, entry: Mapping[str, Any]) -> Provider:

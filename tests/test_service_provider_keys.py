@@ -241,6 +241,33 @@ def test_a_provider_on_another_kinds_host_is_refused(layout: Path, kind: str, ho
         ServiceConfig.from_file(write_toml(layout, extra))
 
 
+def test_stream_usage_can_be_turned_off_for_an_openai_provider(layout: Path) -> None:
+    """T11 (docs/33, "include_usage"): on by default; ``false`` for a compatible API that
+    refuses fields it does not know. It reaches the proxy's policy."""
+    write_key(layout, "anthropic", REAL_ANTHROPIC)
+    write_key(layout, "groq", REAL_OPENAI)
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS + "stream_usage = false\n"))
+    usage = {p.name: p.stream_usage for p in config.model_providers().items}
+    assert usage == {"anthropic": True, "groq": False}
+    assert {p.name: p.stream_usage for p in config.proxy_settings().providers} == usage
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '[[proxy.providers]]\nname = "o"\nkind = "openai"\nmodels = ["m"]\nstream_usage = "no"\n',
+        '[[proxy.providers]]\nname = "o"\nkind = "openai"\nmodels = ["m"]\nstream_usage = 0\n',
+        '[[proxy.providers]]\nname = "a"\nkind = "anthropic"\nstream_usage = false\n',
+        '[[proxy.providers]]\nname = "l"\nkind = "openai"\nlocal = "http://10.0.0.7:11434"\n'
+        'models = ["m"]\nstream_usage = false\n',
+    ],
+    ids=["text", "number", "anthropic", "local"],
+)
+def test_stream_usage_is_a_boolean_of_a_public_openai_provider(layout: Path, extra: str) -> None:
+    with pytest.raises(ConfigError, match="stream_usage"):
+        ServiceConfig.from_file(write_toml(layout, extra))
+
+
 def test_two_providers_with_the_same_real_key_both_wait(layout: Path) -> None:
     write_key(layout, "anthropic", REAL_ANTHROPIC)
     write_key(layout, "groq", REAL_ANTHROPIC)

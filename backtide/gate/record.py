@@ -367,12 +367,15 @@ def llm_request_event(
     provider_tools: Sequence[str] = (),
     endpoint: str | None = None,
     upstream: tuple[str, int] | None = None,
+    include_usage: bool = False,
 ) -> dict[str, Any]:
     """``llm/request``: a request to a provider's host. Of its body, only metadata, and the
     provider-side tools that ``allow_provider_tools`` let through (T06-6), by name. ``endpoint``:
     which of the provider's endpoints it is (``provider_tools.endpoint_of``; the spending cap
     does not charge the free ones, T11). ``upstream``: a local provider's (address, port) (T20):
-    ``local: true``, where it goes, and ``key: "none"`` (no credential reaches it)."""
+    ``local: true``, where it goes, and ``key: "none"`` (no credential reaches it).
+    ``include_usage``: the proxy added ``stream_options.include_usage`` to the body
+    (stream_usage.py): ``include_usage: "added"``, and ``flow["body"]`` is the body as sent."""
     scrub = _scrubber(secrets)
     details = _request_details(flow, scrub)
     details["body"] = _body(flow, scrub, excerpt=False)
@@ -385,6 +388,8 @@ def llm_request_event(
         details["local"] = True
         details["upstream"] = _clean(f"{address}:{port}", scrub, _LIMIT_SHORT)
         details["key"] = "none"
+    if include_usage:
+        details["include_usage"] = "added"
     if provider_tools:
         details["provider_tools"] = _names(provider_tools, scrub)
     return _finish("llm", "request", _target(flow, scrub), details, scrub)

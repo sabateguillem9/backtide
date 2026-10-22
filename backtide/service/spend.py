@@ -56,7 +56,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, tzinfo
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -169,6 +169,9 @@ class _Flight:
     free: bool = False
     reserved: int = 0  # µ$ held against the caps while it is in flight (M5)
     local: bool = False  # T20: a local model's call: costs 0, counted apart
+    # T11: the proxy asked for its streamed usage (include_usage): cut short, it never costs less
+    # than the estimate it had before the proxy asked.
+    usage_added: bool = False
 
 
 def local_zone(
@@ -405,6 +408,7 @@ class Budget:
         service_tier: object = None,
         free: bool = False,
         local: bool = False,
+        usage_added: bool = False,
     ) -> str | None:
         """None if this model call may go out (it now holds a place in flight and, unless it is
         ``free``, reserves its estimate), else why not: ``spend_unavailable``, ``spend_cap``
@@ -435,6 +439,7 @@ class Budget:
                 context=context is True,
                 service_tier=None if service_tier is None else str(service_tier)[:64],
                 free=free is True,
+                usage_added=usage_added is True,
             )
             if not flight.free:
                 reserved = self._reserved()
@@ -532,7 +537,8 @@ class Budget:
         model = details.get("model")
         if not (isinstance(model, str) and model) and flight is not None:
             model = flight.model  # cut before the provider said it: the one asked for
-        return cost_of(
+        complete = failed or details.get("complete") is True
+        cost = cost_of(
             self.book,
             kind=kind,
             model=model,
@@ -543,8 +549,15 @@ class Budget:
             context=flight is not None and flight.context,
             service_tier=None if flight is None else flight.service_tier,
             # A1: a 2xx (or no status) that did not end is billed for what it generated.
-            complete=failed or details.get("complete") is True,
+            complete=complete,
         )
+        if flight is not None and flight.usage_added and not complete:
+            # The proxy asked for this call's usage (docs/33, "include_usage"): cut short, it
+            # costs at least what it did before, when it had no usage and was estimated.
+            guess = self._estimate(flight)
+            if guess > cost.micro:
+                cost = replace(cost, micro=guess, estimated=True)
+        return cost
 
     def _fallback(self, flight: _Flight | None) -> Cost:
         try:

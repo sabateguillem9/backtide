@@ -221,6 +221,8 @@ EVENT_SCHEMA: dict[tuple[str, str], tuple[int | None, frozenset[str]]] = {
             # T20: a local provider's call, and where it goes (the owner's config, no secret).
             "local",
             "upstream",
+            # T11: the proxy asked for the streamed usage (stream_usage.py): "added".
+            "include_usage",
         },
     ),
     ("llm", "response"): (0, _LLM_RESPONSE_KEYS | {"local"}),
@@ -511,7 +513,7 @@ _LIMIT_RANGES = {
     "max_holds": (1, 64),
 }
 _PROVIDER_KEYS = frozenset({"name", "kind", "host", "fake_key", "real_key"})
-_PROVIDER_OPTIONAL = frozenset({"models", "local", "upstream"})
+_PROVIDER_OPTIONAL = frozenset({"models", "local", "upstream", "stream_usage"})
 _MAX_STRUCK_KEY = 4096  # a key file's own limit (service.config.MAX_KEY_BYTES)
 
 
@@ -532,6 +534,8 @@ def _provider_entry(p: Provider) -> dict[str, Any]:
             raise ProtocolError("config.providers: a local provider without its address")
         entry["local"] = True
         entry["upstream"] = [p.upstream[0], p.upstream[1]]
+    if not p.stream_usage:  # T11: only when the owner turned it off (on by default)
+        entry["stream_usage"] = False
     return entry
 
 
@@ -566,6 +570,9 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
             or type(upstream[1]) is not int
         ):
             raise ProtocolError("config.providers: a local provider needs its address and port")
+        stream_usage = entry.get("stream_usage", True)
+        if stream_usage is not True and stream_usage is not False:
+            raise ProtocolError("config.providers: stream_usage is true or false")
         try:
             built.append(
                 Provider(
@@ -577,6 +584,7 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
                     models=tuple(models),
                     local=local is True,
                     upstream=None if upstream is None else (upstream[0], upstream[1]),
+                    stream_usage=stream_usage,
                 )
             )
         except ValueError:

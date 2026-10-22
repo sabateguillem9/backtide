@@ -201,6 +201,10 @@ class Provider:
     # never gets one so: the channel demands it).
     local: bool = False
     upstream: tuple[str, int] | None = None
+    # T11 (docs/33, "include_usage"): whether the proxy may ask this provider for the usage of a
+    # streamed Chat Completions call (``[[proxy.providers]] stream_usage``; on by default). Off
+    # for a compatible API that refuses fields it does not know.
+    stream_usage: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.fullmatch(self.name):
@@ -228,6 +232,8 @@ class Provider:
         object.__setattr__(self, "models", models)
         if self.local is not True and self.local is not False:
             raise ValueError(f"provider {self.name}: local is true or false")
+        if self.stream_usage is not True and self.stream_usage is not False:
+            raise ValueError(f"provider {self.name}: stream_usage is true or false")
         if self.local:
             self._check_local()
         elif self.host.endswith(LOCAL_SUFFIX) or self.upstream is not None:

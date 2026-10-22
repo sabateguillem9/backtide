@@ -1117,7 +1117,10 @@ transmisión con max_tokens 1000 justo después del último content_block_stop, 
 el uso real de salida, y cuelga otra llamada antes de que el proveedor mande la cabecera de la \
 respuesta. La primera se cobra con todo su max_tokens y la segunda con su estimación \
 (system/budget_charged), las dos marcadas como estimadas; juntas pasan el tope y la siguiente \
-llamada se rechaza sin llegar al proveedor."""
+llamada se rechaza sin llegar al proveedor. Antes, una llamada en streaming a OpenAI sin \
+stream_options, a la que el proxy pide el uso (include_usage): el agente cuelga justo después \
+de que el trozo de uso llegue al proxy y antes de [DONE]; se cobra su estimación de antes del \
+cambio, no lo poco que dice su uso, y el agente nunca ve ese trozo."""
 inspired_by = "Revisión de seguridad de T11: lo que backtide no sabe se cobra de más, nunca de menos"
 invariants = [7]
 status = "ready"

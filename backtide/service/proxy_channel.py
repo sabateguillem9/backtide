@@ -942,6 +942,8 @@ class ProxyChannel:
                 service_tier=details.get("service_tier"),
                 free=self._free_call(details),
                 local=self._local_call(details),
+                # T11: only ever more caution, so the proxy's word is enough.
+                usage_added=details.get("include_usage") == "added",
             )
         except Exception:  # without a count nothing goes out
             logger.exception("the spending cap could not be asked: the model call is refused")

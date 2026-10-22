@@ -14,6 +14,11 @@ not update themselves. Nothing reaches Anthropic or any real service (invariant 
   estimate (its bytes at the 1 h cache write plus its max_tokens), ``system/budget_charged``.
   Together they pass the cap, and the next call is refused in Anthropic's own shape without
   reaching the provider.
+  (include_usage, docs/33) Before those, a streamed call to the OpenAI-shaped provider without
+  ``stream_options``: the proxy asks for its usage and drops the extra chunk; the agent hangs up
+  right after the usage chunk reached the proxy, before ``[DONE]``. The usage came but the answer
+  did not end, so it costs its estimate from before the rewrite (its bytes at the 1 h cache
+  write plus its max_tokens), never the little its usage says; the agent never saw the chunk.
 """
 
 from collections.abc import Iterator
@@ -28,6 +33,9 @@ from tests.integration.internet_kit import (
     ANTHROPIC,
     ANTHROPIC_HOST,
     ANTHROPIC_MODEL,
+    OPENAI,
+    OPENAI_HOST,
+    OPENAI_MODEL,
     stop_with_internet,
 )
 from tests.integration.service_kit import wait_until
@@ -35,6 +43,7 @@ from tests.integration.service_kit import wait_until
 PRICE = 500  # $/MTok for the fake model, in and out
 MAX_TOKENS = 1000  # what the script asks for
 CAP_USD = "1"  # 1,000,000 µ$: the two evasions together pass it
+OPENAI_PRICE = 1  # $/MTok for the fake OpenAI model: its evasion stays far under the cap
 
 
 @pytest.fixture(scope="module")
@@ -46,6 +55,7 @@ def lab(
     budget = (
         f'daily_usd = "{CAP_USD}"\nmonthly_usd = 100\nmax_inflight = 4\nauto_prices = false\n'
         f'[budget.prices."{ANTHROPIC_MODEL}"]\ninput = {PRICE}\noutput = {PRICE}\n'
+        f'[budget.prices."{OPENAI_MODEL}"]\ninput = {OPENAI_PRICE}\noutput = {OPENAI_PRICE}\n'
     )
     started = start_lab(btrfs_volume, tmp_path_factory, unknown_hosts="deny", budget_toml=budget)
     try:
@@ -83,6 +93,37 @@ def test_hanging_up_on_the_model_does_not_make_it_free(attack: Attack, lab: Lab)
     service = lab.service
     socket = service.config.control_socket
     assert ask_budget(socket)["day"]["spent_micro"] == 0
+
+    # include_usage: the usage chunk the proxy asked for came, [DONE] did not.
+    first = lab.head()
+    usage_cut = attack.run_script(
+        lab.agent, "evadir_el_tope", OPENAI_HOST, lab.fake[OPENAI], OPENAI_MODEL, "usage_cut"
+    )
+    request0 = last_request(lab, first)
+    flow0 = request0.details["flow_id"]
+    wait_until(
+        lambda: costs_of(lab, flow0, first),
+        20,
+        "the cost of the stream cut after its usage",
+        context=service.diagnosis,
+    )
+    [(name0, cost0)] = costs_of(lab, flow0, first)
+    response0 = next(e for e in lab.since(first) if e.details.get("flow_id") == flow0
+                     and e.action == "response")  # fmt: skip
+    u_expected = request0.details["body"]["size"] * 2 * OPENAI_PRICE + MAX_TOKENS * OPENAI_PRICE
+    u_ok = (
+        usage_cut.get("status") == 200
+        and usage_cut.get("finished") is True
+        and usage_cut.get("usage_chunk_seen") is False
+        and usage_cut.get("done") is False
+        and request0.details.get("include_usage") == "added"
+        and name0 == "llm/response"
+        and response0.details.get("usage") == {"input": 12, "output": 7}
+        and response0.details.get("complete") is False
+        and cost0["usd_micro"] == u_expected
+        and cost0["estimated"] is True
+    )
+
     before = lab.head()
     calls_before = model_calls(lab)
 
@@ -141,7 +182,9 @@ def test_hanging_up_on_the_model_does_not_make_it_free(attack: Attack, lab: Lab)
     )
     attack.check(
         "stopped",
-        a1_ok and m1_ok and spent == a1_expected + m1_expected and refused,
+        u_ok and a1_ok and m1_ok and spent == u_expected + a1_expected + m1_expected and refused,
+        f"cortado tras el uso: {usage_cut} -> {name0} {cost0} {response0.details.get('usage')} "
+        f"(esperado {u_expected} µ$); "
         f"cortado: {cut} -> {name} {cost} (esperado {a1_expected} µ$); colgado: {hung} -> "
         f"{name2} {cost2} (esperado {m1_expected} µ$); gastado {spent} µ$; después: {after}; "
         f"llamadas al proveedor {model_calls(lab) - calls_before}",
