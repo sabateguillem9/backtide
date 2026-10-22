@@ -23,6 +23,7 @@ from backtide.sensors.inotify import (
     RawEvent,
     parse_events,
 )
+from tests.fds import open_fds
 
 
 def pack(wd: int, mask: int, cookie: int = 0, name: bytes = b"", *, padded_to: int = 0) -> bytes:
@@ -185,11 +186,11 @@ class TestOpenBeneath:
             inotify.open_beneath(root, b"dir/fi\0le", self.flags)
 
     def test_no_descriptor_is_leaked_on_failure(self, root: int) -> None:
-        before = len(os.listdir("/dev/fd"))
+        before = open_fds()
         for _ in range(20):
             with pytest.raises(OSError):
                 inotify.open_beneath(root, b"dir/up/outside/secret", self.flags)
-        assert len(os.listdir("/dev/fd")) == before
+        assert open_fds() - before == set()
 
 
 # A mount point under "/" on each system: crossing it must be refused (finding 8).

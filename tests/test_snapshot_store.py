@@ -35,6 +35,7 @@ from backtide.snapshots import (
     SnapshotStore,
     btrfs,
 )
+from tests.fds import open_fds
 
 FAKED = (
     "create_subvolume",
@@ -323,10 +324,6 @@ def marker(path: Path) -> str:
     return (path / "marker").read_text()
 
 
-def open_fds() -> int:
-    return len(os.listdir("/dev/fd"))
-
-
 def _no_real_btrfs(*args: object, **kwargs: object) -> str:
     raise AssertionError("the store ran the real btrfs CLI")
 
@@ -603,7 +600,7 @@ def test_the_lock_fds_are_closed_when_the_body_raises(store: SnapshotStore, cloc
     with pytest.raises(RuntimeError), store._lock():
         raise RuntimeError("boom")
 
-    assert open_fds() == before
+    assert open_fds() - before == set()  # nothing the lock opened stays open
     other_store(store.root, clock, timeout=0).take(Reason.PERIODIC)
 
 

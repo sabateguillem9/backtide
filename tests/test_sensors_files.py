@@ -50,6 +50,7 @@ from backtide.sensors.inotify import (
 )
 from backtide.snapshots import Snapshot
 from tests.conftest import FakeClock
+from tests.fds import open_fds
 
 T0 = datetime(2026, 10, 16, 9, 0, tzinfo=UTC)
 S1 = "20261016T085900.000000Z-periodic"
@@ -1560,10 +1561,10 @@ class TestLifecycle:
         assert not rig.watcher.arm()  # closed for good
 
     def test_no_descriptor_is_left_open_after_closing(self, make_rig: Callable[..., Rig]) -> None:
-        before = len(os.listdir("/dev/fd"))
+        before = open_fds()
         rig = make_rig()
         rig.watcher.close()
-        assert len(os.listdir("/dev/fd")) == before
+        assert open_fds() - before == set()
 
     def test_the_dumper_thread_writes_on_its_own(self, make_rig: Callable[..., Rig]) -> None:
         rig = make_rig(WatcherConfig(dump_interval=0.02, max_watches=100))
