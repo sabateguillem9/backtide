@@ -10,6 +10,8 @@ It holds back what cannot be undone, such as sending a message or deleting somet
 
 > **Status: pre-alpha.** This is a working prototype, not a product. Do not rely on it to protect anything you cannot afford to lose. Read [What works today](#what-works-today) and [Security model](#security-model) first.
 
+**How it was built:** the founder made the product and security decisions; Claude Code wrote nearly all of the code, tests and security reviews, and no human has audited it. The details are in [docs/how-it-was-built.md](docs/how-it-was-built.md).
+
 ## Why
 
 Agents like [OpenClaw](https://github.com/openclaw/openclaw) run with broad access to files, shells, mail and the network. When one goes wrong, or is manipulated, it can delete data and then misreport what it did. A record kept by the agent is only as trustworthy as the agent.
@@ -37,8 +39,8 @@ Developed and tested against OpenClaw, on Linux with Docker and Btrfs.
 | Telegram: alerts with Pause and Rewind buttons, `/pausar`, `/seguir`, `/estado`, and approval of held requests with `/retenidas` and `/lotes` | Works against a fake Bot API in tests. With a real bot, the founder has so far seen only a hold notice arrive; `/estado`, `/pausar`, `/seguir` and approving from the phone are not yet tried by hand |
 | Settings page in the web (`backtide web --ajustes`): put, change or remove the model API keys and the Telegram bot token from the browser. Keys are write-only: the page shows only the last four characters | Works. The Telegram change applies on restart |
 | First real run (`make probar`): the real OpenClaw in its cage thinking with Claude through the proxy, with the gate, Telegram notice and web | Done once by the founder (60 model calls, two rewinds from the web, a held `POST` rejected and another approved). It is a hands-on test, not part of the automatic tests |
-| Attack battery: scripted "evil agent" scenarios that run inside the VM | 66 scenarios with tests; 6 more are listed and still pending (they wait for the spend cap and other later tasks) |
-| Spend cap: count the tokens of model calls in the proxy and cut at a limit | In progress. It does not work yet: until it does, set a spending limit in your provider's console |
+| Attack battery: scripted "evil agent" scenarios that run inside the VM | 71 scenarios with tests; 5 more are listed and still pending (they wait for later tasks) |
+| Spend cap: the proxy prices every model response from the provider's usage report and refuses new calls at the limit ($5 a day and $50 a month by default, editable in Settings), with notices at 50, 80 and 100 %. Anthropic's prices update daily from its official pricing page | Works, tested in the VM with attack scenarios. What the proxy cannot measure is charged high, so the cap stops early rather than late. Keep a spending limit in your provider's console as well |
 | Installer (Linux, then Mac), any agent beyond OpenClaw | Designed or planned |
 
 Two consequences of that table:
@@ -66,7 +68,7 @@ backtide assumes the agent may be mistaken, manipulated or hostile, and tries to
 
 - Anything that has already left the machine, including what you approved. Rewinding does not unsend, unpay or undelete.
 - A request the gate misreads: if a translator calls something a read that in fact writes, it goes out without asking. Without a translator, writes are held and reads pass.
-- Cost: there is no spend cap yet (it is being built). The only brake today is the limit you set at your model provider.
+- Cost beyond the cap's own errors: the cap counts what the proxy sees and charges unknowns high, but it is not your provider's bill. Keep a limit at your model provider too.
 - A container escape. The agent shares the host kernel. The cage reduces the attack surface (no capabilities, seccomp, read-only root) but is not a virtual machine.
 - A compromised host, root access on the host, or a malicious operator.
 - Vulnerabilities in OpenClaw, Docker, Btrfs or the kernel.

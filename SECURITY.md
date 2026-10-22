@@ -60,7 +60,7 @@ These are the rules the project is held to. A violation of any of them is a secu
 7. Every new security feature has its scenario in the evil-agent attack battery.
 8. Attack tests run only inside the VM and the test containers, never against the host machine or real services.
 
-Status note: invariants 3 and 6 are implemented (the proxy and the gate exist and have attack scenarios), but invariant 6 depends on the gate reading requests correctly: a write without a translator is held, while a request that a translator misreads as a read is not. There is also no spend cap yet. See the README.
+Status note: invariants 3 and 6 are implemented (the proxy and the gate exist and have attack scenarios), but invariant 6 depends on the gate reading requests correctly: a write without a translator is held, while a request that a translator misreads as a read is not. The spend cap counts what the proxy sees, not the provider's bill. See the README.
 
 ## Out of scope
 
