@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from backtide.blackbox import BlackBox
 from backtide.service.control import ControlServer, ControlUnavailable
-from backtide.service.settings import Applied, Settings
+from backtide.service.settings import KINDS, Applied, Settings
 from backtide.web.rewind import Availability, Redeemed
 from backtide.web.settings import ControlSettings, SettingTickets, views
 from tests.test_service_control import FakeGuardian, me
@@ -161,7 +161,7 @@ def test_a_tail_that_is_not_four_plain_characters_is_never_shown(
     fake.shown["telegram"] = {"set": True, "tail": "<b>x", "chat_tail": "12345678"}
     said = text_of(web.get("/ajustes").text)
     assert "WHOLEKEY" not in said and "<b>x" not in said and "12345678" not in said
-    assert [v.tail for v in views(fake.shown)] == [None, None, None]
+    assert [v.tail for v in views(fake.shown)] == [None] * len(KINDS)
 
 
 @pytest.mark.parametrize(

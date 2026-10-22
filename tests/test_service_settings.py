@@ -298,7 +298,7 @@ def test_the_status_says_set_its_tail_and_when_and_nothing_more(state: Path, box
     key = anthropic_key()
     settings.set_secret("anthropic", key, requested_by="web")
     shown = settings.status()
-    assert set(shown) == {"anthropic", "openai", "telegram"}
+    assert set(shown) == {"anthropic", "openai", "ollama-cloud", "telegram"}
     anthropic = shown["anthropic"]
     assert anthropic["set"] is True and anthropic["tail"] == key[-4:]
     assert anthropic["in_use"] is True and anthropic["problem"] is None

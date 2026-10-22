@@ -37,6 +37,18 @@ Design: docs/21-diseno-t06-proxy.md, sections 4 to 8. What each hook does:
 - ``error``, ``tls_failed_client`` and the WebSocket hooks: ``net/error``, ``net/tls_failed``
   and the WebSocket summaries; a client message with a real key kills the WebSocket.
 
+**A local provider** (T20, docs/35 section 6.2): the agent calls it by its virtual name
+(``<provider>.backtide.internal``, https, port 443). It must carry exactly its fake key, which is
+dropped (no credential goes on), and only its routes pass, compared exactly
+(``provider_tools.exact_endpoint``), with the same check of the body and its listed models. Once
+backtide has recorded it (``llm/request {local: true, upstream, key: "none"}``), the request is
+rewritten to ``http://<IPv4>:<port>`` (and its ``Host``), the fixed address backtide resolved on
+its side; ``server_connect`` opens exactly that pair for exactly that client without resolving
+anything. Any other private address stays ``private_address``, that same IP on another port too.
+A redirection (3xx) or a protocol switch (101) of a local provider never reaches the agent: a 502
+and ``net/blocked {reason: local_redirect, side: response}``. Every refusal toward it says
+``local: true`` (risk 3 on one of Ollama's administration routes).
+
 **Any exception in a hook kills the flow** (mitmproxy carries on after a hook raises, T06-1
 P7): before the request has gone out the agent gets a 502, after it the flow is killed, and a
 ``net/error {stage}`` is queued. If even that fails the process exits: a dead proxy lets
@@ -74,6 +86,7 @@ from backtide.gate.policy import (
 from backtide.gate.provider_tools import check_request, endpoint_of
 from backtide.gate.providers import (
     CREDENTIAL_HEADERS,
+    LOCAL_SUFFIX,
     NO_KEY,
     Provider,
     blocked_response,
@@ -147,6 +160,8 @@ REFUSALS = {
     "spend_cap": (429, "backtide: spending cap reached; ask the owner\n"),
     "spend_unavailable": (503, "backtide: the spending cannot be counted right now\n"),
     NO_KEY: (400, "backtide: no key set yet for this model provider\n"),
+    # T20: never sent to the agent; the 502 that replaces it is LOCAL_REDIRECT.
+    "local_redirect": (502, "backtide: a local model's redirection never reaches the agent\n"),
 }
 SPEND_REASONS = frozenset({"spend_cap", "spend_unavailable"})
 # The refusals of a model call that the proxy answers in the provider's own error shape.
@@ -298,6 +313,8 @@ class Gate:
         # Flows whose request hook has not come yet: flow id -> (client id, what is known).
         self._reading: dict[str, tuple[str, dict[str, Any]]] = {}
         self._acked: dict[str, set[tuple[str, int]]] = {}  # client id -> targets let through
+        # T20: client id -> the local providers' (IPv4, port) an ack let through for it.
+        self._local_acked: dict[str, set[tuple[str, int]]] = {}
         self._scanner_of: tuple[GateConfig, KeyScanner] | None = None
         self.held_bytes = 0  # reserved by the providers' answers held whole right now
 
@@ -331,6 +348,7 @@ class Gate:
         try:
             self._clients.discard(client.id)
             self._acked.pop(client.id, None)
+            self._local_acked.pop(client.id, None)
             self._forget_unread(client.id)
         except Exception:
             logger.exception("forgetting a client failed: stopping the proxy")
@@ -355,7 +373,7 @@ class Gate:
     def http_connect(self, flow: Any) -> None:
         if not port_allowed(flow.request.port):
             self._block("port", flow, {"host": flow.request.host, "port": flow.request.port})
-        elif self._private_literal(flow.request.host):
+        elif self._private_literal(flow.request.host) or self._unknown_virtual(flow.request.host):
             self._block(
                 "private_address", flow, {"host": flow.request.host, "port": flow.request.port}
             )
@@ -456,17 +474,32 @@ class Gate:
             return
         fields["body"] = body
         provider = config.providers.for_host(request.host)
+        if provider is None and self._unknown_virtual(request.host):
+            # T20: a virtual name of backtide's that no local provider has. It stands for a
+            # private place and is never resolved: refused before backtide is asked.
+            del fields["body"]
+            self._block("private_address", flow, fields)
+            return
         swapped = None
         if provider is not None:
-            if provider.waiting:  # checked as if it had its key; refused after backtide's say
+            local = provider.local
+            if local and provider.upstream is None:
+                # The channel never hands one so: fail closed (the guard answers 502).
+                raise RuntimeError("a local provider without its address")
+            if local:  # T20: the fake key and nothing else, and then no credential at all
+                swapped = ok = only_fake_key(
+                    provider, headers, scheme=request.scheme, port=request.port
+                )
+            elif provider.waiting:  # checked as if it had its key; refused after backtide's say
                 ok = only_fake_key(provider, headers, scheme=request.scheme, port=request.port)
             else:
                 swapped = ok = swap_key(provider, headers, scheme=request.scheme, port=request.port)
             if ok is None:
-                self._block("foreign_credential", flow, fields)
+                self._block("foreign_credential", flow, fields, local=local)
                 return
             # What goes there leaves with the real key: only a model call with the client's own
             # tools, never one that has the provider reach other hosts for the agent (T06-6).
+            # A local provider (and Ollama's cloud): only its routes, compared exactly (T20).
             verdict = check_request(
                 str(provider.kind),
                 request.method,
@@ -476,18 +509,29 @@ class Gate:
                 allowed=config.provider_tools,
                 models=provider.models,
                 trailers=trailers,
+                exact=provider.exact_paths,
+                local=local,
             )
             if verdict.reason is not None:
-                self._block(verdict.reason, flow, fields, tools=verdict.tools)
+                self._block(verdict.reason, flow, fields, tools=verdict.tools, local=local)
                 if verdict.reason == "provider_side_tool":
                     logger.warning("a model request with provider-side tools: refused")
                 return
+            endpoint = endpoint_of(
+                str(provider.kind),
+                request.method,
+                request.path,
+                headers,
+                exact=provider.exact_paths,
+                models=provider.models,
+            )
             event = record.llm_request_event(
                 fields,
                 provider.name,
                 config.scrubber,
                 provider_tools=verdict.tools,
-                endpoint=endpoint_of(str(provider.kind), request.method, request.path, headers),
+                endpoint=endpoint,
+                upstream=provider.upstream if local else None,
             )
             gate = None  # a provider's host is never held (docs/32, section 5, rule 1)
             shape = None
@@ -754,16 +798,30 @@ class Gate:
         if provider is not None and swapped is None:
             # Never to a provider without the real key in its place (the guard answers 502).
             raise RuntimeError("a call to a provider without its key swapped")
+        upstream = provider.upstream if provider is not None and provider.local else None
+        if provider is not None and provider.local and upstream is None:
+            raise RuntimeError("a local provider without its address")
         if swapped is not None:
             # An answer the tap can read: compressed, its usage would be lost (usage_missing).
             swapped = [pair for pair in swapped if pair[0].lower() != "accept-encoding"]
             swapped.append(("accept-encoding", "identity"))
+            if upstream is not None:  # T20: the Host header names where it really goes
+                swapped = [pair for pair in swapped if pair[0].lower() != "host"]
+                swapped.append(("host", f"{upstream[0]}:{upstream[1]}"))
             request.headers.fields = tuple(
                 (name.encode("utf-8", "surrogateescape"), value.encode("utf-8", "surrogateescape"))
                 for name, value in swapped
             )
-        host = normalize_host(request.host) or request.host
-        self._acked.setdefault(flow.client_conn.id, set()).add((host, request.port))
+        if upstream is not None:
+            # T20 (docs/35, section 6.2, step 7): to the fixed address backtide resolved, in clear
+            # (Ollama has no TLS). The scheme first: mitmproxy rebuilds Host from the three.
+            request.scheme = "http"
+            request.host = upstream[0]
+            request.port = upstream[1]
+            self._local_acked.setdefault(flow.client_conn.id, set()).add(upstream)
+        else:
+            host = normalize_host(request.host) or request.host
+            self._acked.setdefault(flow.client_conn.id, set()).add((host, request.port))
         flow.metadata["backtide"] = {
             "provider": provider,
             # The answer is checked for the keys of the config this request went out with.
@@ -798,6 +856,11 @@ class Gate:
     async def _server_connect(self, data: Any) -> None:
         raw_host, port = data.server.address
         host = normalize_host(raw_host) or str(raw_host)
+        if self._local_target(data.client.id, host, port):
+            # T20 (docs/35, section 6.2, step 8): exactly the pair of a local provider, for a
+            # client an ack let through to it. Nothing is resolved.
+            data.server.address = (host, port)
+            return
         if (host, port) not in self._acked.get(data.client.id, set()):
             data.server.error = "backtide: no recorded request asked for this connection"
             self._tell_error("server_connect_unacked", None, host=host, port=port)
@@ -813,6 +876,26 @@ class Gate:
             )
             return
         data.server.address = (chosen, port)
+
+    def _local_target(self, client_id: str, host: str, port: object) -> bool:
+        """Whether (``host``, ``port``) is exactly a local provider's upstream in the current
+        config, acked for this client, and never one of the proxy's own addresses."""
+        if (host, port) not in self._local_acked.get(client_id, set()):
+            return False
+        config = self._channel.config
+        if config is None or type(port) is not int or host in self.agent_side:
+            return False
+        return config.providers.local_at(host, port) is not None
+
+    def _unknown_virtual(self, raw_host: object) -> bool:
+        """Whether the host is under ``.backtide.internal`` and no local provider of the current
+        config has it (T20): such a name is never resolved, so it is refused."""
+        host = normalize_host(raw_host)
+        if host is None or not (host.endswith(LOCAL_SUFFIX) or host == LOCAL_SUFFIX[1:]):
+            return False
+        config = self._channel.config
+        provider = None if config is None else config.providers.for_host(host)
+        return provider is None or not provider.local
 
     def _private_literal(self, raw_host: object) -> bool:
         """Whether the host is an IP literal that may not be reached (server_connect would
@@ -847,6 +930,14 @@ class Gate:
         media = (headers.get("content-type") or "").split(";", 1)[0].strip().lower()
         if provider is not None:
             if not self._provider_headers(flow, meta):
+                return
+            status = flow.response.status_code
+            if provider.local and (status == 101 or 300 <= status < 400):
+                # T20: a local model's redirection or protocol switch never reaches the agent:
+                # held here (no byte of it goes on, within HELD_BUDGET), and replaced by a 502
+                # in ``response``.
+                flow.metadata["backtide_redirect"] = True
+                self._hold_whole(flow, provider, media)
                 return
             encoding = (headers.get("content-encoding") or "").strip().lower()
             if media != "text/event-stream" or encoding not in ("", "identity"):
@@ -898,6 +989,9 @@ class Gate:
         if meta and meta["provider"] is not None:
             if flow.metadata.get("backtide_told"):
                 return  # stopped already (a key in its stream, or a failure)
+            if flow.metadata.get("backtide_redirect"):
+                self._local_redirect(flow, meta)
+                return
             trailers = flow.response.trailers
             pairs = _header_pairs(trailers) if trailers is not None else []
             if pairs and meta["scanner"].found_in(*[t for p in pairs for t in p]):
@@ -923,6 +1017,19 @@ class Gate:
         tap.count(decoded)
         tap.size = len(raw)
         return True
+
+    def _local_redirect(self, flow: Any, meta: Mapping[str, Any]) -> None:
+        """A local provider's 3xx or 101 (T20): the agent gets a 502 instead, and
+        ``net/blocked {reason: local_redirect, side: response, local: true}`` is queued."""
+        flow.metadata["backtide_told"] = True
+        self._channel.tell(
+            record.blocked_event(
+                "local_redirect", meta["fields"], self._channel.scrubber, side="response",
+                local=True,
+            )
+        )  # fmt: skip
+        status, text = REFUSALS["local_redirect"]
+        flow.response = self._respond(status, text.encode(), {"content-type": "text/plain"})
 
     def _stop_answer(self, flow: Any, stage: str) -> None:
         """An answer that may not go to the agent, for a reason that is not a key: killed, and
@@ -988,8 +1095,9 @@ class Gate:
         scrubber = self._channel.scrubber
         if provider is not None:
             event = record.llm_response_event(
-                meta["fields"], provider.name, response, tap.summary(), scrubber
-            )
+                meta["fields"], provider.name, response, tap.summary(), scrubber,
+                local=provider.local,
+            )  # fmt: skip
         else:
             event = record.response_event(meta["fields"], response, scrubber)
         self._channel.tell(event)
@@ -1120,12 +1228,21 @@ class Gate:
         }
 
     def _block(
-        self, reason: str, flow: Any, fields: Mapping[str, Any], *, tools: Iterable[str] = ()
+        self,
+        reason: str,
+        flow: Any,
+        fields: Mapping[str, Any],
+        *,
+        tools: Iterable[str] = (),
+        local: bool = False,
     ) -> None:
-        """Refuse with the reason's status, and queue its ``net/blocked`` (never the body)."""
+        """Refuse with the reason's status, and queue its ``net/blocked`` (never the body).
+        ``local``: toward a local provider (T20)."""
         known = {key: value for key, value in fields.items() if key != "body"}
         self._channel.tell(
-            record.blocked_event(reason, known, self._channel.scrubber, tools=tuple(tools))
+            record.blocked_event(
+                reason, known, self._channel.scrubber, tools=tuple(tools), local=local
+            )
         )
         self._answer(flow, reason)
 

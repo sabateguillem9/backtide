@@ -28,6 +28,13 @@ T06-6". T10 turns the refusal into "hold for approval".
 
 The cost is bounded: the body is 16 MiB at most (the gate's limit), read once, and the walk over
 it stops at MAX_NODES values (``provider_body`` past that).
+
+T20 (docs/35, section 6.2, step 4): for a local provider (an Ollama on the owner's machine) and
+for Ollama's cloud API the endpoint is not found by the end of its path but in a closed list,
+compared exactly (``exact_endpoint``): the same server has routes that download, delete or
+copy models, read the owner's account or search the web. A route that is not on the list stays
+out, even a new one. ``ollama_admin`` names the routes that change the owner's machine or
+account: refusing one of them is risk 3 (decision 9).
 """
 
 import json
@@ -35,6 +42,9 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from backtide.gate.policy import canonical_path
+from backtide.gate.providers import is_cloud_model
 
 MAX_NODES = 1_000_000
 MAX_NAMES = 16
@@ -253,13 +263,22 @@ def check_request(
     allowed: Iterable[str] = frozenset(),
     models: Iterable[str] = (),
     trailers: Sequence[tuple[str, str]] = (),
+    exact: bool = False,
+    local: bool = False,
 ) -> Verdict:
     """Whether a request to a provider of ``kind`` may go on (see the module's docstring).
     ``models``: the provider's listed models (``[[proxy.providers]] models``); when there are
     any, the request's model must be one of them. ``body`` is the decoded one; a request that
     still says it is compressed, or that has trailers, is refused (``provider_body``): no
-    model client sends either, and a server could read them otherwise than the gate."""
-    endpoint = _endpoint(kind, method, path, headers)
+    model client sends either, and a server could read them otherwise than the gate.
+    ``exact``: only the routes of ``EXACT_ROUTES`` (a local provider, Ollama's cloud: T20).
+    ``local``: toward a local provider (``local_allowed``: the owner's list cannot open it)."""
+    models = tuple(models)
+    endpoint = (
+        exact_endpoint(kind, method, path, headers, models)
+        if exact
+        else _endpoint(kind, method, path, headers)
+    )
     if endpoint is None:
         return Verdict("provider_endpoint")
     data = body or b""
@@ -268,17 +287,104 @@ def check_request(
     try:
         _check_headers(headers, trailers)
         request = _strict_json(data)
-        found = _provider_side(kind, endpoint, request, tuple(models))
+        found = _provider_side(kind, endpoint, request, models)
     except _Malformed:
         return Verdict("provider_body")
-    permitted = frozenset(allowed)
+    if local and is_cloud_model(request.get("model")):
+        found.add(CLOUD_MODEL)  # a "local" call that Ollama would send to ollama.com
+    permitted = local_allowed(allowed) if local else frozenset(allowed)
     refused = sorted(name for name in found if name not in permitted)
     if refused:
         return Verdict("provider_side_tool", tuple(refused[:MAX_NAMES]))
     return Verdict(None, tuple(sorted(found)[:MAX_NAMES]))
 
 
+# T20 (review of T20-2/3, M1): ``allow_provider_tools`` is one list for every provider, written
+# for the public ones. Toward a local provider only a plain request field may be allowed by it
+# (one a profile could declare: ``check_profile_param``), never a model off the list, a search
+# model, a fetched source, a provider-side tool, nor Ollama's own fields that reach the owner's
+# machine (design 6.2, step 5). A cloud model (``cloud_model``) is refused whatever the lists say.
+CLOUD_MODEL = "cloud_model"
+LOCAL_NEVER = frozenset(
+    {f"{PARAM_PREFIX}{name}" for name in ("options", "keep_alive", "think", "format")}
+)
+
+
+def local_allowed(allowed: Iterable[str]) -> frozenset[str]:
+    """What of ``allowed`` may still go to a local provider: request fields by name that switch
+    on nothing on the provider's side, and none of LOCAL_NEVER."""
+    kept = set()
+    for name in allowed:
+        if not isinstance(name, str) or name in LOCAL_NEVER:
+            continue
+        try:
+            kept.add(check_profile_param(name))
+        except ValueError:
+            continue  # a tool, a model, a source, or a field that switches something on
+    return frozenset(kept)
+
+
 # --- the endpoint ---------------------------------------------------------------------------------
+
+# T20: the exact routes of a local provider (and of Ollama's cloud API), by kind: (method, path)
+# -> endpoint. ``GET /v1/models/<id>`` too, for an id of its ``models`` only.
+EXACT_ROUTES = {
+    "openai": {
+        ("POST", "/v1/chat/completions"): "chat",
+        ("POST", "/v1/completions"): "completions",
+        ("POST", "/v1/embeddings"): "embeddings",
+        ("POST", "/v1/responses"): "responses",
+        ("GET", "/v1/models"): "models",
+    },
+    "anthropic": {
+        ("POST", "/v1/messages"): "messages",
+        # Ollama answers 404: Claude Code sees an ordinary error (docs/35, section 6.2).
+        ("POST", "/v1/messages/count_tokens"): "count_tokens",
+    },
+}
+_MODEL_PREFIX = "/v1/models/"
+# The routes of Ollama that change the owner's machine or account (docs/35, section 3, P8),
+# matched on whole segments of the path as a lenient server could read it.
+OLLAMA_ADMIN = (
+    "/api/pull", "/api/push", "/api/create", "/api/copy", "/api/delete", "/api/blobs",
+    "/api/experimental", "/api/me", "/api/signout", "/api/user",
+)  # fmt: skip
+
+
+def exact_endpoint(
+    kind: str,
+    method: str,
+    path: str,
+    headers: Sequence[tuple[str, str]] = (),
+    models: Iterable[str] = (),
+) -> str | None:
+    """Which model endpoint a request to a local provider (or Ollama's cloud) is, from the closed
+    list ``EXACT_ROUTES``: method and path (without the query) compared exactly, no ``Upgrade``
+    and no header that names another method or path. None otherwise (``provider_endpoint``)."""
+    routes = EXACT_ROUTES.get(kind)
+    if routes is None or not isinstance(method, str) or not isinstance(path, str):
+        return None
+    if any(name.lower() == "upgrade" or name.lower() in _OVERRIDE_HEADERS for name, _ in headers):
+        return None
+    raw = path.split("?", 1)[0]
+    found = routes.get((method, raw))
+    if found is not None:
+        return found
+    if kind == "openai" and method == "GET" and raw.startswith(_MODEL_PREFIX):
+        model = raw[len(_MODEL_PREFIX) :]
+        if model and model in tuple(models):
+            return "models"
+    return None
+
+
+def ollama_admin(path: object) -> bool:
+    """Whether ``path`` reaches one of Ollama's routes that change the owner's machine or account
+    (``/api/pull``, ``/v1/../api/delete``, ``//API/Pull;x``...), read as a lenient server would."""
+    if not isinstance(path, str):
+        return False
+    canonical = canonical_path(path)
+    return any(canonical == route or canonical.startswith(route + "/") for route in OLLAMA_ADMIN)
+
 
 # The endpoints the providers do not bill (T11, security review M4): the list of models and
 # Anthropic's token count. They still hold a place among the calls in flight.
@@ -286,10 +392,19 @@ FREE_ENDPOINTS = frozenset({"models", "count_tokens"})
 
 
 def endpoint_of(
-    kind: str, method: str, path: str, headers: Sequence[tuple[str, str]] = ()
+    kind: str,
+    method: str,
+    path: str,
+    headers: Sequence[tuple[str, str]] = (),
+    *,
+    exact: bool = False,
+    models: Iterable[str] = (),
 ) -> str | None:
     """Which model endpoint a request is (``messages``, ``count_tokens``, ``chat``,
-    ``responses``, ``completions``, ``embeddings`` or ``models``), or None."""
+    ``responses``, ``completions``, ``embeddings`` or ``models``), or None. ``exact``: from the
+    closed list of a local provider or Ollama's cloud (``exact_endpoint``)."""
+    if exact:
+        return exact_endpoint(kind, method, path, headers, models)
     return _endpoint(kind, method, path, headers)
 
 

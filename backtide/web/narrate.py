@@ -186,7 +186,7 @@ def _tell(event: Event) -> tuple[str, dict[str, Any], bool]:
 
 # The person's changes to the Settings page (T12e): the kind and nothing else.
 _SETTINGS_ACTIONS = frozenset({"secret_set", "secret_cleared", "secret_failed"})
-_SETTINGS_KINDS = frozenset({"anthropic", "openai", "telegram"})
+_SETTINGS_KINDS = frozenset({"anthropic", "openai", "ollama-cloud", "telegram"})
 
 
 def _generic(event: Event) -> tuple[str, dict[str, Any], bool]:

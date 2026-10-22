@@ -366,11 +366,13 @@ def llm_request_event(
     *,
     provider_tools: Sequence[str] = (),
     endpoint: str | None = None,
+    upstream: tuple[str, int] | None = None,
 ) -> dict[str, Any]:
     """``llm/request``: a request to a provider's host. Of its body, only metadata, and the
     provider-side tools that ``allow_provider_tools`` let through (T06-6), by name. ``endpoint``:
     which of the provider's endpoints it is (``provider_tools.endpoint_of``; the spending cap
-    does not charge the free ones, T11)."""
+    does not charge the free ones, T11). ``upstream``: a local provider's (address, port) (T20):
+    ``local: true``, where it goes, and ``key: "none"`` (no credential reaches it)."""
     scrub = _scrubber(secrets)
     details = _request_details(flow, scrub)
     details["body"] = _body(flow, scrub, excerpt=False)
@@ -378,6 +380,11 @@ def llm_request_event(
     details["endpoint"] = _opt_text(endpoint, scrub, _LIMIT_SHORT)
     details |= _llm_metadata(flow.get("body"), scrub)
     details["key"] = "swapped"
+    if upstream is not None:
+        address, port = upstream
+        details["local"] = True
+        details["upstream"] = _clean(f"{address}:{port}", scrub, _LIMIT_SHORT)
+        details["key"] = "none"
     if provider_tools:
         details["provider_tools"] = _names(provider_tools, scrub)
     return _finish("llm", "request", _target(flow, scrub), details, scrub)
@@ -452,8 +459,11 @@ def llm_response_event(
     response: Mapping[str, Any],
     summary: Any,
     secrets: Secrets,
+    *,
+    local: bool = False,
 ) -> dict[str, Any]:
-    """``llm/response``: the summary of the answer (``sse.LlmSummary``), never its text."""
+    """``llm/response``: the summary of the answer (``sse.LlmSummary``), never its text.
+    ``local``: a local provider's answer (T20)."""
     scrub = _scrubber(secrets)
     details: dict[str, Any] = {
         "flow_id": _opt_text(flow.get("flow_id"), scrub, _LIMIT_SHORT),
@@ -467,6 +477,8 @@ def llm_response_event(
     details |= answer
     if summary.dropped:
         details["dropped"] = summary.dropped
+    if local:
+        details["local"] = True
     return _finish("llm", "response", _target(flow, scrub), details, scrub)
 
 
@@ -486,11 +498,13 @@ def blocked_event(
     *,
     tools: Sequence[str] = (),
     side: str | None = None,
+    local: bool = False,
 ) -> dict[str, Any]:
     """``net/blocked``: a refused request, with what is known of it (a ``CONNECT`` only
     knows its host and port). Never its body. ``tools``: the provider-side tools refused;
-    ``side="response"``: what was refused is the provider's answer (T06-6). ValueError for an
-    unknown reason or side."""
+    ``side="response"``: what was refused is the provider's answer (T06-6); ``local``: it was
+    toward a local provider (T20: risk 3 on one of Ollama's administration routes). ValueError
+    for an unknown reason or side."""
     scrub = _scrubber(secrets)
     if reason not in BLOCK_RISK:
         raise ValueError("unknown block reason")
@@ -501,6 +515,8 @@ def blocked_event(
         details["tools"] = _names(tools, scrub)
     if side is not None:
         details["side"] = side
+    if local:
+        details["local"] = True
     return _finish("net", "blocked", _target(flow, scrub), details, scrub)
 
 

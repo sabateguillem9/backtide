@@ -295,6 +295,7 @@ def test_the_block_risks_are_the_design_ones() -> None:
         "provider_body": 2,
         "provider_side_tool": 2,
         "gate_rejected": 1,
+        "local_redirect": 2,  # T20
     }
 
 

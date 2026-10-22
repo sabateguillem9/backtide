@@ -77,6 +77,11 @@ remembers of its fingerprint. Every ``gate`` event is written here, never by the
   channel end them (``gate/batch_rule_end {why}``). ``watch`` (the Telegram notice) is told of
   every hold recorded and of every hold that ends, whoever ended it.
 
+**A local provider** (T20, docs/35 sections 6.4 and 6.5): its calls are never held, like any
+provider's. Whether a call is local is backtide's own reading (its config says the provider is
+local, and the call went to its virtual name), never the proxy's word alone: such a call costs 0
+and has its own calls in flight (``Budget.admit(local=True)``).
+
 The config is never logged: ``protocol.describe`` names the providers and counts the hosts.
 """
 
@@ -310,6 +315,9 @@ class Policy:
     # failed reload could not hand over (``runner.fail_closed``); ``why`` says what the file IS,
     # never what it holds. Only the names ``providers`` has without a key count.
     key_problems: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+    # T20 (review of T20-2/3, L2): local providers whose name resolved elsewhere at a reload, and
+    # where. Not used (the old address stays until a restart): only recorded and alerted.
+    local_moved: Mapping[str, tuple[str, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.unknown_hosts not in UNKNOWN_HOSTS:
@@ -882,7 +890,7 @@ class ProxyChannel:
         the host (and, failing closed, by the name the proxy gives), if any."""
         providers = self._policy.providers
         for provider in (providers.for_host(host), providers.by_name(named)):
-            if provider is not None and provider.real_key is None:
+            if provider is not None and provider.waiting:
                 return provider.name
         return None
 
@@ -933,6 +941,7 @@ class ProxyChannel:
                 context=details.get("context") is True,
                 service_tier=details.get("service_tier"),
                 free=self._free_call(details),
+                local=self._local_call(details),
             )
         except Exception:  # without a count nothing goes out
             logger.exception("the spending cap could not be asked: the model call is refused")
@@ -951,6 +960,15 @@ class ProxyChannel:
         provider = self._policy.providers.by_name(details.get("provider"))
         return str(provider.kind) if provider is not None else "anthropic"
 
+    def _local_call(self, details: Mapping[str, Any]) -> bool:
+        """T20: whether this model call is to a local provider, by backtide's own config: the
+        provider it names is local and, when the event says its host (an ``llm/request``), that
+        host is exactly its virtual name."""
+        provider = self._policy.providers.by_name(details.get("provider"))
+        if provider is None or not provider.local:
+            return False
+        return "host" not in details or details.get("host") == provider.host
+
     def _free_call(self, details: Mapping[str, Any]) -> bool:
         """M4: the list of models or Anthropic's token count, which the providers do not bill:
         only when what the proxy says (``endpoint``) is what backtide reads of the recorded
@@ -961,7 +979,11 @@ class ProxyChannel:
         method, path = details.get("method"), details.get("path")
         if not (isinstance(method, str) and isinstance(path, str)):
             return False
-        return endpoint_of(self._kind(details), method, path) == said
+        provider = self._policy.providers.by_name(details.get("provider"))
+        exact = provider is not None and provider.exact_paths
+        models = provider.models if provider is not None else ()
+        found = endpoint_of(self._kind(details), method, path, exact=exact, models=models)
+        return found == said
 
     def _charge(self, event: dict[str, Any]) -> None:
         """An ``llm/response``: priced, recorded with its cost, then added to the spending (also
@@ -977,7 +999,7 @@ class ProxyChannel:
             return
         if event["source"] == "llm" and event["action"] == "response":
             try:
-                cost = budget.settle(self._kind(details), details)
+                cost = budget.settle(self._kind(details), details, local=self._local_call(details))
             except Exception:  # B2: never fail open, never uncharged
                 logger.exception("pricing a model answer failed: it is charged its estimate")
                 cost = budget.fallback_cost(details)

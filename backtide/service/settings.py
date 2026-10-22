@@ -3,9 +3,11 @@
 
 Where each one lives (the same files a person would write by hand):
 
-- ``anthropic`` and ``openai``: ``<state_dir>/keys/<kind>.key`` (0600, in a 0700 folder), the real
-  key of the ``[proxy]`` provider with that name (docs/21, section 6). Its fake key (``.fake``) is
-  never touched: the agent keeps seeing the same fake one.
+- ``anthropic``, ``openai`` and ``ollama-cloud`` (Ollama's cloud API, T20):
+  ``<state_dir>/keys/<kind>.key`` (0600, in a 0700 folder), the real key of the ``[proxy]``
+  provider with that name (docs/21, section 6). Its fake key (``.fake``) is never touched: the
+  agent keeps seeing the same fake one. A local provider (an Ollama on the owner's machine) has
+  no key at all.
 - ``telegram``: ``<state_dir>/telegram.toml`` (0600), the bot's token and the owner's chat id
   together (the file needs both: ``backtide.service.telegram_config``).
 
@@ -17,9 +19,11 @@ The rules:
   The black box gets ``settings/secret_set`` or ``settings/secret_cleared`` with the kind and who
   asked, nothing else (no length, no hash, no tail).
 - **Checked here**, not in the web: an Anthropic key looks like ``sk-ant-…``, an OpenAI one like
-  ``sk-…``, a Telegram token like ``<digits>:<30-64 characters>`` and a chat id is a positive
-  number. A value that does not fit is refused with a fixed text (never quoting it). A fake key
-  of backtide's is refused too: it would hand the agent's own key to the proxy as the real one.
+  ``sk-…``, an Ollama one is 20-240 letters, digits, dots, dashes and underscores (its shape is not
+  documented: only what cannot be a key is refused), a Telegram token like
+  ``<digits>:<30-64 characters>`` and a chat id is a positive number. A value that does not fit
+  is refused with a fixed text (never quoting it). A fake key of backtide's is refused too: it
+  would hand the agent's own key to the proxy as the real one.
 - **Written atomically**: a new 0600 file of ours (``O_EXCL``, ``O_NOFOLLOW``) next to the old
   one, ``fsync``, ``rename`` over it, ``fsync`` of the folder, all through the folder's own file
   descriptor (a folder swapped for a link half way is not followed). The folder must be ours and
@@ -66,7 +70,8 @@ from backtide.service.telegram_config import (
 
 logger = logging.getLogger(__name__)
 
-PROVIDERS = ("anthropic", "openai")
+OLLAMA_CLOUD = "ollama-cloud"  # T20: Ollama's cloud API (ollama.com), a provider by that name
+PROVIDERS = ("anthropic", "openai", OLLAMA_CLOUD)
 TELEGRAM = "telegram"
 KINDS = (*PROVIDERS, TELEGRAM)
 MAX_VALUE_CHARS = 256
@@ -78,6 +83,9 @@ MIN_SHOWN = 16  # ...only when it has at least this many (fewer: four would be t
 _ANTHROPIC_RE = re.compile(r"sk-ant-(?!oat)[A-Za-z0-9_-]{20,240}", re.ASCII)
 # An OpenAI key: ``sk-…``, ``sk-proj-…``, ``sk-svcacct-…``. Not an Anthropic one.
 _OPENAI_RE = re.compile(r"sk-(?!ant-)[A-Za-z0-9_-]{20,240}", re.ASCII)
+# An Ollama API key (ollama.com, Settings > Keys): its shape is not documented, so only what
+# cannot be one is refused (spaces, odd characters, too short or long, an Anthropic key).
+_OLLAMA_RE = re.compile(r"(?!sk-ant-)[A-Za-z0-9][A-Za-z0-9._-]{19,239}", re.ASCII)
 # "<bot id>:<secret>", as BotFather hands it out (the same shape telegram_config accepts).
 _TELEGRAM_TOKEN_RE = re.compile(r"[0-9]{5,16}:[A-Za-z0-9_-]{30,64}", re.ASCII)
 # A private chat's id: positive (groups and channels are negative and may never command).
@@ -147,6 +155,8 @@ def check_value(kind: str, value: str) -> bool:
         return _ANTHROPIC_RE.fullmatch(value) is not None
     if kind == "openai":
         return _OPENAI_RE.fullmatch(value) is not None
+    if kind == OLLAMA_CLOUD:
+        return _OLLAMA_RE.fullmatch(value) is not None
     if kind == TELEGRAM:
         return _TELEGRAM_TOKEN_RE.fullmatch(value) is not None
     return False
@@ -528,6 +538,8 @@ _SHAPES = {
     "guiones y guiones bajos): no se ha cambiado nada.",
     "openai": "Eso no parece una clave de OpenAI (empieza por sk-, solo letras, cifras, guiones y "
     "guiones bajos): no se ha cambiado nada.",
+    OLLAMA_CLOUD: "Eso no parece una clave de Ollama (de 20 a 240 letras, cifras, puntos, guiones "
+    "y guiones bajos, sin espacios): no se ha cambiado nada.",
     TELEGRAM: "Eso no parece el token de un bot (cifras, dos puntos y unos 35 caracteres, tal "
     "como lo da @BotFather): no se ha cambiado nada.",
 }

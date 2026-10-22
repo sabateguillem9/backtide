@@ -518,6 +518,7 @@ ES: dict[str, str] = {
     "settings.off.ready": "Se pueden cambiar.",
     "settings.kind.anthropic": "Clave de Anthropic",
     "settings.kind.openai": "Clave de OpenAI",
+    "settings.kind.ollama-cloud": "Clave de Ollama (nube)",
     "settings.kind.telegram": "Bot de Telegram",
     "settings.unknown": "no se sabe",
     "settings.problem": "hay un archivo, pero no se puede usar (mira el registro del servicio)",
@@ -632,6 +633,7 @@ ES: dict[str, str] = {
     "settings.event.secret_failed": "No se ha podido cambiar {what}",
     "settings.what.anthropic": "la clave de Anthropic",
     "settings.what.openai": "la clave de OpenAI",
+    "settings.what.ollama-cloud": "la clave de Ollama en la nube",
     "settings.what.telegram": "el bot de Telegram",
     "settings.group.models": "Modelos",
     "settings.group.models.note": "El proxy usa una clave nueva en la siguiente llamada, sin "
@@ -659,6 +661,8 @@ ES: dict[str, str] = {
     "sus cuatro últimos caracteres.",
     "settings.hint.openai": "Empieza por `sk-`. Al guardarla no vuelve a mostrarse: solo sus "
     "cuatro últimos caracteres.",
+    "settings.hint.ollama-cloud": "La que da ollama.com en Settings > Keys. Al guardarla no "
+    "vuelve a mostrarse: solo sus cuatro últimos caracteres.",
     "settings.hint.telegram": "Cifras, dos puntos y unos 35 caracteres, tal como lo da "
     "@BotFather. Al guardarlo no vuelve a mostrarse.",
     "settings.hint.chat": "Solo cifras.",
@@ -1158,6 +1162,7 @@ EN: dict[str, str] = {
     "settings.off.ready": "They can be changed.",
     "settings.kind.anthropic": "Anthropic key",
     "settings.kind.openai": "OpenAI key",
+    "settings.kind.ollama-cloud": "Ollama cloud key",
     "settings.kind.telegram": "Telegram bot",
     "settings.unknown": "unknown",
     "settings.problem": "there is a file, but it cannot be used (see the service's log)",
@@ -1270,6 +1275,7 @@ EN: dict[str, str] = {
     "settings.event.secret_failed": "Could not change {what}",
     "settings.what.anthropic": "the Anthropic key",
     "settings.what.openai": "the OpenAI key",
+    "settings.what.ollama-cloud": "the Ollama cloud key",
     "settings.what.telegram": "the Telegram bot",
     "settings.group.models": "Models",
     "settings.group.models.note": "The proxy uses a new key on the next call, with nothing "
@@ -1297,6 +1303,8 @@ EN: dict[str, str] = {
     "its last four characters.",
     "settings.hint.openai": "It starts with `sk-`. Once saved it is never shown again: only its "
     "last four characters.",
+    "settings.hint.ollama-cloud": "The one ollama.com gives in Settings > Keys. Once saved it is "
+    "never shown again: only its last four characters.",
     "settings.hint.telegram": "Digits, a colon and about 35 characters, as @BotFather hands it "
     "out. Once saved it is never shown again.",
     "settings.hint.chat": "Digits only.",

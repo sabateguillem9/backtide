@@ -46,6 +46,18 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   only for the tests' fake page) and the owner's own prices (``[budget.prices."<model>"]`` with
   ``input`` and ``output`` in $/MTok, and optionally ``cache_read``, ``cache_write_5m`` and
   ``cache_write_1h``), which win over every other table. NEVER a key.
+- A **local** provider (T20, docs/35 section 6.1): ``local = "http://<name or IPv4>:<port>"`` in
+  its ``[[proxy.providers]]`` table (an Ollama on the owner's Mac or LAN). Its host is its
+  virtual name, ``<name>.backtide.internal`` (``host`` is refused), its ``models`` are required
+  and never Ollama's cloud ones, and it has no real key (a ``keys/<name>.key`` is only struck).
+  At most MAX_LOCAL. An IPv4 must be private (``10/8``, ``172.16/12``, ``192.168/16``,
+  ``100.64/10``); a name is resolved by the service (``local_models.py``), never here. The
+  ``[budget] max_inflight_local`` (2) calls to the local providers in flight are apart from
+  ``max_inflight``: they cost nothing and are never stopped by the caps.
+- **Ollama's cloud API** (the founder's addition to T20): a public provider like any other
+  (``host = "ollama.com"``, its real key in the Settings page, the fake one in the jail). It
+  bills by plan, not by token, so backtide cannot know its price: each of its ``models`` must
+  have an owner's price in ``[budget.prices]`` (decided: the owner sets it; no guess).
 - ``[sensor]`` (T07-3, docs/23): whether the agent may run without the process sensor
   (``required``, false by default: decision 7), the sensor container's limits and the reader's
   rate limits. Never the image (pinned in backtide/jail/sensor.py) nor its folder, which is
@@ -69,10 +81,21 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backtide.blackbox.redact import MIN_KNOWN_SECRET
 from backtide.gate.decide import UNKNOWN_HOSTS
+from backtide.gate.policy import is_ip, normalize_host, numeric_ipv4
 from backtide.gate.protocol import MAX_READ_ENDPOINTS
 from backtide.gate.provider_tools import check_allow_entry
+from backtide.gate.providers import (
+    LOCAL_SUFFIX,
+    MAX_LOCAL,
+    Providers,
+    is_cloud_model,
+    is_fake_key,
+    is_ollama_cloud,
+    local_address_ok,
+    new_fake_key,
+    virtual_host,
+)
 from backtide.gate.providers import Provider as GateProvider
-from backtide.gate.providers import Providers, is_fake_key, new_fake_key
 from backtide.gate.providers import Secret as GateSecret
 from backtide.gate.translate.base import Trusted, normalize_trusted
 from backtide.gate.translate.read_post import check_read_endpoint
@@ -88,11 +111,20 @@ from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
 from backtide.service.holds import HoldTimings
 from backtide.service.price_update import PRICES_URL, check_url
-from backtide.service.prices import CACHE_1H, CACHE_5M, CACHE_READ, Price, PriceError, to_decimal
+from backtide.service.prices import (
+    CACHE_1H,
+    CACHE_5M,
+    CACHE_READ,
+    Price,
+    PriceBook,
+    PriceError,
+    to_decimal,
+)
 from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES
 from backtide.service.spend import (
     DEFAULT_DAILY_USD,
     DEFAULT_MAX_INFLIGHT,
+    DEFAULT_MAX_INFLIGHT_LOCAL,
     DEFAULT_MONTHLY_USD,
     MAX_CAP_USD,
     MAX_INFLIGHT,
@@ -137,8 +169,9 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )  # fmt: skip
 _BUDGET_KEYS = frozenset(
-    {"daily_usd", "monthly_usd", "timezone", "max_inflight", "auto_prices", "prices_url", "prices"}
-)
+    {"daily_usd", "monthly_usd", "timezone", "max_inflight", "max_inflight_local", "auto_prices",
+     "prices_url", "prices"}
+)  # fmt: skip
 _PRICE_KEYS = frozenset({"input", "output", "cache_read", "cache_write_5m", "cache_write_1h"})
 _OPTIONAL_KEYS = ("workspace_limit", "cycle_interval", "prune_interval", "max_volume_bytes")
 # The container options a file may change. ``allow_shared_ids`` is a test-only concession and
@@ -170,7 +203,9 @@ _PROXY_CONTAINER_KEYS = frozenset(
     {"name", "network", "image", "uid", "gid", "memory", "cpus", "pids_limit"}
 )
 _PROXY_KEYS = _PROXY_CONTAINER_KEYS | {"allow_hosts", "providers", "allow_provider_tools"}
-_PROVIDER_KEYS = frozenset({"name", "kind", "host", "models"})
+_PROVIDER_KEYS = frozenset({"name", "kind", "host", "models", "local"})
+# T20: ``local = "http://<name or IPv4>:<port>"``, exactly (no path, user, query or https).
+_LOCAL_RE = re.compile(r"http://(?P<host>[A-Za-z0-9.-]{1,253}):(?P<port>[0-9]{1,5})", re.ASCII)
 MAX_PROVIDER_MODELS = 32
 # [sensor]: the container's limits, the reader's rate limits and `required`. Not the image (it is
 # pinned in code), not `file_perm` (a test-only concession) and not its folder.
@@ -225,6 +260,9 @@ class Provider:
     kind: str
     host: str
     models: tuple[str, ...] = ()
+    # T20: a local provider's ``local`` (a host name or an IPv4, and a port), as written: the
+    # service resolves a name (local_models.py). ``host`` is then its virtual name.
+    local: tuple[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +415,23 @@ class ServiceConfig:
         self.jail_config()  # the result is rebuilt on demand
         self.gate_settings()  # validates [gate]
         self.budget_settings()  # validates [budget]
+        self._check_cloud_prices()
+
+    def _check_cloud_prices(self) -> None:
+        """Ollama's cloud API bills by plan, not by token (T20): the owner prices each of its
+        models (``[budget.prices]``), or the spending cap could not count it."""
+        owner = PriceBook(owner=dict(self.budget_settings().owner_prices), defaults={})
+        for provider in self.proxy_settings().providers:
+            if not is_ollama_cloud(provider.host):
+                continue
+            unpriced = [m for m in provider.models if (owner.lookup(m) or (None, ""))[1] != "owner"]
+            if not provider.models or unpriced:
+                raise ConfigError(
+                    f"[proxy] providers: {provider.name} is Ollama's cloud API, which bills by "
+                    "plan and not by token, so backtide cannot know its prices: list its models "
+                    'and give each one a price in [budget.prices."<model>"] (input and output, '
+                    f"$/MTok){': missing ' + ', '.join(unpriced) if unpriced else ''}"
+                )
 
     def _check_proxy(self, config_dir: Path) -> None:
         if not isinstance(self.proxy, Mapping):
@@ -654,13 +709,20 @@ class ServiceConfig:
         that clash. A real key the gate cannot use is not an error: that provider waits."""
         return self.model_providers_and_problems()[0]
 
-    def model_providers_and_problems(self) -> tuple[Providers, dict[str, tuple[str, str]]]:
+    def model_providers_and_problems(
+        self, upstreams: Mapping[str, tuple[str, int]] | None = None
+    ) -> tuple[Providers, dict[str, tuple[str, str]]]:
         """``model_providers`` and, for each provider that waits for its key, why
         (``KEY_MISSING`` or ``KEY_UNUSABLE``) and what is wrong, never quoting a key. Fails
         closed: a key file that cannot be read, a key of the wrong shape, a key two providers
         share and another provider's fake key all leave their provider waiting, never let
         through without its key. What such a file holds (if it is long enough to search for and
-        not a fake key) is still struck and searched for: ``Providers.strike_only``."""
+        not a fake key) is still struck and searched for: ``Providers.strike_only``.
+
+        A local provider (T20) has no real key: whatever its key file holds is struck only. Its
+        address is the one ``upstreams`` gives (the service resolved it), or its IPv4 as
+        written; with neither (a name not resolved yet) it has none, and the channel will not
+        hand it to the proxy (``runner.egress_policy`` resolves first)."""
         items: list[GateProvider] = []
         problems: dict[str, tuple[str, str]] = {}
         struck: list[str] = []  # real keys never swapped in: struck only (review of T09b)
@@ -670,6 +732,11 @@ class ServiceConfig:
             key = self.provider_keys[provider.name]
             if key.strike is not None:
                 struck.append(key.strike.reveal())
+            if provider.local is not None:
+                if key.real is not None:
+                    struck.append(key.real.reveal())  # never sent: struck wherever it shows
+                items.append(self._local_provider(provider, key.fake, upstreams))
+                continue
             fields = {
                 "name": provider.name,
                 "kind": provider.kind,
@@ -715,6 +782,30 @@ class ServiceConfig:
         try:
             return Providers(items, strike_only=strike_only), problems
         except ValueError as error:
+            raise ConfigError(f"[proxy] providers: {error}") from None
+
+    @staticmethod
+    def _local_provider(
+        provider: Provider, fake: str, upstreams: Mapping[str, tuple[str, int]] | None
+    ) -> GateProvider:
+        target = provider.local
+        if target is None:
+            raise ConfigError(f"[proxy] providers: {provider.name} is not local")
+        upstream = (upstreams or {}).get(provider.name)
+        if upstream is None and local_address_ok(target[0]):
+            upstream = target  # an IPv4 as written: nothing to resolve
+        try:
+            return GateProvider(
+                name=provider.name,
+                kind=provider.kind,  # type: ignore[arg-type]
+                host=provider.host,
+                fake_key=fake,
+                real_key=None,
+                models=provider.models,
+                local=True,
+                upstream=upstream,
+            )
+        except ValueError as error:  # Provider's messages never hold a key
             raise ConfigError(f"[proxy] providers: {error}") from None
 
     def proxy_jail_config(self) -> ProxyJailConfig:
@@ -789,6 +880,8 @@ class ServiceConfig:
         names = [provider.name for provider in providers]
         if len(set(names)) != len(names):
             raise ConfigError("[proxy] providers: each name must appear once")
+        if sum(1 for provider in providers if provider.local is not None) > MAX_LOCAL:
+            raise ConfigError(f"[proxy] providers: at most {MAX_LOCAL} local providers")
         tools = self.proxy.get("allow_provider_tools", [])
         if not isinstance(tools, list) or len(tools) > MAX_PROVIDER_TOOLS:
             raise ConfigError(
@@ -907,6 +1000,15 @@ class ServiceConfig:
             or not 1 <= inflight <= MAX_INFLIGHT
         ):
             raise ConfigError(f"[budget] max_inflight must be a whole number, 1-{MAX_INFLIGHT}")
+        local_inflight = self.budget.get("max_inflight_local", DEFAULT_MAX_INFLIGHT_LOCAL)
+        if (
+            isinstance(local_inflight, bool)
+            or not isinstance(local_inflight, int)
+            or not 1 <= local_inflight <= MAX_INFLIGHT
+        ):
+            raise ConfigError(
+                f"[budget] max_inflight_local must be a whole number, 1-{MAX_INFLIGHT}"
+            )
         auto = self.budget.get("auto_prices", True)
         if not isinstance(auto, bool):
             raise ConfigError("[budget] auto_prices must be true or false")
@@ -921,6 +1023,7 @@ class ServiceConfig:
             timezone=zone,
             timezone_name=str(zone_name),
             max_inflight=inflight,
+            max_inflight_local=local_inflight,
             auto_prices=auto,
             prices_url=url,
             owner_prices=_owner_prices(self.budget.get("prices", {})),
@@ -1401,10 +1504,17 @@ def _provider(entry: object) -> Provider:
         raise ConfigError(
             f"[proxy] providers: {name} has kind {kind!r}, not one of {sorted(PROVIDER_HOSTS)}"
         )
+    if "local" in entry:
+        return _local_provider(name, kind, entry)
     host = entry.get("host", PROVIDER_HOSTS[kind])
     _check_host(f"[proxy] providers: {name}'s host", host)
     if "*" in host:
         raise ConfigError(f"[proxy] providers: {name}'s host must be one exact name")
+    if host.lower().rstrip(".").endswith(LOCAL_SUFFIX):
+        raise ConfigError(
+            f"[proxy] providers: {name}'s host is a virtual name of backtide's: a local provider "
+            'says where it is with local = "http://<name or IPv4>:<port>"'
+        )
     others = {default for other, default in PROVIDER_HOSTS.items() if other != kind}
     if host.lower().rstrip(".") in others:
         raise ConfigError(
@@ -1422,6 +1532,63 @@ def _provider(entry: object) -> Provider:
             f"{MAX_PROVIDER_MODELS} model ids"
         )
     return Provider(name=name, kind=kind, host=host, models=tuple(models))
+
+
+def _local_provider(name: str, kind: str, entry: Mapping[str, Any]) -> Provider:
+    """A local provider (T20, docs/35 section 6.1): ``local`` exactly ``http://<name or
+    IPv4>:<port>``, no ``host`` (its host is its virtual name), its models listed and none of
+    Ollama's cloud. A name is resolved by the service; an IPv4 must be private already."""
+    if "host" in entry:
+        raise ConfigError(
+            f"[proxy] providers: {name} is local: its host is {virtual_host(name)}, so it has "
+            "no host setting"
+        )
+    text = entry["local"]
+    match = _LOCAL_RE.fullmatch(text) if isinstance(text, str) else None
+    if match is None:
+        raise ConfigError(
+            f"[proxy] providers: {name}'s local must be exactly http://<name or IPv4>:<port> "
+            "(no path, user, query or https: Ollama speaks plain HTTP)"
+        )
+    target, port = match.group("host"), int(match.group("port"))
+    if not 0 < port < 65536:
+        raise ConfigError(f"[proxy] providers: {name}'s local port must be 1-65535")
+    numeric = numeric_ipv4(target)
+    if numeric is not None:
+        if numeric != target or not local_address_ok(target):
+            raise ConfigError(
+                f"[proxy] providers: {name}'s local address must be a private IPv4 written "
+                "a.b.c.d, in 10/8, 172.16/12, 192.168/16 or 100.64/10 (never loopback, "
+                "link-local or public)"
+            )
+    else:
+        host = normalize_host(target)
+        if host is None or is_ip(host) or host == "localhost" or host.endswith(".localhost"):
+            raise ConfigError(
+                f"[proxy] providers: {name}'s local must name a machine (loopback is the proxy "
+                "itself: use host.lima.internal for the Mac)"
+            )
+        target = host
+    models = entry.get("models", [])
+    if (
+        not isinstance(models, list)
+        or not models
+        or len(models) > MAX_PROVIDER_MODELS
+        or not all(isinstance(m, str) and MODEL_ID.fullmatch(m) for m in models)
+    ):
+        raise ConfigError(
+            f"[proxy] providers: {name} is local, so it lists its models (1 to "
+            f"{MAX_PROVIDER_MODELS} model ids)"
+        )
+    cloud = [m for m in models if is_cloud_model(m)]
+    if cloud:
+        raise ConfigError(
+            f"[proxy] providers: {name} is local, but {', '.join(cloud)} runs in Ollama's cloud "
+            "(its data would leave home): list local models only"
+        )
+    return Provider(
+        name=name, kind=kind, host=virtual_host(name), models=tuple(models), local=(target, port)
+    )
 
 
 def _gate_list(key: str, gate: Mapping[str, Any], limit: int) -> list[Any]:

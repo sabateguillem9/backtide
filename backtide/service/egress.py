@@ -34,6 +34,13 @@ a few points of its life; the watch runs on this module's own thread.
   with a warning in the log and an alert; ``not_applied``, a new key a failed reload could not
   hand over, risk 2, with its own warning and alert), and one that gets its key back as
   ``system/provider_ready``. ``waiting()`` says which wait now (Settings, /estado, the panel).
+- **Local providers** (T20, docs/35 section 6.4): where each one is (resolved by the service) is
+  recorded at the start as ``system/provider_local {provider, name, address, port}`` and, when a
+  reload finds it elsewhere, as ``system/provider_local_changed {applied: false}`` (risk 2, with an
+  alert): the old address stays until the owner restarts the service (review of T20-2/3, L2).
+  Before the proxy starts, no local provider may be on the agent's own network (the start fails
+  at step ``local_provider``); those subnets are kept, and a reload that would break the rule is
+  not taken.
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
 """
 
@@ -64,6 +71,7 @@ from backtide.service.holds import (
     TrustStatus,
     stale_holds,
 )
+from backtide.service.local_models import LocalModelError, outside
 from backtide.service.pause import Ticker
 from backtide.service.price_update import PriceUpdater
 from backtide.service.proxy_channel import (
@@ -173,6 +181,9 @@ class Egress:
         # reads to unknown hosts may still carry out this hour (review of T10-3, M5).
         self._read_budget = ReadBudget(policy.read_budget_host, policy.read_budget_total)
         self._key_states: dict[str, str] = {}  # the providers that wait, as last recorded
+        self._local_states: dict[str, tuple[str, int]] = {}  # local providers, as last recorded
+        self._moves_told: dict[str, tuple[str, int]] = {}  # moves a reload did not apply, told
+        self._agent_subnets: list[str] | None = None  # read at the start, checked at each reload
 
     def waiting(self) -> dict[str, str]:
         """The providers that wait for their key now, and why ("missing", "unusable" or
@@ -200,6 +211,7 @@ class Egress:
             self._hooks = hooks
             self._close_stale_holds()
             self._note_keys()
+            self._note_locals()
             if self.budget is not None and not self._budget_opened:
                 self._budget_opened = True
                 self.budget.open()  # never raises: without a count, model calls are refused
@@ -379,10 +391,21 @@ class Egress:
         that moment end with their connection (refused, recorded as expired: fail closed).
         Records ``system/proxy_reconfigured``, with the providers' names only. Never raises."""
         with self._lock:
+            try:
+                self._outside(policy, self._agent_subnets)
+            except LocalModelError as error:
+                # Review of T20-2/3 (L2): never a local provider on the agent's own network,
+                # also after a reload. The policy is not taken: the proxy keeps the one it has.
+                logger.error("a reload would put a local provider on the agent's network")
+                names = [p.name for p in policy.providers.items]
+                self._record("proxy_reconfigured", {"providers": names, "now": False,
+                                                    "error": str(error)}, risk=2)  # fmt: skip
+                return False
             self._policy = policy
             self._read_budget.host_bytes = policy.read_budget_host
             self._read_budget.total_bytes = policy.read_budget_total
             self._note_keys()
+            self._note_locals()
             names = [p.name for p in policy.providers.items]
             if not self._up or self._channel is None or self._channel.closed:
                 # Down for the watch (silent, out of restarts) but maybe still serving: its
@@ -456,6 +479,88 @@ class Egress:
             self._key_states = dict(now)
         except Exception:
             logger.exception("recording which providers wait for their key failed")
+
+    def _note_locals(self) -> None:
+        """Record where each local provider is, once, and each time it moves (T20). Never
+        raises. Before ``start`` (no hooks yet) it waits for ``start``."""
+        if self._hooks is None:
+            return
+        try:
+            for provider in self._policy.providers.items:
+                if not provider.local or provider.upstream is None:
+                    continue
+                address, port = provider.upstream
+                details: dict[str, Any] = {
+                    "provider": provider.name, "name": provider.host, "address": address,
+                    "port": port,
+                }  # fmt: skip
+                before = self._local_states.get(provider.name)
+                if before == provider.upstream:
+                    continue
+                if before is None:
+                    self._record("provider_local", details)
+                else:
+                    logger.warning(
+                        "local provider %s moved from %s:%d to %s:%d", provider.name, *before,
+                        address, port,
+                    )  # fmt: skip
+                    details["before"] = f"{before[0]}:{before[1]}"
+                    details["applied"] = True
+                    self._record("provider_local_changed", details, risk=1)
+                self._local_states[provider.name] = provider.upstream
+            self._note_moves()
+        except Exception:
+            logger.exception("recording where the local providers are failed")
+
+    def _note_moves(self) -> None:
+        """A local provider whose name resolved elsewhere at a reload keeps its old address
+        until the service restarts (review of T20-2/3, L2): recorded once per new place
+        (``provider_local_changed {applied: false}``, risk 2) with an alert, so the owner
+        decides."""
+        moved = self._policy.local_moved
+        for name in [n for n in self._moves_told if n not in moved]:
+            del self._moves_told[name]
+        for name, (address, port) in sorted(moved.items()):
+            provider = self._policy.providers.by_name(name)
+            if provider is None or provider.upstream is None:
+                continue
+            if self._moves_told.get(name) == (address, port):
+                continue
+            before = provider.upstream
+            details = {
+                "provider": name, "name": provider.host, "address": address, "port": port,
+                "before": f"{before[0]}:{before[1]}", "applied": False,
+            }  # fmt: skip
+            event = self._record("provider_local_changed", details, risk=2)
+            self._alert(
+                AlertLevel.WARNING,
+                f"El modelo local {name} ha cambiado de dirección",
+                f"Su nombre apunta ahora a {address}:{port}, pero backtide sigue usando "
+                f"{before[0]}:{before[1]}. Si el cambio es tuyo (la IP de la torre, por ejemplo), "
+                "reinicia el servicio para usar la nueva; si no, revisa quién ha cambiado ese "
+                "nombre.",
+                event,
+            )
+            self._moves_told[name] = (address, port)
+
+    def _check_locals(self) -> None:
+        """T20: no local provider on the agent's own network (JailError: the start fails). The
+        subnets are kept for the reloads (``reload``)."""
+        if not _upstreams(self._policy):
+            return
+        self._agent_subnets = self._jail.agent_subnets()
+        try:
+            self._outside(self._policy, self._agent_subnets)
+        except LocalModelError as error:
+            raise JailError(str(error)) from None
+
+    @staticmethod
+    def _outside(policy: Policy, subnets: list[str] | None) -> None:
+        """LocalModelError if a local provider of ``policy`` is in one of ``subnets`` (None: not
+        read yet, the start checks it)."""
+        upstreams = _upstreams(policy)
+        if upstreams and subnets is not None:
+            outside(upstreams, subnets)
 
     def _close_stale_holds(self) -> None:
         """Once per service: the holds a dead backtide left open in the black box are ended
@@ -599,6 +704,8 @@ class Egress:
                 self.budget.forget_all()  # a new proxy: the old one's calls in flight are gone
             step = "agent_network"
             self._jail.check_agent_network(self._agent_name)
+            step = "local_provider"
+            self._check_locals()
             step = "start"
             self._jail.start()
             self._jail.wait_ready()
@@ -714,6 +821,10 @@ class Egress:
     def _alert(self, level: AlertLevel, title: str, body: str, event: Event | None) -> None:
         if self._hooks is not None:
             self._hooks.alert(level, title, body, event)
+
+
+def _upstreams(policy: Policy) -> dict[str, tuple[str, int]]:
+    return {p.name: p.upstream for p in policy.providers.items if p.local and p.upstream}
 
 
 def _parse_ts(value: str) -> datetime | None:

@@ -41,6 +41,12 @@ the next one may go out. Design: docs/33-diseno-t11-tope-de-gasto.md.
 - Refused calls are recorded as ``llm/blocked {reason: spend_cap}``, the first at once and then at
   most one every ``BLOCKED_EVERY`` seconds with how many: an agent that insists does not fill the
   black box.
+- **A local model** (T20, docs/35 section 6.5): a call to a local provider (backtide's own config
+  says the provider is local and the call went to its virtual name: ``ProxyChannel`` decides,
+  never the proxy alone) costs 0 (``priced_by: "local"``), reserves nothing and is never stopped
+  by the caps (it costs no money, and it is what can still work once the budget is spent). It
+  has its own ``max_inflight_local`` calls in flight (2), apart from ``max_inflight``: one can
+  take minutes and Ollama serves one at a time, so it must not leave the paid ones without room.
 - Thread-safe: one lock for the totals, the file and what is recorded about them.
 """
 
@@ -84,7 +90,9 @@ DEFAULT_DAILY_USD = Decimal("5")
 DEFAULT_MONTHLY_USD = Decimal("50")
 MAX_CAP_USD = Decimal("100000")
 DEFAULT_MAX_INFLIGHT = 4
+DEFAULT_MAX_INFLIGHT_LOCAL = 2  # T20, decision 7: Ollama serves one call at a time per model
 MAX_INFLIGHT = 64
+LOCAL = "local"  # Cost.priced_by of a local model's call
 # B5: a call in flight holds its place until something closes it (its answer, an error, a
 # block); this long safety TTL only catches one nobody ever says anything of, and charges it.
 INFLIGHT_TTL = 2 * 3600.0
@@ -117,6 +125,7 @@ class BudgetSettings:
     timezone: tzinfo | None = None  # None: the machine's local time
     timezone_name: str = "local"
     max_inflight: int = DEFAULT_MAX_INFLIGHT
+    max_inflight_local: int = DEFAULT_MAX_INFLIGHT_LOCAL
     auto_prices: bool = True
     prices_url: str = ""
     owner_prices: dict[str, Price] = field(default_factory=dict)
@@ -159,6 +168,7 @@ class _Flight:
     service_tier: str | None = None
     free: bool = False
     reserved: int = 0  # µ$ held against the caps while it is in flight (M5)
+    local: bool = False  # T20: a local model's call: costs 0, counted apart
 
 
 def local_zone(
@@ -394,12 +404,16 @@ class Budget:
         context: object = False,
         service_tier: object = None,
         free: bool = False,
+        local: bool = False,
     ) -> str | None:
         """None if this model call may go out (it now holds a place in flight and, unless it is
         ``free``, reserves its estimate), else why not: ``spend_unavailable``, ``spend_cap``
         (recorded as ``llm/blocked``) or ``throttled`` (too many in flight, or what is spent and
-        reserved reaches a cap: M5)."""
+        reserved reaches a cap: M5). ``local`` (T20): only its own ``max_inflight_local``
+        counts; it reserves nothing and no cap stops it."""
         with self._lock:
+            if local:
+                return self._admit_local(flow_id)
             if self._unavailable:
                 return "spend_unavailable"
             self._roll(*self._keys())
@@ -409,7 +423,8 @@ class Budget:
                 self._note_blocked(window, model)
                 return "spend_cap"
             now = self._mono()
-            if len(self._flights) >= self._settings.max_inflight:
+            paid = sum(1 for flight in self._flights.values() if not flight.local)
+            if paid >= self._settings.max_inflight:
                 return "throttled"
             flight = _Flight(
                 now,
@@ -433,6 +448,19 @@ class Budget:
                 self._charge_flight(key, old, "replaced")
             self._flights[key] = flight
             return None
+
+    def _admit_local(self, flow_id: object) -> str | None:
+        """A local model's call (T20): ``throttled`` past ``max_inflight_local`` in flight."""
+        self._expire()
+        now = self._mono()
+        if sum(1 for f in self._flights.values() if f.local) >= self._settings.max_inflight_local:
+            return "throttled"
+        key = flow_id if isinstance(flow_id, str) and flow_id else f"anon-{now}"
+        old = self._flights.pop(key, None)
+        if old is not None:  # cannot be (flow ids are unique); never dropped uncharged
+            self._charge_flight(key, old, "replaced")
+        self._flights[key] = _Flight(now, None, None, local=True)
+        return None
 
     def forget(self, flow_id: object) -> None:
         """A call that was never sent (backtide could not record it): freed, charged nothing."""
@@ -460,13 +488,22 @@ class Budget:
             for key, flight in flights.items():
                 self._charge_flight(key, flight, "proxy_restart")
 
-    def settle(self, kind: str, details: dict[str, Any]) -> Cost:
+    def settle(self, kind: str, details: dict[str, Any], *, local: bool = False) -> Cost:
         """The cost of one ``llm/response`` (it leaves the calls in flight and gives back its
         reservation). Not added yet: ``book`` adds it once its event is in the black box (or
-        failed to be). Never raises: a price that cannot be worked out is the estimate (B2)."""
+        failed to be). Never raises: a price that cannot be worked out is the estimate (B2).
+        ``local`` (T20, backtide's own reading of where the call went): 0."""
         with self._lock:
             flow_id = details.get("flow_id")
             flight = self._flights.pop(flow_id, None) if isinstance(flow_id, str) else None
+            if local:
+                if flight is not None and not flight.local:
+                    # Admitted as a paid call: what it reserved is charged, never freed by a
+                    # word of the proxy's (it cannot be: backtide decides both from its config).
+                    return self._fallback(flight)
+                return Cost(0, priced_by=LOCAL)
+            if flight is not None and flight.local:
+                return Cost(0, priced_by=LOCAL)  # admitted as local by backtide itself
             try:
                 return self._price(kind, details, flight)
             except Exception:
@@ -531,6 +568,12 @@ class Budget:
             service_tier=flight.service_tier,
         )
 
+    def in_flight(self) -> tuple[int, int]:
+        """(paid, local) calls in flight now."""
+        with self._lock:
+            local = sum(1 for flight in self._flights.values() if flight.local)
+            return len(self._flights) - local, local
+
     def _reserved(self) -> int:
         return sum(flight.reserved for flight in self._flights.values())
 
@@ -546,7 +589,9 @@ class Budget:
         self, key: str, flight: _Flight, why: str, cause: Event | None = None
     ) -> Cost:
         """Charge a call that ended without an answer: its estimate, recorded first (the money
-        counts also when that fails)."""
+        counts also when that fails). A local model's call costs nothing (T20)."""
+        if flight.local:
+            return Cost(0, priced_by=LOCAL)
         if flight.free:
             return Cost(0, priced_by="free")
         cost = self._fallback(flight)

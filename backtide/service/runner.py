@@ -67,6 +67,7 @@ from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
 from backtide.service.holds import HoldTimings, HoldWatch
+from backtide.service.local_models import LocalModelError, Lookup, resolve_all
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.price_update import PriceUpdater
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
@@ -402,7 +403,7 @@ def build_egress(
     T06-5), records through the rules (``box``) and strikes the Gateway token too. Constructed
     only: the Guardian starts it. ConfigError for an allowed host the gate cannot use."""
     proxy = proxy if proxy is not None else ProxyJail(config.proxy_jail_config())
-    providers, problems = config.model_providers_and_problems()
+    providers, problems = config.model_providers_and_problems(local_upstreams(config))
     policy = egress_policy(config, providers, problems)
     if timings is None:
         timings = config.gate_settings().timings  # [gate] wait_s, hold_s, preapproval_s
@@ -491,15 +492,57 @@ def egress_policy(
         policy.allow_list()
     except ValueError as error:
         raise ConfigError(f"[proxy] allow_hosts: {error}") from None
+    unresolved = [p.name for p in providers.items if p.local and p.upstream is None]
+    if unresolved:  # never handed to the proxy so (protocol.config refuses it too)
+        raise ConfigError(f"[proxy] providers: {', '.join(unresolved)} have no address yet")
     return policy
 
 
-def providers_now(config: ServiceConfig) -> tuple[Providers, dict[str, tuple[str, str]]]:
+def local_upstreams(
+    config: ServiceConfig,
+    previous: Mapping[str, tuple[str, int]] | None = None,
+    *,
+    lookup: Lookup | None = None,
+    moved: dict[str, tuple[str, int]] | None = None,
+) -> dict[str, tuple[str, int]]:
+    """Where each local provider of ``[proxy]`` is (T20, local_models.py): resolved here, on the
+    trusted side. At the start (``previous`` None) a provider that cannot be placed is a
+    ConfigError, so the service does not start; at a reload it keeps the address it had, also
+    when it now resolves elsewhere (that new place goes into ``moved``: the owner confirms it
+    by restarting). A key file of a local provider is never used (it is struck): said in the
+    log."""
+    providers = config.proxy_settings().providers
+    for provider in providers:
+        key = config.provider_keys.get(provider.name)
+        if provider.local is not None and key is not None and (key.real or key.strike):
+            logger.warning(
+                "local provider %s has a key file in keys/: it is never sent (a local model "
+                "gets no credential, and over http it would travel in clear), only struck",
+                provider.name,
+            )
+    try:
+        if lookup is None:
+            found, now = resolve_all(providers, previous)
+        else:
+            found, now = resolve_all(providers, previous, lookup=lookup)
+    except LocalModelError as error:
+        raise ConfigError(f"[proxy] providers: {error}") from None
+    if moved is not None:
+        moved.update(now)
+    return found
+
+
+def providers_now(
+    config: ServiceConfig,
+    current: Providers | None = None,
+    moved: dict[str, tuple[str, int]] | None = None,
+) -> tuple[Providers, dict[str, tuple[str, str]]]:
     """The providers of ``[proxy]`` with the real keys ``<state_dir>/keys/`` holds NOW (T12e: the
     Settings page set, changed or removed one), and why those without one wait. A provider
     whose key was removed, or whose file cannot be used, waits for its key again: the proxy
     refuses its calls (``no_key``). The fake keys are the ones the service started with (the
-    agent's, never changed). ConfigError only for a ``[proxy]`` the gate cannot use."""
+    agent's, never changed). ConfigError only for a ``[proxy]`` the gate cannot use. The local
+    providers are resolved again (T20); one that cannot be keeps its address in ``current``."""
     names = [p.name for p in config.proxy_settings().providers]
     reals = read_real_keys(config.keys_dir, names)
     keys = {
@@ -514,7 +557,12 @@ def providers_now(config: ServiceConfig) -> tuple[Providers, dict[str, tuple[str
         if name in config.provider_keys
     }
     now = dataclasses.replace(config, provider_keys=keys)
-    return now.model_providers_and_problems()
+    previous = {
+        p.name: p.upstream
+        for p in (current.items if current is not None else ())
+        if p.local and p.upstream is not None
+    }
+    return now.model_providers_and_problems(local_upstreams(config, previous, moved=moved))
 
 
 class _Reloadable(Protocol):
@@ -545,8 +593,11 @@ def key_reloader(
     def reload() -> Applied:
         current = egress.policy
         try:
-            providers, problems = providers_now(config)
-            policy = dataclasses.replace(current, providers=providers, key_problems=problems)
+            moved: dict[str, tuple[str, int]] = {}
+            providers, problems = providers_now(config, current.providers, moved)
+            policy = dataclasses.replace(
+                current, providers=providers, key_problems=problems, local_moved=moved
+            )
             # The sensor strikes the new keys before the proxy can use them; if it cannot, the
             # proxy never gets them (review of 40dfd53, finding 2).
             _refresh(scrub, config, providers)

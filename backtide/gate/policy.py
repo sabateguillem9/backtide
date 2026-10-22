@@ -286,7 +286,7 @@ OAUTH_HOSTS = frozenset(
     }
 )
 # (host, path prefix) of OAuth routes on hosts that also serve other things. A prefix
-# matches on whole segments, after the path is canonicalized (see _canonical_path).
+# matches on whole segments, after the path is canonicalized (see canonical_path).
 OAUTH_PATHS = frozenset(
     {
         ("claude.ai", "/oauth"),
@@ -317,14 +317,14 @@ def is_oauth_login(host: str, path: str) -> bool:
         return True
     if name in OAUTH_HOSTS:
         return True
-    canonical = _canonical_path(path)
+    canonical = canonical_path(path)
     return any(
         name == oauth_host and (canonical == prefix or canonical.startswith(prefix + "/"))
         for oauth_host, prefix in OAUTH_PATHS
     )
 
 
-def _canonical_path(path: str) -> str:
+def canonical_path(path: str) -> str:
     """The path as a lenient server could read it: without query, percent-decoded (a few
     rounds, for %25xx), backslashes as slashes, ``;params`` and trailing dots or spaces of
     each segment dropped, repeated slashes and dot segments resolved, and in lower case.

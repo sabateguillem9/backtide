@@ -47,7 +47,7 @@ from typing import Any
 
 from backtide.blackbox.redact import MIN_KNOWN_SECRET
 from backtide.gate.policy import normalize_pattern
-from backtide.gate.provider_tools import check_allow_entry
+from backtide.gate.provider_tools import check_allow_entry, ollama_admin
 from backtide.gate.providers import Kind, Provider, Providers, Secret
 from backtide.gate.translate.base import (
     LINES_CHARS,
@@ -141,7 +141,13 @@ BLOCK_RISK = {
     "provider_side_tool": 2,  # a tool or connector that runs on the provider's side
     # T10-2: the same fingerprint was rejected (or expired) a moment ago: refused without asking.
     "gate_rejected": 1,
+    # T20: a local provider answered with a redirection or a protocol switch, which never reaches
+    # the agent (it could lead it to another place of the owner's network).
+    "local_redirect": 2,
 }
+# T20 (decision 9): a refusal toward a local provider is risk 3 when its path reaches one of
+# Ollama's routes that change the owner's machine or account (provider_tools.ollama_admin).
+LOCAL_ADMIN_RISK = 3
 # spend_cap and spend_unavailable (T11): a model call refused by the spending cap, or because
 # backtide cannot count the spending; no_key: the provider waits for its key (the owner has not
 # set it). The proxy answers those in the provider's own error shape.
@@ -180,8 +186,9 @@ EVENT_SCHEMA: dict[tuple[str, str], tuple[int | None, frozenset[str]]] = {
         frozenset({"flow_id", "status", "size", "type", "duration_ms", "streamed"}),
     ),
     # tools: the provider-side ones refused (provider_side_tool); side: "response" when what
-    # was refused is the provider's answer (a real key in it: real_key, T06-6).
-    ("net", "blocked"): (None, _REQUEST_KEYS | {"reason", "tools", "side"}),
+    # was refused is the provider's answer (a real key in it: real_key, T06-6); local: it was
+    # toward a local provider (T20).
+    ("net", "blocked"): (None, _REQUEST_KEYS | {"reason", "tools", "side", "local"}),
     # upstream: whether the request may have reached the server (T11: what the cap charges).
     ("net", "error"): (
         1,
@@ -211,9 +218,12 @@ EVENT_SCHEMA: dict[tuple[str, str], tuple[int | None, frozenset[str]]] = {
             "choices",
             "context",
             "service_tier",
+            # T20: a local provider's call, and where it goes (the owner's config, no secret).
+            "local",
+            "upstream",
         },
     ),
-    ("llm", "response"): (0, _LLM_RESPONSE_KEYS),
+    ("llm", "response"): (0, _LLM_RESPONSE_KEYS | {"local"}),
 }
 _EVENT_KEYS = frozenset({"source", "action", "target", "risk", "details"})
 
@@ -229,6 +239,8 @@ def event_risk(source: str, action: str, details: Mapping[str, Any]) -> int:
     reason = details.get("reason")
     if not isinstance(reason, str) or reason not in BLOCK_RISK:
         raise ProtocolError("event: unknown block reason")
+    if details.get("local") is True and ollama_admin(details.get("path")):
+        return max(BLOCK_RISK[reason], LOCAL_ADMIN_RISK)
     return BLOCK_RISK[reason]
 
 
@@ -337,18 +349,7 @@ def config(
     message = {
         "type": "config",
         "allow_hosts": list(allow_hosts),
-        "providers": [
-            {
-                "name": p.name,
-                "kind": str(p.kind),
-                "host": p.host,
-                "fake_key": p.fake_key,
-                # None: waiting for its key (the proxy refuses every call to it: no_key).
-                "real_key": None if p.real_key is None else p.real_key.reveal(),
-                "models": list(p.models),
-            }
-            for p in providers.items
-        ],
+        "providers": [_provider_entry(p) for p in providers.items],
         "limits": dict(limits),
         "provider_tools": list(provider_tools),
         "fp_key": key.hex(),
@@ -510,7 +511,28 @@ _LIMIT_RANGES = {
     "max_holds": (1, 64),
 }
 _PROVIDER_KEYS = frozenset({"name", "kind", "host", "fake_key", "real_key"})
+_PROVIDER_OPTIONAL = frozenset({"models", "local", "upstream"})
 _MAX_STRUCK_KEY = 4096  # a key file's own limit (service.config.MAX_KEY_BYTES)
+
+
+def _provider_entry(p: Provider) -> dict[str, Any]:
+    """One provider of a ``config`` message. A local one (T20) says so and carries where
+    backtide found it, ``upstream: [IPv4, port]``: the proxy never resolves its name."""
+    entry: dict[str, Any] = {
+        "name": p.name,
+        "kind": str(p.kind),
+        "host": p.host,
+        "fake_key": p.fake_key,
+        # None: waiting for its key (the proxy refuses every call to it: no_key).
+        "real_key": None if p.real_key is None else p.real_key.reveal(),
+        "models": list(p.models),
+    }
+    if p.local:
+        if p.upstream is None:
+            raise ProtocolError("config.providers: a local provider without its address")
+        entry["local"] = True
+        entry["upstream"] = [p.upstream[0], p.upstream[1]]
+    return entry
 
 
 def providers_from_config(message: Mapping[str, Any]) -> Providers:
@@ -521,9 +543,9 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
         raise ProtocolError("config.providers: not a list of providers")
     built = []
     for entry in items:
-        if not isinstance(entry, dict) or not _PROVIDER_KEYS <= set(entry) <= _PROVIDER_KEYS | {
-            "models"
-        }:
+        if not isinstance(entry, dict) or not _PROVIDER_KEYS <= set(entry) <= (
+            _PROVIDER_KEYS | _PROVIDER_OPTIONAL
+        ):
             raise ProtocolError("config.providers: wrong fields")
         if not all(isinstance(entry[key], str) for key in _PROVIDER_KEYS - {"real_key"}):
             raise ProtocolError("config.providers: a field is not a text")
@@ -533,6 +555,17 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
         models = entry.get("models", [])
         if not isinstance(models, list):
             raise ProtocolError("config.providers: models is not a list")
+        local = entry.get("local", False)
+        upstream = entry.get("upstream")
+        if local is not True and ("local" in entry or upstream is not None):
+            raise ProtocolError("config.providers: an upstream is only for a local provider")
+        if local is True and (
+            not isinstance(upstream, list)
+            or len(upstream) != 2
+            or not isinstance(upstream[0], str)
+            or type(upstream[1]) is not int
+        ):
+            raise ProtocolError("config.providers: a local provider needs its address and port")
         try:
             built.append(
                 Provider(
@@ -542,6 +575,8 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
                     fake_key=entry["fake_key"],
                     real_key=None if real is None else Secret(real),
                     models=tuple(models),
+                    local=local is True,
+                    upstream=None if upstream is None else (upstream[0], upstream[1]),
                 )
             )
         except ValueError:
@@ -568,7 +603,8 @@ def describe(message: Mapping[str, Any]) -> str:
     kind = message.get("type")
     if kind == "config":
         entries = [p for p in message.get("providers", []) if isinstance(p, dict)]
-        names = [str(p.get("name")) + ("" if p.get("real_key") else " (no key yet)")
+        names = [str(p.get("name")) + (" (local)" if p.get("local") is True else
+                                       "" if p.get("real_key") else " (no key yet)")
                  for p in entries]  # fmt: skip
         hosts = message.get("allow_hosts", [])
         return (
@@ -650,18 +686,7 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
     return struck | {
         "type": "config",
         "allow_hosts": allow,
-        "providers": [
-            {
-                "name": p.name,
-                "kind": str(p.kind),
-                "host": p.host,
-                "fake_key": p.fake_key,
-                # None: waiting for its key (the proxy refuses every call to it: no_key).
-                "real_key": None if p.real_key is None else p.real_key.reveal(),
-                "models": list(p.models),
-            }
-            for p in providers.items
-        ],
+        "providers": [_provider_entry(p) for p in providers.items],
         "limits": checked,
         "provider_tools": allowed_tools,
         "fp_key": fp_key,

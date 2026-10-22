@@ -261,6 +261,22 @@ class ProxyJail:
                 f"the proxy: {others}. Disconnect them (docker network disconnect)"
             )
 
+    def agent_subnets(self) -> list[str]:
+        """The subnets of the agent's network (T20: a local model is never inside one)."""
+        result = docker.run(
+            ["network", "inspect", "--format", "{{json .IPAM.Config}}", self.config.agent_network]
+        )
+        try:
+            entries = json.loads(result.stdout) or []
+        except ValueError as e:
+            raise JailError(f"unexpected output for network {self.config.agent_network}") from e
+        if not isinstance(entries, list):
+            raise JailError(f"unexpected output for network {self.config.agent_network}")
+        subnets = [str(e.get("Subnet")) for e in entries if isinstance(e, dict) and e.get("Subnet")]
+        if not subnets:
+            raise JailError(f"the agent's network {self.config.agent_network} has no subnet")
+        return subnets
+
     def container_id(self) -> str:
         """The running container's full id (its cgroup is named after it)."""
         result = docker.run(["container", "inspect", "--format", "{{.Id}}", self.config.name])

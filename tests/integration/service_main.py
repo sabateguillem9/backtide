@@ -60,10 +60,12 @@ def fail_reloads_when(marker: Path) -> None:
     """The keys' reload raises while ``marker`` exists (the test makes and removes it)."""
     production = runner.providers_now
 
-    def providers_now(config: ServiceConfig) -> object:
+    def providers_now(
+        config: ServiceConfig, current: object = None, moved: object = None
+    ) -> object:
         if marker.exists():
             raise RuntimeError("the test makes the keys' reload fail")
-        return production(config)
+        return production(config, current, moved)  # type: ignore[arg-type]
 
     runner.providers_now = providers_now  # type: ignore[assignment]
 

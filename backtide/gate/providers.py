@@ -7,6 +7,15 @@ real key in the provider's header. A request that carries the real key, anywhere
 host, is refused. A provider whose real key the owner has not set yet (or whose key file cannot
 be used) is "waiting": it has no real key at all, and nothing goes to its host (``no_key``).
 Design and rationale: docs/21-diseno-t06-proxy.md, section 6.
+
+A **local** provider (T20, docs/35 section 6) is a model on the owner's own machine (Ollama on the
+Mac or on a computer of the LAN). The agent calls it by a virtual name,
+``<provider>.backtide.internal``, that no DNS knows; backtide resolved its real place once, on
+the trusted side, to a fixed private IPv4 and port (``upstream``), and the proxy goes there and
+nowhere else. It has no real key: the agent still holds a fake one, which the proxy demands and
+drops, and no credential ever reaches the owner's machine. Its models are listed (never one that
+runs in Ollama's cloud) and only its model routes pass, compared exactly
+(``provider_tools.exact_endpoint``).
 """
 
 import json
@@ -17,6 +26,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from hmac import compare_digest
+from ipaddress import IPv4Address, IPv4Network
 from typing import NoReturn
 
 from backtide.blackbox.redact import MIN_KNOWN_SECRET, scrub_known
@@ -62,6 +72,63 @@ class Kind(StrEnum):
 
 DEFAULT_HOSTS = {Kind.ANTHROPIC: "api.anthropic.com", Kind.OPENAI: "api.openai.com"}
 _HEADER = {Kind.ANTHROPIC: "x-api-key", Kind.OPENAI: "authorization"}
+
+# T20 (docs/35, section 6.1): a local provider's virtual name, and where it may really be.
+LOCAL_SUFFIX = ".backtide.internal"  # ".internal" is reserved (ICANN, 2024): never on internet
+MAX_LOCAL = 4
+# Only private IPv4 (decision 5): the LAN's ranges and Tailscale's (100.64/10). Never loopback
+# (inside the proxy that is the proxy itself), "this network", link-local (cloud metadata),
+# multicast, broadcast, a public address (a public provider goes by https like any other) nor
+# IPv6. The agent's own network is refused by the service, which knows its subnet.
+LOCAL_NETWORKS = tuple(
+    IPv4Network(net) for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
+)
+# Inside 100.64/10 but never a model (review of T20-2/3, L3): Alibaba Cloud's metadata service
+# (100.100.100.200) and Tailscale's own resolver (100.100.100.100).
+LOCAL_REFUSED = IPv4Network("100.100.100.0/24")
+# Ollama's cloud API (T20, the founder's addition): a public provider like any other, with a
+# real key; only its model routes pass, compared exactly as for a local one (the same server
+# has its account and web-search routes). ``ollama.com`` and any name under it.
+OLLAMA_CLOUD_HOST = "ollama.com"
+# A model that runs in Ollama's cloud (decision 6): ``:cloud``, ``-cloud`` or a tag that says so.
+_CLOUD_MODEL_RE = re.compile(r"(?:^|[:_.-])cloud(?:[:_.-]|$)", re.ASCII)
+
+
+def virtual_host(name: str) -> str:
+    """The virtual name of the local provider ``name``: ``<name>.backtide.internal``."""
+    return f"{name}{LOCAL_SUFFIX}"
+
+
+def is_cloud_model(model: object) -> bool:
+    """Whether a model id names one of Ollama's cloud models (``qwen3:480b-cloud``,
+    ``gpt-oss:cloud``): a "local" call to it would leave home through the owner's Ollama."""
+    return isinstance(model, str) and _CLOUD_MODEL_RE.search(model.lower()) is not None
+
+
+def is_ollama_cloud(host: object) -> bool:
+    """Whether ``host`` is Ollama's cloud: ``ollama.com`` or a name under it."""
+    name = normalize_host(host, idna=True)
+    return name is not None and (
+        name == OLLAMA_CLOUD_HOST or name.endswith("." + OLLAMA_CLOUD_HOST)
+    )
+
+
+def local_address_ok(address: object) -> bool:
+    """Whether a local provider may be at ``address``: a plain IPv4 text in its canonical form
+    (``192.168.5.2``; never ``0xc0a80502``, ``3232236802`` or IPv6), inside LOCAL_NETWORKS and
+    not the network's own first or last address, and never in LOCAL_REFUSED."""
+    if not isinstance(address, str):
+        return False
+    try:
+        parsed = IPv4Address(address)
+    except ValueError:
+        return False
+    if str(parsed) != address or parsed in LOCAL_REFUSED:
+        return False
+    for net in LOCAL_NETWORKS:
+        if parsed in net:
+            return parsed not in (net.network_address, net.broadcast_address)
+    return False
 
 
 class Secret:
@@ -130,6 +197,11 @@ class Provider:
     # The model ids of [[proxy.providers]] models: when there are any, a request to this
     # provider may only ask for one of them (T06-6). Empty: any model.
     models: tuple[str, ...] = ()
+    # T20: a local provider (``host`` is its virtual name) and where backtide found it, as
+    # (IPv4, port). ``upstream`` None for a local one: not resolved yet, and refused (the proxy
+    # never gets one so: the channel demands it).
+    local: bool = False
+    upstream: tuple[str, int] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.fullmatch(self.name):
@@ -155,6 +227,37 @@ class Provider:
         ):  # fmt: skip
             raise ValueError(f"provider {self.name}: models must be up to {MAX_MODELS} model ids")
         object.__setattr__(self, "models", models)
+        if self.local is not True and self.local is not False:
+            raise ValueError(f"provider {self.name}: local is true or false")
+        if self.local:
+            self._check_local()
+        elif self.host.endswith(LOCAL_SUFFIX) or self.upstream is not None:
+            raise ValueError(
+                f"provider {self.name}: only a local provider has a virtual name or an upstream"
+            )
+
+    def _check_local(self) -> None:
+        if self.host != virtual_host(self.name):
+            raise ValueError(f"provider {self.name}: a local provider's host is its virtual name")
+        if self.real_key is not None:
+            raise ValueError(f"provider {self.name}: a local provider has no real key")
+        if not self.models or any(is_cloud_model(model) for model in self.models):
+            raise ValueError(
+                f"provider {self.name}: a local provider lists its models, none of the cloud"
+            )
+        upstream = self.upstream
+        if upstream is None:
+            return
+        if (
+            not isinstance(upstream, tuple)
+            or len(upstream) != 2
+            or not local_address_ok(upstream[0])
+            or type(upstream[1]) is not int
+            or not 0 < upstream[1] < 65536
+        ):
+            raise ValueError(
+                f"provider {self.name}: a local provider is at a private IPv4 and a port"
+            )
 
     def _check_real_key(self) -> None:
         if not isinstance(self.real_key, Secret):
@@ -170,8 +273,15 @@ class Provider:
 
     @property
     def waiting(self) -> bool:
-        """Whether it waits for its real key: then nothing is sent to it."""
-        return self.real_key is None
+        """Whether it waits for its real key: then nothing is sent to it. A local provider never
+        has one, and never waits for it."""
+        return self.real_key is None and not self.local
+
+    @property
+    def exact_paths(self) -> bool:
+        """Whether only its model routes pass, compared exactly (``exact_endpoint``): a local
+        provider (an Ollama on the owner's machine) and Ollama's cloud API."""
+        return self.local or is_ollama_cloud(self.host)
 
     @property
     def header(self) -> str:
@@ -333,6 +443,8 @@ class Providers:
             raise ValueError("two providers have the same host")
         if len(set(keys)) != len(keys):
             raise ValueError("two providers share a key")
+        if sum(1 for p in self.items if p.local) > MAX_LOCAL:
+            raise ValueError(f"more than {MAX_LOCAL} local providers")
         struck = list(strike_only)
         if any(not isinstance(key, str) or len(key) < MIN_KNOWN_SECRET for key in struck):
             raise ValueError(f"a key to strike is a text of {MIN_KNOWN_SECRET}+ characters")
@@ -352,8 +464,12 @@ class Providers:
         return [p.real_key.reveal() for p in self.items if p.real_key is not None]
 
     def waiting(self) -> tuple[str, ...]:
-        """The names of the providers that wait for their key."""
-        return tuple(p.name for p in self.items if p.real_key is None)
+        """The names of the providers that wait for their key (never a local one)."""
+        return tuple(p.name for p in self.items if p.waiting)
+
+    def local_at(self, address: str, port: int) -> Provider | None:
+        """The local provider whose upstream is exactly (``address``, ``port``), if any."""
+        return next((p for p in self.items if p.local and p.upstream == (address, port)), None)
 
     def by_name(self, name: object) -> Provider | None:
         """The provider called ``name``, if any."""
