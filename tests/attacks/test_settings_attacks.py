@@ -17,6 +17,10 @@
   (``llm/blocked {reason: no_key}``, a few, not one per call). The person sets a key through the
   control socket (as the web's Settings page does): the next call reaches the provider with it,
   no restart. The person removes it: the calls are refused again, and the service keeps running.
+  Then (review of T09b) the same with a telegram.toml that cannot be used: removing the key
+  still refuses the calls at once; and a key file written by hand that cannot be used (open to
+  others, then a link) keeps the provider waiting when the keys are read again (a key set for
+  the second provider, ``openai``): nothing reaches the provider with it.
 
 In the VM the agent runs with the service's own uid (``allow_shared_ids``, a concession of the
 tests), so the control socket's ``SO_PEERCRED`` check would let it in: what keeps it out is that
@@ -52,6 +56,8 @@ from backtide.service.control import ask_clear_secret, ask_set_secret
 from tests.integration.internet_kit import (
     ANTHROPIC_HOST,
     ANTHROPIC_MODEL,
+    OPENAI_HOST,
+    OPENAI_MODEL,
     PLAIN_HOST,
     FakeInternet,
     leaks,
@@ -62,6 +68,7 @@ from tests.integration.internet_kit import (
 from tests.integration.service_kit import REPO, Service, make_service
 
 PROVIDER = "anthropic"  # the name the Settings page writes: <state_dir>/keys/anthropic.key
+OTHER_PROVIDER = "openai"  # modelo-sin-clave's second provider, with its key from the start
 WEB_PORTS = (8765, 8766)
 PUBLIC_PREFIX = "sk-ant-api03-"  # every Anthropic key starts so: not a secret
 CHUNK = 8
@@ -105,12 +112,18 @@ class Lab:
         return self.internet.requests(ANTHROPIC_HOST, f"/{tag}/{phase}/")
 
 
-def provider_toml() -> str:
-    return (
+def provider_toml(*, openai: bool = False) -> str:
+    text = (
         f"allow_hosts = {json.dumps([PLAIN_HOST])}\n"
         f'[[proxy.providers]]\nname = "{PROVIDER}"\nkind = "anthropic"\n'
         f'host = "{ANTHROPIC_HOST}"\nmodels = ["{ANTHROPIC_MODEL}"]\n'
     )
+    if openai:  # a second provider: setting its key reloads every key file (modelo-sin-clave)
+        text += (
+            f'[[proxy.providers]]\nname = "{OTHER_PROVIDER}"\nkind = "openai"\n'
+            f'host = "{OPENAI_HOST}"\nmodels = ["{OPENAI_MODEL}"]\n'
+        )
+    return text
 
 
 def start_settings_lab(
@@ -126,8 +139,8 @@ def start_settings_lab(
         root,
         tmp_path_factory.mktemp("service-state"),
         names,
-        proxy_toml=provider_toml(),
-        real_keys={PROVIDER: old} if with_key else None,
+        proxy_toml=provider_toml(openai=not with_key),
+        real_keys={PROVIDER: old} if with_key else {OTHER_PROVIDER: made_up_key(OTHER_PROVIDER)},
     )
     internet: FakeInternet | None = None
     try:
@@ -602,6 +615,42 @@ def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: 
     cleared = ask_clear_secret(socket_path, PROVIDER, via="web")
     after_clear = insist(attack, lab, lab.fake, 2)
     reached_after = len(provider_calls(lab))
+    step3 = lab.head()
+
+    # 3. Review of T09b, finding 1: with a telegram.toml that cannot be used, removing the key
+    # still cuts it at once (the reload reads keys/ only, and fails closed).
+    again_key = new_test_key()
+    saved_again = ask_set_secret(socket_path, PROVIDER, again_key, via="web")
+    with_again = insist(attack, lab, lab.fake, 1)
+    telegram = service.config.state_dir / "telegram.toml"
+    telegram.write_text("this is not toml = = [\n")
+    telegram.chmod(0o600)
+    try:
+        cleared_again = ask_clear_secret(socket_path, PROVIDER, via="web")
+        after_broken = insist(attack, lab, lab.fake, 2)
+    finally:
+        telegram.unlink()
+    reached_broken = len(provider_calls(lab))
+
+    # 4. A key file written by hand that cannot be used (open to others, then a link) keeps the
+    # provider waiting when the keys are read again (a key set for the other provider).
+    keys = service.config.keys_dir
+    open_key, linked_key = new_test_key(), new_test_key()
+    (keys / f"{PROVIDER}.key").write_text(open_key + "\n")
+    (keys / f"{PROVIDER}.key").chmod(0o644)
+    other_set = ask_set_secret(socket_path, OTHER_PROVIDER, made_up_key(OTHER_PROVIDER), via="web")
+    with_open_file = insist(attack, lab, lab.fake, 2)
+    target = service.config.state_dir / "elsewhere.key"
+    target.write_text(linked_key + "\n")
+    target.chmod(0o600)
+    (keys / f"{PROVIDER}.key").unlink()
+    (keys / f"{PROVIDER}.key").symlink_to(target)
+    other_again = ask_set_secret(
+        socket_path, OTHER_PROVIDER, made_up_key(OTHER_PROVIDER), via="web"
+    )
+    with_link = insist(attack, lab, lab.fake, 2)
+    unusable_keys = {c["headers"].get("x-api-key") for c in provider_calls(lab)}
+    reached_unusable = len(provider_calls(lab))
     alive = service.require_process().poll() is None and service.process.pid == pid
 
     attack.check(
@@ -617,6 +666,18 @@ def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: 
         and cleared["applied"] == "now"
         and refused_for_want_of_a_key(after_clear)
         and reached_after == 1
+        and saved_again["applied"] == "now"
+        and [c["status"] for c in with_again] == [200]
+        and cleared_again["ok"]
+        and cleared_again["applied"] == "now"
+        and refused_for_want_of_a_key(after_broken)
+        and reached_broken == 2
+        and other_set["ok"]
+        and other_again["ok"]
+        and refused_for_want_of_a_key(with_open_file)
+        and refused_for_want_of_a_key(with_link)
+        and reached_unusable == 2
+        and not {open_key, linked_key} & unusable_keys
         and alive,
         f"sin clave, con su clave falsa: {[c['status'] for c in with_fake]} "
         f"({with_fake[0].get('type')}: {with_fake[0].get('message')}); con una clave suya: "
@@ -624,24 +685,37 @@ def test_without_its_key_nothing_goes_to_the_model(attack: Attack, keyless_lab: 
         f"La persona pone una clave: {saved.get('applied')}, la siguiente llamada da "
         f"{[c['status'] for c in with_key]} y llega con la clave nueva ({seen == [new_key]}). "
         f"La quita: {cleared.get('applied')}, y otra vez {[c['status'] for c in after_clear]}; "
-        f"al proveedor llegó solo la de en medio ({reached_after}). El servicio sigue (pid {pid}): "
-        f"{alive}",
+        f"al proveedor llegó solo la de en medio ({reached_after}). Con un telegram.toml roto, la "
+        f"pone ({saved_again.get('applied')}, {[c['status'] for c in with_again]}) y la quita: "
+        f"{cleared_again.get('applied')}, y las llamadas dan "
+        f"{[c['status'] for c in after_broken]} al momento (al proveedor, {reached_broken} en "
+        f"total). Una clave escrita a mano abierta a otros y luego un enlace: "
+        f"{[c['status'] for c in with_open_file]} y {[c['status'] for c in with_link]}; al "
+        f"proveedor no llegó ninguna de las dos ({reached_unusable} en total). El servicio sigue "
+        f"(pid {pid}): {alive}",
     )
     counted = sum(int(e.details.get("count", 0)) for e in blocked)
     ready = lab.since(mark, "provider_ready", "system")
-    waiting_again = lab.since(mark, "provider_waiting", "system")
+    waits = lab.since(mark, "provider_waiting", "system")
+    waiting_again = [e.details for e in waits if e.seq <= step3]
+    later = [(e.details, e.risk) for e in waits if e.seq > step3]
     attack.check(
         "recorded",
         bool(blocked)
         and len(blocked) < len(with_fake)
         and len(foreign) == 2
         and bool(ready)
-        and [e.details for e in waiting_again] == [{"provider": PROVIDER, "problem": "missing"}],
+        and waiting_again == [{"provider": PROVIDER, "problem": "missing"}]
+        and later
+        == [
+            ({"provider": PROVIDER, "problem": "missing"}, 1),
+            ({"provider": PROVIDER, "problem": "unusable"}, 2),
+        ],
         f"{len(blocked)} llm/blocked no_key (que cuentan {counted} de las {len(with_fake)} "
         f"primeras llamadas; el resto, en el siguiente), {len(foreign)} net/blocked "
         "foreign_credential, "
         f"system/provider_ready {len(ready)} y system/provider_waiting otra vez "
-        f"{[e.details for e in waiting_again]}",
+        f"{waiting_again}; después, con telegram.toml roto y con el archivo que no vale: {later}",
     )
     attack.check(
         "risk",

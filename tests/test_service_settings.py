@@ -562,12 +562,14 @@ def test_the_running_proxy_gets_the_new_key_on_a_new_connection(
 class ReloadableEgress:
     """The part of Egress that key_reloader uses."""
 
-    def __init__(self, *, up: bool = True) -> None:
+    def __init__(self, config: ServiceConfig, *, up: bool = True) -> None:
         self.up = up
+        self.policy = egress_policy(config, *config.model_providers_and_problems())
         self.policies: list[Policy] = []
 
     def reload(self, policy: Policy) -> bool:
         self.policies.append(policy)
+        self.policy = policy
         return self.up
 
 
@@ -604,7 +606,7 @@ def test_changing_a_key_in_settings_refreshes_the_sensors_list(
     old, other = anthropic_key(), openai_key()
     config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
     live = LiveScrub(known_secrets([GATEWAY, *config.model_providers().known_secrets()]))
-    egress = ReloadableEgress()
+    egress = ReloadableEgress(config)
     settings = make(state, box, key_reloader(config, egress, live))  # type: ignore[arg-type]
 
     new = anthropic_key()
@@ -634,7 +636,7 @@ def test_a_key_that_cannot_be_used_makes_its_provider_wait(tmp_path: Path, state
     old, other = anthropic_key(), openai_key()
     config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
     live = LiveScrub(known_secrets([GATEWAY, old, other]))
-    egress = ReloadableEgress()
+    egress = ReloadableEgress(config)
     (config.keys_dir / "anthropic.key").write_text("not a key at all\n")
     assert key_reloader(config, egress, live)() is Applied.NOW  # type: ignore[arg-type]
     (policy,) = egress.policies
@@ -645,3 +647,202 @@ def test_a_key_that_cannot_be_used_makes_its_provider_wait(tmp_path: Path, state
     (config.keys_dir / "anthropic.key").chmod(0o644)  # unreadable: the same
     key_reloader(config, egress, live)()  # type: ignore[arg-type]
     assert egress.policies[-1].waiting() == {"anthropic": "unusable"}
+
+
+# -- security review of T09b (a238e4e): removing a key never fails open --------------------------
+
+
+def running_egress(
+    config: ServiceConfig,
+) -> tuple[Egress, list[dict[str, Any]], list[tuple[str, dict[str, Any], int]]]:
+    """An Egress "up" with a live channel, whose every connection is a real handshake (what the
+    proxy would get as its config), without Docker."""
+    configs: list[dict[str, Any]] = []
+    records: list[tuple[str, dict[str, Any], int]] = []
+
+    def connect(jail: Any, timeout: float) -> ProxyChannel:
+        channel, sent = handshake_with(egress.policy)
+        configs.append(sent)
+        return channel
+
+    providers, problems = config.model_providers_and_problems()
+    egress = Egress(
+        FakeJail(),  # type: ignore[arg-type]
+        agent_name="agent",
+        policy=egress_policy(config, providers, problems),
+        record=lambda *a, **k: None,  # type: ignore[arg-type,return-value]
+        thread=False,
+        connect=connect,
+    )
+
+    def record(source: str, action: str, target: str = "", *, details: Any = None,
+               risk: int = 0) -> None:  # fmt: skip
+        records.append((action, details or {}, risk))
+
+    egress._hooks = EgressHooks(record=record, alert=lambda *a, **k: None)  # type: ignore[arg-type]  # noqa: SLF001
+    egress._channel = connect(None, 1)  # noqa: SLF001
+    egress._up = True  # noqa: SLF001
+    return egress, configs, records
+
+
+def sent_keys(sent: dict[str, Any]) -> dict[str, str | None]:
+    return {p["name"]: p["real_key"] for p in sent["providers"]}
+
+
+def decision(policy: Policy, box: BlackBox) -> tuple[str, str | None]:
+    """What backtide answers the proxy about a model call to Anthropic under ``policy``."""
+    from tests.test_service_proxy_channel import make_channel
+    from tests.test_spend_gate import llm_request
+
+    channel, proxy = make_channel(box, policy=policy)
+    try:
+        channel.handle({"type": "request", "id": 1, "event": llm_request("f-review")})
+        ack = proxy.receive_type("ack")
+    finally:
+        channel.close()
+    return ack["verdict"], ack.get("reason")
+
+
+def broken_telegram(state: Path) -> None:
+    path = state / "telegram.toml"
+    path.write_text("this is not toml = = [\n")
+    path.chmod(0o600)
+
+
+def test_a_broken_telegram_toml_never_keeps_a_removed_key(
+    tmp_path: Path, state: Path, box: BlackBox
+) -> None:
+    """Finding 1: the reloader no longer reads telegram.toml (or anything but keys/). With a
+    telegram.toml that cannot be used, removing a key still makes its provider wait at once,
+    on the service's side and in the proxy's new config, and a call to it is refused."""
+    old, other = anthropic_key(), openai_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
+    egress, configs, _ = running_egress(config)
+    before = egress.policy
+    assert decision(before, box) == ("allow", None)
+    broken_telegram(state)
+    settings = make(state, box, key_reloader(config, egress))
+    outcome = settings.clear_secret("anthropic", requested_by="web")
+    assert (outcome.status, outcome.applied) == (Outcome.CLEARED, Applied.NOW)
+    assert egress.waiting() == {"anthropic": "missing"}
+    assert sent_keys(configs[-1]) == {"anthropic": None, "openai": other}
+    assert decision(egress.policy, box) == ("deny", "no_key")
+    # The rest is the policy it had: the gate's settings are not read again.
+    after = egress.policy
+    assert (after.secrets, after.trusted, after.allow_hosts, after.unknown_hosts) == (
+        before.secrets,
+        before.trusted,
+        before.allow_hosts,
+        before.unknown_hosts,
+    )
+
+
+def test_a_key_that_clashes_with_a_fake_one_never_keeps_a_removed_key(
+    tmp_path: Path, state: Path, box: BlackBox
+) -> None:
+    """Finding 1, the Providers clash: openai.key holding the fake key of anthropic made the
+    reload raise, and anthropic kept its removed key. Now that file waits ("unusable") and the
+    removal applies at once."""
+    old, other = anthropic_key(), openai_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
+    egress, configs, _ = running_egress(config)
+    clash = config.keys_dir / "openai.key"
+    clash.write_text(config.provider_keys["anthropic"].fake + "\n")
+    clash.chmod(0o600)
+    settings = make(state, box, key_reloader(config, egress))
+    outcome = settings.clear_secret("anthropic", requested_by="web")
+    assert (outcome.status, outcome.applied) == (Outcome.CLEARED, Applied.NOW)
+    assert egress.waiting() == {"anthropic": "missing", "openai": "unusable"}
+    assert sent_keys(configs[-1]) == {"anthropic": None, "openai": None}
+    assert decision(egress.policy, box) == ("deny", "no_key")
+
+
+def test_a_service_starts_with_a_key_that_is_another_providers_fake_one(
+    tmp_path: Path, state: Path
+) -> None:
+    config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
+    clash = config.keys_dir / "openai.key"
+    clash.write_text(config.provider_keys["anthropic"].fake + "\n")
+    clash.chmod(0o600)
+    again = ServiceConfig.from_file(tmp_path / "backtide.toml")
+    providers, problems = again.model_providers_and_problems()
+    assert providers.waiting() == ("openai",) and problems["openai"][0] == "unusable"
+    assert again.provider_keys["anthropic"].fake not in problems["openai"][1]
+
+
+def test_a_reload_that_fails_during_a_removal_fails_closed(
+    tmp_path: Path, state: Path, box: BlackBox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever breaks the reload, a key that is no longer in keys/ stops being used at once:
+    its provider waits in the service's policy, and the proxy's channel is replaced, so the
+    proxy refuses until it has the new config. The other provider keeps its key."""
+    from backtide.service import runner
+
+    old, other = anthropic_key(), openai_key()
+    config = service_config(tmp_path, state, {"anthropic": old, "openai": other})
+    egress, configs, records = running_egress(config)
+    channel = egress._channel  # noqa: SLF001
+
+    def broken(config: ServiceConfig) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "providers_now", broken)
+    settings = make(state, box, key_reloader(config, egress))
+    outcome = settings.clear_secret("anthropic", requested_by="web")
+    assert outcome.status is Outcome.CLEARED and outcome.applied is Applied.NOW
+    assert egress.waiting() == {"anthropic": "missing"}
+    assert egress._channel is not channel and channel is not None and channel.closed  # noqa: SLF001
+    assert sent_keys(configs[-1]) == {"anthropic": None, "openai": other}
+    assert decision(egress.policy, box) == ("deny", "no_key")
+    assert ("proxy_reconfigured", {"providers": ["anthropic", "openai"], "now": True}, 0) in records
+    # The removed key is still struck everywhere (it is never swapped in again).
+    assert old in egress.policy.providers.known_secrets()
+    assert egress.policy.providers.real_key_in(f"x {old}")
+
+    # A set that fails the same way never hands over the new key, and the old one stops too.
+    new = openai_key()
+    outcome = settings.set_secret("openai", new, requested_by="web")
+    assert (outcome.status, outcome.applied) == (Outcome.SAVED, Applied.RESTART)
+    assert egress.waiting() == {"anthropic": "missing", "openai": "unusable"}
+    assert sent_keys(configs[-1]) == {"anthropic": None, "openai": None}
+    assert {old, other, new} <= set(egress.policy.providers.strike_only)
+
+
+def test_a_failed_reload_with_the_proxy_down_still_makes_the_provider_wait(
+    tmp_path: Path, state: Path, box: BlackBox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backtide.service import runner
+
+    config = service_config(tmp_path, state, {"anthropic": anthropic_key()})
+    egress, _, _ = running_egress(config)
+    egress._up = False  # noqa: SLF001
+    monkeypatch.setattr(runner, "providers_now", lambda config: 1 / 0)
+    outcome = make(state, box, key_reloader(config, egress)).clear_secret(
+        "anthropic", requested_by="web"
+    )
+    assert outcome.applied is Applied.WHEN_UP
+    assert egress.waiting() == {"anthropic": "missing", "openai": "missing"}
+    assert decision(egress.policy, box) == ("deny", "no_key")
+
+
+def test_a_key_whose_file_cannot_be_used_is_still_struck_by_the_sensor(
+    tmp_path: Path, state: Path
+) -> None:
+    """Finding 2: a key written by hand without chmod 600 (or of a shape the gate refuses) is
+    never swapped in, but the sensor, the proxy and the black box still strike it."""
+    from backtide.sensors.scrub import LiveScrub
+
+    config = service_config(tmp_path, state, {"openai": openai_key()})
+    live = LiveScrub()
+    egress = ReloadableEgress(config)
+    hand = anthropic_key()
+    path = config.keys_dir / "anthropic.key"
+    path.write_text(hand + "\n")
+    path.chmod(0o644)
+    key_reloader(config, egress, live)()  # type: ignore[arg-type]
+    policy = egress.policies[-1]
+    assert policy.waiting() == {"anthropic": "unusable"}
+    assert real_keys(policy.providers)["anthropic"] is None
+    assert hand not in live.text(f"echo {hand}")
+    assert hand not in policy.scrubber().text(f"echo {hand}")
+    assert policy.providers.real_key_in(hand)

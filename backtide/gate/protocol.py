@@ -9,7 +9,7 @@ fixes (the proxy cannot choose it). Errors never quote the offending value.
 | Message | Sent by | What |
 |---|---|---|
 | ``hello {version, pid}`` | proxy | When it starts |
-| ``config {allow_hosts, providers, limits, provider_tools, fp_key, read_endpoints}`` | backtide | The answer to ``hello``; holds the keys |
+| ``config {allow_hosts, providers, limits, provider_tools, fp_key, read_endpoints, strike_only}`` | backtide | The answer to ``hello``; holds the keys |
 | ``request {id, event, gate?}`` / ``ack {id, verdict, seq, reason?, retry_after?, hold_id?, wait_ms?}`` | proxy / backtide | Before a request goes out |
 | ``decision {hold_id, verdict, seq?, reason?}`` | backtide | The person's answer to a held request (T10) |
 | ``released {hold_id}`` / ``hold_left {hold_id, why}`` | proxy | "I let it go" / "I no longer hold it" |
@@ -45,6 +45,7 @@ from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Any
 
+from backtide.blackbox.redact import MIN_KNOWN_SECRET
 from backtide.gate.policy import normalize_pattern
 from backtide.gate.provider_tools import check_allow_entry
 from backtide.gate.providers import Kind, Provider, Providers, Secret
@@ -348,6 +349,8 @@ def config(
         "fp_key": key.hex(),
         "read_endpoints": list(read_endpoints),
     }
+    if providers.strike_only:  # real keys never swapped in, only struck (review of T09b)
+        message["strike_only"] = list(providers.strike_only)
     return _check(message)
 
 
@@ -502,6 +505,7 @@ _LIMIT_RANGES = {
     "max_holds": (1, 64),
 }
 _PROVIDER_KEYS = frozenset({"name", "kind", "host", "fake_key", "real_key"})
+_MAX_STRUCK_KEY = 4096  # a key file's own limit (service.config.MAX_KEY_BYTES)
 
 
 def providers_from_config(message: Mapping[str, Any]) -> Providers:
@@ -538,8 +542,18 @@ def providers_from_config(message: Mapping[str, Any]) -> Providers:
         except ValueError:
             # Provider's own messages never hold a key, but only the field is named here.
             raise ProtocolError("config.providers: a provider is not valid") from None
+    struck = message.get("strike_only", [])
+    if (
+        not isinstance(struck, list)
+        or len(struck) > _MAX_PROVIDERS
+        or not all(
+            isinstance(key, str) and MIN_KNOWN_SECRET <= len(key) <= _MAX_STRUCK_KEY
+            for key in struck
+        )
+    ):
+        raise ProtocolError("config.strike_only: not a list of keys")
     try:
-        return Providers(built)
+        return Providers(built, strike_only=struck)
     except ValueError:
         raise ProtocolError("config.providers: two providers clash") from None
 
@@ -594,7 +608,7 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
     _fields(
         message,
         {"allow_hosts", "providers", "limits", "fp_key"},
-        {"provider_tools", "read_endpoints"},
+        {"provider_tools", "read_endpoints", "strike_only"},
     )
     fp_key = message["fp_key"]
     if not isinstance(fp_key, str) or not _FP_RE.fullmatch(fp_key):
@@ -627,7 +641,8 @@ def _check_config(message: dict[str, Any]) -> dict[str, Any]:
     checked = dict(DEFAULT_LIMITS)
     for name, value in limits.items():
         checked[name] = _int(value, f"config.limits.{name}", *_LIMIT_RANGES[name])
-    return {
+    struck = {"strike_only": list(providers.strike_only)} if providers.strike_only else {}
+    return struck | {
         "type": "config",
         "allow_hosts": allow,
         "providers": [

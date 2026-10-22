@@ -966,8 +966,8 @@ class Gate:
         if config is None:
             raise RuntimeError("no config to check an answer against")
         if self._scanner_of is None or self._scanner_of[0] is not config:
-            keys = [p.real_key.reveal() for p in config.providers.items if p.real_key is not None]
-            self._scanner_of = (config, KeyScanner(keys))
+            # The real keys and those to strike only (review of T09b, finding 2).
+            self._scanner_of = (config, KeyScanner(config.providers.keys_to_find()))
         return self._scanner_of[1]
 
     def _tell_response(self, flow: Any) -> None:

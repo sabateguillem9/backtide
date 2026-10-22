@@ -42,6 +42,7 @@ from backtide.analyzer import (
     parse_rules,
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
+from backtide.blackbox.redact import MIN_KNOWN_SECRET
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import MAIL_TRANSLATORS
 from backtide.jail import AgentJail, JailError, ca
@@ -52,7 +53,15 @@ from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
 from backtide.service.bot import Hooks, telegram_parts
-from backtide.service.config import ConfigError, ProviderKey, ServiceConfig, read_real_keys
+from backtide.service.config import (
+    KEY_UNUSABLE,
+    ConfigError,
+    ProviderKey,
+    ServiceConfig,
+    holds_fake,
+    read_real_keys,
+    read_strike_only,
+)
 from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
@@ -61,7 +70,7 @@ from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.price_update import PriceUpdater
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
 from backtide.service.proxy_channel import Policy, known_secrets
-from backtide.service.settings import Applied, Settings
+from backtide.service.settings import Applied, ReloadFailedClosed, Settings
 from backtide.service.spend import Budget
 from backtide.service.telegram_config import load_telegram
 from backtide.service.trust import TrustStore
@@ -495,35 +504,112 @@ def providers_now(config: ServiceConfig) -> tuple[Providers, dict[str, tuple[str
     names = [p.name for p in config.proxy_settings().providers]
     reals = read_real_keys(config.keys_dir, names)
     keys = {
-        name: ProviderKey(real=real, fake=config.provider_keys[name].fake, problem=problem,
-                          why=why)
+        name: ProviderKey(
+            real=real,
+            fake=config.provider_keys[name].fake,
+            problem=problem,
+            why=why,
+            strike=read_strike_only(config.keys_dir, name) if problem == KEY_UNUSABLE else None,
+        )
         for name, (real, problem, why) in reals.items()
         if name in config.provider_keys
-    }  # fmt: skip
+    }
     now = dataclasses.replace(config, provider_keys=keys)
     return now.model_providers_and_problems()
 
 
+class _Reloadable(Protocol):
+    """What ``key_reloader`` needs of the Egress."""
+
+    @property
+    def policy(self) -> Policy: ...
+
+    def reload(self, policy: Policy) -> bool: ...
+
+
 def key_reloader(
-    config: ServiceConfig, egress: Egress, scrub: LiveScrub | None = None
+    config: ServiceConfig, egress: _Reloadable, scrub: LiveScrub | None = None
 ) -> Callable[[], Applied]:
     """What the Settings page calls after it writes or removes a provider's key: the providers
     read again and handed to the running proxy (``Egress.reload``), no restart. A provider left
     without a usable key waits for it (``no_key``), never crashes the service. With ``scrub``
     (the process sensor's list of secrets) the new key is added to it and the removed one is
-    dropped, before the proxy can use the new key; if ``[proxy]`` cannot be used, nothing
-    changes."""
+    dropped, before the proxy can use the new key.
+
+    Only the providers change: the rest of the policy is the one the proxy has (nothing else is
+    read again, not telegram.toml nor ``[gate]``: review of T09b, finding 1). If even that fails,
+    it fails closed (``fail_closed``): every provider whose key is no longer the one in keys/
+    waits, the proxy's connection is replaced so it refuses until it has that config, and
+    ReloadFailedClosed says so."""
 
     def reload() -> Applied:
-        providers, problems = providers_now(config)
-        policy = egress_policy(config, providers, problems)
-        if scrub is not None:
-            scrub.replace(
-                known_secrets([config.gateway_token.reveal(), *providers.known_secrets()])
-            )
+        current = egress.policy
+        try:
+            providers, problems = providers_now(config)
+            policy = dataclasses.replace(current, providers=providers, key_problems=problems)
+        except Exception as error:
+            logger.error(
+                "the providers' keys cannot be read again (%s): the keys that changed are not "
+                "used until the next reload", type(error).__name__,
+            )  # fmt: skip
+            policy = fail_closed(config, current)
+            _refresh(scrub, config, policy.providers)
+            applied = Applied.NOW if egress.reload(policy) else Applied.WHEN_UP
+            raise ReloadFailedClosed(applied) from error
+        _refresh(scrub, config, providers)
         return Applied.NOW if egress.reload(policy) else Applied.WHEN_UP
 
     return reload
+
+
+def _refresh(scrub: LiveScrub | None, config: ServiceConfig, providers: Providers) -> None:
+    """The process sensor's list of secrets: the Gateway token and ``providers``' keys."""
+    if scrub is not None:
+        scrub.replace(known_secrets([config.gateway_token.reveal(), *providers.known_secrets()]))
+
+
+def fail_closed(config: ServiceConfig, current: Policy) -> Policy:
+    """``current`` with every provider whose real key is not exactly the one in keys/ now (it was
+    removed, replaced or cannot be read) waiting for its key: a failed reload never keeps a key
+    the owner took away. The keys it stops using, and the new ones it does not take, are struck
+    only from now on. If keys/ cannot even be read, every provider waits. Never raises."""
+    items = current.providers.items
+    try:
+        on_disk = read_real_keys(config.keys_dir, [p.name for p in items])
+    except Exception:  # read_real_keys never raises; if it did, nothing is trusted
+        logger.exception("keys/ cannot be read: every provider waits for its key")
+        on_disk = {}
+    problems = dict(current.key_problems)
+    struck = list(current.providers.strike_only)
+    kept = []
+    for provider in items:
+        real, problem, why = on_disk.get(provider.name, (None, KEY_UNUSABLE, "keys/ unreadable"))
+        same = (
+            provider.real_key is not None
+            and real is not None
+            and real.reveal() == provider.real_key.reveal()
+        )
+        if provider.real_key is None or same:
+            kept.append(provider)
+            continue
+        struck.append(provider.real_key.reveal())
+        if real is not None:
+            struck.append(real.reveal())  # the new key, never swapped in by this policy
+        kept.append(dataclasses.replace(provider, real_key=None))
+        problems[provider.name] = (
+            problem or KEY_UNUSABLE,
+            why
+            or "its key changed and the new one could not be handed over: it is read "
+            "again at the next reload",
+        )
+    fakes = [p.fake_key for p in items]
+    struck = [k for k in struck if len(k) >= MIN_KNOWN_SECRET and not holds_fake(k, fakes)]
+    try:
+        providers = Providers(kept, strike_only=struck)
+    except ValueError:  # cannot happen (fewer keys than before): then nothing is struck anew
+        logger.exception("the keys that stopped being used cannot be struck")
+        providers = Providers(kept, strike_only=current.providers.strike_only)
+    return dataclasses.replace(current, providers=providers, key_problems=problems)
 
 
 def prepare_egress(config: ServiceConfig) -> None:

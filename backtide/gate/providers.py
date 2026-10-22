@@ -314,9 +314,15 @@ def contains_secret(part: str | bytes | None, known: Iterable[str]) -> bool:
 class Providers:
     """The configured providers: no two share a name, a host or a key. Those waiting for their
     key (``real_key`` None) are here too: their host is a provider's host, and nothing goes
-    there."""
+    there.
 
-    def __init__(self, items: Iterable[Provider]) -> None:
+    ``strike_only``: real keys that are never swapped in (a key file that cannot be used, a key
+    two providers share, a key just removed when the reload failed: review of T09b, finding 2).
+    They are struck and searched for like the real keys (``known_secrets``, ``real_key_in``,
+    ``keys_to_find``), and nothing else. ValueError for one too short to search for or that is
+    (or holds, or is held in) a fake key."""
+
+    def __init__(self, items: Iterable[Provider], strike_only: Iterable[str] = ()) -> None:
         self.items: tuple[Provider, ...] = tuple(items)
         names = [p.name for p in self.items]
         hosts = [p.host for p in self.items]
@@ -327,6 +333,16 @@ class Providers:
             raise ValueError("two providers have the same host")
         if len(set(keys)) != len(keys):
             raise ValueError("two providers share a key")
+        struck = list(strike_only)
+        if any(not isinstance(key, str) or len(key) < MIN_KNOWN_SECRET for key in struck):
+            raise ValueError(f"a key to strike is a text of {MIN_KNOWN_SECRET}+ characters")
+        fakes = [p.fake_key for p in self.items]
+        if any(key in fake or fake in key for key in struck for fake in fakes):
+            raise ValueError("a key to strike cannot be a fake key")
+        real = set(self._real_keys())
+        self.strike_only: tuple[str, ...] = tuple(
+            key for key in dict.fromkeys(struck) if key not in real
+        )
         self._by_host = {p.host: p for p in self.items}
 
     def __repr__(self) -> str:
@@ -348,12 +364,19 @@ class Providers:
         name = normalize_host(host)
         return self._by_host.get(name) if name else None
 
+    def keys_to_find(self) -> tuple[str, ...]:
+        """The real keys and those to strike only: what must never leave, nor come back in an
+        answer (``real_key``)."""
+        return (*self._real_keys(), *self.strike_only)
+
     def real_key_in(self, *parts: str | bytes | None) -> bool:
-        """Whether any real key shows in any of ``parts`` (the URL, each header name and
-        value, the body, a WebSocket message). Checked for every request, to any host."""
-        real = self._real_keys()
+        """Whether any real key (or one to strike only) shows in any of ``parts`` (the URL,
+        each header name and value, the body, a WebSocket message). Checked for every request,
+        to any host."""
+        real = self.keys_to_find()
         return any(contains_secret(part, real) for part in parts)
 
     def known_secrets(self) -> tuple[str, ...]:
-        """Every real and fake key, for ``scrub_known`` before anything is recorded."""
-        return (*self._real_keys(), *(p.fake_key for p in self.items))
+        """Every real key, key to strike only and fake key, for ``scrub_known`` before
+        anything is recorded."""
+        return (*self.keys_to_find(), *(p.fake_key for p in self.items))

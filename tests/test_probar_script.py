@@ -131,7 +131,10 @@ def test_a_bad_key_file_is_never_used(paths: demo.Paths) -> None:
     key = config.provider_keys["anthropic"]
     assert key.real is None and key.problem == "unusable"  # fail closed: it waits
     assert key.why is not None and "600" in key.why and MADE_UP_KEY not in key.why
-    assert MADE_UP_KEY not in config.model_providers().known_secrets()
+    providers = config.model_providers()
+    anthropic = providers.by_name("anthropic")
+    assert anthropic is not None and anthropic.real_key is None  # never swapped in...
+    assert MADE_UP_KEY in providers.strike_only  # ...but struck (review of T09b, finding 2)
 
 
 def encoded(text: str) -> str:

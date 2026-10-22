@@ -49,14 +49,16 @@ import errno
 import os
 import re
 import stat
+import time
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from backtide.blackbox.redact import MIN_KNOWN_SECRET
 from backtide.gate.decide import UNKNOWN_HOSTS
 from backtide.gate.protocol import MAX_READ_ENDPOINTS
 from backtide.gate.provider_tools import check_allow_entry
@@ -91,6 +93,9 @@ DEFAULT_PRUNE_INTERVAL = 600.0
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 1024
 MAX_KEY_BYTES = 4096
+# A real key file is read twice, this long apart, and taken only if neither the file nor what it
+# holds changed in between (review of T09b, finding 3: a key written by hand may be half written).
+KEY_SETTLE_S = 0.01
 
 STATE_DB = "blackbox.db"
 STATE_KEY = "blackbox.key"
@@ -239,12 +244,16 @@ class ProviderKey:
 
     ``real`` is None while the provider waits for its key (docs/21, section 6): ``problem`` says
     why (``KEY_MISSING`` or ``KEY_UNUSABLE``) and ``why`` what is wrong with the file, in the
-    words of the reader (what the file IS, never what it holds)."""
+    words of the reader (what the file IS, never what it holds); ``strike`` is what an unusable
+    file holds, if anything (``read_strike_only``)."""
 
     real: Secret | None = field(repr=False)
     fake: str = field(repr=False)
     problem: str | None = None
     why: str | None = None
+    # While it waits because its file cannot be used: what the file holds anyway, to strike
+    # wherever it shows and never to swap in (review of T09b, finding 2). None otherwise.
+    strike: Secret | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -568,14 +577,19 @@ class ServiceConfig:
     def model_providers_and_problems(self) -> tuple[Providers, dict[str, tuple[str, str]]]:
         """``model_providers`` and, for each provider that waits for its key, why
         (``KEY_MISSING`` or ``KEY_UNUSABLE``) and what is wrong, never quoting a key. Fails
-        closed: a key file that cannot be read, a key of the wrong shape and a key two providers
-        share all leave their provider waiting, never let through without its key."""
+        closed: a key file that cannot be read, a key of the wrong shape, a key two providers
+        share and another provider's fake key all leave their provider waiting, never let
+        through without its key. What such a file holds (if it is long enough to search for and
+        not a fake key) is still struck and searched for: ``Providers.strike_only``."""
         items: list[GateProvider] = []
         problems: dict[str, tuple[str, str]] = {}
-        for provider in self.proxy_settings().providers:
-            key = self.provider_keys.get(provider.name)
-            if key is None:
-                continue
+        struck: list[str] = []  # real keys never swapped in: struck only (review of T09b)
+        configured = [p for p in self.proxy_settings().providers if p.name in self.provider_keys]
+        fakes = [self.provider_keys[p.name].fake for p in configured]
+        for provider in configured:
+            key = self.provider_keys[provider.name]
+            if key.strike is not None:
+                struck.append(key.strike.reveal())
             fields = {
                 "name": provider.name,
                 "kind": provider.kind,
@@ -594,21 +608,32 @@ class ServiceConfig:
                 )
                 items.append(waiting)
                 continue
+            real = key.real.reveal()
+            if holds_fake(real, fakes):  # another provider's fake key: it would clash
+                problems[provider.name] = (
+                    KEY_UNUSABLE,
+                    f"provider {provider.name}: the real key cannot be a fake key",
+                )
+                items.append(waiting)
+                continue
             try:
                 items.append(
-                    GateProvider(**fields, real_key=GateSecret(key.real.reveal()))  # type: ignore[arg-type]
+                    GateProvider(**fields, real_key=GateSecret(real))  # type: ignore[arg-type]
                 )
             except ValueError as error:  # the real key's shape: it waits (fail closed)
                 problems[provider.name] = (KEY_UNUSABLE, str(error))
                 items.append(waiting)
+                struck.append(real)
         reals = [p.real_key.reveal() for p in items if p.real_key is not None]
         shared = {real for real in reals if reals.count(real) > 1}
         for index, item in enumerate(items):
             if item.real_key is not None and item.real_key.reveal() in shared:
+                struck.append(item.real_key.reveal())
                 items[index] = dataclasses.replace(item, real_key=None)
                 problems[item.name] = (KEY_UNUSABLE, "the same real key as another provider")
+        strike_only = [k for k in struck if len(k) >= MIN_KNOWN_SECRET and not holds_fake(k, fakes)]
         try:
-            return Providers(items), problems
+            return Providers(items, strike_only=strike_only), problems
         except ValueError as error:
             raise ConfigError(f"[proxy] providers: {error}") from None
 
@@ -931,7 +956,8 @@ def read_provider_keys(folder: Path, names: list[str]) -> dict[str, ProviderKey]
     for name in names:
         fake = _fake_key(folder / f"{name}.fake", name)
         real, problem, why = read_real_key(folder, name)
-        keys[name] = ProviderKey(real=real, fake=fake, problem=problem, why=why)
+        strike = read_strike_only(folder, name) if problem == KEY_UNUSABLE else None
+        keys[name] = ProviderKey(real=real, fake=fake, problem=problem, why=why, strike=strike)
     return keys
 
 
@@ -948,23 +974,87 @@ def read_real_keys(
     return {name: read_real_key(folder, name) for name in names}
 
 
-def read_real_key(folder: Path, name: str) -> tuple[Secret | None, str | None, str | None]:
+def read_real_key(
+    folder: Path, name: str, *, pause: Callable[[float], None] = time.sleep
+) -> tuple[Secret | None, str | None, str | None]:
     """``(key, None, None)`` from ``<folder>/<name>.key``, or ``(None, problem, why)`` when
     there is none (``KEY_MISSING``) or it cannot be used (``KEY_UNUSABLE``: not 0600 and ours,
-    a link, too big, not UTF-8, empty). ``why`` says what the file IS, never what it holds.
-    The folder is the caller's to check. Never raises."""
+    a link, too big, not UTF-8, empty, or changed while it was read). ``why`` says what the file
+    IS, never what it holds. The folder is the caller's to check. Never raises.
+
+    The file is read twice, ``KEY_SETTLE_S`` apart (``pause``), and taken only if it is the same
+    file with the same size, times and bytes both times: a key written by hand may be half
+    written (review of T09b, finding 3). A change waits; the next reload reads it again. The
+    Settings page writes atomically, and so does ``mv`` from a temporary file."""
     path = folder / f"{name}.key"
     try:
         if not os.path.lexists(path):
             return None, KEY_MISSING, f"there is no {path} yet"
-        real = _decode(_read_file(path, "real key file", MAX_KEY_BYTES, private=True)).strip()
+        first, before = _read_file_info(path, "real key file", MAX_KEY_BYTES, private=True)
+        pause(KEY_SETTLE_S)
+        second, after = _read_file_info(path, "real key file", MAX_KEY_BYTES, private=True)
     except ConfigError as error:
         return None, KEY_UNUSABLE, str(error)
     except OSError as error:
         return None, KEY_UNUSABLE, f"cannot read {path}: {os.strerror(error.errno or 0)}"
+    if first != second or _identity(before) != _identity(after):
+        return (
+            None,
+            KEY_UNUSABLE,
+            (
+                f"real key file {path} of provider {name} changed while it was read: write keys "
+                "with the Settings page, or with mv from a temporary file; it is read again at the "
+                "next reload"
+            ),
+        )
+    del second
+    try:
+        real = _decode(first).strip()
+    except ConfigError as error:
+        return None, KEY_UNUSABLE, str(error)
     if not real:
         return None, KEY_UNUSABLE, f"real key file {path} of provider {name} is empty"
     return Secret(real), None, None
+
+
+def read_strike_only(folder: Path, name: str) -> Secret | None:
+    """What ``<folder>/<name>.key`` holds although it cannot be used as a key (open to others,
+    of the wrong shape, changed while read), to strike wherever it shows and never to swap in
+    (review of T09b, finding 2). Only a regular file, never through a link, at most
+    MAX_KEY_BYTES of UTF-8; None if there is nothing of MIN_KNOWN_SECRET characters or more.
+    Never raises, never says what it read."""
+    path = folder / f"{name}.key"
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_KEY_BYTES:
+            return None
+        data = os.read(fd, MAX_KEY_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > MAX_KEY_BYTES:
+        return None
+    try:
+        value = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return Secret(value) if len(value) >= MIN_KNOWN_SECRET else None
+
+
+def _identity(info: os.stat_result) -> tuple[int, ...]:
+    """What tells a file, and a change to it, apart: device, inode, size and both times."""
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def holds_fake(key: str, fakes: list[str]) -> bool:
+    """Whether ``key`` is, holds or is held in one of the providers' fake keys."""
+    return any(key in fake or fake in key for fake in fakes)
 
 
 def _fake_key(path: Path, name: str) -> str:
@@ -1176,6 +1266,13 @@ def _read_file(path: Path, what: str, max_bytes: int, *, private: bool) -> bytes
     """The content of a small file that only its owner may have written (and, if ``private``,
     read). Errors say what the file IS (size, mode, owner), never what it holds. Opens without
     following a symlink or blocking on a FIFO."""
+    return _read_file_info(path, what, max_bytes, private=private)[0]
+
+
+def _read_file_info(
+    path: Path, what: str, max_bytes: int, *, private: bool
+) -> tuple[bytes, os.stat_result]:
+    """``_read_file``, and the ``fstat`` of the file it read."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
         fd = os.open(path, flags)
@@ -1208,7 +1305,7 @@ def _read_file(path: Path, what: str, max_bytes: int, *, private: bool) -> bytes
         os.close(fd)
     if len(data) > max_bytes:
         raise ConfigError(f"{what} {path} is too big (the limit is {max_bytes} bytes)")
-    return data
+    return data, info
 
 
 def _decode(data: bytes) -> str:

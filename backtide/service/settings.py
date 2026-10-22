@@ -30,6 +30,8 @@ The rules:
   connection to the proxy with the new config, no restart). A provider of ``[proxy]`` without a
   usable key waits for it (``waiting``): the service runs, the proxy refuses its model calls,
   and ``status`` says so (``waiting``) until the key is set; removing it makes it wait again.
+  If the keys cannot be handed over, the reload fails closed (``ReloadFailedClosed``): a
+  removed key is no longer used already, a new one is used from the next start.
   The Telegram bot reads its file when the service starts, so a change there applies at the
   next start, and the reply says so.
 - One change at a time (a lock), and the value is dropped as soon as it is written. Python cannot
@@ -118,6 +120,16 @@ Waiting = Callable[[], Mapping[str, str]]  # the providers that wait for their k
 
 class SettingsError(Exception):
     """A file or folder of the settings cannot be used. The message never holds a value."""
+
+
+class ReloadFailedClosed(Exception):
+    """The keys could not be handed to the proxy as they are now, so it failed closed: the
+    providers whose key changed wait for it (review of T09b, finding 1). ``applied`` says
+    whether the proxy took that at once (``NOW``) or takes it when it is back (``WHEN_UP``)."""
+
+    def __init__(self, applied: Applied) -> None:
+        super().__init__(f"the reload failed closed ({applied})")
+        self.applied = applied
 
 
 def check_value(kind: str, value: str) -> bool:
@@ -296,7 +308,7 @@ class Settings:
                 remove_private(folder, name, private_dir=kind != TELEGRAM)
             except (SettingsError, OSError) as error:
                 return self._failed(kind, requested_by, "remove", error)
-            applied = Applied.RESTART if kind == TELEGRAM else self._apply(kind)
+            applied = Applied.RESTART if kind == TELEGRAM else self._apply(kind, removed=True)
         return SettingsOutcome(Outcome.CLEARED, _CLEARED[applied], applied)
 
     def _set_telegram(self, token: str, chat_id: str, requested_by: str) -> SettingsOutcome:
@@ -406,14 +418,20 @@ class Settings:
             "registro del servicio.",
         )
 
-    def _apply(self, kind: str) -> Applied:
-        """Hand the providers' keys to the proxy again, if this one is a provider of [proxy]."""
+    def _apply(self, kind: str, *, removed: bool = False) -> Applied:
+        """Hand the providers' keys to the proxy again, if this one is a provider of [proxy].
+        If that fails closed, a removed key is no longer used already (its provider waits);
+        a new one is used from the next start."""
         if kind not in self._in_use:
             return Applied.UNUSED
         if self._reload is None:
             return Applied.RESTART
         try:
             return self._reload()
+        except ReloadFailedClosed as error:
+            logger.error("settings: the proxy could not take the new keys, so the ones that "
+                         "changed wait: %s", _what(error.__cause__ or error))  # fmt: skip
+            return error.applied if removed else Applied.RESTART
         except Exception as error:  # the file is written: it applies at the next start
             logger.error("settings: the proxy could not take the new keys: %s", _what(error))
             return Applied.RESTART

@@ -176,6 +176,11 @@ class Egress:
         """The providers that wait for their key now, and why ("missing" or "unusable")."""
         return self._policy.waiting()
 
+    @property
+    def policy(self) -> Policy:
+        """What every connection to the proxy hands it now (``reload`` changes it)."""
+        return self._policy
+
     # The Guardian's calls
 
     @property

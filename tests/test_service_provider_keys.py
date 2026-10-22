@@ -150,7 +150,12 @@ def test_a_key_file_others_can_read_waits_without_quoting_it(layout: Path, mode:
     key = config.provider_keys["anthropic"]
     assert key.real is None and key.why is not None and "600" in key.why
     assert REAL_ANTHROPIC not in key.why
-    assert REAL_ANTHROPIC not in config.model_providers().known_secrets()
+    # Never swapped in, but still struck (review of T09b, finding 2).
+    providers = config.model_providers()
+    assert REAL_ANTHROPIC in providers.known_secrets() and providers.strike_only == (
+        REAL_ANTHROPIC,
+    )
+    assert providers.real_key_in(f"x-api-key: {REAL_ANTHROPIC}")
 
 
 @pytest.mark.parametrize("mode", [0o750, 0o705, 0o755])
@@ -173,6 +178,7 @@ def test_a_symlinked_key_waits(layout: Path, tmp_path: Path) -> None:
     assert waiting_of(config) == {"anthropic": "unusable"}
     why = config.provider_keys["anthropic"].why
     assert why is not None and "symlink" in why
+    # A link is never followed, not even to strike what it points at.
     assert REAL_ANTHROPIC not in config.model_providers().known_secrets()
 
 
@@ -206,7 +212,9 @@ def test_a_bad_real_key_waits_without_quoting_it(layout: Path, value: str) -> No
     assert not value or value not in problems["anthropic"][1]
     anthropic = providers.by_name("anthropic")
     assert anthropic is not None and anthropic.real_key is None  # never "pass without a key"
-    assert not value or value not in providers.known_secrets()
+    # Never swapped in, but struck wherever it shows (review of T09b, finding 2).
+    assert providers.strike_only == ((value,) if value else ())
+    assert not value or value in providers.known_secrets()
 
 
 def test_a_provider_openclaw_does_not_know_needs_its_models(layout: Path) -> None:
@@ -239,7 +247,57 @@ def test_two_providers_with_the_same_real_key_both_wait(layout: Path) -> None:
     providers, problems = config.model_providers_and_problems()
     assert set(providers.waiting()) == {"anthropic", "groq"}
     assert all(why == "the same real key as another provider" for _, why in problems.values())
-    assert REAL_ANTHROPIC not in providers.known_secrets()
+    assert REAL_ANTHROPIC in providers.known_secrets() and providers.strike_only == (
+        REAL_ANTHROPIC,
+    )
+    assert providers.real_key_in(REAL_ANTHROPIC)
+
+
+def test_a_key_file_with_another_providers_fake_key_waits_and_is_not_a_real_key(
+    layout: Path,
+) -> None:
+    """Review of T09b, finding 1: a key that is another provider's fake one made Providers clash
+    (a ConfigError at the start, a failed reload later). It waits instead, and is not struck as a
+    real key: the agent's own fake key must keep reaching its provider."""
+    config = configured(layout)
+    groq_fake = config.provider_keys["groq"].fake
+    write_key(layout, "anthropic", groq_fake)
+    config = ServiceConfig.from_file(write_toml(layout, PROVIDERS))
+    providers, problems = config.model_providers_and_problems()
+    assert waiting_of(config) == {"anthropic": "unusable"}
+    assert "fake key" in problems["anthropic"][1] and groq_fake not in problems["anthropic"][1]
+    assert providers.strike_only == () and not providers.real_key_in(groq_fake)
+    groq = providers.by_name("groq")
+    assert groq is not None and groq.real_key is not None
+
+
+def test_a_key_file_that_changes_while_it_is_read_waits(layout: Path) -> None:
+    """Review of T09b, finding 3: a key is read twice, and taken only if the file and what it
+    holds did not change in between (a key written by hand may be half written). A change
+    waits; the next reload reads it again."""
+    from backtide.service.config import KEY_UNUSABLE, read_real_key
+
+    path = write_key(layout, "anthropic", REAL_ANTHROPIC)
+    folder = keys_dir(layout)
+
+    def half_written(seconds: float) -> None:
+        path.write_text(REAL_ANTHROPIC[:20])  # in place, as `echo … >` does
+
+    def moved_in(seconds: float) -> None:
+        temp = folder / "anthropic.key.tmp"
+        temp.write_text(REAL_ANTHROPIC + "\n")
+        temp.chmod(0o600)
+        os.replace(temp, path)  # the same key, but another file than the one first read
+
+    for change in (half_written, moved_in):
+        write_key(layout, "anthropic", REAL_ANTHROPIC)
+        real, problem, why = read_real_key(folder, "anthropic", pause=change)
+        assert (real, problem) == (None, KEY_UNUSABLE), change.__name__
+        assert why is not None and "changed while" in why and REAL_ANTHROPIC[:8] not in why
+    pauses: list[float] = []
+    real, problem, why = read_real_key(folder, "anthropic", pause=pauses.append)
+    assert real is not None and real.reveal() == REAL_ANTHROPIC and (problem, why) == (None, None)
+    assert pauses and 0 < pauses[0] <= 0.1  # a short pause between the two reads
 
 
 def test_a_fake_file_that_is_not_a_fake_key_is_refused(layout: Path) -> None:

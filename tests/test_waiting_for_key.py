@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from backtide.blackbox import BlackBox
+from backtide.blackbox.redact import KnownScrubber
 from backtide.gate import protocol
 from backtide.gate.client import Ack
 from backtide.gate.providers import (
@@ -123,6 +124,78 @@ def test_the_proxys_config_carries_a_provider_without_its_key() -> None:
         with pytest.raises(protocol.ProtocolError):
             protocol.decode(json.dumps(broken).encode() + b"\n", protocol.Sender.BACKTIDE)
     assert protocol.ack(1, "deny", reason="no_key")["reason"] == "no_key"
+
+
+# --- a key that is never swapped in is still struck (review of T09b, finding 2) ------------------
+
+STRUCK = "sk-ant-api03-TEST" + "Unus4bleButR3al" * 3  # a key whose file cannot be used
+
+
+def test_a_strike_only_key_is_struck_and_searched_for_but_never_swapped_in() -> None:
+    providers = Providers([waiting_anthropic()], strike_only=[STRUCK, STRUCK])
+    assert providers.strike_only == (STRUCK,)
+    assert providers.known_secrets() == (STRUCK, FAKE)
+    assert providers.real_key_in(f"curl -d {STRUCK}") and not providers.real_key_in(FAKE)
+    assert providers.keys_to_find() == (STRUCK,)
+    headers = [("x-api-key", FAKE)]
+    assert swap_key(providers.items[0], headers, scheme="https", port=443) is None
+    assert STRUCK not in repr(providers)
+    for bad in (["short"], [5], [FAKE]):  # too short to search for, not a text, a fake key
+        with pytest.raises(ValueError):
+            Providers([waiting_anthropic()], strike_only=bad)  # type: ignore[list-item]
+
+
+def test_the_proxys_config_carries_the_keys_to_strike_only() -> None:
+    providers = Providers([waiting_anthropic()], strike_only=[STRUCK])
+    message = protocol.config(["example.com"], providers, {})
+    line = protocol.encode(message, protocol.Sender.BACKTIDE)
+    decoded = protocol.decode(line, protocol.Sender.BACKTIDE)
+    back = protocol.providers_from_config(decoded)
+    assert back.strike_only == (STRUCK,) and back.waiting() == ("anthropic",)
+    assert STRUCK not in protocol.describe(decoded)
+    plain = protocol.config(["example.com"], Providers([waiting_anthropic()]), {})
+    assert "strike_only" not in plain  # nothing to strike: the field is left out
+    for bad in (5, ["short"], [5], [STRUCK] * 100):
+        broken = json.loads(line)
+        broken["strike_only"] = bad
+        with pytest.raises(protocol.ProtocolError):
+            protocol.decode(json.dumps(broken).encode() + b"\n", protocol.Sender.BACKTIDE)
+
+
+def test_backtide_strikes_a_key_it_never_swaps_in() -> None:
+    policy = strict_policy(providers=Providers([waiting_anthropic()], strike_only=[STRUCK]))
+    assert STRUCK not in policy.scrubber().text(f"echo {STRUCK}")
+
+
+def strike_only_channel() -> FakeChannel:
+    channel = FakeChannel()
+    assert channel.config is not None
+    ready = Provider("anthropic", Kind.ANTHROPIC, "api.anthropic.com", FAKE, Secret(REAL))
+    providers = Providers([ready], strike_only=[STRUCK])
+    channel.config = channel.config.__class__(
+        providers, KnownScrubber(providers.known_secrets()), channel.config.limits
+    )
+    return channel
+
+
+def test_the_proxy_refuses_a_request_and_an_answer_with_a_key_it_never_swaps_in() -> None:
+    from tests.test_gate_addon import provider_flow, stream_through
+
+    channel = strike_only_channel()
+    gate, _ = make_gate(channel)
+    flow = model_flow(json.dumps({"model": "m", "messages": [STRUCK]}).encode())
+    send(gate, flow)
+    assert flow.response is not None and flow.response.status_code == 403
+    assert channel.told[0]["details"]["reason"] == "real_key" and channel.asked == []
+    assert STRUCK not in json.dumps(channel.told)
+
+    channel = strike_only_channel()
+    gate, _ = make_gate(channel)
+    flow = provider_flow(("x-api-key", FAKE))
+    send(gate, flow)
+    body = json.dumps({"type": "error", "error": {"message": f"echo {STRUCK}"}}).encode()
+    assert stream_through(gate, flow, body, "application/json") == b"" and flow.killed
+    assert channel.actions() == ["blocked:real_key"]
 
 
 # --- the proxy ----------------------------------------------------------------------------------
