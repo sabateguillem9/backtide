@@ -197,6 +197,8 @@ def test_create_argv_sets_the_environment_of_the_design(cfg: AgentJailConfig) ->
         "CLAWHUB_DISABLE_TELEMETRY": "1",
         "DO_NOT_TRACK": "1",
         **PROXY_ENV,
+        "BASH_ENV": "/dev/null",  # what programs source by themselves: nothing (T17a-3)
+        "CLAUDE_ENV_FILE": "/dev/null",
     }
 
 

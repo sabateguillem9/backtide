@@ -170,6 +170,7 @@ def run_web(
         agent_name=agent_name,
         others=others,
         pending=pending,
+        agent_lines=paths.agent_lines,
     )
     server = make_server(app)
     announce(web_url(real_port, prefix, token), run_name)

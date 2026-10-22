@@ -14,7 +14,8 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
   and start() refuses a container that is not exactly this config's jail (backtide/jail/verify.py)
   or whose mounted config folder holds anything but the profile's config files (OpenClaw:
   openclaw.json), or whose CA folder holds anything but the certificate (ca.py writes it; the
-  CA's key never goes there).
+  CA's key never goes there), or whose image carries what looks like a secret in its own
+  environment (Docker hands those variables to the agent).
 - What the agent is (its folders in /workspace, its config files, how it says it is ready)
   comes from the config's agent profile (backtide/jail/profile.py); every check here is the
   same for every agent.
@@ -61,6 +62,7 @@ from backtide.jail.mounts import (
     live_mount_problems,
     planned_info,
 )
+from backtide.jail.profile import secret_shaped
 from backtide.jail.verify import container_problems
 
 logger = logging.getLogger(__name__)
@@ -606,6 +608,21 @@ class AgentJail:
             return []  # an image without any variable
         if not isinstance(env, list) or not all(isinstance(entry, str) for entry in env):
             raise unexpected
+        secret = sorted(
+            {
+                name
+                for name, _, value in (entry.partition("=") for entry in env)
+                if secret_shaped(name, value)
+            }
+        )
+        if secret:
+            # Docker hands the image's variables to the agent: one with a secret would be a key
+            # the agent sees (docs/34, section 6). Names only, never a value.
+            raise JailError(
+                f"image {self.config.image} carries what looks like a secret in its own "
+                f"environment ({', '.join(secret)}): the agent would see it. Use an image "
+                "without secrets in its ENV"
+            )
         return env
 
     def _network_info(self) -> dict[str, Any] | None:

@@ -20,13 +20,14 @@ socket. Built in ``runner.serve`` when ``<state_dir>/telegram.toml`` exists.
 
 import logging
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any, Protocol
 
 from backtide.blackbox import BlackBox, BlackBoxError, redact
+from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.notify.buttons import ButtonBook
 from backtide.notify.hold_notice import HoldDesk
 from backtide.notify.telegram import TelegramBot, TelegramNotifier
@@ -109,8 +110,10 @@ class GuardianActions:
         ask_decision: AskDecide = ask_decide,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         tz: tzinfo | None = None,
+        agent_lines: Sequence[str] = DEFAULT_PROFILE.rewind_notice_lines,
     ) -> None:
         self._socket = control_socket
+        self._agent_lines = tuple(agent_lines)  # the profile's lines of the rewind notice
         self._ask = ask
         self._ask_decision = ask_decision
         self._now = now
@@ -211,7 +214,9 @@ class GuardianActions:
         target = Snapshot.parse(snapshot_id) if isinstance(snapshot_id, str) else None
         if target is None or not any(snap.id == target.id for snap in self._snapshots()):
             return None
-        paragraphs = rewind_notice(target.taken_at, now=self._now(), tz=self._tz)
+        paragraphs = rewind_notice(
+            target.taken_at, now=self._now(), tz=self._tz, agent_lines=self._agent_lines
+        )
         return "\n\n".join(paragraphs)
 
     def target_for(self, event_seq: int) -> str | None:
@@ -361,7 +366,9 @@ def telegram_parts(config: ServiceConfig, settings: TelegramSettings) -> Telegra
     """The Telegram side of the service. Touches no network: the bot connects when started."""
     api = BotApi(settings.token.reveal(), base=settings.api_base)
     book = ButtonBook()
-    actions = GuardianActions(config.control_socket)
+    actions = GuardianActions(
+        config.control_socket, agent_lines=config.agent_profile.rewind_notice_lines
+    )
     notifier = TelegramNotifier(api, settings.chat_id, book, actions)
     desk = HoldDesk(api, settings.chat_id, book, actions)
     bot = TelegramBot(api, settings.chat_id, book, actions, desk=desk)

@@ -53,6 +53,8 @@ JAIL_ENV = [
     "REQUESTS_CA_BUNDLE=/etc/backtide-ca/ca.pem",
     "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
     "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
+    "BASH_ENV=/dev/null",  # the jail's: what programs source by themselves (T17a-3)
+    "CLAUDE_ENV_FILE=/dev/null",
     f"OPENCLAW_GATEWAY_TOKEN={TOKEN}",
 ]
 

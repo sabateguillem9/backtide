@@ -25,10 +25,13 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
+from backtide.blackbox.redact import strike_text
 from backtide.gate.provider_tools import check_profile_param
+from backtide.gate.providers import FAKE_KEY_PREFIX
 
 if TYPE_CHECKING:
     from backtide.jail.config import AgentJailConfig
+    from backtide.jail.model import ModelProvider
 
 # The container's layout: the same for every profile. The agent writes only below /workspace
 # (its folder in the snapshotted volume); /config is read-only.
@@ -45,8 +48,8 @@ RESERVED_ENV = frozenset(
     {
         "HOME", "DO_NOT_TRACK", "NODE_USE_ENV_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
         "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_OPTIONS",
-        "BASH_ENV", "ENV", "PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "NODE_PATH",
-        "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_SSL_NO_VERIFY",
+        "BASH_ENV", "CLAUDE_ENV_FILE", "ENV", "PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+        "NODE_PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_SSL_NO_VERIFY",
         "NODE_TLS_REJECT_UNAUTHORIZED", "PYTHONHTTPSVERIFY",
     }
 )  # fmt: skip
@@ -56,7 +59,8 @@ _RESERVED_SHAPES = (re.compile(r".*_PROXY", re.IGNORECASE), re.compile(r"LD_.*",
 # own fields, and their values never go in the argv.
 _SECRET_WORDS = ("KEY", "SECRET", "PASSWORD", "TOKEN", "CREDENTIAL")
 
-PINNED_IMAGE_RE = re.compile(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}", re.ASCII)
+# Never a first "-": docker would read the image as one of its own options.
+PINNED_IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}", re.ASCII)
 _PROFILE_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", re.ASCII)
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}", re.ASCII)
 # A program name or path: never something docker could read as one of its own options.
@@ -90,6 +94,18 @@ def is_reserved_env(name: str) -> bool:
     return name.upper() in RESERVED_ENV or any(shape.fullmatch(name) for shape in _RESERVED_SHAPES)
 
 
+def secret_shaped(name: str, value: str) -> bool:
+    """Whether the variable ``name=value`` looks like it carries a secret: a value of a known
+    secret's shape (``sk-...``, ``ghp_...``, a JWT, a URL with a password...), a fake key, or a
+    non-empty value under a secret's name (``..._TOKEN``, ``..._API_KEY``...: the black box's
+    own rules, backtide/blackbox/redact.py). Used for a profile's variables and for the image's
+    own environment (docs/34, section 6); a name alone, with an empty value, is no secret."""
+    if not value:
+        return False
+    pair = f"{name}={value}"
+    return FAKE_KEY_PREFIX in value or strike_text(value) != value or strike_text(pair) != pair
+
+
 def _no_files(config: "AgentJailConfig") -> dict[str, str]:
     del config
     return {}
@@ -102,6 +118,10 @@ def _no_check(files: Mapping[str, str]) -> None:
 def _any_answer(output: str) -> bool:
     del output
     return True
+
+
+def _any_providers(providers: "tuple[ModelProvider, ...]") -> None:
+    del providers
 
 
 @dataclass(frozen=True)
@@ -129,7 +149,9 @@ class AgentProfile:
       output is bounded by AgentJail and never decides anything about security.
     - ``rewind_notice_lines``: what the rewind notice says about this agent (docs/19, section 7).
     - ``provider_params``: top-level fields its model client sends that the gate's list does not
-      know (``param:<name>``, decision 5 of docs/34); allowed for this profile only."""
+      know (``param:<name>``, decision 5 of docs/34); allowed for this profile only.
+    - ``check_providers``: refuses (ValueError) model providers this agent cannot use (OpenClaw:
+      one it has no catalog of, without its model ids)."""
 
     name: str
     version: str
@@ -151,6 +173,7 @@ class AgentProfile:
     ready_answer: Callable[[str], bool] = _any_answer
     rewind_notice_lines: tuple[str, ...] = ()
     provider_params: tuple[str, ...] = ()
+    check_providers: "Callable[[tuple[ModelProvider, ...]], None]" = _any_providers
 
     def __post_init__(self) -> None:
         _match("profile name", self.name, _PROFILE_NAME_RE)
@@ -168,6 +191,7 @@ class AgentProfile:
             ("render_config", self.render_config),
             ("check_config", self.check_config),
             ("ready_answer", self.ready_answer),
+            ("check_providers", self.check_providers),
         ):
             if not callable(function):
                 raise ValueError(f"{label} must be callable")
@@ -220,6 +244,11 @@ class AgentProfile:
                     "and the token have their own fields)"
                 )
             _text(f"the value of {name}", value)
+            if secret_shaped(name, value):
+                raise ValueError(
+                    f"env {name}: its value looks like a secret (never quoted here): a profile's "
+                    "variables never carry one, and the fake key has its own field"
+                )
         for _, provider in self.fake_key_env:
             _match("a fake key's provider", provider, _PROVIDER_NAME_RE)
         every = [

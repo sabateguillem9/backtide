@@ -6,7 +6,7 @@ import os
 import signal
 import sys
 import textwrap
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
@@ -15,6 +15,7 @@ from backtide import __version__
 from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, load_key, redact
 from backtide.jail import ExposedJail, JailError
 from backtide.jail.profile import ProfileError
+from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import (
     OUTCOME_EXIT_CODES,
@@ -310,7 +311,8 @@ def _rewind(args: argparse.Namespace) -> int:
         _error(f"no existe la instantánea {target.id}: mira `backtide instantaneas`")
         return EXIT_ERROR
 
-    print(_rewind_notice(target, now=_now(), tz=_local_tz()))
+    lines = config.agent_profile.rewind_notice_lines
+    print(_rewind_notice(target, now=_now(), tz=_local_tz(), agent_lines=lines))
     if not args.si:
         confirmed = _confirm()
         if confirmed is None:
@@ -361,8 +363,15 @@ def _decide_hold(args: argparse.Namespace) -> int:
     return decide_hold(config, args.hold, args.verdict)
 
 
-def _rewind_notice(target: Snapshot, *, now: datetime, tz: tzinfo) -> str:
-    paragraphs = (*rewind_notice(target.taken_at, now=now, tz=tz), REWIND_NOTICE_WITHOUT_SERVICE)
+def _rewind_notice(
+    target: Snapshot,
+    *,
+    now: datetime,
+    tz: tzinfo,
+    agent_lines: Sequence[str] = DEFAULT_PROFILE.rewind_notice_lines,
+) -> str:
+    notice = rewind_notice(target.taken_at, now=now, tz=tz, agent_lines=agent_lines)
+    paragraphs = (*notice, REWIND_NOTICE_WITHOUT_SERVICE)
     return "\n\n".join(textwrap.fill(paragraph, width=88) for paragraph in paragraphs)
 
 

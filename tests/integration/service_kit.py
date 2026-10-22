@@ -467,6 +467,7 @@ def make_service(
     real_keys: Mapping[str, str] | None = None,
     agent_memory: str = "2g",
     budget_toml: str = TEST_BUDGET,
+    agent_toml: str = "",
 ) -> Service:
     """Write the config and token of a service for the btrfs folder ``root`` (nothing runs
     yet). ``names`` are the container and network names, from the fixtures' cleanup scheme.
@@ -478,7 +479,11 @@ def make_service(
     ``budget_toml`` is the body of ``[budget]`` (T11). By default (``TEST_BUDGET``) the prices
     do not update themselves (a test never reads the real pricing page: invariant 8) and the caps
     are out of reach (the fake models are unknown, so each call is charged by excess);
-    tope-de-gasto sets its own cap of cents and points ``prices_url`` at a fake page."""
+    tope-de-gasto sets its own cap of cents and points ``prices_url`` at a fake page.
+
+    ``agent_toml`` goes at the end of ``[agent]``, after the container's options: another
+    profile (T17a-3: ``profile = "custom"`` and its settings, its tables last). The gateway
+    token is written anyway; only a profile that uses it reads it."""
     container, network = names
     token = secrets.token_urlsafe(32)
     state_dir.chmod(0o700)
@@ -507,8 +512,9 @@ def make_service(
         f"gid = {os.getgid()}\n"
         f'memory = "{agent_memory}"\n'
         'cpus = "2"\n'
+        + agent_toml
         # The proxy's CA is group-readable by the proxy's gid: without root, only this user's.
-        "[proxy]\n"
+        + "[proxy]\n"
         f'name = "{container}-px"\n'  # under the cleanup's prefixes, with this run's pid
         f'network = "{network}-out"\n'
         f"uid = {os.getuid()}\n"
@@ -516,7 +522,7 @@ def make_service(
     )
     config_path.chmod(0o600)
     config = ServiceConfig.from_file(config_path)
-    assert isinstance(config.gateway_token, Secret)
+    assert isinstance(config.gateway_token, Secret) or config.agent_profile.token_env is None
     jail = AgentJail(replace(config.jail_config(), allow_shared_ids=True))
     store = SnapshotStore(root)
     return Service(config, config_path, jail, store, state_dir.parent / f"{state_dir.name}.log")

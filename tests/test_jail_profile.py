@@ -42,7 +42,7 @@ PROFILE_FIELDS = {
     "name", "version", "image", "entrypoint", "command", "workdir", "workspace_dirs", "env",
     "proxy_url_env", "ca_file_env", "token_env", "fake_key_env", "config_names",
     "render_config", "check_config", "ready_log_line", "ready_probe", "ready_answer",
-    "rewind_notice_lines", "provider_params",
+    "rewind_notice_lines", "provider_params", "check_providers",
 }  # fmt: skip
 # What decides the jail's security: AgentJailConfig's or fixed, never a profile's.
 SECURITY_FIELDS = (
@@ -70,7 +70,7 @@ def jail_config(agent: AgentProfile = OPENCLAW, **changes: Any) -> AgentJailConf
         "workspace": WORKSPACE,
         "config_dir": CONFIG_DIR,
         "ca_dir": CA_DIR,
-        "gateway_token": TOKEN,
+        "gateway_token": TOKEN if getattr(agent, "token_env", None) else None,  # who uses it
         "profile": agent,
     }
     return AgentJailConfig(**(fields | changes))
@@ -347,7 +347,6 @@ def local(tmp_path: Path) -> dict[str, Any]:
         "workspace": workspace,
         "config_dir": tmp_path / "agent-config",
         "ca_dir": ca_dir,
-        "gateway_token": TOKEN,
         "uid": os.getuid(),
         "gid": os.getgid(),
         "allow_shared_ids": True,

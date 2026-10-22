@@ -22,10 +22,11 @@ repeats a value of the config in its messages: only paths, so no secret can reac
 import json
 import re
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from backtide.gate.providers import is_fake_key
+from backtide.jail.model import MODEL_ID as MODEL_ID
+from backtide.jail.model import ModelProvider
 from backtide.jail.profile import (
     CONTAINER_CONFIG_DIR,
     CONTAINER_STATE,
@@ -114,40 +115,15 @@ BUILT_IN_PROVIDERS = ("anthropic", "openai")
 _API = {"anthropic": "anthropic-messages", "openai": "openai-completions"}
 # anthropic-messages adds /v1/messages to its base; the OpenAI client adds only /chat/completions.
 _BASE_PATH = {"anthropic": "", "openai": "/v1"}
-_PROVIDER_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", re.ASCII)
-_HOST_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", re.ASCII)
-MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}", re.ASCII)
 
 
-@dataclass(frozen=True)
-class ModelProvider:
-    """A model provider as the agent sees it: its name (OpenClaw's provider id), how it takes
-    its key (``kind``), its host and the FAKE key. Never the real one: the proxy holds that.
-    ``models`` are model ids OpenClaw must know (required for a name OpenClaw has no catalog
-    of); the first of the first provider that has them is the agent's default model."""
-
-    name: str
-    kind: str
-    host: str
-    fake_key: str = field(repr=False)
-    models: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not _PROVIDER_NAME.fullmatch(self.name):
-            raise ValueError(f"invalid provider name {self.name!r}")
-        if self.kind not in _API:
-            raise ValueError(f"provider {self.name}: unknown kind {self.kind!r}")
-        if not isinstance(self.host, str) or not _HOST_NAME.fullmatch(self.host):
-            raise ValueError(f"provider {self.name}: the host must be a lower-case host name")
-        if not is_fake_key(self.fake_key, self.name):
-            raise ValueError(f"provider {self.name}: the agent only ever gets its fake key")
-        if not isinstance(self.models, tuple) or not all(
-            isinstance(model, str) and MODEL_ID.fullmatch(model) for model in self.models
-        ):
-            raise ValueError(f"provider {self.name}: models must be a tuple of model ids")
-        if self.name not in BUILT_IN_PROVIDERS and not self.models:
+def check_providers(providers: tuple[ModelProvider, ...]) -> None:
+    """OpenClaw only knows the models of its built-in providers: any other name needs its model
+    ids (OpenClaw's schema refuses a custom provider without them). ValueError otherwise."""
+    for provider in providers:
+        if provider.name not in BUILT_IN_PROVIDERS and not provider.models:
             raise ValueError(
-                f"provider {self.name}: OpenClaw needs its model ids (it only knows the models "
+                f"provider {provider.name}: OpenClaw needs its model ids (it only knows the models "
                 f"of {', '.join(BUILT_IN_PROVIDERS)} by itself)"
             )
 
@@ -699,6 +675,7 @@ OPENCLAW = AgentProfile(
     ready_probe=HEALTH_PROBE,
     ready_answer=gateway_answer,
     rewind_notice_lines=REWIND_NOTICE_LINES,
+    check_providers=check_providers,
     # The fake keys go in openclaw.json (model_settings), never in a variable; and OpenClaw sends
     # no field the gate's lists lack (probar's param:fallbacks is the owner's allow_provider_tools).
     provider_params=(),

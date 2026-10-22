@@ -4,7 +4,13 @@ Design: docs/19-diseno-t04.md, section "Disposición".
 
 - ``/etc/backtide/backtide.toml`` holds paths, numbers and the agent's container options. NEVER a
   secret: the gateway token is read from ``<state_dir>/gateway.token`` (0600), and a
-  ``gateway_token`` key in the TOML is refused.
+  ``gateway_token`` key in the TOML is refused. The token is OpenClaw's Gateway's: only read,
+  passed to the jail and struck for a profile that uses one.
+- ``[agent] profile`` (T17a-3, docs/34 section 7): ``"openclaw"`` (the default) or ``"custom"``,
+  whose own settings (image by digest, entrypoint, command, workdir, env, ``[agent.model]``,
+  ``[agent.ready]``, ``[agent.rewind]``) describe any other agent (backtide/jail/profiles/
+  custom.py). Nothing of the jail is an [agent] setting: ``ports`` and every security option
+  are refused by name. The agent's config folder is ``<state_dir>/<profile>``.
 - Tokens live in a ``Secret``, whose ``repr`` and ``str`` are ``[REDACTED]``. Errors about the
   token or its file say the size and the permissions, never the content, and no error quotes the
   TOML either (a syntax error says the line, and that is all).
@@ -69,9 +75,11 @@ from backtide.gate.translate.base import Trusted, normalize_trusted
 from backtide.gate.translate.read_post import check_read_endpoint
 from backtide.jail.ca import CaPaths
 from backtide.jail.config import AGENT_DIR, AgentJailConfig, Protected
+from backtide.jail.model import MODEL_ID, ModelProvider
 from backtide.jail.profile import AgentProfile
-from backtide.jail.profiles import DEFAULT_PROFILE
-from backtide.jail.profiles.openclaw import MODEL_ID, ModelProvider
+from backtide.jail.profiles import CUSTOM, DEFAULT_PROFILE, NAMED, profile_names
+from backtide.jail.profiles.custom import KEYS as CUSTOM_KEYS
+from backtide.jail.profiles.custom import custom_profile
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
@@ -106,7 +114,7 @@ STATE_DB = "blackbox.db"
 STATE_KEY = "blackbox.key"
 STATE_CHECKPOINT = "blackbox.checkpoint"
 STATE_TOKEN = "gateway.token"  # noqa: S105 - the file's name, not a secret
-STATE_AGENT_CONFIG = "openclaw"
+STATE_AGENT_CONFIG = "openclaw"  # OpenClaw's: each profile's config folder is named after it
 STATE_LOCK = "backtide.lock"
 STATE_PENDING = "rewind.pending"
 STATE_SOCKET = "control.sock"
@@ -138,6 +146,21 @@ _AGENT_KEYS = frozenset(
         "tmp_size", "stop_timeout", "ready_timeout", "config_dir",
     }
 )  # fmt: skip
+# What the jail decides, the same for every agent (docs/34, section 6): never an [agent] setting,
+# refused by name so the owner reads why. ``ports`` has its own words (_PORTS).
+_JAIL_KEYS = frozenset(
+    {
+        "privileged", "cap_add", "cap_drop", "capabilities", "security_opt", "seccomp",
+        "seccomp_profile", "apparmor", "no_new_privileges", "read_only", "user", "volumes",
+        "volume", "mounts", "binds", "tmpfs", "devices", "device", "network_mode", "networks",
+        "dns", "dns_search", "dns_options", "extra_hosts", "add_host", "links", "pid", "ipc",
+        "uts", "userns", "cgroup", "cgroup_parent", "cgroupns", "sysctls", "group_add",
+        "runtime", "init", "ulimits", "oom_kill_disable", "restart", "log_driver", "log_opt",
+        "protected", "home", "proxy_url", "no_proxy", "ca_dir", "ca_file",
+        "workspace",
+    }
+)  # fmt: skip
+_PORTS = frozenset({"ports", "publish", "expose", "publish_all"})
 # [proxy]: the container options a file may change (``internal_egress`` and ``allow_shared_ids``
 # are test-only concessions, so not here), and what the proxy lets out. Never a key.
 _PROXY_CONTAINER_KEYS = frozenset(
@@ -289,7 +312,8 @@ class ServiceConfig:
 
     state_dir: Path
     volume: Path
-    gateway_token: Secret
+    # OpenClaw's Gateway token, for a profile that uses one (required then): None otherwise.
+    gateway_token: Secret | None = None
     workspace_limit: int | None = None
     cycle_interval: float = DEFAULT_CYCLE_INTERVAL
     prune_interval: float = DEFAULT_PRUNE_INTERVAL
@@ -313,8 +337,13 @@ class ServiceConfig:
                 f"state_dir {self.state_dir} and volume {self.volume} must not contain each "
                 "other: the agent writes the volume, so backtide's black box can never live in it"
             )
-        if not isinstance(self.gateway_token, Secret):
+        profile = agent_profile_of(self.agent)  # every [agent] setting, the profile's first
+        if self.gateway_token is not None and not isinstance(self.gateway_token, Secret):
             raise ConfigError("gateway_token must be a Secret")
+        if profile.token_env is not None and self.gateway_token is None:
+            raise ConfigError(
+                f"profile {profile.name} needs the gateway token: <state_dir>/{STATE_TOKEN}"
+            )
         if self.workspace_limit is not None and not _positive_int(self.workspace_limit):
             raise ConfigError(
                 f"workspace_limit must be a positive number of bytes, got {self.workspace_limit!r}"
@@ -325,9 +354,6 @@ class ServiceConfig:
         ):
             if isinstance(seconds, bool) or not isinstance(seconds, int | float) or seconds <= 0:
                 raise ConfigError(f"{label} must be a positive number of seconds, got {seconds!r}")
-        unknown = sorted(set(self.agent) - _AGENT_KEYS)
-        if unknown:
-            raise ConfigError(f"unknown [agent] settings: {', '.join(map(repr, unknown))}")
         config_dir = self.agent_config_dir
         _require_no_dotdot("[agent] config_dir", config_dir)
         if self.state_dir.is_relative_to(config_dir):
@@ -337,6 +363,7 @@ class ServiceConfig:
             )
         self._check_growth(config_dir)
         self._check_proxy(config_dir)
+        self._check_model(profile)
         self._check_sensor(config_dir)
         # Every agent option, and that no folder of the agent shows a protected path (T14a).
         # Last, so the checks above say first what is wrong in their own words.
@@ -376,6 +403,16 @@ class ServiceConfig:
             raise ConfigError("provider_keys must map each provider to its ProviderKey")
         self.model_providers()
         self.proxy_jail_config()
+
+    def _check_model(self, profile: AgentProfile) -> None:
+        """The providers whose fake key the profile puts in a variable are in ``[proxy]``."""
+        names = {provider.name for provider in self.proxy_settings().providers}
+        for variable, provider in profile.fake_key_env:
+            if provider not in names:
+                raise ConfigError(
+                    f"[agent.model] provider {provider!r} is not one of [[proxy.providers]]: "
+                    f"{variable} would get no key"
+                )
 
     def _check_sensor(self, config_dir: Path) -> None:
         if not isinstance(self.sensor, Mapping):
@@ -449,8 +486,11 @@ class ServiceConfig:
 
     @property
     def agent_config_dir(self) -> Path:
+        """``[agent] config_dir``, or ``<state_dir>/<profile>`` (OpenClaw's: ``openclaw``)."""
         configured = self.agent.get("config_dir")
-        return Path(configured) if configured is not None else self.state_dir / STATE_AGENT_CONFIG
+        if configured is not None:
+            return Path(configured)
+        return self.state_dir / self.agent_profile.name
 
     @property
     def lock_file(self) -> Path:
@@ -508,15 +548,30 @@ class ServiceConfig:
 
     @property
     def agent_profile(self) -> AgentProfile:
-        """Which agent runs in the jail (docs/34, section 7). OpenClaw for now: T17a-3 reads
-        ``[agent] profile``."""
-        return DEFAULT_PROFILE
+        """Which agent runs in the jail (docs/34, section 7): ``[agent] profile``, OpenClaw by
+        default, or the ``custom`` one its settings describe."""
+        return agent_profile_of(self.agent)
+
+    def gateway_secrets(self) -> list[str]:
+        """The Gateway token, to strike wherever it shows, when there is one."""
+        return [] if self.gateway_token is None else [self.gateway_token.reveal()]
 
     def jail_config(self) -> AgentJailConfig:
         """The agent's container settings. It carries the token in the clear (it must reach
         ``docker create``'s environment), so do not log it; AgentJailConfig's repr hides it.
-        The model providers go with their FAKE keys only (for openclaw.json)."""
-        options = {key: value for key, value in self.agent.items() if key != "config_dir"}
+        The model providers go with their FAKE keys only (for the profile: OpenClaw puts them in
+        openclaw.json, a custom agent gets one in its ``key_env``). The token only goes to a
+        profile that uses it."""
+        profile = self.agent_profile
+        options = {
+            key: value
+            for key, value in self.agent.items()
+            if key in _AGENT_KEYS and key != "config_dir"
+        }
+        ready = self.agent.get("ready")
+        if isinstance(ready, Mapping) and "timeout" in ready:
+            options["ready_timeout"] = ready["timeout"]  # agent_profile_of checked it
+        token = self.gateway_token if profile.token_env is not None else None
         try:
             providers = tuple(
                 ModelProvider(
@@ -529,6 +584,7 @@ class ServiceConfig:
                 for p in self.proxy_settings().providers
                 if p.name in self.provider_keys
             )
+            profile.check_providers(providers)
         except ValueError as error:
             raise ConfigError(f"invalid [proxy] providers: {error}") from error
         try:
@@ -536,10 +592,10 @@ class ServiceConfig:
                 workspace=self.workspace,
                 config_dir=self.agent_config_dir,
                 ca_dir=self.agent_ca_dir,
-                gateway_token=self.gateway_token.reveal(),
+                gateway_token=None if token is None else token.reveal(),
                 model_providers=providers,
                 protected=self.agent_protected(),
-                profile=self.agent_profile,
+                profile=profile,
                 **options,
             )
         except ValueError as error:
@@ -887,8 +943,13 @@ class ServiceConfig:
         agent = dict(agent)
         if "config_dir" in agent:
             agent["config_dir"] = _as_path("[agent] config_dir", agent["config_dir"])
-        token_file = state_dir / STATE_TOKEN
-        token = _decode(_read_file(token_file, "gateway token file", MAX_TOKEN_BYTES, private=True))
+        token = None
+        if agent_profile_of(agent).token_env is not None:  # OpenClaw's Gateway; others have none
+            token_file = state_dir / STATE_TOKEN
+            text = _decode(
+                _read_file(token_file, "gateway token file", MAX_TOKEN_BYTES, private=True)
+            )
+            token = Secret(text.strip())
         optional = {key: data[key] for key in _OPTIONAL_KEYS if key in data}
         if "volume_image" in data:
             optional["volume_image"] = _as_path("volume_image", data["volume_image"])
@@ -914,10 +975,65 @@ class ServiceConfig:
         return cls(
             state_dir=state_dir,
             volume=volume,
-            gateway_token=Secret(token.strip()),
+            gateway_token=token,
             agent=agent,
             **optional,
         )
+
+
+def agent_profile_of(agent: Mapping[str, Any]) -> AgentProfile:
+    """The agent profile ``[agent]`` describes (docs/34, section 7): ``profile`` names one of
+    the named profiles (OpenClaw by default) or ``custom``, whose own settings describe it
+    (profiles/custom.py). Refuses (ConfigError) any setting of the jail, ``ports``, a setting
+    only a custom agent has given to a named profile, and every check of the profile. Pure: the
+    image's own environment is checked when the agent starts (AgentJail)."""
+    if not isinstance(agent, Mapping):
+        raise ConfigError("[agent] must be a table")
+    ports = sorted(set(agent) & _PORTS)
+    if ports:
+        raise ConfigError(
+            f"[agent] {', '.join(map(repr, ports))}: an agent on its internal network publishes "
+            "no port (docs/34, P9); a web of the agent would need a relay of backtide"
+        )
+    jail = sorted(set(agent) & _JAIL_KEYS)
+    if jail:
+        raise ConfigError(
+            f"[agent] {', '.join(map(repr, jail))}: the jail decides it, the same for every "
+            "agent (docs/34, section 6), and no setting changes it"
+        )
+    unknown = sorted(set(agent) - _AGENT_KEYS - CUSTOM_KEYS - {"profile"})
+    if unknown:
+        raise ConfigError(f"unknown [agent] settings: {', '.join(map(repr, unknown))}")
+    name = agent.get("profile", DEFAULT_PROFILE.name)
+    own = {key: value for key, value in agent.items() if key in CUSTOM_KEYS}
+    if name != CUSTOM:
+        if name not in NAMED:
+            raise ConfigError(
+                f"[agent] profile must be one of {', '.join(map(repr, profile_names()))}, "
+                f"got {name!r:.80}"
+            )
+        if own:
+            raise ConfigError(
+                f'[agent] {", ".join(map(repr, sorted(own)))}: only for profile = "{CUSTOM}" '
+                f"(the {name} profile has its own)"
+            )
+        return NAMED[name]
+    _check_ready_timeout(agent)
+    try:
+        return custom_profile(agent.get("image"), own)
+    except ValueError as error:
+        raise ConfigError(f"invalid [agent] (profile custom): {error}") from None
+
+
+def _check_ready_timeout(agent: Mapping[str, Any]) -> None:
+    ready = agent.get("ready")
+    if not isinstance(ready, Mapping) or "timeout" not in ready:
+        return
+    if "ready_timeout" in agent:
+        raise ConfigError("[agent] ready_timeout and [agent.ready] timeout: set only one")
+    timeout = ready["timeout"]
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
+        raise ConfigError("[agent.ready] timeout must be a positive number of seconds")
 
 
 def _require_private_state_dir(path: Path) -> None:

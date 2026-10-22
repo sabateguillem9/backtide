@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
+from backtide.jail.model import ModelProvider
 from backtide.jail.profile import (
     CONTAINER_CONFIG_DIR,
     CONTAINER_HOME,
@@ -52,7 +53,6 @@ from backtide.jail.profiles.openclaw import IMAGE as IMAGE
 from backtide.jail.profiles.openclaw import OPENCLAW_VERSION as OPENCLAW_VERSION
 from backtide.jail.profiles.openclaw import READY_LOG_LINE as READY_LOG_LINE
 from backtide.jail.profiles.openclaw import TOKEN_ENV as TOKEN_ENV
-from backtide.jail.profiles.openclaw import ModelProvider
 from backtide.jail.profiles.openclaw import openclaw_config as openclaw_config
 
 AGENT_DIR = "agente"  # inside <root>/workspace: the ONLY host directory the agent sees
@@ -119,6 +119,17 @@ _PROXY_REST_ENV = (
     ("GIT_SSL_CAINFO", str(CONTAINER_CA_FILE)),
 )
 
+# Files programs source by themselves before running anything (T17a-1: the Claude Code image
+# sets both to /etc/sandbox-persistent.sh): pointed at /dev/null, so whatever reads them reads
+# nothing and whatever appends to them writes nowhere. Measured in the VM with that image: a
+# non-interactive ``bash -c`` sources nothing with /dev/null (nor with an empty value). A login or
+# interactive bash still exports the image's own value again (its /etc/profile.d and
+# /etc/bash.bashrc): that is code of the pinned image, on the read-only root.
+_NEUTRAL_ENV = (
+    ("BASH_ENV", "/dev/null"),
+    ("CLAUDE_ENV_FILE", "/dev/null"),
+)
+
 # Docker object names, a hostname label, docker's memory sizes and CPU counts.
 _DOCKER_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", re.ASCII)
 _HOSTNAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
@@ -169,12 +180,14 @@ class AgentJailConfig:
 
     ``profile`` says which agent runs (OpenClaw by default) and only fills in the image (when
     ``image`` is empty), the command, the variables and the config files: every other field
-    here is the jail's, the same for every agent."""
+    here is the jail's, the same for every agent. ``gateway_token`` is for a profile that has a
+    ``token_env`` (OpenClaw's Gateway), required there and refused for any other: nothing that
+    no profile asked for reaches the container."""
 
     workspace: Path
     config_dir: Path
     ca_dir: Path
-    gateway_token: str = field(repr=False)
+    gateway_token: str | None = field(default=None, repr=False)
     # The model providers with their FAKE keys, for the profile (T06-5; OpenClaw puts them in
     # openclaw.json): never in the argv. The real keys never reach this object.
     model_providers: tuple[ModelProvider, ...] = field(default=(), repr=False)
@@ -232,7 +245,10 @@ class AgentJailConfig:
         _require_match("cpus", self.cpus, _CPUS_RE)
         if float(self.cpus) <= 0:
             raise ValueError(f"cpus must be positive, got {self.cpus!r}")
-        if not _TOKEN_RE.fullmatch(self.gateway_token):
+        if self.profile.token_env is None:
+            if self.gateway_token is not None:
+                raise ValueError(f"profile {self.profile.name} uses no gateway token")
+        elif not isinstance(self.gateway_token, str) or not _TOKEN_RE.fullmatch(self.gateway_token):
             raise ValueError(
                 "gateway_token must be 32 to 256 URL-safe characters (secrets.token_urlsafe)"
             )
@@ -256,6 +272,7 @@ class AgentJailConfig:
         names = [p.name for p in self.model_providers]
         if len(set(names)) != len(names):
             raise ValueError("two model providers have the same name")
+        self.profile.check_providers(self.model_providers)
         self._check_protected()
 
     def _check_protected(self) -> None:
@@ -323,13 +340,21 @@ def container_env(config: AgentJailConfig) -> list[tuple[str, str]]:
         *((name, PROXY_URL) for name in profile.proxy_url_env),
         *_PROXY_REST_ENV,
         *((name, str(CONTAINER_CA_FILE)) for name in profile.ca_file_env),
+        *_NEUTRAL_ENV,
     ]
 
 
 def jail_env_names() -> frozenset[str]:
     """Every variable the jail sets itself, whatever the profile: none may come from one."""
     return frozenset(
-        name for name, _ in (*_HOME_ENV, *_NO_TRACKING_ENV, *_PROXY_URL_ENV, *_PROXY_REST_ENV)
+        name
+        for name, _ in (
+            *_HOME_ENV,
+            *_NO_TRACKING_ENV,
+            *_PROXY_URL_ENV,
+            *_PROXY_REST_ENV,
+            *_NEUTRAL_ENV,
+        )
     )
 
 
@@ -338,7 +363,9 @@ def token_env(config: AgentJailConfig) -> dict[str, str]:
     an argv. The profile's token (OpenClaw: the Gateway token) and the FAKE key of each provider
     the profile reads from a variable (none for OpenClaw: its fake keys are in openclaw.json)."""
     profile = config.profile
-    env = {} if profile.token_env is None else {profile.token_env: config.gateway_token}
+    env: dict[str, str] = {}
+    if profile.token_env is not None and config.gateway_token is not None:
+        env[profile.token_env] = config.gateway_token
     fake_keys = {provider.name: provider.fake_key for provider in config.model_providers}
     for name, provider in profile.fake_key_env:
         if provider in fake_keys:

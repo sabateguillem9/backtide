@@ -365,9 +365,7 @@ def build_sensor(
     # the real one it never has, but nothing it could show is recorded either). known_secrets
     # leaves out what is too short to search for (redact() still runs), so nothing here fails
     # quietly: a config whose providers cannot be built raises.
-    known = known_secrets(
-        [config.gateway_token.reveal(), *config.model_providers().known_secrets()]
-    )
+    known = known_secrets([*config.gateway_secrets(), *config.model_providers().known_secrets()])
     # cut_tails: Tetragon cuts long arguments (~327 KiB), maybe in the middle of a secret.
     live = scrub if scrub is not None else LiveScrub()
     live.replace(known)
@@ -480,7 +478,7 @@ def egress_policy(
     policy = Policy(
         allow_hosts=settings.allow_hosts,
         providers=providers,
-        secrets=known_secrets([config.gateway_token.reveal()]),
+        secrets=known_secrets(config.gateway_secrets()),
         provider_tools=settings.allow_provider_tools,
         unknown_hosts=gate.unknown_hosts,
         trusted=gate.trusted,
@@ -576,7 +574,7 @@ def key_reloader(
 def _refresh(scrub: LiveScrub | None, config: ServiceConfig, providers: Providers) -> None:
     """The process sensor's list of secrets: the Gateway token and ``providers``' keys."""
     if scrub is not None:
-        scrub.replace(known_secrets([config.gateway_token.reveal(), *providers.known_secrets()]))
+        scrub.replace(known_secrets([*config.gateway_secrets(), *providers.known_secrets()]))
 
 
 def fail_closed(config: ServiceConfig, current: Policy) -> Policy:

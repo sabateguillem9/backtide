@@ -42,6 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backtide.blackbox import Event, Source
 from backtide.gate.phrase import api_name
+from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
 from backtide.service.notice import rewind_notice
 from backtide.snapshots import Snapshot, SnapshotError
@@ -189,6 +190,7 @@ def create_app(
     keepalive: float = KEEPALIVE,
     tz: tzinfo | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    agent_lines: Sequence[str] = DEFAULT_PROFILE.rewind_notice_lines,
 ) -> Guard:
     """The ASGI app for one run, wrapped in its ``Guard``. ``token`` is the link's one-time
     token, ``session`` the secret of the cookie it is exchanged for, ``prefix`` the random path
@@ -207,7 +209,8 @@ def create_app(
     held requests (T10-5, ``backtide.web.approve``): without ``pending`` the page lists the real
     ones (from the service with `backtide web --aprobar`, else from the black box), and the
     POST that decides exists only when it is enabled. ``spend`` reads the spending (T11) for the
-    panel and Settings; changing the caps goes through ``settings`` (`--ajustes`)."""
+    panel and Settings; changing the caps goes through ``settings`` (`--ajustes`).
+    ``agent_lines`` are the agent profile's lines of the rewind notice (T17a-3)."""
     access = Access(token or make_token(), session)
     prefix = prefix or make_prefix()
     base = f"/s/{prefix}"
@@ -882,7 +885,7 @@ def create_app(
             200,
             "confirm",
             snap=target,
-            notice=rewind_notice(target.taken_at, now=clock(), tz=zone),
+            notice=rewind_notice(target.taken_at, now=clock(), tz=zone, agent_lines=agent_lines),
             csrf=access.csrf,
             ticket=tickets.issue(target.id),
         )

@@ -116,6 +116,10 @@
         "--env",
         "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
         "--env",
+        "BASH_ENV=/dev/null",
+        "--env",
+        "CLAUDE_ENV_FILE=/dev/null",
+        "--env",
         "OPENCLAW_GATEWAY_TOKEN",
         "--entrypoint",
         "tini",
@@ -245,6 +249,14 @@
         [
           "GIT_SSL_CAINFO",
           "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "BASH_ENV",
+          "/dev/null"
+        ],
+        [
+          "CLAUDE_ENV_FILE",
+          "/dev/null"
         ]
       ],
       "config_files": {
@@ -296,7 +308,9 @@
             "REQUESTS_CA_BUNDLE=/etc/backtide-ca/ca.pem",
             "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
             "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
-            "OPENCLAW_GATEWAY_TOKEN=ttttttttttttttttttttttttttttttttttttttttttt"
+            "OPENCLAW_GATEWAY_TOKEN=ttttttttttttttttttttttttttttttttttttttttttt",
+            "BASH_ENV=/dev/null",
+            "CLAUDE_ENV_FILE=/dev/null"
           ]
         },
         "HostConfig": {
@@ -366,7 +380,7 @@
         "its mounts are None, not ['/srv/bt/volume/workspace/agente:/workspace:z', '/srv/bt/state/openclaw:/config:ro,z', '/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z']",
         "its security options are [], not ['no-new-privileges=true']",
         "its seccomp profile is not the current one",
-        "its environment differs in ['CLAWHUB_DISABLE_TELEMETRY', 'CURL_CA_BUNDLE', 'DO_NOT_TRACK', 'GIT_SSL_CAINFO', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'NO_PROXY', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_CONFIG_READONLY', 'OPENCLAW_DISABLE_BONJOUR', 'OPENCLAW_GATEWAY_TOKEN', 'OPENCLAW_NO_AUTO_UPDATE', 'OPENCLAW_OFFLINE', 'OPENCLAW_PROXY_URL', 'OPENCLAW_SKIP_CANVAS_HOST', 'OPENCLAW_SKIP_CRON', 'OPENCLAW_SKIP_GMAIL_WATCHER', 'OPENCLAW_STATE_DIR', 'OPENCLAW_WORKSPACE_DIR', 'PATH', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'http_proxy', 'https_proxy', 'no_proxy']",
+        "its environment differs in ['BASH_ENV', 'CLAUDE_ENV_FILE', 'CLAWHUB_DISABLE_TELEMETRY', 'CURL_CA_BUNDLE', 'DO_NOT_TRACK', 'GIT_SSL_CAINFO', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'NO_PROXY', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_CONFIG_READONLY', 'OPENCLAW_DISABLE_BONJOUR', 'OPENCLAW_GATEWAY_TOKEN', 'OPENCLAW_NO_AUTO_UPDATE', 'OPENCLAW_OFFLINE', 'OPENCLAW_PROXY_URL', 'OPENCLAW_SKIP_CANVAS_HOST', 'OPENCLAW_SKIP_CRON', 'OPENCLAW_SKIP_GMAIL_WATCHER', 'OPENCLAW_STATE_DIR', 'OPENCLAW_WORKSPACE_DIR', 'PATH', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'http_proxy', 'https_proxy', 'no_proxy']",
         "its networks are None / [], not only 'backtide-agente-net'"
       ]
     },
@@ -470,6 +484,10 @@
         "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
         "--env",
         "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
+        "--env",
+        "BASH_ENV=/dev/null",
+        "--env",
+        "CLAUDE_ENV_FILE=/dev/null",
         "--env",
         "OPENCLAW_GATEWAY_TOKEN",
         "--entrypoint",
@@ -600,6 +618,14 @@
         [
           "GIT_SSL_CAINFO",
           "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "BASH_ENV",
+          "/dev/null"
+        ],
+        [
+          "CLAUDE_ENV_FILE",
+          "/dev/null"
         ]
       ],
       "config_files": {
@@ -651,7 +677,9 @@
             "REQUESTS_CA_BUNDLE=/etc/backtide-ca/ca.pem",
             "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
             "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
-            "OPENCLAW_GATEWAY_TOKEN=A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9"
+            "OPENCLAW_GATEWAY_TOKEN=A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9",
+            "BASH_ENV=/dev/null",
+            "CLAUDE_ENV_FILE=/dev/null"
           ]
         },
         "HostConfig": {
@@ -721,7 +749,7 @@
         "its mounts are None, not ['/srv/bt/volume/workspace/agente:/workspace:z', '/srv/bt/state/openclaw:/config:ro,z', '/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z']",
         "its security options are [], not ['no-new-privileges=true']",
         "its seccomp profile is not the current one",
-        "its environment differs in ['CLAWHUB_DISABLE_TELEMETRY', 'CURL_CA_BUNDLE', 'DO_NOT_TRACK', 'GIT_SSL_CAINFO', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'NO_PROXY', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_CONFIG_READONLY', 'OPENCLAW_DISABLE_BONJOUR', 'OPENCLAW_GATEWAY_TOKEN', 'OPENCLAW_NO_AUTO_UPDATE', 'OPENCLAW_OFFLINE', 'OPENCLAW_PROXY_URL', 'OPENCLAW_SKIP_CANVAS_HOST', 'OPENCLAW_SKIP_CRON', 'OPENCLAW_SKIP_GMAIL_WATCHER', 'OPENCLAW_STATE_DIR', 'OPENCLAW_WORKSPACE_DIR', 'PATH', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'http_proxy', 'https_proxy', 'no_proxy']",
+        "its environment differs in ['BASH_ENV', 'CLAUDE_ENV_FILE', 'CLAWHUB_DISABLE_TELEMETRY', 'CURL_CA_BUNDLE', 'DO_NOT_TRACK', 'GIT_SSL_CAINFO', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'NO_PROXY', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_CONFIG_READONLY', 'OPENCLAW_DISABLE_BONJOUR', 'OPENCLAW_GATEWAY_TOKEN', 'OPENCLAW_NO_AUTO_UPDATE', 'OPENCLAW_OFFLINE', 'OPENCLAW_PROXY_URL', 'OPENCLAW_SKIP_CANVAS_HOST', 'OPENCLAW_SKIP_CRON', 'OPENCLAW_SKIP_GMAIL_WATCHER', 'OPENCLAW_STATE_DIR', 'OPENCLAW_WORKSPACE_DIR', 'PATH', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'http_proxy', 'https_proxy', 'no_proxy']",
         "its networks are None / [], not only 'backtide-test-net-0123abcd'"
       ]
     }

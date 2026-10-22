@@ -47,11 +47,12 @@ def remove_sensor(name: str) -> None:
 
 @contextmanager
 def sensed_service(
-    make_real_service: Callable[..., Service], *, required: bool = False
+    make_real_service: Callable[..., Service], *, required: bool = False, **options: Any
 ) -> Iterator[Service]:
-    """A service (not started) whose config has a ``[sensor]`` and whose launcher runs it."""
+    """A service (not started) whose config has a ``[sensor]`` and whose launcher runs it.
+    ``options`` go to ``make_real_service`` (another agent: T17a-3's ``agent_toml``)."""
     remove_stale_sensors()
-    service = make_real_service()
+    service = make_real_service(**options)
     name = f"{SENSOR_PREFIX}{os.getpid()}-{uuid4().hex[:12]}"
     with service.config_path.open("a") as config:
         config.write(f'[sensor]\nname = "{name}"\n')

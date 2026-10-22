@@ -761,6 +761,45 @@ def test_start_refuses_an_unreadable_image_environment(
         ready_jail.start()
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "GITHUB_TOKEN=ghp_" + "a" * 36,
+        "ANTHROPIC_API_KEY=sk-ant-api03-" + "Zz9" * 10,
+        "DATABASE_URL=postgres://app:hunter2@db.example.com/app",
+        "MY_SERVICE_SECRET=plain-but-named-as-a-secret",
+        "SOME_SETTING=backtide-fake-anthropic-" + "k" * 32,
+    ],
+    ids=["github-token", "model-key", "url-password", "secret-name", "a-fake-key"],
+)
+def test_start_refuses_an_image_whose_own_environment_carries_a_secret(
+    ready_jail: AgentJail, fake_docker: FakeDocker, entry: str
+) -> None:
+    """Docker hands the image's ENV to the agent: a secret there is one it sees (T17a-3,
+    docs/34 section 6). Checked at every start, for any profile; only names are said."""
+    env = ["PATH=/usr/bin:/bin", entry]
+    fake_docker.reply("image", "inspect", Reply(json.dumps(env)))
+    name, _, value = entry.partition("=")
+    with pytest.raises(JailError, match=f"looks like a secret.*\\({name}\\)") as caught:
+        ready_jail.start()
+    assert value not in str(caught.value)
+    assert ["start", ready_jail.config.name] not in fake_docker.commands()
+
+
+def test_start_accepts_an_image_environment_without_secrets(
+    ready_jail: AgentJail, fake_docker: FakeDocker
+) -> None:
+    env = [
+        "PATH=/usr/bin:/bin",
+        "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",  # python's images: a public one
+        "API_TOKEN=",  # a name alone holds nothing
+        "NO_PROXY=172.17.0.0/16",  # the jail's own wins (verify.py checks the result)
+    ]
+    fake_docker.reply("image", "inspect", Reply(json.dumps(env)))
+    ready_jail.start()
+    assert ["start", ready_jail.config.name] in fake_docker.commands()
+
+
 def test_start_needs_the_seccomp_profile(
     config: AgentJailConfig, fake_docker: FakeDocker, tmp_path: Path
 ) -> None:
