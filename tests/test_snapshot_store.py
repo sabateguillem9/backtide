@@ -35,7 +35,7 @@ from backtide.snapshots import (
     SnapshotStore,
     btrfs,
 )
-from tests.fds import open_fds
+from tests.fds import open_fds_on
 
 FAKED = (
     "create_subvolume",
@@ -595,12 +595,12 @@ def test_the_lock_is_polled_until_the_timeout(store: SnapshotStore, clock: Clock
 
 
 def test_the_lock_fds_are_closed_when_the_body_raises(store: SnapshotStore, clock: Clock) -> None:
-    before = open_fds()
-
+    lock_file = store.root / store_module.LOCK_FILE
     with pytest.raises(RuntimeError), store._lock():
+        assert len(open_fds_on(store.root, lock_file)) >= 2  # the root and the lock are open
         raise RuntimeError("boom")
 
-    assert open_fds() - before == set()  # nothing the lock opened stays open
+    assert open_fds_on(store.root, lock_file) == set()  # nothing the lock opened stays open
     other_store(store.root, clock, timeout=0).take(Reason.PERIODIC)
 
 

@@ -22,3 +22,22 @@ def open_fds() -> set[int]:
             continue
         found.add(int(name))
     return found
+
+
+def open_fds_on(*paths: os.PathLike[str] | str) -> set[int]:
+    """The open descriptors that point at one of ``paths``. Another test's thread can open
+    descriptors while one is measured (CI saw two appear that way); counting only the files the
+    code under test opens cannot be fooled by that."""
+    wanted = set()
+    for path in paths:
+        info = os.stat(path, follow_symlinks=False)
+        wanted.add((info.st_dev, info.st_ino))
+    found = set()
+    for fd in open_fds():
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            continue
+        if (info.st_dev, info.st_ino) in wanted:
+            found.add(fd)
+    return found
