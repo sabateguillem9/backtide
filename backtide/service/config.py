@@ -69,7 +69,9 @@ from backtide.gate.translate.base import Trusted, normalize_trusted
 from backtide.gate.translate.read_post import check_read_endpoint
 from backtide.jail.ca import CaPaths
 from backtide.jail.config import AGENT_DIR, AgentJailConfig, Protected
-from backtide.jail.openclaw import MODEL_ID, ModelProvider
+from backtide.jail.profile import AgentProfile
+from backtide.jail.profiles import DEFAULT_PROFILE
+from backtide.jail.profiles.openclaw import MODEL_ID, ModelProvider
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
@@ -501,6 +503,12 @@ class ServiceConfig:
     def workspace(self) -> Path:
         return self.volume / "workspace"
 
+    @property
+    def agent_profile(self) -> AgentProfile:
+        """Which agent runs in the jail (docs/34, section 7). OpenClaw for now: T17a-3 reads
+        ``[agent] profile``."""
+        return DEFAULT_PROFILE
+
     def jail_config(self) -> AgentJailConfig:
         """The agent's container settings. It carries the token in the clear (it must reach
         ``docker create``'s environment), so do not log it; AgentJailConfig's repr hides it.
@@ -528,6 +536,7 @@ class ServiceConfig:
                 gateway_token=self.gateway_token.reveal(),
                 model_providers=providers,
                 protected=self.agent_protected(),
+                profile=self.agent_profile,
                 **options,
             )
         except ValueError as error:
@@ -719,6 +728,14 @@ class ServiceConfig:
             allowed = tuple(dict.fromkeys(check_allow_entry(tool) for tool in tools))
         except ValueError as error:
             raise ConfigError(f"[proxy] allow_provider_tools: {error}") from None
+        # The fields the agent's own model client sends (decision 5 of docs/34): its profile's,
+        # for it alone. Only top-level fields by name, never a provider-side tool.
+        allowed = tuple(dict.fromkeys((*allowed, *self.agent_profile.provider_params)))
+        if len(allowed) > MAX_PROVIDER_TOOLS:
+            raise ConfigError(
+                f"[proxy] allow_provider_tools and the agent's profile allow more than "
+                f"{MAX_PROVIDER_TOOLS} provider fields and tools"
+            )
         return ProxySettings(
             allow_hosts=tuple(hosts), providers=providers, allow_provider_tools=allowed
         )

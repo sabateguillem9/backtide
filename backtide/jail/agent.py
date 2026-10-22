@@ -12,8 +12,12 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
   rewound workspace (a running container would keep the old one mounted).
 - create() and start() refuse an agent that shares backtide's uid or gid (see AgentJailConfig),
   and start() refuses a container that is not exactly this config's jail (backtide/jail/verify.py)
-  or whose mounted config folder holds anything but openclaw.json, or whose CA folder holds
-  anything but the certificate (ca.py writes it; the CA's key never goes there).
+  or whose mounted config folder holds anything but the profile's config files (OpenClaw:
+  openclaw.json), or whose CA folder holds anything but the certificate (ca.py writes it; the
+  CA's key never goes there).
+- What the agent is (its folders in /workspace, its config files, how it says it is ready)
+  comes from the config's agent profile (backtide/jail/profile.py); every check here is the
+  same for every agent.
 - The mount check (T14a, backtide/jail/mounts.py): create() refuses a planned container, and
   start() an existing one, that would show the agent what it must not (ExposedJail); right
   after ``docker start`` the running container is checked again and killed if it does.
@@ -44,15 +48,10 @@ from backtide.jail import docker
 from backtide.jail.ca import certificates_only
 from backtide.jail.config import (
     AGENT_DIR,
-    AGENT_SUBDIRS,
     CA_CERT_FILE,
-    CONFIG_FILE,
-    HEALTH_URL,
-    READY_LOG_LINE,
     AgentJailConfig,
     docker_create_argv,
     network_create_argv,
-    openclaw_config,
     token_env,
 )
 from backtide.jail.docker import JailError
@@ -62,7 +61,6 @@ from backtide.jail.mounts import (
     live_mount_problems,
     planned_info,
 )
-from backtide.jail.openclaw import check_rewindable
 from backtide.jail.verify import container_problems
 
 logger = logging.getLogger(__name__)
@@ -70,21 +68,14 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL = 0.5  # seconds between two readiness checks
 EXEC_TIMEOUT = 60.0
 EXEC_MAX_OUTPUT = 1024 * 1024  # bytes a docker exec may print by default
-HEALTH_TIMEOUT = 15.0  # one /healthz probe, docker exec included
-HEALTH_MAX_OUTPUT = 64 * 1024  # /healthz answers with a few bytes of JSON
-# -q first: curl must not read a .curlrc from HOME, which is the agent's /workspace/home (one
-# with `url = file:///dev/zero` and `next` made this probe print 1 GB/s). The agent can still
-# trace curl or answer on the Gateway's port itself, so the output is bounded as well.
-HEALTH_PROBE = (
-    "curl", "-q", "--fail", "--silent", "--max-time", "5", "--max-filesize", "4096", HEALTH_URL,
-)  # fmt: skip
-LOGS_MAX_OUTPUT = 1024 * 1024  # the logs of one start, read until [gateway] ready shows up
+HEALTH_TIMEOUT = 15.0  # one run of the profile's ready probe, docker exec included
+HEALTH_MAX_OUTPUT = 64 * 1024  # OpenClaw's /healthz answers with a few bytes of JSON
+LOGS_MAX_OUTPUT = 1024 * 1024  # the logs of one start, read until the ready line shows up
 LOG_TAIL_LINES = 20
 LOG_TAIL_MAX_OUTPUT = 512 * 1024  # 20 log entries of at most 16 KiB each, with room to spare
 AGENT_DIR_MODE = 0o700
 CONFIG_DIR_MODE = 0o750  # group: the agent's gid, so it can read its config and nothing else
 CONFIG_FILE_MODE = 0o640
-_TMP_CONFIG = f".{CONFIG_FILE}.tmp"
 _NO_SUCH_CONTAINER = "No such container"
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _NOT_RUNNING = "is not running"
@@ -160,8 +151,8 @@ class AgentJail:
             )
 
     def prepare_workspace(self) -> None:
-        """Create ``agente/`` and its ``home``, ``state`` and ``work`` folders where missing,
-        owned by the agent's uid and gid with mode 0700.
+        """Create ``agente/`` and the profile's folders in it (OpenClaw: ``home``, ``state`` and
+        ``work``) where missing, owned by the agent's uid and gid with mode 0700.
 
         Existing folders are only checked (a real directory, owned by the agent's uid): they
         belong to the agent and to its snapshots, so they are never changed. Creating them for
@@ -173,7 +164,7 @@ class AgentJail:
         try:
             agent_fd = self._ensure_agent_dir(workspace_fd, AGENT_DIR, self.config.agent_dir)
             try:
-                for name in AGENT_SUBDIRS:
+                for name in self.config.profile.workspace_dirs:
                     path = self.config.agent_dir / name
                     os.close(self._ensure_agent_dir(agent_fd, name, path))
             finally:
@@ -182,15 +173,26 @@ class AgentJail:
             os.close(workspace_fd)
 
     def write_config(self) -> None:
-        """Write OpenClaw's config into ``config_dir`` (created when missing), atomically.
+        """Write the profile's config files into ``config_dir`` (created when missing), each
+        atomically (OpenClaw: openclaw.json; a profile may write none, and the folder is still
+        there, empty).
 
-        The folder holds only openclaw.json (anything else there is refused, so nothing of
-        backtide is ever mounted by mistake). Folder 0750 and file 0640, owned by backtide, group
-        the agent's gid: the agent can read them, and the mount is read-only anyway. Raises
-        ``UnrewindableConfig`` (a ValueError, before touching the disk) when the config has
-        authorization that a rewind would revive (docs/20, section 8)."""
-        config = openclaw_config(self.config)
-        check_rewindable(config)  # an unsafe config is never written (UnrewindableConfig)
+        The folder holds only those files (anything else there is refused, so nothing of
+        backtide is ever mounted by mistake). Folder 0750 and files 0640, owned by backtide,
+        group the agent's gid: the agent can read them, and the mount is read-only anyway.
+        Raises the profile's ProfileError (a ValueError, before touching the disk) when the
+        config cannot be run safely: OpenClaw's ``UnrewindableConfig``, for authorization that
+        a rewind would revive (docs/20, section 8)."""
+        profile = self.config.profile
+        files = dict(profile.render_config(self.config))
+        if sorted(files) != sorted(profile.config_names) or not all(
+            isinstance(text, str) for text in files.values()
+        ):
+            raise JailError(
+                f"profile {profile.name} rendered {sorted(files)}, not its config files "
+                f"{sorted(profile.config_names)}"
+            )
+        profile.check_config(files)  # an unsafe config is never written (ProfileError)
         self._check_planned("gets no config")  # never written where the agent must not look
         path = self.config.config_dir
         try:
@@ -202,8 +204,8 @@ class AgentJail:
         dir_fd = _open_dir(path)
         try:
             self._check_config_dir(dir_fd, path)
-            content = json.dumps(config, indent=2) + "\n"
-            self._replace_config(dir_fd, content.encode())
+            for name in profile.config_names:
+                self._replace_config(dir_fd, name, files[name].encode())
         finally:
             os.close(dir_fd)
 
@@ -220,7 +222,7 @@ class AgentJail:
     def start(self) -> None:
         """Start the container. It must exist and be exactly this config's jail (anything
         else, such as a container left by an older backtide, raises JailError: remove it and
-        create it again). Returns before OpenClaw is ready."""
+        create it again). Returns before the agent is ready."""
         self._check_ids_not_shared()
         self._check_mount_sources()
         checked = self._check_container()
@@ -364,8 +366,10 @@ class AgentJail:
         return state is not None and state.get("Paused") is True
 
     def wait_ready(self, timeout: float | None = None) -> None:
-        """Wait until this run of the Gateway has logged ``[gateway] ready`` and /healthz
-        answers from inside the container. Raises JailError, with the last log lines, if the
+        """Wait until this run of the agent is ready as its profile says: it has logged the
+        profile's ready line and the ready probe answers from inside the container (OpenClaw:
+        ``[gateway] ready``, and /healthz says ``{"ok": true}``); without either, once it runs.
+        Raises JailError, with the last log lines, if the
         container stops or ``timeout`` (default: the config's) passes first, and also if the
         probe or the logs print more than their bound (the agent is not to be trusted then).
         A frozen container fails at once."""
@@ -620,6 +624,9 @@ class AgentJail:
         return _json_object(result.stdout, f"network {self.config.network}")
 
     def _logged_ready(self, started_at: str) -> bool:
+        line = self.config.profile.ready_log_line
+        if not line:
+            return True
         if not started_at:
             return False
         result = docker.run(
@@ -627,16 +634,16 @@ class AgentJail:
             check=False,
             max_output=LOGS_MAX_OUTPUT,
         )
-        return READY_LOG_LINE in result.stdout or READY_LOG_LINE in result.stderr
+        return line in result.stdout or line in result.stderr
 
     def _healthy(self) -> bool:
-        result = self.exec(HEALTH_PROBE, timeout=HEALTH_TIMEOUT, max_output=HEALTH_MAX_OUTPUT)
-        if result.returncode != 0:
-            return False
-        try:
-            return json.loads(result.stdout).get("ok") is True
-        except (ValueError, AttributeError):
-            return False
+        profile = self.config.profile
+        if not profile.ready_probe:
+            return True
+        result = self.exec(
+            profile.ready_probe, timeout=HEALTH_TIMEOUT, max_output=HEALTH_MAX_OUTPUT
+        )
+        return result.returncode == 0 and profile.ready_answer(result.stdout) is True
 
     def _ensure_agent_dir(self, parent_fd: int, name: str, path: Path) -> int:
         """Open ``name`` below ``parent_fd`` as a directory, creating it for the agent first
@@ -676,16 +683,19 @@ class AgentJail:
             ) from e
 
     def _check_config_dir(self, dir_fd: int, path: Path) -> None:
+        names = self.config.profile.config_names
         _require_owned_by_backtide(dir_fd, path)
-        _unlink_if_present(dir_fd, _TMP_CONFIG)  # left by a crash in the middle of a write
-        _require_only_the_config(dir_fd, path)
+        for name in names:
+            _unlink_if_present(dir_fd, _tmp_name(name))  # left by a crash in a write
+        _require_only_the_config(dir_fd, path, names)
         self._share_with_agent_group(dir_fd, path, CONFIG_DIR_MODE)
 
-    def _replace_config(self, dir_fd: int, content: bytes) -> None:
+    def _replace_config(self, dir_fd: int, name: str, content: bytes) -> None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-        tmp_path = self.config.config_dir / _TMP_CONFIG
+        tmp = _tmp_name(name)
+        tmp_path = self.config.config_dir / tmp
         try:
-            fd = os.open(_TMP_CONFIG, flags, CONFIG_FILE_MODE, dir_fd=dir_fd)
+            fd = os.open(tmp, flags, CONFIG_FILE_MODE, dir_fd=dir_fd)
         except OSError as e:
             raise JailError(f"cannot create {tmp_path}: {e}") from e
         try:
@@ -695,10 +705,10 @@ class AgentJail:
         finally:
             os.close(fd)
         try:
-            os.rename(_TMP_CONFIG, CONFIG_FILE, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             os.fsync(dir_fd)
         except OSError as e:
-            raise JailError(f"cannot replace {self.config.config_file}: {e}") from e
+            raise JailError(f"cannot replace {self.config.config_dir / name}: {e}") from e
 
     def _share_with_agent_group(self, fd: int, path: Path, mode: int) -> None:
         try:
@@ -735,20 +745,23 @@ class AgentJail:
         config_fd = _open_dir(self.config.config_dir)
         try:
             _require_owned_by_backtide(config_fd, self.config.config_dir)
-            _require_only_the_config(config_fd, self.config.config_dir)
+            _require_only_the_config(
+                config_fd, self.config.config_dir, self.config.profile.config_names
+            )
         finally:
             os.close(config_fd)
-        try:
-            st = os.lstat(self.config.config_file)
-        except OSError as e:
-            raise JailError(f"{self.config.config_file} is missing: run write_config()") from e
-        if not stat.S_ISREG(st.st_mode):
-            raise JailError(f"{self.config.config_file} is not a regular file")
-        if st.st_nlink != 1:
-            raise JailError(
-                f"{self.config.config_file} has {st.st_nlink} names (a hard link to another "
-                "file?): run write_config()"
-            )
+        for config_file in self.config.config_files:
+            try:
+                st = os.lstat(config_file)
+            except OSError as e:
+                raise JailError(f"{config_file} is missing: run write_config()") from e
+            if not stat.S_ISREG(st.st_mode):
+                raise JailError(f"{config_file} is not a regular file")
+            if st.st_nlink != 1:
+                raise JailError(
+                    f"{config_file} has {st.st_nlink} names (a hard link to another "
+                    "file?): run write_config()"
+                )
 
 
 def _require_owned_by_backtide(dir_fd: int, path: Path) -> None:
@@ -757,12 +770,20 @@ def _require_owned_by_backtide(dir_fd: int, path: Path) -> None:
         raise JailError(f"{path} is owned by uid {owner}, not backtide's {os.geteuid()}")
 
 
-def _require_only_the_config(dir_fd: int, path: Path) -> None:
-    strays = sorted(set(os.listdir(dir_fd)) - {CONFIG_FILE})
+def _tmp_name(name: str) -> str:
+    """Where a config file is written before it replaces the old one."""
+    return f".{name}.tmp"
+
+
+def _require_only_the_config(dir_fd: int, path: Path, names: Sequence[str]) -> None:
+    strays = sorted(set(os.listdir(dir_fd)) - set(names))
     if strays:
+        only = f"hold only {', '.join(names)}" if names else "be empty"
+        tmps = ", ".join(_tmp_name(name) for name in names)
+        hint = f" (a stray {tmps}: run write_config())" if names else ""
         raise JailError(
-            f"{path} is mounted into the agent and must hold only {CONFIG_FILE}; "
-            f"found {strays}: move them elsewhere (a stray {_TMP_CONFIG}: run write_config())"
+            f"{path} is mounted into the agent and must {only}; "
+            f"found {strays}: move them elsewhere{hint}"
         )
 
 

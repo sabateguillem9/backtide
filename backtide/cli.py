@@ -14,7 +14,7 @@ from pathlib import Path
 from backtide import __version__
 from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, load_key, redact
 from backtide.jail import ExposedJail, JailError
-from backtide.jail.openclaw import UnrewindableConfig
+from backtide.jail.profile import ProfileError
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import (
     OUTCOME_EXIT_CODES,
@@ -217,7 +217,7 @@ def _watch(args: argparse.Namespace) -> int:
     print("backtide arrancando. Ctrl-C o SIGTERM lo paran, y con él al agente.", flush=True)
     try:
         serve(config)
-    except UnrewindableConfig as error:
+    except ProfileError as error:  # OpenClaw's: UnrewindableConfig
         _error(error.notice)  # the alert and the black box already hold the detail
         return EXIT_ERROR
     except ServiceLocked as error:

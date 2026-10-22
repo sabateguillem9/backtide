@@ -1,0 +1,729 @@
+{
+  "seccomp_profile": {
+    "defaultAction": "SCMP_ACT_ERRNO",
+    "syscalls": [
+      {
+        "names": [
+          "read"
+        ]
+      }
+    ]
+  },
+  "image_env": [
+    "PATH=/usr/local/bin:/usr/bin:/bin",
+    "NODE_ENV=production",
+    "HOME=/home/node"
+  ],
+  "configs": {
+    "plain": {
+      "create_argv": [
+        "create",
+        "--name",
+        "backtide-agente",
+        "--hostname",
+        "agente",
+        "--user",
+        "61000:61000",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges=true",
+        "--security-opt",
+        "seccomp=/Users/guillemsabategoula/Documents/GitHub/SO/deploy/seccomp/agent.json",
+        "--read-only",
+        "--network",
+        "backtide-agente-net",
+        "--restart",
+        "no",
+        "--memory",
+        "2g",
+        "--memory-swap",
+        "2g",
+        "--pids-limit",
+        "512",
+        "--cpus",
+        "2",
+        "--stop-timeout",
+        "30",
+        "--log-driver",
+        "local",
+        "--log-opt",
+        "max-size=10m",
+        "--log-opt",
+        "max-file=3",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=256m",
+        "--tmpfs",
+        "/sys/fs/btrfs:ro,nosuid,nodev,noexec,size=4k,mode=0555",
+        "--tmpfs",
+        "/sys/devices/virtual/block:ro,nosuid,nodev,noexec,size=4k,mode=0555",
+        "--volume",
+        "/srv/bt/volume/workspace/agente:/workspace:z",
+        "--volume",
+        "/srv/bt/state/openclaw:/config:ro,z",
+        "--volume",
+        "/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z",
+        "--env",
+        "HOME=/workspace/home",
+        "--env",
+        "OPENCLAW_STATE_DIR=/workspace/state",
+        "--env",
+        "OPENCLAW_WORKSPACE_DIR=/workspace/work",
+        "--env",
+        "OPENCLAW_CONFIG_PATH=/config/openclaw.json",
+        "--env",
+        "OPENCLAW_CONFIG_READONLY=1",
+        "--env",
+        "OPENCLAW_NO_AUTO_UPDATE=1",
+        "--env",
+        "OPENCLAW_OFFLINE=1",
+        "--env",
+        "OPENCLAW_DISABLE_BONJOUR=1",
+        "--env",
+        "OPENCLAW_SKIP_CRON=1",
+        "--env",
+        "OPENCLAW_SKIP_CANVAS_HOST=1",
+        "--env",
+        "OPENCLAW_SKIP_GMAIL_WATCHER=1",
+        "--env",
+        "CLAWHUB_DISABLE_TELEMETRY=1",
+        "--env",
+        "DO_NOT_TRACK=1",
+        "--env",
+        "HTTP_PROXY=http://backtide-proxy:8080",
+        "--env",
+        "HTTPS_PROXY=http://backtide-proxy:8080",
+        "--env",
+        "http_proxy=http://backtide-proxy:8080",
+        "--env",
+        "https_proxy=http://backtide-proxy:8080",
+        "--env",
+        "OPENCLAW_PROXY_URL=http://backtide-proxy:8080",
+        "--env",
+        "NO_PROXY=localhost,127.0.0.1,::1",
+        "--env",
+        "no_proxy=localhost,127.0.0.1,::1",
+        "--env",
+        "NODE_USE_ENV_PROXY=1",
+        "--env",
+        "NODE_EXTRA_CA_CERTS=/etc/backtide-ca/ca.pem",
+        "--env",
+        "SSL_CERT_FILE=/etc/backtide-ca/ca.pem",
+        "--env",
+        "REQUESTS_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+        "--env",
+        "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+        "--env",
+        "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
+        "--env",
+        "OPENCLAW_GATEWAY_TOKEN",
+        "--entrypoint",
+        "tini",
+        "ghcr.io/openclaw/openclaw@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8",
+        "-s",
+        "--",
+        "node",
+        "openclaw.mjs",
+        "gateway"
+      ],
+      "create_cli_env": {
+        "OPENCLAW_GATEWAY_TOKEN": "ttttttttttttttttttttttttttttttttttttttttttt"
+      },
+      "network_argv": [
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--internal",
+        "--opt",
+        "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+        "--opt",
+        "com.docker.network.bridge.gateway_mode_ipv6=isolated",
+        "backtide-agente-net"
+      ],
+      "container_env": [
+        [
+          "HOME",
+          "/workspace/home"
+        ],
+        [
+          "OPENCLAW_STATE_DIR",
+          "/workspace/state"
+        ],
+        [
+          "OPENCLAW_WORKSPACE_DIR",
+          "/workspace/work"
+        ],
+        [
+          "OPENCLAW_CONFIG_PATH",
+          "/config/openclaw.json"
+        ],
+        [
+          "OPENCLAW_CONFIG_READONLY",
+          "1"
+        ],
+        [
+          "OPENCLAW_NO_AUTO_UPDATE",
+          "1"
+        ],
+        [
+          "OPENCLAW_OFFLINE",
+          "1"
+        ],
+        [
+          "OPENCLAW_DISABLE_BONJOUR",
+          "1"
+        ],
+        [
+          "OPENCLAW_SKIP_CRON",
+          "1"
+        ],
+        [
+          "OPENCLAW_SKIP_CANVAS_HOST",
+          "1"
+        ],
+        [
+          "OPENCLAW_SKIP_GMAIL_WATCHER",
+          "1"
+        ],
+        [
+          "CLAWHUB_DISABLE_TELEMETRY",
+          "1"
+        ],
+        [
+          "DO_NOT_TRACK",
+          "1"
+        ],
+        [
+          "HTTP_PROXY",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "HTTPS_PROXY",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "http_proxy",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "https_proxy",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "OPENCLAW_PROXY_URL",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "NO_PROXY",
+          "localhost,127.0.0.1,::1"
+        ],
+        [
+          "no_proxy",
+          "localhost,127.0.0.1,::1"
+        ],
+        [
+          "NODE_USE_ENV_PROXY",
+          "1"
+        ],
+        [
+          "NODE_EXTRA_CA_CERTS",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "SSL_CERT_FILE",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "REQUESTS_CA_BUNDLE",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "CURL_CA_BUNDLE",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "GIT_SSL_CAINFO",
+          "/etc/backtide-ca/ca.pem"
+        ]
+      ],
+      "config_files": {
+        "openclaw.json": "{\n  \"gateway\": {\n    \"mode\": \"local\",\n    \"bind\": \"loopback\",\n    \"port\": 18789,\n    \"auth\": {\n      \"mode\": \"token\"\n    },\n    \"nodes\": {\n      \"pairing\": {\n        \"sshVerify\": false\n      }\n    }\n  },\n  \"plugins\": {\n    \"entries\": {\n      \"device-pair\": {\n        \"enabled\": false\n      }\n    }\n  },\n  \"update\": {\n    \"checkOnStart\": false,\n    \"auto\": {\n      \"enabled\": false\n    }\n  },\n  \"models\": {\n    \"catalogRefresh\": {\n      \"enabled\": false\n    }\n  },\n  \"cron\": {\n    \"enabled\": false\n  },\n  \"memory\": {\n    \"search\": {\n      \"provider\": \"none\"\n    }\n  },\n  \"discovery\": {\n    \"mdns\": {\n      \"mode\": \"off\"\n    }\n  },\n  \"agents\": {\n    \"defaults\": {\n      \"workspace\": \"/workspace/work\",\n      \"sandbox\": {\n        \"mode\": \"off\"\n      }\n    }\n  },\n  \"tools\": {\n    \"elevated\": {\n      \"enabled\": false\n    },\n    \"deny\": [\n      \"group:automation\",\n      \"sessions_spawn\",\n      \"sessions_send\"\n    ]\n  }\n}\n"
+      },
+      "good_info": {
+        "Id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "Config": {
+          "Image": "ghcr.io/openclaw/openclaw@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8",
+          "User": "61000:61000",
+          "Hostname": "agente",
+          "Entrypoint": [
+            "tini"
+          ],
+          "Cmd": [
+            "-s",
+            "--",
+            "node",
+            "openclaw.mjs",
+            "gateway"
+          ],
+          "StopTimeout": 30,
+          "Env": [
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "NODE_ENV=production",
+            "HOME=/workspace/home",
+            "OPENCLAW_STATE_DIR=/workspace/state",
+            "OPENCLAW_WORKSPACE_DIR=/workspace/work",
+            "OPENCLAW_CONFIG_PATH=/config/openclaw.json",
+            "OPENCLAW_CONFIG_READONLY=1",
+            "OPENCLAW_NO_AUTO_UPDATE=1",
+            "OPENCLAW_OFFLINE=1",
+            "OPENCLAW_DISABLE_BONJOUR=1",
+            "OPENCLAW_SKIP_CRON=1",
+            "OPENCLAW_SKIP_CANVAS_HOST=1",
+            "OPENCLAW_SKIP_GMAIL_WATCHER=1",
+            "CLAWHUB_DISABLE_TELEMETRY=1",
+            "DO_NOT_TRACK=1",
+            "HTTP_PROXY=http://backtide-proxy:8080",
+            "HTTPS_PROXY=http://backtide-proxy:8080",
+            "http_proxy=http://backtide-proxy:8080",
+            "https_proxy=http://backtide-proxy:8080",
+            "OPENCLAW_PROXY_URL=http://backtide-proxy:8080",
+            "NO_PROXY=localhost,127.0.0.1,::1",
+            "no_proxy=localhost,127.0.0.1,::1",
+            "NODE_USE_ENV_PROXY=1",
+            "NODE_EXTRA_CA_CERTS=/etc/backtide-ca/ca.pem",
+            "SSL_CERT_FILE=/etc/backtide-ca/ca.pem",
+            "REQUESTS_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+            "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+            "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
+            "OPENCLAW_GATEWAY_TOKEN=ttttttttttttttttttttttttttttttttttttttttttt"
+          ]
+        },
+        "HostConfig": {
+          "Binds": [
+            "/srv/bt/volume/workspace/agente:/workspace:z",
+            "/srv/bt/state/openclaw:/config:ro,z",
+            "/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupnsMode": "private",
+          "IpcMode": "private",
+          "LogConfig": {
+            "Type": "local",
+            "Config": {
+              "max-file": "3",
+              "max-size": "10m"
+            }
+          },
+          "Memory": 2147483648,
+          "MemorySwap": 2147483648,
+          "NanoCpus": 2000000000,
+          "NetworkMode": "backtide-agente-net",
+          "PidsLimit": 512,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "Name": "no",
+            "MaximumRetryCount": 0
+          },
+          "SecurityOpt": [
+            "no-new-privileges=true",
+            "seccomp={\"defaultAction\": \"SCMP_ACT_ERRNO\", \"syscalls\": [{\"names\": [\"read\"]}]}"
+          ],
+          "Tmpfs": {
+            "/tmp": "rw,nosuid,nodev,size=256m",
+            "/sys/fs/btrfs": "ro,nosuid,nodev,noexec,size=4k,mode=0555",
+            "/sys/devices/virtual/block": "ro,nosuid,nodev,noexec,size=4k,mode=0555"
+          }
+        },
+        "NetworkSettings": {
+          "Networks": {
+            "backtide-agente-net": {
+              "IPAddress": ""
+            }
+          }
+        }
+      },
+      "problems_of_empty_info": [
+        "Image is None, not 'ghcr.io/openclaw/openclaw@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8'",
+        "User is None, not '61000:61000'",
+        "Hostname is None, not 'agente'",
+        "Entrypoint is None, not ['tini']",
+        "Cmd is None, not ['-s', '--', 'node', 'openclaw.mjs', 'gateway']",
+        "StopTimeout is None, not 30",
+        "HostConfig.CapDrop is None, not ['ALL']",
+        "HostConfig.ReadonlyRootfs is None, not True",
+        "HostConfig.Tmpfs is None, not {'/tmp': 'rw,nosuid,nodev,size=256m', '/sys/fs/btrfs': 'ro,nosuid,nodev,noexec,size=4k,mode=0555', '/sys/devices/virtual/block': 'ro,nosuid,nodev,noexec,size=4k,mode=0555'}",
+        "HostConfig.RestartPolicy.Name is None, not 'no'",
+        "HostConfig.Memory is None, not 2147483648",
+        "HostConfig.MemorySwap is None, not 2147483648",
+        "HostConfig.PidsLimit is None, not 512",
+        "HostConfig.NanoCpus is None, not 2000000000",
+        "HostConfig.LogConfig is None, not {'Type': 'local', 'Config': {'max-size': '10m', 'max-file': '3'}}",
+        "HostConfig.CgroupnsMode is None, not 'private'",
+        "HostConfig.IpcMode is None, not private",
+        "its mounts are None, not ['/srv/bt/volume/workspace/agente:/workspace:z', '/srv/bt/state/openclaw:/config:ro,z', '/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z']",
+        "its security options are [], not ['no-new-privileges=true']",
+        "its seccomp profile is not the current one",
+        "its environment differs in ['CLAWHUB_DISABLE_TELEMETRY', 'CURL_CA_BUNDLE', 'DO_NOT_TRACK', 'GIT_SSL_CAINFO', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'NO_PROXY', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_CONFIG_READONLY', 'OPENCLAW_DISABLE_BONJOUR', 'OPENCLAW_GATEWAY_TOKEN', 'OPENCLAW_NO_AUTO_UPDATE', 'OPENCLAW_OFFLINE', 'OPENCLAW_PROXY_URL', 'OPENCLAW_SKIP_CANVAS_HOST', 'OPENCLAW_SKIP_CRON', 'OPENCLAW_SKIP_GMAIL_WATCHER', 'OPENCLAW_STATE_DIR', 'OPENCLAW_WORKSPACE_DIR', 'PATH', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'http_proxy', 'https_proxy', 'no_proxy']",
+        "its networks are None / [], not only 'backtide-agente-net'"
+      ]
+    },
+    "full": {
+      "create_argv": [
+        "create",
+        "--name",
+        "backtide-test-agent-0123abcd",
+        "--hostname",
+        "agente",
+        "--user",
+        "501:1000",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges=true",
+        "--security-opt",
+        "seccomp=/opt/backtide/deploy/seccomp/agent.json",
+        "--read-only",
+        "--network",
+        "backtide-test-net-0123abcd",
+        "--restart",
+        "no",
+        "--memory",
+        "1536m",
+        "--memory-swap",
+        "1536m",
+        "--pids-limit",
+        "256",
+        "--cpus",
+        "1.5",
+        "--stop-timeout",
+        "12",
+        "--log-driver",
+        "local",
+        "--log-opt",
+        "max-size=10m",
+        "--log-opt",
+        "max-file=3",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=64m",
+        "--tmpfs",
+        "/sys/fs/btrfs:ro,nosuid,nodev,noexec,size=4k,mode=0555",
+        "--tmpfs",
+        "/sys/devices/virtual/block:ro,nosuid,nodev,noexec,size=4k,mode=0555",
+        "--volume",
+        "/srv/bt/volume/workspace/agente:/workspace:z",
+        "--volume",
+        "/srv/bt/state/openclaw:/config:ro,z",
+        "--volume",
+        "/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z",
+        "--env",
+        "HOME=/workspace/home",
+        "--env",
+        "OPENCLAW_STATE_DIR=/workspace/state",
+        "--env",
+        "OPENCLAW_WORKSPACE_DIR=/workspace/work",
+        "--env",
+        "OPENCLAW_CONFIG_PATH=/config/openclaw.json",
+        "--env",
+        "OPENCLAW_CONFIG_READONLY=1",
+        "--env",
+        "OPENCLAW_NO_AUTO_UPDATE=1",
+        "--env",
+        "OPENCLAW_OFFLINE=1",
+        "--env",
+        "OPENCLAW_DISABLE_BONJOUR=1",
+        "--env",
+        "OPENCLAW_SKIP_CRON=1",
+        "--env",
+        "OPENCLAW_SKIP_CANVAS_HOST=1",
+        "--env",
+        "OPENCLAW_SKIP_GMAIL_WATCHER=1",
+        "--env",
+        "CLAWHUB_DISABLE_TELEMETRY=1",
+        "--env",
+        "DO_NOT_TRACK=1",
+        "--env",
+        "HTTP_PROXY=http://backtide-proxy:8080",
+        "--env",
+        "HTTPS_PROXY=http://backtide-proxy:8080",
+        "--env",
+        "http_proxy=http://backtide-proxy:8080",
+        "--env",
+        "https_proxy=http://backtide-proxy:8080",
+        "--env",
+        "OPENCLAW_PROXY_URL=http://backtide-proxy:8080",
+        "--env",
+        "NO_PROXY=localhost,127.0.0.1,::1",
+        "--env",
+        "no_proxy=localhost,127.0.0.1,::1",
+        "--env",
+        "NODE_USE_ENV_PROXY=1",
+        "--env",
+        "NODE_EXTRA_CA_CERTS=/etc/backtide-ca/ca.pem",
+        "--env",
+        "SSL_CERT_FILE=/etc/backtide-ca/ca.pem",
+        "--env",
+        "REQUESTS_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+        "--env",
+        "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+        "--env",
+        "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
+        "--env",
+        "OPENCLAW_GATEWAY_TOKEN",
+        "--entrypoint",
+        "tini",
+        "ghcr.io/openclaw/openclaw@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8",
+        "-s",
+        "--",
+        "node",
+        "openclaw.mjs",
+        "gateway"
+      ],
+      "create_cli_env": {
+        "OPENCLAW_GATEWAY_TOKEN": "A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9"
+      },
+      "network_argv": [
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--internal",
+        "--opt",
+        "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+        "--opt",
+        "com.docker.network.bridge.gateway_mode_ipv6=isolated",
+        "backtide-test-net-0123abcd"
+      ],
+      "container_env": [
+        [
+          "HOME",
+          "/workspace/home"
+        ],
+        [
+          "OPENCLAW_STATE_DIR",
+          "/workspace/state"
+        ],
+        [
+          "OPENCLAW_WORKSPACE_DIR",
+          "/workspace/work"
+        ],
+        [
+          "OPENCLAW_CONFIG_PATH",
+          "/config/openclaw.json"
+        ],
+        [
+          "OPENCLAW_CONFIG_READONLY",
+          "1"
+        ],
+        [
+          "OPENCLAW_NO_AUTO_UPDATE",
+          "1"
+        ],
+        [
+          "OPENCLAW_OFFLINE",
+          "1"
+        ],
+        [
+          "OPENCLAW_DISABLE_BONJOUR",
+          "1"
+        ],
+        [
+          "OPENCLAW_SKIP_CRON",
+          "1"
+        ],
+        [
+          "OPENCLAW_SKIP_CANVAS_HOST",
+          "1"
+        ],
+        [
+          "OPENCLAW_SKIP_GMAIL_WATCHER",
+          "1"
+        ],
+        [
+          "CLAWHUB_DISABLE_TELEMETRY",
+          "1"
+        ],
+        [
+          "DO_NOT_TRACK",
+          "1"
+        ],
+        [
+          "HTTP_PROXY",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "HTTPS_PROXY",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "http_proxy",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "https_proxy",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "OPENCLAW_PROXY_URL",
+          "http://backtide-proxy:8080"
+        ],
+        [
+          "NO_PROXY",
+          "localhost,127.0.0.1,::1"
+        ],
+        [
+          "no_proxy",
+          "localhost,127.0.0.1,::1"
+        ],
+        [
+          "NODE_USE_ENV_PROXY",
+          "1"
+        ],
+        [
+          "NODE_EXTRA_CA_CERTS",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "SSL_CERT_FILE",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "REQUESTS_CA_BUNDLE",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "CURL_CA_BUNDLE",
+          "/etc/backtide-ca/ca.pem"
+        ],
+        [
+          "GIT_SSL_CAINFO",
+          "/etc/backtide-ca/ca.pem"
+        ]
+      ],
+      "config_files": {
+        "openclaw.json": "{\n  \"gateway\": {\n    \"mode\": \"local\",\n    \"bind\": \"loopback\",\n    \"port\": 18789,\n    \"auth\": {\n      \"mode\": \"token\"\n    },\n    \"nodes\": {\n      \"pairing\": {\n        \"sshVerify\": false\n      }\n    }\n  },\n  \"plugins\": {\n    \"entries\": {\n      \"device-pair\": {\n        \"enabled\": false\n      }\n    }\n  },\n  \"update\": {\n    \"checkOnStart\": false,\n    \"auto\": {\n      \"enabled\": false\n    }\n  },\n  \"models\": {\n    \"catalogRefresh\": {\n      \"enabled\": false\n    },\n    \"mode\": \"merge\",\n    \"providers\": {\n      \"anthropic\": {\n        \"baseUrl\": \"https://api.anthropic.com\",\n        \"api\": \"anthropic-messages\",\n        \"auth\": \"api-key\",\n        \"apiKey\": \"backtide-fake-anthropic-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n      },\n      \"local\": {\n        \"baseUrl\": \"https://llm.example.com/v1\",\n        \"api\": \"openai-completions\",\n        \"auth\": \"api-key\",\n        \"apiKey\": \"backtide-fake-local-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\n        \"models\": [\n          {\n            \"id\": \"qwen-2.5\",\n            \"name\": \"qwen-2.5\"\n          },\n          {\n            \"id\": \"llama/3\",\n            \"name\": \"llama/3\"\n          }\n        ]\n      }\n    }\n  },\n  \"cron\": {\n    \"enabled\": false\n  },\n  \"memory\": {\n    \"search\": {\n      \"provider\": \"none\"\n    }\n  },\n  \"discovery\": {\n    \"mdns\": {\n      \"mode\": \"off\"\n    }\n  },\n  \"agents\": {\n    \"defaults\": {\n      \"workspace\": \"/workspace/work\",\n      \"sandbox\": {\n        \"mode\": \"off\"\n      },\n      \"model\": {\n        \"primary\": \"local/qwen-2.5\"\n      }\n    }\n  },\n  \"tools\": {\n    \"elevated\": {\n      \"enabled\": false\n    },\n    \"deny\": [\n      \"group:automation\",\n      \"sessions_spawn\",\n      \"sessions_send\"\n    ]\n  }\n}\n"
+      },
+      "good_info": {
+        "Id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "Config": {
+          "Image": "ghcr.io/openclaw/openclaw@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8",
+          "User": "501:1000",
+          "Hostname": "agente",
+          "Entrypoint": [
+            "tini"
+          ],
+          "Cmd": [
+            "-s",
+            "--",
+            "node",
+            "openclaw.mjs",
+            "gateway"
+          ],
+          "StopTimeout": 12,
+          "Env": [
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "NODE_ENV=production",
+            "HOME=/workspace/home",
+            "OPENCLAW_STATE_DIR=/workspace/state",
+            "OPENCLAW_WORKSPACE_DIR=/workspace/work",
+            "OPENCLAW_CONFIG_PATH=/config/openclaw.json",
+            "OPENCLAW_CONFIG_READONLY=1",
+            "OPENCLAW_NO_AUTO_UPDATE=1",
+            "OPENCLAW_OFFLINE=1",
+            "OPENCLAW_DISABLE_BONJOUR=1",
+            "OPENCLAW_SKIP_CRON=1",
+            "OPENCLAW_SKIP_CANVAS_HOST=1",
+            "OPENCLAW_SKIP_GMAIL_WATCHER=1",
+            "CLAWHUB_DISABLE_TELEMETRY=1",
+            "DO_NOT_TRACK=1",
+            "HTTP_PROXY=http://backtide-proxy:8080",
+            "HTTPS_PROXY=http://backtide-proxy:8080",
+            "http_proxy=http://backtide-proxy:8080",
+            "https_proxy=http://backtide-proxy:8080",
+            "OPENCLAW_PROXY_URL=http://backtide-proxy:8080",
+            "NO_PROXY=localhost,127.0.0.1,::1",
+            "no_proxy=localhost,127.0.0.1,::1",
+            "NODE_USE_ENV_PROXY=1",
+            "NODE_EXTRA_CA_CERTS=/etc/backtide-ca/ca.pem",
+            "SSL_CERT_FILE=/etc/backtide-ca/ca.pem",
+            "REQUESTS_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+            "CURL_CA_BUNDLE=/etc/backtide-ca/ca.pem",
+            "GIT_SSL_CAINFO=/etc/backtide-ca/ca.pem",
+            "OPENCLAW_GATEWAY_TOKEN=A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9A-b_9"
+          ]
+        },
+        "HostConfig": {
+          "Binds": [
+            "/srv/bt/volume/workspace/agente:/workspace:z",
+            "/srv/bt/state/openclaw:/config:ro,z",
+            "/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupnsMode": "private",
+          "IpcMode": "private",
+          "LogConfig": {
+            "Type": "local",
+            "Config": {
+              "max-file": "3",
+              "max-size": "10m"
+            }
+          },
+          "Memory": 1610612736,
+          "MemorySwap": 1610612736,
+          "NanoCpus": 1500000000,
+          "NetworkMode": "backtide-test-net-0123abcd",
+          "PidsLimit": 256,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "Name": "no",
+            "MaximumRetryCount": 0
+          },
+          "SecurityOpt": [
+            "no-new-privileges=true",
+            "seccomp={\"defaultAction\": \"SCMP_ACT_ERRNO\", \"syscalls\": [{\"names\": [\"read\"]}]}"
+          ],
+          "Tmpfs": {
+            "/tmp": "rw,nosuid,nodev,size=64m",
+            "/sys/fs/btrfs": "ro,nosuid,nodev,noexec,size=4k,mode=0555",
+            "/sys/devices/virtual/block": "ro,nosuid,nodev,noexec,size=4k,mode=0555"
+          }
+        },
+        "NetworkSettings": {
+          "Networks": {
+            "backtide-test-net-0123abcd": {
+              "IPAddress": ""
+            }
+          }
+        }
+      },
+      "problems_of_empty_info": [
+        "Image is None, not 'ghcr.io/openclaw/openclaw@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8'",
+        "User is None, not '501:1000'",
+        "Hostname is None, not 'agente'",
+        "Entrypoint is None, not ['tini']",
+        "Cmd is None, not ['-s', '--', 'node', 'openclaw.mjs', 'gateway']",
+        "StopTimeout is None, not 12",
+        "HostConfig.CapDrop is None, not ['ALL']",
+        "HostConfig.ReadonlyRootfs is None, not True",
+        "HostConfig.Tmpfs is None, not {'/tmp': 'rw,nosuid,nodev,size=64m', '/sys/fs/btrfs': 'ro,nosuid,nodev,noexec,size=4k,mode=0555', '/sys/devices/virtual/block': 'ro,nosuid,nodev,noexec,size=4k,mode=0555'}",
+        "HostConfig.RestartPolicy.Name is None, not 'no'",
+        "HostConfig.Memory is None, not 1610612736",
+        "HostConfig.MemorySwap is None, not 1610612736",
+        "HostConfig.PidsLimit is None, not 256",
+        "HostConfig.NanoCpus is None, not 1500000000",
+        "HostConfig.LogConfig is None, not {'Type': 'local', 'Config': {'max-size': '10m', 'max-file': '3'}}",
+        "HostConfig.CgroupnsMode is None, not 'private'",
+        "HostConfig.IpcMode is None, not private",
+        "its mounts are None, not ['/srv/bt/volume/workspace/agente:/workspace:z', '/srv/bt/state/openclaw:/config:ro,z', '/srv/bt/state/agent-ca:/etc/backtide-ca:ro,z']",
+        "its security options are [], not ['no-new-privileges=true']",
+        "its seccomp profile is not the current one",
+        "its environment differs in ['CLAWHUB_DISABLE_TELEMETRY', 'CURL_CA_BUNDLE', 'DO_NOT_TRACK', 'GIT_SSL_CAINFO', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'NO_PROXY', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_CONFIG_READONLY', 'OPENCLAW_DISABLE_BONJOUR', 'OPENCLAW_GATEWAY_TOKEN', 'OPENCLAW_NO_AUTO_UPDATE', 'OPENCLAW_OFFLINE', 'OPENCLAW_PROXY_URL', 'OPENCLAW_SKIP_CANVAS_HOST', 'OPENCLAW_SKIP_CRON', 'OPENCLAW_SKIP_GMAIL_WATCHER', 'OPENCLAW_STATE_DIR', 'OPENCLAW_WORKSPACE_DIR', 'PATH', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE', 'http_proxy', 'https_proxy', 'no_proxy']",
+        "its networks are None / [], not only 'backtide-test-net-0123abcd'"
+      ]
+    }
+  }
+}

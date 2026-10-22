@@ -1,17 +1,21 @@
-"""The agent jail's settings, the ``docker`` argv that builds it and OpenClaw's config. Pure.
+"""The agent jail's settings and the ``docker`` argv that builds it. Pure.
 
 Design: docs/13-diseno-t03-jaula.md. Nothing here touches the disk or runs a command, so the
-Mac unit tests check every security option of the container.
+Mac unit tests check every security option of the container. What changes from one agent to
+another (image, command, variables, config files: docs/34, section 7) comes from the config's
+AgentProfile (backtide/jail/profile.py; OpenClaw's is the default); everything below that
+decides security is the same for every agent, and no profile field reaches it.
 
 - The image is pinned by digest, the user is never root and every capability is dropped.
   By default the agent runs as a uid and gid of its own (61000), meant to be nobody else's.
 - The root filesystem is read-only. The agent writes only to ``/workspace`` (its folder in the
-  snapshotted volume) and to a small ``/tmp`` tmpfs; OpenClaw's config is mounted read-only.
+  snapshotted volume) and to a small ``/tmp`` tmpfs; its config folder is mounted read-only.
   ``/sys/fs/btrfs`` and ``/sys/devices/virtual/block`` are covered with empty read-only tmpfs.
 - The network is ``--internal`` with an isolated gateway: no route out and no address of the
   host on the bridge. No ports are published and no host entries are added.
-- No API key ever reaches the container. The Gateway token reaches it through the docker
-  CLI's environment (``-e NAME`` without a value), never through an argv that ``ps`` shows.
+- No real API key ever reaches the container. The profile's token (OpenClaw's Gateway token)
+  and fake keys reach it through the docker CLI's environment (``-e NAME`` without a value),
+  never through an argv that ``ps`` shows.
 - The only way out is the egress proxy (docs/21-diseno-t06-proxy.md), a neighbour on the same
   internal network under the alias ``backtide-proxy``. The variables only help programs find
   it: whatever ignores them has no route at all. The agent trusts the proxy's CA through its
@@ -24,33 +28,38 @@ import re
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Any
 
-from backtide.jail.openclaw import ModelProvider, model_settings
-
-# OpenClaw 2026.9.8 (docs/12). Bump the digest and the version together, after testing in the VM.
-OPENCLAW_VERSION = "2026.9.8"
-IMAGE = (
-    "ghcr.io/openclaw/openclaw"
-    "@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8"
+from backtide.jail.profile import (
+    CONTAINER_CONFIG_DIR,
+    CONTAINER_HOME,
+    CONTAINER_WORKSPACE,
+    PINNED_IMAGE_RE,
+    AgentProfile,
 )
-GATEWAY_PORT = 18789
-READY_LOG_LINE = "[gateway] ready"
-HEALTH_URL = f"http://127.0.0.1:{GATEWAY_PORT}/healthz"
+from backtide.jail.profile import CONTAINER_STATE as CONTAINER_STATE
+from backtide.jail.profile import CONTAINER_WORK as CONTAINER_WORK
+from backtide.jail.profiles import DEFAULT_PROFILE
+
+# OpenClaw's names, kept here for the imports that predate the profile (the tests, the VM kits).
+# The jail reads them from config.profile; they live in backtide/jail/profiles/openclaw.py.
+from backtide.jail.profiles.openclaw import AGENT_SUBDIRS as AGENT_SUBDIRS
+from backtide.jail.profiles.openclaw import COMMAND as COMMAND
+from backtide.jail.profiles.openclaw import CONFIG_FILE as CONFIG_FILE
+from backtide.jail.profiles.openclaw import ENTRYPOINT as ENTRYPOINT
+from backtide.jail.profiles.openclaw import GATEWAY_PORT as GATEWAY_PORT
+from backtide.jail.profiles.openclaw import HEALTH_URL as HEALTH_URL
+from backtide.jail.profiles.openclaw import IMAGE as IMAGE
+from backtide.jail.profiles.openclaw import OPENCLAW_VERSION as OPENCLAW_VERSION
+from backtide.jail.profiles.openclaw import READY_LOG_LINE as READY_LOG_LINE
+from backtide.jail.profiles.openclaw import TOKEN_ENV as TOKEN_ENV
+from backtide.jail.profiles.openclaw import ModelProvider
+from backtide.jail.profiles.openclaw import openclaw_config as openclaw_config
 
 AGENT_DIR = "agente"  # inside <root>/workspace: the ONLY host directory the agent sees
-AGENT_SUBDIRS = ("home", "state", "work")
-CONFIG_FILE = "openclaw.json"
-TOKEN_ENV = "OPENCLAW_GATEWAY_TOKEN"  # noqa: S105 - the variable's name, not a secret
 
-CONTAINER_WORKSPACE = PurePosixPath("/workspace")
-CONTAINER_CONFIG_DIR = PurePosixPath("/config")
 CONTAINER_CA_DIR = PurePosixPath("/etc/backtide-ca")
 CA_CERT_FILE = "ca.pem"  # the only file of ca_dir: the CA's certificate, never its key
 CONTAINER_CA_FILE = CONTAINER_CA_DIR / CA_CERT_FILE
-CONTAINER_HOME = CONTAINER_WORKSPACE / "home"
-CONTAINER_STATE = CONTAINER_WORKSPACE / "state"
-CONTAINER_WORK = CONTAINER_WORKSPACE / "work"
 
 # Docker mounts /sys read-only in the container, and it shows the host's. These two directories
 # are covered with an empty read-only tmpfs (docs/19, section 5):
@@ -75,47 +84,31 @@ NO_NEW_PRIVILEGES = "no-new-privileges=true"
 LOG_DRIVER = "local"
 LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}  # bounded: the agent prints what it likes
 
-# The image's entrypoint runs `openclaw doctor --fix` first, which exits 1 when the config is
-# read-only (OPENCLAW_CONFIG_READONLY=1) and fails on the read-only root without it (checked in
-# the VM with 2026.9.8). Doctor only migrates or repairs state left by OTHER versions, and the
-# image is pinned, so the jail starts the Gateway directly under the image's own tini.
-ENTRYPOINT = "tini"
-COMMAND = ("-s", "--", "node", "openclaw.mjs", "gateway")
-
 # The egress proxy (docs/21, sections 1 and 2): its alias exists only on the agent's network.
 PROXY_ALIAS = "backtide-proxy"
 PROXY_PORT = 8080
 PROXY_URL = f"http://{PROXY_ALIAS}:{PROXY_PORT}"
-NO_PROXY_HOSTS = "localhost,127.0.0.1,::1"  # the Gateway listens in the container itself
+NO_PROXY_HOSTS = "localhost,127.0.0.1,::1"  # an agent may listen in the container itself
 
-# Turn off everything that would phone home or start background work (docs/12).
-_FIXED_ENV = (
-    ("HOME", str(CONTAINER_HOME)),
-    ("OPENCLAW_STATE_DIR", str(CONTAINER_STATE)),
-    ("OPENCLAW_WORKSPACE_DIR", str(CONTAINER_WORK)),
-    ("OPENCLAW_CONFIG_PATH", str(CONTAINER_CONFIG_DIR / CONFIG_FILE)),
-    ("OPENCLAW_CONFIG_READONLY", "1"),
-    ("OPENCLAW_NO_AUTO_UPDATE", "1"),
-    ("OPENCLAW_OFFLINE", "1"),
-    ("OPENCLAW_DISABLE_BONJOUR", "1"),
-    ("OPENCLAW_SKIP_CRON", "1"),
-    ("OPENCLAW_SKIP_CANVAS_HOST", "1"),
-    ("OPENCLAW_SKIP_GMAIL_WATCHER", "1"),
-    ("CLAWHUB_DISABLE_TELEMETRY", "1"),
-    ("DO_NOT_TRACK", "1"),
-)
+# The jail's variables, around the profile's own (docs/34, section 6): HOME first, the profile's
+# after it, then the rest. A profile can set none of these (profile.RESERVED_ENV).
+_HOME_ENV = (("HOME", str(CONTAINER_HOME)),)
+_NO_TRACKING_ENV = (("DO_NOT_TRACK", "1"),)
 
 # The way out and the CA (docs/21, sections 2 and 3). Both spellings of the proxy variables:
 # curl reads only the lowercase http_proxy. NODE_USE_ENV_PROXY makes Node's own fetch and http
-# honour them (for the agent's node scripts; OpenClaw has its own dispatcher, T06-1 P9).
-# NODE_EXTRA_CA_CERTS adds the CA to Node's; the other four REPLACE the system's CAs with ours
-# for curl, Python and git: everything goes through the proxy, which signs every certificate.
-_PROXY_ENV = (
+# honour them (for the agent's node scripts; OpenClaw has its own dispatcher, T06-1 P9, which
+# reads the profile's proxy_url_env). NODE_EXTRA_CA_CERTS adds the CA to Node's; the other four
+# REPLACE the system's CAs with ours for curl, Python and git: everything goes through the
+# proxy, which signs every certificate. The profile's proxy_url_env go right after the four
+# proxy variables, and its ca_file_env after the CA's.
+_PROXY_URL_ENV = (
     ("HTTP_PROXY", PROXY_URL),
     ("HTTPS_PROXY", PROXY_URL),
     ("http_proxy", PROXY_URL),
     ("https_proxy", PROXY_URL),
-    ("OPENCLAW_PROXY_URL", PROXY_URL),
+)
+_PROXY_REST_ENV = (
     ("NO_PROXY", NO_PROXY_HOSTS),
     ("no_proxy", NO_PROXY_HOSTS),
     ("NODE_USE_ENV_PROXY", "1"),
@@ -131,7 +124,6 @@ _DOCKER_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", re.ASCII)
 _HOSTNAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
 _SIZE_RE = re.compile(r"[1-9][0-9]{0,9}[kmg]", re.ASCII)
 _CPUS_RE = re.compile(r"(?:[1-9][0-9]{0,2}|0)(?:\.[0-9]{1,2})?", re.ASCII)
-_PINNED_IMAGE_RE = re.compile(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}", re.ASCII)
 # What secrets.token_urlsafe produces; at least 32 characters.
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,256}", re.ASCII)
 
@@ -168,26 +160,30 @@ class AgentJailConfig:
     """Everything that defines the agent's container. Validated on creation (ValueError).
 
     ``workspace`` is ``<root>/workspace``, the snapshotted subvolume; only its ``agente/``
-    folder is mounted. ``config_dir`` holds only ``openclaw.json`` and must live outside the
-    workspace. ``ca_dir`` holds only ``ca.pem``, the egress proxy's CA certificate (ca.py),
-    and lives apart from both. ``uid``/``gid`` are the agent's: AgentJail refuses to create or
-    start the container when either is backtide's own (or one of backtide's groups), unless
-    ``allow_shared_ids`` says so. Only the VM tests set it: they run without root, so the
-    agent's folders can only belong to the test user."""
+    folder is mounted. ``config_dir`` holds only the profile's config files (OpenClaw:
+    ``openclaw.json``) and must live outside the workspace. ``ca_dir`` holds only ``ca.pem``,
+    the egress proxy's CA certificate (ca.py), and lives apart from both. ``uid``/``gid`` are
+    the agent's: AgentJail refuses to create or start the container when either is backtide's
+    own (or one of backtide's groups), unless ``allow_shared_ids`` says so. Only the VM tests
+    set it: they run without root, so the agent's folders can only belong to the test user.
+
+    ``profile`` says which agent runs (OpenClaw by default) and only fills in the image (when
+    ``image`` is empty), the command, the variables and the config files: every other field
+    here is the jail's, the same for every agent."""
 
     workspace: Path
     config_dir: Path
     ca_dir: Path
     gateway_token: str = field(repr=False)
-    # The model providers with their FAKE keys, for openclaw.json only (T06-5): never in the
-    # environment or the argv. The real keys never reach this object.
+    # The model providers with their FAKE keys, for the profile (T06-5; OpenClaw puts them in
+    # openclaw.json): never in the argv. The real keys never reach this object.
     model_providers: tuple[ModelProvider, ...] = field(default=(), repr=False)
     name: str = "backtide-agente"
     network: str = "backtide-agente-net"
     # Fixed, so a Gateway owner lease restored from a snapshot names this same host and
     # OpenClaw can see that its process is gone (otherwise it refuses to start for 5 min).
     hostname: str = "agente"
-    image: str = IMAGE
+    image: str = ""  # pinned by digest; empty: the profile's
     uid: int = AGENT_UID
     gid: int = AGENT_GID
     memory: str = "2g"
@@ -200,8 +196,14 @@ class AgentJailConfig:
     allow_shared_ids: bool = False  # a test-only concession, see the docstring
     # What the agent must never see (T14a): ServiceConfig.jail_config() fills it in.
     protected: tuple[Protected, ...] = ()
+    # Which agent runs in the jail (docs/34, section 7): never anything of the above.
+    profile: AgentProfile = DEFAULT_PROFILE
 
     def __post_init__(self) -> None:
+        if not isinstance(self.profile, AgentProfile):
+            raise ValueError(f"profile must be an AgentProfile, got {type(self.profile).__name__}")
+        if self.image == "":
+            object.__setattr__(self, "image", self.profile.image)
         for label, path in (
             ("workspace", self.workspace),
             ("config_dir", self.config_dir),
@@ -224,7 +226,7 @@ class AgentJailConfig:
         for label, value in (("name", self.name), ("network", self.network)):
             _require_match(label, value, _DOCKER_NAME_RE)
         _require_match("hostname", self.hostname, _HOSTNAME_RE)
-        _require_match("image (pinned by digest)", self.image, _PINNED_IMAGE_RE)
+        _require_match("image (pinned by digest)", self.image, PINNED_IMAGE_RE)
         _require_match("memory", self.memory, _SIZE_RE)
         _require_match("tmp_size", self.tmp_size, _SIZE_RE)
         _require_match("cpus", self.cpus, _CPUS_RE)
@@ -290,8 +292,18 @@ class AgentJailConfig:
         return self.workspace / AGENT_DIR
 
     @property
+    def config_files(self) -> tuple[Path, ...]:
+        """The profile's files in ``config_dir`` (OpenClaw: openclaw.json alone)."""
+        return tuple(self.config_dir / name for name in self.profile.config_names)
+
+    @property
     def config_file(self) -> Path:
-        return self.config_dir / CONFIG_FILE
+        """The profile's one config file (OpenClaw: openclaw.json). ValueError for a profile
+        that writes none or several: use ``config_files``."""
+        files = self.config_files
+        if len(files) != 1:
+            raise ValueError(f"profile {self.profile.name} does not write exactly one config file")
+        return files[0]
 
     @property
     def ca_file(self) -> Path:
@@ -299,14 +311,39 @@ class AgentJailConfig:
 
 
 def container_env(config: AgentJailConfig) -> list[tuple[str, str]]:
-    """The variables the agent sees, without the token's value (see token_env)."""
-    del config  # the same for every agent today; kept for symmetry with the other builders
-    return [*_FIXED_ENV, *_PROXY_ENV]
+    """The variables the agent sees, without those of token_env: the jail's, with the profile's
+    own after HOME and the profile's names for the proxy's URL and the CA's path among the
+    jail's. Their values are always the jail's."""
+    profile = config.profile
+    return [
+        *_HOME_ENV,
+        *profile.env,
+        *_NO_TRACKING_ENV,
+        *_PROXY_URL_ENV,
+        *((name, PROXY_URL) for name in profile.proxy_url_env),
+        *_PROXY_REST_ENV,
+        *((name, str(CONTAINER_CA_FILE)) for name in profile.ca_file_env),
+    ]
+
+
+def jail_env_names() -> frozenset[str]:
+    """Every variable the jail sets itself, whatever the profile: none may come from one."""
+    return frozenset(
+        name for name, _ in (*_HOME_ENV, *_NO_TRACKING_ENV, *_PROXY_URL_ENV, *_PROXY_REST_ENV)
+    )
 
 
 def token_env(config: AgentJailConfig) -> dict[str, str]:
-    """The environment the docker CLI needs for ``docker create``: only the Gateway token."""
-    return {TOKEN_ENV: config.gateway_token}
+    """The environment the docker CLI needs for ``docker create``: the values that never go in
+    an argv. The profile's token (OpenClaw: the Gateway token) and the FAKE key of each provider
+    the profile reads from a variable (none for OpenClaw: its fake keys are in openclaw.json)."""
+    profile = config.profile
+    env = {} if profile.token_env is None else {profile.token_env: config.gateway_token}
+    fake_keys = {provider.name: provider.fake_key for provider in config.model_providers}
+    for name, provider in profile.fake_key_env:
+        if provider in fake_keys:
+            env[name] = fake_keys[provider]
+    return env
 
 
 def volume_binds(config: AgentJailConfig) -> list[str]:
@@ -352,7 +389,10 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
     """Arguments for ``docker`` (without the program name) that create the agent container.
 
     Run it with token_env(config) in the CLI's environment: ``-e OPENCLAW_GATEWAY_TOKEN``
-    without a value makes the CLI copy it from there."""
+    without a value makes the CLI copy it from there. Only the image, the entrypoint, the
+    command, the working folder and the variables come from the profile, always after every
+    security option, and the profile's checks keep each a single argument docker cannot read as
+    an option of its own."""
     argv = [
         "create",
         "--name", config.name,
@@ -379,8 +419,12 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
         argv += ["--volume", bind]
     for name, value in container_env(config):
         argv += ["--env", f"{name}={value}"]
-    argv += ["--env", TOKEN_ENV]  # value taken from the CLI's environment, see token_env
-    argv += ["--entrypoint", ENTRYPOINT, config.image, *COMMAND]
+    for name in token_env(config):
+        argv += ["--env", name]  # value taken from the CLI's environment, see token_env
+    profile = config.profile
+    if profile.workdir is not None:
+        argv += ["--workdir", str(profile.workdir)]
+    argv += ["--entrypoint", profile.entrypoint, config.image, *profile.command]
     return argv
 
 
@@ -397,48 +441,6 @@ def network_create_argv(config: AgentJailConfig) -> list[str]:
         "--opt", "com.docker.network.bridge.gateway_mode_ipv6=isolated",
         config.network,
     ]  # fmt: skip
-
-
-def openclaw_config(config: AgentJailConfig) -> dict[str, Any]:
-    """OpenClaw's openclaw.json: the hardened baseline of docs/12, with no secrets in it, and
-    the model providers with their FAKE keys (T06-5: openclaw.model_settings).
-
-    Validated against the pinned image with ``openclaw config validate`` (a VM test), and it
-    passes ``openclaw.check_rewindable`` (AgentJail.write_config enforces it)."""
-    claw = _baseline()
-    models = model_settings(config.model_providers)
-    if models:
-        claw["models"].update(models["models"])
-        if "primary" in models:
-            claw["agents"]["defaults"]["model"] = {"primary": models["primary"]}
-    return claw
-
-
-def _baseline() -> dict[str, Any]:
-    return {
-        "gateway": {
-            "mode": "local",
-            "bind": "loopback",
-            "port": GATEWAY_PORT,
-            "auth": {"mode": "token"},  # the token comes from OPENCLAW_GATEWAY_TOKEN
-            # On by default: the gateway would try SSH towards private peers (docs/20, rule 8).
-            "nodes": {"pairing": {"sshVerify": False}},
-        },
-        # Active by default: its /pair codes would come back after a rewind (docs/20, rule 8).
-        "plugins": {"entries": {"device-pair": {"enabled": False}}},
-        "update": {"checkOnStart": False, "auto": {"enabled": False}},
-        "models": {"catalogRefresh": {"enabled": False}},
-        "cron": {"enabled": False},
-        "memory": {"search": {"provider": "none"}},  # OpenClaw's built-in "no embeddings"
-        "discovery": {"mdns": {"mode": "off"}},
-        "agents": {
-            "defaults": {"workspace": str(CONTAINER_WORK), "sandbox": {"mode": "off"}},
-        },
-        "tools": {
-            "elevated": {"enabled": False},
-            "deny": ["group:automation", "sessions_spawn", "sessions_send"],
-        },
-    }
 
 
 def _require_absolute(label: str, path: Path) -> None:

@@ -27,6 +27,7 @@ from backtide.jail.config import (
 from backtide.jail.docker import JailError
 from backtide.jail.mounts import exposure_problems
 from backtide.jail.openclaw import UnrewindableConfig
+from backtide.jail.profiles import openclaw as openclaw_profile
 
 TOKEN = "u" * 43
 STARTED_AT = "2026-10-06T16:44:06.49679418Z"
@@ -393,7 +394,8 @@ def test_write_config_never_writes_an_unrewindable_config(
     jail: AgentJail, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     unsafe = openclaw_config(jail.config) | {"channels": {"telegram": {"dmPolicy": "pairing"}}}
-    monkeypatch.setattr(agent_module, "openclaw_config", lambda _config: unsafe)
+    # The profile renders openclaw.json from openclaw_config (T17a-2: no longer agent.py's).
+    monkeypatch.setattr(openclaw_profile, "openclaw_config", lambda _config: unsafe)
     with pytest.raises(UnrewindableConfig, match="channels.telegram.dmPolicy"):
         jail.write_config()
     assert not jail.config.config_dir.exists()  # refused before touching the disk

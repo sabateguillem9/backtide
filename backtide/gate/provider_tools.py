@@ -200,6 +200,20 @@ def check_allow_entry(entry: object) -> str:
     return entry
 
 
+PARAM_PREFIX = "param:"
+
+
+def check_profile_param(entry: object) -> str:
+    """A provider-side field an agent profile allows (decision 5 of docs/34): a top-level field
+    of the request, ``param:<name>``, and nothing else. A profile can never allow a tool, a
+    connector, a fetched source or a model that the gate refuses: only the owner can, with
+    ``allow_provider_tools``. Raises ValueError, with a message that is safe to show."""
+    name = check_allow_entry(entry)
+    if not name.startswith(PARAM_PREFIX) or name == PARAM_PREFIX:
+        raise ValueError(f"a profile only allows request fields by name ({PARAM_PREFIX}<name>)")
+    return name
+
+
 def check_request(
     kind: str,
     method: str,
@@ -360,7 +374,7 @@ def _provider_side(
             found.add(key)
     for key in request:
         if key not in _FIELDS[endpoint] and key not in _CONNECTORS:
-            found.add(_name(f"param:{key}"))
+            found.add(_name(f"{PARAM_PREFIX}{key}"))
     model = request.get("model")
     if models:
         if not isinstance(model, str):

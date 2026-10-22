@@ -5,7 +5,9 @@ Docker reads every option, the seccomp profile included, when it creates a conta
 an older seccomp profile) or made by hand under the same name (a ``--privileged`` debug shell,
 a ``docker.sock`` mount) would otherwise be started as if it were the jail. So AgentJail.start()
 compares ``docker container inspect`` with what docker_create_argv asks for, field by field,
-and refuses any difference: such a container must be removed and created again.
+and refuses any difference: such a container must be removed and created again. What it
+expects of the image, the command and the variables comes from the config's agent profile;
+every other rule here is the same for every agent (docs/34, section 6).
 
 The egress proxy (proxy.py) gets the same treatment from proxy_container_problems. Neither
 container may have a DNS server of its own: with ``--dns``, Docker forwards outside names even
@@ -21,18 +23,16 @@ from typing import Any
 from backtide.jail import proxy_config
 from backtide.jail import sensor as sensor_jail
 from backtide.jail.config import (
-    COMMAND,
-    ENTRYPOINT,
     LOG_DRIVER,
     LOG_OPTIONS,
     NO_NEW_PRIVILEGES,
     PROXY_ALIAS,
-    TOKEN_ENV,
     AgentJailConfig,
     container_env,
     memory_bytes,
     nano_cpus,
     tmpfs_mounts,
+    token_env,
     volume_binds,
 )
 from backtide.jail.proxy_config import ProxyJailConfig
@@ -76,7 +76,7 @@ def container_problems(
     """What differs between ``info`` (``docker container inspect``) and the jail of ``config``;
     empty when they match. ``seccomp_profile`` is the parsed JSON of config.seccomp_profile and
     ``image_env`` the image's own environment. Never quotes an environment value: the token is
-    one of them."""
+    one of them (and the profile's fake keys)."""
     created = _section(info, "Config")
     host = _section(info, "HostConfig")
     problems = _config_problems(config, created)
@@ -221,14 +221,17 @@ def _proxy_network_problems(config: ProxyJailConfig, info: dict[str, Any]) -> li
 
 
 def _config_problems(config: AgentJailConfig, created: dict[str, Any]) -> list[str]:
+    profile = config.profile
     expected = {
         "Image": config.image,
         "User": f"{config.uid}:{config.gid}",
         "Hostname": config.hostname,
-        "Entrypoint": [ENTRYPOINT],
-        "Cmd": list(COMMAND),
+        "Entrypoint": [profile.entrypoint],
+        "Cmd": list(profile.command),
         "StopTimeout": config.stop_timeout,
     }
+    if profile.workdir is not None:
+        expected["WorkingDir"] = str(profile.workdir)
     return _differences("", created, expected)
 
 
@@ -278,10 +281,9 @@ def _security_opt_problems(options: list[str], seccomp_profile: object) -> list[
 
 
 def _env_problems(config: AgentJailConfig, env: object, image_env: list[str]) -> list[str]:
-    """The image's variables, overridden by the jail's and the token: nothing more or less.
-    Only names are reported."""
-    expected = _env_dict(image_env) | dict(container_env(config))
-    expected[TOKEN_ENV] = config.gateway_token
+    """The image's variables, overridden by the jail's and those of token_env (the token, the
+    profile's fake keys): nothing more or less. Only names are reported."""
+    expected = _env_dict(image_env) | dict(container_env(config)) | token_env(config)
     actual = _env_dict(env if isinstance(env, list) else [])
     differing = sorted(
         name for name in expected.keys() | actual.keys() if expected.get(name) != actual.get(name)

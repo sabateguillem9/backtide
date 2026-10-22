@@ -94,7 +94,7 @@ from uuid import uuid4
 import backtide
 from backtide.blackbox import BlackBox, BlackBoxError, Event, redact
 from backtide.jail import AgentJail, ExposedJail, JailError
-from backtide.jail.openclaw import UnrewindableConfig
+from backtide.jail.profile import ProfileError
 from backtide.notify import Alert, AlertLevel, AlertSink, LogBridge, LoggedProblem
 from backtide.service.clock import clock_synced as kernel_clock_synced
 from backtide.service.config import ServiceConfig
@@ -626,11 +626,11 @@ class Guardian:
         user's language: the alert carries the error's own Spanish notice (paths of the config,
         never values), and the caller prints it again when it exits."""
         details: dict[str, Any] = {"error": _short(error)}
-        if isinstance(error, UnrewindableConfig):
+        if isinstance(error, ProfileError):  # OpenClaw's: UnrewindableConfig
             details["reason"] = "unrewindable_config"
-            details["problems"] = [problem.path for problem in error.problems]
+            details["problems"] = list(error.paths)
         event = self._record("system", "service_start_failed", details=details, risk=2)
-        if isinstance(error, UnrewindableConfig):
+        if isinstance(error, ProfileError):
             self._alert(
                 AlertLevel.ERROR,
                 "La configuración del agente no se puede rebobinar",

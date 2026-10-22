@@ -2,8 +2,9 @@
 
 One source for every place that asks a person to confirm a rewind: `backtide rebobinar` today,
 Telegram (T09) and the web (T12b) later. The generic part lives here; the lines about the
-agent's channels come from its profile (``backtide.jail.openclaw.REWIND_NOTICE_LINES``). Only the
-time of the snapshot changes from one notice to another: nothing in it comes from the agent.
+agent come from its profile (``AgentProfile.rewind_notice_lines``; OpenClaw's, about its
+channels, by default). Only the time of the snapshot changes from one notice to another: nothing
+in it comes from the agent.
 
 The text is a tuple of paragraphs in Spanish, so each place lays them out its own way (the CLI
 wraps them at 88 columns, the web gives each one its own paragraph).
@@ -12,7 +13,7 @@ wraps them at 88 columns, the web gives each one its own paragraph).
 from collections.abc import Sequence
 from datetime import datetime, timedelta, tzinfo
 
-from backtide.jail.openclaw import REWIND_NOTICE_LINES
+from backtide.jail.profiles import DEFAULT_PROFILE
 
 TIME_FORMAT = "%H:%M:%S del %Y-%m-%d"
 
@@ -40,7 +41,7 @@ def rewind_notice(
     *,
     now: datetime,
     tz: tzinfo,
-    agent_lines: Sequence[str] = REWIND_NOTICE_LINES,
+    agent_lines: Sequence[str] = DEFAULT_PROFILE.rewind_notice_lines,
 ) -> tuple[str, ...]:
     """The notice for a rewind to a snapshot taken at ``taken_at`` (aware), as paragraphs:
     when, what comes back, what does not, the agent's own lines, and the undo point."""
