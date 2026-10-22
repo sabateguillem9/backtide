@@ -14,8 +14,9 @@ which is read-only. ``check_rewindable`` enforces that on the config backtide wr
 
 The rules, with their sources in OpenClaw 2026.9.8, are docs/20-openclaw-autorizacion-y-
 rebobinado.md, section 8 (numbered the same here). Rule 12 is not about rewinding but about the
-gate's notices: OpenClaw's Telegram command menu (T10-5). Where OpenClaw's default is the unsafe
-choice (``dmPolicy`` is "pairing" when absent), the key must be written. The check never
+gate's notices: OpenClaw's Telegram command menu (T10-5). Rule 13 keeps OpenClaw's own browser off
+(T21, docs/36 decision 12). Where OpenClaw's default is the unsafe choice (``dmPolicy`` is
+"pairing" when absent, ``browser.enabled`` is true), the key must be written. The check never
 repeats a value of the config in its messages: only paths, so no secret can reach a log.
 """
 
@@ -215,6 +216,7 @@ def problems_in(config: dict[str, Any]) -> list[RewindProblem]:
     _gateway(config, found)  # rule 8
     _automation(config, found)  # rule 9
     _plugins(config, found)  # rules 8 (device-pair), 10, 11
+    _browser(config, found)  # rule 13
     return found.problems
 
 
@@ -595,6 +597,67 @@ def _plugins(config: dict[str, Any], found: _Findings) -> None:
                 )
 
 
+# Rule 13: OpenClaw's own browser
+#
+# OpenClaw 2026.9.8 ships its browser plugin enabled (extensions/browser/openclaw.plugin.json,
+# "enabledByDefault"), and ``browser.enabled`` defaults to true (src/browser/constants.ts). Its
+# built-in profiles ``user`` (driver "existing-session") and ``chrome`` (driver "extension") drive
+# the owner's real, signed-in Chrome, and ``allowSystemProfileImport`` (default true) copies the
+# cookies of the owner's Chrome profile into a managed one (src/config/zod-schema.root-shape.ts,
+# extensions/browser/src/browser/config.ts). The jail has no Chromium and no route out but the
+# proxy, so today it cannot start; T21 puts a browser in its own container instead (docs/36).
+# Off, the tool still exists and routes to a paired node's browser BEFORE it reads
+# browser.enabled, unless ``gateway.nodes.browser.mode`` is "off" (default "auto";
+# extensions/browser/src/browser-tool.routing.ts). The sandbox browser (agents.*.sandbox.browser)
+# needs a sandbox, which the baseline turns off; ``allowHostControl`` lets it reach the host's.
+
+BROWSER_KEYS = ("enabled",)  # nothing else may be set for a browser that is off
+SANDBOX_BROWSER_FLAGS = ("enabled", "allowHostControl")
+
+
+def _browser(config: dict[str, Any], found: _Findings) -> None:
+    raw = config.get("browser")
+    browser = _dict(config, "browser", "", found)
+    if (raw is None or isinstance(raw, dict)) and browser.get("enabled") is not False:
+        found.add(
+            "browser.enabled",
+            "must be written as false: OpenClaw's own browser is on by default, and its user and "
+            "chrome profiles drive the owner's real Chrome and import its cookies",
+        )
+    for key in browser:
+        if key not in BROWSER_KEYS:
+            found.add(
+                f"browser.{_seg(key)}",
+                "no browser profile may be configured: the user and chrome profiles drive the "
+                "owner's real Chrome with its sessions"
+                if key == "profiles"
+                else "OpenClaw's own browser is off: none of its settings may be set",
+            )
+    # The parents' types are rules 5 and 8's to report: navigated here without a word.
+    quiet = _Findings()
+    nodes = _dict(_dict(config, "gateway", "", quiet), "nodes", "gateway", quiet)
+    raw = nodes.get("browser")
+    routing = _dict(nodes, "browser", "gateway.nodes", found)
+    if (raw is None or isinstance(raw, dict)) and routing.get("mode") != "off":
+        found.add(
+            "gateway.nodes.browser.mode",
+            'must be written as "off": by default the browser tool drives the browser of a '
+            "paired node, and that route does not read browser.enabled",
+        )
+    agents = _dict(config, "agents", "", quiet)
+    scopes = [("agents.defaults", _dict(agents, "defaults", "agents", quiet))]
+    scopes += list(_children(agents, "entries", "agents", quiet))
+    for path, scope in scopes:
+        sandbox = _dict(_dict(scope, "sandbox", path, found), "browser", f"{path}.sandbox", found)
+        for flag in SANDBOX_BROWSER_FLAGS:
+            if sandbox.get(flag) is True:
+                found.add(
+                    f"{path}.sandbox.browser.{flag}",
+                    "must not be true: OpenClaw's own browser stays off (a sandbox browser, or "
+                    "its control of the host's browser)",
+                )
+
+
 # openclaw.json and the profile
 
 
@@ -620,11 +683,18 @@ def _baseline() -> dict[str, Any]:
             "bind": "loopback",
             "port": GATEWAY_PORT,
             "auth": {"mode": "token"},  # the token comes from OPENCLAW_GATEWAY_TOKEN
-            # On by default: the gateway would try SSH towards private peers (docs/20, rule 8).
-            "nodes": {"pairing": {"sshVerify": False}},
+            "nodes": {
+                # "auto" by default: the browser tool would drive a paired node's browser,
+                # whatever browser.enabled says (docs/20, rule 13).
+                "browser": {"mode": "off"},
+                # On by default: the gateway would try SSH towards private peers (docs/20, rule 8).
+                "pairing": {"sshVerify": False},
+            },
         },
         # Active by default: its /pair codes would come back after a rewind (docs/20, rule 8).
         "plugins": {"entries": {"device-pair": {"enabled": False}}},
+        # On by default; its user and chrome profiles drive the owner's real Chrome (rule 13).
+        "browser": {"enabled": False},
         "update": {"checkOnStart": False, "auto": {"enabled": False}},
         "models": {"catalogRefresh": {"enabled": False}},
         "cron": {"enabled": False},

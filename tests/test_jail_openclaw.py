@@ -1,4 +1,4 @@
-"""check_rewindable: docs/20-openclaw-autorizacion-y-rebobinado.md, section 8, rules 1-12.
+"""check_rewindable: docs/20-openclaw-autorizacion-y-rebobinado.md, section 8, rules 1-13.
 
 Each rule has at least one config that passes and one that fails. A failing config must name
 the offending path, so the log (English) and the user notice (Spanish) point at the exact key.
@@ -601,6 +601,120 @@ def test_rule12_custom_commands_are_registered_even_with_native_off(base: Config
 def test_rule12_without_a_telegram_channel_there_is_nothing_to_check(base: Config) -> None:
     assert "channels" not in base
     check_rewindable(base)
+
+
+# Rule 13: OpenClaw's own browser is off (T21, docs/36 decision 12)
+
+
+def test_rule13_the_baseline_turns_the_browser_off_and_its_node_routing(base: Config) -> None:
+    assert base["browser"] == {"enabled": False}
+    assert base["gateway"]["nodes"]["browser"] == {"mode": "off"}
+    check_rewindable(base)
+
+
+def test_rule13_the_browser_must_be_turned_off_in_writing(base: Config) -> None:
+    # OpenClaw 2026.9.8 turns its browser on when browser.enabled is absent.
+    del base["browser"]
+    (problem,) = problems_in(base)
+    assert problem.path == "browser.enabled"
+    assert "on by default" in problem.why
+    base["browser"] = {}
+    assert paths(base) == ["browser.enabled"]
+
+
+@pytest.mark.parametrize("value", [True, "false", 0, None, "off"])
+def test_rule13_only_a_boolean_false_turns_it_off(base: Config, value: object) -> None:
+    base["browser"]["enabled"] = value
+    assert paths(base) == ["browser.enabled"]
+
+
+def test_rule13_the_browser_must_be_an_object(base: Config) -> None:
+    base["browser"] = False
+    assert paths(base) == ["browser"]
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        {"user": {"driver": "existing-session", "attachOnly": True}},  # the owner's real Chrome
+        {"chrome": {"driver": "extension"}},  # the owner's Chrome through the extension relay
+        {"openclaw": {"cdpPort": 18800}},  # even OpenClaw's own managed profile
+        {},
+    ],
+)
+def test_rule13_no_browser_profile_is_accepted(base: Config, profiles: Config) -> None:
+    base["browser"]["profiles"] = profiles
+    (problem,) = problems_in(base)
+    assert problem.path == "browser.profiles"
+    assert "real Chrome" in problem.why
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("allowSystemProfileImport", True),
+        ("allowSystemProfileImport", False),  # off is the default to rely on: nothing to write
+        ("defaultProfile", "user"),
+        ("cdpUrl", "http://10.0.0.2:9222"),
+        ("attachOnly", True),
+        ("executablePath", "/workspace/home/chrome"),
+        ("extraArgs", ["--proxy-server=direct://"]),
+        ("noSandbox", True),
+        ("ssrfPolicy", {"dangerouslyAllowPrivateNetwork": True}),
+    ],
+)
+def test_rule13_no_other_browser_setting_is_accepted(base: Config, key: str, value: object) -> None:
+    base["browser"][key] = value
+    assert paths(base) == [f"browser.{key}"]
+
+
+def test_rule13_odd_browser_keys_are_named_safely(base: Config) -> None:
+    base["browser"]["pro\nfiles"] = {}
+    assert paths(base) == ["browser.pro?files"]
+
+
+def test_rule13_node_routing_must_be_off_in_writing(base: Config) -> None:
+    # The tool routes to a paired node's browser before it looks at browser.enabled
+    # (extensions/browser/src/browser-tool.routing.ts); the default mode is "auto".
+    del base["gateway"]["nodes"]["browser"]
+    (problem,) = problems_in(base)
+    assert problem.path == "gateway.nodes.browser.mode"
+    assert "node" in problem.why
+    for mode in ("auto", "manual", None, False):
+        base["gateway"]["nodes"]["browser"] = {"mode": mode}
+        assert paths(base) == ["gateway.nodes.browser.mode"]
+    base["gateway"]["nodes"]["browser"] = "off"
+    assert paths(base) == ["gateway.nodes.browser"]
+
+
+def test_rule13_a_wrong_gateway_is_reported_once(base: Config) -> None:
+    base["gateway"]["nodes"] = []
+    found = paths(base)
+    assert found.count("gateway.nodes") == 1
+    assert "gateway.nodes.browser.mode" in found
+
+
+@pytest.mark.parametrize("key", ["enabled", "allowHostControl"])
+def test_rule13_no_sandbox_browser_and_no_host_control(base: Config, key: str) -> None:
+    base["agents"]["defaults"]["sandbox"]["browser"] = {key: True}
+    assert paths(base) == [f"agents.defaults.sandbox.browser.{key}"]
+    base["agents"]["defaults"]["sandbox"]["browser"] = {key: False}
+    check_rewindable(base)
+    base["agents"]["entries"] = {"main": {"sandbox": {"browser": {key: True}}}}
+    assert paths(base) == [f"agents.entries.main.sandbox.browser.{key}"]
+
+
+def test_rule13_sandbox_settings_must_be_objects(base: Config) -> None:
+    base["agents"]["defaults"]["sandbox"]["browser"] = True
+    assert paths(base) == ["agents.defaults.sandbox.browser"]
+    base["agents"]["defaults"]["sandbox"] = "off"
+    assert paths(base) == ["agents.defaults.sandbox"]
+
+
+def test_rule13_an_empty_config_is_refused_for_the_browser_too() -> None:
+    found = paths({})
+    assert "browser.enabled" in found
+    assert "gateway.nodes.browser.mode" in found
 
 
 # The error

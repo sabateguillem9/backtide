@@ -8,10 +8,11 @@ openclaw.json, a container that verify.py accepts, and every problem verify.py r
 empty ``docker inspect`` (which names each value it expects). Nothing of it may change for
 OpenClaw; regenerate it only on purpose, when the jail changes for every agent.
 
-Changed on purpose twice since, each time with a script that proved nothing else moved: T17a-3
-(``BASH_ENV`` and ``CLAUDE_ENV_FILE`` at /dev/null) and the security review of the profiles
+Changed on purpose three times since, each time with a script that proved nothing else moved:
+T17a-3 (``BASH_ENV`` and ``CLAUDE_ENV_FILE`` at /dev/null), the security review of the profiles
 (``--no-healthcheck``, and the profile's own variables by name in the argv, their values in the
-docker CLI's environment: ``create_cli_env`` is create_env now).
+docker CLI's environment: ``create_cli_env`` is create_env now) and rule 13 of check_rewindable
+(openclaw.json only: ``browser.enabled`` false and ``gateway.nodes.browser.mode`` "off").
 """
 
 import copy

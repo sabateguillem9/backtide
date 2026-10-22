@@ -178,6 +178,23 @@ def test_openclaw_accepts_the_config_that_check_rewindable_accepts(running_agent
     assert _validate_copy(running_agent, bad).returncode != 0
 
 
+def test_openclaws_own_browser_is_off_and_has_nothing_to_start(running_agent) -> None:
+    """Rule 13 (docs/20): the running config turns OpenClaw's browser and its node routing off,
+    and the pinned image has no Chromium for it anyway (built without OPENCLAW_INSTALL_BROWSER;
+    PLAYWRIGHT_BROWSERS_PATH is in the read-only root)."""
+    config = json.loads(running_agent.jail.config.config_file.read_text())
+    assert config["browser"] == {"enabled": False}
+    assert config["gateway"]["nodes"]["browser"] == {"mode": "off"}
+    found = sh(
+        running_agent,
+        "ls -A /home/node/.cache/ms-playwright 2>/dev/null; "
+        "command -v chromium chromium-browser google-chrome google-chrome-stable chrome; "
+        "find / -xdev \\( -name 'chrome' -o -name 'chromium*' -o -name 'headless_shell' \\) "
+        "-type f -perm -u=x 2>/dev/null | head -5; true",  # programs, not OpenClaw's sources
+    )
+    assert found.stdout.strip() == "", found.stdout
+
+
 # What the container is
 
 

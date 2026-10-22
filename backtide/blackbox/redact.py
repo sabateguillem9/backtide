@@ -23,6 +23,24 @@ _SENSITIVE_WORDS = (
     r"|(?:secret|signing|encryption|master)[-_]?key|authorization|cookie)"
 )
 _SECRET_NAME_RE = re.compile(rf"[\w.-]*?{_SENSITIVE_WORDS}")
+# Payment cards (T21, docs/36 decision 11): the number, its CVV and a PIN, by the names forms and
+# APIs give them. Unlike the words above, a card word must be the whole name or follow a separator
+# (also a bracket, raw or %-escaped, as in card[cvc] or card%5Bcvc%5D): "pin" and "pan" are struck,
+# "spin", "span" and "pincode" are not. Bare "cid" and "csc" are e-mail and other things: only
+# after card or cc.
+_NAME_SEP = r"(?:[-_.\[\]]|%5[bBdD])"
+_CARD_W = rf"{_NAME_SEP}{{0,2}}"  # between the words of one name: card_number, card][number
+_CARD_WORDS = (
+    rf"(?:(?:(?:credit|debit|payment){_CARD_W})?card{_CARD_W}(?:number|num|no|nr)"
+    rf"|cc{_CARD_W}(?:number|num|no)|primary{_CARD_W}account{_CARD_W}number|pan"
+    rf"|(?:(?:card|cc){_CARD_W})?(?:cvv2?|cvc2?|cvn)|(?:card|cc){_CARD_W}(?:csc|cid)"
+    rf"|(?:card{_CARD_W})?(?:security{_CARD_W}code|verification{_CARD_W}(?:value|code))"
+    rf"|(?:(?:card|atm){_CARD_W})?pin(?:{_CARD_W}(?:number|block))?)"
+)
+# A name, from its first character: anything up to a separator, then the card words, then maybe
+# the closing bracket of card[cvc].
+_CARD_NAME = rf"(?:[\w.\[\]%-]*?{_NAME_SEP})?{_CARD_WORDS}(?:\]|%5[dD])?"
+_CARD_NAME_RE = re.compile(_CARD_NAME, re.IGNORECASE)
 # Headers stored as {"name": "Authorization", "value": "..."} (HAR) or similar pairs.
 _PAIR_NAME_KEYS = frozenset({"name", "key", "header"})
 _PAIR_VALUE_KEYS = frozenset({"value", "values"})
@@ -98,6 +116,25 @@ _TEXT_PATTERNS = (
     # "name": "value" with a secret name: JSON and Python reprs inside a text.
     re.compile(rf"(?i)\"[\w.-]*?{_SENSITIVE_WORDS}\"\s*:\s*\"(?P<secret>(?:[^\"\\]|\\.)*)\""),
     re.compile(rf"(?i)'[\w.-]*?{_SENSITIVE_WORDS}'\s*:\s*'(?P<secret>(?:[^'\\]|\\.)*)'"),
+    # Card fields by name (_CARD_NAME): form and query pairs, JSON and Python reprs (strings and
+    # numbers: a CVV may be sent as 123), and --flags.
+    re.compile(rf"(?i)(?<![\w.\[\]%-]){_CARD_NAME}=(?P<secret>[^\s&#;,'\"]+)"),
+    re.compile(rf"(?i)\"{_CARD_NAME}\"\s*:\s*\"(?P<secret>(?:[^\"\\]|\\.)*)\""),
+    re.compile(rf"(?i)'{_CARD_NAME}'\s*:\s*'(?P<secret>(?:[^'\\]|\\.)*)'"),
+    re.compile(rf"(?i)[\"']{_CARD_NAME}[\"']\s*:\s*(?P<secret>-?[0-9][0-9.eE+-]*)"),
+    re.compile(rf"(?i)(?<!\S)--{_CARD_NAME}[ \t]+(?P<secret>[^\s'\"]+)"),
+)
+
+# A payment card number: 13 to 19 digits, maybe in groups split by a space, a dash, a "+" or a
+# "%20" (a form's space), starting as every card network's numbers do (2 to 6), and Luhn-valid
+# (_is_card_number), so that most other long numbers stay: a timestamp starts with 1, and only one
+# in ten random numbers passes Luhn. It must be a whole run: not part of a longer one (20 digits,
+# or more groups), nor the decimals of a number. Each match is bounded (at most 18 groups), so the
+# scan is linear.
+_CARD_NUMBER_RE = re.compile(
+    r"(?<![0-9])(?<![0-9][ +.-])(?<![0-9]%20)"
+    r"(?P<secret>[2-6](?:(?:[ +-]|%20)?[0-9]){12,18})"
+    r"(?!(?:[ +-]|%20)?[0-9])(?!\.[0-9])"
 )
 
 
@@ -150,7 +187,10 @@ def _lower(key: object) -> str | None:
 
 
 def _is_secret_name(key: object) -> bool:
-    return isinstance(key, str) and _SECRET_NAME_RE.fullmatch(key.strip().lower()) is not None
+    if not isinstance(key, str):
+        return False
+    name = key.strip().lower()
+    return _SECRET_NAME_RE.fullmatch(name) is not None or _CARD_NAME_RE.fullmatch(name) is not None
 
 
 def _redact_key(key: object) -> object:
@@ -175,7 +215,22 @@ def strike_text(text: str, on_strike: Callable[[re.Match[str]], object] | None =
 
     for pattern in _TEXT_PATTERNS:
         text = pattern.sub(strike, text)
-    return text
+
+    def strike_card(match: re.Match[str]) -> str:
+        return strike(match) if _is_card_number(match.group("secret")) else match.group(0)
+
+    return _CARD_NUMBER_RE.sub(strike_card, text)
+
+
+def _is_card_number(text: str) -> bool:
+    """Whether the digits of ``text`` (a _CARD_NUMBER_RE match) pass the Luhn check."""
+    total = 0
+    for place, char in enumerate(reversed([c for c in text.replace("%20", "") if c.isdigit()])):
+        digit = ord(char) - 48
+        if place % 2:
+            digit = digit * 2 - 9 if digit > 4 else digit * 2
+        total += digit
+    return total % 10 == 0
 
 
 def _strike_secret(match: re.Match[str]) -> str:

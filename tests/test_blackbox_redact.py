@@ -565,11 +565,28 @@ _redact_mod = _importlib.import_module("backtide.blackbox.redact")
         "services/T1/",
         "services/T1/B1/a",
         "triggers/E1/a/",
+        "4",
+        "4 ",
+        "4-",
+        "4+",
+        "4%20",
+        "4.",
+        "card_",
+        "card[",
+        "card%5b",
+        "card[]",
+        '"cvc',
+        '"card_',
+        '"cvc": ',
+        "'pin':",
+        "pin=",
+        "--pin",
+        "x-",
     ],  # fmt: skip
 )
 def test_each_pattern_is_fast_on_70_kib_of_hostile_text(unit: str) -> None:
     hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
-    for pattern in _redact_mod._TEXT_PATTERNS:
+    for pattern in (*_redact_mod._TEXT_PATTERNS, _redact_mod._CARD_NUMBER_RE):
         start = _time.perf_counter()
         pattern.search(hostile)
         elapsed = _time.perf_counter() - start
@@ -594,3 +611,201 @@ def test_a_jwt_with_a_payload_over_4_kib_is_struck() -> None:
     assert struck.endswith("done")
     unsigned = redact(f"x eyJhbGciOiJub25lIn0.{payload}. y")  # alg none: an empty signature
     assert "Ab3dE6gH9Ab3dE6gH9" not in unsigned
+
+
+# --- Payment cards (T21, docs/36 decision 11): numbers by Luhn, CVV and PIN by name -----------
+
+# Published test numbers of the card networks (all Luhn-valid), of 13 to 19 digits.
+CARDS = [
+    "4242424242424242",  # Visa
+    "4111111111111111",
+    "4222222222222",  # Visa, 13 digits
+    "5555555555554444",  # Mastercard
+    "2223003122003222",  # Mastercard, 2-series
+    "378282246310005",  # American Express, 15 digits
+    "36227206271667",  # Diners, 14 digits
+    "6011111111111117",  # Discover
+    "3530111333300000",  # JCB
+    "6200000000000005",  # UnionPay
+    "6011000990139420007",  # 19 digits
+]
+
+
+def _spaced(number: str, sep: str) -> str:
+    return sep.join(number[i : i + 4] for i in range(0, len(number), 4))
+
+
+@pytest.mark.parametrize("number", CARDS)
+def test_a_luhn_valid_card_number_is_struck_in_any_text(number: str) -> None:
+    assert redact(f"paid with {number} today") == f"paid with {REDACTED} today"
+    assert redact(number) == REDACTED
+
+
+@pytest.mark.parametrize("sep", [" ", "-", "+", "%20"])
+def test_a_card_number_is_struck_with_its_usual_separators(sep: str) -> None:
+    text = f"card {_spaced('4242424242424242', sep)} exp 12/30"
+    assert redact(text) == f"card {REDACTED} exp 12/30"
+    amex = "3782 822463 10005".replace(" ", sep)  # Amex groups 4-6-5
+    assert redact(f"[{amex}]") == f"[{REDACTED}]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "4242424242424241",  # one digit off: not Luhn-valid
+        "4111 1111 1111 1112",
+        "order 5555555555554445 shipped",
+        "1729600000000 ms",  # a timestamp in milliseconds (13 digits)
+        "1729600000000000000 ns",  # and in nanoseconds (19 digits)
+        "1000000000000008",  # Luhn-valid, but no card number starts with 1
+        "9000000000000001",  # nor with 9
+        "424242424242",  # Luhn-valid, 12 digits: too short
+        "42424242424242424242",  # Luhn-valid, 20 digits: too long
+        "4242 4242 4242 4242 4242",  # the same, spaced
+        "p=0.4242424242424242",  # the decimals of a number
+        "4242424242424242.5",
+        "call +34 612 345 678",
+        "2026-10-22T16:56:26.123456789Z",
+    ],
+)
+def test_numbers_that_are_not_card_numbers_are_kept(text: str) -> None:
+    assert redact(text) == text
+
+
+def test_only_the_card_number_goes_and_the_text_around_stays() -> None:
+    text = "Visa 4242 4242 4242 4242, Amex 378282246310005; total 42,00 EUR"
+    assert redact(text) == f"Visa {REDACTED}, Amex {REDACTED}; total 42,00 EUR"
+
+
+def test_a_card_number_in_a_form_body_is_struck() -> None:
+    body = "amount=1999&number=4242424242424242&exp_month=12"
+    assert redact(body) == f"amount=1999&number={REDACTED}&exp_month=12"
+    plus = "number=4242+4242+4242+4242&exp=12%2F30"
+    assert redact(plus) == f"number={REDACTED}&exp=12%2F30"
+
+
+def test_a_card_number_in_a_json_body_is_struck() -> None:
+    body = '{"card": {"number": "4242424242424242", "exp_month": 12}}'
+    assert redact(body) == f'{{"card": {{"number": "{REDACTED}", "exp_month": 12}}}}'
+    assert redact({"card": {"number": "5555 5555 5555 4444"}}) == {"card": {"number": REDACTED}}
+
+
+CARD_FIELDS = [
+    "card_number",
+    "cardNumber",
+    "card-number",
+    "CARDNUMBER",
+    "card_num",
+    "card_no",
+    "credit_card_number",
+    "debit-card-number",
+    "cc-number",
+    "cc_number",
+    "ccnum",
+    "pan",
+    "PAN",
+    "primary_account_number",
+    "cvv",
+    "CVV2",
+    "cvc",
+    "cvc2",
+    "card_cvc",
+    "card_cvv",
+    "cardCvc",
+    "cc-csc",
+    "card_cid",
+    "security_code",
+    "securityCode",
+    "card_security_code",
+    "card_verification_value",
+    "pin",
+    "PIN",
+    "card_pin",
+    "atm-pin",
+    "pin_number",
+    "pin_block",
+    "card[number]",
+    "card[cvc]",
+    "payment_method_data[card][cvc]",
+    "card%5Bcvc%5D",
+    "billing.card.cvv",
+    "x-card-cvc",
+]
+
+
+@pytest.mark.parametrize("name", CARD_FIELDS)
+def test_card_fields_are_struck_by_name_in_a_mapping(name: str) -> None:
+    assert redact({name: "123"}) == {name: REDACTED}
+    assert redact({name: 123}) == {name: REDACTED}  # a CVV sent as a JSON number
+    assert redact([name, "1234"]) == [name, REDACTED]  # a header or argv pair
+    assert redact({"name": name, "value": "123"}) == {"name": name, "value": REDACTED}
+
+
+@pytest.mark.parametrize("name", CARD_FIELDS)
+def test_card_fields_are_struck_by_name_in_form_and_json_text(name: str) -> None:
+    assert redact(f"a=1&{name}=123&b=2") == f"a=1&{name}={REDACTED}&b=2"
+    assert redact(f"{name}=123") == f"{name}={REDACTED}"
+    assert redact(f'{{"{name}": "123", "b": 2}}') == f'{{"{name}": "{REDACTED}", "b": 2}}'
+    assert redact(f'{{"{name}":123,"b":2}}') == f'{{"{name}":{REDACTED},"b":2}}'
+    assert redact(f"{{'{name}': '0042'}}") == f"{{'{name}': '{REDACTED}'}}"
+    assert redact(f"--{name} 1234 --x") == f"--{name} {REDACTED} --x"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "span",
+        "time_span",
+        "spin",
+        "pinned",
+        "pins",
+        "japan",
+        "company",
+        "cc",  # an e-mail's copy
+        "bcc",
+        "cid",  # an e-mail's Content-ID
+        "number",
+        "card",
+        "card_type",
+        "card_brand",
+        "card_last4",
+        "exp_month",
+        "pan_id",
+        "topic",
+        "pincode",  # a postal code in India
+    ],
+)
+def test_ordinary_names_near_the_card_ones_are_kept(name: str) -> None:
+    assert redact({name: "123"}) == {name: "123"}
+    assert redact(f"{name}=123") == f"{name}=123"
+    assert redact(f'{{"{name}": "123"}}') == f'{{"{name}": "123"}}'
+
+
+def test_card_patterns_are_idempotent() -> None:
+    text = 'card 4242 4242 4242 4242 cvc=123 {"pin": 1234}'
+    once = redact(text)
+    assert "4242" not in once and "123" not in once and "1234" not in once
+    assert redact(once) == once
+
+
+def test_strike_text_reports_a_card_number_it_strikes() -> None:
+    seen: list[str] = []
+    struck = _redact_mod.strike_text("x 4242424242424242 y", on_strike=lambda m: seen.append(m[0]))
+    assert struck == f"x {REDACTED} y"
+    assert seen == ["4242424242424242"]
+
+
+def test_redact_is_linear_on_hostile_digits() -> None:
+    def hostile(size: int) -> str:
+        return ("4242 4242 4242 4242 4242 " * (size // 25 + 1))[:size]
+
+    small, large = hostile(64 * 1024), hostile(512 * 1024)
+    assert_linear(redact, small, large, 8, floor=0.01, cap=2.0, label="redact on card digits")
+
+
+def test_redact_is_linear_on_hostile_card_names() -> None:
+    def hostile(size: int) -> str:
+        return ('"payment_card[card][cvc%5d' * (size // 26 + 1))[:size]
+
+    small, large = hostile(64 * 1024), hostile(512 * 1024)
+    assert_linear(redact, small, large, 8, floor=0.01, cap=2.0, label="redact on card names")
