@@ -41,7 +41,7 @@ In scope: anything in this repository that weakens one of the invariants below, 
 - reach the internet other than through the proxy;
 - get a secret recorded in the black box;
 - make an event in the black box change or disappear without the hash chain breaking;
-- bypass a hold on a destructive or outbound action (once the gate exists);
+- bypass a hold on a destructive or outbound action;
 - break rewinding, for example by exhausting space or metadata;
 - attack the read-only web view or the control socket from inside the agent's container.
 
@@ -60,7 +60,7 @@ These are the rules the project is held to. A violation of any of them is a secu
 7. Every new security feature has its scenario in the evil-agent attack battery.
 8. Attack tests run only inside the VM and the test containers, never against the host machine or real services.
 
-Status note: invariants 3 (a test exists; the proxy does not yet) and 6 (the gate is not built) are only partly implemented today. See the README.
+Status note: invariants 3 and 6 are implemented (the proxy and the gate exist and have attack scenarios), but invariant 6 depends on the gate reading requests correctly: a write without a translator is held, while a request that a translator misreads as a read is not. There is also no spend cap yet. See the README.
 
 ## Out of scope
 
