@@ -1,0 +1,5 @@
+008bwant 1234567890abcdef1234567890abcdef12345678 multi_ack_detailed side-band-64k thin-pack no-progress ofs-delta agent=git/2.54.0-Darwin
+00000032have 2bfd8a244ec6a4e6eab10468e9a42a363f2eebbf
+0032have 99acd4bedf4b599c929a85b689a6aa48c0c5ce2e
+0032have 2439e6b1146bb4ead48dd40f0ea445459b1dcbf4
+0009done

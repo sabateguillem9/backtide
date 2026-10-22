@@ -372,6 +372,8 @@ def batch_label(notice: Mapping[str, Any], kind: str) -> str:
         return (
             "Todo a estos destinatarios (sesión)" if many else "Todo a este destinatario (sesión)"
         )
+    if isinstance(reading, Mapping) and reading.get("translator") == "git":
+        return "Pushes que crean ramas nuevas, 1 h"
     if isinstance(reading, Mapping):
         noun = "Envíos" if reading.get("effect") == "send" else "Cambios"
         return f"{noun} de {api_name(str(reading.get('translator')))}, 1 h"
@@ -384,10 +386,26 @@ NEVER = (
 )
 
 
+# A git batch (security review of T17b-1, M1): only pushes that create new refs, in the
+# repository of the hold (its account is the credential and the repository). The repository is
+# the agent's text, so it goes in its block, never in ours.
+GIT_BATCH = (
+    "¿Crear un lote? Se aprueba esta petición y, durante 1 hora, sin volver a preguntar, todo "
+    "push que solo crea ramas o etiquetas nuevas en este mismo repositorio (el de abajo) y con "
+    "esta misma credencial. Mover o borrar una rama o etiqueta que ya existe se pregunta "
+    "siempre, uno a uno: backtide no puede saber si es un push forzado. Ojo: una rama nueva "
+    "puede lanzar los GitHub Actions del repositorio con su código. Se ve y se revoca con "
+    "/lotes."
+)
+
+
 def batch_question(notice: Mapping[str, Any], kind: str) -> str:
     """The confirmation of a batch: its exact scope."""
     reading = notice.get("reading")
-    if isinstance(reading, Mapping):
+    if isinstance(reading, Mapping) and reading.get("translator") == "git":
+        ours = GIT_BATCH
+        agent = [_one_line(f"Ahora: {reading.get('target') or ''}")]
+    elif isinstance(reading, Mapping):
         api = api_name(str(reading.get("translator")))
         if kind == "recipient":
             ours = (
@@ -443,6 +461,8 @@ def batches_text(rules: Sequence[Mapping[str, Any]]) -> str:
         elif rule.get("scope") == "recipient":
             what = f"{api_name(str(rule.get('translator')))}, todo a unos destinatarios, sesión"
             agent.append(f"{n}. " + _recipients(rule.get("recipients") or []))
+        elif rule.get("translator") == "git":
+            what = "git, pushes que crean ramas nuevas, 1 h"
         else:
             noun = "envíos" if rule.get("effect") == "send" else "cambios"
             what = f"{api_name(str(rule.get('translator')))}, todos los {noun}, 1 h"

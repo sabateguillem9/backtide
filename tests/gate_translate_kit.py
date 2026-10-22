@@ -20,6 +20,7 @@ GRAPH_AUTH = ("authorization", "Bearer eyFAKE.graph.token")
 SLACK_AUTH = ("authorization", "Bearer xoxb-0000-fake-slack-bot")
 DISCORD_AUTH = ("authorization", "Bot fake.discord.bot.token")
 GITHUB_AUTH = ("authorization", "Bearer fake-github-token")
+GIT_AUTH = ("authorization", "Basic eC1hY2Nlc3MtdG9rZW46ZmFrZS1naXRodWItdG9rZW4=")
 JSON = ("content-type", "application/json")
 FORM = ("content-type", "application/x-www-form-urlencoded")
 

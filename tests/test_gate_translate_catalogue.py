@@ -8,6 +8,7 @@ accounts (``OWNER_DRAFTS``).
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,7 @@ from tests.gate_translate_kit import (
     BOT_PATH,
     CTX,
     DISCORD_AUTH,
+    GIT_AUTH,
     GITHUB_AUTH,
     GOOGLE_AUTH,
     GRAPH_AUTH,
@@ -139,6 +141,16 @@ def _gh(query: str) -> RequestView:
     return request(
         "POST", "api.github.com", "/graphql", json_body={"query": query}, headers=(GITHUB_AUTH,)
     )
+
+
+def _git(method: str, route: str, fixture: str | None = None, body: bytes = b"") -> RequestView:
+    if fixture is not None:
+        body = (Path(__file__).parent / "fixtures" / "git" / fixture).read_bytes()
+    service = route.split("?", 1)[0]
+    headers = (GIT_AUTH,)
+    if method == "POST":
+        headers += (("content-type", f"application/x-{service}-request"),)
+    return request(method, "github.com", f"/octo/demo.git/{route}", body=body, headers=headers)
 
 
 CATALOGUE = [
@@ -716,6 +728,21 @@ CATALOGUE = [
         request("GET", "api.github.com", "/graphql?query=%7Bviewer%7Blogin%7D%7D"),
         UNKNOWN,
     ),
+    # git over smart HTTP (T17b-1): what git 2.54 really sent (tests/fixtures/git/).
+    Case("git-discovery", _git("GET", "info/refs?service=git-upload-pack"), READ, write=False),
+    Case("git-fetch", _git("POST", "git-upload-pack", "fetch-v2-fetch.bin"), READ, write=False),
+    Case("git-ls-refs", _git("POST", "git-upload-pack", "fetch-v2-ls-refs.bin"), READ, write=False),
+    # The probe before a large push: an empty command list, the server does nothing.
+    Case("git-push-probe", _git("POST", "git-receive-pack", body=b"0000"), READ, write=False),
+    Case(
+        "git-push",
+        _git("POST", "git-receive-pack", "push-create.bin"),
+        CHANGE,
+        ("refs/heads/main",),
+    ),  # fmt: skip
+    Case("git-push-force", _git("POST", "git-receive-pack", "push-force.bin"), CHANGE),
+    Case("git-push-delete", _git("POST", "git-receive-pack", "push-delete-tag.bin"), DELETE),
+    Case("git-push-options", _git("POST", "git-receive-pack", "push-options.bin"), UNKNOWN),
 ]
 
 HARMLESS = {
@@ -752,6 +779,7 @@ def test_the_catalogue_has_unique_ids_and_covers_every_translator() -> None:
         "discord",
         "read_post",
         "github_graphql",
+        "git",
     }
 
 
@@ -815,6 +843,7 @@ def test_each_translator_answers_in_its_apis_shape() -> None:
         "discord": Shape.DISCORD,
         "read_post": Shape.PLAIN,
         "github_graphql": Shape.PLAIN,
+        "git": Shape.PLAIN,
     }
 
 
@@ -850,6 +879,9 @@ ODD = [
     ("discord.com", "POST", "/api/v10/../v10/channels/1/messages"),
     ("api.tavily.com", "PUT", "/search"),
     ("api.github.com", "PUT", "/graphql"),
+    ("github.com", "PUT", "/octo/demo.git/git-receive-pack"),
+    ("github.com", "POST", "/octo/demo.git/info/refs"),
+    ("github.com", "GET", "/octo/demo.git/git-receive-pack"),
 ]
 
 

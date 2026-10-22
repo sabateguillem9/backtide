@@ -185,6 +185,9 @@ class Note(StrEnum):
     # A Telegram inline message (``inline_message_id``): it may be in any chat, so never
     # trusted, whatever ``chat_id`` says (review of T10-3, H2).
     INLINE_MESSAGE = "inline_message"
+    # A git push that moves a ref that already exists: it may be a forced push, which its body
+    # cannot tell, so it never rides a batch (security review of T17b-1, M1).
+    MOVES_REF = "moves_ref"
     SECRET_SEEN = "secret_seen"  # noqa: S105 (a note, not a secret): striking removed a secret from what it carries
 
 

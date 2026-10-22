@@ -36,6 +36,7 @@ TARGETS = [
     ("discord.com", "/api/v10/channels/1/messages", (DISCORD_AUTH,)),
     ("api.tavily.com", "/search", ()),
     ("api.github.com", "/graphql", ()),
+    ("github.com", "/octo/demo.git/git-receive-pack", ()),
 ]
 TARGET_IDS = [host for host, _path, _headers in TARGETS]
 JSON = ("content-type", "application/json")

@@ -707,6 +707,10 @@ class HoldBook:
             return ()
         if scope.translator is None:
             return (BatchKind.KIND,)
+        if scope.translator == "git":
+            # Only pushes that create new refs ride a batch (a ref is created once: "todo a
+            # este destinatario" would add nothing). Review of T17b-1, M1.
+            return (BatchKind.KIND,)
         to_them = scope.reply_to <= scope.recipients
         if 1 <= len(scope.recipients) <= MAX_BATCH_RECIPIENTS and to_them:
             return (BatchKind.RECIPIENT, BatchKind.KIND)

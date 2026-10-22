@@ -2,13 +2,13 @@
 ``Reading`` the gate decides on. Pure: no I/O, bounded cost.
 
 ``translate(view, context)`` picks the translator by the connection's host (and, for GitHub, the
-``/graphql`` path), never by the ``Host`` header or the body. It returns None when no translator
-knows the request (the gate's plain rules apply: reads pass, writes are held), and otherwise
-always a ``Reading``: a translator that fails, or a request past the common checks (a method
-override header, a body still encoded, trailers, too large), gives ``Effect.UNKNOWN``, which
-the gate holds. It never raises for anything the agent sends. A read that a body carries (a
-search by POST, a "harmless" write) is held when the body is over 64 KiB, and held with risk 3
-when it carries a secret (``base.guard_read``).
+``/graphql`` path or a repository's git routes), never by the ``Host`` header or the body. It
+returns None when no translator knows the request (the gate's plain rules apply: reads pass, writes
+are held), and otherwise always a ``Reading``: a translator that fails, or a request past the
+common checks (a method override header, a body still encoded, trailers, too large), gives
+``Effect.UNKNOWN``, which the gate holds. It never raises for anything the agent sends. A read that
+a body carries (a search by POST, a "harmless" write) is held when the body is over 64 KiB, and
+held with risk 3 when it carries a secret (``base.guard_read``).
 """
 
 import logging
@@ -17,6 +17,7 @@ from typing import NamedTuple
 
 from backtide.gate.translate import (
     discord,
+    git,
     github_graphql,
     gmail,
     graph_mail,
@@ -104,6 +105,7 @@ _TRANSLATORS = (
         Shape.PLAIN,
         WAIT_DEFAULT,
     ),
+    _Entry(git.NAME, git.claims, git.read, Shape.PLAIN, WAIT_DEFAULT),
     _Entry(read_post.NAME, read_post.claims, read_post.read, Shape.PLAIN, WAIT_DEFAULT),
 )
 

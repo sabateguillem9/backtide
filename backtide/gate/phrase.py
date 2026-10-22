@@ -23,8 +23,12 @@ _API = {
     "slack": "Slack",
     "discord": "Discord",
     "github_graphql": "GitHub",
+    "git": "git",
     "read_post": "Un buscador",
 }
+# A push (translate/git.py): what it does, and what backtide cannot know of it (a note).
+_GIT = {"change": "push a un repositorio", "delete": "push que borra ramas o etiquetas"}
+_GIT_UNSEEN = "backtide no ve el código que lleva"
 _MAIL = frozenset({"gmail", "graph_mail"})
 _VERBS = {
     "send": "enviar",
@@ -50,6 +54,9 @@ _NOTES = {
     "translator_failed": "el traductor falló",
     "fetches_url": "la plataforma descargará esa dirección",
     "inline_message": "un mensaje en línea: puede estar en cualquier chat",
+    "moves_ref": (
+        "mueve una rama o etiqueta que ya existe: backtide no puede saber si es un push forzado"
+    ),
 }
 # Quote marks the agent could use to close our «…» and write after it as if it were ours
 # (review of T10-3, L8): inside a quote they become plain ones.
@@ -72,6 +79,8 @@ def action(reading: Mapping[str, Any]) -> str:
     effect = str(reading.get("effect", "unknown"))
     if effect == "unknown":
         what = "una petición que backtide no entiende"
+    elif translator == "git" and effect in _GIT:
+        what = _GIT[effect]
     else:
         noun = ("un correo" if translator in _MAIL else "un mensaje") if effect in (
             "send", "forward"
@@ -83,6 +92,8 @@ def action(reading: Mapping[str, Any]) -> str:
 def note_texts(reading: Mapping[str, Any]) -> list[str]:
     """The reading's notes in our words (our fixed texts, never the agent's)."""
     texts = [_NOTES[note] for note in reading.get("notes") or [] if note in _NOTES]
+    if reading.get("translator") == "git" and reading.get("effect") in _GIT:
+        texts.append(_GIT_UNSEEN)
     if reading.get("cut"):
         texts.append("resumida: era demasiado larga")
     return list(dict.fromkeys(texts))
@@ -126,8 +137,8 @@ def cut_middle(text: str, limit: int = RECIPIENT_CHARS) -> str:
 
 
 def _recipients(translator: str, recipients: Sequence[Any]) -> str:
-    if not recipients:
-        return ""
+    if not recipients or translator == "git":
+        return ""  # a push's refs are in its target, with what happens to each one
     shown = ", ".join(cut_middle(_line(str(item))) for item in recipients[:_SHOWN_RECIPIENTS])
     more = len(recipients) - _SHOWN_RECIPIENTS
     if more > 0:

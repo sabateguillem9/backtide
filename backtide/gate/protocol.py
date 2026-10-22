@@ -86,7 +86,7 @@ MAX_READ_ENDPOINTS = 64  # [gate] read_endpoints
 # shorter texts and lists, and ``cut: true``, which backtide never trusts (nor, in T10-4, batches).
 MAX_READING_BYTES = 24 * 1024
 _TRANSLATORS = frozenset(
-    {"telegram", "gmail", "graph_mail", "slack", "discord", "github_graphql", "read_post"}
+    {"telegram", "gmail", "graph_mail", "slack", "discord", "github_graphql", "git", "read_post"}
 )
 _OPERATION_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}", re.ASCII)
 _ACCOUNT_RE = re.compile(r"[0-9a-f]{16}", re.ASCII)
