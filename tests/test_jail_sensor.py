@@ -24,6 +24,8 @@ from backtide.jail.sensor import (
     IMAGE,
     POLICY_FILE,
     POLICY_SHA256,
+    REDACTION_FILTERS,
+    REDACTION_LAST_RULES,
     REDACTION_RULES,
     REDACTION_TOOL_RULES,
     SensorJail,
@@ -199,14 +201,26 @@ def test_each_redaction_line_is_one_json_rule() -> None:
     lines = sensor_settings(CONFIG)["redaction-filters"].splitlines()
     assert [json.loads(line) for line in lines] == [
         {"redact": list(r)} for r in REDACTION_RULES
-    ] + [{"binary_regex": [b], "redact": list(r)} for b, r in REDACTION_TOOL_RULES]
+    ] + [{"binary_regex": [b], "redact": list(r)} for b, r in REDACTION_TOOL_RULES] + [
+        {"redact": list(REDACTION_LAST_RULES)}
+    ]
+
+
+def test_the_generic_flag_rule_runs_after_every_other() -> None:
+    """It strikes whatever follows a secret-named flag: run earlier, it would take the "-u" or
+    the "Bearer" another rule starts from (the review of the shared words)."""
+    assert REDACTION_FILTERS[-1] == (None, REDACTION_LAST_RULES)
+    assert [f for f in REDACTION_FILTERS[:-1] if f[0] is None] == [
+        (None, r) for r in REDACTION_RULES
+    ]
 
 
 def _tetragon_redact(text: str, binary: str = "/bin/true") -> str:
     """What Tetragon does with a rule: each capture group of each match becomes *****. A rule
-    with a binary_regex only applies to a binary it matches."""
-    filters = [*REDACTION_RULES]
-    filters += [rules for regex, rules in REDACTION_TOOL_RULES if re.search(regex, binary)]
+    with a binary_regex only applies to a binary it matches. In the filters' order."""
+    filters = [
+        rules for regex, rules in REDACTION_FILTERS if regex is None or re.search(regex, binary)
+    ]
     for rules in filters:
         for rule in rules:
             pattern = re.compile(rule)
@@ -349,9 +363,8 @@ def test_the_redaction_rules_leave_ordinary_flags(binary: str, arguments: str) -
 
 def test_every_rule_is_re2_shaped() -> None:
     """RE2 has no lookaround and no backreference: Tetragon would refuse to start."""
-    rules = [rule for rules in REDACTION_RULES for rule in rules]
-    rules += [rule for _, rules in REDACTION_TOOL_RULES for rule in rules]
-    rules += [binary for binary, _ in REDACTION_TOOL_RULES]
+    rules = [rule for _, rules in REDACTION_FILTERS for rule in rules]
+    rules += [binary for binary, _ in REDACTION_FILTERS if binary is not None]
     for rule in rules:
         assert not re.search(r"\(\?<?[=!]|\\[1-9]|\(\?P=", rule), rule
         assert re.compile(rule).groups >= (0 if rule.startswith("(?:^|/)") else 1), rule

@@ -791,8 +791,14 @@ def _hostile(unit: str, size: int) -> str:
 
 
 @pytest.mark.parametrize(
-    "unit", ["a.", "a-", "-x ", "eyJ-", "token ", "pass=", '"a', "a b ", "a\n", "x://"]
-)
+    "unit",
+    [
+        "a.", "a-", "-x ", "eyJ-", "token ", "pass=", '"a', "a b ", "a\n", "x://",
+        # The review of the shared words: runs of secret-named flags, scheme words, spills.
+        "--pass ", "--password ", "--pass --password ", "-pass-", "MASTER_KEY=-x ",
+        "--auth Bearer ", "config set token -x ",
+    ],
+)  # fmt: skip
 def test_no_argv_pattern_is_quadratic(unit: str) -> None:
     small, hostile = _hostile(unit, HOSTILE_SIZE // GROWTH), _hostile(unit, HOSTILE_SIZE)
     for pattern in procs.every_pattern():

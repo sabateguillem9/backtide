@@ -233,6 +233,64 @@ def test_the_t07_5_rules_strike_glued_passwords_in_tetragons_own_file(
     assert any(a.endswith("keep-this-visible") and "-p2222" in a for a in arguments), arguments
 
 
+def test_the_shared_secret_words_strike_in_tetragons_own_file(
+    sensor: ReviewSensor, target: Target
+) -> None:
+    """The rules built from backtide/blackbox/secret_words.py (the words redact and procs use
+    too): accepted by this Tetragon's RE2 and striking in its own file."""
+    f = {name: _fake() for name in (
+        "signing", "secret_key", "enc_flag", "master_flag", "pass_flag", "auth_flag",
+        "header", "config", "wrapped_1", "wrapped_2", "env_tool", "anyauth", "proxy_anyauth",
+        "sh_anyauth", "auth_bearer", "pass_pass", "name_bearer", "scheme_run", "name_basic",
+    )}  # fmt: skip
+    # Left to procs on purpose (a quoted value after -b): it may reach Tetragon's file, which is
+    # root's alone, and the -b before it must stay for procs to strike it.
+    cookie = _fake()
+    f["sk16"] = "sk-" + _fake(16)
+    nonce = f"backtide-review-words-{secrets.token_hex(6)}"
+    tools = "/tmp/words"  # noqa: S108 - inside the throwaway target, not on the host
+    copies = f"cp /bin/true {tools}/env && cp /bin/true {tools}/curl"
+    done = target.exec("sh", "-c", f"mkdir -p {tools} && {copies}")
+    assert done.returncode == 0, done.stderr
+    runs = [
+        ["/bin/true", nonce, f"signing_key={f['signing']}", f"SECRET_KEY={f['secret_key']}",
+         "--encryption-key", f["enc_flag"], f"--master-key={f['master_flag']}",
+         "--pass", f["pass_flag"], "--auth", f["auth_flag"], f["sk16"],
+         f"X-Signing-Key: {f['header']}", "keep-words-visible"],
+        ["/bin/true", nonce, "config", "set", "signing_key", f["config"]],
+        ["/bin/true", nonce, f"--private-key={f['wrapped_1']} {f['wrapped_2']}", "x"],
+        [f"{tools}/env", nonce, f"MASTER_KEY={f['env_tool']}", "run"],
+        # The review: a flag named like a secret ("--anyauth", "--auth") must not take the
+        # anchor ("-u", "Bearer") of the rule that knows the secret. The flag rule runs last.
+        [f"{tools}/curl", nonce, "--anyauth", "-u", f"alice:{f['anyauth']}", "https://h.invalid"],
+        [f"{tools}/curl", nonce, "--proxy-anyauth", "-U", f"alice:{f['proxy_anyauth']}", "x"],
+        ["/bin/sh", "-c", f"true {nonce}; curl --anyauth -u alice:{f['sh_anyauth']} h 2>/dev/null;"
+         " true"],
+        ["/bin/true", nonce, "--auth", "Bearer", f["auth_bearer"], "--pass", "--pass",
+         f["pass_pass"], f"signing_key=Bearer {f['name_bearer']}"],
+        # The second review: the last rules strike a plain word only, after scheme words.
+        [f"{tools}/curl", nonce, "--anyauth", "-b", f"sid={cookie}; theme=dark", "https://h"],
+        ["/bin/true", nonce, "--no-auth", "Bearer", "Basic", f"{f['scheme_run']}9/",
+         "signing_key:", "Basic", f"{f['name_basic']}9/"],
+    ]  # fmt: skip
+    for argv in runs:
+        target.exec(*argv)
+    deadline = time.monotonic() + EVENT_TIMEOUT
+    while time.monotonic() < deadline and sensor.text().count(nonce) < len(runs):
+        time.sleep(0.5)
+    time.sleep(2)
+    text = sensor.text() + sensor.logs()
+    lines = [json.loads(raw) for raw in sensor.text().splitlines() if nonce in raw]
+    lines = [line for line in lines if "process_exec" in line]
+    arguments = [line["process_exec"]["process"]["arguments"] for line in lines]
+    leaked = [name for name, value in f.items() if value in text]
+    report("review_words", {"arguments": arguments, "leaked": leaked})
+    assert len(lines) >= len(runs), arguments
+    assert leaked == [], arguments
+    assert any(a.endswith("keep-words-visible") for a in arguments), arguments
+    assert any('--anyauth -b "sid=' in a for a in arguments), arguments
+
+
 def _listening(pid: int) -> list[str]:
     found = []
     for table in ("tcp", "tcp6"):

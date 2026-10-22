@@ -11,18 +11,16 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NoReturn
 from urllib.parse import quote, quote_plus, unquote, unquote_plus
 
+from backtide.blackbox.secret_words import SENSITIVE_WORDS, SK_KEY
+
 REDACTED = "[REDACTED]"
 MAX_TEXT_BYTES = 4096
 # Room kept for the "…[truncated N bytes]" suffix, so a cut text stays within MAX_TEXT_BYTES.
 _SUFFIX_RESERVE = 64
 
-# A name is secret when it ENDS with one of these words, so "access_token", "X-Api-Key"
-# or "client_secret" are secret but "input_tokens" or "token_count" are not.
-_SENSITIVE_WORDS = (
-    r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
-    r"|(?:secret|signing|encryption|master)[-_]?key|authorization|cookie)"
-)
-_SECRET_NAME_RE = re.compile(rf"[\w.-]*?{_SENSITIVE_WORDS}")
+# A name is secret when it ENDS with one of the sensitive words (secret_words, shared with both
+# process-sensor barriers), so "access_token" is secret but "input_tokens" is not.
+_SECRET_NAME_RE = re.compile(rf"[\w.-]*?{SENSITIVE_WORDS}")
 # Payment cards (T21, docs/36 decision 11): the number, its CVV and a PIN, by the names forms and
 # APIs give them. Unlike the words above, a card word must be the whole name or follow a separator
 # (also a bracket, raw or %-escaped, as in card[cvc] or card%5Bcvc%5D): "pin" and "pan" are struck,
@@ -67,14 +65,14 @@ _TEXT_PATTERNS = (
     # possessive, and anchored at a bounded header, so the scan stays linear.
     re.compile(r"\b(?P<secret>eyJ[A-Za-z0-9_-]{1,512}+\.eyJ[A-Za-z0-9_-]++(?:\.[A-Za-z0-9_-]*+)?)"),
     # Header lines with a secret name: "Authorization: Basic ...", "X-Auth-Token: ..."
-    re.compile(rf"(?i)(?<![\w-])[\w-]*?{_SENSITIVE_WORDS}[ \t]*:[ \t]*(?P<secret>[^\r\n\"']+)"),
+    re.compile(rf"(?i)(?<![\w-])[\w-]*?{SENSITIVE_WORDS}[ \t]*:[ \t]*(?P<secret>[^\r\n\"']+)"),
     re.compile(r"(?i)\bbearer\s+(?P<secret>[A-Za-z0-9._~+/-]{8,}=*)"),
     # Basic credentials: base64 (with a digit, +, /, = or a case change, unlike a word).
     re.compile(
         r"(?i:\bbasic)\s+"
         r"(?P<secret>(?=[A-Za-z0-9+/]*(?:[0-9+/=]|[a-z][A-Z]))[A-Za-z0-9+/]{8,}={0,2})"
     ),
-    re.compile(r"\b(?P<secret>sk-[A-Za-z0-9_-]{20,})"),  # OpenAI, Anthropic
+    re.compile(rf"\b(?P<secret>{SK_KEY})"),  # OpenAI, Anthropic
     re.compile(r"\b(?P<secret>[rs]k_(?:live|test)_[A-Za-z0-9]{16,})"),  # Stripe
     re.compile(r"\b(?P<secret>AIza[0-9A-Za-z_-]{35})"),  # Google API keys (Gemini)
     re.compile(r"\b(?P<secret>gh[pousr]_[A-Za-z0-9]{20,})"),  # GitHub
@@ -107,15 +105,17 @@ _TEXT_PATTERNS = (
     re.compile(r"(?<!\S)\"(?:-u|--user)(?:[ \t]+|=)[^\s:\"]+:(?P<secret>[^\"\r\n]+)\""),
     re.compile(r"(?<!\S)(?:-u|--user)(?:[ \t]+|=)'[^\s:']+:(?P<secret>[^'\r\n]+)'"),
     re.compile(r"(?<!\S)(?:-u|--user)(?:[ \t]+|=)[^\s:]+:(?!\[REDACTED\])(?P<secret>\S+)"),
-    # A flag with a secret name and its value after a space: --password hunter2
-    re.compile(rf"(?i)(?<!\S)--?[\w-]*?{_SENSITIVE_WORDS}[ \t]+(?P<secret>[^\s'\"]+)"),
+    # A flag with a secret name and its value after a space: --password hunter2. A run of them
+    # (--password --password x) is skipped, so the value is struck and not the second name; one
+    # dash then [\w-], so each step has one way to split (no exponential retry).
+    re.compile(rf"(?i)(?<!\S)(?:-[\w-]*?{SENSITIVE_WORDS}[ \t]+)+(?P<secret>[^\s'\"]+)"),
     # URL parameters that carry a key or a signature: ?key=AIza..., &sig=...
     re.compile(r"(?i)[?&](?:key|sig|signature)=(?P<secret>[^&#\s]+)"),
     # name=value with a secret name: URL parameters, --flags, environment variables.
-    re.compile(rf"(?i)(?<![\w.-])[\w.-]*?{_SENSITIVE_WORDS}=(?P<secret>[^\s&#;,'\"]+)"),
+    re.compile(rf"(?i)(?<![\w.-])[\w.-]*?{SENSITIVE_WORDS}=(?P<secret>[^\s&#;,'\"]+)"),
     # "name": "value" with a secret name: JSON and Python reprs inside a text.
-    re.compile(rf"(?i)\"[\w.-]*?{_SENSITIVE_WORDS}\"\s*:\s*\"(?P<secret>(?:[^\"\\]|\\.)*)\""),
-    re.compile(rf"(?i)'[\w.-]*?{_SENSITIVE_WORDS}'\s*:\s*'(?P<secret>(?:[^'\\]|\\.)*)'"),
+    re.compile(rf"(?i)\"[\w.-]*?{SENSITIVE_WORDS}\"\s*:\s*\"(?P<secret>(?:[^\"\\]|\\.)*)\""),
+    re.compile(rf"(?i)'[\w.-]*?{SENSITIVE_WORDS}'\s*:\s*'(?P<secret>(?:[^'\\]|\\.)*)'"),
     # Card fields by name (_CARD_NAME): form and query pairs, JSON and Python reprs (strings and
     # numbers: a CVV may be sent as 123), and --flags.
     re.compile(rf"(?i)(?<![\w.\[\]%-]){_CARD_NAME}=(?P<secret>[^\s&#;,'\"]+)"),

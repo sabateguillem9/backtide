@@ -869,6 +869,35 @@ def test_p11_redaction_filters_apply_to_the_file(sensor: Sensor, target: Target)
     assert "environment_variables" not in sensor.log.read_text()
 
 
+def test_p11_an_invalid_redaction_filter_never_serves(
+    tetragon_image: str, target: Target, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A rule RE2 cannot read (a lookbehind) must stop Tetragon loudly, never let it serve
+    without its filters: backtide's readiness (``serving()``: ``tetra status`` says running)
+    would otherwise accept a sensor that writes secrets in clear."""
+    bad = json.dumps({"redact": [r"(?<=--password )(\S+)"]})
+    filters = design_settings()["redaction-filters"] + "\n" + bad
+    with tetragon(
+        tmp_path_factory.mktemp("bad-redaction"),
+        tetragon_image,
+        design_settings(**{"redaction-filters": filters}),
+    ) as s:
+        try:
+            ready = wait_ready(s, target, timeout=45)
+            outcome: dict[str, Any] = {"marker_seen": ready.marker_seen}
+        except AssertionError:
+            outcome = {"marker_seen": None}
+        status = s.tetra("status")
+        outcome["status"] = (status.stdout + status.stderr).strip()[:300]
+        outcome["status_running"] = status.returncode == 0 and "running" in status.stdout.lower()
+        outcome["running"] = s.running()
+        lines = s.logs().splitlines()
+        outcome["log"] = [line[:300] for line in lines if "level=" in line][:8]
+    report("p11_invalid_redaction", outcome)
+    assert outcome["marker_seen"] is None, outcome
+    assert not outcome["status_running"], outcome
+
+
 def test_p11_field_filters_shrink_the_exec_events(
     sensor: Sensor, tetragon_image: str, target: Target, tmp_path_factory: pytest.TempPathFactory
 ) -> None:

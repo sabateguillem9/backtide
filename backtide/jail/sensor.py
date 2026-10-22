@@ -40,6 +40,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from backtide.blackbox.secret_words import (
+    CONFIG_BASE,
+    CONFIG_WORDS,
+    ENV_WORDS,
+    FLAG_BASE,
+    FLAG_WORDS,
+    SENSITIVE_BASE,
+    SENSITIVE_WORDS,
+    SK_KEY,
+)
 from backtide.jail import docker
 from backtide.jail.docker import JailError
 
@@ -115,12 +125,9 @@ _FILE_PERMS = frozenset({"600", "640", "644"})
 # (T07-1, P11) with the capture refined afterwards to ``([^\s"']+)``, so a closing quote stays.
 # The second barrier is backtide/sensors/procs.py (redact and its own patterns).
 _SECRET_VALUE = r"""([^\s"']+)"""  # noqa: S105 - a pattern, not a secret
-# redact.py's sensitive names (backtide/blackbox/redact.py, _SENSITIVE_WORDS), in RE2.
-_SENSITIVE = (
-    r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
-    r"|authorization|cookie)"
-)
-_FLAG_WORDS = r"(?:password|passwd|pass|pwd|secret|token|api[-_]?key|apikey|auth|cookie)"
+# The words are backtide/blackbox/secret_words.py's, shared with redact and procs. The rules
+# below keep the *_BASE words they were checked with at their place in the order; the whole
+# lists are in REDACTION_LAST_RULES (secret_words' docstring says why).
 # A script's command up to its end (; | & ) backquote or a line break, quotes skipped whole),
 # lazily, and a value: quoted, or up to the next separator. RE2 is linear: no cap needed.
 _SEGMENT = r"""(?:[^;|&\r\n)`'"]|'[^'\r\n]*'|"[^"\r\n]*")*"""
@@ -137,7 +144,7 @@ _TOOLS: tuple[tuple[str, str | None, tuple[tuple[str, str, str], ...]], ...] = (
     (r"(?:redis|valkey|keydb)-cli", None, (("-a", "opt", ""),)),
     (r"mongo(?:sh|dump|restore|export|import|stat|top|files)?", None, (("-p", "opt", ""),)),
     (r"lftp", None, (("-u", "opt", r"[^\s,\"']*,"),)),
-    (r"env", None, ((rf"(?i:[A-Za-z0-9_.-]*{_FLAG_WORDS})=", "glued", ""),)),
+    (r"env", None, ((rf"(?i:[A-Za-z0-9_.-]*{FLAG_BASE})=", "glued", ""),)),
     (
         r"(?:smbclient|rpcclient|smbget|smbcacls|smbtree)",
         None,
@@ -234,7 +241,7 @@ REDACTION_RULES: tuple[tuple[str, ...], ...] = (
     ),
     (r"(?:--?(?:password|passwd|secret|token|api-key|apikey))(?:\s+|=)" + _SECRET_VALUE,),
     (
-        r"\b(sk-[A-Za-z0-9_-]{16,})",
+        rf"\b({SK_KEY})",
         r"\b(gh[pousr]_[A-Za-z0-9]{20,})",
         r"\b(AKIA[A-Z0-9]{16})\b",
         r"(?://[^/\s:@]+:)([^/\s@]+)(?:@)",
@@ -243,8 +250,8 @@ REDACTION_RULES: tuple[tuple[str, ...], ...] = (
     # redact.py and checked in the VM (tests/integration/test_sensor_review.py). RE2 has no
     # lookbehind, so a name may start anywhere: it strikes more, never less.
     (
-        rf"(?i)[A-Za-z0-9_.-]*{_SENSITIVE}=([^\s&#;,\"']+)",
-        rf"(?i)[A-Za-z0-9_-]*{_SENSITIVE}[ \t]*:[ \t]*(?:bearer[ \t]+|basic[ \t]+)?"
+        rf"(?i)[A-Za-z0-9_.-]*{SENSITIVE_BASE}=([^\s&#;,\"']+)",
+        rf"(?i)[A-Za-z0-9_-]*{SENSITIVE_BASE}[ \t]*:[ \t]*(?:bearer[ \t]+|basic[ \t]+)?"
         + _SECRET_VALUE,
         r"(?i)\bbearer\s+([A-Za-z0-9._~+/-]{8,}=*)",
         r"(?:^|\s)(?:-u|--user)(?:\s+|=)[^\s:\"']+:" + _SECRET_VALUE,
@@ -263,10 +270,10 @@ REDACTION_RULES: tuple[tuple[str, ...], ...] = (
     # quote ("--password=pass phrase"); a glued curl -b (-bsessionid=…, a name then =);
     # MYSQL_PWD=, SSHPASS=, REDISCLI_AUTH=; openssl's pass:…
     (
-        rf'(?i)(?:^|\s)"--?[A-Za-z0-9_-]*{_FLAG_WORDS}(?:=|[ \t]+)([^"\r\n]+)',
+        rf'(?i)(?:^|\s)"--?[A-Za-z0-9_-]*{FLAG_BASE}(?:=|[ \t]+)([^"\r\n]+)',
         r'(?:^|\s)"-b([^\s"=;]+=[^"\r\n]*)',
         r"""(?:^|[\s"'])-b([^\s"'=;]+=[^\s"']*)""",
-        r"""(?i)(?:^|[^A-Za-z0-9_.-])[A-Za-z0-9_.-]*(?:pwd|pass|passwd|auth)=([^\s&#;,"']+)""",
+        rf"""(?i)(?:^|[^A-Za-z0-9_.-])[A-Za-z0-9_.-]*{ENV_WORDS}=([^\s&#;,"']+)""",
         r"""(?:^|[\s"'])pass:([^\s"']+)""",
     ),
     # T07-5: SQL passwords (IDENTIFIED BY 'x', PASSWORD 'x'); aws/npm config set of a key
@@ -276,7 +283,7 @@ REDACTION_RULES: tuple[tuple[str, ...], ...] = (
         r'(?i)\bidentified\s+(?:with\s+\S+\s+)?by\s+(?:password\s+)?"([^"\r\n]*)',
         r"(?i)\bpassword\s+'([^'\r\n]*)",
         r'(?i)\bpassword\s+"([^"\r\n]*)',
-        r"(?i)\bconfig(?:ure)?\s+set\s+(?:-\S*\s+)*\S*(?:secret|token|passw|auth|credential)\S*"
+        rf"(?i)\bconfig(?:ure)?\s+set\s+(?:-\S*\s+)*\S*{CONFIG_BASE}\S*"
         r"\s+([^\s\"']+)",
         r'(?:^|\s)"?(?:-u|--user)(?:\s+|=)"[^\s:"]+:([^"\r\n]+)',
         r'(?:^|\s)"(?:-u|--user)(?:\s+|=)[^\s:"]+:([^"\r\n]+)',
@@ -288,6 +295,38 @@ REDACTION_RULES: tuple[tuple[str, ...], ...] = (
 # T07-5: the same tools when they are the binary itself (Tetragon's binary_regex).
 REDACTION_TOOL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
     (rf"(?:^|/){name}$", _tool_rules(sub, specs)) for name, sub, specs in _TOOLS
+)
+# The review of the shared words: the whole word lists, in rules that run after every other
+# filter (the tools' too), so a name that only they know never strikes the word an earlier rule
+# starts from. The wrapped-element rule strikes up to the element's closing quote, only when
+# that quote is followed by whitespace or the end. The others strike only a plain word: not one
+# that starts a flag or a quote, which may be the anchor of a form only procs knows (--anyauth
+# -b "sid=x; y", --no-auth --token "x y", signing_key: -U alice:pw); procs strikes those. Scheme
+# words before it are skipped ("token=Basic x" strikes x, which the bearer rule would not;
+# "Bearer Basic x" too, or x would lose the word redact's basic rule starts from). Accepted
+# limit (docs/23, section 5): a plain word that starts a form of its own (token:, token=,
+# password, MYSQL_PWD=) is taken like any other (signing_key: token: "x y").
+_SCHEME = r"(?:(?i:bearer|basic)[ \t]+)*"
+_PLAIN = r"""([^\s"'-][^\s"']*)"""
+_FLAG_NAME = rf"--?[A-Za-z0-9_-]*{FLAG_WORDS}(?:[ \t]+|=)"
+REDACTION_LAST_RULES: tuple[str, ...] = (
+    # An element Tetragon wrapped in quotes because it has a space, to its own closing quote:
+    # one followed by whitespace or the end, not the quote that opens the next element
+    # (-c "--private-key -b "sid=x; y" would lose the -b procs starts from).
+    rf'(?i)(?:^|\s)"--?[A-Za-z0-9_-]*{FLAG_WORDS}(?:=|[ \t]+)([^"\r\n]+)"(?:\s|$)',
+    # A flag named like a secret (--encryption-key x, --pass=x; procs' _FLAG): anchored at the
+    # start of an element, a run of them skipped (--pass --pass x).
+    rf"""(?i)(?:^|[\s"']){_FLAG_NAME}(?:{_FLAG_NAME})*{_SCHEME}{_PLAIN}""",
+    rf"(?i)[A-Za-z0-9_.-]*{SENSITIVE_WORDS}={_SCHEME}([^\s&#;,\"'-][^\s&#;,\"']*)",
+    rf"(?i)[A-Za-z0-9_-]*{SENSITIVE_WORDS}[ \t]*:[ \t]*{_SCHEME}{_PLAIN}",
+    rf"(?i)\bconfig(?:ure)?\s+set\s+(?:-\S*\s+)*\S*{CONFIG_WORDS}\S*\s+{_SCHEME}{_PLAIN}",
+)
+# Every filter in the order Tetragon applies them (a binary_regex, or None for every binary):
+# each rule runs over what the earlier ones already struck.
+REDACTION_FILTERS: tuple[tuple[str | None, tuple[str, ...]], ...] = (
+    *((None, rules) for rules in REDACTION_RULES),
+    *REDACTION_TOOL_RULES,
+    (None, REDACTION_LAST_RULES),
 )
 # Accepted limit (T07 review, finding 5): the Gateway token and the providers' keys are exact
 # values with no shape, and Tetragon only knows patterns. They are not written into conf.d
@@ -409,11 +448,12 @@ def sensor_settings(config: SensorJailConfig) -> dict[str, str]:
         ),
         "cgroup-rate": config.cgroup_rate,
         "redaction-filters": "\n".join(
-            [json.dumps({"redact": list(rules)}) for rules in REDACTION_RULES]
-            + [
-                json.dumps({"binary_regex": [binary], "redact": list(rules)})
-                for binary, rules in REDACTION_TOOL_RULES
-            ]
+            json.dumps(
+                {"redact": list(rules)}
+                if binary is None
+                else {"binary_regex": [binary], "redact": list(rules)}
+            )
+            for binary, rules in REDACTION_FILTERS
         ),
         "server-address": SOCKET,
         "health-server-address": "",  # empty: no health port at all

@@ -35,6 +35,15 @@ from typing import Any
 
 from backtide.blackbox.model import Source
 from backtide.blackbox.redact import REDACTED, strike_text
+from backtide.blackbox.secret_words import (
+    CONFIG_BASE,
+    CONFIG_WORDS,
+    ENV_WORDS,
+    FLAG_BASE,
+    FLAG_WORDS,
+    SENSITIVE_BASE,
+    SENSITIVE_WORDS,
+)
 
 ARGV_LIMIT = 1024  # bytes of argv, binary or cwd kept (docs/23, decision 8)
 # Hostile text longer than two windows is struck window by window (its head and its tail):
@@ -97,21 +106,32 @@ _EXEC_ID_RE = re.compile(r"[A-Za-z0-9+/=_-]{8,128}", re.ASCII)
 _KEYED_ACTIONS = frozenset({"exec", "exit", "connect"})
 
 # Command-line forms ``redact`` does not strike on its own: a value after a flag whose name ends
-# with one of these words (``--pass x``, ``--password "two words"``) and an assignment inside a
-# script (``password = 'x'``). Each quantifier is bounded or possessive and each name starts
-# after a non-word character, so the scans stay linear on hostile text.
-_SECRET_WORDS = r"(?:password|passwd|pass|pwd|secret|token|api[-_]?key|apikey|auth|cookie)"  # noqa: S105
-# A flag starts an element: after a space, at the start, or after a quote (a shell's, or the
-# one Tetragon puts around an element with a space in it).
-_FLAG = rf"(?i)(?<![^\s\"'])--?[\w-]*?{_SECRET_WORDS}(?:[ \t]+|=)"
-# redact.py's sensitive names, for JSON and Python values a cut window leaves unclosed.
-_VALUE_WORDS = (
-    r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
-    r"|authorization|cookie)"
-)
-# An environment-style assignment the shell reads a password from (MYSQL_PWD=, SSHPASS=,
-# REDISCLI_AUTH=): the words redact leaves out because they are too common in prose.
-_ENV_WORDS = r"(?:pwd|pass|passwd|auth)"
+# with one of the flag words (``--pass x``, ``--password "two words"``) and an assignment inside
+# a script (``password = 'x'``). The words are secret_words': the forms below keep the *_BASE
+# words they were checked with at their place in the order, and _LATE_PATTERNS, after redact's,
+# have the whole lists (secret_words' docstring says why). Each quantifier is bounded or
+# possessive and each name starts after a non-word character, so the scans stay linear on
+# hostile text.
+_SECRET_WORDS = FLAG_BASE
+_VALUE_WORDS = SENSITIVE_BASE
+
+
+def _flag(words: str) -> str:
+    """A flag named like a secret, to its separator. It starts an element: after a space, at
+    the start, or after a quote (a shell's, or the one Tetragon puts around an element with a
+    space in it)."""
+    return rf"(?i)(?<![^\s\"'])--?[\w-]*?{words}(?:[ \t]+|=)"
+
+
+_FLAG = _flag(_SECRET_WORDS)
+# A scheme word before a value (--auth Bearer x, MYSQL_PWD=Basic x): skipped, so the value is
+# struck and not the word.
+_SCHEME = r"(?:(?i:bearer|basic)[ \t]++)?+"
+# A run of secret-named flags (--pass --pass x), skipped whole so the value after the last one
+# is struck. One dash then [\w-]: each step has one way to split and ends at a separator, so a
+# run that fails is not retried two ways per step (exponential).
+_FLAG_STEP = rf"-[\w-]*?{FLAG_WORDS}(?:[ \t]+|=)"
+_FLAG_RUN = rf"(?i)(?<![^\s\"']){_FLAG_STEP}(?:{_FLAG_STEP})*"
 
 
 def _quoted(quote: str, open_end: bool) -> str:
@@ -165,13 +185,13 @@ def _argv_patterns(open_end: bool) -> tuple[re.Pattern[str], ...]:
         r"(?<![^\s\"'])(?:-b|--cookie)(?:[ \t]+|=)(?P<secret>[^\s\"']+)",
         # -bsessionid=…: glued, and shaped like a cookie (a name, then =).
         r"(?<![^\s\"'])-b(?P<secret>[^\s\"'=;]+=[^\s\"']*)",
-        rf"(?i)(?<![\w.-])[\w.-]*?{_ENV_WORDS}=(?P<secret>[^\s&#;,'\"]+)",
+        rf"(?i)(?<![\w.-])[\w.-]*?{ENV_WORDS}=(?P<secret>[^\s&#;,'\"]+)",
         # openssl's -pass pass:secret, -passin pass:secret.
         r"(?<![^\s\"'])pass:(?P<secret>[^\s\"']+)",
         # aws configure set aws_secret_access_key x, npm config set //r/:_authToken x: the
         # key's name is checked by a lookahead and taken possessively (linear).
         r"(?i)\bconfig(?:ure)?[ \t]+set[ \t]+(?:-\S*+[ \t]+)*+"
-        r"(?=\S*?(?:secret|token|passw|auth|credential))\S++[ \t]+(?P<secret>[^\s\"']+)",
+        rf"(?=\S*?{CONFIG_BASE})\S++[ \t]+(?P<secret>[^\s\"']+)",
         # Three or more lines of 64 base64 characters: the body of a key, even without BEGIN.
         r"(?<![A-Za-z0-9+/])(?P<secret>(?:[A-Za-z0-9+/]{64}\r?\n){3,}[A-Za-z0-9+/=]{0,64})",
     ]
@@ -181,6 +201,32 @@ def _argv_patterns(open_end: bool) -> tuple[re.Pattern[str], ...]:
 # Both sets: [0] for a text whose end is its real end, [1] for one cut short (the head window,
 # or arguments Tetragon cut: truncArgs), where an unclosed quote closes at the cut.
 _ARGV_PATTERNS = (_argv_patterns(False), _argv_patterns(True))
+
+
+def _late_patterns(open_end: bool) -> tuple[re.Pattern[str], ...]:
+    """The forms above that depend on a word list, with the whole lists, a run of flags and a
+    scheme word skipped, and nothing left for later: they run last, after redact's patterns, so
+    whatever they strike no other pattern needed. In the order of _argv_patterns."""
+    flag = _flag(FLAG_WORDS)
+    patterns: list[str] = []
+    for quote in ('"', "'"):
+        for value in (_quoted(quote, open_end), _unclosed(quote)):
+            patterns += [
+                rf"{flag}{quote}{value}",
+                rf"(?i)(?<![\w.-])[\w.-]*?{FLAG_WORDS}[\"']?[ \t]*[:=][ \t]*{quote}{value}",
+                rf"(?i){quote}[\w.-]*?{SENSITIVE_WORDS}{quote}\s*:\s*{quote}{value}",
+            ]
+    patterns += [
+        rf'(?i)(?<!\S)"--?[\w-]*?{FLAG_WORDS}(?:=|[ \t]+){_wrapped(open_end)}',
+        rf"{_FLAG_RUN}{_SCHEME}[\"']*(?P<secret>[^\s\"']+)",
+        rf"(?i)(?<![\w.-])[\w.-]*?{ENV_WORDS}={_SCHEME}(?P<secret>[^\s&#;,'\"]+)",
+        r"(?i)\bconfig(?:ure)?[ \t]+set[ \t]+(?:-\S*+[ \t]+)*+"
+        rf"(?=\S*?{CONFIG_WORDS})\S++[ \t]+{_SCHEME}(?P<secret>[^\s\"']+)",
+    ]
+    return tuple(re.compile(pattern) for pattern in patterns)
+
+
+_LATE_PATTERNS = (_late_patterns(False), _late_patterns(True))
 
 # --- T07-5: tools that take a password glued to a short flag (``mysql -pS3cr3t``), after a flag
 # only they give that meaning (``sshpass -p``, ``ldapsearch -w``, ``zip -P``) or in a place of
@@ -193,8 +239,11 @@ _ARGV_PATTERNS = (_argv_patterns(False), _argv_patterns(True))
 # backtide/jail/sensor.py (_TOOLS).
 _SEGMENT = 512
 _SCRIPT_VALUE = r"""(?P<secret>(?:'[^'\r\n]*+'?|"[^"\r\n]*+"?|[^\s"';|&<>()`]++)++)"""
-# How a flag meets its value: glued (-pX), glued or after spaces (-p X), = or spaces.
-_SEPS = {"glued": "", "opt": "[ \t]*", "eq": "(?:=|[ \t]+)"}
+# How a flag meets its value: glued (-pX), glued or after spaces (-p X), = or spaces; "assign"
+# is glued too, for a NAME= of a secret name (env's late spec): its value may open a quote and
+# a scheme word first, and takes the next word along when it looks like a flag.
+_SEPS = {"glued": "", "assign": "", "opt": "[ \t]*", "eq": "(?:=|[ \t]+)"}
+_GLUED = frozenset({"glued", "assign"})
 # (flag, separator, what comes before the secret: user, or user and a separator)
 type _FlagSpec = tuple[str, str, str]
 # What comes before a secret is bounded and possessive: an unbounded run that fails at its end
@@ -278,11 +327,12 @@ def _tool_argv(specs: tuple[_FlagSpec, ...], open_end: bool) -> tuple[re.Pattern
         sep = _SEPS[how]
         # An element Tetragon wrapped in quotes ("-pa b"): the value runs to its close.
         patterns.append(rf'(?<!\S)"{flag}{sep}{before}{wrapped}')
-        if how != "glued" or before:
+        if how not in _GLUED or before:
             # The value is an element of its own, wrapped: -p "a b", -u "alice:pw x".
-            spaced = "[ \t]+" if how == "glued" else sep
+            spaced = "[ \t]+" if how in _GLUED else sep
             patterns.append(rf'(?<!\S){flag}{spaced}"{before}{wrapped}')
-        patterns.append(rf"(?<!\S){flag}{sep}{before}(?!\[REDACTED\])(?P<secret>\S+)")
+        lead, spill = (rf"[\"']?{_SCHEME}", r"(?:-\S*+[ \t]++)*") if how == "assign" else ("", "")
+        patterns.append(rf"(?<!\S){flag}{sep}{before}{lead}(?!\[REDACTED\])(?P<secret>{spill}\S+)")
     return tuple(re.compile(pattern) for pattern in patterns)
 
 
@@ -293,7 +343,7 @@ def _tool_script(specs: tuple[_FlagSpec, ...]) -> tuple[re.Pattern[str], ...]:
         # Behind a wrapper (sudo mysql "-ppw x"): an element Tetragon wrapped.
         patterns.append(rf'(?<!\S)"{flag}{sep}{before}(?P<secret>[^"\r\n]++)')
         if before:  # curl -u 'alice:pw x': the quote opens before the user
-            spaced = "[ \t]*" if how == "glued" else sep
+            spaced = "[ \t]*" if how in _GLUED else sep
             patterns += [
                 rf"""(?<![^\s"']){flag}{spaced}{q}{before}(?P<secret>[^{q}\r\n]++)"""
                 for q in ("'", '"')
@@ -315,6 +365,13 @@ def _make_tool(name: str, subcommand: str | None, specs: tuple[_FlagSpec, ...]) 
 
 
 _TOOLS = tuple(_make_tool(*entry) for entry in _TOOL_FLAGS)
+# env's own assignments with the whole flag words, after redact's patterns (as _LATE_PATTERNS):
+# env "SIGNING_KEY=a b" run, env MASTER_KEY="Bearer x".
+_ENV_TOOL = next(tool for tool in _TOOLS if tool.name.pattern == "env")
+_ENV_LATE = tuple(
+    _tool_argv(((rf"(?i:[\w.-]*?{FLAG_WORDS})=", "assign", ""),), open_end)
+    for open_end in (False, True)
+)
 _SCRIPT_TOOL_RE = re.compile(
     r"(?<![\w.-])(?:" + "|".join(tool.in_script.pattern for tool in _TOOLS) + r")(?![\w.-])"
 )
@@ -789,7 +846,11 @@ def _strike_patterns(
     text = _strike_scripts(text, strike)
     for pattern in _ARGV_PATTERNS[open_end]:
         text = pattern.sub(strike, text)
-    return strike_text(text, on_strike=None if notes is None else lambda m: _note(m, notes))
+    text = strike_text(text, on_strike=None if notes is None else lambda m: _note(m, notes))
+    late = _LATE_PATTERNS[open_end] + (_ENV_LATE[open_end] if tool is _ENV_TOOL else ())
+    for pattern in late:
+        text = pattern.sub(strike, text)
+    return text
 
 
 def _tool_of(binary: str | None) -> _Tool | None:
@@ -859,6 +920,7 @@ def _note(match: re.Match[str], notes: set[str]) -> None:
 def every_pattern() -> list[re.Pattern[str]]:
     """Every pattern of this module that runs on hostile text: for the cost tests."""
     patterns = [*_ARGV_PATTERNS[0], *_ARGV_PATTERNS[1], _KEY_END_RE, _SCRIPT_TOOL_RE]
+    patterns += [*_LATE_PATTERNS[0], *_LATE_PATTERNS[1], *_ENV_LATE[0], *_ENV_LATE[1]]
     for tool in _TOOLS:
         patterns += [*tool.argv[0], *tool.argv[1], *tool.script]
     return patterns
