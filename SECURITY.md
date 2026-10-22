@@ -43,7 +43,8 @@ In scope: anything in this repository that weakens one of the invariants below, 
 - make an event in the black box change or disappear without the hash chain breaking;
 - bypass a hold on a destructive or outbound action;
 - break rewinding, for example by exhausting space or metadata;
-- attack the read-only web view or the control socket from inside the agent's container.
+- attack the web view (which can rewind, approve holds and change settings when started with those options), its Settings page or the control socket from inside the agent's container;
+- raise the spending cap, or make a model call cost less than it did, from inside the agent's container.
 
 Also in scope: the supply chain of this repository, such as the CI workflow and pinned dependencies.
 
