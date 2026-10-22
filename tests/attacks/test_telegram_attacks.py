@@ -16,6 +16,7 @@ api.telegram.org and no real token is used. The service finds it through ``api_b
 import hashlib
 import math
 import os
+import re
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ from attack_kit import CONTAINER_WORK, Attack, scenario
 from test_pause_attacks import LEAF, OVER, fill_near_the_cap
 from test_space_pause import CAP, cgroup_freeze, state, wait_frozen
 
+from backtide.blackbox import Event
 from backtide.service.telegram_config import STATE_TELEGRAM
 from tests.integration.conftest import (
     _agent_names,
@@ -45,6 +47,7 @@ from tests.telegram_fake import OWNER, STRANGER, TOKEN, Call, FakeBotApi, button
 FREEZE_WITHIN = 2.0  # the criterion of T09
 ALERT_WITHIN = 5.0  # likewise
 REWIND_WITHIN = 180.0
+CITED = re.compile(r"\(evento (\d+) de la caja negra\)")  # notify/telegram.py, alert_text
 DECOY = "987654321:" + "dEcOy_" * 6  # token-shaped, planted in the agent's folder as control
 
 
@@ -132,10 +135,19 @@ def time_to_freeze(service: Service, fake: FakeBotApi, **who: object) -> float:
     return time.monotonic() - pushed
 
 
-def event_wall(service: Service, action: str, predicate=lambda event: True) -> float:  # noqa: ANN001
-    event = next(e for e in reversed(service.events(action)) if predicate(e))
-    moment = datetime.strptime(event.ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
-    return moment.timestamp()
+def cited_event(service: Service, alert: Call) -> Event:
+    """The black-box event an alert cites ("(evento N de la caja negra)"): the one it is about.
+    Not "the newest of that action": every pause is recorded, so a second space_pause can follow
+    the alert by a fraction of a second, and timing the alert against it gives a negative delay."""
+    found = CITED.findall(alert.params["text"])
+    assert len(found) == 1, alert.params["text"]
+    seq = int(found[0])
+    (event,) = [e for e in service.events() if e.seq == seq]
+    return event
+
+
+def wall_of(event: Event) -> float:
+    return datetime.strptime(event.ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC).timestamp()
 
 
 def press(fake: FakeBotApi, label: str, message: Call, **who: object) -> None:
@@ -196,10 +208,9 @@ def test_pausar_freezes_and_an_alert_rewinds(
         after=before_alerts,
         timeout=30,
     )
-    recorded_at = event_wall(
-        service, "space_pause", lambda e: "P3" in e.details.get("conditions", [])
-    )
-    latency = alert.wall - recorded_at
+    cited = cited_event(service, alert)
+    assert cited.action == "space_pause" and "P3" in cited.details.get("conditions", []), cited
+    latency = alert.wall - wall_of(cited)
     labels = [label for label, _ in buttons(alert)]
     attack.check(
         "recorded",

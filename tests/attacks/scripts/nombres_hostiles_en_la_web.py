@@ -36,10 +36,14 @@ errors: dict = {}
 spacer = os.path.join(base, "spacer.txt")
 with open(spacer, "wb"):
     pass
-# One name at a time, with a change of a plain file between each (and the watcher's 2 s dump):
+# One name at a time, with a change of a plain file before each (and the watcher's 2 s dump):
 # the web folds a burst of the same action into one line that shows only the first name, and
-# every name has to be shown on its own for the test to see it.
+# every name has to be shown on its own for the test to see it. The change comes BEFORE the name,
+# so the first name does not join the creation of the spacer.
 for kind, name in NAMES.items():
+    time.sleep(2.5)
+    with open(spacer, "ab") as handle:
+        handle.write(b"x")
     time.sleep(2.5)
     try:
         with open(os.path.join(base, name), "wb") as handle:
@@ -47,7 +51,7 @@ for kind, name in NAMES.items():
         made[kind] = name
     except OSError as error:
         errors[kind] = str(error)
-    time.sleep(2.5)
-    with open(spacer, "ab") as handle:
-        handle.write(b"x")
+time.sleep(2.5)
+with open(spacer, "ab") as handle:
+    handle.write(b"x")
 print(json.dumps({"made": made, "errors": errors}))

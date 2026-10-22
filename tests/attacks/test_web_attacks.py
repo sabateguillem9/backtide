@@ -29,6 +29,7 @@ from datetime import UTC
 from attack_kit import CONTAINER_WORK, Attack, is_healthy, scenario, tree_digest
 from fastapi.testclient import TestClient
 from risk_kit import peak, rules_of, summary
+from watcher_kit import calm
 
 from backtide.blackbox import Event
 from backtide.gate.addon import REFUSALS
@@ -95,6 +96,9 @@ def inert(html: str, where: str) -> list[str]:
 @scenario("nombres-hostiles-en-la-web")
 def test_hostile_names_are_inert_in_the_web(attack: Attack, real_service: Service) -> None:
     jail = real_service.jail
+    # OpenClaw writes hundreds of files as it starts (its control UI's assets): a name created in
+    # that burst of creates is folded into its line, which shows only the burst's first file.
+    calm(real_service)
     before = real_service.box.head()
     seq_before = before[0] if before else 0
 

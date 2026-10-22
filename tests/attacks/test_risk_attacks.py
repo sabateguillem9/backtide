@@ -142,8 +142,23 @@ def test_deleting_after_emptying_the_bucket(
 ) -> None:
     service = started(make_real_service)
     calm(service)
+    before_build = last_seq(service)
     built = attack.run_script(service.jail, BUCKET_SCRIPT, "build", f"{CONTAINER_WORK}/cubo")
     assert built["files"] == 150, built
+
+    def creates_recorded() -> bool:
+        """The watcher has written the project's 156 creates (folders included) to the black
+        box. A snapshot can hold the files before that: the watcher writes every 2 s, and a
+        project deleted within that same window is created and deleted there, so its deletes
+        are ``transient`` (they destroy nothing that existed before) and no rule counts them."""
+        made = [
+            e
+            for e in file_events(service, "create", since_seq=before_build)
+            if e.target == PROJECT or e.target.startswith(PROJECT + "/")
+        ]
+        return len(made) >= 156
+
+    wait_until(creates_recorded, WITHIN, "the project's creates", context=service.diagnosis)
     holding: list = []
 
     def snapshotted() -> bool:
