@@ -8,7 +8,6 @@ The real `docker pause` from Telegram is in the VM battery (tests/attacks)."""
 # ruff: noqa: F811
 
 import threading
-import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -260,13 +259,25 @@ def test_a_cli_seguir_that_waited_for_the_lock_does_not_undo_a_later_pausar(
     running: World,
 ) -> None:
     pause(running)
+    marked = threading.Event()
+    real_mark = running.guardian.user_pause_mark
+
+    def mark_and_tell() -> int:
+        try:
+            return real_mark()
+        finally:
+            marked.set()  # the seguir has its mark: a /pausar from now on is a later one
+
+    running.guardian.user_pause_mark = mark_and_tell  # type: ignore[method-assign]
     finished = threading.Event()
     with running.guardian.agent_lock:  # the CLI's seguir waits here
         worker = threading.Thread(
             target=lambda: (running.guardian.resume(requested_by="cli"), finished.set())
         )
         worker.start()
-        time.sleep(0.1)
+        # Not a sleep: a seguir that had not taken its mark yet would see this /pausar as an
+        # earlier one, and rightly undo it (a slow machine did not give it the time).
+        assert marked.wait(5)
         pause(running)  # /pausar meanwhile
     assert finished.wait(5)
     worker.join()
@@ -278,15 +289,26 @@ def test_a_pause_reopened_during_a_resume_survives_a_restart(
 ) -> None:
     pause(running)
     real_unpause = running.jail.unpause
+    real_resumed = running.guardian._record_resumed  # noqa: SLF001
+    pausing: list[threading.Thread] = []
 
     def unpause_then_pausar() -> None:
         real_unpause()
         # /pausar right after the thaw: a new user_pause after the one the resume closes
-        threading.Thread(target=lambda: pause(running)).start()
-        time.sleep(0.2)
+        pausing.append(threading.Thread(target=lambda: pause(running)))
+        pausing[0].start()
+
+    def resumed_after_the_pausar(*args: object, **kwargs: object) -> object:
+        # The /pausar is in the box before the user_resume that closes the older pause: the
+        # order a restart must not be fooled by, every time (a sleep made it only likely, and
+        # on a slow machine the /pausar was not even recorded when this test looked).
+        pausing[0].join(5)
+        return real_resumed(*args, **kwargs)
 
     running.jail.unpause = unpause_then_pausar  # type: ignore[method-assign]
+    running.guardian._record_resumed = resumed_after_the_pausar  # type: ignore[method-assign]  # noqa: SLF001
     running.guardian.resume(requested_by="telegram")
+    assert pausing and not pausing[0].is_alive()
     closed = running.only("user_resume").details["closes"]
     assert max(e.seq for e in running.events("user_pause")) > closed
     running.guardian.stop()

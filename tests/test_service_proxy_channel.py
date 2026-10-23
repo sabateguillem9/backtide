@@ -326,7 +326,11 @@ def test_backtide_strikes_its_own_secrets_again_also_in_lower_case_and_cut(
     proxy.send(protocol.request(2, cut, facts()))
     proxy.send(protocol.event(record.dropped_event(1) | {"target": FAKE}))
     [proxy.receive_type("ack") for _ in range(2)]
-    time.sleep(0.2)
+    # The channel reads the proxy's messages in order: once a ping sent after the event is
+    # answered, the event is in the box (a fixed sleep let a slow machine check before it was).
+    proxy.send(protocol.ping())
+    proxy.receive_type("pong")
+    assert [e for e in box.events() if e.action == "dropped"]
     text = json.dumps([[e.target, e.details] for e in box.events()])
     for secret in (GATEWAY, GATEWAY.lower(), REAL[:30], FAKE):
         assert secret not in text
@@ -693,7 +697,7 @@ def test_a_yes_that_crosses_a_hold_left_is_a_preapproval_not_lost_nor_spent_twic
     assert gated.decide(hold_id) == "released"
     gated.proxy.receive_type("decision")
     gated.proxy.send(protocol.hold_left(hold_id, "client_left"))  # it had just gone
-    time.sleep(0.1)
+    # No wait: the channel reads in order, so hold_left is taken before the next request.
     assert gated.ask(delete_event(flow_id="f2"), write_facts())["verdict"] == "allow"
     assert gated.ask(delete_event(flow_id="f3"), write_facts())["verdict"] == "hold"
 

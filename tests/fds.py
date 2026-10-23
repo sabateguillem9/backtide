@@ -7,6 +7,7 @@ first, and compare sets: a leak is a descriptor that is open after and was not b
 
 import gc
 import os
+from pathlib import Path
 
 
 def open_fds() -> set[int]:
@@ -41,3 +42,31 @@ def open_fds_on(*paths: os.PathLike[str] | str) -> set[int]:
         if (info.st_dev, info.st_ino) in wanted:
             found.add(fd)
     return found
+
+
+def tree(root: os.PathLike[str] | str) -> list[Path]:
+    """``root`` and everything below it, symlinks included and not followed: what the code under
+    test can open there, for ``open_fds_on``."""
+    found = [Path(root)]
+    for folder, dirs, files in os.walk(root):  # never into a symlinked directory
+        found += [Path(folder, name) for name in (*dirs, *files)]
+    return found
+
+
+def identity(fd: int) -> tuple[int, int]:
+    """What ``fd`` is open on, (st_dev, st_ino): unlike its number, not handed to the next
+    thread that opens something."""
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def still_open(fd: int, was: tuple[int, int]) -> bool:
+    """Whether ``fd`` is still open on the object whose ``identity`` was ``was``. That the number
+    answers proves nothing: another test's thread can get it the moment it is closed (CI saw
+    it). A pipe has no path for ``open_fds_on``; this is how to follow one. (macOS reuses a
+    closed pipe's identity, so a false "still open" needs that AND the same number taken by
+    another pipe; on Linux a pipe's identity is never reused.)"""
+    try:
+        return identity(fd) == was
+    except OSError:
+        return False

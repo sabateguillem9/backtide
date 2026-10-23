@@ -6,7 +6,6 @@ constructors do no I/O), and the run loop is driven with a fake guardian. The VM
 """
 
 import fcntl
-import gc
 import os
 import signal
 import stat
@@ -32,6 +31,7 @@ from backtide.service.runner import (
     take_lock,
 )
 from backtide.snapshots import SnapshotStore
+from tests.fds import identity, still_open
 
 TOKEN = "T0kenForTestsOnly_" + "a1B2c3D4e5F6g7H8i9J0" * 2
 
@@ -411,21 +411,30 @@ def test_a_guardian_that_fails_still_closes_the_alerts_and_the_box() -> None:
     assert calls[-2:] == ["alerts.close", "box.close"]
 
 
+def signal_me(number: int = signal.SIGTERM) -> None:
+    """Send ``number`` to this process from inside the guardian's run, where the handlers are
+    surely in place. A timer started before run_guardian could fire before they were, on a
+    slow machine, and then the default action ends pytest itself."""
+    os.kill(os.getpid(), number)
+
+
 @pytest.mark.parametrize("name", ["SIGTERM", "SIGINT", "SIGHUP"])
 def test_a_signal_stops_the_guardian_instead_of_killing_the_process(name: str) -> None:
     calls: list[str] = []
     guardian = FakeGuardian(calls)
     number = getattr(signal, name)
-    timer = threading.Timer(0.3, os.kill, args=(os.getpid(), number))
+
+    def signalled(stop: threading.Event) -> None:
+        signal_me(number)
+        calls.append("stopped by the signal" if stop.wait(5) else "never stopped")
+
+    guardian.on_run = signalled
     before = signal.getsignal(number)
-    timer.start()
-    try:
-        run(calls, guardian)  # waits on `stop` for up to 5 s: the signal must end it
-    finally:
-        timer.cancel()
+    run(calls, guardian)
     assert calls == [
         "alerts.start",
         "guardian.run",
+        "stopped by the signal",
         "guardian.stopped",
         "alerts.close",
         "box.close",
@@ -448,17 +457,13 @@ def test_a_second_signal_while_stopping_does_not_interrupt_the_stop() -> None:
     guardian = FakeGuardian(calls)
 
     def slow_stop(stop: threading.Event) -> None:
-        stop.wait(5)
-        os.kill(os.getpid(), signal.SIGTERM)  # the impatient one, while "stopping"
+        signal_me()  # the first one: it starts the stop
+        assert stop.wait(5)
+        signal_me()  # the impatient one, while "stopping"
         calls.append("still stopping")
 
     guardian.on_run = slow_stop
-    timer = threading.Timer(0.2, os.kill, args=(os.getpid(), signal.SIGTERM))
-    timer.start()
-    try:
-        run(calls, guardian)
-    finally:
-        timer.cancel()
+    run(calls, guardian)
     assert "still stopping" in calls
     assert calls[-1] == "box.close"
 
@@ -477,46 +482,39 @@ def test_a_signal_handler_touches_no_lock_it_only_writes_to_a_pipe() -> None:
     RecordingEvent.setters = []
     calls: list[str] = []
     stop = RecordingEvent()
-    timer = threading.Timer(0.2, os.kill, args=(os.getpid(), signal.SIGTERM))
-    timer.start()
-    try:
-        run(calls, FakeGuardian(calls), stop=stop)
-    finally:
-        timer.cancel()
+    guardian = FakeGuardian(calls)
+    guardian.on_run = lambda stop: (signal_me(), stop.wait(5))
+    run(calls, guardian, stop=stop)
     assert RecordingEvent.setters
     assert threading.main_thread().name not in RecordingEvent.setters
 
 
-def open_fds() -> set[int]:
-    """The descriptors open right now. Listing a directory opens one of its own, which is gone by
-    the time the list is returned: drop whatever no longer answers."""
-    found = set()
-    for name in os.listdir("/dev/fd"):
-        try:
-            os.fstat(int(name))
-        except OSError:
-            continue
-        found.add(int(name))
-    return found
+def test_no_thread_or_pipe_is_left_behind_by_the_signal_plumbing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each run's own pipe and thread, followed as such. Comparing every descriptor of the
+    process before and after failed on CI: another test's thread opened six meanwhile. And a
+    pipe's number alone proves nothing once it is closed: another thread can get it at once."""
+    import backtide.service.runner as runner  # noqa: PLC0415
 
+    made: list[runner._StopPipe] = []
+    pipes: list[tuple[int, tuple[int, int]]] = []
 
-def test_no_thread_or_pipe_is_left_behind_by_the_signal_plumbing() -> None:
-    """What the code under test opened and did not close, not a count of everything the process
-    has: another test's leftover socket or connection that the GC closes in the middle would
-    move a count (it did, once), but it can only take descriptors away from the "before" set."""
-    gc.collect()  # let any earlier test's leftovers close now, not in the middle of this one
-    threads = set(threading.enumerate())
-    fds = open_fds()
+    class NotedPipe(runner._StopPipe):
+        def __init__(self, stop: threading.Event) -> None:
+            super().__init__(stop)
+            made.append(self)
+            pipes.extend((fd, identity(fd)) for fd in (self._read, self._write))
+
+    monkeypatch.setattr(runner, "_StopPipe", NotedPipe)
     calls: list[str] = []
     stop = threading.Event()
     stop.set()
     for _ in range(3):
         run(calls, FakeGuardian(calls), stop=stop)
-    gc.collect()
-    leaked_threads = [t.name for t in set(threading.enumerate()) - threads if t.is_alive()]
-    assert leaked_threads == []
-    leaked_fds = open_fds() - fds
-    assert leaked_fds == set()
+    assert len(made) == 3 and len(pipes) == 6
+    assert [one._thread.name for one in made if one._thread.is_alive()] == []  # noqa: SLF001
+    assert [fd for fd, was in pipes if still_open(fd, was)] == []
 
 
 # --- an unusable black-box key must not leave an unrecorded agent running ----------------------

@@ -11,6 +11,7 @@ fake ``peer`` (a different uid, an unreadable one), and the real call is checked
 import json
 import logging
 import os
+import select
 import shutil
 import socket
 import stat
@@ -518,14 +519,16 @@ def test_the_bytes_after_the_newline_are_ignored(
 def test_a_silent_client_gets_a_timeout_and_blocks_nobody(
     make_server: Callable[..., ControlServer], guardian: FakeGuardian
 ) -> None:
-    server = make_server(request_timeout=0.5)
+    """Told by the order of the two answers, not by a time limit a slow machine can pass: the
+    other client is answered while the silent one still waits for its timeout."""
+    server = make_server(request_timeout=1.0)
     silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     silent.settimeout(5)
     silent.connect(str(server.path))  # connects and says nothing
     try:
         started = time.monotonic()
         assert talk(server, rewind_request())["outcome"] == "done"  # another client is served now
-        assert time.monotonic() - started < 0.4
+        assert select.select([silent], [], [], 0)[0] == [], "served only after the silent one"
         raw = b""
         while chunk := silent.recv(4096):
             raw += chunk
@@ -540,26 +543,31 @@ def test_a_silent_client_gets_a_timeout_and_blocks_nobody(
 def test_a_client_that_drips_bytes_does_not_get_more_time(
     make_server: Callable[..., ControlServer], guardian: FakeGuardian
 ) -> None:
-    """The 5 s are for the whole request, not for each read."""
+    """The 5 s are for the whole request, not for each read: the server gives up while the
+    bytes still come (with a deadline per read, it would wait for the whole drip). Told by when
+    the answer comes in the drip, not by a time limit a slow machine can pass."""
     server = make_server(request_timeout=0.6)
     request = rewind_request()
-    started = time.monotonic()
+    assert len(request) > 30  # a drip of 3 s or more, five times the deadline
+    answered_in_the_drip = False
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(5)
         sock.connect(str(server.path))
         for byte in request[:-1]:  # everything but the newline, one byte every 0.1 s
-            if time.monotonic() - started > 1.5:
+            if select.select([sock], [], [], 0)[0]:
+                answered_in_the_drip = True  # the server answered (and hung up) meanwhile
                 break
             try:
                 sock.sendall(bytes([byte]))
             except OSError:
-                break  # the server already answered and hung up
+                answered_in_the_drip = True  # the server already answered and hung up
+                break
             time.sleep(0.1)
         raw = b""
         while chunk := sock.recv(4096):
             raw += chunk
+    assert answered_in_the_drip, "the server waited for the whole drip"
     assert "tardado" in json.loads(raw)["message"]
-    assert time.monotonic() - started < 2.5
     assert guardian.calls == []
 
 
@@ -573,7 +581,8 @@ def test_too_many_open_connections_are_turned_away_and_logged(
             held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             held.connect(str(server.path))
             holders.append(held)
-        time.sleep(0.2)  # let both threads start
+        # No wait for the holders' threads: connections are counted as they are accepted, in
+        # the order they came, so these two are counted before the third.
         with caplog.at_level(logging.WARNING, logger="backtide.service.control"):
             third = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             third.settimeout(5)
@@ -882,8 +891,7 @@ def test_a_connection_over_the_cap_is_told_so_not_just_cut(
     server = make_server(max_connections=1, request_timeout=30)
     holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     holder.connect(str(server.path))
-    try:
-        time.sleep(0.2)
+    try:  # counted when accepted, in order: before the extra one, with no wait
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as extra:
             extra.settimeout(5)
             extra.connect(str(server.path))

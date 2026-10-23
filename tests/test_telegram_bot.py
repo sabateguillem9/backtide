@@ -101,8 +101,21 @@ class Rig:
         found = self.fake.wait_call(
             "sendMessage", lambda c: contains in c.params.get("text", ""), after=after
         )
-        time.sleep(0.05)  # the bot binds the buttons once the answer reaches it
+        self.bound(found)
         return found
+
+    def bound(self, call: Call) -> None:
+        """Wait until every button of ``call`` is bound to its message: the bot binds them
+        once the Bot API's answer reaches it, and a press before that is "wrong message" (a
+        fixed 0.05 s was a guess that a slow machine outruns)."""
+        tokens = [data for _, data in buttons(call)]
+        deadline = time.monotonic() + WAIT
+        while not all(
+            (found := self.book.peek(token)) is not None and found.message_id == call.message_id
+            for token in tokens
+        ):
+            assert time.monotonic() < deadline, "the buttons were never bound"
+            time.sleep(0.01)
 
     def settle(self) -> None:
         """Wait until the bot has fetched everything pushed so far (and so handled it)."""
@@ -210,11 +223,13 @@ def test_orders_are_rate_limited_but_pausar_is_not() -> None:
             for _ in range(3):
                 fake.push_message("/pausar")
             fake.wait_call("sendMessage", lambda c: "Demasiadas órdenes" in c.params["text"])
+            # Every order is taken in turn on the polling thread: once the three /pausar are
+            # done, the four /estado before them were let through or turned away. The two let
+            # through run on the worker, which can be later (a fixed 0.2 s was a guess).
             deadline = time.monotonic() + WAIT
-            while actions.calls.count("pause") < 3:
-                assert time.monotonic() < deadline
+            while actions.calls.count("pause") < 3 or actions.calls.count("status") < 2:
+                assert time.monotonic() < deadline, actions.calls
                 time.sleep(0.01)
-            time.sleep(0.2)
             assert actions.calls.count("status") == 2
             assert len(actions.ignored("rate_limited")) == 2
         finally:
@@ -339,8 +354,10 @@ def test_rebobinar_shows_the_notice_asks_and_only_then_rewinds(rig: Rig) -> None
     rig.settle()
     assert rig.actions.calls == [f"rewind:{SNAPSHOT}"]
     assert len(rig.actions.ignored("used_button")) == 2
-    answers = [c.params.get("text") for c in rig.fake.sent("answerCallbackQuery")]
-    assert "Este botón ya se usó." in answers
+    # Answered through the outbox, a thread of its own: waited for, not looked for once.
+    rig.fake.wait_call(
+        "answerCallbackQuery", lambda c: c.params.get("text") == "Este botón ya se usó."
+    )
 
 
 def test_cancel_uses_up_the_confirmation(rig: Rig) -> None:
@@ -433,6 +450,15 @@ def test_a_failed_send_forgets_the_buttons(rig: Rig) -> None:
 # --- texts and secrets -------------------------------------------------------------------------
 
 
+def wait_logged(caplog: pytest.LogCaptureFixture, text: str) -> None:
+    """Wait until the bot's polling thread has logged ``text`` (a fixed 0.3 s after the fake saw
+    the call was a guess: the answer still has to reach the bot)."""
+    deadline = time.monotonic() + WAIT
+    while not any(text in record.getMessage() for record in caplog.records):
+        assert time.monotonic() < deadline, f"never logged {text!r}"
+        time.sleep(0.01)
+
+
 def test_texts_escape_control_and_invisible_characters_but_keep_lines() -> None:
     text = printable("a‮b\x1b[2J\nc​d")
     assert text.split("\n") == ["a\\u202eb\\x1b[2J", "c\\u200bd"]
@@ -446,8 +472,7 @@ def test_the_token_is_never_logged(caplog: pytest.LogCaptureFixture) -> None:
         actions = FakeActions()
         bot = TelegramBot(BotApi(TOKEN, base=fake.base), OWNER, ButtonBook(), actions)
         bot.start()
-        fake.wait_call("deleteWebhook")
-        time.sleep(0.3)
+        wait_logged(caplog, "refused the bot token")
         bot.close()
         with pytest.raises(Exception):  # noqa: B017
             TelegramNotifier(BotApi(TOKEN, base=fake.base), OWNER, ButtonBook(), actions).send(
@@ -497,7 +522,5 @@ def test_a_conflict_says_another_program_reads_the_updates(
         fake.fail_with = 409
         bot = TelegramBot(BotApi(TOKEN, base=fake.base), OWNER, ButtonBook(), FakeActions())
         bot.start()
-        fake.wait_call("deleteWebhook")
-        time.sleep(0.3)
+        wait_logged(caplog, "another program")
         bot.close()
-    assert any("another program" in r.getMessage() for r in caplog.records)

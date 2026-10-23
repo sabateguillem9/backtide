@@ -8,7 +8,7 @@ from pathlib import Path
 
 from backtide.web.narrate import Narrator  # noqa: F401 - the stream folds with it
 from tests.conftest import FakeClock
-from tests.webkit import START, new_box, new_client, parse_sse
+from tests.webkit import START, WatchedReader, new_box, new_client, parse_sse
 
 
 def stream(
@@ -17,25 +17,34 @@ def stream(
     *,
     seconds: float = 0.4,
     write: Callable[[], None] | None = None,
-    delay: float = 0.1,
+    reader: WatchedReader | None = None,
     headers: dict[str, str] | None = None,
     **options,
 ):
-    """Run /ahora/stream for ``seconds`` while ``write`` appends to the box after ``delay``."""
+    """Run /ahora/stream for ``seconds``; ``write`` appends to the box once the stream has
+    read it, so what it writes lands inside the stream however slow the machine (a fixed
+    delay did not: CI). ``reader``: to wait on inside ``write`` (made here if not given)."""
     options.setdefault("poll_interval", 0.02)
-    web = new_client(tmp_path, stream_seconds=seconds, **options)
+    reader = reader if reader is not None else WatchedReader(tmp_path / "blackbox.db")
+    web = new_client(tmp_path, stream_seconds=seconds, reader=reader, **options)
+    failed: list[BaseException] = []
     writer = None
     if write is not None:
 
         def later() -> None:
-            time.sleep(delay)
-            write()
+            try:
+                reader.wait_read()
+                write()
+            except BaseException as error:  # noqa: BLE001 - raised again in the test
+                failed.append(error)
 
         writer = threading.Thread(target=later)
         writer.start()
     response = web.get(f"/ahora/stream{query}", headers=headers)
     if writer is not None:
         writer.join()
+    if failed:
+        raise failed[0]
     assert response.status_code == 200
     return parse_sse(response.text)
 
@@ -74,15 +83,16 @@ def test_nothing_is_repeated_between_polls(tmp_path: Path) -> None:
 def test_a_deletion_burst_grows_in_place_instead_of_adding_lines(tmp_path: Path) -> None:
     box = new_box(tmp_path)
     box.append("system", "agent_start", "")
+    reader = WatchedReader(tmp_path / "blackbox.db")
 
     def write() -> None:
         for i in range(3):
             box.append("file", "delete", f"f{i}.txt")
-        time.sleep(0.2)  # a later poll
+        reader.wait_seen(4)  # the rest comes in a later poll
         for i in range(3, 10):
             box.append("file", "delete", f"f{i}.txt")
 
-    events = stream(tmp_path, "?after=1", write=write, seconds=1.0)
+    events = stream(tmp_path, "?after=1", write=write, reader=reader, seconds=1.0)
     lines = [e["data"] for e in of_kind(events, "lines")]
     assert len(lines) >= 2
     assert 'id="l-2"' in lines[0] and "hx-swap-oob" not in lines[0]
@@ -181,7 +191,7 @@ def test_hostile_names_in_the_stream_are_inert(tmp_path: Path) -> None:
     def write() -> None:
         box.append("file", "create", nasty)
 
-    events = stream(tmp_path, "?after=0&x=1", write=write, delay=0.1)
+    events = stream(tmp_path, "?after=0&x=1", write=write)
     raw = "".join(e.get("data", "") for e in events)
     assert "<script>" not in raw and "‮" not in raw
     assert "&lt;script&gt;" in raw and "U+202E" in raw and "U+000A" in raw
@@ -193,10 +203,10 @@ def test_hostile_names_in_the_stream_are_inert(tmp_path: Path) -> None:
 
 
 def test_a_box_that_appears_later_is_picked_up(tmp_path: Path) -> None:
-    def write() -> None:
+    def write() -> None:  # once the stream has found no box
         new_box(tmp_path).append("system", "agent_start", "")
 
-    events = stream(tmp_path, "?after=0", write=write, delay=0.3, seconds=1.2)
+    events = stream(tmp_path, "?after=0", write=write, seconds=0.6)
     assert any("El agente ha arrancado" in e["data"] for e in of_kind(events, "lines"))
 
 
@@ -215,13 +225,15 @@ def test_the_stream_never_writes_to_the_box(tmp_path: Path) -> None:
 
 def test_each_event_in_a_burst_across_many_polls_ends_with_one_line(tmp_path: Path) -> None:
     box = new_box(tmp_path, FakeClock(START))
+    reader = WatchedReader(tmp_path / "blackbox.db")
 
     def write() -> None:
-        for _ in range(30):
+        for seq in range(1, 31):
             box.append("file", "modify", "same.txt")
-            time.sleep(0.01)
+            if seq % 10 == 0:
+                reader.wait_seen(seq)  # three polls at least, each one growing the same line
 
-    events = stream(tmp_path, "?after=0", write=write, delay=0.05, seconds=1.0)
+    events = stream(tmp_path, "?after=0", write=write, reader=reader, seconds=1.0)
     html = "".join(e["data"] for e in of_kind(events, "lines"))
     assert "Ha modificado 30 archivos, entre ellos" in html  # grown in place, up to the end
     assert html.count('id="l-1"') >= 2 and html.count('id="l-2"') == 0

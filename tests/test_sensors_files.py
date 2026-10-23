@@ -50,7 +50,7 @@ from backtide.sensors.inotify import (
 )
 from backtide.snapshots import Snapshot
 from tests.conftest import FakeClock
-from tests.fds import open_fds
+from tests.fds import open_fds_on, tree
 
 T0 = datetime(2026, 10, 16, 9, 0, tzinfo=UTC)
 S1 = "20261016T085900.000000Z-periodic"
@@ -1560,11 +1560,33 @@ class TestLifecycle:
         assert [r.target for r in rig.files()] == ["work/last"]
         assert not rig.watcher.arm()  # closed for good
 
-    def test_no_descriptor_is_left_open_after_closing(self, make_rig: Callable[..., Rig]) -> None:
-        before = open_fds()
+    def test_no_descriptor_is_left_open_after_closing(
+        self, make_rig: Callable[..., Rig], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What the watcher opens, followed as such: every directory it can open is below
+        ``tmp_path``, and its waker is an eventfd or a pipe (on Linux every eventfd and epoll
+        share one identity, so it is followed through its own close). Comparing every
+        descriptor of the process before and after counts other tests' threads too."""
+
+        class NotedWaker(files_module._Waker):
+            closed = False
+
+            def __init__(self) -> None:
+                super().__init__()
+                wakers.append(self)
+
+            def close(self) -> None:
+                super().close()
+                self.closed = True
+
+        wakers: list[NotedWaker] = []
+        monkeypatch.setattr(files_module, "_Waker", NotedWaker)
         rig = make_rig()
+        assert open_fds_on(*tree(tmp_path)), "the watcher holds the directories it watches"
         rig.watcher.close()
-        assert open_fds() - before == set()
+        assert open_fds_on(*tree(tmp_path)) == set()
+        assert wakers and all(waker.closed for waker in wakers)
+        assert rig.ino.closed
 
     def test_the_dumper_thread_writes_on_its_own(self, make_rig: Callable[..., Rig]) -> None:
         rig = make_rig(WatcherConfig(dump_interval=0.02, max_watches=100))

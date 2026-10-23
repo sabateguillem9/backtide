@@ -23,7 +23,7 @@ from backtide.sensors.inotify import (
     RawEvent,
     parse_events,
 )
-from tests.fds import open_fds
+from tests.fds import open_fds_on, tree
 
 
 def pack(wd: int, mask: int, cookie: int = 0, name: bytes = b"", *, padded_to: int = 0) -> bytes:
@@ -185,12 +185,15 @@ class TestOpenBeneath:
         with pytest.raises(ValueError, match="NUL"):
             inotify.open_beneath(root, b"dir/fi\0le", self.flags)
 
-    def test_no_descriptor_is_leaked_on_failure(self, root: int) -> None:
-        before = open_fds()
+    def test_no_descriptor_is_leaked_on_failure(self, root: int, tmp_path: Path) -> None:
+        """Counted on what the walk can open (``tmp_path`` and all below it), not on every
+        descriptor of the process: another test's thread can open some meanwhile."""
+        everything = tree(tmp_path)
+        before = open_fds_on(*everything)  # the fixture's own descriptor of base
         for _ in range(20):
             with pytest.raises(OSError):
                 inotify.open_beneath(root, b"dir/up/outside/secret", self.flags)
-        assert open_fds() - before == set()
+        assert open_fds_on(*everything) == before
 
 
 # A mount point under "/" on each system: crossing it must be refused (finding 8).

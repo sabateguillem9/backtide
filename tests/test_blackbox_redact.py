@@ -5,7 +5,7 @@ import pytest
 
 from backtide.blackbox import REDACTED, redact
 from backtide.blackbox.redact import MAX_TEXT_BYTES, KnownScrubber, scrub_known
-from tests.scaling import assert_linear
+from tests.scaling import assert_linear, best_time
 
 LEAKED = "s3cr3tVALUE-0123456789abcdefXYZ"
 
@@ -536,7 +536,6 @@ def test_a_known_scrubber_is_reusable_and_never_shows_its_secrets() -> None:
 # --- T07 third-pass H1: no redaction pattern is quadratic on hostile text -------------------
 
 import importlib as _importlib  # noqa: E402
-import time as _time  # noqa: E402
 
 # The package exposes a ``redact`` function, which shadows the submodule by that name.
 _redact_mod = _importlib.import_module("backtide.blackbox.redact")
@@ -585,11 +584,14 @@ _redact_mod = _importlib.import_module("backtide.blackbox.redact")
     ],  # fmt: skip
 )
 def test_each_pattern_is_fast_on_70_kib_of_hostile_text(unit: str) -> None:
+    """0.05 s for one search, about four times what the slowest takes on the Mac. Over it,
+    the best of three more: one pause of the machine (another test's thread, the GC) during
+    one of the ~1200 searches is not a slow pattern; a backtracking one is slow every time."""
     hostile = (unit * (70 * 1024 // len(unit)))[: 70 * 1024]
     for pattern in (*_redact_mod._TEXT_PATTERNS, _redact_mod._CARD_NUMBER_RE):
-        start = _time.perf_counter()
-        pattern.search(hostile)
-        elapsed = _time.perf_counter() - start
+        elapsed = best_time(lambda pattern=pattern: pattern.search(hostile))
+        if elapsed >= 0.05:
+            elapsed = best_time(lambda pattern=pattern: pattern.search(hostile), 3)
         assert elapsed < 0.05, f"{pattern.pattern[:40]!r} took {elapsed:.3f}s on {unit!r}"
 
 

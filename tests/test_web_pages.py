@@ -494,14 +494,15 @@ def test_a_hostile_dropped_reason_does_not_take_the_page_down(tmp_path: Path) ->
 def test_a_hostile_dropped_reason_does_not_stop_the_stream(tmp_path: Path) -> None:
     box = new_box(tmp_path)
     box.append("system", "agent_start", "")
-    web = new_client(tmp_path, stream_seconds=0.4, poll_interval=0.02)
     import threading
-    import time
 
-    from tests.webkit import parse_sse
+    from tests.webkit import WatchedReader, parse_sse
+
+    reader = WatchedReader(tmp_path / "blackbox.db")
+    web = new_client(tmp_path, stream_seconds=0.4, poll_interval=0.02, reader=reader)
 
     def write() -> None:
-        time.sleep(0.1)
+        reader.wait_read()  # inside the stream, however slow the machine
         box.append("file", "dropped", ".", details={"reason": "{0.__class__}"}, risk=1)
         box.append("file", "create", "after.txt")
 

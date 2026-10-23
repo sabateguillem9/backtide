@@ -7,7 +7,6 @@ T10: no form, no POST, no route behind them."""
 import json
 import re
 import threading
-import time
 from datetime import UTC, timedelta
 from pathlib import Path
 
@@ -35,7 +34,17 @@ from backtide.web.agents import (
 from backtide.web.app import _heads
 from backtide.web.security import CSP, POST_PATH
 from tests.conftest import FakeClock
-from tests.webkit import KEY, PREFIX_PATH, START, new_app, new_box, new_client, parse_sse
+from tests.webkit import (
+    KEY,
+    PREFIX_PATH,
+    START,
+    WAIT,
+    WatchedReader,
+    new_app,
+    new_box,
+    new_client,
+    parse_sse,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "backtide" / "web" / "static"
@@ -54,9 +63,20 @@ def other_box(tmp_path: Path, slug: str, clock: FakeClock) -> BlackBox:
     return BlackBox(home / "blackbox.db", KEY, checkpoint_path=home / "cp", clock=clock)
 
 
-def source(tmp_path: Path, slug: str, name: str, snaps: list[Snapshot] | None = None):
+def source(
+    tmp_path: Path,
+    slug: str,
+    name: str,
+    snaps: list[Snapshot] | None = None,
+    reader: BoxReader | None = None,
+):
     listing = (lambda: list(snaps)) if snaps is not None else None
-    return AgentSource(slug, name, BoxReader(tmp_path / "agents" / slug / "blackbox.db"), listing)
+    reader = reader if reader is not None else BoxReader(agent_db(tmp_path, slug))
+    return AgentSource(slug, name, reader, listing)
+
+
+def agent_db(tmp_path: Path, slug: str) -> Path:
+    return tmp_path / "agents" / slug / "blackbox.db"
 
 
 def request(**changes: object) -> PendingRequest:
@@ -296,15 +316,16 @@ def test_only_the_main_agent_can_be_rewound_from_here(tmp_path: Path, boxes) -> 
 
 
 def test_the_agent_streams_its_own_box(tmp_path: Path, boxes, clock: FakeClock) -> None:
+    watched = WatchedReader(agent_db(tmp_path, "codigo"))
     web = new_client(
         tmp_path,
         stream_seconds=0.4,
         poll_interval=0.02,
-        others=[source(tmp_path, "codigo", "Agente de código")],
+        others=[source(tmp_path, "codigo", "Agente de código", reader=watched)],
     )
 
     def later() -> None:
-        time.sleep(0.1)
+        watched.wait_read()  # inside the stream, however slow the machine
         boxes["codigo"].append("exec", "run", "make deploy", risk=2)
         boxes["main"].append("exec", "run", "nunca-aqui")
 
@@ -320,17 +341,26 @@ def test_the_agent_streams_its_own_box(tmp_path: Path, boxes, clock: FakeClock) 
 
 def test_the_room_streams_every_agent_cards_and_requests(tmp_path: Path, boxes) -> None:
     pending: list[PendingRequest] = []
+    started = threading.Event()
+
+    def listing() -> list[PendingRequest]:
+        listed = list(pending)
+        started.set()  # the stream has the requests it starts from (and sends only changes)
+        return listed
+
     web = new_client(
         tmp_path,
         stream_seconds=0.6,
         poll_interval=0.02,
         clock=lambda: NOW,
         others=[source(tmp_path, "codigo", "Agente de código")],
-        pending=lambda: list(pending),
+        pending=listing,
     )
 
     def later() -> None:
-        time.sleep(0.15)
+        # After the stream's first read of the requests: a request already there when it
+        # starts is not a change to send (a slow start of the stream lost it that way).
+        assert started.wait(WAIT)
         # The request first: a new event makes the stream read the requests at once, and the
         # next read only comes after REQUESTS_EVERY, longer than this stream (CI saw it miss).
         pending.append(request(id="r9"))
@@ -352,7 +382,7 @@ def test_the_room_streams_every_agent_cards_and_requests(tmp_path: Path, boxes) 
 def test_the_room_stream_goes_on_from_the_last_event_id(tmp_path: Path, boxes) -> None:
     web = new_client(
         tmp_path,
-        stream_seconds=0.2,
+        stream_seconds=0.5,  # two boxes read before the first poll: room for a slow start
         poll_interval=0.02,
         others=[source(tmp_path, "codigo", "Agente de código")],
     )
@@ -688,10 +718,12 @@ def test_an_unreadable_request_list_says_so(tmp_path: Path, boxes) -> None:
 
 
 def test_the_stream_keeps_the_last_list_when_it_cannot_read_it(tmp_path: Path, boxes) -> None:
-    state = {"broken": False}
+    reads = 0
 
     def listing() -> list[PendingRequest]:
-        if state["broken"]:
+        nonlocal reads
+        reads += 1
+        if reads > 2:  # read where the stream starts and at its first poll; then it is gone
             raise OSError("gone")
         return [request(id="r7", agent="principal")]
 
@@ -707,10 +739,7 @@ def test_the_stream_keeps_the_last_list_when_it_cannot_read_it(tmp_path: Path, b
     old = app_module.REQUESTS_EVERY
     app_module.REQUESTS_EVERY = 0.05
     try:
-        timer = threading.Timer(0.15, lambda: state.update(broken=True))
-        timer.start()
         events = parse_sse(web.get("/panel/stream").text)
-        timer.join()
     finally:
         app_module.REQUESTS_EVERY = old
     sent = [e["data"] for e in events if e.get("event") == "requests"]
