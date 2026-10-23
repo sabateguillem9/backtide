@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from backtide.snapshots import SnapshotError, SnapshotNoSpace, btrfs
+from tests.fds import open_fds_on
 
 linux_only = pytest.mark.skipif(sys.platform != "linux", reason="needs glibc renameat2")
 MIB = 1024**2
@@ -1025,12 +1026,10 @@ def use_fake_ioctl(monkeypatch: pytest.MonkeyPatch, error: OSError | None = None
 def test_fsid_reads_the_uuid_from_fs_info(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     fake = use_fake_ioctl(monkeypatch)
     assert btrfs.fsid(tmp_path) == FSID
-    ((fd, request, size),) = fake.calls
+    ((_, request, size),) = fake.calls
     assert request == btrfs.BTRFS_IOC_FS_INFO == 0x8400941F
     assert size == 1024  # sizeof(struct btrfs_ioctl_fs_info_args)
-    with pytest.raises(OSError) as closed:
-        os.fstat(fd)
-    assert closed.value.errno == errno.EBADF
+    assert open_fds_on(tmp_path) == set()  # the fd it opened is closed
 
 
 def test_fsid_failure_is_a_snapshot_error_and_closes_the_fd(
@@ -1040,9 +1039,8 @@ def test_fsid_failure_is_a_snapshot_error_and_closes_the_fd(
     with pytest.raises(SnapshotError, match="FS_INFO") as info:
         btrfs.fsid(tmp_path)
     assert info.value.errno == errno.ENOTTY
-    ((fd, _, _),) = fake.calls
-    with pytest.raises(OSError):
-        os.fstat(fd)
+    assert len(fake.calls) == 1
+    assert open_fds_on(tmp_path) == set()  # the fd it opened is closed
 
 
 @pytest.mark.parametrize(
@@ -1337,12 +1335,12 @@ def test_subvolume_info_decodes_the_fields_at_their_offsets(
         otransid=123,
     )
     assert not info.readonly
-    ((fd, request, size),) = fake.calls
+    ((_, request, size),) = fake.calls
     assert request == btrfs.BTRFS_IOC_GET_SUBVOL_INFO == 0x81F8943C
     assert size == 504
-    with pytest.raises(OSError) as closed:
-        os.fstat(fd)
-    assert closed.value.errno == errno.EBADF
+    # The fd it opened is closed. Asking about its number is not enough: another test's thread
+    # can get the same number right after (CI saw an fstat succeed that way).
+    assert open_fds_on(subvol_dir) == set()
 
 
 def test_subvolume_info_without_a_parent_is_none_and_flags_say_read_only(
@@ -1382,9 +1380,8 @@ def test_subvolume_info_failure_is_a_snapshot_error_and_closes_the_fd(
     with pytest.raises(SnapshotError, match="GET_SUBVOL_INFO") as raised:
         btrfs.subvolume_info(subvol_dir)
     assert raised.value.errno == errno.ENOTTY
-    ((fd, _, _),) = fake.calls
-    with pytest.raises(OSError):
-        os.fstat(fd)
+    assert len(fake.calls) == 1
+    assert open_fds_on(subvol_dir) == set()  # the fd it opened is closed
 
 
 @pytest.mark.parametrize(
