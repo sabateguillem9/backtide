@@ -146,19 +146,51 @@ def test_deleting_after_emptying_the_bucket(
     built = attack.run_script(service.jail, BUCKET_SCRIPT, "build", f"{CONTAINER_WORK}/cubo")
     assert built["files"] == 150, built
 
-    def creates_recorded() -> bool:
-        """The watcher has written the project's 156 creates (folders included) to the black
-        box. A snapshot can hold the files before that: the watcher writes every 2 s, and a
-        project deleted within that same window is created and deleted there, so its deletes
-        are ``transient`` (they destroy nothing that existed before) and no rule counts them."""
-        made = [
-            e
-            for e in file_events(service, "create", since_seq=before_build)
-            if e.target == PROJECT or e.target.startswith(PROJECT + "/")
-        ]
-        return len(made) >= 156
+    def creates_accounted() -> tuple[int, int]:
+        """The project's paths below ``work/cubo`` (5 folders and 150 files) that the watcher
+        has already written to the black box: each path once if it has a record of its own,
+        and what summaries fold under ``work/cubo`` (they count by the first two levels).
 
-    wait_until(creates_recorded, WITHIN, "the project's creates", context=service.diagnosis)
+        Not only ``create``: a file made before the watcher arms its new folder, and written
+        right after, can reach the window as a write before the folder's walk reports it,
+        and then its record is a ``modify``. And not only records of their own: OpenClaw's
+        start-up can spend most of the bucket's 1.000 tokens, ``calm`` gives back 5 a second,
+        and then the creates beyond that are folded into a summary."""
+        after = file_events(service, since_seq=before_build)
+        own = {
+            e.target
+            for e in after
+            if e.action in ("create", "modify") and e.target.startswith(PROJECT + "/")
+        }
+        folded = sum(
+            entry["count"]
+            for e in after
+            if e.action == "summary"
+            for entry in e.details.get("dirs", [])
+            if entry["dir"] == PROJECT
+        )
+        return len(own), folded
+
+    def creates_written() -> bool:
+        """Every path below the project is out of the watcher's 2 s window, and so is the
+        project folder, whose create came before them. Until then a snapshot can already hold
+        the files while the deletes would land in the same window as the creates, and a create
+        and a delete in one window are a ``transient`` delete (it destroys nothing that existed
+        before), which no rule counts."""
+        return sum(creates_accounted()) >= 155
+
+    def creates_context() -> str:
+        loose, folded = creates_accounted()
+        summaries = [
+            (e.details.get("counts"), e.details.get("dirs", [])[:5])
+            for e in file_events(service, "summary", since_seq=before_build)
+        ]
+        return (
+            f"{loose} paths with a record of their own and {folded} folded below {PROJECT}; "
+            f"summaries: {summaries}\n{service.diagnosis()}"
+        )
+
+    wait_until(creates_written, WITHIN, "the project's creates", context=creates_context)
     holding: list = []
 
     def snapshotted() -> bool:
