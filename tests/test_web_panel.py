@@ -331,9 +331,11 @@ def test_the_room_streams_every_agent_cards_and_requests(tmp_path: Path, boxes) 
 
     def later() -> None:
         time.sleep(0.15)
+        # The request first: a new event makes the stream read the requests at once, and the
+        # next read only comes after REQUESTS_EVERY, longer than this stream (CI saw it miss).
+        pending.append(request(id="r9"))
         boxes["codigo"].append("exec", "run", "make deploy", risk=2)
         boxes["main"].append("file", "create", "work/plan.md", details={"type": "file"})
-        pending.append(request(id="r9"))
 
     writer = threading.Thread(target=later)
     writer.start()
