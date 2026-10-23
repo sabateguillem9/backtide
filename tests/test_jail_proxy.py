@@ -175,6 +175,8 @@ def test_main_imports_nothing_of_the_service() -> None:
     # Only the agent's side may use it (the egress side is reachable from the host).
     assert 'AGENT_SIDE_ALIAS = "backtide-proxy"' in main
     assert '"connection_strategy": "lazy"' in main
+    # Request smuggling (docs/incidentes.md, 2026-10-22): mitmproxy's own header validation.
+    assert '"validate_inbound_headers": True' in main
     assert "with_dumper=False" in main
     assert "master.addons.add(gate, Ready())" in main
     assert 'int(os.environ["BACKTIDE_UID"])' in main  # no uid, no proxy

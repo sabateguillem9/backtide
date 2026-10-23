@@ -135,6 +135,11 @@ BLOCK_RISK = {
     # HTTP/1 trailers: mitmproxy 12.2.3 cannot read them, so the request can be neither checked
     # nor held (review of T10-2).
     "trailers": 2,
+    # Request smuggling (docs/incidentes.md, 2026-10-22): a header or trailer whose name is not
+    # an RFC token or whose value holds CR, LF or NUL, Transfer-Encoding with Content-Length, or
+    # a Transfer-Encoding that is not exactly chunked. Any of these could reframe the request
+    # for an HTTP/1.1 upstream.
+    "malformed_header": 2,
     # T06-6: what goes to a provider's host leaves with the real key (provider_tools.py).
     "provider_endpoint": 2,  # not one of the provider's model endpoints
     "provider_body": 2,  # a body that is not the provider's JSON: its tools cannot be checked

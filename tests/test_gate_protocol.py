@@ -291,6 +291,7 @@ def test_the_block_risks_are_the_design_ones() -> None:
         "not_allowed": 1,
         "undecodable": 2,
         "trailers": 2,  # HTTP/1 trailers, which mitmproxy cannot read (review of T10-2)
+        "malformed_header": 2,  # a header or framing that could reframe the request (T11 review)
         "provider_endpoint": 2,
         "provider_body": 2,
         "provider_side_tool": 2,

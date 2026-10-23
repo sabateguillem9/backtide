@@ -48,6 +48,10 @@ class Headers:
                 return value
         return default
 
+    def __setitem__(self, name: str, value: str) -> None:
+        kept = [(k, v) for k, v in self.items() if k.lower() != name.lower()]
+        self.fields = tuple((k.encode(), v.encode()) for k, v in [*kept, (name, value)])
+
 
 @dataclass
 class Request:
@@ -61,6 +65,19 @@ class Request:
     trailers: Headers | None = None
     raw_content: bytes | None = b""
     stream: bool = False
+
+    def __post_init__(self) -> None:
+        # A real HTTP/1.1 body always carries its Content-Length (that is how mitmproxy read it);
+        # the fake says so too unless the test set a length or chunked, so the smuggling belt is
+        # happy. HTTP/2 and 3 bodies may arrive without one (the smuggling tests rely on that).
+        version = str(self.http_version).upper()
+        if (
+            self.raw_content
+            and version.startswith("HTTP/1")
+            and self.headers.get("content-length") is None
+            and self.headers.get("transfer-encoding") is None
+        ):
+            self.headers["content-length"] = str(len(self.raw_content))
 
     @property
     def host_header(self) -> str | None:
@@ -480,14 +497,17 @@ def test_a_body_over_the_limit_is_refused_before_it_is_read() -> None:
 
 
 def provider_flow(*headers: tuple[str, str]) -> Flow:
+    body = json.dumps({"model": "m", "messages": [{"content": "secret text"}]}).encode()
     return Flow(
         Request(
             host="api.anthropic.com",
             path="/v1/messages",
-            headers=Headers([("Host", "api.anthropic.com"), *headers]),
-            raw_content=json.dumps(
-                {"model": "m", "messages": [{"content": "secret text"}]}
-            ).encode(),
+            # A real HTTP/1.1 body always carries its Content-Length (that is how mitmproxy read
+            # it); the fake says so too, so the smuggling belt (addon._let_through) is happy.
+            headers=Headers(
+                [("Host", "api.anthropic.com"), ("Content-Length", str(len(body))), *headers]
+            ),
+            raw_content=body,
         ),
         client_conn=Client(sni="api.anthropic.com"),
     )
@@ -1039,6 +1059,7 @@ def model_flow(body: bytes, path: str = "/v1/messages", method: str = "POST") ->
     flow.request.raw_content = body
     flow.request.path = path
     flow.request.method = method
+    flow.request.headers["content-length"] = str(len(body))  # match the new body (the belt)
     return flow
 
 
@@ -1115,8 +1136,7 @@ def test_a_plain_model_call_still_goes_on() -> None:
 def test_the_same_body_to_an_ordinary_host_is_left_to_the_allowed_list() -> None:
     channel = FakeChannel()
     gate, _ = make_gate(channel)
-    flow = Flow()
-    flow.request.raw_content = tool_body({"type": "web_search"})
+    flow = Flow(Request(raw_content=tool_body({"type": "web_search"})))
     send(gate, flow)
     assert flow.response is None and len(channel.asked) == 1
 
@@ -1756,7 +1776,7 @@ def test_the_fingerprint_counts_the_headers_and_the_trailers() -> None:
     "header",
     [
         ("X-Data", "AKIA" + "ABCDEFGHIJKLMNOP"),
-        ("X-Note", "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"),
+        ("X-Note", "-----BEGIN PRIVATE KEY----- MIIE -----END PRIVATE KEY-----"),
         ("X-Debug", f"leak {FAKE}"),  # a key backtide's scrubber knows
         ("X-Trace-Note", "Bearer abcdefghijklmnop"),
     ],

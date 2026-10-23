@@ -71,6 +71,7 @@ import dataclasses
 import functools
 import logging
 import os
+import re
 import socket
 import time
 import zlib
@@ -145,6 +146,7 @@ REFUSALS = {
     "too_large": (413, "backtide: the body is over the limit\n"),
     "undecodable": (400, "backtide: this Content-Encoding cannot be checked\n"),
     "trailers": (400, "backtide: HTTP/1 trailers cannot be checked, so this request is refused\n"),
+    "malformed_header": (400, "backtide: a header or its framing is malformed\n"),
     "provider_endpoint": (403, "backtide: only the provider's model endpoints are allowed\n"),
     "provider_body": (400, "backtide: a model request must be the provider's JSON\n"),
     "provider_side_tool": (
@@ -448,7 +450,17 @@ class Gate:
             self._refuse_unrecorded(flow)
             return
         request = flow.request
+        _frame_h2_body(request)
         fields = self._flow_fields(flow)
+        trailers_present = request.trailers is not None and len(_header_pairs(request.trailers)) > 0
+        reason = _malformed_framing(request, trailers_present)
+        if reason is not None:
+            # Request smuggling (docs/incidentes.md, 2026-10-22): a header the proxy would write
+            # as is to an HTTP/1.1 upstream could reframe the request. Refused before anything
+            # else, for every version, and recorded. HTTP/2 trailers (none on h1 reach here:
+            # _announces_http1_trailers cut them) are refused like h1's (B5).
+            self._block(reason, flow, fields)
+            return
         if not port_allowed(request.port):
             self._block("port", flow, fields)
             return
@@ -865,6 +877,25 @@ class Gate:
             # answers 502, if it is not the one the rewrite was planned on).
             request.raw_content = with_include_usage(request.raw_content or b"", usage_at)
             swapped = _with_length(swapped, len(request.raw_content))
+        if request.raw_content:
+            # Belt (request smuggling, docs/incidentes.md 2026-10-22): the request leaves framed,
+            # for every version and after the include_usage rewrite. A chunked body mitmproxy
+            # frames itself; otherwise exactly one Content-Length, equal to the body's length (so
+            # _frame_h2_body and the rewrite both land). Else UnframedBody: the guard answers 502
+            # and records net/error. Checked on the headers that go out (``swapped`` for a
+            # provider, else the request's own, which _frame_h2_body already fixed).
+            outgoing = swapped if swapped is not None else _header_pairs(request.headers)
+            lengths = [
+                int(v.strip()) if v.strip().isdigit() else -1
+                for n, v in outgoing
+                if n.strip().lower() == "content-length"
+            ]
+            chunked = any(
+                n.strip().lower() == "transfer-encoding" and "chunked" in v.lower()
+                for n, v in outgoing
+            )
+            if not (chunked or (len(lengths) == 1 and lengths[0] == len(request.raw_content))):
+                raise UnframedBody("a request body leaves without a single matching length")
         upstream = provider.upstream if provider is not None and provider.local else None
         if provider is not None and provider.local and upstream is None:
             raise RuntimeError("a local provider without its address")
@@ -1414,6 +1445,11 @@ def _wire_reading(reading: Reading) -> dict[str, Any]:
         return protocol.fit_reading(held.summary())
 
 
+class UnframedBody(RuntimeError):
+    """A request body that would leave without a single length that matches it: never sent (the
+    guard answers 502 and records ``net/error {stage: UnframedBody}``). Request smuggling belt."""
+
+
 class Undecodable(Exception):
     """A request body the gate cannot check: ``reason`` is ``undecodable`` or ``too_large``."""
 
@@ -1453,6 +1489,59 @@ def decode_body(raw: bytes | None, encoding: str | None, limit: int = BODY_LIMIT
             raise Undecodable("undecodable")
         return data
     raise Undecodable("undecodable")
+
+
+def _has_header(request: Any, name: str) -> bool:
+    return request.headers.get(name) is not None
+
+
+# A header (field) name as RFC 9110 §5.1 defines it ("token"): no spaces, controls or separators.
+_TOKEN_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", re.ASCII)
+
+
+def _malformed_framing(request: Any, trailers_present: bool) -> str | None:
+    """Request smuggling (docs/incidentes.md, 2026-10-22): the reason to refuse a request whose
+    headers could reframe it for an HTTP/1.1 upstream, or None. ``trailers`` for trailers (h2
+    reach the request hook; h1 were cut at requestheaders), else ``malformed_header`` for a
+    header or trailer name that is not a token, a value with CR, LF or NUL, Transfer-Encoding
+    together with Content-Length, or a Transfer-Encoding that is not exactly ``chunked``."""
+    version = str(request.http_version).upper()
+    if trailers_present and version.startswith(("HTTP/2", "HTTP/3")):
+        # HTTP/2 and 3 trailers reach the request hook; mitmproxy would forward them to the
+        # HTTP/1.1 upstream, which frames them after a chunked body only. Refused like h1's
+        # announced trailers (B5). (An h1 request's trailers reaching here are left to the usual
+        # write path, as before: in production _announces_http1_trailers already cut them.)
+        return "trailers"
+    pairs = _header_pairs(request.headers)
+    for name, value in pairs:
+        if not _TOKEN_NAME_RE.fullmatch(name):
+            return "malformed_header"
+        if any(ch in value for ch in ("\r", "\n", "\0")) or "\0" in name:
+            return "malformed_header"
+    tes = [v.strip().lower() for n, v in pairs if n.strip().lower() == "transfer-encoding"]
+    has_cl = any(n.strip().lower() == "content-length" for n, _ in pairs)
+    if tes:
+        if has_cl or len(tes) > 1 or tes[0] != "chunked":
+            return "malformed_header"
+    return None
+
+
+def _frame_h2_body(request: Any) -> None:
+    """Request smuggling fix (security review of T11, docs/incidentes.md 2026-10-22). An HTTP/2
+    or HTTP/3 request carries no ``Content-Length`` and no ``Transfer-Encoding``: its body is
+    framed by DATA frames. mitmproxy 12.2.3 forwards it to an HTTP/1.1 upstream without adding
+    either, so the server reads a zero-length body (RFC 9112 §6.3 rule 6) and the body bytes stay
+    on the connection, read as a second request the gate never saw. So the gate adds the
+    ``Content-Length`` of the body it read: here, before ``_flow_fields``, so it is recorded and
+    counts in the fingerprint; a request with no body gets ``Content-Length: 0``. A chunked body
+    (which mitmproxy does re-frame) and one that already has a length are left alone. The
+    include_usage rewrite (if any) corrects the length again when it changes the body."""
+    version = str(request.http_version).upper()
+    if not version.startswith(("HTTP/2", "HTTP/3")):
+        return
+    if _has_header(request, "content-length") or _has_header(request, "transfer-encoding"):
+        return
+    request.headers["content-length"] = str(len(request.raw_content or b""))
 
 
 def _announces_http1_trailers(request: Any) -> bool:

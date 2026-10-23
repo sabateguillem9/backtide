@@ -66,6 +66,11 @@ OPTIONS = {
     "body_size_limit": "16m",
     "termlog_verbosity": "warn",
     "block_global": True,  # serve only clients with a private address
+    # Refuse malformed requests before any hook: h2 >= 4.3.0 then rejects CR, LF and NUL in an
+    # HTTP/2 header (CVE-2025-57804), which mitmproxy would otherwise write as is to an HTTP/1.1
+    # server (request smuggling). On by default in mitmproxy 12.2.3; pinned so it stays on. The
+    # gate checks the same itself (addon.py, ``malformed_framing``).
+    "validate_inbound_headers": True,
 }
 
 

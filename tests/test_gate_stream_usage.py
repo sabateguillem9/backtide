@@ -316,8 +316,8 @@ def test_a_denied_call_is_never_rewritten() -> None:
 
 def test_a_call_without_content_length_gets_none() -> None:
     """Chunked in HTTP/1.1, mitmproxy chunks it again; HTTP/2 to HTTP/2, the protocol frames it.
-    (HTTP/2 without Content-Length toward an HTTP/1.1 server is apart: an issue of its own that
-    is older than this rewrite.)"""
+    (HTTP/2 without Content-Length toward an HTTP/1.1 server was a smuggling bug older than this
+    rewrite, fixed separately: test_gate_smuggling.py and the contrabando-h2 scenario.)"""
     channel = channel_with(openai())
     gate, _ = make_gate(channel)
     flow = openai_flow(chat_body(), ("Transfer-Encoding", "chunked"), length=False)
