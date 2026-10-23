@@ -24,6 +24,7 @@ from datetime import date, datetime, timedelta, tzinfo
 from typing import Any
 
 from backtide.blackbox import Event, Source
+from backtide.gate.phrase import api_name
 from backtide.snapshots import Snapshot
 from backtide.web import format as fmt
 from backtide.web.narrate import Line, Name, Narrator
@@ -55,6 +56,7 @@ REWIND_ACTIONS = frozenset({"rewind_requested", "rewind_done", "rewind_failed"})
 
 # What a held request wants to do, in plain words (i18n "req.<kind>"); anything else is "other".
 KINDS = ("email", "message", "delete", "call", "pay", "post", "other")
+_HOST = re.compile(r"[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](:[0-9]{1,5})?")
 
 
 class RosterError(ValueError):
@@ -197,6 +199,32 @@ class PendingRequest:
     @property
     def what(self) -> str:
         return self.kind if self.kind in KINDS else "other"
+
+    @property
+    def api(self) -> str:
+        """The API in our words ("Telegram", "Gmail"), or "" when backtide does not name it."""
+        name = api_name(self.translator)
+        return "" if name == api_name("") else name
+
+    @property
+    def want(self) -> str:
+        """Which "want.<key>" titles a hold of the gate (T12f-1): by what the gate read (its
+        kind, its rule, the API it named), never by the agent's words, which only fill in the
+        host (``target_name``). "ours" is our phrase as it is (``action``)."""
+        if self.action:
+            # A forward and a push say more in our own phrase ("Gmail: reenviar un correo",
+            # "git: push que borra ramas o etiquetas") than in a title (review of T12f-1, L2).
+            if self.translator == "git" or "reenviar" in self.action:
+                return "ours"
+            if self.kind in ("email", "message", "delete"):
+                return f"{self.kind}_api" if self.api else self.kind
+            return "ours"
+        # Without a reading the host fills in the title only when it looks like one: anything
+        # else (quote marks, spaces) could read as our words, and stays in the agent's block.
+        host = "_host" if _HOST.fullmatch(self.target) else ""
+        if self.kind == "delete":
+            return f"delete{host}"
+        return ("write" if self.reason == "write" else "call") + host
 
     @property
     def target_name(self) -> Name:

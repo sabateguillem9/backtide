@@ -18,7 +18,8 @@
 <body data-age-now="{{ t.raw('age.now') }}" data-age-sec="{{ t.raw('age.sec') }}" data-age-min="{{ t.raw('age.min') }}" data-age-hour="{{ t.raw('age.hour') }}" data-age-day="{{ t.raw('age.day') }}">
 {% set many = roster | length > 1 %}
 {% set here = agent if agent else (roster.main if (not many or active not in ('', 'panel')) else none) %}
-<div class="page{% if wide %} wide{% endif %}">
+{# One header, of one width on every page (T12f-1): it does not move as you go. #}
+<div class="topbar">
 <header class="top">
   <div class="brand">
     <a class="home" href="{{ base }}/panel">{{ t('app.name') }}</a>
@@ -32,11 +33,13 @@
     <a href="{{ here.base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}{% if active == key %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     {% endfor %}
     {% endif %}
-    <a href="{{ base }}/peticiones"{% if active == 'holds' %} aria-current="page"{% endif %}>{{ t('nav.holds') }}{% if active == 'holds' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
+    <a href="{{ base }}/peticiones"{% if active == 'holds' %} aria-current="page"{% endif %}>{{ t('nav.holds') }}{% if requests is defined %} <span class="badge" data-waiting-badge{% if not requests %} hidden{% endif %}><span class="badge-dot" aria-hidden="true"></span><span class="num" data-waiting-n>{{ requests | length if requests else 0 }}</span><span class="visually-hidden"> {{ t('nav.waiting') }}</span></span>{% endif %}{% if active == 'holds' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     <a href="{{ base }}/ajustes"{% if active == 'settings' %} aria-current="page"{% endif %}>{{ t('nav.settings') }}{% if active == 'settings' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
   </nav>
   {% endif %}
 </header>
+</div>
+<div class="page{% if wide %} wide{% endif %}">
 {% if agent and many %}
 <div class="agentbar a-{{ agent.colour }}">
   <p class="agentbar-who"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(agent), 48) }}</span></p>

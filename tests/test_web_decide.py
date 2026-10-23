@@ -149,7 +149,7 @@ def test_with_aprobar_the_buttons_lead_to_a_confirmation(web: TestClient) -> Non
     assert f'href="{PREFIX_PATH}/peticiones/ver?id={HOLD}"' in page
     assert "<form" not in page, "the panel itself changes nothing"
     said = text_of(page)
-    assert "Telegram: enviar un mensaje" in said, "our words, from the closed tables"
+    assert "Quiere enviar un mensaje por Telegram" in said, "our words, from the closed tables"
     assert "Lo que pide el agente (texto suyo, no de backtide):" in said and "556" in said
 
 
@@ -190,7 +190,7 @@ def test_without_aprobar_the_holds_come_from_the_black_box(tmp_path: Path) -> No
                details={"hold_id": OTHER, "by": "cli"})  # fmt: skip
     web = new_client(tmp_path, clock=lambda: NOW)
     said = text_of(web.get("/peticiones").text)
-    assert "desde la caja negra" in said and "Telegram: enviar un mensaje" in said
+    assert "desde la caja negra" in said and "Quiere enviar un mensaje por Telegram" in said
     assert "example.com/y" not in said, "a hold with its end is not listed"
     later = new_client(tmp_path, clock=lambda: NOW + timedelta(minutes=10))
     assert "desde la caja negra" not in text_of(later.get("/peticiones").text), "expired"
@@ -425,6 +425,9 @@ def test_a_list_from_the_black_box_that_may_miss_holds_says_so(
     page = web.get("/peticiones").text
     assert "data-partial" in page and "Puede que haya más" in text_of(page)
     assert "example.com/y" not in text_of(page), "the hold is past what was read"
+    panel = web.get("/panel").text
+    h1 = panel[panel.index("<h1") : panel.index("</h1>")]
+    assert "No se sabe si algo espera tu sí." in h1, "not 'nothing waits' (T12f-1, L3)"
 
 
 def test_box_partial_needs_a_full_read_whose_oldest_row_is_recent() -> None:

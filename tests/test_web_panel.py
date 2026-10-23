@@ -189,7 +189,7 @@ def test_the_requests_say_what_why_how_serious_and_how_long(room: TestClient) ->
     text = text_of(waiting)
     assert "Esperan tu sí" in text
     assert "Quiere enviar un correo a ana@ejemplo.com" in text
-    assert "Retenida porque va a un destino que no ha usado nunca." in text
+    assert "Frenada porque va a un destino que no ha usado nunca." in text
     assert "riesgo importante" in text
     assert "Se rechaza sola en 4:07" in text
     assert 'data-deadline="' in waiting and 'data-held="' in waiting

@@ -2,9 +2,23 @@
 {% block title %}{{ t('panel.title') }}{% endblock %}
 {% block main %}
 <main class="panel" hx-ext="sse" sse-connect="{{ base }}/panel/stream?after={{ heads }}">
+  {# One sentence on top (T12f-1): what waits for you, and the most urgent. The stream sends the
+     requests again; web.js (syncWaiting) rewrites this from what it carries, with these words. #}
+  {% set n = requests | length if requests else 0 %}
   <div class="panel-head">
-    <h1>{{ t('panel.title') }}</h1>
-    <p class="lede">{{ t('panel.lede') }}</p>
+    <p class="eyebrow">{{ t('panel.title') }}</p>
+    <h1 class="statement" data-summary-title data-one="{{ t.raw('panel.summary.one') }}" data-other="{{ t.raw('panel.summary.other') }}" data-none="{{ t('panel.summary.none') }}" data-unknown="{{ t('panel.summary.unknown') }}" data-least="{{ t.raw('panel.summary.least') }}">{% set unsure = stale or holds_partial() %}{% if (stale and not requests) or (unsure and not n) %}{{ t('panel.summary.unknown') }}{% elif unsure %}{{ t('panel.summary.least', n=n) }}{% elif n %}{{ t.plural('panel.summary', n) }}{% else %}{{ t('panel.summary.none') }}{% endif %}</h1>
+    <p class="lede req-clock summary-left" data-summary-left{% if n %} data-held="{{ requests[0].held_at.isoformat() }}" data-deadline="{{ requests[0].expires_at.isoformat() }}"{% else %} hidden{% endif %} data-done="0:00">{{ t('panel.summary.left') }} <span class="req-count num">{% if n %}{{ countdown(requests[0].left(now)) }}{% endif %}</span></p>
+    <p class="lede" data-summary-calm{% if n %} hidden{% endif %}>{{ t('panel.lede') }}</p>
+    {# What is not a request but needs you: an agent frozen, stopped or without its sensor. The
+       cards are sent again by the stream; web.js (syncMatters) rebuilds this from them. #}
+    {% set matters = cards | selectattr('state', 'in', ['frozen', 'sensor_down', 'stopped']) | list %}
+    <div class="matters" data-matters{% if not matters %} hidden{% endif %}>
+      <h2 class="matters-title">{{ t('panel.others') }}</h2>
+      <ul class="attention" data-frozen="{{ t('attn.frozen') }}" data-sensor_down="{{ t('attn.sensor_down') }}" data-stopped="{{ t('attn.stopped') }}">
+        {% for c in matters %}<li class="a-{{ c.agent.colour }} st-{{ c.state }}"><span class="pulse" aria-hidden="true"></span><span><a href="{{ c.agent.base }}/ahora"><span class="agent-name">{{ vis(agent_name(c.agent), 48) }}</span></a> {{ t('attn.' ~ c.state) }}</span></li>{% endfor %}
+      </ul>
+    </div>
   </div>
   {# The gate's requests (T10). Approve and Reject are drawn and disabled: there is no form, no
      POST and no route behind them. Deciding is T10's, with its own reviewed path. #}

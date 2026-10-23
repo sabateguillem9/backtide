@@ -103,7 +103,9 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 @media (max-width: 480px) { h1 { font-size: 30px; } .lede { font-size: 15px; } }
 
-.page { max-width: var(--size-measure); margin: 0 auto; padding: var(--space-6) var(--space-4) 0; min-height: 100vh; display: flex; flex-direction: column; }
+/* T12f-1: one header, of one width on every page, so it does not move as you go */
+.topbar { max-width: 76rem; margin: 0 auto; padding: var(--space-6) var(--space-4) 0; }
+.page { max-width: var(--size-measure); margin: 0 auto; padding: 0 var(--space-4); min-height: 100vh; display: flex; flex-direction: column; }
 .page > main { flex: 1; display: flex; flex-direction: column; gap: 0; }
 .top { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-12); }
 .brand { display: flex; align-items: baseline; gap: var(--space-3); flex-wrap: wrap; }
@@ -113,6 +115,9 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 .top nav a { position: relative; color: var(--ink-muted); text-decoration: none; padding: 6px 0; }
 .top nav a:hover { color: var(--ink); }
 .top nav a[aria-current="page"] { color: var(--ink); }
+.badge { display: inline-flex; align-items: center; gap: 4px; margin-left: 2px; color: var(--state-waiting); font-weight: 500; }
+.badge[hidden] { display: none; }
+.badge-dot { width: 7px; height: 7px; border-radius: var(--radius-dot); background: var(--state-waiting); }
 /* The underline of the page you are on: one hairline that glides between pages. */
 .nav-line { position: absolute; left: 0; right: 0; bottom: 0; height: var(--stroke-hairline); background: var(--ink); }
 .foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-6); margin-top: var(--space-12); padding: var(--space-6) 0; border-top: var(--stroke-hairline) solid var(--ink); font-size: 13px; letter-spacing: 0.04em; color: var(--ink-muted); }
@@ -183,8 +188,9 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 .line.you .said { color: var(--ink); font-weight: 500; }
 .line.answer { margin-bottom: var(--space-3); }
 /* What the agent chose is never backtide's voice: its own style (quotes, isolated direction, spaces
-   kept) and clipped to its own box, so no name can pile marks over the lines around it. */
-.name { display: inline-block; max-width: 100%; vertical-align: bottom; overflow: clip; unicode-bidi: isolate; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); font-weight: 500; }
+   kept) and clipped to its own box, so no name can pile marks over the lines around it. Drawn
+   as it is: Jost joins "--" into a dash, and `git reset --hard` must not read as "–hard". */
+.name { display: inline-block; max-width: 100%; vertical-align: bottom; overflow: clip; unicode-bidi: isolate; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); font-weight: 500; font-variant-ligatures: none; font-feature-settings: "liga" 0, "clig" 0, "dlig" 0, "calt" 0; }
 .name::before { content: "\201C"; }
 .name::after { content: "\201D"; }
 .esc { font-size: 0.78em; font-weight: 500; letter-spacing: 0.04em; color: var(--ink); border-bottom: var(--stroke-hairline) solid var(--ink); padding: 0 1px; margin: 0 1px; white-space: nowrap; }
@@ -391,6 +397,18 @@ a.dot-button { text-decoration: none; }
 /* the control room */
 .page.wide { max-width: 76rem; }
 .panel-head .lede { max-width: var(--size-measure); }
+/* T12f-1: the sentence on top, and what else needs you */
+.eyebrow { margin: 0 0 var(--space-2); font-size: 14px; letter-spacing: 0.04em; color: var(--ink-muted); }
+.lede.req-clock { margin-top: var(--space-2); }
+.summary-left .req-count { font-size: inherit; color: var(--ink); }
+.summary-left.is-late .req-count { color: var(--risk-3); }
+.matters { margin-top: var(--space-6); max-width: var(--size-measure); }
+.matters-title { margin: 0; font-size: 14px; font-weight: 500; letter-spacing: 0.04em; color: var(--ink-muted); }
+.attention { list-style: none; margin: var(--space-2) 0 0; padding: 0; }
+.attention li { display: flex; align-items: baseline; margin-top: var(--space-2); font-size: 15px; color: var(--ink-soft); }
+.attention .pulse { flex: none; transform: translateY(-1px); }
+.attention a { color: var(--agent); font-weight: 500; text-decoration: none; }
+.attention a:hover .agent-name { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .section-title { display: flex; align-items: center; gap: var(--space-2); margin: 0; font-size: 19px; line-height: 1.3; font-weight: 500; letter-spacing: -0.01em; }
 .section-count { color: var(--ink-muted); font-weight: 400; }
 .room { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-12); margin-top: var(--space-12); }
@@ -409,8 +427,28 @@ a.dot-button { text-decoration: none; }
 .waiting:has(.req) .waiting-mark { background: var(--state-waiting); }
 .waiting .note { margin-top: var(--space-2); max-width: var(--size-measure); }
 .waiting .note.is-stale { color: var(--ink); }
-.requests { list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); gap: var(--space-6); margin: var(--space-6) 0 0; padding: 0; }
-.req { display: flex; flex-direction: column; padding: var(--space-4); background: var(--paper); border-top: var(--stroke-identity) solid var(--agent); }
+/* A list of decisions (T12f-1): one row each, the most urgent first; what it wants on the left,
+   how serious, how long and the buttons on the right. */
+.requests { list-style: none; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-4); margin: var(--space-6) 0 0; padding: 0; }
+.req { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-4); padding: var(--space-4); background: var(--paper); border-top: var(--stroke-identity) solid var(--agent); }
+.req-main, .req-side { min-width: 0; }
+.req-side { display: flex; flex-direction: column; }
+.req-side .risk-word { margin-top: 0; }
+@media (min-width: 760px) {
+  .req { grid-template-columns: minmax(0, 1fr) 17rem; gap: var(--space-8); padding: var(--space-6); }
+}
+/* The agent's host in our title: its own weight, so it never reads as our words */
+.req-what .name { font-weight: 400; }
+.req-cost { margin: var(--space-2) 0 0; font-size: 15px; color: var(--ink); }
+.req-more { margin-top: var(--space-3); font-size: 14px; }
+.req-more summary { display: inline-flex; align-items: center; min-height: var(--size-target); cursor: pointer; color: var(--ink-muted); }
+.req-more summary:hover, .req-more[open] summary { color: var(--ink); }
+.req-more summary::after { content: "\25BE"; margin-left: var(--space-1); font-size: 12px; }
+.req-more[open] summary::after { content: "\25B4"; }
+.req-more ul { list-style: none; margin: 0; padding: 0; }
+.req-more li { margin-top: var(--space-1); }
+.req-more a { color: var(--ink); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.req-more .req-soon { margin: var(--space-2) 0 0; }
 .req-who { margin: 0; font-size: 14px; }
 .req-who a { display: inline-flex; align-items: center; color: var(--agent); font-weight: 500; text-decoration: none; }
 .req-who a:hover .agent-name { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
@@ -451,12 +489,12 @@ a.req-no { text-decoration: underline; text-decoration-thickness: 1px; text-unde
 .hold-rule-what { font-weight: 500; color: var(--ink); }
 .hold-one { margin-top: var(--space-4); }
 /* Approve and Reject: links with --aprobar, else drawn disabled saying why */
-.req-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-6); margin-top: auto; padding-top: var(--space-4); }
+.req-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-6); padding-top: var(--space-4); }
 .req-yes, .req-no { display: inline-flex; align-items: center; gap: var(--space-3); min-height: var(--size-target); padding: 0; font: inherit; font-size: 15px; font-weight: 500; color: var(--ink); background: none; border: 0; }
 .req-no { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .req-yes:disabled, .req-no:disabled { color: var(--ink-muted); cursor: not-allowed; }
 .req-yes:disabled .dot-button { background: transparent; color: var(--ink-muted); border: var(--stroke-hairline) solid var(--ink-muted); transform: none; }
-.req-soon { font-size: 13px; letter-spacing: 0.04em; color: var(--ink-muted); }
+.req-soon { margin: var(--space-2) 0 0; font-size: 13px; letter-spacing: 0.04em; color: var(--ink-muted); }
 
 /* the agents' cards */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: var(--space-6); margin-top: var(--space-4); }
@@ -510,7 +548,6 @@ a.req-no { text-decoration: underline; text-decoration-thickness: 1px; text-unde
 .live:has(.pline) .pfeed-empty { display: none; }
 @media (max-width: 480px) {
   .waiting:has(.req) { padding: var(--space-4); margin-left: calc(-1 * var(--space-4)); margin-right: calc(-1 * var(--space-4)); }
-  .requests { grid-template-columns: minmax(0, 1fr); }
   .cards { grid-template-columns: minmax(0, 1fr); }
   .pline { grid-template-columns: 3.6rem 9px minmax(0, 1fr); }
   .waiting-head h2, .waiting-count { font-size: 21px; }

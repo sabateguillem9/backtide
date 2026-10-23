@@ -4,12 +4,15 @@
    in backtide.gate.phrase's words, our notes, the risk, the clock, the buttons) and the
    AGENT'S (recipients, subject, first lines, the request), in a block of its own headed "lo que
    pide el agente", every piece through vis(): escaped, invisible characters made visible,
-   cut. The buttons are links to a confirmation page (GET, it changes nothing) only when this
+   cut. A hold is titled by what it wants to do (PendingRequest.want, T12f-1): the verb is
+   the gate's reading, the agent's host only fills it in, as a name. The buttons are links to a confirmation page (GET, it changes nothing) only when this
    web may decide (`backtide web --aprobar`, "ready"); else they are drawn disabled with a note
    on how to turn them on. Addresses are cut in the middle with our marker (vis_mid), keeping the
    domain; a list read from the black box that may miss older holds says so (holds_partial). #}
 {% set approvals = approvals_state() %}
-<div class="waiting-head">
+{# What the page's sentence on top and the header's count read when the stream sends this again
+   (web.js, syncWaiting): how many wait and when the first runs out. #}
+<div class="waiting-head" data-n="{{ requests | length if requests else 0 }}"{% if stale and not requests %} data-unknown{% elif stale or holds_partial() %} data-unsure{% endif %}{% if requests %} data-held="{{ requests[0].held_at.isoformat() }}" data-deadline="{{ requests[0].expires_at.isoformat() }}"{% endif %}>
   <h2 id="waiting-title"><span class="waiting-mark" aria-hidden="true"></span>{{ t('wait.title') }}</h2>
   {% if requests %}<span class="waiting-count num">{{ requests | length }}</span>{% endif %}
 </div>
@@ -25,10 +28,13 @@
 <ol class="requests">
   {% for r in requests %}
   {% set who = roster.get(r.agent) %}
+  {% set cost = r.kind if r.kind in ('email', 'message', 'delete') else 'other' %}
   <li class="req a-{{ who.colour }} risk-{{ r.risk }}" id="req-{{ r.id }}">
+    <div class="req-main">
     <p class="req-who"><a href="{{ who.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(who), 48) }}</span></a> <span class="muted">· {{ t('wait.held') }} <time data-ago datetime="{{ r.held_at.isoformat() }}">{{ age(r.held_at) }}</time></span></p>
     {% if r.action or r.request %}
-    {% if r.action %}<p class="req-what" lang="es">{{ r.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
+    <h3 class="req-what">{% if r.want == 'ours' %}<span lang="es">{{ r.action }}</span>{% else %}{{ say('want.' ~ r.want, target=r.target_name, api=r.api) }}{% endif %}</h3>
+    {% if not (cost == 'delete' and r.reason == 'delete') %}<p class="req-cost">{{ t('cost.' ~ cost) }}</p>{% endif %}
     {% if r.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ r.notes | join('; ') }}.</span></p>{% endif %}
     <div class="req-agent">
       <p class="req-agent-head">{{ t('hold.agent') }}</p>
@@ -40,10 +46,13 @@
       {% if r.request %}<p class="req-lines"><span class="name">{{ vis(r.request, 400) }}</span></p>{% endif %}
     </div>
     {% else %}
-    <p class="req-what">{{ say('req.' ~ r.what, target=r.target_name) }}</p>
+    <h3 class="req-what">{{ say('req.' ~ r.what, target=r.target_name) }}</h3>
     {% if r.detail_name %}<p class="req-detail">{{ say('req.detail', detail=r.detail_name) }}</p>{% endif %}
+    <p class="req-cost">{{ t('cost.' ~ cost) }}</p>
     {% endif %}
     <p class="req-why"><span class="muted">{{ t('wait.why') }}</span> {{ t('why.' ~ r.reason) if t.has('why.' ~ r.reason) else t('why.unknown') }}</p>
+    </div>
+    <div class="req-side">
     <p class="req-risk risk-word"><span class="dot dot-{{ r.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ r.risk) }}</p>
     <div class="req-clock" data-held="{{ r.held_at.isoformat() }}" data-deadline="{{ r.expires_at.isoformat() }}" data-done="{{ t('wait.expired') }}">
       <p class="req-left"><span class="muted">{{ t('wait.left') }}</span> <span class="req-count num">{{ countdown(r.left(now)) }}</span></p>
@@ -53,13 +62,26 @@
       {% if approvals == 'ready' %}
       <a class="req-yes" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=aprobar"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('wait.approve') }}</span></a>
       <a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=rechazar">{{ t('wait.reject') }}</a>
-      {% if r.trustable %}<a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=confiar">{{ t('wait.trust') }}</a>{% elif r.trust_off %}<span class="req-soon" data-trust-off="{{ r.trust_off }}">{{ t('wait.trust_off.' ~ r.trust_off) }}</span>{% endif %}
       {% else %}
       <button class="req-yes" type="button" disabled aria-describedby="soon-{{ r.id }}"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('wait.approve') }}</span></button>
       <button class="req-no" type="button" disabled aria-describedby="soon-{{ r.id }}">{{ t('wait.reject') }}</button>
       {% endif %}
-      {% if who.main %}<a class="req-no" href="{{ base }}/peticiones/ver?id={{ r.id | urlencode }}">{{ t('wait.view') }}</a>{% endif %}
-      {% if approvals != 'ready' %}<span class="req-soon" id="soon-{{ r.id }}">{{ t.code('wait.off.' ~ approvals) if t.has('wait.off.' ~ approvals) else t.code('wait.off.off') }}</span>{% endif %}
+    </div>
+    {% if approvals != 'ready' %}<p class="req-soon" id="soon-{{ r.id }}">{{ t.code('wait.off.' ~ approvals) if t.has('wait.off.' ~ approvals) else t.code('wait.off.off') }}</p>{% endif %}
+    {# A level below approve and reject: trusting a recipient (never a click away by accident)
+       and the whole request. #}
+    {% set can_trust = approvals == 'ready' and r.trustable %}
+    {% set trust_note = approvals == 'ready' and not r.trustable and r.trust_off %}
+    {% if can_trust or trust_note or who.main %}
+    <details class="req-more">
+      <summary>{{ t('wait.more') }}</summary>
+      {% if can_trust or who.main %}<ul>
+        {% if can_trust %}<li><a href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=confiar">{{ t('wait.trust_long') }}</a></li>{% endif %}
+        {% if who.main %}<li><a href="{{ base }}/peticiones/ver?id={{ r.id | urlencode }}">{{ t('wait.view_long') }}</a></li>{% endif %}
+      </ul>{% endif %}
+      {% if trust_note %}<p class="req-soon" data-trust-off="{{ r.trust_off }}">{{ t('wait.trust_off.' ~ r.trust_off) }}</p>{% endif %}
+    </details>
+    {% endif %}
     </div>
   </li>
   {% endfor %}

@@ -657,6 +657,89 @@
   }
   wakers.push(tickClocks);
 
+  // -- the control room's sentence and the header's count (T12f-1) -------------------------------
+  // The stream sends the requests (and each card) again when they change. The sentence on top,
+  // the count in the header and "your other matters" are rewritten from what it carries, with
+  // words the server wrote into data-*: only numbers and names reach them, through textContent.
+
+  function syncWaiting() {
+    var head = document.querySelector(".waiting-in .waiting-head[data-n]");
+    if (!head) return;
+    var n = parseInt(head.getAttribute("data-n"), 10) || 0;
+    document.querySelectorAll("[data-waiting-badge]").forEach(function (badge) {
+      badge.hidden = n === 0;
+      var num = badge.querySelector("[data-waiting-n]");
+      if (num && num.textContent !== String(n)) num.textContent = String(n);
+    });
+    var title = document.querySelector("[data-summary-title]");
+    if (!title) return;
+    var unsure = head.hasAttribute("data-unsure");
+    var text = head.hasAttribute("data-unknown") || (unsure && n === 0)
+      ? title.getAttribute("data-unknown")
+      : unsure
+        ? (title.getAttribute("data-least") || "").replace("{n}", String(n))
+        : n === 0
+        ? title.getAttribute("data-none")
+        : n === 1
+          ? title.getAttribute("data-one")
+          : (title.getAttribute("data-other") || "").replace("{n}", String(n));
+    if (text && title.textContent !== text) title.textContent = text;
+    var left = document.querySelector("[data-summary-left]");
+    if (left) {
+      left.hidden = n === 0;
+      if (n) {
+        left.setAttribute("data-held", head.getAttribute("data-held") || "");
+        left.setAttribute("data-deadline", head.getAttribute("data-deadline") || "");
+      } else {
+        left.removeAttribute("data-deadline");
+      }
+    }
+    var calm = document.querySelector("[data-summary-calm]");
+    if (calm) calm.hidden = n !== 0;
+  }
+
+  var MATTERS = ["frozen", "sensor_down", "stopped"];
+  function syncMatters() {
+    var box = document.querySelector("[data-matters]");
+    var list = box && box.querySelector(".attention");
+    if (!list) return;
+    var found = [];
+    document.querySelectorAll("article.card").forEach(function (card) {
+      var inner = card.querySelector(".card-in");
+      var link = card.querySelector(".card-name a");
+      var name = card.querySelector(".card-name .agent-name");
+      if (!inner || !link || !name) return;
+      var state = MATTERS.filter(function (s) { return inner.classList.contains("st-" + s); })[0];
+      if (!state) return;
+      var colour = Array.prototype.filter.call(card.classList, function (c) { return /^a-\d+$/.test(c); })[0];
+      found.push({ id: card.id, state: state, colour: colour || "", href: link.getAttribute("href"), name: name.textContent });
+    });
+    var key = found.map(function (m) { return m.id + ":" + m.state + ":" + m.name; }).join("|");
+    if (list.getAttribute("data-key") === key) return;
+    list.setAttribute("data-key", key);
+    while (list.firstChild) list.removeChild(list.firstChild);
+    found.forEach(function (m) {
+      var li = document.createElement("li");
+      li.className = (m.colour ? m.colour + " " : "") + "st-" + m.state;
+      var dot = document.createElement("span");
+      dot.className = "pulse";
+      dot.setAttribute("aria-hidden", "true");
+      var said = document.createElement("span");
+      var a = document.createElement("a");
+      a.setAttribute("href", m.href);
+      var who = document.createElement("span");
+      who.className = "agent-name";
+      who.textContent = m.name;
+      a.appendChild(who);
+      said.appendChild(a);
+      said.appendChild(document.createTextNode(" " + (list.getAttribute("data-" + m.state) || "")));
+      li.appendChild(dot);
+      li.appendChild(said);
+      list.appendChild(li);
+    });
+    box.hidden = found.length === 0;
+  }
+
   // -- the control room: the feed of every agent, newest on top ----------------------------------
 
   var pfeed = document.getElementById("pfeed");
@@ -714,8 +797,10 @@
     } else if (target && target.classList && target.classList.contains("card")) {
       tickAges();
       stirCard(target);
+      syncMatters();
     } else if (target && target.classList && target.classList.contains("waiting-in")) {
       markRequests();
+      syncWaiting();
       tickAges();
       tickClocks();
     }
