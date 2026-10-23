@@ -4,7 +4,8 @@ Design: docs/34-diseno-t17-cualquier-agente.md, sections 5 to 7. The jail is the
 agent; a profile only fills in what the agent needs to work inside it: its image, how it starts,
 the variables it reads, the files backtide writes for it in ``/config``, how it gets its fake
 model key, how backtide knows it is ready, what the rewind notice says about it and the
-provider-side fields its model client sends.
+provider-side fields its model client sends, and the package registries it reads from (only
+reviewed ones, T17b-1).
 
 Nothing that decides the jail's security comes from here, and an AgentProfile has no field for
 it: the uid and gid, the capabilities, seccomp, the read-only root, the tmpfs and the /sys
@@ -142,6 +143,14 @@ REVIEWED_RESERVED_ENV = frozenset(
         ("npm_config_update_notifier", "false"),
     }
 )
+# Hosts a NAMED profile may add to the gate's allowed list (T17b-1, docs/34 section 8): the
+# package registries a programming agent reads from all day. On the list, a read there is off
+# the read budget (docs/32, section 13) and may carry a credential header; everything else of
+# the gate still applies (writes are held, a secret seen in a URL or a header is held, the
+# guard's 2 KiB each). Reviewed one by one in code: only hosts that serve packages, never one
+# that serves what anyone writes (a gist, a paste, a git forge). The custom profile never
+# gets any: the owner's own go in [proxy] allow_hosts.
+REVIEWED_ALLOW_HOSTS = frozenset({"registry.npmjs.org", "pypi.org", "files.pythonhosted.org"})
 CUSTOM_NAME = "custom"  # the profile put together from [agent] (profiles/custom.py)
 # How the agent runs in its container (docs/34, section 7 and decision 3):
 # - "service": the container's command IS the agent (OpenClaw's Gateway); if it ends, the agent
@@ -379,7 +388,10 @@ class AgentProfile:
     - ``mode``: ``"service"`` (the command is the agent) or ``"shell"`` (the container waits and
       the owner runs the agent in it: ``shell`` says how, and only a shell profile has one).
     - ``env`` may hold a reserved name only for a named profile, and only one of the exact pairs
-      of ``REVIEWED_RESERVED_ENV``."""
+      of ``REVIEWED_RESERVED_ENV``.
+    - ``allow_hosts``: hosts this agent reads from all day that join the gate's allowed list
+      (``ServiceConfig.proxy_settings``), only of ``REVIEWED_ALLOW_HOSTS`` and only for a named
+      profile (T17b-1: Claude Code's package registries)."""
 
     name: str
     version: str
@@ -407,6 +419,7 @@ class AgentProfile:
     )
     mode: str = SERVICE_MODE
     shell: ShellCommands | None = None
+    allow_hosts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _match("profile name", self.name, _PROFILE_NAME_RE)
@@ -454,6 +467,7 @@ class AgentProfile:
             check_profile_param(entry)
         if len(set(self.provider_params)) != len(self.provider_params):
             raise ValueError("provider_params has the same field twice")
+        self._check_hosts()
 
     def for_providers(self, providers: "tuple[ModelProvider, ...]") -> "AgentProfile":
         """This profile with ``provider_env``'s variables for ``providers`` added to ``env``
@@ -465,6 +479,20 @@ class AgentProfile:
         if not extra:
             return self
         return dataclasses.replace(self, env=(*self.env, *extra), provider_env=_no_provider_env)
+
+    def _check_hosts(self) -> None:
+        if not isinstance(self.allow_hosts, tuple):
+            raise ValueError("allow_hosts must be a tuple of host names")
+        if self.allow_hosts and self.name == CUSTOM_NAME:
+            raise ValueError(
+                "allow_hosts: the custom profile adds no host (the owner's go in [proxy] "
+                "allow_hosts)"
+            )
+        for host in self.allow_hosts:
+            if host not in REVIEWED_ALLOW_HOSTS:
+                raise ValueError(f"allow_hosts: {host!r} is not a reviewed package registry")
+        if len(set(self.allow_hosts)) != len(self.allow_hosts):
+            raise ValueError("allow_hosts has the same host twice")
 
     def _check_workdir(self) -> None:
         if self.workdir is None:

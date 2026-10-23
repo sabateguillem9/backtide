@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from backtide.gate.providers import is_fake_key
+from backtide.gate.providers import Providers, is_fake_key
 from backtide.jail.config import container_env, create_env, docker_create_argv, token_env
 from backtide.jail.profile import (
     MAX_PROMPT,
@@ -36,6 +36,7 @@ from backtide.jail.profiles.claude_code import (
 )
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.notice import rewind_notice
+from backtide.service.runner import egress_policy
 
 PROVIDER = '[[proxy.providers]]\nname = "anthropic"\nkind = "anthropic"\n'
 TOML = f'[agent]\nprofile = "claude-code"\n[proxy]\n{PROVIDER}'
@@ -84,6 +85,7 @@ def test_claude_code_is_a_named_profile_of_the_shell_mode() -> None:
     assert profile.workspace_dirs == ("home", "work")
     assert profile.fake_key_env == (("ANTHROPIC_API_KEY", "anthropic"),)
     assert profile.provider_params == ("param:diagnostics",)
+    assert profile.allow_hosts == ("registry.npmjs.org", "pypi.org", "files.pythonhosted.org")
     assert profile.token_env is None
     assert profile.config_names == ("claude.json",)
     assert OPENCLAW.mode == "service" and OPENCLAW.shell is None
@@ -112,6 +114,10 @@ def test_its_jail_from_backtide_toml(layout: Path) -> None:
     assert not any(secrets["ANTHROPIC_API_KEY"] in arg for arg in argv)
     assert create_env(jail)["npm_config_audit"] == "false"
     assert "param:diagnostics" in config.proxy_settings().allow_provider_tools
+    # T17b-1: npm's and PyPI's registries are on the gate's allowed list (no read budget), and
+    # the audit's POST after an install is off (npm_config_audit, above).
+    assert config.proxy_settings().allow_hosts == CLAUDE_CODE.allow_hosts
+    assert egress_policy(config, Providers([])).allow_list().allows("files.pythonhosted.org")
 
 
 def test_its_provider_must_be_anthropic_at_its_real_host(layout: Path) -> None:

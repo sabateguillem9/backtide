@@ -134,7 +134,12 @@ _V2_COMMANDS: dict[bytes, tuple[frozenset[bytes], dict[bytes, re.Pattern[bytes]]
     b"object-info": (frozenset({b"size"}), {b"oid": _OID_ANY_RE}),
 }  # fmt: skip
 # GitHub's own tokens: the credential a git request to github.com is meant to carry.
-_GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")
+# GitHub's tokens at their real lengths (classic: 36 after the prefix; fine-grained: 22, "_", 59):
+# with any length, a key of letters and digits glued after one would be part of "one whole
+# token" (security review of T17b-1). A token of another length is searched like any text.
+_GITHUB_TOKEN_RE = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}"
+)
 NAME_WIDTH = 60  # a ref name in the target, at most (cut in the middle)
 _MORE = 12  # room kept for " y NN más"
 _VOLATILE_CAPABILITIES = (b"agent=", b"session-id=")
@@ -336,12 +341,15 @@ def _foreign_credential(headers: tuple[tuple[str, str], ...], scrub: KnownScrubb
     """Whether a credential header carries a key the redaction knows that is not GitHub's (an
     Anthropic key in a ``Basic`` password, say). The gate lets a translated read pass whatever
     its credential says, since it is the API's own; toward github.com only GitHub's tokens are
-    (security review of T17b-1, L2)."""
+    (security review of T17b-1, L2). A part passes as GitHub's only when it is one whole token:
+    a key glued after one (``ghp_...sk-ant-...``) is searched with it, not cut out with it."""
     for name, value in headers:
         if name.strip().lower() not in CREDENTIAL_HEADERS:
             continue
         for text in _credential_texts(value):
-            if has_secret(_GITHUB_TOKEN_RE.sub("", text), scrub):
+            if _GITHUB_TOKEN_RE.fullmatch(text.strip()):
+                continue
+            if has_secret(text, scrub):
                 return True
     return False
 

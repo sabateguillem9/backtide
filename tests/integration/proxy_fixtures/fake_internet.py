@@ -19,6 +19,18 @@ the pinned mitmproxy image. Never contacted from the Mac and never with a real k
 - T17a-4, ``git push`` over smart HTTP: ``GET .../info/refs?service=git-receive-pack`` gets the
   advertisement of an empty repository, so git goes on to its ``POST .../git-receive-pack``
   (which the gate holds: a test checks it never arrives here).
+- T17b-1, a day of programming:
+  - ``github.com`` serves the repositories the test baked (``/opt/internet/git/<owner>/<repo>``:
+    ``refs`` and ``pack``, and ``next.refs`` and ``next.pack`` for after ``POST /git/advance``
+    on the control port) over git's smart HTTP, protocol v0 with no capability but ``symref``:
+    ``info/refs`` advertises the refs, ``git-upload-pack`` answers ``NAK`` and, after ``done``,
+    the whole pack; ``git-receive-pack`` takes the commands (never the objects: the pack is
+    read and dropped), moves the refs it advertises from then on and reports ``ok`` for each.
+  - ``registry.npmjs.org`` is an npm registry where every name exists at version 1.0.0, made up
+    on the spot: ``t17-wide-<n>`` depends on ``t17-leaf-0`` to ``t17-leaf-<n-1>``. Each
+    packument points at its tarball, with its ``integrity``.
+  - ``pypi.org/simple/<name>/`` and ``files.pythonhosted.org/packages/t17/<wheel>`` are PyPI
+    the same way: ``t17-pywide-<n>`` requires ``t17-pyleaf-0`` to ``t17-pyleaf-<n-1>``.
 - ``.../chat/completions``: a fake OpenAI-compatible Chat Completions API (JSON or SSE). A
   streamed call with ``stream_options.include_usage`` true gets ``"usage": null`` in each chunk
   and one more chunk, ``"choices": []`` with the usage, before ``[DONE]``, as OpenAI documents
@@ -53,13 +65,19 @@ Prints READY_LINE once all of them listen.
 """
 
 import base64
+import gzip
+import hashlib
+import io
 import json
+import os
 import re
 import socket
 import ssl
 import struct
+import tarfile
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 READY_LINE = "t06-internet-ready"
@@ -95,6 +113,21 @@ TG_UPDATES: list[dict] = []
 TG_COND = threading.Condition(LOCK)
 TG_NEXT = {"update": 5000, "message": 900}
 CURRENT = threading.local()  # the connection a handler thread is serving
+# T17b-1: git, npm and PyPI (never the real ones: invariant 8).
+GIT_DIR = "/opt/internet/git"
+GIT_ROUTE = re.compile(
+    r"/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/(info/refs|git-upload-pack|git-receive-pack)"
+)
+GIT_PUSHED: dict[str, dict[str, str]] = {}  # repository: the refs pushes moved (None: deleted)
+GIT_ADVANCED: set[str] = set()  # repositories that serve next.refs and next.pack
+ZERO_ID = "0" * 40
+NPM_HOST = "registry.npmjs.org"
+PYPI_HOST = "pypi.org"
+PYPI_FILES = "files.pythonhosted.org"
+PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,100}")
+NPM_WIDE = re.compile(r"t17-wide-(\d{1,4})")
+PYPI_WIDE = re.compile(r"t17-pywide-(\d{1,4})")
+PACKAGES: dict[tuple[str, str], bytes] = {}  # (kind, name): the tarball or wheel, made once
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -119,6 +152,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:  # noqa: N802 - stdlib name
         self._serve()
 
+    # T17b-1: uv asks a wheel's size and reads its end with ranges.
+    def do_HEAD(self) -> None:  # noqa: N802 - stdlib name
+        self._serve()
+
     def _serve(self) -> None:
         body = self._read_body()
         record = {
@@ -136,6 +173,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == "POST" and self.path == "/tg/push":
                 self._tg_push(body)
                 return
+            if self.command == "POST" and self.path == "/git/advance":
+                with LOCK:
+                    GIT_ADVANCED.add(body.decode().strip().lower())
+                self._json(200, {"advanced": sorted(GIT_ADVANCED)})
+                return
             self._control()
             return
         with LOCK:
@@ -143,6 +185,19 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         bot = TG_PATH.fullmatch(path)
         host = (record["host"] or "").split(":")[0]
+        git = GIT_ROUTE.fullmatch(path) if host == "github.com" else None
+        if git is not None and _baked(f"{git.group(1)}/{git.group(2)}".lower()):
+            self._git(f"{git.group(1)}/{git.group(2)}".lower(), git.group(3), body)
+            return
+        if git is not None and git.group(3) == "git-receive-pack" and self.command == "POST":
+            self._git_report(_push_commands(body))  # an approved push to an unbaked repository
+            return
+        if host == NPM_HOST and self.command in ("GET", "HEAD"):
+            self._npm(path)
+            return
+        if host in (PYPI_HOST, PYPI_FILES) and self.command in ("GET", "HEAD"):
+            self._pypi(host, path)
+            return
         if path.endswith("/info/refs") and "service=git-receive-pack" in self.path:
             self._git_advertisement("git-receive-pack")
             return
@@ -281,7 +336,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _sse(self, events: list[tuple[str | None, object]]) -> None:
         self.send_response(200)
@@ -360,6 +416,111 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # T17b-1: git, npm and PyPI
+
+    def _git(self, repo: str, route: str, body: bytes) -> None:
+        if route == "info/refs":
+            push = "service=git-receive-pack" in self.path
+            service = "git-receive-pack" if push else "git-upload-pack"
+            refs = sorted(_git_refs(repo).items())
+            if push:  # what git's send-pack needs, and nothing it would act on
+                caps = "report-status delete-refs agent=git/t17-fake"
+                lines = [f"{oid} {ref}" for ref, oid in refs] or [f"{ZERO_ID} capabilities^{{}}"]
+            else:
+                caps = "symref=HEAD:refs/heads/main agent=git/t17-fake"
+                head = dict(refs).get("refs/heads/main", ZERO_ID)
+                lines = [f"{head} HEAD", *(f"{oid} {ref}" for ref, oid in refs)]
+            lines[0] += f"\0{caps}"
+            advertised = b"".join(_pkt(f"{line}\n") for line in lines)
+            data = _pkt(f"# service={service}\n") + b"0000" + advertised + b"0000"
+            self._bytes(200, f"application/x-{service}-advertisement", data)
+        elif route == "git-upload-pack":
+            answer = b"0008NAK\n"
+            if b"0009done\n" in body:
+                answer += _git_file(repo, "pack")
+            self._bytes(200, "application/x-git-upload-pack-result", answer)
+        else:
+            commands = _push_commands(body)
+            with LOCK:
+                moved = GIT_PUSHED.setdefault(repo, {})
+                for _old, new, ref in commands:
+                    moved[ref] = new
+            self._git_report(commands)
+
+    def _git_report(self, commands: list[tuple[str, str, str]]) -> None:
+        data = _pkt("unpack ok\n") + b"".join(_pkt(f"ok {ref}\n") for *_, ref in commands)
+        self._bytes(200, "application/x-git-receive-pack-result", data + b"0000")
+
+    def _npm(self, path: str) -> None:
+        parts = path.strip("/").split("/")
+        name = parts[0]
+        if not PACKAGE_NAME.fullmatch(name):
+            self._json(404, {"error": "not found"})
+        elif len(parts) == 1:
+            tarball = _package("npm", name)
+            version = {
+                "name": name,
+                "version": "1.0.0",
+                "dependencies": _npm_deps(name),
+                "dist": {
+                    "tarball": f"https://{NPM_HOST}/{name}/-/{name}-1.0.0.tgz",
+                    "shasum": hashlib.sha1(tarball).hexdigest(),  # noqa: S324 - npm's own
+                    "integrity": "sha512-"
+                    + base64.b64encode(hashlib.sha512(tarball).digest()).decode(),
+                },
+            }
+            self._json(200, {"name": name, "dist-tags": {"latest": "1.0.0"},
+                             "versions": {"1.0.0": version}})  # fmt: skip
+        elif parts[1:] == ["-", f"{name}-1.0.0.tgz"]:
+            self._bytes(200, "application/octet-stream", _package("npm", name))
+        else:
+            self._json(404, {"error": "not found"})
+
+    def _pypi(self, host: str, path: str) -> None:
+        parts = path.strip("/").split("/")
+        if host == PYPI_HOST and len(parts) == 2 and parts[0] == "simple":
+            name = re.sub(r"[-_.]+", "-", parts[1].lower())
+            if not PACKAGE_NAME.fullmatch(name):
+                self._json(404, {"error": "not found"})
+                return
+            wheel = _wheel_name(name)
+            digest = hashlib.sha256(_package("pypi", name)).hexdigest()
+            link = f"https://{PYPI_FILES}/packages/t17/{wheel}#sha256={digest}"
+            page = f'<!DOCTYPE html><html><body><a href="{link}">{wheel}</a></body></html>\n'
+            self._bytes(200, "text/html", page.encode())
+        elif host == PYPI_FILES and len(parts) == 3 and parts[:2] == ["packages", "t17"]:
+            name = parts[2].split("-1.0.0-", 1)[0].replace("_", "-")
+            if parts[2] != _wheel_name(name) or not PACKAGE_NAME.fullmatch(name):
+                self._json(404, {"error": "not found"})
+                return
+            self._bytes(200, "application/octet-stream", _package("pypi", name))
+        else:
+            self._json(404, {"error": "not found"})
+
+    def _bytes(self, status: int, kind: str, data: bytes) -> None:
+        """``data``, or the part of it a ``Range: bytes=a-b`` or ``bytes=-n`` asks for (206);
+        only the headers for a HEAD."""
+        wanted = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("range") or "")
+        total = len(data)
+        if status == 200 and wanted is not None and (wanted.group(1) or wanted.group(2)):
+            first, last = wanted.groups()
+            start = int(first) if first else max(0, total - int(last))
+            end = min(total - 1, int(last)) if first and last else total - 1
+            status, data = 206, data[start : end + 1]
+            content_range = f"bytes {start}-{end}/{total}"
+        else:
+            content_range = None
+        self.send_response(status)
+        self.send_header("content-type", kind)
+        self.send_header("cache-control", "no-cache")
+        self.send_header("accept-ranges", "bytes")
+        if content_range is not None:
+            self.send_header("content-range", content_range)
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _anthropic(self, body: bytes) -> None:
         request = _json_or_empty(body)
@@ -664,6 +825,108 @@ def _pkt(text: str) -> bytes:
     return f"{len(data) + 4:04x}".encode() + data
 
 
+def _baked(repo: str) -> bool:
+    return os.path.isfile(os.path.join(GIT_DIR, repo, "refs"))
+
+
+def _git_file(repo: str, name: str) -> bytes:
+    """A baked repository's file, of its state now (``next.`` once advanced)."""
+    with LOCK:
+        prefix = "next." if repo in GIT_ADVANCED else ""
+    with open(os.path.join(GIT_DIR, repo, prefix + name), "rb") as handle:
+        return handle.read()
+
+
+def _git_refs(repo: str) -> dict[str, str]:
+    """The refs a repository advertises now: the baked ones of its state, moved by the pushes
+    it took. Unbaked: none (an empty repository)."""
+    refs: dict[str, str] = {}
+    if _baked(repo):
+        for line in _git_file(repo, "refs").decode().splitlines():
+            oid, _space, ref = line.partition(" ")
+            refs[ref] = oid
+    with LOCK:
+        for ref, oid in GIT_PUSHED.get(repo, {}).items():
+            refs[ref] = oid
+    return {ref: oid for ref, oid in refs.items() if oid != ZERO_ID}
+
+
+def _push_commands(body: bytes) -> list[tuple[str, str, str]]:
+    """The ``old new ref`` commands at the start of a push's body (until its flush)."""
+    commands, index = [], 0
+    while index + 4 <= len(body):
+        size = int(body[index : index + 4], 16)
+        if size == 0:
+            break
+        line = body[index + 4 : index + size].split(b"\0", 1)[0].decode().strip()
+        old, new, ref = line.split(" ", 2)
+        commands.append((old, new, ref))
+        index += size
+    return commands
+
+
+def _npm_deps(name: str) -> dict[str, str]:
+    wide = NPM_WIDE.fullmatch(name)
+    return {f"t17-leaf-{n}": "1.0.0" for n in range(int(wide.group(1)))} if wide else {}
+
+
+def _wheel_name(name: str) -> str:
+    return f"{name.replace('-', '_')}-1.0.0-py3-none-any.whl"
+
+
+def _package(kind: str, name: str) -> bytes:
+    """An npm tarball or a wheel for ``name``, the same bytes every time."""
+    with LOCK:
+        made = PACKAGES.get((kind, name))
+    if made is not None:
+        return made
+    made = _tarball(name) if kind == "npm" else _wheel(name)
+    with LOCK:
+        PACKAGES[(kind, name)] = made
+    return made
+
+
+def _tarball(name: str) -> bytes:
+    manifest = {"name": name, "version": "1.0.0", "main": "index.js",
+                "dependencies": _npm_deps(name)}  # fmt: skip
+    files = {
+        "package/package.json": json.dumps(manifest).encode(),
+        "package/index.js": f"module.exports = {json.dumps(name)};\n".encode(),
+    }
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        for path, data in files.items():
+            info = tarfile.TarInfo(path)
+            info.size, info.mtime, info.mode = len(data), 0, 0o644
+            tar.addfile(info, io.BytesIO(data))
+    return gzip.compress(raw.getvalue(), mtime=0)
+
+
+def _wheel(name: str) -> bytes:
+    module = name.replace("-", "_")
+    info = f"{module}-1.0.0.dist-info"
+    wide = PYPI_WIDE.fullmatch(name)
+    needs = [f"t17-pyleaf-{n}" for n in range(int(wide.group(1)))] if wide else []
+    metadata = "Metadata-Version: 2.1\nName: " + name + "\nVersion: 1.0.0\n"
+    metadata += "".join(f"Requires-Dist: {need}\n" for need in needs)
+    files = {
+        f"{module}/__init__.py": f"NAME = {json.dumps(name)}\n",
+        f"{info}/METADATA": metadata,
+        f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: t17-fake\nRoot-Is-Purelib: true\n"
+        "Tag: py3-none-any\n",
+    }
+    record = ""
+    for path, text in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).rstrip(b"=")
+        record += f"{path},sha256={digest.decode()},{len(text.encode())}\n"
+    files[f"{info}/RECORD"] = record + f"{info}/RECORD,,\n"
+    raw = io.BytesIO()
+    with zipfile.ZipFile(raw, "w") as wheel:
+        for path, text in files.items():
+            wheel.writestr(zipfile.ZipInfo(path, (1980, 1, 1, 0, 0, 0)), text)
+    return raw.getvalue()
+
+
 def _exec_asked(request: dict, mark: re.Pattern[str] = EXEC_MARK) -> str | None:
     """The command of ``T06-EXEC:[[...]]`` in the user's latest messages (those after the last
     answer of the model), unless they bring a tool's result back (that ends the exchange)."""
@@ -735,6 +998,9 @@ class TLSServer(ThreadingHTTPServer):
     """One HTTPS listener. Counts each TCP accept, then does TLS in the connection's thread."""
 
     daemon_threads = True
+    # T17b-1: npm opens hundreds of connections at once; the default backlog (5) would refuse
+    # some, and the proxy would answer 502 for the fake internet's sake, not backtide's.
+    request_queue_size = 1024
 
     def __init__(self, port: int, context: ssl.SSLContext) -> None:
         super().__init__(("0.0.0.0", port), Handler)  # noqa: S104 - inside the fake internet

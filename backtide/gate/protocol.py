@@ -503,7 +503,8 @@ def pong() -> dict[str, Any]:
 
 DEFAULT_LIMITS = {
     "max_connections": 256,
-    "max_pending": 32,
+    "max_pending": 32,  # requests that may have a body: up to 16 MiB each in the proxy's memory
+    "max_pending_reads": 256,  # those without one (T17b-1: npm sends a whole install at once)
     "max_queue": 1000,
     "ack_timeout_ms": 5000,
     "ping_interval_ms": 5000,
@@ -512,6 +513,7 @@ DEFAULT_LIMITS = {
 _LIMIT_RANGES = {
     "max_connections": (1, 4096),
     "max_pending": (1, 256),
+    "max_pending_reads": (1, 4096),
     "max_queue": (1, 100_000),
     "ack_timeout_ms": (100, 60_000),
     "ping_interval_ms": (500, 60_000),

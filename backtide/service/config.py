@@ -276,6 +276,9 @@ class ProxySettings:
     allow_hosts: tuple[str, ...]
     providers: tuple[Provider, ...]
     allow_provider_tools: tuple[str, ...] = ()
+    # Those of ``allow_hosts`` only the agent's profile adds (T17b-1): read unasked, but never
+    # a WebSocket's way out (security review of T17b-1).
+    profile_hosts: tuple[str, ...] = ()
 
 
 class Secret:
@@ -870,7 +873,7 @@ class ServiceConfig:
 
     def proxy_settings(self) -> ProxySettings:
         """``allow_hosts``, ``providers`` and ``allow_provider_tools`` of ``[proxy]``, checked
-        (ConfigError)."""
+        (ConfigError), with what the agent's profile adds to the first and the last."""
         hosts = self.proxy.get("allow_hosts", [])
         if not isinstance(hosts, list) or len(hosts) > MAX_ALLOW_HOSTS:
             raise ConfigError(
@@ -905,8 +908,20 @@ class ServiceConfig:
                 f"[proxy] allow_provider_tools and the agent's profile allow more than "
                 f"{MAX_PROVIDER_TOOLS} provider fields and tools"
             )
+        # The package registries the agent reads from all day (T17b-1, docs/34 section 8): its
+        # profile's, reviewed in code (profile.REVIEWED_ALLOW_HOSTS), after the owner's.
+        profile_hosts = tuple(h for h in self.agent_profile.allow_hosts if h not in hosts)
+        hosts = list(dict.fromkeys((*hosts, *self.agent_profile.allow_hosts)))
+        if len(hosts) > MAX_ALLOW_HOSTS:
+            raise ConfigError(
+                f"[proxy] allow_hosts and the agent's profile list more than {MAX_ALLOW_HOSTS} "
+                "hosts"
+            )
         return ProxySettings(
-            allow_hosts=tuple(hosts), providers=providers, allow_provider_tools=allowed
+            allow_hosts=tuple(hosts),
+            providers=providers,
+            allow_provider_tools=allowed,
+            profile_hosts=profile_hosts,
         )
 
     def gate_settings(self, owner_chat: int | None = None) -> GateSettings:

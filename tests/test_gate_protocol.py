@@ -451,6 +451,8 @@ def test_the_hold_messages_are_described_without_their_content() -> None:
         {"limits": {"max_pending": 10**9}},
         {"limits": {"unknown": 1}},
         {"limits": {"max_pending": True}},
+        {"limits": {"max_pending_reads": 0}},
+        {"limits": {"max_pending_reads": 5000}},
         {"providers": [{"name": "anthropic"}]},
         {"providers": "x"},
         {"limits": {"max_holds": 0}},

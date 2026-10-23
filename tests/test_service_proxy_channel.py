@@ -629,6 +629,21 @@ def test_a_read_passes_recorded_with_its_rule_and_without_any_gate_event(gated: 
     assert gated.gate_events() == []
 
 
+def test_a_websocket_goes_to_the_owners_hosts_but_not_to_the_profiles(box: BlackBox) -> None:
+    """Security review of T17b-1: a host the agent's profile adds (a package registry) is read
+    unasked, but a WebSocket there would be a way out that is never held."""
+    hosts = ("example.com", "registry.npmjs.org")
+    made = Gated(box, policy=policy(allow_hosts=hosts, profile_hosts=("registry.npmjs.org",)))
+    try:
+        owners = made.ask(request_event(), facts(websocket=True))
+        assert owners["verdict"] == "allow"
+        registry = request_event(host="registry.npmjs.org")
+        assert made.ask(registry, facts(websocket=True))["verdict"] == "deny"
+        assert made.ask(registry, facts("d" * 64))["verdict"] == "allow"  # a plain read
+    finally:
+        made.channel.close()
+
+
 def test_a_delete_is_held_recorded_as_gate_held_and_not_as_a_request(gated: Gated) -> None:
     ack = gated.ask(delete_event(), write_facts())
     assert ack["verdict"] == "hold" and ack["wait_ms"] == 90_000 and ack["retry_after"] == 30

@@ -6,7 +6,9 @@ Design: docs/21-diseno-t06-proxy.md, sections 4 to 8. What each hook does:
   network, and at most ``max_connections`` at once; any other is cut.
 - ``http_connect``: a ``CONNECT`` to a port other than 80 or 443 is refused (``port``).
 - ``requestheaders``: no channel, no request (503, ``not_recorded``); at most ``max_pending``
-  requests reading their body or waiting for their ack (429, ``throttled``); a body over the
+  requests that may have a body, reading it or waiting for their ack, and ``max_pending_reads``
+  without one (T17b-1: npm 9 sends a whole install at once), waiting for their ack (429,
+  ``throttled``; one with a body over its places is cut instead); a body over the
   limit is refused before it is read (413, ``too_large``); an HTTP/1 request that announces
   trailers is cut (``trailers``: mitmproxy 12.2.3 cannot read them, so it could be neither
   checked nor held). One whose body never reached the ``request`` hook (mitmproxy's reader
@@ -326,6 +328,7 @@ class Gate:
         self.agent_side: frozenset[str] = frozenset()
         self._clients: set[str] = set()
         self._waiting: set[str] = set()  # flows reading their body or waiting for their ack
+        self._bodies: set[str] = set()  # those of them that may have a body (max_pending)
         # Flows whose request hook has not come yet: flow id -> (client id, what is known).
         self._reading: dict[str, tuple[str, dict[str, Any]]] = {}
         self._acked: dict[str, set[tuple[str, int]]] = {}  # client id -> targets let through
@@ -370,6 +373,12 @@ class Gate:
             logger.exception("forgetting a client failed: stopping the proxy")
             self._die()
 
+    def _stop_waiting(self, flow_id: str) -> None:
+        """A request no longer waits for its ack (answered, held, failed or gone): its place,
+        among those with a body or those without, is free."""
+        self._waiting.discard(flow_id)
+        self._bodies.discard(flow_id)
+
     def _forget_unread(self, client_id: str) -> None:
         """The requests of a client that is gone whose body never reached the request hook nor
         the error hook (mitmproxy's reader failed on them): recorded, and their place given
@@ -378,7 +387,7 @@ class Gate:
             if owner != client_id:
                 continue
             del self._reading[flow_id]
-            self._waiting.discard(flow_id)
+            self._stop_waiting(flow_id)
             self._tell_error(
                 "request_unread", None, flow_id=flow_id, host=fields["host"], port=fields["port"]
             )
@@ -410,7 +419,12 @@ class Gate:
             flow.kill()
             return
         body = _may_have_body(flow.request)
-        if len(self._waiting) >= self._channel.limits["max_pending"]:
+        limits = self._channel.limits
+        if (
+            len(self._bodies) >= limits["max_pending"]
+            if body
+            else len(self._waiting) - len(self._bodies) >= limits["max_pending_reads"]
+        ):
             self._channel.count_throttled()
             if body:
                 # mitmproxy reads (and keeps) the body of a request that already has its answer,
@@ -431,6 +445,8 @@ class Gate:
         # Every request whose body mitmproxy reads holds a place until its request (or error)
         # hook, the refused ones too: at most max_pending bodies of 16 MiB in memory.
         self._waiting.add(flow.id)
+        if body:
+            self._bodies.add(flow.id)
         fields = self._flow_fields(flow)
         self._reading[flow.id] = (flow.client_conn.id, {k: fields[k] for k in ("host", "port")})
 
@@ -440,7 +456,7 @@ class Gate:
         try:
             await self._request(flow)
         finally:
-            self._waiting.discard(flow.id)
+            self._stop_waiting(flow.id)
 
     async def _request(self, flow: Any) -> None:
         if flow.response is not None:
@@ -779,7 +795,7 @@ class Gate:
         or ``hold_left`` (none after a deny), so a yes is spent exactly once. ``shape``: how its
         API writes "pending" and "rejected" (a translator's, T10-3); None: plain text."""
         hold_id = str(ack.hold_id)
-        self._waiting.discard(flow.id)  # a held request no longer waits for its ack
+        self._stop_waiting(flow.id)  # a held request no longer waits for its ack
         if flow.response is not None or self._client_gone(flow):
             if flow.response is None:
                 flow.kill()
@@ -1026,6 +1042,21 @@ class Gate:
     def responseheaders(self, flow: Any) -> None:
         meta = flow.metadata.get("backtide")
         provider = meta["provider"] if meta else None
+        if (
+            provider is None
+            and flow.response.status_code == 101
+            and not _has_header(flow.request, "upgrade")
+        ):
+            # mitmproxy opens a WebSocket on the answer (a 101 to a request with
+            # Sec-WebSocket-*), not on the request's Upgrade: a GET without Upgrade passed as a
+            # read, even to an unknown host, would open one that no rule decided (security
+            # review of T17b-1). Every request that names Upgrade is a WebSocket opening the
+            # gate decided on (``_upgrade_refused``). A local model's 101 is held below.
+            if meta is None:
+                flow.kill()
+            else:
+                self._stop_answer(flow, "unrequested_upgrade")
+            return
         headers = flow.response.headers
         media = (headers.get("content-type") or "").split(";", 1)[0].strip().lower()
         if provider is not None:
@@ -1207,7 +1238,7 @@ class Gate:
     @_guard_after("error")
     def error(self, flow: Any) -> None:
         was_waiting = flow.id in self._waiting
-        self._waiting.discard(flow.id)
+        self._stop_waiting(flow.id)
         self._reading.pop(flow.id, None)
         self._release(flow)
         meta = flow.metadata.get("backtide")
@@ -1504,7 +1535,8 @@ def _malformed_framing(request: Any, trailers_present: bool) -> str | None:
     headers could reframe it for an HTTP/1.1 upstream, or None. ``trailers`` for trailers (h2
     reach the request hook; h1 were cut at requestheaders), else ``malformed_header`` for a
     header or trailer name that is not a token, a value with CR, LF or NUL, Transfer-Encoding
-    together with Content-Length, or a Transfer-Encoding that is not exactly ``chunked``."""
+    together with Content-Length, a Transfer-Encoding that is not exactly ``chunked``, or an
+    ``Upgrade`` that is not a WebSocket opening (``_upgrade_refused``)."""
     version = str(request.http_version).upper()
     if trailers_present and version.startswith(("HTTP/2", "HTTP/3")):
         # HTTP/2 and 3 trailers reach the request hook; mitmproxy would forward them to the
@@ -1523,7 +1555,27 @@ def _malformed_framing(request: Any, trailers_present: bool) -> str | None:
     if tes:
         if has_cl or len(tes) > 1 or tes[0] != "chunked":
             return "malformed_header"
+    if _upgrade_refused(request, pairs):
+        return "malformed_header"
     return None
+
+
+def _upgrade_refused(request: Any, pairs: list[tuple[str, str]]) -> bool:
+    """Whether the request names ``Upgrade`` without being exactly a WebSocket opening: a GET
+    with no body and one ``Upgrade: websocket``. The gate passes a WebSocket to the allowed list
+    unasked, so a POST that only named ``Upgrade`` went out without its hold, and any other
+    protocol would leave the connection as a tunnel no hook reads (security review of T17b-1)."""
+    upgrades = [value.strip().lower() for name, value in pairs if name.strip().lower() == "upgrade"]
+    if not upgrades:
+        return False
+    lengths = [v.strip() for n, v in pairs if n.strip().lower() == "content-length"]
+    return (
+        str(request.method) != "GET"
+        or upgrades != ["websocket"]
+        or bool(request.raw_content)
+        or any(n.strip().lower() == "transfer-encoding" for n, _ in pairs)
+        or any(length != "0" for length in lengths)
+    )
 
 
 def _frame_h2_body(request: Any) -> None:

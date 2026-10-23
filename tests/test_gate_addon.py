@@ -672,7 +672,7 @@ def test_only_the_agent_side_may_connect_and_only_so_many_at_once() -> None:
 
 
 def test_only_so_many_requests_wait_at_once() -> None:
-    channel = FakeChannel(limits={"max_pending": 2})
+    channel = FakeChannel(limits={"max_pending_reads": 2})
     gate, _ = make_gate(channel)
     flows = [Flow(id=f"f{n}") for n in range(3)]
     for flow in flows:
@@ -683,6 +683,34 @@ def test_only_so_many_requests_wait_at_once() -> None:
     late = Flow(id="f9")
     gate.requestheaders(late)
     assert status(late) is None
+
+
+def test_requests_without_a_body_have_more_places_than_those_with_one() -> None:
+    """T17b-1: npm 9 behind a proxy sends every fetch of an install at once (its proxy agent
+    ignores ``maxsockets``): with 32 places for everything, a medium install got 429s until it
+    failed. A request without a body keeps no 16 MiB in the proxy's memory, so it waits among
+    ``max_pending_reads`` (256 by default, as many as the connections); one that may have a body
+    still among ``max_pending`` (32), and the bodyless ones never take those places."""
+    assert (DEFAULT_LIMITS["max_pending"], DEFAULT_LIMITS["max_pending_reads"]) == (32, 256)
+    channel = FakeChannel(limits={"max_pending": 1, "max_pending_reads": 3})
+    gate, _ = make_gate(channel)
+    reads = [bodyless(f"r{n}") for n in range(3)]
+    for flow in reads:
+        gate.requestheaders(flow)
+    assert [status(f) for f in reads] == [None, None, None]
+    body = with_body("b0")
+    gate.requestheaders(body)
+    assert status(body) is None and not body.killed  # the reads took none of its places
+    one_more_body, one_more_read = with_body("b1"), bodyless("r3")
+    gate.requestheaders(one_more_body)
+    gate.requestheaders(one_more_read)
+    assert one_more_body.killed and status(one_more_read) == 429
+    asyncio.run(gate.request(reads[0]))
+    again = bodyless("r4")
+    gate.requestheaders(again)
+    assert status(again) is None
+    asyncio.run(gate.request(body))
+    assert gate._waiting == {"r1", "r2", "r4"}  # noqa: SLF001
 
 
 def with_body(flow_id: str, size: int = 100) -> Flow:
@@ -721,11 +749,14 @@ def test_a_request_refused_at_its_headers_still_holds_a_place_while_its_body_is_
 
 
 def test_over_the_pending_limit_a_body_is_cut_and_a_bodyless_request_gets_429() -> None:
-    channel = FakeChannel(limits={"max_pending": 1})
+    channel = FakeChannel(limits={"max_pending": 1, "max_pending_reads": 1})
     gate, _ = make_gate(channel)
     waiting = with_body("f0")
     gate.requestheaders(waiting)
     assert status(waiting) is None
+    first_plain = bodyless("f3")
+    gate.requestheaders(first_plain)
+    assert status(first_plain) is None  # its own places
     cut, plain = with_body("f1"), bodyless("f2")
     gate.requestheaders(cut)
     gate.requestheaders(plain)
@@ -1331,6 +1362,32 @@ def test_an_answer_with_another_transfer_encoding_is_not_let_through() -> None:
     answered(gate, flow, headers=headers)
     assert flow.killed
     assert [e["details"]["stage"] for e in channel.told] == ["response_transfer_encoding"]
+
+
+def test_a_switch_to_a_websocket_the_request_did_not_ask_for_is_stopped() -> None:
+    """mitmproxy opens a WebSocket on a 101 to a request with Sec-WebSocket-*: a GET without
+    Upgrade went through as a read, toward any host (security review of T17b-1)."""
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    headers = Headers([("Host", "example.com"), ("Sec-WebSocket-Version", "13")])
+    flow = Flow(request=Request(method="GET", headers=headers))
+    send(gate, flow)
+    assert flow.response is None  # a read: it goes out
+    flow.response = Response(101, headers=Headers([("upgrade", "websocket")]))
+    gate.responseheaders(flow)
+    assert flow.killed
+    assert [e["details"]["stage"] for e in channel.told] == ["unrequested_upgrade"]
+
+
+def test_a_websocket_the_gate_let_open_gets_its_101() -> None:
+    channel = FakeChannel()
+    gate, _ = make_gate(channel)
+    headers = Headers([("Host", "example.com"), ("Upgrade", "websocket")])
+    flow = Flow(request=Request(method="GET", headers=headers))
+    send(gate, flow)
+    flow.response = Response(101, headers=Headers([("upgrade", "websocket")]))
+    gate.responseheaders(flow)
+    assert not flow.killed and channel.told == []
 
 
 def test_answers_held_whole_share_a_memory_budget(monkeypatch: pytest.MonkeyPatch) -> None:

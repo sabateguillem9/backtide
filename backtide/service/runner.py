@@ -478,6 +478,7 @@ def egress_policy(
         )
     policy = Policy(
         allow_hosts=settings.allow_hosts,
+        profile_hosts=settings.profile_hosts,
         providers=providers,
         secrets=known_secrets(config.gateway_secrets()),
         provider_tools=settings.allow_provider_tools,

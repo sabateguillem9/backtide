@@ -98,6 +98,9 @@ class Facts:
     provider: bool = False
     websocket: bool = False
     allowed: bool = False  # the connection's host is on the allowed list
+    # ... only because the agent's profile adds it (a package registry, T17b-1): enough to read
+    # unasked, not to open a WebSocket (security review of T17b-1).
+    profile_host: bool = False
     preapproved: bool = False
     rejected: bool = False  # rejected or expired less than 10 min ago
     credential_bytes: int = 0  # the bytes of its credential headers, names and values
@@ -134,7 +137,10 @@ def decide(facts: Facts, *, unknown_hosts: str = "hold") -> Decision:
     if facts.provider:
         return Decision(Verdict.PASS, "provider")
     if facts.websocket:
-        if facts.allowed:
+        # Only a GET with no body opens one: the proxy refuses any other request that names
+        # Upgrade, and this checks it again (security review of T17b-1).
+        opening = facts.method == "GET" and facts.exact_read and not facts.has_body
+        if opening and facts.allowed and not facts.profile_host:
             return Decision(Verdict.PASS, "websocket")
         return Decision(Verdict.REJECT, "not_allowed")
     if unknown_hosts == "deny" and not facts.allowed:

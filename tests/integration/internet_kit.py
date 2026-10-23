@@ -78,8 +78,11 @@ TELEGRAM_HOST = "api.telegram.org"
 # The final review of T10 (confiar-sin-querer): Gmail's API host, so the gate's Gmail translator
 # reads the agent's mails there. A fake too, inside the test's network (invariant 8).
 GMAIL_HOST = "gmail.googleapis.com"
+# T17b-1, a day of programming: npm's and PyPI's registries, fakes that make up every package
+# (proxy_fixtures/fake_internet.py), inside the test's network (invariant 8).
+REGISTRY_HOSTS = ("registry.npmjs.org", "pypi.org", "files.pythonhosted.org")
 HOSTS = (ANTHROPIC_HOST, OPENAI_HOST, PLAIN_HOST, OTHER_HOST, TELEGRAM_HOST, GMAIL_HOST,
-         *OAUTH_LOGIN_HOSTS)  # fmt: skip
+         *OAUTH_LOGIN_HOSTS, *REGISTRY_HOSTS)  # fmt: skip
 REPLY_TEXT = "T06 PONG FROM THE FAKE MODEL"  # proxy_fixtures/fake_internet.py
 GRANTS_OPTION = "--egress-grants"
 
@@ -148,18 +151,28 @@ class FakeInternet:
         """How often its resolver failed to read or answer a query (by protocol)."""
         return self.stats()["dns_errors"]
 
+    def advance_git(self, repo: str) -> None:
+        """A baked repository (``owner/name``) moves on upstream: its github.com serves its
+        ``next`` refs and pack from now on (T17b-1)."""
+        post = (
+            "import sys, urllib.request; urllib.request.urlopen(urllib.request.Request("
+            "'http://127.0.0.1:9000/git/advance', data=sys.argv[1].encode()), timeout=10)"
+        )
+        jail_docker.run(["exec", self.name, "python3", "-c", post, repo], timeout=30)
+
     def remove(self) -> None:
         jail_docker.run(["rm", "--force", "--volumes", self.name], check=False)
 
 
-def start_fake_internet(service: Service, root: Path) -> FakeInternet:
+def start_fake_internet(service: Service, root: Path, git: Path | None = None) -> FakeInternet:
     """Make the service's egress network (as its proxy will find it) and start the fake
-    internet on it. The service must not be running yet."""
-    return start_fake_internet_for(service.config, root)
+    internet on it. The service must not be running yet. ``git``: a folder of repositories
+    baked by ``bake_git_repo``, that its github.com serves (T17b-1)."""
+    return start_fake_internet_for(service.config, root, git=git)
 
 
 def start_fake_internet_for(
-    config: ServiceConfig, root: Path, name: str | None = None
+    config: ServiceConfig, root: Path, name: str | None = None, *, git: Path | None = None
 ) -> FakeInternet:
     """``start_fake_internet`` for a service's ``config``, named ``name`` (by default a unique
     name under the tests' cleanup prefix). `make probar FALSO=1` (scripts/demo/probar.py) uses
@@ -171,18 +184,25 @@ def start_fake_internet_for(
         folder.mkdir(exist_ok=True)
     ca_key, ca_cert = make_ca(certs, "T06-5 test internet CA", 2048, 30)
     server_pem = make_server_cert(
-        certs, ca_key, ca_cert, (TELEGRAM_HOST, GMAIL_HOST, *OAUTH_LOGIN_HOSTS)
+        certs, ca_key, ca_cert, (TELEGRAM_HOST, GMAIL_HOST, *OAUTH_LOGIN_HOSTS, *REGISTRY_HOSTS)
     )
     shutil.copyfile(server_pem, internet / "server.pem")
     shutil.copyfile(FIXTURES / "fake_internet.py", files / "fake_internet.py")
     for folder in (files, internet):
         for path in folder.iterdir():
             path.chmod(0o444)
+    if git is not None:  # readable by the fake's uid, written by nobody
+        shutil.copytree(git, internet / "git", ignore=shutil.ignore_patterns(".work"))
+        for path in sorted((internet / "git").rglob("*"), reverse=True):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        (internet / "git").chmod(0o555)
+    for folder in (files, internet):
         folder.chmod(0o555)
     proxy = test_proxy(config)
     proxy.ensure_network()
     name = name or unique(CONTAINER_PREFIX)
-    argv = hardened(name, FAKE_UID) + ["--network", proxy.config.network]
+    # T17b-1: a thread per connection, and npm opens hundreds at once (64 would make it 502).
+    argv = hardened(name, FAKE_UID, pids=1024) + ["--network", proxy.config.network]
     for host in HOSTS:
         argv += ["--network-alias", host]
     argv += [
@@ -211,6 +231,71 @@ def start_fake_internet_for(
         fake.remove()
         raise
     return fake
+
+
+GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "t17",
+    "GIT_AUTHOR_EMAIL": "t17@example.invalid",
+    "GIT_COMMITTER_NAME": "t17",
+    "GIT_COMMITTER_EMAIL": "t17@example.invalid",
+    "GIT_AUTHOR_DATE": "2026-10-01T10:00:00Z",
+    "GIT_COMMITTER_DATE": "2026-10-01T10:00:00Z",
+}
+
+
+def bake_git_repo(
+    root: Path,
+    repo: str,
+    files: dict[str, str],
+    *,
+    tags: int = 0,
+    then: dict[str, str] | None = None,
+) -> None:
+    """A repository the fake internet's github.com serves as ``repo`` (``owner/name``), baked
+    here with this machine's git into ``root/<repo>``: its refs and a pack of all its objects.
+    ``files`` is its first commit on ``main``; ``tags`` annotated tags on it (``v0001``...);
+    ``then``, a second commit that ``POST /git/advance`` brings in (``next.refs`` and
+    ``next.pack``: upstream moved on)."""
+    out = root / repo
+    out.mkdir(parents=True)
+    work = root / ".work" / repo
+    work.mkdir(parents=True)
+    env = {**os.environ, **GIT_ENV}
+
+    def git(*args: str, stdin: bytes = b"") -> bytes:  # never this process's stdin
+        done = subprocess.run(
+            ["git", "-C", str(work), *args], env=env, input=stdin, capture_output=True,
+            check=True, timeout=300,
+        )  # fmt: skip
+        return done.stdout
+
+    def snapshot(prefix: str) -> None:
+        refs = git("for-each-ref", "--format=%(objectname) %(refname)")
+        (out / f"{prefix}refs").write_bytes(refs)
+        (out / f"{prefix}pack").write_bytes(git("pack-objects", "--all", "--stdout", "-q"))
+
+    git("init", "-q", "-b", "main")
+    for name, text in files.items():
+        (work / name).parent.mkdir(parents=True, exist_ok=True)
+        (work / name).write_text(text)
+    git("add", "-A")
+    git("commit", "-q", "-m", "first")
+    if tags:
+        stream = "".join(
+            f"tag v{n:04d}\nfrom refs/heads/main\ntagger t17 <t17@example.invalid> 0 +0000\n"
+            "data 0\n\n"
+            for n in range(tags)
+        )
+        git("fast-import", "--quiet", stdin=stream.encode())
+    snapshot("")
+    if then is not None:
+        for name, text in then.items():
+            (work / name).write_text(text)
+        git("add", "-A")
+        git("commit", "-q", "-m", "upstream")
+        snapshot("next.")
 
 
 def stop_with_internet(service: Service, internet: FakeInternet | None) -> None:

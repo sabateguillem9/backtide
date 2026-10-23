@@ -317,6 +317,8 @@ class Policy:
     # optional strict mode (decision 1).
     unknown_hosts: str = "hold"
     trusted: tuple[Trusted, ...] = ()  # [gate] trusted (docs/32, section 9), normalized
+    # Those of ``allow_hosts`` only the agent's profile adds (T17b-1): no WebSocket to them.
+    profile_hosts: tuple[str, ...] = ()
     read_endpoints: tuple[str, ...] = ()  # [gate] read_endpoints, for the read_post translator
     # [gate] read_budget_host_kib and read_budget_total_kib (review of T10-3, M5), in bytes.
     read_budget_host: int = DEFAULT_HOST_BYTES
@@ -353,6 +355,12 @@ class Policy:
 
     def allow_list(self) -> AllowList:
         return AllowList([*self.allow_hosts, *(p.host for p in self.providers.items)])
+
+    def websocket_list(self) -> AllowList:
+        """The allowed list without the hosts only the profile adds: where a WebSocket may go
+        (security review of T17b-1)."""
+        owners = [host for host in self.allow_hosts if host not in self.profile_hosts]
+        return AllowList([*owners, *(p.host for p in self.providers.items)])
 
     def scrubber(self) -> KnownScrubber:
         known = [*self.providers.known_secrets(), *self.secrets]
@@ -463,6 +471,7 @@ class ProxyChannel:
         self._record = record
         self._policy = policy
         self._allow = policy.allow_list()
+        self._websocket_allow = policy.websocket_list()
         self._scrub = policy.scrubber()
         self._limits = dict(limits or {})
         self._mono = monotonic
@@ -736,6 +745,8 @@ class ProxyChannel:
             header_bytes=gate["header_bytes"],
             websocket=gate["websocket"],
             allowed=allowed,
+            profile_host=allowed
+            and not (isinstance(host, str) and self._websocket_allow.allows(host)),
             preapproved=self._book.preapproved(fp),
             rejected=self._book.rejected(fp),
             credential_bytes=gate["credential_bytes"],

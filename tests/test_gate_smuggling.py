@@ -180,6 +180,41 @@ def test_a_plain_chunked_request_is_allowed() -> None:
     assert blocked_reason(flow) is None  # mitmproxy re-chunks it; no Content-Length added
 
 
+# --- Upgrade only as a WebSocket opening (security review of T17b-1) -----------------------------
+
+
+def ws_flow(method: str, body: bytes, *extra: tuple[str, str]) -> Flow:
+    headers = [("Host", "example.com"), ("Connection", "Upgrade"), *extra]
+    request = Request(method=method, headers=Headers(headers), raw_content=body)
+    return Flow(request, client_conn=Client(sni="example.com"))
+
+
+def test_a_write_that_names_upgrade_is_refused_not_passed_as_a_websocket() -> None:
+    """The gate passes a WebSocket to the allowed list unasked: a POST that only named Upgrade
+    went out with its body and without its hold."""
+    for flow in (
+        ws_flow("POST", b"secret=1", ("Upgrade", "websocket")),
+        ws_flow("PUT", b"", ("Upgrade", "websocket")),
+        ws_flow("GET", b"x", ("Upgrade", "websocket")),
+        ws_flow("GET", b"", ("Upgrade", "websocket"), ("Transfer-Encoding", "chunked")),
+    ):
+        assert blocked_reason(flow) == "malformed_header", flow.request.method
+
+
+def test_an_upgrade_to_anything_but_a_websocket_is_refused() -> None:
+    """mitmproxy would leave such a connection as a tunnel no hook reads."""
+    for value in ("h2c", "websocket, h2c", "tls/1.2", "WebSocketx"):
+        assert blocked_reason(ws_flow("GET", b"", ("Upgrade", value))) == "malformed_header", value
+    twice = ws_flow("GET", b"", ("Upgrade", "websocket"), ("Upgrade", "websocket"))
+    assert blocked_reason(twice) == "malformed_header"
+
+
+def test_a_websocket_opening_reaches_the_gate() -> None:
+    for value in ("websocket", "WebSocket"):
+        flow = ws_flow("GET", b"", ("Upgrade", value))
+        assert blocked_reason(flow) is None, value
+
+
 # --- HTTP/2 trailers refused like h1's (B5) ------------------------------------------------------
 
 

@@ -18,6 +18,8 @@ any agent.
   Only an API key in v1 (decision 4): a subscription's OAuth is blocked by the proxy.
 - ``param:diagnostics``: Claude Code sends that top-level field in every model call (P5); the
   gate refuses unknown fields, so this profile allows it (decision 5).
+- The package registries (T17b-1): npm's and PyPI's hosts join the gate's allowed list, so an
+  install is reads off the read budget; with npm's audit off, it asks nothing.
 - Its variables: no non-essential traffic (P4: two reads at start, which the gate refuses
   without harm), no marketplace autoinstall, and npm's three harmless settings that a named
   profile may set (REVIEWED_RESERVED_ENV: no audit POST after an install, no funding message,
@@ -107,6 +109,10 @@ ENV = (
     ("npm_config_update_notifier", "false"),
 )
 PROVIDER_PARAMS = ("param:diagnostics",)
+# Where npm and pip install from (T17b-1, docs/34 section 8): on the gate's allowed list, so a
+# big install (hundreds of reads to one registry) never runs out of the read budget. npm's audit
+# POST is off (npm_config_audit, above); a publish is still a write, and held.
+ALLOW_HOSTS = ("registry.npmjs.org", "pypi.org", "files.pythonhosted.org")
 
 # Both with its permission prompts off and backtide's settings (decision 3; docs/34 section 5).
 _COMMON = ("--dangerously-skip-permissions", "--settings", SETTINGS_PATH)
@@ -328,6 +334,7 @@ def _claude_code(provider: str) -> AgentProfile:
         ready_answer=version_answer,
         rewind_notice_lines=REWIND_NOTICE_LINES,
         provider_params=PROVIDER_PARAMS,
+        allow_hosts=ALLOW_HOSTS,
         check_providers=check,
         provider_env=env,
         mode=SHELL_MODE,

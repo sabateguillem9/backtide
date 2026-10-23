@@ -523,8 +523,10 @@ def test_fetches_outside_their_grammar_are_held(body: bytes) -> None:
     held(fetch(body))
 
 
-GHP = "ghp_" + "a1B2c3D4e5" * 4
+GHP = "ghp_" + "a1B2c3D4e5" * 3 + "a1B2c3"  # 36 after the prefix, like GitHub's
+PAT = "github_pat_" + "A1b2c3D4e5" * 2 + "Zz" + "_" + "q9W8e7R6t5" * 5 + "y4U3i2O1p"
 FOREIGN = "sk-ant-api03-" + "Ab1" * 30
+GATEWAY_HEX = "9f" * 24  # a secret of letters and digits only, like a Gateway token
 
 
 def _basic(user: str, password: str) -> tuple[str, str]:
@@ -540,6 +542,13 @@ def _basic(user: str, password: str) -> tuple[str, str]:
         _basic(FOREIGN, "x"),
         ("private-token", FOREIGN),
         ("cookie", f"session={FOREIGN}"),
+        ("authorization", f"Bearer {GHP}{FOREIGN}"),  # glued after a GitHub token
+        ("authorization", f"Bearer {GHP}-{FOREIGN}"),
+        _basic("x-access-token", GHP + FOREIGN),
+        _basic(GHP + FOREIGN, "x"),
+        # Letters and digits only, glued on: part of "one token" if any length were one.
+        ("authorization", f"token {GHP}{GATEWAY_HEX}"),
+        ("authorization", f"Bearer {PAT}{GATEWAY_HEX}"),
     ],
 )
 def test_another_services_key_toward_github_is_held_with_risk_3(header: tuple[str, str]) -> None:
@@ -570,7 +579,7 @@ def test_a_known_secret_as_the_credential_is_held_too() -> None:
         ("authorization", f"Bearer {GHP}"),
         ("authorization", f"token {GHP}"),
         _basic("x-access-token", GHP),
-        _basic("octo", "github_pat_" + "A1b2_" * 10),
+        _basic("octo", PAT),
         _basic("x-access-token", "fake-github-token"),
     ],
 )

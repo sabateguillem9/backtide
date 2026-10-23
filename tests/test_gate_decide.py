@@ -90,6 +90,14 @@ def test_a_websocket_only_to_the_allowed_list() -> None:
     assert verdict(replace(socket, allowed=False)) == (Verdict.REJECT, "not_allowed", 0)
     # Never held, never preapproved: an open WebSocket is a blank cheque.
     assert verdict(replace(socket, allowed=False, preapproved=True))[0] is Verdict.REJECT
+    # Only a GET with no body opens one, and never toward a host only the agent's profile
+    # adds (a package registry): security review of T17b-1.
+    assert verdict(replace(socket, method="POST", exact_read=False))[0] is Verdict.REJECT
+    assert verdict(replace(socket, has_body=True))[0] is Verdict.REJECT
+    assert verdict(replace(socket, exact_read=False))[0] is Verdict.REJECT
+    assert verdict(replace(socket, profile_host=True)) == (Verdict.REJECT, "not_allowed", 0)
+    # The same request without Upgrade, to a profile host, is a plain read.
+    assert verdict(replace(READ, profile_host=True)) == (Verdict.PASS, "read", 0)
 
 
 def test_a_preapproved_fingerprint_passes_and_a_rejected_one_is_refused() -> None:

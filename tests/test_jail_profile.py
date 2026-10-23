@@ -24,7 +24,9 @@ from backtide.jail.config import (
 )
 from backtide.jail.docker import JailError
 from backtide.jail.profile import (
+    CUSTOM_NAME,
     RESERVED_ENV,
+    REVIEWED_ALLOW_HOSTS,
     AgentProfile,
     ProfileError,
     image_env_problem,
@@ -51,6 +53,7 @@ PROFILE_FIELDS = {
     "proxy_url_env", "ca_file_env", "token_env", "fake_key_env", "config_names",
     "render_config", "check_config", "ready_log_line", "ready_probe", "ready_answer",
     "rewind_notice_lines", "provider_params", "check_providers", "provider_env", "mode", "shell",
+    "allow_hosts",
 }  # fmt: skip
 # What decides the jail's security: AgentJailConfig's or fixed, never a profile's.
 SECURITY_FIELDS = (
@@ -205,6 +208,13 @@ def test_a_profile_cannot_set_a_reserved_variable(name: str, where: Any) -> None
         {"provider_params": ("param:",)},
         {"provider_params": ("param:Diagnostics",)},
         {"provider_params": ("param:diagnostics", "param:diagnostics")},
+        # T17b-1: only the reviewed package registries, each once, as a tuple.
+        {"allow_hosts": ["registry.npmjs.org"]},
+        {"allow_hosts": ("example.com",)},
+        {"allow_hosts": ("*.npmjs.org",)},
+        {"allow_hosts": ("Registry.npmjs.org",)},
+        {"allow_hosts": ("registry.npmjs.org.",)},
+        {"allow_hosts": ("pypi.org", "pypi.org")},
         {"name": "Not A Name"},
         {"version": ""},
     ],
@@ -212,6 +222,21 @@ def test_a_profile_cannot_set_a_reserved_variable(name: str, where: Any) -> None
 def test_invalid_profiles_are_refused(changes: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         profile(**changes)
+
+
+def test_a_named_profile_may_list_the_reviewed_registries() -> None:
+    """T17b-1 (docs/34, section 8): a programming agent's package registries go on the gate's
+    allowed list, so an install is a read off the read budget. Only those reviewed in code."""
+    hosts = ("registry.npmjs.org", "pypi.org", "files.pythonhosted.org")
+    assert set(hosts) == REVIEWED_ALLOW_HOSTS
+    assert profile(allow_hosts=hosts).allow_hosts == hosts
+    assert profile().allow_hosts == () and OPENCLAW.allow_hosts == ()
+
+
+def test_the_custom_profile_lists_no_host() -> None:
+    """Its hosts would come from the owner's TOML: those go in [proxy] allow_hosts, said there."""
+    with pytest.raises(ValueError, match="allow_hosts"):
+        profile(name=CUSTOM_NAME, allow_hosts=("pypi.org",))
 
 
 @pytest.mark.parametrize(
@@ -620,3 +645,21 @@ def test_the_service_uses_the_default_profile_and_its_provider_fields(
     monkeypatch.setattr(ServiceConfig, "agent_profile", property(lambda _self: agent))
     assert config.proxy_settings().allow_provider_tools == ("param:diagnostics",)
     assert config.jail_config().profile is agent
+
+
+def test_the_profiles_hosts_join_the_owners_allowed_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17b-1: the owner's [proxy] allow_hosts first, then the profile's, each once."""
+    config = ServiceConfig(
+        state_dir=tmp_path / "state",
+        volume=tmp_path / "volume",
+        gateway_token=Secret(TOKEN),
+        proxy={"allow_hosts": ["github.com", "pypi.org"]},
+    )
+    assert config.proxy_settings().allow_hosts == ("github.com", "pypi.org")  # OpenClaw: none
+    agent = profile(allow_hosts=("registry.npmjs.org", "pypi.org"))
+    monkeypatch.setattr(ServiceConfig, "agent_profile", property(lambda _self: agent))
+    assert config.proxy_settings().allow_hosts == ("github.com", "pypi.org", "registry.npmjs.org")
+    # Only what the owner did not list already is the profile's (no WebSocket there).
+    assert config.proxy_settings().profile_hosts == ("registry.npmjs.org",)

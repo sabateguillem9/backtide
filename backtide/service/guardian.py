@@ -681,12 +681,14 @@ class Guardian:
     def _start_details(self) -> dict[str, Any]:
         """What ``service_start`` says: backtide's version, which agent profile runs and the
         provider fields that profile lets through the gate on its own (``param:<name>``, decision
-        5 of docs/34), so what reaches a provider beyond the gate's lists is on the record."""
+        5 of docs/34) and the hosts it adds to the allowed list (T17b-1), so what the profile
+        widens beyond the owner's lists is on the record."""
         profile = self._config.agent_profile
         return {
             "version": backtide.__version__,
             "profile": profile.name,
             "profile_params": list(profile.provider_params),
+            "profile_hosts": list(profile.allow_hosts),
         }
 
     def _stop_unrecorded(self, error: BaseException) -> None:

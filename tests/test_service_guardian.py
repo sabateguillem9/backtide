@@ -649,6 +649,7 @@ def test_the_service_start_event_says_the_profile_and_its_provider_fields(world:
     world.guardian.start()
     details = world.only("service_start").details
     assert (details["profile"], details["profile_params"]) == ("openclaw", [])
+    assert details["profile_hosts"] == []  # T17b-1: the hosts it adds to the allowed list
 
 
 def test_an_agent_found_running_is_stopped_first_and_the_gap_is_recorded(world: World) -> None:
