@@ -1,5 +1,3 @@
-<!-- DRAFT for founder review. Not published. Fill in <security contact> before publishing. -->
-
 # Security policy
 
 backtide is a security tool in pre-alpha. It has not been audited by anyone outside the project. Reports are welcome and taken seriously.
@@ -8,7 +6,7 @@ backtide is a security tool in pre-alpha. It has not been audited by anyone outs
 
 Please do not open a public issue, pull request or discussion for a vulnerability.
 
-Send the report to: `<security contact>`
+Use GitHub's private vulnerability reporting: open the **Security** tab of this repository and choose **Report a vulnerability**. Only the maintainers can see the report.
 
 Include, as far as you can:
 
@@ -20,7 +18,7 @@ Do not send real secrets, personal data or anything you do not want us to hold.
 
 What you can expect from us:
 
-- an acknowledgement of your report within `<response time>`;
+- an acknowledgement of your report within 7 days (best effort: this is a small pre-alpha project);
 - a fix or a plan, and a say in when details become public;
 - credit in the fix, if you want it.
 

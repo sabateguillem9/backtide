@@ -1,5 +1,3 @@
-<!-- DRAFT for founder review. Not published. The sign-off rule (DCO) follows docs/15; confirm it. -->
-
 # Contributing
 
 backtide is pre-alpha and moves quickly. Please open an issue to talk about a change before you write a large one.

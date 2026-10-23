@@ -1,5 +1,3 @@
-<!-- DRAFT for founder review. Not published. Decisions are listed in docs/26-que-publicar.md. -->
-
 # backtide
 
 A black box for AI agents.
@@ -32,24 +30,25 @@ Developed and tested against OpenClaw, on Linux with Docker and Btrfs.
 | File watcher (inotify) that records file changes in the black box | Works |
 | Service (`backtide vigilar`): snapshots every 2 minutes while there is activity, freezes the agent when space runs low, `backtide seguir` to resume | Works |
 | Web view on `127.0.0.1`: live feed, history with filters, snapshots, and rewind with a confirmation step. With `--aprobar` it also lists the held requests, with Approve, Reject and View, each behind a confirmation | Works |
-| Outbound proxy (mitmproxy): the agent's only way out. Every request is recorded in the black box before it leaves; with no recording, nothing leaves. The agent only ever sees a fake API key; the proxy swaps in the real one. Private addresses, OAuth logins, provider-side tools and unknown destinations are refused | Works |
+| Outbound proxy (mitmproxy): the agent's only way out. Every request is recorded in the black box before it leaves; with no recording, nothing leaves. The agent only ever sees a fake API key; the proxy swaps in the real one. Private addresses, OAuth logins and provider-side tools are refused; writes to unknown destinations are held (the strict mode `unknown_hosts = "deny"` refuses them) | Works |
 | Process and connection sensor (Tetragon, eBPF): every command and connection of the agent, recorded from the kernel; losses are reported, never silent | Works |
 | Risk rules: each event gets a level from 0 to 3; risk 3 takes an evidence snapshot and alerts | Works |
 | The approval gate: the proxy holds writes and other outgoing actions until you approve them (from the terminal, Telegram or the web) and rejects them if you do not answer in 5 minutes. Reads pass without asking. Translators read the content of Gmail, Microsoft mail, Telegram, Slack and Discord requests, so the notice says who gets what. Batches ("everything to this recipient", "sends of this kind for 1 hour") and trusted recipients cut down the number of questions | Works, tested in the VM against a fake internet and with the real OpenClaw. Mail trust is switched off until backtide knows your own accounts |
 | Telegram: alerts with Pause and Rewind buttons, `/pausar`, `/seguir`, `/estado`, and approval of held requests with `/retenidas` and `/lotes` | Works against a fake Bot API in tests. With a real bot, the founder has so far seen only a hold notice arrive; `/estado`, `/pausar`, `/seguir` and approving from the phone are not yet tried by hand |
 | Settings page in the web (`backtide web --ajustes`): put, change or remove the model API keys and the Telegram bot token from the browser. Keys are write-only: the page shows only the last four characters | Works. The Telegram change applies on restart |
 | First real run (`make probar`): the real OpenClaw in its cage thinking with Claude through the proxy, with the gate, Telegram notice and web | Done once by the founder (60 model calls, two rewinds from the web, a held `POST` rejected and another approved). It is a hands-on test, not part of the automatic tests |
-| Attack battery: scripted "evil agent" scenarios that run inside the VM | 71 scenarios with tests; 5 more are listed and still pending (they wait for later tasks) |
+| Attack battery: scripted "evil agent" scenarios that run inside the VM | 80 scenarios with tests; 6 more are listed and still pending (they wait for later tasks) |
 | Spend cap: the proxy prices every model response from the provider's usage report and refuses new calls at the limit ($5 a day and $50 a month by default, editable in Settings), with notices at 50, 80 and 100 %. Anthropic's prices update daily from its official pricing page | Works, tested in the VM with attack scenarios. What the proxy cannot measure is charged high, so the cap stops early rather than late. Keep a spending limit in your provider's console as well |
-| Installer (Linux, then Mac), any agent beyond OpenClaw | Designed or planned |
+| Claude Code in the same cage (`make probar PERFIL=claude-code`, `backtide entrar`, `backtide tarea`), and any Linux container image through a restricted `[agent]` profile | Works in the VM; the attack battery runs with Claude Code (12 scenarios) as well as with OpenClaw. Shell mode only, with an API key |
+| Installer (Linux, then Mac), Codex and other agents | Designed or planned |
 
 Two consequences of that table:
 
-- The agent reaches the internet only through the proxy, and only to the hosts you allow (its model provider by default). Everything it sends is recorded first.
+- The agent reaches the internet only through the proxy. Everything it sends is recorded first. By default reads to any host pass and writes to hosts you have not allowed are held; in the strict mode only the hosts you allow (its model provider by default) are reachable.
 - The gate decides by what a request *does*, not only where it goes. A read passes (it is recorded first). A write or a send to anything else is held, with a short sentence saying what it would do. What the gate cannot see is listed in the design (internal note), section 13: a read can still carry some data in its URL (capped by a budget per host), and a request to the model provider carries the whole conversation.
 - backtide can restore the agent's folder; it cannot take back an email, a payment or a deleted cloud database that was approved or that left through a hole the gate does not cover.
 
-The plan is in docs/08-plan-de-desarrollo.md (internal note) and the tasks are in docs/backlog.md (internal note). Most design documents are written in Spanish.
+Start with the [documentation guide](docs/guide/README.md). The tasks are in docs/backlog.md (internal note). Most design documents are written in Spanish.
 
 ## Security model
 
@@ -84,8 +83,8 @@ The invariants the code is held to are in [SECURITY.md](SECURITY.md). Nobody out
 You need a Mac with Apple Silicon, [uv](https://docs.astral.sh/uv/) and [Lima](https://lima-vm.io/). Everything that needs the Linux kernel (Docker, Btrfs, eBPF) runs in a Fedora VM called `vigia-dev`, which mounts this folder. Linux-only code is not tested on the Mac.
 
 ```bash
-git clone <repo url>
-cd <repo folder>
+git clone https://github.com/sabateguillem9/backtide.git
+cd backtide
 uv sync --locked
 
 make vm-up      # create and start the dev VM (first run takes a while)

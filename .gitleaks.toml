@@ -1,0 +1,30 @@
+# Secret scanner settings (gitleaks). Run: gitleaks detect --source . --redact
+#
+# The only findings are made-up values that the redaction tests and the attack
+# battery need in order to check that real-looking secrets are redacted before
+# they are recorded. Listed by file on purpose: a new file with a real-looking
+# secret is still reported.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake secrets used as test inputs for the redaction"
+paths = [
+  '''^tests/test_blackbox_redact\.py$''',
+  '''^tests/test_secret_words_parity\.py$''',
+  '''^tests/test_sensors_procs\.py$''',
+  '''^tests/test_jail_sensor\.py$''',
+  '''^tests/test_jail_agent\.py$''',
+  '''^tests/test_jail_profile\.py$''',
+  '''^tests/test_jail_custom_profile\.py$''',
+  '''^tests/test_cli_shell\.py$''',
+  '''^tests/test_gate_addon\.py$''',
+  '''^tests/test_gate_record\.py$''',
+  '''^tests/attacks/test_blackbox_attacks\.py$''',
+  '''^tests/attacks/test_gate_attacks\.py$''',
+  '''^tests/attacks/scripts/nombres_de_clave_en_la_linea\.py$''',
+  '''^tests/attacks/scripts/nombres_hostiles\.py$''',
+  # A regular expression that matches "curl -u user:password", not a secret
+  '''^backtide/sensors/procs\.py$''',
+]

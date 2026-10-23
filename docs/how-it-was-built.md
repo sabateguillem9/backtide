@@ -79,13 +79,13 @@ Each row is a decision recorded with its date. The source column points to where
 
 | Date | Decision | Source |
 |---|---|---|
-| 2026-10-05 (first commit) | Build a black box for AI agents: record from outside the agent, let you rewind, and stop what cannot be undone before it leaves. Start with OpenClaw on Linux. | 07 (internal note), 08 (internal note) |
+| 2026-10-05 (first commit) | Build a black box for AI agents: record from outside the agent, let you rewind, and stop what cannot be undone before it leaves. Start with OpenClaw on Linux. | [How it works](guide/how-it-works.md) |
 | 2026-10-06 | The agent gets a fake model key; the proxy swaps in the real one, so the agent never sees it. | backlog (internal note), T06 |
 | 2026-10-06 | A spending cap stops being optional. | backlog (internal note), T11 |
 | 2026-10-06 | A `/pausar` command in Telegram freezes the agent from outside, at once. | backlog (internal note), T09 |
 | 2026-10-06 | Default gate rules: reads pass; sending, deleting and paying are held, showing who gets what; the unknown is held rather than refused; batch approval to avoid fatigue. | backlog (internal note), T10 |
 | 2026-10-06 | If the disk quota cannot be put back on a rewind, the rewind does not happen. When space runs out, backtide may grow the volume once, with a ceiling, and never deletes snapshots to make room. | backlog (internal note), T03b and T04 |
-| 2026-10-07 | No plugin with hooks inside coding agents: it would run inside the agent, which could switch it off, and if it failed the action would go through. | backlog (internal note), "Después"; 18 (internal note) |
+| 2026-10-07 | No plugin with hooks inside coding agents: it would run inside the agent, which could switch it off, and if it failed the action would go through. | backlog (internal note), "Después" |
 | 2026-10-17 | The product is called backtide, always in lower case. | devlog (internal note) |
 | 2026-10-17 | Proxy: mitmproxy pinned by digest; the real key lives only in the proxy's memory; until the gate exists, unknown hosts are refused. Six decisions, the recommended option in each. | 21 (internal note) |
 | 2026-10-17 | Kernel sensor: Tetragon only observes and never kills; it is optional by default, and `required = true` makes the agent stop without it. Twelve decisions. | 23 (internal note) |
@@ -137,7 +137,7 @@ Measured on 2026-10-22, at commit `0800a5a`.
 | Calendar | 2026-10-05 to 2026-10-22, commits on 10 different days | `git log --date=short` |
 | Unit tests (Mac) | 9,212; in a run of `make test` that day, 9,208 passed and 4 were skipped | `uv run pytest --collect-only -q` |
 | VM integration tests | 453 | `uv run pytest --collect-only -q -m integration` |
-| Attack battery | 76 scenarios: 71 ready with tests, 5 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test (73 tests collected with `-m ataques`) |
+| Attack battery | 86 scenarios: 80 ready with tests, 6 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
 | Product code | 56,683 lines in 122 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
 | Test code | 101,273 lines in 272 Python files | the same for `tests/` |
 | Documents | 36 numbered documents in `docs/`, plus the backlog, the log and two guides | `ls docs/*.md`. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
