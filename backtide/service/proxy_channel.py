@@ -80,7 +80,10 @@ remembers of its fingerprint. Every ``gate`` event is written here, never by the
 **A local provider** (T20, docs/35 sections 6.4 and 6.5): its calls are never held, like any
 provider's. Whether a call is local is backtide's own reading (its config says the provider is
 local, and the call went to its virtual name), never the proxy's word alone: such a call costs 0
-and has its own calls in flight (``Budget.admit(local=True)``).
+and has its own calls in flight (``Budget.admit(local=True)``). A refusal of risk 2 toward it (its
+host is exactly a local provider's virtual name, by the same config) is handed to
+``LocalRefusals`` once recorded (decision 9: the first of each reason told at once, then at most one
+every 10 min); the channel's tick sends what is due.
 
 The config is never logged: ``protocol.describe`` names the providers and counts the hosts.
 """
@@ -114,7 +117,7 @@ from backtide.gate.protocol import (
     ProtocolError,
     Sender,
 )
-from backtide.gate.provider_tools import FREE_ENDPOINTS, endpoint_of
+from backtide.gate.provider_tools import FREE_ENDPOINTS, endpoint_of, ollama_admin
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import (
     OVERRIDE_HEADERS,
@@ -189,6 +192,14 @@ class Record(Protocol):
     def __call__(
         self, source: str, action: str, target: str, *, details: Mapping[str, Any], risk: int
     ) -> Event: ...
+
+
+class LocalRefusalNotes(Protocol):
+    """``backtide.notify.local_refusals.LocalRefusals``: never blocks, never raises."""
+
+    def note(self, event: Event, provider: str) -> None: ...
+
+    def send_due(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -433,8 +444,12 @@ class ProxyChannel:
         frozen: Callable[[], bool] | None = None,
         trust: TrustStore | None = None,
         budget: Budget | None = None,
+        local_refusals: LocalRefusalNotes | None = None,
     ) -> None:
         self._sock = sock
+        # T20-5 (docs/35, decision 9): told of each refusal of risk 2 toward a local provider.
+        # One for the service (the Egress keeps it across channels).
+        self._local_refusals = local_refusals
         # The spending cap (T11, docs/33): asked before a model call goes out, told what each
         # answer cost. One for the service (the Egress keeps it across channels).
         self._budget = budget
@@ -1278,10 +1293,13 @@ class ProxyChannel:
             return len(ended)
 
     def tick(self) -> None:
-        """The holds whose 5 min are over, and the flood count (every TICK_EVERY s)."""
+        """The holds whose 5 min are over, the flood count, and the notices of refusals toward
+        a local provider that are due (every TICK_EVERY s)."""
         with self._gate_lock:
             if not self.closed:
                 self._tick_locked()
+        if self._local_refusals is not None:
+            self._local_refusals.send_due()
 
     def _tick_locked(self) -> None:
         for hold in self._book.due():
@@ -1413,11 +1431,44 @@ class ProxyChannel:
         self._event_plain(event)
 
     def _event_plain(self, event: dict[str, Any]) -> Event | None:
+        event = self._local_admin_risk(event)
         size = len(json.dumps(event, separators=(",", ":")))
         if not self._budgets.take_event(size, self._mono()):
             self._dropped += 1
             return None
-        return self._append(event)
+        stored = self._append(event)
+        self._local_refusal(stored)
+        return stored
+
+    def _local_admin_risk(self, event: dict[str, Any]) -> dict[str, Any]:
+        """B1 of the review of T20-5: a ``net/blocked`` toward a local provider's virtual name
+        (by backtide's config) whose path reaches one of Ollama's administration routes is risk
+        3 whatever its reason. The proxy marks ``local`` only in its provider branch, so a
+        ``Host`` that does not match (host_mismatch, 2) or a huge body (too_large, 1) on
+        ``/api/pull`` would stay lower, and the attempt would go untold."""
+        if event["source"] != "net" or event["action"] != "blocked":
+            return event
+        if event["risk"] >= protocol.LOCAL_ADMIN_RISK:
+            return event
+        details = event["details"]
+        host = details.get("host")
+        provider = self._policy.providers.for_host(host) if isinstance(host, str) else None
+        if provider is None or not provider.local or not ollama_admin(details.get("path")):
+            return event
+        return {**event, "risk": protocol.LOCAL_ADMIN_RISK}
+
+    def _local_refusal(self, stored: Event | None) -> None:
+        """Decision 9 of docs/35: a ``net/blocked`` of risk 2 (as recorded, after the rules)
+        whose host is exactly a local provider's virtual name in backtide's own config is told.
+        The proxy's ``local: true`` alone is not enough. Risk 3 is the RiskResponder's."""
+        if self._local_refusals is None or stored is None or stored.risk != 2:
+            return
+        if stored.source != "net" or stored.action != "blocked":
+            return
+        host = stored.details.get("host")
+        provider = self._policy.providers.for_host(host) if isinstance(host, str) else None
+        if provider is not None and provider.local:
+            self._local_refusals.note(stored, provider.name)
 
     def _report_counts(self) -> None:
         now = self._mono()

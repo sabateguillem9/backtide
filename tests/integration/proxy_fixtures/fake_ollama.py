@@ -12,8 +12,10 @@ only reach it through a local provider's fixed address.
   gets ``{"fake": "ollama"}``, so a request that should never arrive is seen when it does. A
   model request with ``T20-REDIRECT`` in its body gets ``302 Location: http://<this
   container>:22/``; with ``T20-SWITCH``, ``101 Switching Protocols`` (the proxy must cut both).
-- 22 and 8080: decoys. They count every TCP connection and close it: the tests check that nothing
-  ever reaches them.
+  With ``T20-SLOW`` it waits SLOW_SECONDS before answering, and counts how many such calls it
+  holds at once (``slow`` in ``/stats``: T20-5's flood, against ``max_inflight_local``).
+- 22, 80, 443 and 8080: decoys. They count every TCP connection and close it: the tests check
+  that nothing ever reaches them.
 - 9000: control, ``GET /stats``: every request seen on 11434 (method, path, headers, body size,
   the ``model`` and the top-level fields of a JSON body, the peer's address) and the connections
   accepted per port. ``GET /api/version`` says VERSION: the service asks it from the VM, never
@@ -25,16 +27,19 @@ Prints READY_LINE once all of them listen.
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 READY_LINE = "t20-ollama-ready"
 REPLY_TEXT = "T20 PONG FROM THE FAKE OLLAMA"
 MODEL = "t20-fake-coder:7b"
 VERSION = "0.40.8"  # what it says it is
-DECOYS = (22, 8080)
+DECOYS = (22, 80, 443, 8080)
 LOCK = threading.Lock()
 REQUESTS: list[dict] = []
-ACCEPTS = {"11434": 0, "22": 0, "8080": 0}
+ACCEPTS = {str(p): 0 for p in (11434, 22, 80, 443, 8080)}
+SLOW_SECONDS = 4.0
+SLOW = {"now": 0, "max": 0, "seen": 0}  # T20-SLOW calls held at once, at most, and in all
 
 
 def own_address() -> str:
@@ -109,6 +114,17 @@ class Ollama(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _slowly(self) -> None:
+        with LOCK:
+            SLOW["now"] += 1
+            SLOW["seen"] += 1
+            SLOW["max"] = max(SLOW["max"], SLOW["now"])
+        try:
+            time.sleep(SLOW_SECONDS)
+        finally:
+            with LOCK:
+                SLOW["now"] -= 1
+
     def do_GET(self) -> None:  # noqa: N802 - http.server's name
         self._note(b"")
         if self.path == "/api/version":  # what the SERVICE asks, from the VM (T20-4)
@@ -134,6 +150,8 @@ class Ollama(BaseHTTPRequestHandler):
         if b"T20-REDIRECT" in body:
             self._send(302, b"", location=f"http://{own_address()}:22/")
             return
+        if b"T20-SLOW" in body:
+            self._slowly()
         if b"T20-SWITCH" in body:
             self.send_response(101)
             self.send_header("upgrade", "websocket")
@@ -219,7 +237,7 @@ class Control(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         with LOCK:
-            data = json.dumps({"requests": REQUESTS, "accepts": ACCEPTS}).encode()
+            data = json.dumps({"requests": REQUESTS, "accepts": ACCEPTS, "slow": SLOW}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))

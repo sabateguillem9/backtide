@@ -629,3 +629,117 @@ def test_the_settings_page_takes_an_ollama_key() -> None:
         "ümlaut" + "x" * 30,
     ):
         assert not check_value("ollama-cloud", bad)
+
+
+# --- decision 9: a refusal of risk 2 toward a local provider is told (T20-5) ---------------------
+
+
+class Notices:
+    """The channel's side of ``LocalRefusals``: what it was handed."""
+
+    def __init__(self) -> None:
+        self.noted: list[tuple[Any, str]] = []
+        self.due = 0
+
+    def note(self, event: Any, provider: str) -> None:
+        self.noted.append((event, provider))
+
+    def send_due(self) -> None:
+        self.due += 1
+
+
+def refused(
+    reason: str, path: str, *, host: str = "ollama.backtide.internal", local: bool = True,
+    method: str = "GET",
+) -> dict[str, Any]:  # fmt: skip
+    flow = {"flow_id": "b1", "method": method, "scheme": "https", "host": host, "port": 443,
+            "path": path, "headers": []}  # fmt: skip
+    return record.blocked_event(reason, flow, (), local=local)
+
+
+def test_a_refusal_of_risk_2_toward_a_local_provider_is_told(box: BlackBox) -> None:
+    notices = Notices()
+    channel, _ = make_channel(box, policy=both_policy(), local_refusals=notices)
+    for event in (
+        refused("provider_endpoint", "/api/tags"),
+        refused("provider_endpoint", "/api/pull", method="POST"),  # risk 3: the RiskResponder's
+        # The proxy's word alone is not enough: not a local provider's host by backtide's config.
+        refused("foreign_credential", "/v1/messages", host="api.anthropic.com"),
+        # And backtide's config is: a Host that does not match, toward the virtual name.
+        refused("host_mismatch", "/v1/chat/completions", local=False),
+        refused("port", "/v1/chat/completions"),  # risk 1: no notice
+    ):
+        channel.handle({"type": "event", "event": event})
+    told = [(e.details["reason"], e.details["path"], e.risk, name) for e, name in notices.noted]
+    assert told == [
+        ("provider_endpoint", "/api/tags", 2, "ollama"),
+        ("host_mismatch", "/v1/chat/completions", 2, "ollama"),
+    ]
+    assert all(e.seq > 0 for e, _ in notices.noted)  # recorded first, then told
+
+
+def test_with_the_spending_cap_the_refusals_are_told_too(tmp_path: Path, box: BlackBox) -> None:
+    notices = Notices()
+    budget = budget_for(tmp_path, box, daily_usd=Decimal("100"))
+    channel, _ = make_channel(box, budget=budget, policy=both_policy(), local_refusals=notices)
+    channel.handle(
+        {"type": "event", "event": refused("provider_side_tool", "/v1/chat/completions")}
+    )
+    assert [e.details["reason"] for e, _ in notices.noted] == ["provider_side_tool"]
+
+
+def test_the_channels_tick_sends_what_is_due(box: BlackBox) -> None:
+    notices = Notices()
+    channel, _ = make_channel(box, policy=both_policy(), local_refusals=notices)
+    channel.tick()
+    assert notices.due == 1
+
+
+def test_the_egress_tells_through_the_guardians_door_and_never_loses_a_count(
+    tmp_path: Path, box: BlackBox
+) -> None:
+    world = World(tmp_path)
+    assert world.egress.start(world.hooks)
+    notices = world.egress.local_refusals
+    first = box.append("net", "blocked", "x", details={"reason": "provider_endpoint"}, risk=2)
+    second = box.append("net", "blocked", "y", details={"reason": "provider_endpoint"}, risk=2)
+
+    def told() -> list[str]:
+        return [title for _, title in world.alerts if "modelo local" in title]
+
+    notices.note(first, "ollama")
+    notices.note(second, "ollama")
+    assert len(told()) == 1  # the second waits for its 10 minutes
+    world.now[0] += 600
+    world.egress.check()  # the proxy's watch sends it, even with no channel ticking
+    assert len(told()) == 2
+    notices.note(first, "ollama")
+    world.egress.stop()  # and the stop sends what is still held
+    assert len(told()) == 3
+
+
+@pytest.mark.parametrize(
+    ("reason", "method"),
+    [("host_mismatch", "POST"), ("too_large", "POST"), ("provider_endpoint", "DELETE")],
+)
+def test_an_admin_route_toward_a_local_provider_is_risk_3_whatever_the_reason(
+    box: BlackBox, reason: str, method: str
+) -> None:
+    """B1 of the review of T20-5: the proxy marks ``local`` only in its provider branch, so a
+    ``Host: x.example`` (host_mismatch) or a huge body (too_large) on /api/pull stayed at 2 or 1.
+    backtide raises it by its own config: the host is a local provider's virtual name."""
+    notices = Notices()
+    channel, _ = make_channel(box, policy=both_policy(), local_refusals=notices)
+    event = refused(reason, "/v1/../api/pull", local=False, method=method)
+    channel.handle({"type": "event", "event": event})
+    [stored] = [e for e in box.events() if e.action == "blocked"]
+    assert stored.risk == 3 and stored.details["reason"] == reason
+    assert notices.noted == []  # risk 3 is the RiskResponder's
+
+
+def test_an_admin_path_toward_another_host_keeps_its_risk(box: BlackBox) -> None:
+    channel, _ = make_channel(box, policy=both_policy())
+    event = refused("host_mismatch", "/api/pull", host="api.anthropic.com", local=False)
+    channel.handle({"type": "event", "event": event})
+    [stored] = [e for e in box.events() if e.action == "blocked"]
+    assert stored.risk == 2

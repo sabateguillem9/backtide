@@ -40,7 +40,12 @@ READY_LINE = "t20-ollama-ready"  # proxy_fixtures/fake_ollama.py
 REPLY_TEXT = "T20 PONG FROM THE FAKE OLLAMA"
 MODEL = "t20-fake-coder:7b"
 PORT = 11434
-DECOYS = (22, 8080)
+DECOYS = (22, 80, 443, 8080)
+# A public-looking name the fake Ollama answers for too (a Docker network-alias on the egress
+# network): the proxy resolves it to the fake Ollama's private IP. The exception is by the
+# virtual name, not by the destination IP, so a name that resolves inward is still refused
+# (``private_address``): T20-5 scenario, step 2. Nothing of ``.backtide.internal``.
+TRAP_NAME = "ollama-trap.fake.test"
 # A private address no test network uses: written in the config first, then replaced by the fake
 # Ollama's own (known only once it runs on the egress network that the service's config names).
 PLACEHOLDER = "10.255.255.20"
@@ -66,6 +71,15 @@ class FakeOllama:
     def accepts(self) -> dict[str, int]:
         return self.stats()["accepts"]
 
+    def slow(self) -> dict[str, int]:
+        """The ``T20-SLOW`` calls it held at once now, at most (``max``) and in all (``seen``)."""
+        return self.stats()["slow"]
+
+    def from_peer(self, peer: str) -> list[dict]:
+        """Every request it saw from ``peer`` (the proxy's IP on the egress network), whatever
+        the path: counting by peer, not by path (review of T20-5, M4)."""
+        return [r for r in self.stats()["requests"] if r["peer"] == peer]
+
     def remove(self) -> None:
         jail_docker.run(["rm", "--force", "--volumes", self.name], check=False)
 
@@ -78,9 +92,12 @@ def local_provider_toml(name: str, address: str = PLACEHOLDER, kind: str = "open
     )
 
 
-def start_fake_ollama(config: ServiceConfig, root: Path) -> FakeOllama:
+def start_fake_ollama(
+    config: ServiceConfig, root: Path, aliases: tuple[str, ...] = ()
+) -> FakeOllama:
     """Start the fake Ollama on the egress network of ``config``, which the fake internet's kit
-    made already (``start_fake_internet``)."""
+    made already (``start_fake_internet``). ``aliases``: extra Docker network-aliases that
+    resolve to its IP (``TRAP_NAME``: a public-looking name for step 2)."""
     files = root / "t20"
     files.mkdir(mode=0o755, parents=True, exist_ok=True)
     shutil.copyfile(FIXTURES / "fake_ollama.py", files / "fake_ollama.py")
@@ -89,6 +106,8 @@ def start_fake_ollama(config: ServiceConfig, root: Path) -> FakeOllama:
     network = config.proxy_jail_config().network  # made by the fake internet's kit
     name = unique(CONTAINER_PREFIX)
     argv = hardened(name, OLLAMA_UID) + ["--network", network]
+    for alias in aliases:
+        argv += ["--network-alias", alias]
     argv += [
         "--volume", f"{files}:/opt/t20:ro,z",
         "--entrypoint", "python3", proxy_config.IMAGE, "/opt/t20/fake_ollama.py",

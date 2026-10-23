@@ -44,7 +44,9 @@ a few points of its life; the watch runs on this module's own thread.
   (``ask_version``, on a thread of its own; T20-4): ``system/provider_local_ready {provider,
   version, minimum, old}``, risk 2 with an alert when it is older than the minimum, or
   ``system/provider_local_unanswered {provider, address, port, why}`` (risk 1) when it does not
-  answer (Ollama closed on the Mac, a wrong port).
+  answer (Ollama closed on the Mac, a wrong port). A refusal of risk 2 toward a local provider
+  is told (``local_refusals``, one for the service, docs/35 decision 9): the first of each reason
+  at once, then at most one every 10 min; what is held is sent by the watch and at the stop.
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
 """
 
@@ -63,6 +65,7 @@ from backtide.jail.docker import JailError
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.proxy_config import MITMPROXY_VERSION
 from backtide.notify import AlertLevel
+from backtide.notify.local_refusals import LocalRefusals
 from backtide.service.holds import (
     STALE_WINDOW,
     BatchOutcome,
@@ -197,6 +200,9 @@ class Egress:
         self._local_states: dict[str, tuple[str, int]] = {}  # local providers, as last recorded
         self._moves_told: dict[str, tuple[str, int]] = {}  # moves a reload did not apply, told
         self._agent_subnets: list[str] | None = None  # read at the start, checked at each reload
+        # T20-5 (docs/35, decision 9): the notices of refusals of risk 2 toward a local provider.
+        # One for the service, handed to every channel, so a proxy restart keeps its count.
+        self.local_refusals = LocalRefusals(self._alert, clock=monotonic)
 
     def waiting(self) -> dict[str, str]:
         """The providers that wait for their key now, and why ("missing", "unusable" or
@@ -259,6 +265,7 @@ class Egress:
             if error is not None:
                 details["error"] = _short(error)
             self._record("proxy_stop", details, risk=0 if error is None else 2)
+        self.local_refusals.flush()  # nothing counted is lost (decision 9)
 
     def check(self) -> None:
         """One look of the watch (WATCH_EVERY s on its thread). Never raises."""
@@ -271,6 +278,7 @@ class Egress:
             except Exception as error:
                 logger.exception("the proxy's watch failed")
                 self._record("proxy_watch_failed", {"error": _short(error)}, risk=2)
+        self.local_refusals.send_due()  # also while no channel ticks (the proxy is down)
         if back and self._hooks is not None:
             try:
                 self._hooks.back()
@@ -831,6 +839,7 @@ class Egress:
                         frozen=self._frozen,
                         trust=self._trust,
                         budget=self.budget,
+                        local_refusals=self.local_refusals,
                     )
                     channel.handshake(max(0.5, deadline - self._mono()))
                 except BaseException:
