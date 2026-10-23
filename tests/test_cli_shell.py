@@ -775,6 +775,31 @@ def test_a_scanned_config_that_did_not_change_is_copied(tmp_path: Path) -> None:
         assert tar.getnames() == [".mcp.json"]
 
 
+def test_a_scanned_git_config_whose_times_moved_is_copied_as_it_was_read(tmp_path: Path) -> None:
+    """On the folder Lima shares with the Mac, reading a file moves its ctime: the check is by
+    content, so a git config read again (or touched) with the same bytes still goes in, and
+    what goes in is exactly what was reviewed (2026-10-23, the founder's first import)."""
+    folder = tmp_path / "r"
+    (folder / ".git").mkdir(parents=True)
+    config_file = folder / ".git" / "config"
+    text = '[remote "origin"]\n\turl = https://github.com/o/r.git\n'
+    config_file.write_text(text)
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        plan = shell_cli.plan_import(fd)
+        assert plan.secrets == [] and ".git/config" in plan.scanned
+        config_file.chmod(0o600)  # moves the ctime
+        os.utime(config_file)  # and the mtime
+        out = io.BytesIO()
+        shell_cli.write_tar(fd, plan, out)
+    finally:
+        os.close(fd)
+    out.seek(0)
+    with tarfile.open(fileobj=out) as tar:
+        member = tar.extractfile(".git/config")
+        assert member is not None and member.read() == text.encode()
+
+
 def test_an_agent_config_too_big_to_read_is_left_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

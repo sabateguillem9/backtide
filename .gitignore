@@ -27,3 +27,6 @@ data/
 
 # Sistema
 .DS_Store
+
+# Informes internos para el founder (no se publican, D21)
+informes/

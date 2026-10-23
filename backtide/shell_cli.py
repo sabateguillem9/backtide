@@ -38,6 +38,7 @@ what is copied (B3). ``~/.claude`` is never a source.
 """
 
 import contextlib
+import io
 import json
 import os
 import re
@@ -396,9 +397,6 @@ class ImportRefused(Exception):
     """The host folder cannot be imported; the message is Spanish."""
 
 
-Identity = tuple[int, int, int, int, int]  # st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size
-
-
 @dataclass
 class ImportPlan:
     """What a host folder holds, read without following links."""
@@ -408,7 +406,8 @@ class ImportPlan:
     skipped: list[str] = field(default_factory=list)  # links and others, relative
     secrets: list[str] = field(default_factory=list)  # what looks like a secret, left out
     bytes: int = 0  # of ``files``, kept as they are added
-    scanned: dict[str, Identity] = field(default_factory=dict)  # read for secrets, as read
+    # Read for secrets: their bytes as read, which are what is copied (B3 of the review).
+    scanned: dict[str, bytes] = field(default_factory=dict)
 
 
 # What looks like a secret (M2 of the review of T17a-4): left out of an import unless the owner
@@ -481,10 +480,6 @@ def looks_secret(relative: str, kind: str) -> bool:
     return name in SECRET_FILES or bool(_SECRET_NAME_RE.fullmatch(name))
 
 
-def _identity(info: os.stat_result) -> Identity:
-    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
-
-
 def _scan_kind(relative: str) -> str | None:
     """Which reader a file of an import needs before it goes in: "git" (a ``config`` inside a
     ``.git``), "json" or "toml" (an agent's config), or None."""
@@ -502,8 +497,10 @@ def _scan_kind(relative: str) -> str | None:
 def _scanned_secret(dir_fd: int, name: str, relative: str, plan: "ImportPlan") -> bool:
     """Whether a file that has to be read before it goes in (``_scan_kind``) holds a secret.
     One that cannot be read, is too big or cannot be parsed is taken as one (it is left out,
-    and said). One without is noted in ``plan.scanned`` as it was read (B3 of the review): the
-    copy refuses it if it changed since."""
+    and said). One without is noted in ``plan.scanned`` with the bytes read (B3 of the review):
+    those bytes are what is copied, and the copy refuses it if its content changed since. By
+    content, not by its times: on the folder Lima shares with the Mac, reading a file moves its
+    ctime, so every git config looked changed (2026-10-23)."""
     kind = _scan_kind(relative)
     if kind is None:
         return False
@@ -513,7 +510,6 @@ def _scanned_secret(dir_fd: int, name: str, relative: str, plan: "ImportPlan") -
     except OSError:
         return True
     try:
-        identity = _identity(os.fstat(fd))
         chunks, size = [], 0
         while size <= limit and (chunk := os.read(fd, limit + 1 - size)):
             chunks.append(chunk)
@@ -530,7 +526,7 @@ def _scanned_secret(dir_fd: int, name: str, relative: str, plan: "ImportPlan") -
     else:
         secret = _config_holds_secret(raw, toml=kind == "toml")
     if not secret:
-        plan.scanned[relative] = identity
+        plan.scanned[relative] = raw
     return secret
 
 
@@ -675,17 +671,32 @@ def write_tar(source_fd: int, plan: ImportPlan, out: BinaryIO) -> None:
                 found = os.fstat(fd)
                 if not stat.S_ISREG(found.st_mode):
                     raise ImportRefused(f"{rel} ha dejado de ser un archivo normal")
-                if rel in plan.scanned and _identity(found) != plan.scanned[rel]:
-                    raise ImportRefused(
-                        f"{rel} ha cambiado desde que se revisó si llevaba secretos: no se importa"
-                    )
                 info = tarfile.TarInfo(rel)
-                info.size = found.st_size
                 info.mode = found.st_mode & 0o755 | 0o600
+                reviewed = plan.scanned.get(rel)
+                if reviewed is not None:
+                    if _read_upto(fd, len(reviewed) + 1) != reviewed:
+                        raise ImportRefused(
+                            f"{rel} ha cambiado desde que se revisó si llevaba secretos: no se "
+                            "importa"
+                        )
+                    info.size = len(reviewed)
+                    tar.addfile(info, io.BytesIO(reviewed))
+                    continue
+                info.size = found.st_size
                 with os.fdopen(os.dup(fd), "rb") as handle:
                     tar.addfile(info, handle)
             finally:
                 os.close(fd)
+
+
+def _read_upto(fd: int, limit: int) -> bytes:
+    """At most ``limit`` bytes of ``fd``, from where it is."""
+    chunks, size = [], 0
+    while size < limit and (chunk := os.read(fd, limit - size)):
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
 
 
 def _open_below(root_fd: int, rel: str) -> int:
