@@ -156,6 +156,65 @@ vm-limpiar: ## VM: borra solo restos nuestros (backtide-*, vigia-demo-*, volúme
 	@case "$(FORZAR)" in ""|1) ;; *) echo "FORZAR solo puede valer 1" >&2; exit 2;; esac
 	$(VM_SH) 'FORZAR=$(FORZAR) sh scripts/vm-limpiar.sh'
 
+# Clean, throwaway VMs for the installer (T13-1, T13-5; docs/25): nothing of the dev VM, no Mac
+# folder mounted, the code copied in from `git archive HEAD`. One at a time: 4 CPU, 6 GiB.
+LIMPIA_PREFIX := backtide-limpia-
+LIMPIA_VM = $(LIMPIA_PREFIX)$(DISTRO)
+LIMPIA_TEMPLATE_fedora := template:fedora-44
+LIMPIA_TEMPLATE_ubuntu24 := template:ubuntu-24.04
+LIMPIA_TEMPLATE_ubuntu26 := template:ubuntu-26.04
+LIMPIA_CHECK = @case "$(DISTRO)" in fedora|ubuntu24|ubuntu26) ;; *) echo "DISTRO es fedora, ubuntu24 o ubuntu26" >&2; exit 2;; esac
+
+.PHONY: vm-limpia-up vm-limpia-codigo vm-limpia-copiar vm-limpia-ejecutar vm-limpia-shell \
+	vm-limpia-reiniciar vm-limpia-borrar vm-limpia-lista
+
+vm-limpia-up: ## Clean VM: create and start backtide-limpia-<DISTRO> (fedora|ubuntu24|ubuntu26), copy the code in
+	$(LIMPIA_CHECK)
+	@others=$$(limactl list --format '{{.Name}} {{.Status}}' | awk '$$1 ~ /^$(LIMPIA_PREFIX)/ && $$1 != "$(LIMPIA_VM)" && $$2 == "Running" {print $$1}'); \
+	if [ -n "$$others" ]; then echo "Ya hay una VM limpia en marcha ($$others): bórrala antes (make vm-limpia-borrar)" >&2; exit 2; fi
+	@status=$$(limactl list --format '{{.Status}}' $(LIMPIA_VM) 2>/dev/null); \
+	if [ "$$status" = "Running" ]; then echo "$(LIMPIA_VM) ya está en marcha"; \
+	elif [ -n "$$status" ]; then limactl start --tty=false $(LIMPIA_VM); \
+	else limactl start --name=$(LIMPIA_VM) --tty=false --mount-none --containerd=none \
+	  --cpus=4 --memory=6 --disk=40 $(LIMPIA_TEMPLATE_$(DISTRO)); fi
+	@$(MAKE) --no-print-directory vm-limpia-codigo DISTRO=$(DISTRO)
+
+vm-limpia-codigo: ## Clean VM: copy `git archive HEAD` (+ tests/install/ as it is now) to ~/backtide-src
+	$(LIMPIA_CHECK)
+	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/backtide-limpia.XXXXXX") || exit 1; trap 'rm -rf "$$tmp"' EXIT; \
+	git archive --format=tar -o "$$tmp/src.tar" HEAD && \
+	if [ -d tests/install ]; then COPYFILE_DISABLE=1 tar --no-xattrs -cf "$$tmp/install.tar" tests/install; else tar -cf "$$tmp/install.tar" -T /dev/null; fi && \
+	limactl copy "$$tmp/src.tar" "$$tmp/install.tar" $(LIMPIA_VM):/tmp/ && \
+	limactl shell --workdir / $(LIMPIA_VM) -- sh -c 'rm -rf ~/backtide-src && mkdir ~/backtide-src && tar -xf /tmp/src.tar -C ~/backtide-src && tar -xf /tmp/install.tar -C ~/backtide-src && rm /tmp/src.tar /tmp/install.tar' && \
+	echo "Código de $$(git rev-parse --short HEAD) en $(LIMPIA_VM):~/backtide-src"
+
+vm-limpia-copiar: ## Clean VM: copy a Mac file or folder (DE=...) to a VM path (A=...)
+	$(LIMPIA_CHECK)
+	@test -n "$(DE)" && test -n "$(A)" || { echo "Uso: make vm-limpia-copiar DISTRO=... DE=<archivo del Mac> A=<ruta de la VM>" >&2; exit 2; }
+	limactl copy -r "$(DE)" "$(LIMPIA_VM):$(A)"
+
+vm-limpia-ejecutar: ## Clean VM: run CMD="..." in bash inside it (as the Lima user; sudo works there, and only there; write $ as $$)
+	$(LIMPIA_CHECK)
+	@test -n "$$CMD" || { echo 'Di qué ejecutar: make vm-limpia-ejecutar DISTRO=... CMD="..."' >&2; exit 2; }
+	@c=$$(printf '%s' "$$CMD" | base64 | tr -d '\n'); \
+	limactl shell --workdir / $(LIMPIA_VM) -- sh -c "echo $$c | base64 -d | bash"
+
+vm-limpia-shell: ## Clean VM: open a shell inside it
+	$(LIMPIA_CHECK)
+	limactl shell --workdir / $(LIMPIA_VM)
+
+vm-limpia-reiniciar: ## Clean VM: stop and start it again (a reboot, to test what comes back)
+	$(LIMPIA_CHECK)
+	limactl stop $(LIMPIA_VM)
+	limactl start --tty=false $(LIMPIA_VM)
+
+vm-limpia-borrar: ## Clean VM: delete backtide-limpia-<DISTRO> (never vigia-dev)
+	$(LIMPIA_CHECK)
+	limactl delete --force $(LIMPIA_VM)
+
+vm-limpia-lista: ## Clean VMs: which backtide-limpia-* exist and their state
+	@limactl list --format '{{.Name}} {{.Status}} {{.CPUs}} {{.Memory}}' | awk '$$1 ~ /^$(LIMPIA_PREFIX)/' || true
+
 vm-down: ## Stop the VM
 	limactl stop $(VM)
 
