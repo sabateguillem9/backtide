@@ -167,7 +167,7 @@ def test_a_card_tells_the_state_the_last_action_and_todays_counts(room: TestClie
     ]
     text = text_of(code)
     assert "Ha ejecutado rm -rf /" in text, "the last action, in plain words"
-    assert "eventos hoy 8" in text and "riesgo 3 hoy 1" in text
+    assert "Hoy 8 acciones" in text and "1 cosa grave" in text
     assert 'class="is-risky"' in code
     assert "1 petición espera tu sí" in text and "espera tu sí" in text
     assert 'class="card-in st-waiting"' in code, "a request waiting: that is its state"
@@ -264,7 +264,7 @@ def test_the_room_in_english(room: TestClient) -> None:
     text = text_of(room.get("/panel", headers={"accept-language": "en"}).text)
     assert "Control room" in text and "Waiting for your yes" in text
     assert "Wants to send an email to ana@ejemplo.com" in text
-    assert "backtide web --aprobar" in text and "events today" in text
+    assert "backtide web --aprobar" in text and "Today 8 actions" in text
 
 
 # -- each agent's own pages ------------------------------------------------------------------------
@@ -636,7 +636,7 @@ def test_a_flood_does_not_hide_a_sensor_down(flooded: TestClient) -> None:
 def test_a_flood_does_not_turn_risk_3_into_zero(flooded: TestClient) -> None:
     html = flooded.get("/panel").text
     card = html[html.index('id="card-principal"') :]
-    assert "riesgo 3 hoy 1" in text_of(card), "counted beyond the rows read, not a bare 0"
+    assert "1 cosa grave" in text_of(card), "counted beyond the rows read, not a bare 0"
     assert 'class="is-risky"' in card
 
 
@@ -653,7 +653,7 @@ def test_a_count_that_could_not_be_finished_is_marked(
     _flood(box)
     html = new_client(tmp_path, clock=lambda: START + timedelta(minutes=1)).get("/panel").text
     card = text_of(html[html.index('id="card-principal"') :])
-    assert "riesgo 3 hoy ≥2" in card, "at least what was counted, and it says so"
+    assert "≥2 cosas graves" in card, "at least what was counted, and it says so"
 
 
 def test_a_flood_does_not_hide_the_state_or_a_rewind(tmp_path: Path) -> None:

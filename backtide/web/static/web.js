@@ -744,6 +744,48 @@
 
   var pfeed = document.getElementById("pfeed");
   var PFEED_MAX = 60;
+
+  // An agent's name once per run of its lines, and the routine put aside (T12f-1b). Newest on
+  // top: a line is "same" when the visible line above it is of the same agent, so only the
+  // newest of a run says the name (the others keep it for readers). Lines only ever get
+  // classes and a count here, never text from the agent.
+  function feedAgent(line) {
+    var match = /^p-(.+)-\d+$/.exec(line.id || "");
+    return match ? match[1] : "";
+  }
+  function regroupFeed() {
+    if (!pfeed) return;
+    var important = pfeed.classList.contains("only-important");
+    var above = "";
+    var hidden = 0;
+    Array.prototype.forEach.call(pfeed.children, function (line) {
+      if (!line.classList.contains("pline")) return;
+      var routine = line.classList.contains("routine");
+      if (important && routine) {
+        hidden += 1;
+        return;
+      }
+      var who = feedAgent(line);
+      line.classList.toggle("same", who !== "" && who === above);
+      above = who;
+    });
+    var note = document.querySelector("[data-hidden-count]");
+    if (note) {
+      var template = note.getAttribute(hidden === 1 ? "data-hidden-one" : "data-hidden-other") || "";
+      note.textContent = template.replace("{n}", String(hidden));
+      note.hidden = !(important && hidden > 0);
+    }
+  }
+  document.querySelectorAll("[data-feed-filter]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var important = button.getAttribute("data-feed-filter") === "important";
+      if (pfeed) pfeed.classList.toggle("only-important", important);
+      document.querySelectorAll("[data-feed-filter]").forEach(function (other) {
+        other.setAttribute("aria-pressed", String(other === button));
+      });
+      regroupFeed();
+    });
+  });
   function onPanelFeed(records) {
     var gone = {};
     records.forEach(function (record) {
@@ -759,6 +801,7 @@
       });
     });
     while (pfeed.children.length > PFEED_MAX) pfeed.removeChild(pfeed.lastElementChild);
+    regroupFeed();
   }
 
   // A card the stream redrew: its agent moved, so the dot of its little tide hops once.
@@ -847,7 +890,10 @@
     stagger(results.querySelectorAll(".event"), 24);
     new MutationObserver(onRowsChange).observe(results, { childList: true, subtree: true });
   }
-  if (pfeed) new MutationObserver(onPanelFeed).observe(pfeed, { childList: true });
+  if (pfeed) {
+    new MutationObserver(onPanelFeed).observe(pfeed, { childList: true });
+    regroupFeed();
+  }
   markRequests();
   snapshotRows();
   heart();

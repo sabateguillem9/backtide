@@ -1,8 +1,11 @@
-"""T12f-1: the header, the control room and the requests, told in a person's words.
+"""T12f-1 and T12f-1b: the header, the control room, the requests, the cards and the feed, told
+in a person's words.
 
 The agent's text is drawn as it is (no ligatures), a request is titled by what it wants to do
 (the verb from what the gate read, never from what the agent wrote), the control room opens
-with one sentence on what waits, and "trust" sits a level below approve and reject.
+with one sentence on what waits, "trust" sits a level below approve and reject, each card
+tells its day in one line with one call to action, and the feed says an agent's name once per
+run and can put the routine aside.
 """
 
 import re
@@ -256,3 +259,190 @@ def test_a_list_that_may_be_incomplete_says_at_least(tmp_path: Path) -> None:
     assert "data-least=" in html
     head = re.search(r'<div class="waiting-head"[^>]*>', html)
     assert head and "data-unsure" not in head.group(0), "a full list is sure"
+
+
+# -- T12f-1b: the cards ------------------------------------------------------------------------
+
+
+def card_of(html: str, slug: str) -> str:
+    start = html.index(f'id="card-{slug}"')
+    return html[start : html.index("</article>", start)]
+
+
+def room_with(tmp_path: Path, script, *, pending=None, now=START + timedelta(minutes=1)):
+    clock = FakeClock(START)
+    main = new_box(tmp_path, clock)
+    main.append("system", "agent_start", "")
+    mail = other_box(tmp_path, "correo", clock)
+    mail.append("system", "agent_start", "")
+    script(main, mail, clock)
+    return new_client(
+        tmp_path,
+        clock=lambda: now,
+        others=[source(tmp_path, "correo", "Asistente de correo")],
+        pending=lambda: pending or [],
+    )
+
+
+def test_a_card_tells_its_day_in_one_line(tmp_path: Path) -> None:
+    def script(main, mail, clock):
+        main.append("file", "modify", "work/a.md")
+        main.append("snapshot", "take", "s", snapshot_id="20261016T100000.000000Z-periodic")
+        mail.append("exec", "run", "rm -rf /", risk=3)
+
+    html = room_with(tmp_path, script).get("/panel").text
+    main = card_of(html, "principal")
+    assert "Hoy 3 acciones · 1 punto para volver · nada grave" in text_of(main)
+    assert "<dl" not in main, "no more three big numbers"
+    mail = card_of(html, "correo")
+    assert "Hoy 2 acciones · 0 puntos para volver · 1 cosa grave" in text_of(mail)
+    assert 'class="is-risky"' in mail and 'class="is-risky"' not in main
+
+
+def test_a_card_says_when_the_day_is_cut_or_the_serious_count_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import backtide.web.agents as agents
+
+    monkeypatch.setattr(agents, "RISK_CAP", 2)
+
+    def script(main, mail, clock):
+        for _ in range(4):
+            main.append("exec", "run", "rm -rf /", risk=3)
+        for i in range(5001):
+            main.append("file", "modify", f"work/f{i % 50}.txt")
+
+    text = text_of(card_of(room_with(tmp_path, script).get("/panel").text, "principal"))
+    assert "5000+ acciones" in text, "events there were more of than were read"
+    assert "≥2 cosas graves" in text, "at least what was counted, and it says so"
+
+
+def test_a_card_in_english(tmp_path: Path) -> None:
+    def script(main, mail, clock):
+        mail.append("exec", "run", "rm -rf /", risk=3)
+
+    html = room_with(tmp_path, script).get("/panel", headers={"accept-language": "en"}).text
+    assert "Today 2 actions · 0 points to go back to · 1 serious thing" in text_of(
+        card_of(html, "correo")
+    )
+
+
+def test_a_card_has_one_call_to_action_a_waiting_request(tmp_path: Path) -> None:
+    pending = [request(id="r1", agent="correo"), request(id="r2", agent="correo")]
+    html = room_with(tmp_path, lambda main, mail, clock: None, pending=pending).get("/panel").text
+    mail = card_of(html, "correo")
+    assert mail.count('class="card-cta"') == 1
+    assert re.search(
+        r'<a class="card-cta" href="#req-r1">.*?2 peticiones esperan tu sí', mail, re.S
+    )
+    assert 'class="card-cta"' not in card_of(html, "principal"), "a calm agent asks for nothing"
+
+
+@pytest.mark.parametrize(
+    ("script", "state"),
+    [
+        (lambda b: b.append("system", "space_pause", "", details={"frozen": True}), "frozen"),
+        (lambda b: b.append("system", "sensor_down", "tetragon", risk=2), "sensor_down"),
+    ],
+)
+def test_a_frozen_or_blind_agent_points_to_its_page(tmp_path: Path, script, state: str) -> None:
+    def run(main, mail, clock):
+        mail.append("system", "sensor_start", "")
+        script(mail)
+
+    html = room_with(tmp_path, run).get("/panel").text
+    mail = card_of(html, "correo")
+    assert f'class="card-in st-{state}"' in mail
+    assert re.search(
+        r'<a class="card-cta" href="[^"]*/agentes/correo/ahora">.*?Ver qué pasa', mail, re.S
+    )
+
+
+def test_a_card_keeps_its_three_links(tmp_path: Path) -> None:
+    html = room_with(tmp_path, lambda main, mail, clock: None).get("/panel").text
+    links = re.search(r'<p class="card-links">(.*?)</p>', card_of(html, "correo"), re.S)
+    assert links and text_of(links.group(1)) == "Ahora Historia Instantáneas"
+
+
+# -- T12f-1b: the feed -------------------------------------------------------------------------
+
+
+def feed_lines(html: str) -> list[tuple[list[str], str]]:
+    feed = html[html.index('id="pfeed"') :]
+    feed = feed[: feed.index("</ol>")]
+    return [
+        (cls.split(), text_of(body))
+        for cls, body in re.findall(r'<li class="(pline[^"]*)"[^>]*>(.*?)</li>', feed, re.S)
+    ]
+
+
+def test_the_feed_says_an_agents_name_once_per_run(tmp_path: Path) -> None:
+    def script(main, mail, clock):
+        for who, what in (
+            (main, "a1"),
+            (main, "a2"),
+            (mail, "b1"),
+            (main, "a3"),
+            (main, "a4"),
+        ):
+            clock.advance(timedelta(seconds=1))
+            who.append("exec", "run", what)
+
+    html = room_with(tmp_path, script, now=START + timedelta(minutes=2)).get("/panel").text
+    same = {text.split()[-1]: "same" in cls for cls, text in feed_lines(html)}
+    assert same["a4"] is False, "the newest of its run says its name"
+    assert same["a3"] is True and same["b1"] is False
+    assert same["a2"] is False and same["a1"] is True
+    assert html.count('<a class="who"') == html.count('<li class="pline'), "the name stays"
+
+
+def test_the_routine_is_marked_and_the_filter_is_offered(tmp_path: Path) -> None:
+    def script(main, mail, clock):
+        clock.advance(timedelta(seconds=1))
+        main.append("exec", "run", "git status")
+        clock.advance(timedelta(seconds=1))
+        main.append("exec", "run", "rm -rf /", risk=3)
+
+    html = room_with(tmp_path, script, now=START + timedelta(minutes=2)).get("/panel").text
+    by_text = {text: cls for cls, text in feed_lines(html)}
+    risky = next(c for text, c in by_text.items() if "rm -rf /" in text)
+    calm = next(c for text, c in by_text.items() if "git status" in text)
+    assert "routine" in calm and "routine" not in risky
+    buttons = re.findall(r'<button[^>]*aria-pressed="(\w+)"[^>]*data-feed-filter="(\w+)"', html)
+    assert buttons == [("true", "all"), ("false", "important")]
+    assert 'data-hidden-one="' in html and 'data-hidden-other="' in html
+    assert re.search(r"<p[^>]*data-hidden-count[^>]*hidden", html), "hidden until it is used"
+
+
+def test_the_feed_logic_stays_free_of_markup() -> None:
+    js = (STATIC / "web.js").read_text()
+    assert "regroupFeed" in js and "data-feed-filter" in js
+    assert "innerHTML" not in js and "insertAdjacentHTML" not in js
+
+
+def test_a_delete_and_anything_above_risk_0_are_never_routine(tmp_path: Path) -> None:
+    """The filter hides risk 0 and nothing else; a delete is never put aside, even at risk 0
+    (review of T12f-1b, L1), and a folded burst that grows past risk 0 is no longer routine (L3)."""
+
+    def script(main, mail, clock):
+        for what, risk in (("exec a-calm", 0), ("exec b-one", 1), ("exec c-two", 2)):
+            clock.advance(timedelta(seconds=1))
+            main.append("exec", "run", what, risk=risk)
+        clock.advance(timedelta(seconds=1))
+        main.append("file", "delete", "work/.env", risk=0)
+        clock.advance(timedelta(minutes=2))
+        main.append("file", "modify", "work/x1", risk=0)
+        main.append("file", "modify", "work/x2", risk=2)
+
+    html = room_with(tmp_path, script, now=START + timedelta(minutes=5)).get("/panel").text
+    routine = {text: "routine" in cls for cls, text in feed_lines(html)}
+    by = lambda needle: next(v for text, v in routine.items() if needle in text)  # noqa: E731
+    assert by("a-calm") is True
+    assert by("b-one") is False and by("c-two") is False
+    assert by(".env") is False, "a delete says so, even when it looks calm"
+    assert by("x1") is False, "a folded burst takes the highest risk of its events"
+
+
+def test_a_hidden_name_shows_when_it_has_the_keyboard() -> None:
+    css = (STATIC / "web.css").read_text()
+    assert ".pline.same .who:focus-visible" in css

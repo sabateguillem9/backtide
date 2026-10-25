@@ -1,4 +1,4 @@
-<li class="pline a-{{ who.colour }}{% if line.mark %} mark{% endif %}" id="p-{{ who.slug }}-{{ line.id }}"{% if oob %} hx-swap-oob="true"{% endif %}>
+<li class="pline a-{{ who.colour }}{% if line.mark %} mark{% endif %}{% if line.risk == 0 and line.what != 'file/delete' %} routine{% endif %}{% if same is defined and same %} same{% endif %}" id="p-{{ who.slug }}-{{ line.id }}"{% if oob %} hx-swap-oob="true"{% endif %}>
   {% set began = line.first_ts or line.ts %}
   <time class="when" datetime="{{ began }}" title="{{ stamp(began) }}">{{ clock(began) }}</time>
   <span class="dot dot-{{ line.risk }}" role="img" aria-label="{{ t('risk.' ~ line.risk) }}"></span>

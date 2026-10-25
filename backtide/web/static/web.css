@@ -517,14 +517,13 @@ a.req-no { text-decoration: underline; text-decoration-thickness: 1px; text-unde
 .card-last .dot { margin-top: 6px; }
 .card-last .said { overflow-wrap: anywhere; min-width: 0; }
 .card-last .ago { grid-column: 2; font-size: 13px; letter-spacing: 0.02em; color: var(--ink-muted); }
-.card-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2); margin: 0; }
-.card-counts div { display: flex; flex-direction: column-reverse; justify-content: flex-end; }
-.card-counts dt { font-size: 13px; letter-spacing: 0.02em; color: var(--ink-muted); }
-.card-counts dd { margin: 0; font-size: 22px; line-height: 1.15; font-weight: 500; }
-.card-counts .is-risky dd { color: var(--risk-3); }
-.card-pending { margin: 0; font-size: 14px; }
-.card-pending a { display: inline-flex; align-items: center; color: var(--state-waiting); font-weight: 500; }
-.card-pending .waiting-mark { width: 8px; height: 8px; margin-right: var(--space-2); background: var(--state-waiting); }
+/* The day in one line, and the one thing a card asks for (T12f-1b) */
+.card-day { margin: 0; font-size: 14px; color: var(--ink-muted); }
+.card-day span { white-space: nowrap; }
+.card-day .is-risky { color: var(--risk-3); font-weight: 500; }
+.card-cta { display: inline-flex; align-items: center; gap: var(--space-2); align-self: flex-start; min-height: var(--size-target); font-size: 15px; font-weight: 500; color: var(--st); text-decoration: none; }
+.card-cta:hover { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.card-cta .pulse { margin-right: 0; }
 .card-links { display: flex; flex-wrap: wrap; gap: 0 var(--space-4); margin: auto 0 0; font-size: 14px; }
 .card-links a { padding: 6px 0; color: var(--ink-muted); }
 .card-links a:hover { color: var(--ink); }
@@ -542,7 +541,19 @@ a.req-no { text-decoration: underline; text-decoration-thickness: 1px; text-unde
 .pline .who { display: inline-flex; align-items: center; margin-right: var(--space-1); font-size: 13px; font-weight: 500; letter-spacing: 0.02em; color: var(--agent); text-decoration: none; }
 .pline .who .tag { width: 10px; }
 .pline .who:hover .agent-name { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.pline.routine .said { color: var(--ink-muted); font-size: 14px; }
 .pline.mark .said { color: var(--ink-muted); font-size: 14px; }
+/* An agent's name once per run of its lines (the name stays for readers) */
+.pline.same .who { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.pline.same .who:focus-visible { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+.pfeed.only-important .pline.routine { display: none; }
+.live-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-4); }
+.seg { display: inline-flex; gap: var(--space-4); font-size: 14px; }
+.seg button { position: relative; min-height: var(--size-target); padding: 0; font: inherit; color: var(--ink-muted); background: none; border: 0; cursor: pointer; }
+.seg button[aria-pressed="true"] { color: var(--ink); }
+.seg button[aria-pressed="true"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: 6px; height: var(--stroke-hairline); background: var(--ink); }
+.seg button:hover { color: var(--ink); }
+.feed-hidden[hidden] { display: none; }
 .pline.mark .dot { width: 7px; height: 7px; margin-top: 8px; background: var(--agent); border: 0; outline: 0; }
 .pfeed-empty { margin-top: var(--space-4); }
 .live:has(.pline) .pfeed-empty { display: none; }

@@ -39,11 +39,23 @@
       </div>
     </section>
     <section class="live" aria-labelledby="live-title">
-      <h2 class="section-title" id="live-title"><span class="live-dot" aria-hidden="true"></span>{{ t('panel.live') }}</h2>
+      <div class="live-head">
+        <h2 class="section-title" id="live-title"><span class="live-dot" aria-hidden="true"></span>{{ t('panel.live') }}</h2>
+        {# What the feed shows (T12f-1b): everything, or what is not routine (risk 0, and never a delete). Only the
+           browser changes it; the choice is not kept. #}
+        <div class="seg" role="group" aria-label="{{ t('feed.show') }}">
+          <button type="button" aria-pressed="true" data-feed-filter="all">{{ t('feed.all') }}</button>
+          <button type="button" aria-pressed="false" data-feed-filter="important">{{ t('feed.important') }}</button>
+        </div>
+      </div>
+      <p class="note feed-hidden" data-hidden-count data-hidden-one="{{ t.raw('feed.hidden.one') }}" data-hidden-other="{{ t.raw('feed.hidden.other') }}" hidden></p>
       <p class="note conn" aria-live="polite" data-off="{{ t('live.off') }}"></p>
-      <ol class="pfeed" id="pfeed" role="log" aria-live="polite" sse-swap="feed" hx-swap="afterbegin">
+      {# An agent's name once per run of its lines: the newest of a run says it, the older ones of
+         the same agent do not (they keep it for readers). web.js (regroupFeed) keeps this as lines arrive. #}
+      <ol class="pfeed" id="pfeed" role="log" aria-label="{{ t('feed.label') }}" aria-live="polite" sse-swap="feed" hx-swap="afterbegin">
         {% for who, line in feed %}
         {% set oob = false %}
+        {% set same = not loop.first and feed[loop.index0 - 1][0].slug == who.slug %}
         {% include "panel_line.html" %}
         {% endfor %}
       </ol>

@@ -15,17 +15,16 @@
   {% else %}
   <p class="card-last note">{{ t('card.nothing') }}</p>
   {% endif %}
-  <dl class="card-counts">
-    <div><dt>{{ t('card.events') }}</dt><dd class="num">{{ s.events_today }}{% if s.more %}+{% endif %}</dd></div>
-    <div><dt>{{ t('card.snaps') }}</dt><dd class="num">{{ s.snaps_today }}</dd></div>
-    <div{% if s.risk3_today %} class="is-risky"{% endif %}><dt>{{ t('card.risk3') }}</dt><dd class="num">{% if s.risk3_cut %}≥{% endif %}{{ s.risk3_today }}</dd></div>
-  </dl>
-  <p class="card-pending">
-    {% if c.pending %}
-    <a href="#req-{{ c.pending[0].id }}"><span class="waiting-mark" aria-hidden="true"></span>{{ t.plural('card.pending', c.pending | length) }}</a>
-    {% else %}
-    <span class="muted">{{ t('card.pending.none') }}</span>
-    {% endif %}
-  </p>
+  {# The day in one line (T12f-1b): "Hoy 883 acciones · 26 puntos para volver · nada grave". The
+     serious part is a floor ("≥N") when the count could not be finished. #}
+  <p class="card-day">{{ t('card.today') }}
+    {% if s.more %}{{ t('card.day.actions.more', n=s.events_today) }}{% else %}{{ t.plural('card.day.actions', s.events_today) }}{% endif %} · {{ t.plural('card.day.points', s.snaps_today) }} ·
+    {% if s.risk3_today %}<span class="is-risky">{% if s.risk3_cut %}{{ t('card.day.grave.cut', n=s.risk3_today) }}{% else %}{{ t.plural('card.day.grave', s.risk3_today) }}{% endif %}</span>{% else %}<span>{{ t('card.day.grave.none') }}</span>{% endif %}</p>
+  {# One call to action, in the state's colour: the request that waits, or a look at what is wrong. #}
+  {% if c.pending %}
+  <a class="card-cta" href="#req-{{ c.pending[0].id }}"><span class="pulse" aria-hidden="true"></span>{{ t.plural('card.pending', c.pending | length) }}</a>
+  {% elif c.state in ('frozen', 'sensor_down') %}
+  <a class="card-cta" href="{{ c.agent.base }}/ahora"><span class="pulse" aria-hidden="true"></span>{{ t('card.look') }}</a>
+  {% endif %}
   <p class="card-links"><a href="{{ c.agent.base }}/ahora">{{ t('nav.now') }}</a><a href="{{ c.agent.base }}/historia">{{ t('nav.history') }}</a><a href="{{ c.agent.base }}/instantaneas">{{ t('nav.snapshots') }}</a></p>
 </div>
