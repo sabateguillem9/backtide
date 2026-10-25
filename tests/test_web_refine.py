@@ -1,5 +1,5 @@
-"""T12f-1, T12f-1b and T12f-2a: the header, the control room, the requests, the cards, the feed
-and the agent's pages, told in a person's words.
+"""T12f-1, T12f-1b, T12f-2a and T12f-2b: the header, the control room, the requests, the cards,
+the feed, the agent's pages and its history, told in a person's words.
 
 The agent's text is drawn as it is (no ligatures), a request is titled by what it wants to do
 (the verb from what the gate read, never from what the agent wrote), the control room opens
@@ -640,3 +640,192 @@ def test_a_name_with_hidden_characters_cannot_break_the_bars_markup(tmp_path: Pa
     nav = re.search(r'<nav class="agentbar-tabs"[^>]*>', html)
     assert nav and nav.group(0) == '<nav class="agentbar-tabs" aria-labelledby="agentbar-name">'
     assert html.count('id="agentbar-name"') == 1 and "\u202e" not in html
+
+
+# -- T12f-2b: History ------------------------------------------------------------
+
+CHIPS = [
+    ("Todo", ""),
+    ("Lo importante", "riesgo=1"),
+    ("Archivos", "origen=file"),
+    ("Comandos", "origen=exec"),
+    ("Internet", "origen=net"),
+    ("Modelos", "origen=llm"),
+    ("Lo que frenó backtide", "origen=gate"),
+    ("Puntos para volver", "origen=snapshot"),
+]
+
+
+def history_web(tmp_path: Path) -> TestClient:
+    """One agent with a day of events of every kind, over four days (the last is "today")."""
+    clock = FakeClock(START)
+    box = new_box(tmp_path, clock)
+    box.append("file", "create", "work/a.md", details={"type": "file"})
+    box.append("exec", "run", "git status")
+    clock.advance(timedelta(days=1))
+    box.append("net", "connect", "api.example.com:443")
+    box.append("llm", "call", "api.anthropic.com")
+    clock.advance(timedelta(days=1))
+    box.append(
+        "gate", "held", "https://example.com/x", risk=2, details={"hold_id": "h-0123456789ab"}
+    )
+    box.append("file", "delete", "work/old.md", risk=1)
+    clock.advance(timedelta(days=1))
+    box.append("snapshot", "take", "s", snapshot_id="20261019T100000.000000Z-periodic")
+    box.append("system", "log", "hello")
+    return new_client(tmp_path, clock=lambda: START + timedelta(days=3, hours=1))
+
+
+def chips_of(html: str) -> list[tuple[str, str, bool]]:
+    nav = re.search(r'<nav class="chips"[^>]*>(.*?)</nav>', html, re.S)
+    assert nav, "the filter chips"
+    return [
+        (text_of(label), href, current == ' aria-current="true"')
+        for href, current, label in re.findall(
+            r'<a href="([^"]*)"( aria-current="true")?[^>]*>(.*?)</a>', nav.group(1), re.S
+        )
+    ]
+
+
+def test_history_filters_are_words_that_are_links(tmp_path: Path) -> None:
+    html = history_web(tmp_path).get("/historia").text
+    chips = chips_of(html)
+    assert [label for label, _, _ in chips] == [label for label, _ in CHIPS]
+    for (_, query), (_, href, _) in zip(CHIPS, chips, strict=True):
+        assert href == f"{PREFIX_PATH}/historia" + (f"?{query}" if query else "")
+    assert [c for c in chips if c[2]] == [("Todo", f"{PREFIX_PATH}/historia", True)]
+
+
+@pytest.mark.parametrize(
+    ("query", "current", "open_filters"),
+    [
+        ("origen=file", "Archivos", False),
+        ("riesgo=1", "Lo importante", False),
+        ("origen=snapshot", "Puntos para volver", False),
+        ("origen=file&riesgo=1", None, True),
+        ("accion=delete", None, True),
+        ("rango=1h", None, True),
+        ("desde=2026-10-18T00:00", None, True),
+    ],
+)
+def test_the_chip_that_matches_the_filters_is_the_current_one(
+    tmp_path: Path, query: str, current: str | None, open_filters: bool
+) -> None:
+    html = history_web(tmp_path).get(f"/historia?{query}").text
+    assert [label for label, _, on in chips_of(html) if on] == ([current] if current else [])
+    assert ('<details class="more-filters" open>' in html) is open_filters
+
+
+def test_every_chip_leads_to_what_it_says(tmp_path: Path) -> None:
+    web = history_web(tmp_path)
+    shown = {
+        "Todo": 8,
+        "Lo importante": 2,  # risk 1 or more: the delete and the held request
+        "Archivos": 2,
+        "Comandos": 1,
+        "Internet": 1,
+        "Modelos": 1,
+        "Lo que frenó backtide": 1,
+        "Puntos para volver": 1,
+    }
+    for label, href, _ in chips_of(web.get("/historia").text):
+        page = web.get(href.removeprefix(PREFIX_PATH)).text
+        assert len(re.findall(r'<details class="event[^"]*" id="e-\d+"', page)) == shown[label], (
+            label
+        )
+
+
+def test_the_other_filters_wait_behind_more_filters_in_words(tmp_path: Path) -> None:
+    html = history_web(tmp_path).get("/historia").text
+    form = re.search(
+        r'<details class="more-filters">.*?(<form class="filters".*?</form>)', html, re.S
+    )
+    assert form, "the form sits inside 'More filters'"
+    assert "hx-" not in form.group(1), "plain navigation: the chips and the form never disagree"
+    assert "Más filtros" in text_of(html)
+    options = re.findall(r"<option[^>]*>(.*?)</option>", form.group(1), re.S)
+    assert "Archivos" in options and "Lo que frenó backtide" in options
+    assert not {"file", "exec", "net", "llm", "gate", "snapshot"} & set(options), "no raw names"
+    assert "Desde qué gravedad" in text_of(form.group(1))
+
+
+def test_history_groups_the_rows_by_day_and_each_row_has_only_its_time(tmp_path: Path) -> None:
+    html = history_web(tmp_path).get("/historia").text
+    days = re.findall(r'<h2 class="day" data-day="([\d-]+)">(.*?)</h2>', html)
+    assert [(key, text_of(label)) for key, label in days] == [
+        ("2026-10-19", "Hoy"),
+        ("2026-10-18", "Ayer"),
+        ("2026-10-17", "17 oct"),
+        ("2026-10-16", "16 oct"),
+    ]
+    first = html[html.index('class="day"') :]
+    assert re.search(
+        r'<time class="when" datetime="[^"]+" title="2026-10-19 10:00:00">10:00:00</time>', first
+    )
+    assert 'class="tag">' not in html[html.index('id="results"') :], "no machine tag on the row"
+    assert html.count("Detalles</span>") == 8, "every row says it opens details"
+
+
+def test_a_page_of_older_rows_carries_its_days_and_the_browser_joins_them(tmp_path: Path) -> None:
+    fragment = history_web(tmp_path).get("/historia?antes=4", headers={"hx-request": "true"}).text
+    assert '<h2 class="day"' in fragment and "<html" not in fragment
+    js = (STATIC / "web.js").read_text()
+    assert "function joinDays" in js and "data-day" in js
+
+
+def test_the_details_are_told_in_words(tmp_path: Path) -> None:
+    html = history_web(tmp_path).get("/historia?origen=snapshot").text
+    labels = [text_of(dt) for dt in re.findall(r"<dt>(.*?)</dt>", html, re.S)]
+    assert labels == [
+        "Evento número",
+        "Hora exacta (UTC)",
+        "Para buscarlo",
+        "Sobre qué",
+        "Gravedad",
+        "Punto para volver",
+        "Huella",
+        "Datos en bruto",
+    ]
+    assert "snapshot / take" in text_of(html), "the machine's name is still there, in the details"
+
+
+def test_history_in_english(tmp_path: Path) -> None:
+    html = history_web(tmp_path).get("/historia", headers={"accept-language": "en"}).text
+    assert [label for label, _, _ in chips_of(html)] == [
+        "All",
+        "What matters",
+        "Files",
+        "Commands",
+        "Internet",
+        "Models",
+        "What backtide stopped",
+        "Points to go back to",
+    ]
+    assert re.search(r'<h2 class="day"[^>]*>Today</h2>', html) and "Yesterday</h2>" in html
+    assert "More filters" in text_of(html) and "Details</span>" in html
+
+
+def test_the_chips_scroll_sideways_on_a_phone() -> None:
+    css = (STATIC / "web.css").read_text()
+    assert re.search(r"@media \(max-width: 480px\) \{[^}]*\.chips \{[^}]*overflow-x: auto", css)
+
+
+def test_a_hostile_event_stays_inside_its_details_and_a_day_heading_says_only_the_day(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(START)
+    box = new_box(tmp_path, clock)
+    box.append("file", 'a"b', '"><img src=x onerror=1>‮txt', details={"x": "<script>1</script>"})
+    html = new_client(tmp_path, clock=lambda: START).get("/historia").text
+    assert "<img" not in html and "<script>1" not in html and "‮" not in html
+    heading = re.search(r'<h2 class="day"[^>]*>(.*?)</h2>', html, re.S)
+    assert heading and text_of(heading.group(1)) == "Hoy"
+    summary = re.search(r"<summary class=\"line\">(.*?)</summary>", html, re.S)
+    assert summary and "<img" not in summary.group(1)
+
+
+def test_a_burst_or_an_older_page_is_not_the_whole_of_a_chip(tmp_path: Path) -> None:
+    """Only part of what a chip says is shown then, so no chip claims to be the page (L2)."""
+    web = history_web(tmp_path)
+    for query in ("origen=file&tras=1&antes=9", "antes=5"):
+        assert not [c for c in chips_of(web.get(f"/historia?{query}").text) if c[2]], query

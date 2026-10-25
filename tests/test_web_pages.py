@@ -169,9 +169,9 @@ def test_history_lists_newest_first_with_details(web: TestClient) -> None:
     html = web.get("/historia").text
     assert html.index('id="e-35"') < html.index('id="e-1"')
     assert 'class="event"' in html and "<details" in html
-    assert "Número" in html and "Huella" in html
+    assert "Evento número" in html and "Huella" in html
     assert "&#34;type&#34;: &#34;file&#34;" in html  # the details, pretty-printed and escaped
-    assert re.search(r"<dt>Riesgo</dt><dd>2 · riesgo importante</dd>", html)
+    assert re.search(r"<dt>Gravedad</dt><dd>2 · riesgo importante</dd>", html)
 
 
 def test_history_escapes_hostile_names_in_the_sentence_target_and_details(
@@ -313,7 +313,7 @@ def test_the_filter_form_works_without_javascript(web: TestClient) -> None:
         and 'method="get"' in form.group(0)
         and f'action="{PREFIX_PATH}/historia"' in form.group(0)
     )
-    assert 'hx-push-url="true"' in form.group(0)
+    assert "hx-" not in form.group(0), "plain navigation (T12f-2b): the chips and the form agree"
 
 
 def test_snapshot_marks_in_the_timeline(web: TestClient) -> None:

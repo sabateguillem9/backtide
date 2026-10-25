@@ -246,13 +246,28 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 #results { margin-top: var(--space-8); }
 .events { display: flex; flex-direction: column; }
 .event { border-top: var(--stroke-hairline) solid transparent; padding: var(--space-2) 0; }
-.event > summary { list-style: none; cursor: pointer; grid-template-columns: 9.4rem 9px 1fr; }
+.event > summary { list-style: none; cursor: pointer; grid-template-columns: 4.6rem 9px minmax(0, 1fr) auto; }
 .event > summary::-webkit-details-marker { display: none; }
 .event > summary:hover .said { color: var(--ink); }
-.event .tag { grid-column: 3; font-size: 13px; letter-spacing: 0.04em; color: var(--ink-muted); }
 .event .said { grid-column: 3; }
+.event .more-label { grid-column: 4; padding-top: 3px; font-size: 13px; letter-spacing: 0.02em; color: var(--ink-muted); }
+.event > summary:hover .more-label, .event[open] > summary .more-label { color: var(--ink); }
+.event[open] > summary .more-label { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+/* What to show, in words, and the rest of the filters behind a fold (T12f-2b) */
+.chips { display: flex; flex-wrap: wrap; gap: 0 var(--space-3); margin-top: var(--space-6); font-size: 14px; }
+.chips a { position: relative; display: inline-flex; align-items: center; min-height: var(--size-target); color: var(--ink-muted); text-decoration: none; white-space: nowrap; }
+.chips a:hover, .chips a[aria-current="true"] { color: var(--ink); }
+.chips a[aria-current="true"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: 8px; height: var(--stroke-hairline); background: var(--ink); }
+.more-filters { margin-top: var(--space-2); font-size: 14px; }
+.more-filters > summary { display: inline-flex; align-items: center; min-height: var(--size-target); cursor: pointer; color: var(--ink-muted); }
+.more-filters > summary:hover, .more-filters[open] > summary { color: var(--ink); }
+.more-filters > summary::after { content: "\25BE"; margin-left: var(--space-1); font-size: 12px; }
+.more-filters[open] > summary::after { content: "\25B4"; }
+.more-filters .filters { margin-top: var(--space-3); }
+.day { margin: var(--space-6) 0 var(--space-1); font-size: 14px; font-weight: 500; letter-spacing: 0.04em; color: var(--ink-muted); }
+.events > .day:first-child { margin-top: 0; }
 .event.mark > summary .said { color: var(--ink-muted); }
-.facts { display: grid; grid-template-columns: 9.4rem 1fr; gap: var(--space-1) var(--space-3); margin: var(--space-3) 0 var(--space-4); font-size: 14px; }
+.facts { display: grid; grid-template-columns: 10.5rem 1fr; gap: var(--space-1) var(--space-3); margin: var(--space-3) 0 var(--space-4); font-size: 14px; }
 .facts dt { color: var(--ink-muted); }
 .facts dd { margin: 0; color: var(--ink-soft); overflow: clip; overflow-wrap: anywhere; }
 .facts pre { overflow: clip; margin: 0; font: inherit; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -260,7 +275,7 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 .more { display: inline-block; margin-top: var(--space-4); font-size: 14px; }
 @media (max-width: 480px) {
   .line { grid-template-columns: 3.6rem 9px 1fr; }
-  .event > summary { grid-template-columns: 3.6rem 9px 1fr; }
+  .event > summary { grid-template-columns: 3.6rem 9px minmax(0, 1fr) auto; }
   .facts { grid-template-columns: 1fr; }
 }
 
@@ -406,6 +421,7 @@ a.dot-button { text-decoration: none; }
 .agentbar-tabs a:hover, .agentbar-tabs a[aria-current="page"] { color: var(--ink); }
 .agentbar-tabs a[aria-current="page"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: calc(-1 * var(--stroke-hairline)); height: var(--stroke-tide); background: var(--agent); }
 @media (max-width: 480px) { .agentbar-tabs { gap: 0 var(--space-4); font-size: 14px; } }
+@media (max-width: 480px) { .chips { flex-wrap: nowrap; overflow-x: auto; margin-right: calc(-1 * var(--space-4)); padding-right: var(--space-4); scrollbar-width: none; } }
 .agentbar-others a { display: inline-flex; align-items: center; padding: 6px 0; color: var(--ink-muted); text-decoration: none; }
 .agentbar-others a:hover { color: var(--ink); }
 

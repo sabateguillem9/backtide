@@ -4,11 +4,25 @@
 <main class="history a-{{ agent.colour }}">
   <h1>{{ t('hist.title') }}</h1>
   <p class="lede">{{ t('hist.lede') }}</p>
-  <form class="filters" action="{{ abase }}/historia" method="get" hx-get="{{ abase }}/historia" hx-target="#results" hx-push-url="true" hx-trigger="change, submit">
+  {# What to show, in words (T12f-2b): links with the parameters the page already takes, so they
+     work without JavaScript and the chip that is on is always the page's own state. The form of
+     the rest of the filters waits behind "More filters", open when one of them is in use. #}
+  {% set plain = not (filters.action or filters.rng or filters.since_text or filters.until_text or filters.after is not none or filters.before) %}
+  <nav class="chips" aria-label="{{ t('hist.show') }}">
+    {% for key, query in (('all', ''), ('important', 'riesgo=1'), ('file', 'origen=file'), ('exec', 'origen=exec'), ('net', 'origen=net'), ('llm', 'origen=llm'), ('gate', 'origen=gate'), ('snapshot', 'origen=snapshot')) %}
+    {% if key == 'all' %}{% set on = plain and not filters.source and not filters.min_risk %}
+    {% elif key == 'important' %}{% set on = plain and not filters.source and filters.min_risk == 1 %}
+    {% else %}{% set on = plain and filters.source == key and not filters.min_risk %}{% endif %}
+    <a href="{{ abase }}/historia{% if query %}?{{ query }}{% endif %}"{% if on %} aria-current="true"{% endif %}>{{ t('hist.chip.' ~ key) }}</a>
+    {% endfor %}
+  </nav>
+  <details class="more-filters"{% if not plain or (filters.source and filters.min_risk) %} open{% endif %}>
+    <summary>{{ t('hist.more_filters') }}</summary>
+  <form class="filters" action="{{ abase }}/historia" method="get">
     <label>{{ t('hist.source') }}
       <select name="origen">
         <option value="">{{ t('hist.any') }}</option>
-        {% for s in sources %}<option value="{{ s }}"{% if filters.source == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
+        {% for s in sources %}<option value="{{ s }}"{% if filters.source == s %} selected{% endif %}>{{ t('hist.src.' ~ s) if t.has('hist.src.' ~ s) else vis(s, 24) }}</option>{% endfor %}
       </select>
     </label>
     <label>{{ t('hist.action') }}
@@ -36,6 +50,7 @@
     </label>
     <button class="dot-button" type="submit" aria-label="{{ t('hist.apply') }}">{% include "arrow.html" %}</button>
   </form>
+  </details>
   {% if filters.after is not none %}<p class="note">{{ t('hist.burst') }} <a href="{{ abase }}/historia">{{ t('hist.all') }}</a></p>{% endif %}
   <section id="results">
     {% include "history_results.html" %}

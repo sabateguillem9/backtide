@@ -1,4 +1,13 @@
+{# The rows of a page, a heading for each day (T12f-2b): "Hoy", "Ayer", "17 oct". The day is the
+   person's own (the page's ``stamp``); the heading's words are ``day_time`` without its clock.
+   A page of older rows starts a heading of its own; web.js (joinDays) drops it when the page
+   above ended on the same day. #}
+{% set seen = namespace(day='') %}
 {% for e in events %}
+{% set day = stamp(e.ts)[:10] %}
+{% if day != seen.day %}{% set seen.day = day %}
+<h2 class="day" data-day="{{ day }}">{{ day_time(parse_ts(e.ts)).rsplit(', ', 1)[0] }}</h2>
+{% endif %}
 {% include "event_row.html" %}
 {% endfor %}
 {% if older %}

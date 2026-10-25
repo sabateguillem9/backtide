@@ -384,6 +384,17 @@
 
   // -- history and snapshots: rows rise in ------------------------------------------------------
 
+  // A page of older rows starts a day heading of its own; one for a day that already has a
+  // heading above it is dropped, so a day is told once (T12f-2b). Only attributes are read.
+  function joinDays(scope) {
+    var last = "";
+    scope.querySelectorAll(".day[data-day]").forEach(function (heading) {
+      var day = heading.getAttribute("data-day");
+      if (day === last) heading.parentNode.removeChild(heading);
+      else last = day;
+    });
+  }
+
   function onRowsChange(records) {
     var rows = [];
     records.forEach(function (record) {
@@ -394,6 +405,8 @@
       });
     });
     stagger(rows, 24);
+    var shown = document.getElementById("results");
+    if (shown) joinDays(shown);
   }
 
   var pinned = null; // the snapshot the rewind panel is about: the preview leaves it alone

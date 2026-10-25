@@ -1,9 +1,9 @@
 <details class="event{% if e.source.value == 'snapshot' and e.action == 'take' %} mark{% endif %}" id="e-{{ e.seq }}">
   <summary class="line">
-    <time class="when" datetime="{{ e.ts }}">{{ stamp(e.ts) }}</time>
+    <time class="when" datetime="{{ e.ts }}" title="{{ stamp(e.ts) }}">{{ clock(e.ts) }}</time>
     <span class="dot dot-{{ e.risk }}" role="img" aria-label="{{ t('risk.' ~ e.risk) }}"></span>
     <span class="said">{{ tell(e) }}</span>
-    <span class="tag">{{ e.source.value }}/{{ vis(e.action, 64) }}</span>
+    <span class="more-label">{{ t('hist.details') }}</span>
   </summary>
   <dl class="facts">
     <dt>{{ t('hist.field.seq') }}</dt><dd>{{ e.seq }}</dd>
