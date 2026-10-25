@@ -1,0 +1,16 @@
+# The proxy's channel folder: a small tmpfs of the proxy's own. Mounted here and not by the
+# service, because what the hardened service mounts stays in its own mount namespace and
+# Docker never sees it (docs/25, section 1; T13-1, P5). Written by the installer from
+# deploy/systemd/proxy-channel.mount.in (backtide/setup/units.py); change the template, not this.
+[Unit]
+Description=backtide proxy channel (tmpfs)
+RequiresMountsFor=@STATE_DIR@
+
+[Mount]
+What=@CHANNEL_SOURCE@
+Where=@PROXY_CHANNEL_DIR@
+Type=tmpfs
+Options=@CHANNEL_OPTIONS@
+
+[Install]
+WantedBy=multi-user.target

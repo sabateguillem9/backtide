@@ -1,0 +1,15 @@
+# backtide's volume: Btrfs in a sparse file, mounted through a loop device that systemd sets
+# up and frees itself (docs/25, section 1; T13-1, P2). Written by the installer from
+# deploy/systemd/volume.mount.in (backtide/setup/units.py); change the template, not this.
+[Unit]
+Description=backtide volume (Btrfs in a file)
+RequiresMountsFor=@STATE_DIR@
+
+[Mount]
+What=@VOLUME_IMAGE@
+Where=@VOLUME_MOUNT@
+Type=btrfs
+Options=loop,noatime,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target

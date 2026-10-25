@@ -85,6 +85,7 @@ _FIXED_ENV = (
 )
 
 CHANNEL_TMPFS_SOURCE = "backtide-proxy-channel"  # the tmpfs's name in mountinfo
+CHANNEL_SIZE = "1m"  # the channel folder's tmpfs: a socket needs next to nothing
 _ADDRESS_RE = re.compile(r"[0-9a-fA-F.:]{2,45}", re.ASCII)
 _DOCKER_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", re.ASCII)
 _SIZE_RE = re.compile(r"[1-9][0-9]{0,9}[kmg]", re.ASCII)
@@ -140,7 +141,7 @@ class ProxyJailConfig:
     ready_timeout: float = 30.0  # seconds wait_ready waits by default
     package_dir: Path = PACKAGE_DIR
     backtide_uid: int = 0
-    channel_size: str = "1m"  # the channel folder's tmpfs: a socket needs next to nothing
+    channel_size: str = CHANNEL_SIZE
     internal_egress: bool = False  # a test-only concession, see the docstring
     allow_shared_ids: bool = False  # a test-only concession, see the docstring
     egress_neighbours: tuple[str, ...] = ()  # a test-only concession, see the docstring
@@ -248,11 +249,14 @@ def proxy_env(config: ProxyJailConfig) -> list[tuple[str, str]]:
 def channel_mount_argv(config: ProxyJailConfig) -> list[str]:
     """``mount`` (as root) of the channel folder's tmpfs: small, the proxy's own, no devices,
     no set-uid, nothing executable."""
-    options = (
-        f"size={config.channel_size},mode=0700,uid={config.uid},gid={config.gid},"
-        "nosuid,nodev,noexec"
-    )
+    options = channel_tmpfs_options(config.channel_size, config.uid, config.gid)
     return ["mount", "-t", "tmpfs", "-o", options, CHANNEL_TMPFS_SOURCE, str(config.channel_dir)]
+
+
+def channel_tmpfs_options(size: str, uid: int, gid: int) -> str:
+    """The channel tmpfs's mount options, the same for ``mount`` and for the systemd mount unit
+    an installed backtide uses (docs/25, section 1)."""
+    return f"size={size},mode=0700,uid={uid},gid={gid},nosuid,nodev,noexec"
 
 
 def volume_binds(config: ProxyJailConfig) -> list[str]:

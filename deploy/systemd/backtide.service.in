@@ -1,0 +1,38 @@
+# backtide: the black box around the AI agent. Written by the installer from
+# deploy/systemd/backtide.service.in (backtide/setup/units.py); change the template, not this.
+# Root with a short capability list (docs/25, section 2, option A, as measured in T13-1).
+[Unit]
+Description=backtide, black box for an AI agent
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+RequiresMountsFor=@VOLUME_MOUNT@ @PROXY_CHANNEL_DIR@
+AssertPathIsMountPoint=@VOLUME_MOUNT@
+AssertPathIsMountPoint=@PROXY_CHANNEL_DIR@
+
+[Service]
+Type=simple
+ExecStart=@PROGRAM@ vigilar --config @CONFIG_FILE@
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+KillMode=mixed
+UMask=0077
+CapabilityBoundingSet=@CAPABILITIES@
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@STATE_DIR@ @VOLUME_MOUNT@
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

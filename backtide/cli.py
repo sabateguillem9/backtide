@@ -33,6 +33,8 @@ from backtide.service.retenidas import decide as decide_hold
 from backtide.service.retenidas import listing as list_holds
 from backtide.service.runner import ServiceLocked, ServiceRunning, serve, take_lock
 from backtide.service.seguir import seguir
+from backtide.setup import layout, preflight
+from backtide.setup.host import SystemHost
 from backtide.snapshots import Snapshot, SnapshotError, SnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,7 @@ EXIT_ERROR = 2  # usage errors (argparse also exits with 2) and unreadable input
 EXIT_PROBLEM = 3  # rebobinar: rewound, but something went wrong afterwards (or cannot tell)
 NOT_VERIFIED = "NO VERIFICADA: trátala como no íntegra"
 MAX_LISTED_PROBLEMS = 50
-DEFAULT_CONFIG = Path("/etc/backtide/backtide.toml")
+DEFAULT_CONFIG = layout.CONFIG_FILE
 DEFAULT_LISTED_SNAPSHOTS = 30  # docs/19, decision 21
 # Only `backtide rebobinar` says this: the rest of the notice is backtide/service/notice.py.
 REWIND_NOTICE_WITHOUT_SERVICE = (
@@ -134,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.set_defaults(handler=_resume)
     _add_holds(commands)
     _add_spending(commands)
+    _add_check(commands)
     _add_web(commands)
     _add_shell(commands)
     return parser
@@ -338,6 +341,26 @@ def _add_spending(commands: "argparse._SubParsersAction[argparse.ArgumentParser]
     caps.add_argument("--dia", dest="day", metavar="N", help="nuevo tope diario, en dólares")
     caps.add_argument("--mes", dest="month", metavar="N", help="nuevo tope mensual, en dólares")
     caps.set_defaults(handler=_caps)
+
+
+def _add_check(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """`backtide comprobar` (T13-2): the installer's preflight, for anyone, at any time."""
+    check = commands.add_parser(
+        "comprobar",
+        help="comprueba si esta máquina sirve para backtide",
+        description="Repasa lo que backtide necesita de esta máquina (kernel, Btrfs, cgroup v2, "
+        "systemd, BTF para el sensor de procesos, espacio, Docker, SELinux o AppArmor...) y dice "
+        "cómo arreglar lo que falte. No cambia nada. Con `sudo` lo ve todo. Sale con 0 si no hay "
+        "ningún fallo (los avisos no cuentan) y 1 si hay alguno.",
+    )
+    check.set_defaults(handler=_check)
+
+
+def _check(args: argparse.Namespace) -> int:
+    """`backtide comprobar`."""
+    checks = preflight.run_checks(SystemHost(), installing=False)
+    print(preflight.report(checks))
+    return EXIT_FAILED if preflight.failed(checks) else EXIT_OK
 
 
 def _add_config(parser: argparse.ArgumentParser) -> None:

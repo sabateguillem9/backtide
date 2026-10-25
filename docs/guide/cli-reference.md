@@ -27,6 +27,7 @@ Other guides: [getting started](getting-started.md), [configuration](configurati
 | `backtide tarea` | Give the coding agent one task ("task") |
 | `backtide importar` | Copy a folder from your computer into the agent's workspace ("import") |
 | `backtide exportar` | Copy the agent's work out to a new folder on your computer ("export") |
+| `backtide comprobar` | Check whether this machine can run backtide ("check") |
 
 `backtide --version` prints the version (`backtide 0.1.0` today). `backtide` on its own, or `backtide --help`, prints the list of commands. Each command also answers to `--help`.
 
@@ -408,6 +409,22 @@ backtide tope [--config FILE] [--dia DOLLARS] [--mes DOLLARS]
 ```sh
 backtide tope --dia 3 --mes 20 --config ~/backtide-demo-run/backtide.toml
 ```
+
+## Check the machine
+
+### `backtide comprobar`
+
+Checks whether this Linux machine has what backtide needs, and says how to fix what is missing. It reads and changes nothing. The installer (not ready yet) runs the same checks before it touches anything.
+
+```sh
+sudo backtide comprobar
+```
+
+- What it looks at: root, the architecture (x86_64 or aarch64), the kernel (6.7 or later), Btrfs, loop devices, cgroup v2, systemd, time sync, the kernel's BTF (the process sensor needs it), free space in `/var/lib`, that the ids 61000 and 61001 belong to nobody, `btrfs-progs`, `openssl`, Docker Engine (not Docker Desktop, Podman or rootless Docker) and SELinux or AppArmor.
+- Each line is `[ok]`, `[aviso]` (a warning: something works less, or the installer will do it with your permission) or `[falla]` (a failure: backtide cannot run safely here). Under each warning or failure, how to fix it.
+- Without `sudo` it still runs, with a warning: some checks (Docker, SELinux) may come out short.
+- **Fedora 43 and 44 with kernel 7.1 or later:** the process sensor (Tetragon v1.7.1) cannot read their BTF yet, so the agent runs but its commands are not recorded. `comprobar` warns about it. Ubuntu 24.04 and 26.04 are fine. It goes away with Tetragon 1.8.
+- Exit codes: `0` no failure (warnings do not count); `1` at least one failure.
 
 ## `make` commands
 

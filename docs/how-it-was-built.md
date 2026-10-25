@@ -137,7 +137,7 @@ Measured on 2026-10-22, at commit `0800a5a`.
 | Calendar | 2026-10-05 to 2026-10-22, commits on 10 different days | `git log --date=short` |
 | Unit tests (Mac) | 9,212; in a run of `make test` that day, 9,208 passed and 4 were skipped | `uv run pytest --collect-only -q` |
 | VM integration tests | 453 | `uv run pytest --collect-only -q -m integration` |
-| Attack battery | 86 scenarios: 80 ready with tests, 6 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
+| Attack battery | 93 scenarios: 80 ready with tests, 13 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
 | Product code | 56,683 lines in 122 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
 | Test code | 101,273 lines in 272 Python files | the same for `tests/` |
 | Documents | 36 numbered documents in `docs/`, plus the backlog, the log and two guides | `ls docs/*.md`. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
