@@ -121,7 +121,7 @@ def test_the_state_follows_the_agent(tmp_path: Path) -> None:
 
     events = stream(tmp_path, "?after=1", write=write)
     (state,) = of_kind(events, "state")
-    assert "congelado" in state["data"] and "st-frozen" in state["data"]
+    assert "Congelado: no hace nada" in state["data"] and "st-frozen" in state["data"]
 
 
 def test_the_tide_follows_the_snapshots(tmp_path: Path) -> None:

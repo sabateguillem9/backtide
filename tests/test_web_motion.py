@@ -234,7 +234,7 @@ def test_the_dot_lives_outside_what_the_stream_replaces(web: TestClient) -> None
         r'<div class="tide-wrap" id="tide" sse-swap="tide">(.*?)</div>\s*<svg', html, re.S
     )
     assert swapped and "tide-head" not in swapped.group(1)
-    assert 'class="tide-head"' in html and 'class="tide-frame is-intro" data-tide' in html
+    assert 'class="tide-head"' in html and 'class="tide-frame can-rewind" data-tide' in html
     assert 'stroke="url(#tide-fade)"' in html, "the tide's fade-in, drawn by the SVG itself"
 
 
@@ -363,7 +363,7 @@ def test_asking_has_its_own_page_in_the_navigation(web: TestClient) -> None:
     html = web.get("/ahora").text
     assert f'href="{PREFIX_PATH}/ahora/preguntar">Preguntar</a>' in html
     page = web.get("/ahora/preguntar").text
-    assert re.search(r'aria-current="page">Preguntar<span class="nav-line"', page)
+    assert re.search(r'aria-current="page">Preguntar</a>', page), "its tab in the agent's bar"
     assert 'class="line you"' not in page, "no question yet: only the help"
     assert "Puedes preguntar" in page
     assert page.count(f'hx-get="{PREFIX_PATH}/ahora/preguntar?q=') == 3, "three suggestions"
@@ -371,10 +371,18 @@ def test_asking_has_its_own_page_in_the_navigation(web: TestClient) -> None:
 
 
 def test_the_current_page_carries_the_gliding_underline(web: TestClient) -> None:
+    """One underline per page, under what is current: in the header on the global pages, under
+    the tab on an agent's pages (T12f-2a); the same view-transition name, so it glides."""
     for path, label in (("/historia", "Historia"), ("/instantaneas", "Instantáneas")):
         html = web.get(path).text
-        assert html.count('class="nav-line"') == 1
-        assert re.search(rf'aria-current="page">{label}<span class="nav-line"', html)
+        assert re.search(rf'<a [^>]*aria-current="page">{label}</a>', html)
+        assert html.count('aria-current="page"') == 1
+    panel = web.get("/panel").text
+    assert panel.count('class="nav-line"') == 1
+    css = web.get("/static/web.css").text
+    assert re.search(
+        r'\.agentbar-tabs a\[aria-current="page"\]::after \{ view-transition-name: nav-line', css
+    )
 
 
 def test_the_snapshots_page_draws_its_list_on_a_tide(tmp_path: Path) -> None:

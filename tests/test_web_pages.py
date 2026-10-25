@@ -60,7 +60,7 @@ def test_now_tells_what_happened_as_a_conversation(web: TestClient) -> None:
 
 def test_the_agent_state_is_at_the_top(web: TestClient) -> None:
     html = web.get("/ahora").text
-    assert "El agente" in text_of(html) and "vigilado" in text_of(html)
+    assert "Vigilado: todo lo que haga queda grabado." in text_of(html)
     assert 'class="status-dot st-watched"' in html
     assert html.index("st-watched") < html.index('id="feed"')
 

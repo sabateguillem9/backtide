@@ -1,6 +1,4 @@
-<p class="agent">
-  <span class="muted">{{ t('agent.label') }}</span>
-  <span class="status-dot st-{{ state }}" aria-hidden="true"></span>
-  <strong>{{ t('state.' ~ state) }}</strong>
-</p>
+{# The agent's state in one sentence (T12f-2a). The stream sends this again when the state
+   changes; the dot stays because the heartbeat of the tide looks for ``.st-watched`` here. #}
+<h1 class="statement"><span class="status-dot st-{{ state }}" aria-hidden="true"></span>{{ t('now.is.' ~ state) if t.has('now.is.' ~ state) else t('now.is.unknown') }}</h1>
 <p class="note">{% if state_time %}{{ t('state.note', time=state_time) }}{% else %}{{ t('state.none') }}{% endif %}</p>

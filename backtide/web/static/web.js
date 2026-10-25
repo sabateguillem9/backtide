@@ -19,9 +19,6 @@
   function moving() {
     return !(reduce && reduce.matches) && typeof Element.prototype.animate === "function";
   }
-  function inOut(t) {
-    return 0.5 - Math.cos(Math.PI * t) / 2;
-  }
   function out(t) {
     return 1 - Math.pow(1 - t, 3);
   }
@@ -138,38 +135,6 @@
     };
   }
 
-  // Points of the drawn line, left to right: where the dot rides during the intro.
-  function wavePoints() {
-    var points = [];
-    frame.querySelectorAll("svg.tide .tide-line").forEach(function (path) {
-      if (typeof path.getTotalLength !== "function") return;
-      var length = path.getTotalLength();
-      var n = Math.max(2, Math.ceil(length / 2));
-      for (var i = 0; i <= n; i++) {
-        var p = path.getPointAtLength((length * i) / n);
-        points.push([p.x, p.y]);
-      }
-    });
-    points.sort(function (a, b) { return a[0] - b[0]; });
-    return points;
-  }
-  function yAt(points, x) {
-    if (!points.length) return tide.base;
-    var lo = 0;
-    var hi = points.length - 1;
-    if (x <= points[lo][0]) return points[lo][1];
-    if (x >= points[hi][0]) return points[hi][1];
-    while (hi - lo > 1) {
-      var mid = (lo + hi) >> 1;
-      if (points[mid][0] <= x) lo = mid;
-      else hi = mid;
-    }
-    var a = points[lo];
-    var b = points[hi];
-    var t = b[0] === a[0] ? 0 : (x - a[0]) / (b[0] - a[0]);
-    return a[1] + (b[1] - a[1]) * t;
-  }
-
   function rememberMarks(fresh) {
     frame.querySelectorAll(".tide-mark").forEach(function (mark) {
       var at = mark.getAttribute("data-at") || mark.getAttribute("cx");
@@ -201,49 +166,10 @@
     go.onfinish = function () { ring.remove(); };
   }
 
-  // The intro: the line draws in from the left (CSS) and the dot rides its head (here, in step).
-  function intro() {
-    if (!frame || !frame.classList.contains("is-intro")) return;
-    var done = function () {
-      frame.classList.remove("is-intro");
-      frame.classList.add("can-rewind");
-    };
-    var win = lineParts().win;
-    if (!moving() || !tide || !win || !win.getAnimations) {
-      done();
-      return;
-    }
-    var base = win.getAnimations()[0];
-    if (!base) {
-      done();
-      return;
-    }
-    var points = wavePoints();
-    var start = points.length ? points[0][0] : 0;
-    var frames = [];
-    for (var i = 0; i <= 48; i++) {
-      var o = i / 48;
-      var edge = inOut(o) * tide.width;
-      var x = clamp(edge, start, tide.right);
-      frames.push({
-        offset: o,
-        transform: "translate(" + (x - tide.right).toFixed(2) + "px," + (yAt(points, x) - tide.base).toFixed(2) + "px)",
-        opacity: clamp((edge - start) / 30, 0, 1),
-      });
-    }
-    var ride = tide.pos.animate(frames, { duration: 1800, easing: "linear", fill: "backwards" });
-    base.ready.then(function () {
-      if (base.startTime !== null) ride.startTime = base.startTime;
-    });
-    ride.onfinish = done;
-    base.onfinish = done;
-    base.oncancel = done;
-  }
-
   // Something happened: the dot hops (its hops are the agent's activity) and the sea swells.
   var hopping = null;
   function stir() {
-    if (!tide || !moving() || document.hidden || frame.classList.contains("is-intro")) return;
+    if (!tide || !moving() || document.hidden) return;
     if (!hopping && tide.hop) {
       hopping = tide.hop.animate(
         [
@@ -326,7 +252,7 @@
   // -- the conversation -------------------------------------------------------------------------
 
   var feed = document.getElementById("feed");
-  var stick = true;
+  var stick = atBottom(); // at the top of a long page nothing drags it down (T12f-2a)
   var jump = document.querySelector(".ask .jump");
 
   function atBottom() {
@@ -871,7 +797,6 @@
   if (frame) {
     rememberMarks(false);
     runCounters(frame, true);
-    intro();
   }
   if (feed) {
     var lines = feed.querySelectorAll(".line[id] time[datetime]");
@@ -882,8 +807,6 @@
       if (at !== null) alertUntil = Math.max(alertUntil, at + 90000);
     });
     new MutationObserver(onFeedChange).observe(feed, { childList: true });
-    toBottom(false);
-    window.addEventListener("load", function () { toBottom(false); });
   }
   var results = document.getElementById("results");
   if (results) {

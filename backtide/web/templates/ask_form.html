@@ -6,4 +6,13 @@
     <span class="field-line"></span>
     <button class="dot-button" type="submit" aria-label="{{ t('chat.send') }}">{% include "arrow.html" %}</button>
   </div>
+  {# Questions the rules answer (ask.py): one click asks them. Without JavaScript they are
+     plain links to the chat's own page. #}
+  {% if examples is defined and examples %}
+  <ul class="ask-examples" aria-label="{{ t('chat.examples') }}">
+    {% for key in ('last_hour', 'today', 'state') %}
+    <li><a href="{{ abase }}/ahora/preguntar?q={{ t.raw('chat.example.' ~ key) | urlencode }}" hx-get="{{ abase }}/ahora/preguntar?q={{ t.raw('chat.example.' ~ key) | urlencode }}" hx-target="#feed" hx-swap="beforeend">{{ t('chat.example.' ~ key) }}</a></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
 </form>

@@ -2,8 +2,7 @@
 {% block title %}{{ t('now.title') }}{% endblock %}
 {% block main %}
 <main class="watch a-{{ agent.colour }}" hx-ext="sse" sse-connect="{{ abase }}/ahora/stream?after={{ head }}">
-  <h1>{{ t('now.title') }}</h1>
-  <p class="lede">{{ t('now.lede') }}</p>
+  <p class="eyebrow">{{ t('now.title') }} · {{ t('now.lede') }}</p>
   <div class="watchbar">
     <div class="state" id="state" sse-swap="state">{% include "state.html" %}</div>
     <p class="last-move" data-off="{{ t('live.off') }}">
@@ -22,6 +21,7 @@
     {% include "line.html" %}
     {% endfor %}
   </div>
+  {% set examples = true %}
   {% include "ask_form.html" %}
 </main>
 {% endblock %}

@@ -1,5 +1,5 @@
-"""T12f-1 and T12f-1b: the header, the control room, the requests, the cards and the feed, told
-in a person's words.
+"""T12f-1, T12f-1b and T12f-2a: the header, the control room, the requests, the cards, the feed
+and the agent's pages, told in a person's words.
 
 The agent's text is drawn as it is (no ligatures), a request is titled by what it wants to do
 (the verb from what the gate read, never from what the agent wrote), the control room opens
@@ -27,7 +27,7 @@ from tests.test_web_panel import (
     source,
     text_of,
 )
-from tests.webkit import START, new_box, new_client
+from tests.webkit import PREFIX_PATH, START, new_box, new_client
 
 DELETE = {
     "reason": "delete", "method": "DELETE", "host": "api.github.com",
@@ -446,3 +446,197 @@ def test_a_delete_and_anything_above_risk_0_are_never_routine(tmp_path: Path) ->
 def test_a_hidden_name_shows_when_it_has_the_keyboard() -> None:
     css = (STATIC / "web.css").read_text()
     assert ".pline.same .who:focus-visible" in css
+
+
+# -- T12f-2a: Now, the agent's bar and the still tide ----------------------------------------
+
+
+def agent_pages(tmp_path: Path, script=None) -> TestClient:
+    clock = FakeClock(START)
+    box = new_box(tmp_path, clock)
+    box.append("system", "agent_start", "")
+    if script is not None:
+        script(box, clock)
+    return new_client(tmp_path, clock=lambda: START + timedelta(minutes=1))
+
+
+def test_the_tide_is_drawn_still(tmp_path: Path) -> None:
+    """No entrance: it draws where it is (the entrance left Snapshots blank when the browser did
+    not run the animation), and it can already move the dot to a point it is shown."""
+    html = agent_pages(tmp_path).get("/ahora").text
+    assert 'class="tide-frame can-rewind" data-tide' in html and "is-intro" not in html
+    css = (STATIC / "web.css").read_text()
+    assert "is-intro" not in css and "tide-window-in" not in css
+    js = (STATIC / "web.js").read_text()
+    assert "is-intro" not in js and "function intro" not in js
+
+
+def header_links(html: str) -> list[str]:
+    nav = re.search(r'<header class="top">.*?<nav[^>]*>(.*?)</nav>', html, re.S)
+    assert nav, "the header's navigation"
+    return [text_of(a) for a in re.findall(r"<a [^>]*>.*?</a>", nav.group(1), re.S)]
+
+
+@pytest.mark.parametrize(
+    ("path", "current"),
+    [
+        ("/ahora", "Ahora"),
+        ("/historia", "Historia"),
+        ("/instantaneas", "Instantáneas"),
+        ("/ahora/preguntar", "Preguntar"),
+    ],
+)
+def test_the_agent_has_a_bar_with_its_tabs_and_the_header_is_only_global(
+    tmp_path: Path, path: str, current: str
+) -> None:
+    html = agent_pages(tmp_path).get(path).text
+    assert header_links(html) == ["Panel", "Peticiones", "Ajustes"]
+    assert '<div class="agentbar a-' in html, "the agent's bar"
+    tabs = re.search(r'<nav class="agentbar-tabs"[^>]*>(.*?)</nav>', html, re.S)
+    assert tabs
+    assert [text_of(a) for a in re.findall(r"<a [^>]*>.*?</a>", tabs.group(1), re.S)] == [
+        "Ahora",
+        "Historia",
+        "Instantáneas",
+        "Preguntar",
+    ]
+    assert re.findall(r'<a [^>]*aria-current="page"[^>]*>(.*?)</a>', tabs.group(1), re.S) == [
+        current
+    ]
+
+
+def test_the_panel_and_the_other_pages_have_no_agent_bar(tmp_path: Path) -> None:
+    web = agent_pages(tmp_path)
+    for path in ("/panel", "/peticiones", "/ajustes"):
+        assert "agentbar-tabs" not in web.get(path).text, path
+
+
+def test_the_tabs_of_another_agent_stay_under_its_address(tmp_path: Path) -> None:
+    clock = FakeClock(START)
+    new_box(tmp_path, clock).append("system", "agent_start", "")
+    other_box(tmp_path, "correo", clock).append("system", "agent_start", "")
+    web = new_client(
+        tmp_path,
+        clock=lambda: START,
+        others=[source(tmp_path, "correo", "Asistente de correo")],
+    )
+    html = web.get("/agentes/correo/historia").text
+    tabs = re.search(r'<nav class="agentbar-tabs"[^>]*>(.*?)</nav>', html, re.S)
+    assert tabs and re.findall(r'href="([^"]*)"', tabs.group(1)) == [
+        f"{PREFIX_PATH}/agentes/correo/ahora",
+        f"{PREFIX_PATH}/agentes/correo/historia",
+        f"{PREFIX_PATH}/agentes/correo/instantaneas",
+        f"{PREFIX_PATH}/agentes/correo/ahora/preguntar",
+    ]
+    assert "Asistente de correo" in text_of(html[html.index("agentbar") :][:600])
+    assert "OpenClaw" not in text_of(tabs.group(1)) and "Tu agente" in text_of(
+        html[html.index("agentbar-others") :][:400]
+    ), "the other agents stay one click away"
+
+
+@pytest.mark.parametrize(
+    ("script", "sentence"),
+    [
+        (None, "Vigilado: todo lo que haga queda grabado."),
+        (
+            lambda box, clock: box.append("system", "space_pause", "", details={"frozen": True}),
+            "Congelado: no hace nada hasta que liberes espacio.",
+        ),
+        (lambda box, clock: box.append("system", "agent_stop", ""), "Parado."),
+    ],
+)
+def test_now_opens_with_the_state_in_one_sentence(tmp_path: Path, script, sentence: str) -> None:
+    html = agent_pages(tmp_path, script).get("/ahora").text
+    state = re.search(r'<div class="state" id="state"[^>]*>(.*?)</div>', html, re.S)
+    assert state
+    h1 = re.search(r'<h1 class="statement">(.*?)</h1>', state.group(1), re.S)
+    assert h1 and text_of(h1.group(1)) == sentence
+    assert html.count("<h1") == 1, "the sentence is the page's one heading"
+    assert "El agente" not in text_of(state.group(1)), "no more 'El agente: vigilado'"
+
+
+def test_the_state_sentence_in_english(tmp_path: Path) -> None:
+    html = agent_pages(tmp_path).get("/ahora", headers={"accept-language": "en"}).text
+    assert "Watched: everything it does is recorded." in text_of(html)
+
+
+def test_a_state_keeps_the_dot_the_heartbeat_looks_for(tmp_path: Path) -> None:
+    html = agent_pages(tmp_path).get("/ahora").text
+    assert re.search(r'<div class="state" id="state".*?class="status-dot st-watched"', html, re.S)
+
+
+def test_now_does_not_scroll_by_itself() -> None:
+    """The sentence on top is the first thing seen; the "new lines" button says what arrives."""
+    js = (STATIC / "web.js").read_text()
+    assert "var stick = atBottom();" in js, "a long page is not dragged down by a new line"
+    assert 'addEventListener("load", function () { toBottom(false); })' not in js
+    assert not re.search(r"observe\(feed, \{ childList: true \}\);\s*toBottom\(false\)", js)
+
+
+def test_calm_lines_are_quiet_and_a_delete_is_not(tmp_path: Path) -> None:
+    def script(box, clock):
+        clock.advance(timedelta(seconds=1))
+        box.append("exec", "run", "git status")
+        clock.advance(timedelta(seconds=1))
+        box.append("exec", "run", "rm -rf build", risk=2)
+        clock.advance(timedelta(seconds=1))
+        box.append("file", "delete", "work/.env", risk=0)
+
+    html = agent_pages(tmp_path, script).get("/ahora").text
+    lines = {
+        text_of(body): cls
+        for cls, body in re.findall(
+            r'<div class="(line[^"]*)" id="l-\d+"[^>]*>(.*?)</div>\s*(?=<div class="line|</div>)',
+            html,
+            re.S,
+        )
+    }
+    by = lambda needle: next(c for text, c in lines.items() if needle in text)  # noqa: E731
+    assert "routine" in by("git status")
+    assert "routine" not in by("rm -rf build") and "routine" not in by(".env")
+
+
+def test_the_chat_offers_questions_it_can_answer(tmp_path: Path) -> None:
+    html = agent_pages(tmp_path).get("/ahora").text
+    examples = re.search(r'<ul class="ask-examples"[^>]*>(.*?)</ul>', html, re.S)
+    assert examples
+    links = re.findall(r'<a [^>]*href="([^"]*)"[^>]*>(.*?)</a>', examples.group(1), re.S)
+    assert len(links) == 3
+    for href, label in links:
+        assert href.startswith(f"{PREFIX_PATH}/ahora/preguntar?q="), href
+        assert "hx-get=" in examples.group(1) and 'hx-target="#feed"' in examples.group(1)
+        # each one is a question the rules answer (ask.py): not a "not yet"
+        answer = new_client(tmp_path, clock=lambda: START).get(href).text
+        assert "todavía no lo sé responder" not in answer, label
+
+
+def test_the_questions_are_not_offered_twice_on_the_chat_page(tmp_path: Path) -> None:
+    """Its own page already lists what it can answer; the examples are for Now."""
+    html = agent_pages(tmp_path).get("/ahora/preguntar").text
+    assert "ask-examples" not in html
+    assert html.count(f'hx-get="{PREFIX_PATH}/ahora/preguntar?q=') == 3
+
+
+def test_the_chat_field_is_not_pinned_on_a_phone() -> None:
+    css = (STATIC / "web.css").read_text()
+    assert re.search(r"@media \(max-width: 480px\) \{[^}]*\.ask \{ position: relative; \}", css)
+    assert re.search(r"\.jump \{ position: fixed;", css), (
+        "the 'new lines' button follows the screen"
+    )
+
+
+def test_a_name_with_hidden_characters_cannot_break_the_bars_markup(tmp_path: Path) -> None:
+    """The tabs are named by the agent's own name element, never by a copy of it in an attribute:
+    the marker `vis` writes for a bidi character carries quotes of its own (review of T12f-2a)."""
+    clock = FakeClock(START)
+    new_box(tmp_path, clock).append("system", "agent_start", "")
+    other_box(tmp_path, "correo", clock).append("system", "agent_start", "")
+    web = new_client(
+        tmp_path,
+        clock=lambda: START,
+        others=[source(tmp_path, "correo", "Asistente\u202ede correo")],
+    )
+    html = web.get("/agentes/correo/ahora").text
+    nav = re.search(r'<nav class="agentbar-tabs"[^>]*>', html)
+    assert nav and nav.group(0) == '<nav class="agentbar-tabs" aria-labelledby="agentbar-name">'
+    assert html.count('id="agentbar-name"') == 1 and "\u202e" not in html

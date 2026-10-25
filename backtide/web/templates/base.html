@@ -17,7 +17,6 @@
 </head>
 <body data-age-now="{{ t.raw('age.now') }}" data-age-sec="{{ t.raw('age.sec') }}" data-age-min="{{ t.raw('age.min') }}" data-age-hour="{{ t.raw('age.hour') }}" data-age-day="{{ t.raw('age.day') }}">
 {% set many = roster | length > 1 %}
-{% set here = agent if agent else (roster.main if (not many or active not in ('', 'panel')) else none) %}
 {# One header, of one width on every page (T12f-1): it does not move as you go. #}
 <div class="topbar">
 <header class="top">
@@ -28,11 +27,6 @@
   {% if active %}
   <nav aria-label="{{ t('nav.label') }}">
     <a href="{{ base }}/panel"{% if active == 'panel' %} aria-current="page"{% endif %}>{{ t('nav.panel') }}{% if active == 'panel' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
-    {% if here %}
-    {% for key, path, label in (('now', '/ahora', 'nav.now'), ('history', '/historia', 'nav.history'), ('snapshots', '/instantaneas', 'nav.snapshots'), ('ask', '/ahora/preguntar', 'nav.ask')) %}
-    <a href="{{ here.base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}{% if active == key %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
-    {% endfor %}
-    {% endif %}
     <a href="{{ base }}/peticiones"{% if active == 'holds' %} aria-current="page"{% endif %}>{{ t('nav.holds') }}{% if requests is defined %} <span class="badge" data-waiting-badge{% if not requests %} hidden{% endif %}><span class="badge-dot" aria-hidden="true"></span><span class="num" data-waiting-n>{{ requests | length if requests else 0 }}</span><span class="visually-hidden"> {{ t('nav.waiting') }}</span></span>{% endif %}{% if active == 'holds' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     <a href="{{ base }}/ajustes"{% if active == 'settings' %} aria-current="page"{% endif %}>{{ t('nav.settings') }}{% if active == 'settings' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
   </nav>
@@ -40,13 +34,24 @@
 </header>
 </div>
 <div class="page{% if wide %} wide{% endif %}">
-{% if agent and many %}
+{# The agent's own bar (T12f-2a): who it is, the others one click away, and its four pages. The
+   header above keeps only what is global. #}
+{% if agent and active in ('now', 'history', 'snapshots', 'ask') %}
 <div class="agentbar a-{{ agent.colour }}">
-  <p class="agentbar-who"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(agent), 48) }}</span></p>
-  <nav class="agentbar-others" aria-label="{{ t('agents.switch') }}">
-    {% for other in roster %}{% if other.slug != agent.slug %}
-    <a class="a-{{ other.colour }}" href="{{ other.base }}/{{ 'ahora/preguntar' if active == 'ask' else ('historia' if active == 'history' else ('instantaneas' if active == 'snapshots' else 'ahora')) }}"><span class="tag" aria-hidden="true"></span>{{ vis(agent_name(other), 48) }}</a>
-    {% endif %}{% endfor %}
+  <div class="agentbar-top">
+    <p class="agentbar-who"><span class="tag" aria-hidden="true"></span><span class="agent-name" id="agentbar-name">{{ vis(agent_name(agent), 48) }}</span></p>
+    {% if many %}
+    <nav class="agentbar-others" aria-label="{{ t('agents.switch') }}">
+      {% for other in roster %}{% if other.slug != agent.slug %}
+      <a class="a-{{ other.colour }}" href="{{ other.base }}/{{ 'ahora/preguntar' if active == 'ask' else ('historia' if active == 'history' else ('instantaneas' if active == 'snapshots' else 'ahora')) }}"><span class="tag" aria-hidden="true"></span>{{ vis(agent_name(other), 48) }}</a>
+      {% endif %}{% endfor %}
+    </nav>
+    {% endif %}
+  </div>
+  <nav class="agentbar-tabs" aria-labelledby="agentbar-name">
+    {% for key, path, label in (('now', '/ahora', 'nav.now'), ('history', '/historia', 'nav.history'), ('snapshots', '/instantaneas', 'nav.snapshots'), ('ask', '/ahora/preguntar', 'nav.ask')) %}
+    <a href="{{ agent.base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}</a>
+    {% endfor %}
   </nav>
 </div>
 {% endif %}
