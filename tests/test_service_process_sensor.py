@@ -9,6 +9,7 @@ import copy
 import json
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,35 @@ from backtide.service.process_sensor import (
     recorded_keys,
 )
 from backtide.snapshots import Snapshot
+
+
+@pytest.fixture(autouse=True)
+def readers_stop_with_their_test(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A sensor a test starts and never stops keeps its reader's thread polling the test's
+    folder every 0.5 s for the rest of the suite: 48 of them did, and another test's descriptor
+    check took one of their cursor files for a leak of its own. Each reader still running at the
+    end of its test is stopped, and none may be left alive."""
+    running: list[TetragonReader] = []
+    start, stop = TetragonReader.start, TetragonReader.stop
+
+    def noted_start(reader: TetragonReader) -> None:
+        start(reader)
+        running.append(reader)
+
+    def noted_stop(reader: TetragonReader, timeout: float = 10.0) -> None:
+        if reader in running:
+            running.remove(reader)
+        stop(reader, timeout)
+
+    monkeypatch.setattr(TetragonReader, "start", noted_start)
+    monkeypatch.setattr(TetragonReader, "stop", noted_stop)
+    before = set(threading.enumerate())
+    yield
+    for reader in list(running):
+        reader.stop()
+    left = [t for t in set(threading.enumerate()) - before if t.name == "tetragon-reader"]
+    assert [t for t in left if t.is_alive()] == []
+
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tetragon"
 AGENT_ID = "4978b4ee592382f24921acfc5822f6f33f7e95e6c89887f80dac399102aa2eff"
