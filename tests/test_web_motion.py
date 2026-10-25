@@ -411,12 +411,12 @@ def test_snapshots_have_human_titles_and_a_small_id(tmp_path: Path) -> None:
     web = new_client(tmp_path, snapshots=lambda: snaps, clock=lambda: now)
     html = web.get("/instantaneas").text
     titles = re.findall(r'<time class="snaptitle"[^>]*>([^<]+)</time>', html)
-    assert titles == ["Hoy, 09:24", "Ayer, 12:53", "14 oct, 09:10", "3 mar 2025, 08:05"]
+    assert titles == ["09:24", "Ayer, 12:53", "14 oct, 09:10", "3 mar 2025, 08:05"]
     assert "antes de rebobinar" in html and "manual" in html
     assert re.findall(r'<span class="sid">([^<]+)</span>', html) == [s.id for s in snaps[::-1]]
     english = web.get("/instantaneas?lang=en").text
     titles = re.findall(r'<time class="snaptitle"[^>]*>([^<]+)</time>', english)
-    assert titles == ["Today, 09:24", "Yesterday, 12:53", "14 Oct, 09:10", "3 Mar 2025, 08:05"]
+    assert titles == ["09:24", "Yesterday, 12:53", "14 Oct, 09:10", "3 Mar 2025, 08:05"]
     assert "before a rewind" in english
 
 

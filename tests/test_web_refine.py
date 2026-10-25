@@ -1,5 +1,5 @@
-"""T12f-1, T12f-1b, T12f-2a and T12f-2b: the header, the control room, the requests, the cards,
-the feed, the agent's pages and its history, told in a person's words.
+"""T12f-1 to T12f-2c: the header, the control room, the requests, the cards, the feed, the
+agent's pages, its history and its snapshots, told in a person's words.
 
 The agent's text is drawn as it is (no ligatures), a request is titled by what it wants to do
 (the verb from what the gate read, never from what the agent wrote), the control room opens
@@ -9,13 +9,15 @@ run and can put the routine aside.
 """
 
 import re
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from backtide.service.notice import rewind_notice
+from backtide.snapshots import Reason, Snapshot
 from tests.conftest import FakeClock
 from tests.test_web_decide import NOW as HOLD_NOW
 from tests.test_web_decide import FakeApprover, hold
@@ -27,6 +29,7 @@ from tests.test_web_panel import (
     source,
     text_of,
 )
+from tests.test_web_rewind import FakeRewinder
 from tests.webkit import PREFIX_PATH, START, new_box, new_client
 
 DELETE = {
@@ -829,3 +832,116 @@ def test_a_burst_or_an_older_page_is_not_the_whole_of_a_chip(tmp_path: Path) -> 
     web = history_web(tmp_path)
     for query in ("origen=file&tras=1&antes=9", "antes=5"):
         assert not [c for c in chips_of(web.get(f"/historia?{query}").text) if c[2]], query
+
+
+# -- T12f-2c: Snapshots ----------------------------------------------------------------------------
+
+SNAP_NOW = datetime(2026, 10, 16, 18, 0, tzinfo=UTC)
+SNAP_AGES = (timedelta(minutes=3), timedelta(minutes=30), timedelta(hours=3), timedelta(hours=30))
+
+
+def snapshots_web(tmp_path: Path, ages=SNAP_AGES) -> TestClient:
+    snaps = [Snapshot(SNAP_NOW - age, str(Reason.PERIODIC)) for age in reversed(ages)]
+    new_box(tmp_path).append("file", "create", "work/a.md")
+    return new_client(
+        tmp_path, snapshots=lambda: snaps, rewinder=FakeRewinder(), clock=lambda: SNAP_NOW
+    )
+
+
+def test_snapshots_are_grouped_by_how_far_back_they_are(tmp_path: Path) -> None:
+    html = snapshots_web(tmp_path).get("/instantaneas").text
+    groups = re.findall(
+        r'<h2 class="snapgroup">(.*?)</h2>\s*<ol class="snaplist">(.*?)</ol>', html, re.S
+    )
+    assert [(text_of(name), len(re.findall('class="snaprow"', rows))) for name, rows in groups] == [
+        ("Últimos 10 minutos", 1),
+        ("Última hora", 1),
+        ("Hoy", 1),
+        ("Antes", 1),
+    ]
+    assert html.count('class="snaprow"') == 4
+
+
+def test_a_group_with_nothing_in_it_is_not_drawn(tmp_path: Path) -> None:
+    html = (
+        snapshots_web(tmp_path, (timedelta(minutes=3), timedelta(days=3))).get("/instantaneas").text
+    )
+    assert [text_of(g) for g in re.findall(r'<h2 class="snapgroup">(.*?)</h2>', html, re.S)] == [
+        "Últimos 10 minutos",
+        "Antes",
+    ]
+
+
+def test_a_row_says_its_time_and_the_old_ones_their_day_too(tmp_path: Path) -> None:
+    html = snapshots_web(tmp_path).get("/instantaneas").text
+    titles = re.findall(r'<time class="snaptitle"[^>]*>([^<]+)</time>', html)
+    assert titles == ["17:57", "17:30", "15:00", "Ayer, 12:00"]
+
+
+def test_the_long_identifier_waits_for_the_command_line(tmp_path: Path) -> None:
+    html = snapshots_web(tmp_path).get("/instantaneas").text
+    fold = re.findall(
+        r'<details class="snapid"><summary>Para la línea de comandos</summary>\s*'
+        r'<span class="sid">([^<]+)</span>',
+        html,
+    )
+    assert len(fold) == 4 and html.count('class="sid"') == 4, "only inside the fold"
+
+
+def test_the_way_back_says_where_it_goes(tmp_path: Path) -> None:
+    html = snapshots_web(tmp_path).get("/instantaneas").text
+    assert text_of(re.search(r'<span class="rewind">.*?</span>', html, re.S).group(0)).startswith(
+        "Volver aquí"
+    )
+    english = snapshots_web(tmp_path).get("/instantaneas", headers={"accept-language": "en"}).text
+    assert "Go back here" in text_of(english)
+
+
+def test_the_preview_says_where_you_would_go_back_to(tmp_path: Path) -> None:
+    html = snapshots_web(tmp_path).get("/instantaneas").text
+    hint = re.search(r'<p class="note preview-hint"[^>]*>', html)
+    assert hint
+    assert 'data-template="Volverías a las {time} ({ago})."' in hint.group(0)
+    assert "data-default=" in hint.group(0)
+    clocks = re.findall(r'<li class="snaprow" data-rewind-to="[^"]+" data-clock="([^"]+)"', html)
+    assert clocks == ["17:57:00", "17:30:00", "15:00:00", "12:00:00"]
+    js = (STATIC / "web.js").read_text()
+    assert "function previewSentence" in js and "data-template" in js
+
+
+def test_the_confirmation_tells_where_you_go_back_to_above_the_fixed_notice(tmp_path: Path) -> None:
+    web = snapshots_web(tmp_path)
+    target = Snapshot(SNAP_NOW - SNAP_AGES[0], str(Reason.PERIODIC))
+    page = web.get(f"/instantaneas/rebobinar?id={target.id}").text
+    shown = text_of(page)
+    assert "La carpeta del agente volverá a como estaba: Hoy, 17:57 (hace 3 min)." in shown
+    summary = re.search(r'<p class="rewind-summary">(.*?)</p>', page, re.S)
+    assert summary and not re.search(r"todo|everything", text_of(summary.group(1)).lower()), (
+        "no promise of more than the folder: what already went out does not come back"
+    )
+    notice = re.search(r'<div class="notice" lang="es">', page)
+    assert notice and page.index("rewind-summary") < notice.start()
+    for paragraph in rewind_notice(target.taken_at, now=SNAP_NOW, tz=UTC):
+        assert paragraph in shown, "the fixed notice is untouched"
+    assert "Sí, volver aquí" in shown
+
+
+def test_the_snapshots_page_says_what_it_keeps(tmp_path: Path) -> None:
+    html = snapshots_web(tmp_path).get("/instantaneas").text
+    assert "Puedes volver a cualquiera de estos puntos" in text_of(html)
+
+
+def test_a_snapshot_of_yesterday_keeps_its_day_even_in_the_last_minutes(tmp_path: Path) -> None:
+    """At 00:05 a snapshot of 23:55 is 10 minutes old, but it is yesterday's (review of T12f-2c)."""
+    now = datetime(2026, 10, 16, 0, 5, tzinfo=UTC)
+    snaps = [Snapshot(datetime(2026, 10, 15, 23, 55, tzinfo=UTC), str(Reason.PERIODIC))]
+    new_box(tmp_path).append("file", "create", "work/a.md")
+    web = new_client(tmp_path, snapshots=lambda: snaps, rewinder=FakeRewinder(), clock=lambda: now)
+    html = web.get("/instantaneas").text
+    assert re.findall(r'<time class="snaptitle"[^>]*>([^<]+)</time>', html) == ["Ayer, 23:55"]
+
+
+def test_the_controls_are_named_by_what_they_say(tmp_path: Path) -> None:
+    html = snapshots_web(tmp_path).get("/instantaneas").text
+    labels = re.findall(r'<a class="dot-button rewind-go"[^>]*aria-label="([^"]+)"', html)
+    assert labels and all(label.startswith("Volver a ") for label in labels)

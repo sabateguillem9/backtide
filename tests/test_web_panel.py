@@ -312,7 +312,7 @@ def test_only_the_main_agent_can_be_rewound_from_here(tmp_path: Path, boxes) -> 
     html = web.get("/agentes/codigo/instantaneas").text
     assert "Desde aquí solo se rebobina el agente que lleva el servicio" in text_of(html)
     assert "rebobinar?id=" not in html and "rewind-go" not in html
-    assert 'disabled aria-label="Rebobinar' in html
+    assert 'disabled aria-label="Volver aquí' in html
 
 
 def test_the_agent_streams_its_own_box(tmp_path: Path, boxes, clock: FakeClock) -> None:

@@ -282,7 +282,13 @@ h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 500; letter-spac
 /* snapshots */
 .snapshots .tide-frame { margin-top: var(--space-8); }
 .preview-hint { margin-top: var(--space-2); }
+.snapgroup { margin: var(--space-8) 0 0; font-size: 14px; font-weight: 500; letter-spacing: 0.04em; color: var(--ink-muted); }
+.snapgroup + .snaplist { margin-top: var(--space-1); }
 .snaplist { list-style: none; margin: var(--space-8) 0 0; padding: 0; }
+.snapid { margin-top: 2px; font-size: 13px; }
+.snapid > summary { display: inline-flex; align-items: center; min-height: 24px; cursor: pointer; color: var(--ink-muted); letter-spacing: 0.02em; }
+.snapid > summary:hover, .snapid[open] > summary { color: var(--ink); }
+.rewind-summary { margin: var(--space-3) 0 0; font-size: 17px; color: var(--ink); }
 .snaprow { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 0; }
 .snapinfo { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .snaptitle { font-size: 17px; font-weight: 500; letter-spacing: -0.01em; }
@@ -306,6 +312,7 @@ a.dot-button { text-decoration: none; }
 .rewind-step h2:focus-visible { outline: var(--stroke-focus) solid var(--ink); outline-offset: 3px; }
 .rewind-snap { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--space-3); margin: var(--space-2) 0 0; }
 .rewind-snap .sid { margin: 0; }
+.snapid .sid { margin-top: 0; }
 .notice { margin-top: var(--space-6); color: var(--ink-soft); font-size: 15px; }
 .notice p { margin: 0 0 var(--space-3); }
 .rewind-said { margin: var(--space-4) 0 0; color: var(--ink-soft); overflow-wrap: anywhere; }

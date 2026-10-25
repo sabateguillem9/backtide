@@ -8,6 +8,7 @@
 {% if view == 'confirm' %}
   <h2 id="rewind-title" tabindex="-1">{{ t('rewind.confirm.title') }}</h2>
   <p class="rewind-snap"><span class="snaptitle">{{ day_time(snap.taken_at) }}</span> <span class="sid">{{ vis(snap.id, 80) }}</span></p>
+  <p class="rewind-summary">{{ t('rewind.summary', time=day_time(snap.taken_at), ago=age(snap.taken_at)) }}</p>
   <div class="notice" lang="es">
     {% for paragraph in notice %}
     <p>{{ paragraph }}</p>

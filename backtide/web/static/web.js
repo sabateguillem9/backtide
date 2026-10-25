@@ -410,6 +410,21 @@
   }
 
   var pinned = null; // the snapshot the rewind panel is about: the preview leaves it alone
+  // The line above the list says where the row you are on would take you ("Volverías a las
+  // 17:57:00 (hace 3 min)."), or its own default when none is. The clock is the row's (the
+  // server wrote it), the age is what the row shows now; the words are the server's template.
+  function previewSentence(hint, row) {
+    if (!hint) return;
+    var text = hint.getAttribute("data-default") || "";
+    if (row) {
+      var ago = row.querySelector(".snapmeta .ago");
+      text = (hint.getAttribute("data-template") || text)
+        .replace("{time}", row.getAttribute("data-clock") || "")
+        .replace("{ago}", ago ? ago.textContent : "");
+    }
+    hint.textContent = text;
+  }
+
   function snapshotRows() {
     var list = document.querySelector(".snaplist");
     if (!list) return;
@@ -422,6 +437,7 @@
       if (pinned !== null || current === row) return;
       if (current) current.classList.remove("is-previewing");
       current = row;
+      previewSentence(hint, row);
       if (!row) {
         restore();
         return;
@@ -465,6 +481,12 @@
     var at = step.getAttribute("data-rewind-to") || "";
     var hold = view === "confirm" || (view === "result" && (outcome === "done" || outcome === "problem"));
     pinned = hold ? at : null;
+    var hint = document.querySelector(".preview-hint");
+    var held = null;
+    document.querySelectorAll(".snaprow").forEach(function (row) {
+      if (hold && row.getAttribute("data-rewind-to") === at) held = row;
+    });
+    previewSentence(hint, held);
     if (!hold || !retractTo(at)) restore();
     var title = step.querySelector("#rewind-title");
     if (title) title.focus({ preventScroll: true });

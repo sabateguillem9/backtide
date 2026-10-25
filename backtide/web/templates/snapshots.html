@@ -6,35 +6,45 @@
   <p class="lede">{{ t('snaps.lede') }}</p>
   {% set live = false %}
   {% include "tide_frame.html" %}
-  <p class="note preview-hint" hidden>{{ t('snaps.preview') }}</p>
+  <p class="note preview-hint" data-default="{{ t.raw('snaps.preview') }}" data-template="{{ t.raw('snaps.preview.to') }}" hidden>{{ t('snaps.preview') }}</p>
   {% if error and box_unreadable %}<p class="note">{{ t('snaps.unreadable') }} {{ t('box.unreadable') }}</p>{% elif error %}<p class="note source">{{ t('snaps.from_box') }}</p>{% endif %}
   {% if rows and rewind_state != 'ready' %}<p class="note rewind-off">{{ t('rewind.off.' ~ rewind_state) }}</p>{% endif %}
   <div id="rewind-panel" class="rewind-panel" aria-live="polite"></div>
   {% if not rows %}
   <p class="note">{{ t('snaps.empty') }}</p>
   {% else %}
+  {# Grouped by how far back they are (T12f-2c): the last 10 minutes, the last hour, the rest of
+     today, before. Newest first, so the groups come in that order; an empty one is not drawn. #}
+  {% set shown = namespace(group='') %}
+  {% for snap in rows %}
+  {% set secs = (now - snap.taken_at).total_seconds() %}
+  {% set group = 'recent' if secs < 600 else ('hour' if secs < 3600 else ('today' if stamp(snap.taken_at)[:10] == stamp(now)[:10] else 'before')) %}
+  {% if group != shown.group %}
+  {% if shown.group %}</ol>{% endif %}
+  {% set shown.group = group %}
+  <h2 class="snapgroup">{{ t('snaps.group.' ~ group) }}</h2>
   <ol class="snaplist">
-    {% for snap in rows %}
-    <li class="snaprow" data-rewind-to="{{ snap.taken_at.isoformat() }}">
+  {% endif %}
+    <li class="snaprow" data-rewind-to="{{ snap.taken_at.isoformat() }}" data-clock="{{ clock(snap.taken_at.isoformat()) }}">
       <div class="snapinfo">
-        <time class="snaptitle" datetime="{{ snap.taken_at.isoformat() }}" title="{{ stamp(snap.taken_at) }}">{{ day_time(snap.taken_at) }}</time>
+        <time class="snaptitle" datetime="{{ snap.taken_at.isoformat() }}" title="{{ stamp(snap.taken_at) }}">{{ stamp(snap.taken_at)[11:16] if stamp(snap.taken_at)[:10] == stamp(now)[:10] else day_time(snap.taken_at) }}</time>
         <span class="snapmeta">
           {{ t('reason.' ~ snap.reason) if t.has('reason.' ~ snap.reason) else vis(snap.reason, 40) }}
           · <time class="ago" datetime="{{ snap.taken_at.isoformat() }}" data-ago>{{ age(snap.taken_at) }}</time>
         </span>
-        <span class="visually-hidden">{{ t('snaps.id.label') }}:</span>
-        <span class="sid">{{ vis(snap.id, 80) }}</span>
+        <details class="snapid"><summary>{{ t('snaps.id.label') }}</summary>
+          <span class="sid">{{ vis(snap.id, 80) }}</span></details>
       </div>
       <span class="rewind">
         {% if rewind_state == 'ready' %}
-        <small>{{ t('snaps.rewind') }}</small>
+        <small>{{ t('snaps.go_back') }}</small>
         <a class="dot-button rewind-go" href="{{ base }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-get="{{ base }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-target="#rewind-panel" hx-swap="innerHTML" aria-label="{{ t('snaps.rewind.to', time=day_time(snap.taken_at)) }}">{% include "arrow.html" %}</a>
         {% else %}
-        <button class="dot-button" type="button" disabled aria-label="{{ t('snaps.rewind') }}: {{ t('snaps.rewind.off') }}">{% include "arrow.html" %}</button>
+        <button class="dot-button" type="button" disabled aria-label="{{ t('snaps.go_back') }}: {{ t('snaps.rewind.off') }}">{% include "arrow.html" %}</button>
         {% endif %}
       </span>
     </li>
-    {% endfor %}
+  {% endfor %}
   </ol>
   {% if hidden %}
   <p class="note">{{ t('snaps.more', n=rows | length) }} <a href="{{ abase }}/instantaneas?todas=1">+{{ hidden }}</a></p>
