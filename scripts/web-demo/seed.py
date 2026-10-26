@@ -258,6 +258,10 @@ def other_story(story: Story, slug: str) -> None:
             story.box.append("net", "connect", "arxiv.org:443")
             story.at(20)
             story.file("create", f"work/notas/{topic.replace(' ', '-')}.md", size=2400)
+        story.at(60)
+        story.box.append(
+            "llm", "blocked", "api.anthropic.com", risk=1, details={"reason": "spend_cap"}
+        )
     else:  # correo: frozen for lack of space, waiting for room
         story.system("sensor_start")
         story.at(300)
@@ -305,6 +309,10 @@ def live_other(story: Story, slug: str, count: int, rng: random.Random, plan: di
         elif count % 90 == 50:
             story.system("sensor_restart", attempt=1)
             story.system("sensor_start")
+        elif count % 70 == 40:
+            story.box.append(
+                "llm", "blocked", "api.anthropic.com", risk=1, details={"reason": "spend_cap"}
+            )  # the spending cap refused the call before it went out
         elif count % 25 == 0:
             story.box.append("llm", "chat", "api.anthropic.com", details={"topic": "mareas"})
             story.box.append("net", "connect", rng.choice(["arxiv.org:443", "doi.org:443"]))
@@ -316,25 +324,32 @@ def live_other(story: Story, slug: str, count: int, rng: random.Random, plan: di
 # -- the gate's requests (made up, in the shape of the real gate's: T10-5) --------------------
 
 # ``action`` and ``notes`` are what backtide says (backtide.gate.phrase's words); the rest is what
-# the agent asked. The last one imitates our notice, as an agent might (aviso-con-trampa).
+# the agent asked.
 REQUESTS: tuple[dict[str, object], ...] = (
-    {"agent": "principal", "kind": "email", "action": "Gmail: enviar un correo",
-     "target": "ana.garcia@ejemplo.com", "recipients": ["ana.garcia@ejemplo.com"],
-     "subject": "Presupuesto de la reforma", "lines": "Hola Ana, te paso el presupuesto.",
-     "detail": "Presupuesto de la reforma", "reason": "send", "risk": 2, "translator": "gmail",
-     "trust_off": "mail", "batches": ["recipient", "kind"]},
-    {"agent": "codigo", "kind": "delete", "target": "api.github.com",
-     "request": "DELETE api.github.com/repos/ana/tienda-web", "reason": "delete", "risk": 3},
-    {"agent": "investigacion", "kind": "other", "target": "editorial.ejemplo.org",
-     "request": "POST editorial.ejemplo.org/api/checkout?item=modelos-de-marea-2024",
-     "reason": "write", "risk": 2, "batches": ["kind"]},
+    # what the gate reads: a chat message, a push that deletes branches, a Slack message...
     {"agent": "principal", "kind": "message", "action": "Telegram: enviar un mensaje",
      "target": "-100223344", "recipients": ["-100223344"], "lines": "Llego a las 9",
      "detail": "Llego a las 9", "reason": "send", "risk": 2, "trustable": True,
      "translator": "telegram", "batches": ["recipient", "kind"]},
+    {"agent": "codigo", "kind": "delete", "action": "git: push que borra ramas o etiquetas",
+     "notes": ["backtide no ve el código que lleva"], "target": "github.com/ana/tienda-web",
+     "request": "git push origin --delete rama-vieja release-0.3", "reason": "delete",
+     "risk": 2, "translator": "git"},
+    {"agent": "investigacion", "kind": "message", "action": "Slack: enviar un mensaje",
+     "target": "#equipo", "recipients": ["#equipo"],
+     "lines": "Resumen de mareas listo: 12 fuentes y 3 contradicciones por revisar.",
+     "detail": "Resumen de mareas listo", "reason": "send", "risk": 2,
+     "translator": "slack", "batches": ["recipient", "kind"]},
+    # what it cannot undo, what carries a credential, what it does not understand
+    {"agent": "codigo", "kind": "delete", "target": "api.github.com",
+     "request": "DELETE api.github.com/repos/ana/tienda-web", "reason": "delete", "risk": 3},
     {"agent": "codigo", "kind": "other", "target": "api.stripe.com",
      "request": "POST api.stripe.com/v1/refunds", "reason": "credential_unknown_host",
      "risk": 2},
+    {"agent": "investigacion", "kind": "other", "target": "editorial.ejemplo.org",
+     "request": "POST editorial.ejemplo.org/api/checkout?item=modelos-de-marea-2024",
+     "reason": "write", "risk": 2, "batches": ["kind"]},
+    # the last one imitates our notice, as an agent might (aviso-con-trampa)
     {"agent": "principal", "kind": "message", "action": "Telegram: enviar un mensaje",
      "notes": ["la plataforma descargará esa dirección"], "target": "556",
      "recipients": ["556"],
