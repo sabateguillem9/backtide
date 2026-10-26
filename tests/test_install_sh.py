@@ -4,6 +4,7 @@ before changing anything when it is not root or not on a supported Linux."""
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -59,7 +60,9 @@ def test_without_root_it_stops_at_once(args: tuple[str, ...], tmp_path: Path) ->
 
 
 def test_an_unsupported_system_stops_before_any_change(tmp_path: Path) -> None:
-    """With a fake `id` that says root, on the Mac: no /etc/os-release, so it stops there."""
+    """With a fake `id` that says root and no archive: on the Mac there is no os-release, so it
+    stops there; on a supported Linux (CI) it stops at the missing release. Either way, before
+    any change."""
     fake = tmp_path / "bin"
     fake.mkdir()
     (fake / "id").write_text("#!/bin/sh\necho 0\n")
@@ -73,5 +76,12 @@ def test_an_unsupported_system_stops_before_any_change(tmp_path: Path) -> None:
         check=False,
     )
     assert done.returncode == 1
-    assert "os-release" in done.stderr or "no es una de las que admite" in done.stderr
+    if sys.platform == "darwin":
+        assert "os-release" in done.stderr or "no es una de las que admite" in done.stderr
+    else:
+        assert (
+            "os-release" in done.stderr
+            or "no es una de las que admite" in done.stderr
+            or ("aún no hay versión publicada" in done.stderr)
+        )
     assert sorted(p.name for p in tmp_path.iterdir()) == ["bin"]
