@@ -553,6 +553,70 @@ def test_privilege_and_disk_tools_are_risk_2() -> None:
     assert risk_with_defaults(ran("ls", "/usr/bin/sudoku"))[0] == 0
 
 
+@pytest.mark.parametrize(
+    ("argv", "program"),
+    [
+        ("u+s /workspace/work/x", "/usr/bin/chmod"),
+        ("+s x", "/bin/chmod"),
+        ("g+s x", "/bin/chmod"),
+        ("ug+s,o-w x", "/bin/chmod"),
+        ("4755 x", "/bin/chmod"),
+        ("04755 x", "/bin/chmod"),
+        ("-R 2775 shared", "/bin/chmod"),
+        ("-c chmod u+s /workspace/work/x", "/bin/sh"),
+        ("-c cp /bin/id x && chmod 4755 x", "/bin/bash"),
+    ],
+)
+def test_making_a_setuid_file_is_risk_2(argv: str, program: str) -> None:
+    """T13-3, scenario setuid-en-el-volumen."""
+    assert risk_with_defaults(ran(argv, program))[0] == 2
+
+
+@pytest.mark.parametrize(
+    "argv", ["u+x notes+s file", "755 x", "0644 x", "-R u+rwX srv", "644 4755.txt"]
+)
+def test_ordinary_chmods_are_not_setuid(argv: str) -> None:
+    assert risk_with_defaults(ran(argv, "/bin/chmod"))[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("argv", "program"),
+    [
+        ("/etc/backtide/backtide.toml", "/usr/bin/cat"),
+        ("-la /var/lib/backtide", "/usr/bin/ls"),
+        ("-c cat /var/lib/backtide/keys/anthropic.key", "/bin/sh"),
+        ("/etc/systemd/system/backtide.service", "/usr/bin/cat"),
+    ],
+)
+def test_looking_for_backtides_installation_is_risk_2(argv: str, program: str) -> None:
+    """T13-3, scenario agente-no-ve-la-instalacion."""
+    assert risk_with_defaults(ran(argv, program)) == (2, ("exec-backtide-install",))
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        "/etc/backtide-ca/ca.pem",  # the agent's own CA folder
+        "-la /var/lib/backtide-agent",
+        "/var/lib/backtide-agent/workspace/agente/work/x",
+        "/etc/backtidecfg",
+        "/opt/backtide-old/x",
+    ],
+)
+def test_names_that_only_start_like_backtides_are_not_its_installation(argv: str) -> None:
+    """Review of T13-3, R7: the folder itself or what hangs below it, nothing next to it."""
+    assert risk_with_defaults(ran(argv, "/usr/bin/cat"))[0] == 0
+
+
+@pytest.mark.parametrize(
+    "argv",
+    ["/etc/backtide", "/etc/backtide/", "-la /var/lib/backtide /tmp", '-c "ls /etc/backtide"'],
+)
+def test_the_folders_themselves_count(argv: str) -> None:
+    program = "/bin/sh" if argv.startswith("-c") else "/usr/bin/ls"
+    assert risk_with_defaults(ran(argv, program)) == (2, ("exec-backtide-install",))
+
+
 def test_the_exec_rules_do_not_touch_other_sources() -> None:
     assert risk_with_defaults(seen("create", "/bin/rm", argv="-rf /"))[0] == 0
 

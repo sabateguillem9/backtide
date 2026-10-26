@@ -15,8 +15,9 @@ How it works, with no names to maintain:
   ``pytest_terminal_summary`` names every leaked object, and what could not be removed.
 
 Left alone on purpose: Docker's own networks (bridge, host, none); the demo's objects (a person
-may run ``make demo`` while the tests run); and test objects whose name carries the pid of
-ANOTHER live pytest (a second ``make it`` at the same time).
+may run ``make demo`` while the tests run); test objects whose name carries the pid of ANOTHER
+live pytest (a second ``make it`` at the same time); and, on a machine where backtide is
+installed (a clean VM of T13-3), the installed backtide's own containers and networks.
 
 The conftest.py of tests/integration and tests/attacks import the three hooks from here. They
 are idempotent: with both conftests loaded in one session, the guard still runs once.
@@ -127,8 +128,20 @@ def _is_pytest_alive(pid: int) -> bool:
         return False
 
 
+# An installed backtide's own containers and networks (T13-3): the scenarios of a real
+# installation restart its service, which makes them again. Theirs, never a test's leak; and only
+# where backtide is installed, so a test elsewhere that leaked one of these names is still caught.
+INSTALLED_NAMES = frozenset(
+    {"backtide-agente", "backtide-egress", "backtide-sensor", "backtide-agente-net",
+     "backtide-salida-net"}
+)  # fmt: skip
+INSTALLED_UNIT = Path("/etc/systemd/system/backtide.service")
+
+
 def _ours(item: Item, alive: Callable[[int], bool] | None) -> bool:
     if item.name in BUILTIN_NETWORKS or item.name.startswith(DEMO_PREFIXES):
+        return False
+    if item.name in INSTALLED_NAMES and INSTALLED_UNIT.is_file():
         return False
     return not is_another_run(item.name, alive=alive)
 

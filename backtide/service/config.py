@@ -1711,15 +1711,18 @@ def _require_no_dotdot(label: str, path: Path) -> None:
         raise ConfigError(f"{label} must not have '..' components, got {str(path)!r}")
 
 
-def _read_file(path: Path, what: str, max_bytes: int, *, private: bool) -> bytes:
+def _read_file(
+    path: Path, what: str, max_bytes: int, *, private: bool, owners: tuple[int, ...] = ()
+) -> bytes:
     """The content of a small file that only its owner may have written (and, if ``private``,
     read). Errors say what the file IS (size, mode, owner), never what it holds. Opens without
-    following a symlink or blocking on a FIFO."""
-    return _read_file_info(path, what, max_bytes, private=private)[0]
+    following a symlink or blocking on a FIFO. The owner must be whoever reads it, or one of
+    ``owners`` (the web reads root's ``web.toml``, 0640 with its group: T13-3)."""
+    return _read_file_info(path, what, max_bytes, private=private, owners=owners)[0]
 
 
 def _read_file_info(
-    path: Path, what: str, max_bytes: int, *, private: bool
+    path: Path, what: str, max_bytes: int, *, private: bool, owners: tuple[int, ...] = ()
 ) -> tuple[bytes, os.stat_result]:
     """``_read_file``, and the ``fstat`` of the file it read."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -1735,7 +1738,7 @@ def _read_file_info(
         facts = f"{info.st_size} bytes, mode {mode:04o}"
         if not stat.S_ISREG(info.st_mode):
             raise ConfigError(f"{what} {path} is not a regular file")
-        if info.st_uid != os.geteuid():
+        if info.st_uid != os.geteuid() and info.st_uid not in owners:
             raise ConfigError(
                 f"{what} {path} is owned by uid {info.st_uid}, not {os.geteuid()} ({facts})"
             )

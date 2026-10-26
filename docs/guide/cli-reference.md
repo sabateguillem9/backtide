@@ -28,6 +28,9 @@ Other guides: [getting started](getting-started.md), [configuration](configurati
 | `backtide importar` | Copy a folder from your computer into the agent's workspace ("import") |
 | `backtide exportar` | Copy the agent's work out to a new folder on your computer ("export") |
 | `backtide comprobar` | Check whether this machine can run backtide ("check") |
+| `backtide instalar` | Install backtide as a system service ("install"; `install.sh` calls it) |
+| `backtide imagenes` | List the container images this version uses, pinned by digest ("images") |
+| `backtide enlace` | Print the installed web's one-time link ("link") |
 
 `backtide --version` prints the version (`backtide 0.1.0` today). `backtide` on its own, or `backtide --help`, prints the list of commands. Each command also answers to `--help`.
 
@@ -105,6 +108,7 @@ backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes]
 | `--rebobinar` | off | The Snapshots page can rewind (with the same notice as `rebobinar` and a confirmation) |
 | `--aprobar` | off | The Requests page can approve and reject held requests (each behind a confirmation). Without it the buttons are shown switched off |
 | `--ajustes` | off | The Settings page can set and remove API keys, the Telegram bot and the spending cap. Without it the page only explains how to switch it on |
+| `--enlace-en FILE` | off | Write the one-time link (and the run name) to `FILE`, mode `600`, instead of printing it, and remove the file when the web stops. The installed `backtide-web.service` uses it so the link never lands in the system journal; `sudo backtide enlace` prints it |
 
 How it behaves:
 
@@ -414,7 +418,7 @@ backtide tope --dia 3 --mes 20 --config ~/backtide-demo-run/backtide.toml
 
 ### `backtide comprobar`
 
-Checks whether this Linux machine has what backtide needs, and says how to fix what is missing. It reads and changes nothing. The installer (not ready yet) runs the same checks before it touches anything.
+Checks whether this Linux machine has what backtide needs, and says how to fix what is missing. It reads and changes nothing. The installer runs the same checks before it touches anything.
 
 ```sh
 sudo backtide comprobar
@@ -424,7 +428,63 @@ sudo backtide comprobar
 - Each line is `[ok]`, `[aviso]` (a warning: something works less, or the installer will do it with your permission) or `[falla]` (a failure: backtide cannot run safely here). Under each warning or failure, how to fix it.
 - Without `sudo` it still runs, with a warning: some checks (Docker, SELinux) may come out short.
 - **Fedora 43 and 44 with kernel 7.1 or later:** the process sensor (Tetragon v1.7.1) cannot read their BTF yet, so the agent runs but its commands are not recorded. `comprobar` warns about it. Ubuntu 24.04 and 26.04 are fine. It goes away with Tetragon 1.8.
-- Exit codes: `0` no failure (warnings do not count); `1` at least one failure.
+- What else it looks at (T13-3): whether backtide's two Docker networks overlap a route of the machine that is not Docker's (a VPN or your LAN). A clash is a warning that says how to move them (`--subredes`).
+- `--despues-de-instalar` ("after installing"), as root, tests the installed backtide for real: its four systemd units are active; the volume is mounted `nosuid,nodev,noatime`; the agent started under the service and answers; it runs as uid 61000 with no capability (and as `container_t` under SELinux, or with its AppArmor profile); from inside it nothing connects without the proxy; the black box verifies; the process sensor sees a test command (a warning only, see the kernel note above); the web listens, left its link and its journal holds no link; and `systemd-analyze security` of both services is at or under the level measured in clean VMs. It is the installer's last step.
+- Exit codes: `0` no failure (warnings do not count); `1` at least one failure; `2` (with `--despues-de-instalar`) not root or a bad config.
+
+## Install
+
+### `install.sh` and `backtide instalar`
+
+`install.sh` is a short `sh` script at the root of the repository: read it before you run it. It checks that it runs as root on Ubuntu 24.04 or 26.04 or Fedora 43 or 44 (x86_64 or aarch64), downloads `uv` (pinned by version and sha256), checks the sha256 of the backtide archive, installs it in `/opt/backtide/releases/<version>-<hash>` with its own Python 3.12 and its locked dependencies (the build backend uv uses to install backtide itself, `hatchling`, is not pinned yet), and hands over to `backtide instalar`. There is no published release yet, so today you give it an archive and its hash:
+
+```sh
+git archive --format=tar -o backtide.tar HEAD && sha256sum backtide.tar
+sudo sh install.sh --desde backtide.tar --sha256 <the hash> [backtide instalar flags]
+```
+
+`backtide instalar` does the rest, each step checked and recorded in `/var/lib/backtide/install-manifest.json`: the preflight of `comprobar` (any failure stops it before it changes anything), the `backtide-web` account, the folders and their permissions, `btrfs-progs`/`openssl`/`gnupg` if missing, Docker Engine from Docker's own repository if there is none (its signing key is checked by fingerprint), SELinux in Docker on Fedora, the three images by digest, the agent's volume, the config and keys, the two Docker networks, the systemd units, and the self-test. **Run it again and it changes nothing**; cut it half way and the next run goes on from there.
+
+```sh
+sudo backtide instalar [--si] [--dry-run] [--proveedor anthropic|openai]
+                       [--clave-archivo FILE | --clave-stdin | --sin-clave]
+                       [--tope-diario N] [--tope-mensual N] [--zona-horaria ZONE]
+                       [--subredes A,B] [--volumen-gib N]
+```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--si` | off | Answer yes to every question (installing packages or Docker, SELinux in Docker). Without it, and without a terminal, it stops at the first question |
+| `--dry-run` | off | Show the checks and the steps; change nothing |
+| `--proveedor` | `anthropic` | Whose key it stores (`keys/<provider>.key`) |
+| `--clave-archivo FILE` | none | Read the model's key from `FILE` (one line). Delete the file afterwards |
+| `--clave-stdin` | off | Read the key from standard input |
+| `--sin-clave` | off | No key now: set it later in the web's Settings page |
+| `--tope-diario`, `--tope-mensual` | `5`, `50` | The spending caps in dollars, written to the first `backtide.toml` |
+| `--zona-horaria` | the machine's | The time zone of "a day" for the cap |
+| `--subredes A,B` | chosen | The subnets of the agent's network (A) and the egress one (B). By default two free `/24` from `172.29.0.0/16`, from the top, that no route, address or Docker network uses |
+| `--volumen-gib N` | `20` | The agent's volume size (sparse: it takes what is written) |
+
+How it behaves:
+
+- **Keys never go in an argument** (`ps` would show them). With a terminal and none of the three key flags, it asks for the key without echo; an empty answer leaves it for the Settings page.
+- An existing `/etc/backtide/backtide.toml` is kept as it is. An existing `volume.img` is never overwritten or formatted again.
+- On Fedora with SELinux enforcing and a Docker that does not use it, it asks before changing Docker: first `live-restore` (a reload, nothing restarts), then `selinux-enabled` and one restart of Docker (your other containers keep running). A Docker that already uses SELinux is not touched.
+- At the end it prints how to open the web (`sudo backtide enlace`) and repeats the warnings.
+- Exit codes: `0` installed and tested; `1` stopped (it says where and how to go on); `2` not root or a bad flag.
+- Uninstalling and upgrading are not there yet (T13-4).
+
+### `backtide enlace`
+
+```sh
+sudo backtide enlace
+```
+
+Prints the one-time link of the installed web (`backtide-web.service`), its run name, and the `ssh -L 8765:127.0.0.1:8765 <user>@<server>` line to reach it from another computer without opening a port. The link lives in a file only the web's user and root can read (`/run/backtide-web/enlace`), never in the journal. For a new one, `sudo systemctl restart backtide-web`. Exit codes: `0` printed; `1` no running web, or a file that is not the web's link.
+
+### `backtide imagenes`
+
+Prints the three images this version runs (the agent, the proxy, the sensor), each pinned by digest: the only list of them, the one the installer pulls and checks.
 
 ## `make` commands
 

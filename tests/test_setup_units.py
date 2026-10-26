@@ -76,6 +76,12 @@ SERVICE = {
     "ProtectKernelModules": ["yes"],
     "ProtectKernelTunables": ["yes"],
     "ProtectControlGroups": ["yes"],
+    # T13-3, measured in clean VMs
+    "ProtectHostname": ["yes"],
+    "ProtectClock": ["yes"],
+    "ProtectKernelLogs": ["yes"],
+    "RestrictRealtime": ["yes"],
+    "RemoveIPC": ["yes"],
     "RestrictAddressFamilies": ["AF_UNIX AF_INET AF_INET6"],
     "RestrictNamespaces": ["yes"],
     "LockPersonality": ["yes"],
@@ -87,7 +93,12 @@ WEB = {
     "Type": ["simple"],
     "User": [layout.WEB_USER],
     "Group": [layout.WEB_USER],
-    "ExecStart": [f"{layout.PROGRAM} web --config {layout.WEB_CONFIG_FILE}"],
+    # T13-3: the one-time link goes to a file of its own, never to the journal.
+    "ExecStart": [
+        f"{layout.PROGRAM} web --config {layout.WEB_CONFIG_FILE} --enlace-en {layout.WEB_LINK_FILE}"
+    ],
+    "RuntimeDirectory": ["backtide-web"],
+    "RuntimeDirectoryMode": ["0700"],
     "Restart": ["on-failure"],
     "RestartSec": ["5"],
     "UMask": ["0077"],
@@ -111,6 +122,9 @@ WEB = {
     "RestrictNamespaces": ["yes"],
     "RestrictRealtime": ["yes"],
     "RestrictSUIDSGID": ["yes"],
+    "ProtectProc": ["invisible"],
+    "ProcSubset": ["pid"],
+    "PrivateUsers": ["yes"],
     "LockPersonality": ["yes"],
     "MemoryDenyWriteExecute": ["yes"],
     "SystemCallFilter": ["@system-service"],
@@ -201,7 +215,8 @@ def test_the_channel_tmpfs_mount(rendered: dict[str, str]) -> None:
 def test_the_web_directives_are_exactly_these(rendered: dict[str, str]) -> None:
     web = directives(rendered["backtide-web.service"], "Service")
     assert web == WEB
-    assert "ReadWritePaths" not in web  # it only reads
+    assert "ReadWritePaths" not in web  # it only reads (and writes its link in /run/backtide-web)
+    assert layout.WEB_LINK_FILE.parent == Path("/run") / web["RuntimeDirectory"][0]
 
 
 def test_render_refuses_a_missing_or_odd_value() -> None:

@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import signal
+import stat
 import sys
 import textwrap
 from collections.abc import Iterator, Sequence
@@ -344,23 +345,203 @@ def _add_spending(commands: "argparse._SubParsersAction[argparse.ArgumentParser]
 
 
 def _add_check(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
-    """`backtide comprobar` (T13-2): the installer's preflight, for anyone, at any time."""
+    """`backtide comprobar` (T13-2): the installer's preflight, for anyone, at any time; with
+    `--despues-de-instalar` (T13-3), the self-test of an installed backtide."""
     check = commands.add_parser(
         "comprobar",
         help="comprueba si esta máquina sirve para backtide",
         description="Repasa lo que backtide necesita de esta máquina (kernel, Btrfs, cgroup v2, "
-        "systemd, BTF para el sensor de procesos, espacio, Docker, SELinux o AppArmor...) y dice "
-        "cómo arreglar lo que falte. No cambia nada. Con `sudo` lo ve todo. Sale con 0 si no hay "
-        "ningún fallo (los avisos no cuentan) y 1 si hay alguno.",
+        "systemd, BTF para el sensor de procesos, espacio, Docker, SELinux o AppArmor, las redes "
+        "de Docker frente a una VPN o la LAN...) y dice cómo arreglar lo que falte. No cambia "
+        "nada. Con `sudo` lo ve todo. Con --despues-de-instalar, como root, prueba además la "
+        "instalación de verdad: las unidades, el agente bajo backtide y su confinamiento, que no "
+        "sale sin el proxy, la caja negra, el sensor y la web. Sale con 0 si no hay ningún fallo "
+        "(los avisos no cuentan) y 1 si hay alguno.",
     )
+    check.add_argument(
+        "--despues-de-instalar",
+        dest="installed",
+        action="store_true",
+        help="prueba backtide ya instalado (la autoprueba del instalador); hace falta root",
+    )
+    _add_config(check)
     check.set_defaults(handler=_check)
+
+    images = commands.add_parser(
+        "imagenes",
+        help="lista las imágenes que usa esta versión, fijadas por digest",
+        description="Imprime las imágenes de Docker que esta versión de backtide usa (el agente, "
+        "el proxy y el sensor), cada una fijada por su digest. Es la única lista: el instalador "
+        "descarga estas y comprueba el digest.",
+    )
+    images.set_defaults(handler=_images)
+
+    install = commands.add_parser(
+        "instalar",
+        help="instala backtide en esta máquina (lo llama install.sh)",
+        description="Instala backtide como servicio de systemd: comprueba la máquina, instala lo "
+        "que falte (con permiso), crea el volumen del agente, las claves, las redes y las "
+        "unidades, arranca el servicio y su web, y prueba que todo funciona. Se puede ejecutar "
+        "otra vez sin romper nada: solo hace lo que falte. Las claves nunca van en un argumento: "
+        "--clave-archivo dice dónde leerla, --clave-stdin la lee de la entrada estándar y, con "
+        "terminal, se pide sin eco. Hace falta root. Sale con 0 si queda instalado y probado, 1 si "
+        "se paró (dice dónde y cómo seguir) y 2 si hay un error de uso.",
+    )
+    install.add_argument("--si", action="store_true", help="contesta que sí a todas las preguntas")
+    install.add_argument(
+        "--dry-run", action="store_true", help="enseña lo que haría y no cambia nada"
+    )
+    install.add_argument(
+        "--proveedor",
+        choices=("anthropic", "openai"),
+        default="anthropic",
+        help="el proveedor del modelo cuya clave se guarda (por defecto anthropic)",
+    )
+    keys = install.add_mutually_exclusive_group()
+    keys.add_argument(
+        "--clave-archivo",
+        type=Path,
+        metavar="RUTA",
+        help="lee la clave del modelo de este archivo (una línea); bórralo después",
+    )
+    keys.add_argument(
+        "--clave-stdin", action="store_true", help="lee la clave del modelo de la entrada estándar"
+    )
+    keys.add_argument(
+        "--sin-clave",
+        action="store_true",
+        help="no pide la clave: la pondrás después en la página Ajustes de la web",
+    )
+    install.add_argument("--tope-diario", metavar="DOLARES", help="tope de gasto diario (5)")
+    install.add_argument("--tope-mensual", metavar="DOLARES", help="tope de gasto mensual (50)")
+    install.add_argument(
+        "--zona-horaria", metavar="ZONA", help="zona horaria del día del tope (la de la máquina)"
+    )
+    install.add_argument(
+        "--subredes",
+        metavar="A,B",
+        help="las subredes de las redes del agente (A) y de salida (B), si no valen las que elige",
+    )
+    install.add_argument(
+        "--volumen-gib",
+        type=int,
+        default=layout.VOLUME_SIZE // layout.GIB,
+        metavar="N",
+        help=f"tamaño máximo del volumen del agente, disperso (por defecto "
+        f"{layout.VOLUME_SIZE // layout.GIB})",
+    )
+    install.set_defaults(handler=_install)
 
 
 def _check(args: argparse.Namespace) -> int:
-    """`backtide comprobar`."""
-    checks = preflight.run_checks(SystemHost(), installing=False)
-    print(preflight.report(checks))
+    """`backtide comprobar` and `backtide comprobar --despues-de-instalar`."""
+    if not args.installed:
+        checks = preflight.run_checks(SystemHost(), installing=False)
+        print(preflight.report(checks))
+        return EXIT_FAILED if preflight.failed(checks) else EXIT_OK
+    from backtide.setup import selftest
+    from backtide.setup.host import run as host_run
+
+    if _effective_uid() != 0:
+        _error("la autoprueba de la instalación necesita root: `sudo backtide comprobar "
+               "--despues-de-instalar`.")  # fmt: skip
+        return EXIT_ERROR
+    config = _load_config(args)
+    if config is None:
+        return EXIT_ERROR
+    print("Probando la instalación (el primer arranque del agente tarda unos minutos)...")
+    checks = selftest.run_selftest(config, SystemHost(), run=host_run)
+    print(preflight.report(checks, installed=True))
     return EXIT_FAILED if preflight.failed(checks) else EXIT_OK
+
+
+def _images(args: argparse.Namespace) -> int:
+    from backtide.setup import images
+
+    print(images.listing())
+    return EXIT_OK
+
+
+def _install(args: argparse.Namespace) -> int:
+    """`backtide instalar` (T13-3): backtide.setup.install does the work."""
+    from decimal import Decimal, InvalidOperation
+    from functools import partial
+
+    from backtide.setup import install, selftest
+    from backtide.setup.host import run as host_run
+
+    if _effective_uid() != 0 and not args.dry_run:
+        _error("instalar necesita root: `sudo backtide instalar` (o `sudo sh install.sh`).")
+        return EXIT_ERROR
+    try:
+        daily = Decimal(args.tope_diario) if args.tope_diario is not None else None
+        monthly = Decimal(args.tope_mensual) if args.tope_mensual is not None else None
+    except InvalidOperation:
+        _error("los topes son números de dólares, como 5 o 12.50")
+        return EXIT_ERROR
+    if not 1 <= args.volumen_gib <= 4096:
+        _error("--volumen-gib va de 1 a 4096")
+        return EXIT_ERROR
+    options = install.Options(
+        yes=args.si,
+        dry_run=args.dry_run,
+        provider=args.proveedor,
+        key_file=args.clave_archivo,
+        key_stdin=args.clave_stdin,
+        no_key=args.sin_clave,
+        daily_usd=daily,
+        monthly_usd=monthly,
+        timezone=args.zona_horaria,
+        subnets=args.subredes,
+        volume_size=args.volumen_gib * layout.GIB,
+    )
+    host = SystemHost()
+    installer = install.Installer(
+        host=host,
+        run=host_run,
+        run_long=partial(host_run, timeout=3600.0),
+        prompter=TerminalPrompter(),
+        options=options,
+        self_test=lambda config: selftest.run_selftest(config, host, run=host_run),
+        release=Path(__file__).resolve().parents[1],
+    )
+    try:
+        installer.install()
+    except install.InstallError as error:
+        _error(f"la instalación se ha parado: {error}")
+        _error("Lo hecho hasta aquí está apuntado; vuelve a ejecutar el instalador para seguir.")
+        return EXIT_FAILED
+    except KeyboardInterrupt:
+        _error("interrumpido: vuelve a ejecutar el instalador para seguir donde se quedó.")
+        return EXIT_FAILED
+    return EXIT_OK
+
+
+class TerminalPrompter:
+    """Questions and keys through /dev/tty, so they work under `curl ... | sudo sh` too."""
+
+    TTY = "/dev/tty"
+
+    def __init__(self) -> None:
+        try:
+            with open(self.TTY, "rb"):
+                self.interactive = True
+        except OSError:
+            self.interactive = False
+
+    def say(self, text: str) -> None:
+        print(text, flush=True)
+
+    def confirm(self, question: str) -> bool:
+        with open(self.TTY, "r+", encoding="utf-8", errors="replace") as tty:
+            tty.write(f"{question} [s/N] ")
+            tty.flush()
+            return tty.readline().strip().lower() in YES_ANSWERS
+
+    def secret(self, prompt: str) -> str:
+        import getpass
+
+        return getpass.getpass(prompt)
 
 
 def _add_config(parser: argparse.ArgumentParser) -> None:
@@ -854,7 +1035,34 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         help="deja que la web apruebe y rechace las peticiones retenidas pidiéndoselo al servicio "
         "(hace falta su mismo usuario); sin esto, las enseña con los botones apagados",
     )
+    web.add_argument(
+        "--enlace-en",
+        dest="link_file",
+        type=Path,
+        metavar="ARCHIVO",
+        help="escribe el enlace de un solo uso en ARCHIVO (0600) en vez de imprimirlo: lo usa "
+        "backtide-web.service para que el enlace no quede en el registro (`sudo backtide "
+        "enlace` lo enseña)",
+    )
     web.set_defaults(handler=_web)
+
+    link = commands.add_parser(
+        "enlace",
+        help="enseña el enlace de la web instalada (backtide-web.service)",
+        description="Enseña el enlace de un solo uso de la web que corre como servicio "
+        "(backtide-web.service), con el nombre de su ejecución y cómo llegar desde otro "
+        "ordenador sin abrir puertos (`ssh -L`). Hace falta `sudo`: el enlace es un archivo de "
+        "la web que nadie más puede leer, nunca una línea del registro. Para uno nuevo, "
+        "`sudo systemctl restart backtide-web`. Sale con 0 si lo enseña y 1 si no hay.",
+    )
+    link.add_argument(
+        "--archivo",
+        dest="link_file",
+        type=Path,
+        default=layout.WEB_LINK_FILE,
+        help=argparse.SUPPRESS,
+    )
+    link.set_defaults(handler=_link)
 
 
 WEB_REWIND_LINES = {
@@ -930,14 +1138,26 @@ def _web(args: argparse.Namespace) -> int:
         return EXIT_ERROR
 
     def announce(url: str, run_name: str) -> None:
-        print(f"Puesto de vigilancia listo, solo en este ordenador:\n\n  {url}\n", flush=True)
-        print(
-            f"Nombre de esta ejecución: {run_name}\n"
-            "Debe ser el mismo que sale en la cabecera de la página: si no, no es esta.\n"
-            "El enlace vale una sola vez (después la página usa una cookie de este navegador). "
-            "Ctrl-C la para.",
-            flush=True,
-        )
+        if args.link_file is not None:
+            try:
+                _write_link(args.link_file, url, run_name)
+            except OSError as error:
+                raise LinkFileError(args.link_file, error) from None
+            print(
+                f"Puesto de vigilancia listo, solo en este ordenador. Ejecución: {run_name}. El "
+                f"enlace de un solo uso está en {args.link_file}: `sudo backtide enlace` lo "
+                "enseña.",
+                flush=True,
+            )
+        else:
+            print(f"Puesto de vigilancia listo, solo en este ordenador:\n\n  {url}\n", flush=True)
+            print(
+                f"Nombre de esta ejecución: {run_name}\n"
+                "Debe ser el mismo que sale en la cabecera de la página: si no, no es esta.\n"
+                "El enlace vale una sola vez (después la página usa una cookie de este "
+                "navegador). Ctrl-C la para.",
+                flush=True,
+            )
         rewinder = ControlRewinder(paths.control_socket, enabled=args.rebobinar)
         print(_web_rewind_line(rewinder.availability()), flush=True)
         settings = ControlSettings(paths.control_socket, enabled=args.ajustes)
@@ -958,10 +1178,97 @@ def _web(args: argparse.Namespace) -> int:
             can_set=args.ajustes,
             can_approve=args.aprobar,
         )
+    except LinkFileError as error:
+        _error(str(error))
+        return EXIT_FAILED
     except OSError as error:
         _error(f"no se puede abrir el puerto {port} en 127.0.0.1: {error.strerror or error}")
         return EXIT_FAILED
+    finally:
+        if args.link_file is not None:
+            _remove_link(args.link_file)
     print("Puesto de vigilancia parado.")
+    return EXIT_OK
+
+
+class LinkFileError(Exception):
+    """The web could not write its link file (`--enlace-en`)."""
+
+    def __init__(self, path: Path, error: OSError) -> None:
+        super().__init__(
+            f"no se puede escribir el enlace en {path}: {error.strerror or error}. La web no "
+            "arranca sin poder dar su enlace."
+        )
+
+
+def _write_link(path: Path, url: str, run_name: str) -> None:
+    """The link and the run's name, in a new 0600 file of ours (never through a link)."""
+    _remove_link(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, f"{url}\n{run_name}\n".encode())
+    finally:
+        os.close(fd)
+
+
+def _remove_link(path: Path) -> None:
+    """A link that no longer opens anything is not left behind."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logger.warning("could not remove the web's link file %s: %s", path, error.strerror)
+
+
+LINK_MAX_BYTES = 4096
+
+
+def _link(args: argparse.Namespace) -> int:
+    """`backtide enlace`: the installed web's one-time link, read from its file."""
+    from backtide.web.server import web_url_problem
+
+    path = args.link_file
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        _error(
+            f"no hay enlace en {path}: ¿está en marcha la web (`systemctl status "
+            f"{layout.WEB_UNIT}`)? Arráncala con `sudo systemctl start {layout.WEB_UNIT}`."
+        )
+        return EXIT_FAILED
+    except PermissionError:
+        _error("el enlace solo lo puede leer root: `sudo backtide enlace`.")
+        return EXIT_FAILED
+    except OSError as error:
+        _error(f"no se puede abrir {path}: {error.strerror}")
+        return EXIT_FAILED
+    try:
+        info = os.fstat(fd)
+        data = os.read(fd, LINK_MAX_BYTES + 1) if stat.S_ISREG(info.st_mode) else b""
+    finally:
+        os.close(fd)
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if (
+        len(data) > LINK_MAX_BYTES
+        or len(lines) != 2
+        or stat.S_IMODE(info.st_mode) & 0o077
+        or web_url_problem(lines[0]) is not None
+    ):
+        _error(f"{path} no es el archivo del enlace de la web: no se enseña.")
+        return EXIT_FAILED
+    url, run_name = lines[0], _printable(lines[1])
+    port = url.split(":")[2].split("/")[0]
+    print(f"Puesto de vigilancia, solo en ese ordenador:\n\n  {url}\n")
+    print(
+        f"Nombre de esta ejecución: {run_name} (debe salir igual en la cabecera de la página).\n"
+        "El enlace vale una sola vez; para uno nuevo, `sudo systemctl restart "
+        f"{layout.WEB_UNIT}` y otra vez `sudo backtide enlace`.\n"
+        f"Si backtide corre en otro ordenador, llega sin abrir ningún puerto: `ssh -L "
+        f"{port}:127.0.0.1:{port} <usuario>@<servidor>` y abre el enlace en tu navegador."
+    )
     return EXIT_OK
 
 

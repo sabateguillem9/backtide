@@ -3,7 +3,9 @@ volume and the service's control socket (to ask for a rewind, T12b).
 
 ``ServiceConfig.from_file`` also reads the gateway token (and the service opens the HMAC key):
 secrets a viewer has no use for, and which would force it to run as root. This reads the same
-TOML, with the same checks on the file (not writable by others, not a link, small), and takes
+TOML, with the same checks on the file (not writable by group or others, not a link, small; its
+owner the web's own user or root: an installed web, as ``backtide-web``, reads root's
+``/etc/backtide/web.toml``, 0640 with the group ``backtide-web``, T13-3), and takes
 ``state_dir`` and ``volume`` and nothing else: no token, no key, no checkpoint. Everything else
 in the file is ignored, so the service's own configuration works as it is. The control socket is
 only ever connected to (``backtide.web.rewind``), never opened as a file. From ``[agent]`` it
@@ -39,7 +41,9 @@ class WebPaths:
     def from_file(cls, path: Path) -> "WebPaths":
         """Raises ConfigError (its message never quotes the file)."""
         text = _decode(
-            _read_file(Path(path), "configuration file", MAX_CONFIG_BYTES, private=False)
+            _read_file(
+                Path(path), "configuration file", MAX_CONFIG_BYTES, private=False, owners=(0,)
+            )
         )
         try:
             data = tomllib.loads(text)

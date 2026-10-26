@@ -9,7 +9,11 @@ After=@SERVICE_UNIT@
 Type=simple
 User=@WEB_USER@
 Group=@WEB_USER@
-ExecStart=@PROGRAM@ web --config @WEB_CONFIG_FILE@
+# The one-time link goes to a file of the web's own (0600, in its RuntimeDirectory), never to the
+# journal: `sudo backtide enlace` prints it (T13-3).
+ExecStart=@PROGRAM@ web --config @WEB_CONFIG_FILE@ --enlace-en @WEB_LINK_FILE@
+RuntimeDirectory=@WEB_RUN_DIR_NAME@
+RuntimeDirectoryMode=0700
 Restart=on-failure
 RestartSec=5
 UMask=0077
@@ -32,6 +36,10 @@ IPAddressAllow=localhost
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+# Measured in clean VMs in T13-3: it sees only its own processes, and a user namespace of its own.
+ProtectProc=invisible
+ProcSubset=pid
+PrivateUsers=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service

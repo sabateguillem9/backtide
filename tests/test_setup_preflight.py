@@ -118,6 +118,7 @@ def test_a_good_machine_has_no_failures_and_no_warnings_but_the_kernel() -> None
         "openssl",
         "docker",
         "confinement",
+        "networks",
     }
 
 
@@ -431,3 +432,61 @@ def test_failed_counts_only_failures() -> None:
     fail = preflight.Check("c", Status.FAIL, "mal", "arréglalo")
     assert not preflight.failed([ok, warn])
     assert preflight.failed([ok, fail])
+
+
+# T13-3: backtide's Docker networks against the host's routes (a VPN, the LAN)
+
+ROUTES = ("ip", "-j", "-4", "route", "show", "table", "all")
+ADDRESSES = ("ip", "-j", "-4", "addr", "show")
+
+
+def inspect_subnet(name: str) -> tuple[str, ...]:
+    return ("docker", "network", "inspect", "--format", "{{json .IPAM.Config}}", name)
+
+
+def with_networks(routes: list[dict], agent: str | None, egress: str | None) -> FakeHost:
+    host = FakeHost()
+    host.commands[ROUTES] = Ran(0, json.dumps(routes), "")
+    host.commands[ADDRESSES] = Ran(0, "[]", "")
+    for name, subnet in zip(preflight.BACKTIDE_NETWORKS, (agent, egress), strict=True):
+        if subnet is not None:
+            host.commands[inspect_subnet(name)] = Ran(0, json.dumps([{"Subnet": subnet}]), "")
+    return host
+
+
+def test_networks_that_clash_with_nothing_are_ok() -> None:
+    routes = [
+        {"dst": "default", "dev": "eth0"},
+        {"dst": "192.168.5.0/24", "dev": "eth0"},
+        {"dst": "172.29.255.0/24", "dev": "br-1a2b3c"},  # the network itself: Docker's
+    ]
+    check = checks(with_networks(routes, "172.29.255.0/24", "172.29.254.0/24"))["networks"]
+    assert check.status is Status.OK
+    assert "172.29.255.0/24" in check.summary and "172.29.254.0/24" in check.summary
+
+
+def test_a_vpn_route_over_a_backtide_network_is_a_warning_that_says_what_to_do() -> None:
+    routes = [{"dst": "172.29.0.0/16", "dev": "tun0"}]
+    check = checks(with_networks(routes, "172.29.255.0/24", "172.29.254.0/24"))["networks"]
+    assert check.status is Status.WARN
+    assert "tun0" in check.summary and "--subredes" in check.fix
+
+
+def test_without_docker_or_networks_there_is_nothing_to_clash() -> None:
+    assert checks(with_networks([], None, None))["networks"].status is Status.OK
+    host = FakeHost()
+    del host.commands[("docker", "info", "--format", "{{json .}}")]
+    assert checks(host)["networks"].status is Status.OK
+
+
+def test_docker_on_ubuntu_writes_apparmor_with_its_profile() -> None:
+    """T13-3: Docker 29 on Ubuntu 24.04 says `name=apparmor,profile=default`."""
+    host = FakeHost(files={**FakeHost().files, "/sys/module/apparmor/parameters/enabled": b"Y"})
+    del host.files["/sys/fs/selinux/enforce"]
+    options = ["name=apparmor,profile=default", "name=seccomp,profile=builtin", "name=cgroupns"]
+    info = {**DOCKER_INFO, "SecurityOptions": options}
+    host.commands[("docker", "info", "--format", "{{json .}}")] = Ran(0, json.dumps(info), "")
+    assert checks(host)["confinement"].status is Status.OK
+    info["SecurityOptions"] = ["name=seccomp,profile=builtin", "name=rootless"]
+    host.commands[("docker", "info", "--format", "{{json .}}")] = Ran(0, json.dumps(info), "")
+    assert checks(host)["docker"].status is Status.FAIL

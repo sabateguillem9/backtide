@@ -40,6 +40,7 @@ the real port before the app is built (its ``Host`` check needs it).
 """
 
 import logging
+import re
 import socket
 from collections.abc import Callable, Sequence
 from types import FrameType
@@ -118,6 +119,23 @@ def make_server(app: Callable) -> uvicorn.Server:  # type: ignore[type-arg]
 
 def web_url(port: int, prefix: str, token: str) -> str:
     return f"http://{LOOPBACK}:{port}/s/{prefix}/?t={token}"
+
+
+_WEB_URL = re.compile(
+    rf"http://{re.escape(LOOPBACK)}:(?P<port>[0-9]{{1,5}})/s/[A-Za-z0-9_-]{{8,64}}/\?t=[A-Za-z0-9_-]{{16,128}}",
+    re.ASCII,
+)
+
+
+def web_url_problem(text: str) -> str | None:
+    """None if ``text`` is a link exactly as ``web_url`` makes it (`backtide enlace` prints
+    nothing else), else why not."""
+    match = _WEB_URL.fullmatch(text)
+    if match is None:
+        return "it is not a link of this web"
+    if not 0 < int(match["port"]) <= 65535:
+        return "its port is out of range"
+    return None
 
 
 def run_web(

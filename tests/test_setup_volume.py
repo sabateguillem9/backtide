@@ -236,3 +236,23 @@ def test_the_image_folder_must_be_private(tmp_path: Path) -> None:
     with pytest.raises(VolumeError, match="0777"):
         volume.create_image(folder / "volume.img", 64 * MIB, run=FakeRun(), nocow=False)
     assert not (folder / "volume.img").exists()
+
+
+@pytest.mark.parametrize("open_mode", [0o770, 0o730, 0o702])
+def test_the_image_folder_may_not_be_written_by_its_group_or_others(
+    tmp_path: Path, open_mode: int
+) -> None:
+    folder = tmp_path / "state"
+    folder.mkdir()
+    os.chmod(folder, open_mode)
+    with pytest.raises(VolumeError, match="que nadie más escriba"):
+        volume.create_image(folder / "volume.img", 64 * MIB, run=FakeRun(), nocow=False)
+
+
+def test_the_state_folder_of_an_install_takes_the_image(tmp_path: Path) -> None:
+    """T13-3: /var/lib/backtide is 0710 root:backtide-web (D25); the image goes in it, 0600."""
+    folder = tmp_path / "state"
+    folder.mkdir()
+    os.chmod(folder, 0o710)  # noqa: S103 - the state folder of D25, under test
+    volume.create_image(folder / "volume.img", 64 * MIB, run=FakeRun(), nocow=False)
+    assert stat.S_IMODE((folder / "volume.img").stat().st_mode) == 0o600

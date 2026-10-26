@@ -664,11 +664,27 @@ def test_the_channel_tmpfs_is_small_private_and_inert(cfg: ProxyJailConfig) -> N
     ]  # fmt: skip
 
 
+def channel_line(
+    config: ProxyJailConfig,
+    *,
+    source: str = "backtide-proxy-channel",
+    options: str = "rw,nosuid,nodev,noexec,relatime",
+    supers: str | None = None,
+    fstype: str = "tmpfs",
+) -> str:
+    """A mountinfo line as the kernel writes it for the channel's tmpfs (seen in T13-1)."""
+    point = os.path.realpath(config.channel_dir).replace(" ", "\\040")
+    if supers is None:
+        supers = f"rw,size=1024k,mode=700,uid={config.uid},gid={config.gid},inode64"
+    return f"80 22 0:50 / {point} {options} shared:2 - {fstype} {source} {supers}\n"
+
+
 class FakeMounts:
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    def __init__(self, config: ProxyJailConfig, line: str | None = None) -> None:
+        self.config = config
         self.mounted = False
         self.calls: list[list[str]] = []
+        self.line = line
 
     def mount(self, argv: list[str]) -> None:
         self.calls.append(argv)
@@ -678,13 +694,12 @@ class FakeMounts:
         root = "22 1 0:21 / / rw,relatime shared:1 - btrfs /dev/vda2 rw\n"
         if not self.mounted:
             return root
-        point = os.path.realpath(self.path).replace(" ", "\\040")
-        return root + f"80 22 0:50 / {point} rw,nosuid shared:2 - tmpfs backtide-proxy-channel rw\n"
+        return root + (self.line or channel_line(self.config))
 
 
 def test_prepare_channel_mounts_the_tmpfs_once(local_cfg: ProxyJailConfig) -> None:
     config = replace(local_cfg, channel_tmpfs=True)
-    mounts = FakeMounts(config.channel_dir)
+    mounts = FakeMounts(config)
     jail = ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table)
     jail.prepare_channel()
     jail.prepare_channel()
@@ -695,12 +710,81 @@ def test_create_and_start_refuse_a_channel_that_is_not_its_tmpfs(
     local_cfg: ProxyJailConfig, fake_docker: FakeDocker
 ) -> None:
     config = replace(local_cfg, channel_tmpfs=True)
-    mounts = FakeMounts(config.channel_dir)
+    mounts = FakeMounts(config)
     ProxyJail(local_cfg).prepare_channel()  # the folder, without its tmpfs
     jail = ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table)
     for step in (jail.create, jail.start):
         with pytest.raises(JailError, match="not the channel's tmpfs"):
             step()
+
+
+# T13-3: an installed backtide finds the tmpfs its systemd unit mounted, and takes only that one.
+
+
+def test_the_units_tmpfs_is_taken_as_it_is_and_never_mounted_again(
+    local_cfg: ProxyJailConfig,
+) -> None:
+    config = replace(local_cfg, channel_tmpfs=True)
+    mounts = FakeMounts(config)
+    mounts.mounted = True  # the .mount unit did it before the service started
+    ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table).prepare_channel()
+    assert mounts.calls == []
+
+
+@pytest.mark.parametrize(
+    ("change", "said"),
+    [
+        ({"source": "tmpfs"}, "source"),
+        ({"source": "none"}, "source"),
+        ({"options": "rw,nosuid,nodev,relatime"}, "without noexec"),
+        ({"options": "rw,nodev,noexec"}, "without nosuid"),
+        ({"options": "ro,nosuid,nodev,noexec"}, "without rw"),
+        ({"supers": "rw,size=102400k,mode=700,uid={uid},gid={gid}"}, "size"),
+        ({"supers": "rw,mode=700,uid={uid},gid={gid}"}, "size"),
+        ({"supers": "rw,size=1024k,mode=777,uid={uid},gid={gid}"}, "mode"),
+        ({"supers": "rw,size=1024k,mode=700,uid=0,gid={gid}"}, "uid"),
+        ({"supers": "rw,size=1024k,mode=700,uid={uid},gid=0"}, "gid"),
+        ({"fstype": "ramfs"}, "not tmpfs"),
+    ],
+)
+def test_any_other_tmpfs_on_the_channel_folder_is_refused(
+    local_cfg: ProxyJailConfig, fake_docker: FakeDocker, change: dict[str, str], said: str
+) -> None:
+    config = replace(local_cfg, channel_tmpfs=True)
+    if "supers" in change:
+        change = {"supers": change["supers"].format(uid=config.uid, gid=config.gid)}
+    mounts = FakeMounts(config, channel_line(config, **change))
+    mounts.mounted = True
+    jail = ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table)
+    with pytest.raises(JailError, match=said):
+        jail.prepare_channel()
+    assert mounts.calls == []  # never mounted over it either: refused, not "fixed"
+    for step in (jail.create, jail.start):
+        with pytest.raises(JailError, match="not the channel's tmpfs"):
+            step()
+
+
+def test_a_mount_over_the_channels_tmpfs_is_what_counts(local_cfg: ProxyJailConfig) -> None:
+    """Two mounts on one folder: a process sees the later one, so that one is checked."""
+    config = replace(local_cfg, channel_tmpfs=True)
+    ours = channel_line(config)
+    theirs = channel_line(config, source="other", supers="rw,size=1g,mode=777")
+    mounts = FakeMounts(config, ours + theirs)
+    mounts.mounted = True
+    with pytest.raises(JailError, match="source"):
+        ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table).prepare_channel()
+    mounts.line = theirs + ours  # the unit's on top again: fine
+    ProxyJail(config, mount=mounts.mount, mountinfo=mounts.table).prepare_channel()
+
+
+def test_the_tmpfs_size_is_read_as_the_kernel_writes_it() -> None:
+    from backtide.jail.proxy import _size_bytes
+
+    assert _size_bytes("1m") == _size_bytes("1024k") == _size_bytes("1048576") == 1024**2
+    assert _size_bytes("1g") == 1024**3
+    assert _size_bytes("") is None
+    assert _size_bytes("10%") is None
+    assert _size_bytes("k") is None
 
 
 def test_a_mount_that_does_not_show_up_is_an_error(local_cfg: ProxyJailConfig) -> None:

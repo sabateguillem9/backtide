@@ -20,9 +20,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
+from backtide.jail.config import AgentJailConfig
 from backtide.jail.docker import sanitize
+from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import TETRAGON_VERSION
-from backtide.setup import layout
+from backtide.setup import layout, networks
 from backtide.setup.host import Host, Ran
 
 MIN_KERNEL = (6, 7)  # simple quotas (docs/16)
@@ -38,6 +40,11 @@ TETRAGON_BTF_HEADER_LEN = 24
 DOCKER_INFO = ("docker", "info", "--format", "{{json .}}")
 SUMMARY_LIMIT = 200
 REPORT_WIDTH = 96
+# The networks an installed backtide's agent and proxy use (the defaults the installer writes).
+BACKTIDE_NETWORKS = (
+    AgentJailConfig.__dataclass_fields__["network"].default,
+    ProxyJailConfig.__dataclass_fields__["network"].default,
+)
 
 
 class Status(StrEnum):
@@ -58,9 +65,11 @@ def failed(checks: Sequence[Check]) -> bool:
     return any(check.status is Status.FAIL for check in checks)
 
 
-def report(checks: Sequence[Check]) -> str:
-    """The checks for a terminal: one line each, how to fix it underneath, and a verdict."""
-    lines = ["¿Sirve esta máquina para backtide?", ""]
+def report(checks: Sequence[Check], *, installed: bool = False) -> str:
+    """The checks for a terminal: one line each, how to fix it underneath, and a verdict.
+    ``installed``: the self-test of an installed backtide (`comprobar --despues-de-instalar`)."""
+    title = "¿Funciona backtide instalado?" if installed else "¿Sirve esta máquina para backtide?"
+    lines = [title, ""]
     for check in checks:
         label = f"[{check.status.value}]"
         lines.append(f"  {label:<8}{check.summary}")
@@ -74,8 +83,15 @@ def report(checks: Sequence[Check]) -> str:
     warnings = sum(check.status is Status.WARN for check in checks)
     counted = f"{_count(failures, 'fallo', 'fallos')} y {_count(warnings, 'aviso', 'avisos')}"
     lines.append("")
-    if failures:
+    if failures and installed:
+        lines.append(f"{counted}: backtide está instalado pero no funciona como debe.")
+    elif failures:
         lines.append(f"{counted}: backtide no puede instalarse aquí hasta arreglar los fallos.")
+    elif warnings and installed:
+        lines.append(
+            f"Ningún fallo y {_count(warnings, 'aviso', 'avisos')}: backtide funciona; lee los "
+            "avisos."
+        )
     elif warnings:
         lines.append(
             f"Ningún fallo y {_count(warnings, 'aviso', 'avisos')}: backtide puede "
@@ -146,6 +162,7 @@ def run_checks(host: Host, *, installing: bool) -> list[Check]:
         ),
         docker,
         _confinement(host, docker_info),
+        _networks(host, docker_info),
     ]
 
 
@@ -411,7 +428,7 @@ def _docker(host: Host, *, installing: bool) -> tuple[Check, dict[str, object] |
             "Docker Desktop no deja cargar eBPF ni da Btrfs. Hace falta Docker Engine en un "
             "Linux (en un Mac, dentro de una VM).",
         ), info
-    if "name=rootless" in options:
+    if _has_option(options, "rootless"):
         return Check(
             "docker",
             Status.FAIL,
@@ -438,7 +455,7 @@ def _confinement(host: Host, docker_info: dict[str, object] | None) -> Check:
                 "confinar)",
                 unknown_fix,
             )
-        if "name=selinux" in _security_options(docker_info):
+        if _has_option(_security_options(docker_info), "selinux"):
             return Check("confinement", Status.OK, "SELinux activo, y Docker lo usa")
         return Check(
             "confinement",
@@ -464,7 +481,7 @@ def _confinement(host: Host, docker_info: dict[str, object] | None) -> Check:
                 "AppArmor activo, pero no se sabe si Docker lo usa",
                 unknown_fix,
             )
-        if "name=apparmor" in _security_options(docker_info):
+        if _has_option(_security_options(docker_info), "apparmor"):
             return Check("confinement", Status.OK, "AppArmor activo, y Docker lo usa")
         return Check(
             "confinement",
@@ -478,6 +495,48 @@ def _confinement(host: Host, docker_info: dict[str, object] | None) -> Check:
         "Ni SELinux ni AppArmor: el agente queda confinado solo por seccomp y capacidades",
         "Ubuntu trae AppArmor y Fedora SELinux, encendidos de serie: actívalos si los apagaste.",
     )
+
+
+def _networks(host: Host, docker_info: dict[str, object] | None) -> Check:
+    """backtide's two Docker networks against the host's routes (T13-3): a VPN or a LAN that
+    came after the installer chose their subnets may overlap them."""
+    if docker_info is None:
+        return Check(
+            "networks",
+            Status.OK,
+            "Las redes de backtide se crearán al instalar, con subredes que nadie use",
+        )
+    routes = networks.host_routes(host.run)
+    found, clashes = [], []
+    for name in BACKTIDE_NETWORKS:
+        subnet = networks.subnet_of(name, host.run)
+        if not isinstance(subnet, networks.IPv4Network):
+            continue
+        found.append(f"{name} {subnet}")
+        clashes += [f"{name} ({subnet}) con {route.describe()}" for route in
+                    networks.clashes(subnet, routes)]  # fmt: skip
+    if clashes:
+        return Check(
+            "networks",
+            Status.WARN,
+            f"Una red de backtide choca con otra de la máquina: {_clean('; '.join(clashes))}",
+            "Suele ser una VPN o la LAN. Si el agente se queda sin modelo, para backtide "
+            "(`systemctl stop backtide`), borra esas redes (`docker network rm ...`) y vuelve a "
+            "instalar con `--subredes A,B` libres (A la del agente, B la de salida).",
+        )
+    if not found:
+        return Check(
+            "networks",
+            Status.OK,
+            "Las redes de backtide se crearán al instalar, con subredes que nadie use",
+        )
+    return Check("networks", Status.OK, f"Redes sin choques: {_clean(', '.join(found))}")
+
+
+def _has_option(options: list[str], name: str) -> bool:
+    """Docker writes each as ``name=<x>`` followed by its settings: ``name=apparmor,profile=
+    default`` on Ubuntu (T13-3: an exact match missed it), ``name=selinux`` on Fedora."""
+    return any(option.split(",")[0] == f"name={name}" for option in options)
 
 
 def _security_options(info: dict[str, object]) -> list[str]:

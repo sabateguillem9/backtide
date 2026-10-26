@@ -71,6 +71,9 @@ _REPORTS: pytest.StashKey[dict[str, pytest.TestReport]] = pytest.StashKey()
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "scenario(id): the manifest scenario this test runs")
+    config.addinivalue_line(
+        "markers", "instalada: needs a real installation (a clean VM after install.sh), as root"
+    )
 
 
 # Split for the report and the "nothing ran" guard: scenario ids collected for THIS run, and of
@@ -97,6 +100,9 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             continue
         scenario_id = marker.args[0]
         item.extra_keyword_matches.add(scenario_id)
+        if item.get_closest_marker("instalada") is not None and not _in_a_clean_vm():
+            # Before any fixture: theirs reads the installed configuration.
+            item.add_marker(pytest.mark.skip(reason=INSTALLED_SKIP))
         _COLLECTED_IDS.add(scenario_id)
         profiles = scenarios()[scenario_id].profiles
         if profile not in profiles:
@@ -172,9 +178,41 @@ def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pyte
 @pytest.fixture(autouse=True)
 def _only_in_the_vm(request: pytest.FixtureRequest) -> None:
     """Invariant 8: an attack never runs on the Mac, on a laptop or in CI. The same check the
-    VM fixtures make (hostname, not root, passwordless sudo), before anything else starts."""
-    if request.node.get_closest_marker("ataques") is not None:
-        _vm._require_dev_vm_user_with_sudo()
+    VM fixtures make (hostname, not root, passwordless sudo), before anything else starts.
+    The scenarios of a real installation (``instalada``, T13-3) run only in a clean VM where
+    install.sh put backtide, as root: anywhere else they are skipped, saying where they run."""
+    if request.node.get_closest_marker("ataques") is None:
+        return
+    if request.node.get_closest_marker("instalada") is not None:
+        _require_installed_clean_vm()
+        return
+    _vm._require_dev_vm_user_with_sudo()
+
+
+CLEAN_VM_PREFIX = "lima-backtide-limpia-"
+INSTALLED_SKIP = (
+    "solo en una VM limpia con backtide instalado por install.sh, como root (make vm-limpia-*, "
+    "docs/25, «Resultados de T13-3»)"
+)
+
+
+def _in_a_clean_vm() -> bool:
+    import platform
+
+    return sys.platform == "linux" and platform.node().startswith(CLEAN_VM_PREFIX)
+
+
+def _require_installed_clean_vm() -> None:
+    import os
+
+    from backtide.setup import layout
+
+    if not _in_a_clean_vm():
+        pytest.skip(INSTALLED_SKIP)
+    if os.geteuid() != 0:
+        pytest.fail("the scenarios of an installation run as root: that is what they test")
+    if not (layout.UNIT_DIR / layout.SERVICE_UNIT).is_file():
+        pytest.fail(f"backtide is not installed here: run install.sh first ({INSTALLED_SKIP})")
 
 
 @pytest.fixture(scope="module")

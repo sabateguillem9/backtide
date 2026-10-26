@@ -61,7 +61,9 @@ def create_image(image: Path, size: int, *, run: Runner, nocow: bool) -> None:
         raise ValueError(f"the volume size must be a positive number of MiB, got {size!r}")
     parent = _open_dir(image.parent)  # nobody else may swap the file between our steps
     try:
-        _require_private(image.parent, os.fstat(parent))
+        # Root's and written by nobody else. The state folder is 0710 for the web's group (D25):
+        # it may pass through to names it knows, never list it nor make or swap a file in it.
+        _require_private(image.parent, os.fstat(parent), closed=0o022)
     finally:
         os.close(parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -161,14 +163,15 @@ def _open_dir(path: Path) -> int:
         raise VolumeError(f"{path} no es una carpeta de verdad: {e.strerror}") from e
 
 
-def _require_private(path: Path, info: os.stat_result) -> None:
+def _require_private(path: Path, info: os.stat_result, *, closed: int = 0o077) -> None:
     mode = stat.S_IMODE(info.st_mode)
     if info.st_uid != os.geteuid():
         raise VolumeError(f"{path} no es de quien instala (dueño {info.st_uid})")
-    if mode & 0o077:
+    if mode & closed:
+        wanted = "0700, solo de root" if closed == 0o077 else "de root y que nadie más escriba"
         raise VolumeError(
-            f"{path} está en {mode:04o}: tiene que ser 0700, solo de root. Revisa quién la "
-            "creó antes de cambiarla."
+            f"{path} está en {mode:04o}: tiene que ser {wanted}. Revisa quién la creó antes de "
+            "cambiarla."
         )
 
 

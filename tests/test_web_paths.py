@@ -79,3 +79,45 @@ def test_a_config_others_can_write_is_refused(tmp_path: Path) -> None:
 def test_a_missing_file_is_a_config_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         WebPaths.from_file(tmp_path / "nope.toml")
+
+
+class _OwnedBy:
+    """An ``os.fstat`` result as if the file belonged to ``uid`` (the Mac cannot chown)."""
+
+    def __init__(self, real: os.stat_result, uid: int) -> None:
+        self.st_mode, self.st_size, self.st_uid = real.st_mode, real.st_size, uid
+
+
+def _files_owned_by(monkeypatch: pytest.MonkeyPatch, uid: int) -> None:
+    import backtide.service.config as config_module
+
+    real_fstat = os.fstat
+    monkeypatch.setattr(config_module.os, "fstat", lambda fd: _OwnedBy(real_fstat(fd), uid))
+
+
+def test_an_installed_web_reads_roots_web_toml_with_its_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T13-3: backtide-web.service reads /etc/backtide/web.toml, root's, 0640 with the group
+    backtide-web. Root's (or the reader's own) is accepted; anybody else's is not."""
+    config = write(tmp_path / "web.toml", 'state_dir = "/s"\nvolume = "/v"\n', 0o640)
+    _files_owned_by(monkeypatch, 0)
+    assert WebPaths.from_file(config).volume == Path("/v")
+
+
+def test_a_web_toml_of_another_user_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = write(tmp_path / "web.toml", 'state_dir = "/s"\nvolume = "/v"\n', 0o640)
+    _files_owned_by(monkeypatch, os.geteuid() + 4242)
+    with pytest.raises(ConfigError, match="owned by uid"):
+        WebPaths.from_file(config)
+
+
+def test_a_web_toml_its_group_can_write_is_refused_even_from_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = write(tmp_path / "web.toml", 'state_dir = "/s"\nvolume = "/v"\n', 0o660)
+    _files_owned_by(monkeypatch, 0)
+    with pytest.raises(ConfigError, match="writable"):
+        WebPaths.from_file(config)

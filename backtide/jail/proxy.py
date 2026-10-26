@@ -16,6 +16,10 @@ style: synchronous, no state of its own (every method asks Docker or the disk), 
 - The channel folder is a small tmpfs mounted by backtide (root) in prepare_channel(), so the
   proxy cannot fill the disk of ``state_dir`` (T06-4); create() and start() refuse a channel
   folder that is not that tmpfs. Only the VM tests go without it (``channel_tmpfs=False``).
+  An installed backtide finds it already mounted by its systemd unit (docs/25, section 1), and
+  takes it only if it is exactly the one ``channel_mount_argv`` would make (T13-3): the topmost
+  mount on the folder, a tmpfs named CHANNEL_TMPFS_SOURCE, of the channel's size, mode and ids,
+  and ``nosuid,nodev,noexec``. Any other tmpfs found there is refused, never used.
 - ``check_agent_network`` (T06-4): on the agent's network there is nobody but the agent and
   the proxy.
 """
@@ -28,6 +32,7 @@ import stat
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +40,7 @@ from backtide.jail import docker
 from backtide.jail.ca import CA_FILE, DHPARAM_FILE
 from backtide.jail.docker import JailError
 from backtide.jail.proxy_config import (
+    CHANNEL_TMPFS_SOURCE,
     EGRESS_LABEL,
     READY_LOG_LINE,
     ProxyJailConfig,
@@ -121,11 +127,17 @@ class ProxyJail:
             pass
         except OSError as e:
             raise JailError(f"cannot create {path}: {e}") from e
-        if self.config.channel_tmpfs and not self._channel_is_tmpfs():
-            os.close(_open_dir(path))  # a real folder, not a symlink, before mounting on it
-            self._mount(channel_mount_argv(self.config))
-            if not self._channel_is_tmpfs():
-                raise JailError(f"{path} is still not a tmpfs after mounting one on it")
+        if self.config.channel_tmpfs:
+            mounted = self._channel_mount()
+            if mounted is None:
+                os.close(_open_dir(path))  # a real folder, not a symlink, before mounting on it
+                self._mount(channel_mount_argv(self.config))
+                mounted = self._channel_mount()
+                if mounted is None:
+                    raise JailError(f"{path} is still not a tmpfs after mounting one on it")
+            problem = self._channel_mount_problem(mounted)
+            if problem is not None:
+                raise JailError(f"{path} is mounted, but not as the channel's tmpfs: {problem}")
         fd = _open_dir(path)
         try:
             uid, gid = self.config.uid, self.config.gid
@@ -285,13 +297,19 @@ class ProxyJail:
             raise JailError(f"unexpected id for container {self.config.name}")
         return container_id
 
-    def _channel_is_tmpfs(self) -> bool:
+    def _channel_mount(self) -> "_Mount | None":
+        """The topmost mount on the channel folder (the one a process sees), or None."""
         target = os.path.realpath(self.config.channel_dir)
         try:
             table = self._mountinfo()
         except OSError as e:
             raise JailError(f"cannot read the mount table: {e}") from e
-        return any(point == target and fstype == "tmpfs" for point, fstype in _mount_points(table))
+        found = [mount for mount in _mounts(table) if mount.point == target]
+        return found[-1] if found else None
+
+    def _channel_mount_problem(self, mounted: "_Mount") -> str | None:
+        """Why ``mounted`` is not the tmpfs channel_mount_argv makes, or None (T13-3)."""
+        return channel_mount_problem(mounted, self.config)
 
     # Checks
 
@@ -317,10 +335,15 @@ class ProxyJail:
     def _check_mount_sources(self) -> None:
         """``docker -v`` would create a missing source as root and it follows symlinks: every
         source must already be a real directory, holding what it should and nothing more."""
-        if self.config.channel_tmpfs and not self._channel_is_tmpfs():
-            raise JailError(
-                f"{self.config.channel_dir} is not the channel's tmpfs: prepare_channel() first"
-            )
+        if self.config.channel_tmpfs:
+            mounted = self._channel_mount()
+            problem = "nothing is mounted there" if mounted is None else None
+            problem = problem or (mounted and self._channel_mount_problem(mounted))
+            if problem:
+                raise JailError(
+                    f"{self.config.channel_dir} is not the channel's tmpfs ({problem}): "
+                    "prepare_channel() first"
+                )
         fd = _open_dir(self.config.channel_dir)
         try:
             self._check_channel(fd)
@@ -456,16 +479,71 @@ class ProxyJail:
         return READY_LOG_LINE in result.stdout or READY_LOG_LINE in result.stderr
 
 
-def _mount_points(table: str) -> list[tuple[str, str]]:
-    """``(mount point, fstype)`` of each line of a mountinfo table (proc(5))."""
-    points = []
+@dataclass(frozen=True)
+class _Mount:
+    """One line of a mountinfo table (proc(5)): where, what, and its two option lists."""
+
+    point: str
+    fstype: str
+    source: str
+    options: frozenset[str]  # the mount's own (rw, nosuid...)
+    super_options: dict[str, str]  # the filesystem's (size=1024k, mode=700...)
+
+
+def _mounts(table: str) -> list[_Mount]:
+    """Each mount of a mountinfo table, in its order (a later one covers an earlier one)."""
+    mounts = []
     for line in table.splitlines():
         before, sep, after = line.partition(" - ")
-        fields = before.split()
-        if not sep or len(fields) < 5 or not after.split():
+        fields, tail = before.split(), after.split()
+        if not sep or len(fields) < 6 or not tail:
             continue
-        points.append((_unescape(fields[4]), after.split()[0]))
-    return points
+        supers: dict[str, str] = {}
+        for option in (tail[2] if len(tail) > 2 else "").split(","):
+            name, _, value = option.partition("=")
+            supers[name] = value
+        mounts.append(
+            _Mount(
+                point=_unescape(fields[4]),
+                fstype=tail[0],
+                source=_unescape(tail[1]) if len(tail) > 1 else "",
+                options=frozenset(fields[5].split(",")),
+                super_options=supers,
+            )
+        )
+    return mounts
+
+
+_SIZE_UNITS = {"k": 1024, "m": 1024**2, "g": 1024**3}
+
+
+def _size_bytes(text: str) -> int | None:
+    """``1m``, ``1024k`` or ``1048576`` (how ``mount`` takes a tmpfs size and how the kernel
+    shows it) in bytes; None for anything else."""
+    unit = _SIZE_UNITS.get(text[-1:].lower(), 1) if text else 1
+    digits = text[:-1] if text[-1:].lower() in _SIZE_UNITS else text
+    return int(digits) * unit if digits.isdigit() else None
+
+
+def channel_mount_problem(mounted: _Mount, config: ProxyJailConfig) -> str | None:
+    """Why ``mounted`` is not the channel's tmpfs as channel_mount_argv makes it (the systemd
+    unit of an installed backtide uses the same options), or None."""
+    if mounted.fstype != "tmpfs":
+        return f"it is {mounted.fstype}, not tmpfs"
+    problems = []
+    if mounted.source != CHANNEL_TMPFS_SOURCE:
+        problems.append(f"its source is {docker.sanitize(mounted.source, 64)!r}")
+    missing = sorted({"rw", "nosuid", "nodev", "noexec"} - mounted.options)
+    if missing:
+        problems.append(f"it is mounted without {','.join(missing)}")
+    supers = mounted.super_options
+    if _size_bytes(supers.get("size", "")) != _size_bytes(config.channel_size):
+        problems.append(f"its size is {docker.sanitize(supers.get('size', '?'), 32)}")
+    wanted = {"mode": f"{CHANNEL_DIR_MODE:o}", "uid": str(config.uid), "gid": str(config.gid)}
+    for name, value in wanted.items():
+        if supers.get(name, "").lstrip("0") != value.lstrip("0"):
+            problems.append(f"its {name} is {docker.sanitize(supers.get(name, '?'), 32)}")
+    return "; ".join(problems) or None
 
 
 def _unescape(field: str) -> str:

@@ -335,6 +335,50 @@ action = "exec"
 target = ["*/sh", "*/bash", "*/dash", "*/zsh"]
 where = [{ field = "argv", op = "glob", value = ["*chmod -R 777*", "*chmod -R 0777*"] }]
 
+# T13-3 (escenario `setuid-en-el-volumen`): un ejecutable setuid o setgid del agente no le sirve
+# de nada en el anfitrión (el volumen va con `nosuid`), pero que lo intente es sospechoso.
+[[rule]]
+id = "exec-setuid"
+description = "Marca un archivo como setuid o setgid (chmod u+s, chmod 4755)"
+risk = 2
+source = "exec"
+action = "exec"
+target = "*/chmod"
+where = [{ field = "argv", op = "glob", value = [
+  "+s *", "* +s *", "*[ugoa]+s *", "*[ugoa]+s,*", "[246][0-7][0-7][0-7] *",
+  "0[246][0-7][0-7][0-7] *", "-* [246][0-7][0-7][0-7] *", "-* 0[246][0-7][0-7][0-7] *",
+] }]
+
+[[rule]]
+id = "exec-shell-setuid"
+description = "Una orden de shell que marca un archivo como setuid o setgid"
+risk = 2
+source = "exec"
+action = "exec"
+target = ["*/sh", "*/bash", "*/dash", "*/zsh"]
+where = [{ field = "argv", op = "glob", value = [
+  "*chmod +s *", "*chmod *[ugoa]+s *", "*chmod [246][0-7][0-7][0-7] *",
+  "*chmod 0[246][0-7][0-7][0-7] *", "*chmod -* [246][0-7][0-7][0-7] *",
+] }]
+
+# T13-3 (escenario `agente-no-ve-la-instalacion`): desde la jaula no se ve nada de la instalación
+# de backtide, pero buscarla (su configuración, su estado, sus unidades) es sospechoso.
+[[rule]]
+id = "exec-backtide-install"
+description = "Busca la instalación de backtide (/etc/backtide, /var/lib/backtide, sus unidades)"
+risk = 2
+source = "exec"
+action = "exec"
+# Only the folders themselves and what hangs below them: never /etc/backtide-ca (the agent's own
+# CA) nor /var/lib/backtide-agent (review of T13-3, R7). Each one at the end of the command, or
+# followed by `/`, a space or a quote.
+where = [{ field = "argv", op = "glob", value = [
+  "*/etc/backtide", "*/etc/backtide/*", "*/etc/backtide *", "*/etc/backtide\"*", "*/etc/backtide'*",
+  "*/var/lib/backtide", "*/var/lib/backtide/*", "*/var/lib/backtide *", "*/var/lib/backtide\"*",
+  "*/var/lib/backtide'*", "*/opt/backtide", "*/opt/backtide/*", "*/opt/backtide *",
+  "*/etc/systemd/system/backtide.service*", "*/etc/systemd/system/backtide-web.service*",
+] }]
+
 # ---------------------------------------------------------------------------------------------
 # Red (T06, el proxy). PROVISIONAL: se escriben para `net/request` con `details.method`. El proxy
 # ya graba sus propios riesgos (rechazos, clave real) y T10 retiene lo destructivo antes de que

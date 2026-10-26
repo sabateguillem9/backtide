@@ -70,6 +70,26 @@ def test_dockers_own_networks_and_the_demo_are_left_alone() -> None:
     assert leaks.containers == [] and leaks.networks == []
 
 
+def test_an_installed_backtides_own_objects_are_left_alone_only_where_it_is_installed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T13-3: the scenarios of a real installation restart its service, which makes its
+    containers again. Elsewhere those names are leaks like any other."""
+    before = Inventory()
+    after = Inventory(
+        containers=(Item("c1", "backtide-agente", "Up"), Item("c2", "backtide-test-agent-1-x")),
+        networks=(Item("n1", "backtide-salida-net"),),
+    )
+    monkeypatch.setattr(docker_leaks, "INSTALLED_UNIT", tmp_path / "backtide.service")
+    leaks = docker_leaks.find_leaks(before, after, alive=lambda pid: False)
+    assert [c.name for c in leaks.containers] == ["backtide-agente", "backtide-test-agent-1-x"]
+    assert [n.name for n in leaks.networks] == ["backtide-salida-net"]
+    (tmp_path / "backtide.service").write_text("[Unit]\n")
+    leaks = docker_leaks.find_leaks(before, after, alive=lambda pid: False)
+    assert [c.name for c in leaks.containers] == ["backtide-test-agent-1-x"]
+    assert leaks.networks == []
+
+
 def test_test_objects_of_another_live_pytest_are_left_alone_but_dead_ones_are_not() -> None:
     other = f"backtide-test-agent-{99999}-abc123"
     after = inventory((item(other),))

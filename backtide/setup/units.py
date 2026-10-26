@@ -69,6 +69,8 @@ def unit_values() -> dict[str, str]:
         "PROXY_CHANNEL_DIR": str(layout.PROXY_CHANNEL_DIR),
         "CAPABILITIES": " ".join(layout.SERVICE_CAPABILITIES),
         "WEB_USER": layout.WEB_USER,
+        "WEB_LINK_FILE": str(layout.WEB_LINK_FILE),
+        "WEB_RUN_DIR_NAME": layout.WEB_RUN_DIR.name,
         "SERVICE_UNIT": layout.SERVICE_UNIT,
         "CHANNEL_SOURCE": CHANNEL_TMPFS_SOURCE,
         "CHANNEL_OPTIONS": channel_tmpfs_options(CHANNEL_SIZE, PROXY_UID, PROXY_GID),
