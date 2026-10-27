@@ -1,0 +1,65 @@
+# backtide-mac: the VM that holds backtide on a Mac (T13b; docs/25, section 7).
+# install-mac.sh creates it from this file, taken from the checked archive of backtide; the Linux
+# install.sh then runs inside it, unchanged. The first line is how install-mac.sh knows a VM is
+# its own: do not change it.
+#
+# What it is, and why:
+# - Fedora 44 Cloud, its image pinned by digest (the one T13-3 tested): backtide needs a Linux
+#   kernel with Btrfs and eBPF, which Docker Desktop's VM does not give.
+# - 4 CPU, 6 GiB, a 40 GiB disk that only takes the space it uses (sparse).
+# - NO folder of the Mac is mounted: the VM, the agent and backtide never see your files.
+# - Only the web's port is forwarded, to this Mac's 127.0.0.1 and nowhere else (the rules below,
+#   tested with Lima 2.2.1; install-mac.sh checks them on every run).
+# - No ssh agent, X11, proxy settings or containerd of the Mac go in.
+# - What this does NOT stop: the VM itself (its root and its own programs, not the agent's jail,
+#   which has no route there) can reach services listening on this Mac's 127.0.0.1, through
+#   Lima's address for the host, 192.168.5.2 (host.lima.internal). That is Lima's network.
+minimumLimaVersion: 2.0.0
+
+vmType: vz
+os: Linux
+arch: aarch64
+images:
+- location: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
+  arch: aarch64
+  digest: "sha256:55c60a3b80d3616a08705afd0459e75fe9f03c54aba7a46e4002a41a72fa0d5b"
+
+cpus: 4
+memory: "6GiB"
+disk: "40GiB"
+
+mounts: []
+
+containerd:
+  system: false
+  user: false
+
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+
+propagateProxyEnv: false
+upgradePackages: false
+
+video:
+  display: "none"
+
+# First match wins: the web (backtide-web.service listens on the VM's 127.0.0.1:8765) to the
+# Mac's 127.0.0.1:8765, and nothing else, TCP or UDP, on any address of the VM. The web checks
+# that it is called as 127.0.0.1:8765, so the two ports must be the same.
+portForwards:
+- guestIP: "127.0.0.1"
+  guestPort: 8765
+  hostIP: "127.0.0.1"
+  hostPort: 8765
+  proto: tcp
+- guestIP: "0.0.0.0"
+  guestIPMustBeZero: false
+  proto: any
+  ignore: true
+- guestIP: "::"
+  guestIPMustBeZero: false
+  proto: any
+  ignore: true

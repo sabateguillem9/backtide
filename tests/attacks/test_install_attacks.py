@@ -96,6 +96,11 @@ def back_to_normal(installed: Installed) -> None:
 
 @pytest.fixture(scope="module")
 def installed() -> Iterator[Installed]:
+    yield from open_installed()
+
+
+def open_installed() -> Iterator[Installed]:
+    """The installed backtide, its agent answering (test_mac_vm_attacks.py uses it too)."""
     config = ServiceConfig.from_file(layout.CONFIG_FILE)
     box = BlackBox(
         config.blackbox_db,

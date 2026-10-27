@@ -55,14 +55,19 @@ def test_without_root_it_stops_at_once(args: tuple[str, ...], tmp_path: Path) ->
         ["sh", str(SCRIPT), *args], capture_output=True, text=True, cwd=tmp_path, check=False
     )
     assert done.returncode == 1
-    assert "hace falta root" in done.stderr
+    if sys.platform == "darwin":
+        # On a Mac it hands over to install-mac.sh, which never asks for root (T13b) and stops
+        # at the missing or unreadable archive, before any change.
+        assert "aún no hay versión publicada" in done.stderr or "no existe x.tar" in done.stderr
+    else:
+        assert "hace falta root" in done.stderr
     assert list(tmp_path.iterdir()) == []
 
 
 def test_an_unsupported_system_stops_before_any_change(tmp_path: Path) -> None:
-    """With a fake `id` that says root and no archive: on the Mac there is no os-release, so it
-    stops there; on a supported Linux (CI) it stops at the missing release. Either way, before
-    any change."""
+    """With a fake `id` that says root and no archive: on the Mac it hands over to install-mac.sh,
+    which refuses root; on a supported Linux (CI) it stops at the missing release. Either way,
+    before any change."""
     fake = tmp_path / "bin"
     fake.mkdir()
     (fake / "id").write_text("#!/bin/sh\necho 0\n")
@@ -77,7 +82,7 @@ def test_an_unsupported_system_stops_before_any_change(tmp_path: Path) -> None:
     )
     assert done.returncode == 1
     if sys.platform == "darwin":
-        assert "os-release" in done.stderr or "no es una de las que admite" in done.stderr
+        assert "sin sudo" in done.stderr  # install-mac.sh: root on the Mac is refused (T13b)
     else:
         assert (
             "os-release" in done.stderr
@@ -85,3 +90,18 @@ def test_an_unsupported_system_stops_before_any_change(tmp_path: Path) -> None:
             or ("aún no hay versión publicada" in done.stderr)
         )
     assert sorted(p.name for p in tmp_path.iterdir()) == ["bin"]
+
+
+def test_a_second_run_keeps_the_uv_it_has(tmp_path: Path) -> None:
+    """uv prints its version with the platform after it (``uv 0.12.17 (aarch64-unknown-linux-gnu)``,
+    seen in the Mac's VM, T13b): the check compares the first two words, so a second run does not
+    download and reinstall uv."""
+    line = next(line for line in TEXT.splitlines() if '"$UV" --version' in line)
+    check = line.split("[ ", 2)[2].split(" ]", 1)[0]
+    fake = tmp_path / "uv"
+    fake.write_text("#!/bin/sh\necho 'uv 0.12.17 (aarch64-unknown-linux-gnu)'\n")
+    fake.chmod(0o755)
+    test = f"UV={fake}; UV_VERSION=0.12.17; if [ {check} ]; then echo again; else echo kept; fi"
+    assert subprocess.run(["sh", "-c", test], capture_output=True, text=True).stdout == "kept\n"
+    other = test.replace("UV_VERSION=0.12.17", "UV_VERSION=0.12.18")
+    assert subprocess.run(["sh", "-c", other], capture_output=True, text=True).stdout == "again\n"

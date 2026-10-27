@@ -1,6 +1,6 @@
 #!/bin/bash
-# The installation in a clean VM, end to end (T13-3; T13-5 reuses it). Inside a backtide-limpia-*
-# VM only, as root, never on the Mac or in vigia-dev:
+# The installation in a clean VM, end to end (T13-3; T13-5 and the Mac's lab, T13b, reuse it).
+# Inside a backtide-limpia-* or backtide-prueba-* VM only, as root, never on the Mac or in vigia-dev:
 #
 #   sudo bash instalar_lab.sh bloquear            # nothing of the agent's leaves the VM
 #   sudo bash instalar_lab.sh instalar SRC.tar    # install.sh --desde SRC.tar, made-up key,
@@ -21,8 +21,15 @@ KEY_FILE=$LAB/made-up.key
 PS_LOG=$LAB/ps.log
 
 require_clean_vm_root() {
-  case "$(hostname)" in lima-backtide-limpia-*) ;; *) echo "only inside a backtide-limpia-* VM" >&2; exit 2 ;; esac
+  case "$(hostname)" in lima-backtide-limpia-* | lima-backtide-prueba-*) ;;
+    *) echo "only inside a backtide-limpia-* or backtide-prueba-* VM" >&2; exit 2 ;; esac
   [ "$(id -u)" = 0 ] || { echo "run it as root" >&2; exit 2; }
+}
+
+# Everything but making the cut needs it there: a VM named like ours without the cut is not a lab.
+require_lab_mark() {
+  nft list table inet backtide_lab >/dev/null 2>&1 \
+    || { echo "no lab network cut here: run \`instalar_lab.sh bloquear\` first" >&2; exit 2; }
 }
 
 result() { printf 'RESULT %s=%s\n' "$1" "$2"; }
@@ -84,17 +91,18 @@ instalar() {
 }
 
 fugas() {
-  local key found=""
-  key=$(tr -d '\n' < "$KEY_FILE")
-  grep -qF "$key" "$PS_LOG" && found="$found ps"
-  journalctl -b --no-pager -o cat 2>/dev/null | grep -qF "$key" && found="$found journal"
-  grep -rqF "$key" /var/log 2>/dev/null && found="$found /var/log"
-  grep -qF "$key" "$LAB/install.log" && found="$found install.log"
-  for c in $(docker ps -aq); do docker logs "$c" 2>&1 | grep -qF "$key" && found="$found docker-logs:$c"; done
+  # The key is read from its file by grep (-f), never put in grep's arguments: a ps sampler that is
+  # still running (the Mac's lab keeps one for the whole session) would record it there.
+  local found="" match=(grep -qF -f "$KEY_FILE")
+  "${match[@]}" "$PS_LOG" && found="$found ps"
+  journalctl -b --no-pager -o cat 2>/dev/null | "${match[@]}" && found="$found journal"
+  grep -rqF -f "$KEY_FILE" /var/log 2>/dev/null && found="$found /var/log"
+  [ ! -e "$LAB/install.log" ] || ! "${match[@]}" "$LAB/install.log" || found="$found install.log"
+  for c in $(docker ps -aq); do docker logs "$c" 2>&1 | "${match[@]}" && found="$found docker-logs:$c"; done
   # Files: everywhere backtide writes, but its one place for the key and the lab's own copy.
   while IFS= read -r file; do
     case "$file" in /var/lib/backtide/keys/anthropic.key | "$KEY_FILE") ;; *) found="$found $file" ;; esac
-  done < <(grep -rlF "$key" /etc /var/lib/backtide /opt/backtide /run /tmp /root 2>/dev/null || true)
+  done < <(grep -rlF -f "$KEY_FILE" /etc /var/lib/backtide /opt/backtide /run /tmp /root 2>/dev/null || true)
   result ps_samples "$(grep -c . "$PS_LOG")"
   result key_leaks "[${found# }]"
   result key_file "$(stat -c '%U:%G %a' /var/lib/backtide/keys/anthropic.key)"
@@ -138,9 +146,9 @@ require_clean_vm_root
 case "${1:-}" in
   bloquear) bloquear ;;
   cortar) cortar ;;
-  instalar) instalar "${2:?the source archive}" ;;
-  fugas) fugas ;;
-  estado) estado ;;
-  bateria) shift; bateria "${1:?the source archive}" "${@:2}" ;;
+  instalar) require_lab_mark; instalar "${2:?the source archive}" ;;
+  fugas) require_lab_mark; fugas ;;
+  estado) require_lab_mark; estado ;;
+  bateria) require_lab_mark; shift; bateria "${1:?the source archive}" "${@:2}" ;;
   *) sed -n '2,15p' "$0"; exit 2 ;;
 esac

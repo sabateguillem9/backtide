@@ -16,14 +16,15 @@ make help         # every command
 ### What does backtide support?
 
 - **Host:** a Mac with Apple Silicon, with Lima and uv. This is the only setup the quickstart and the demo were written for. See [getting-started.md](getting-started.md).
+- **Installing it as a service:** on Ubuntu 24.04 or 26.04 or Fedora 43 or 44 with `install.sh`, and on a Mac with Apple Silicon with `install-mac.sh`, which makes a Linux VM of its own and runs `install.sh` inside it. See [cli-reference.md](cli-reference.md#install-macsh-backtide-on-a-mac) for what changes on a Mac (sleep, files, the clock).
 - **Agents:** OpenClaw, and Claude Code (`PERFIL=claude-code`). Other agents are designed or planned, not built. The README's status table is the reference.
 - **Models:** Claude through the proxy, or a local model through Ollama. See [real-run.md](real-run.md).
 
 ### What is not supported?
 
 - **Windows**, including WSL2: not supported.
-- **Intel Macs:** not tested.
-- **Linux without the VM:** the demo and test scripts refuse to run anywhere but the Lima VM `vigia-dev`. The code is designed for Linux with Docker and Btrfs, but there is no installer yet. `make test` and `make lint` do run on Linux (the project's CI runs them on Ubuntu).
+- **Intel Macs:** not tested, and `install-mac.sh` refuses them for now.
+- **Linux without the VM:** the demo and test scripts refuse to run anywhere but the Lima VM `vigia-dev`. The code is designed for Linux with Docker and Btrfs, and `install.sh` installs it there as a service (see above). `make test` and `make lint` do run on Linux (the project's CI runs them on Ubuntu).
 - **Messaging channels whose sessions break when rewound, such as WhatsApp and Signal:** not supported in this version. Rewinding restores the agent's working folder, but not the state of those sessions.
 - **State outside the rewound folder:** configuration, channel tokens and the list of who may talk to the agent are not rolled back.
 - **Taking back what already left:** an email, a payment or a deleted cloud resource that was approved, or that left through a hole the gate does not cover. A rewind does not unsend, unpay or undelete.

@@ -68,6 +68,7 @@ from backtide.jail.proxy import ProxyJail
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.snapshots import SnapshotError, btrfs, grow
 from backtide.snapshots.store import SnapshotStore
+from tests import vm_gates
 from tests.docker_leaks import (  # noqa: F401 - pytest hooks: the leak guard (docs below)
     pytest_collection_finish,
     pytest_sessionfinish,
@@ -575,8 +576,19 @@ def _mounted_btrfs(
 
 def _require_dev_vm_user_with_sudo() -> None:
     # Never sudo on the Mac, a Linux laptop or a CI runner, even if pytest -m integration runs.
-    if sys.platform != "linux" or platform.node() != VM_HOSTNAME:
-        pytest.fail(f"integration tests run only inside the {VM_HOSTNAME} VM: use `make it`")
+    # vigia-dev, or a Mac installer's test VM (T13b) that carries the lab's network cut.
+    node = platform.node()
+    if not vm_gates.is_dev_vm(node, sys.platform):
+        pytest.fail(
+            f"integration tests run only inside the {VM_HOSTNAME} VM (`make it`), or a "
+            "backtide-prueba-* VM of the Mac installer's lab"
+        )
+    if vm_gates.needs_lab_mark(node):
+        mark = subprocess.run(  # noqa: S603 - fixed argv
+            vm_gates.lab_mark_argv(sudo=True), capture_output=True, timeout=COMMAND_TIMEOUT
+        )
+        if mark.returncode != 0:
+            pytest.fail(f"{node} has no lab network cut (instalar_lab.sh bloquear): not a lab VM")
     if os.geteuid() == 0:
         pytest.fail(
             "run the integration tests as the normal user, not root: they test the "

@@ -23,6 +23,8 @@ from attack_manifest import (
 )
 from attack_report import Result, describe, format_pending, format_report, format_scenario
 
+from tests import vm_gates
+
 HERE = Path(__file__).parent
 ROOT = HERE.parents[1]
 MANIFEST = load_manifest()
@@ -90,11 +92,13 @@ def test_attack_tests_are_left_out_of_make_test_and_make_it() -> None:
     assert "ataques" in "".join(options["markers"])
 
 
-@pytest.mark.skipif(platform.node() == "lima-vigia-dev", reason="this is the VM itself")
+@pytest.mark.skipif(
+    vm_gates.is_dev_vm(platform.node(), sys.platform), reason="this is one of the VMs itself"
+)
 def test_the_vm_guard_refuses_to_run_an_attack_anywhere_else() -> None:
-    """Invariant 8, on the Mac: the check every attack makes first fails here."""
+    """Invariant 8, on the Mac and in CI: the check every attack makes first fails here."""
     guard = sys.modules["backtide_vm_fixtures"]._require_dev_vm_user_with_sudo
-    with pytest.raises(pytest.fail.Exception, match="only inside"):
+    with pytest.raises(pytest.fail.Exception, match="only inside the lima-vigia-dev VM"):
         guard()
 
 

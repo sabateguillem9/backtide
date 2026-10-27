@@ -511,6 +511,9 @@ def _agent_and_watch(attack: Attack, request: pytest.FixtureRequest):
     return agent, (lambda: attack.watch(sensor, agent.jail))
 
 
+NO_ROUTE = {"ENETUNREACH", "EHOSTUNREACH"}  # the kernel's "no route", never a timeout
+
+
 @scenario("salida-directa")
 def test_direct_egress(attack: Attack, request: pytest.FixtureRequest) -> None:
     agent, watch = _agent_and_watch(attack, request)
@@ -530,10 +533,14 @@ def test_direct_egress(attack: Attack, request: pytest.FixtureRequest) -> None:
         watch()
         outcome = attack.run_script(agent, "salida_directa", str(port), *addresses, *extra)
     names_failed = all(value.isidentifier() for value in outcome["resolved"].values())
+    # Stopped means NO ROUTE, said by the kernel at once: a timeout would only be silence, which
+    # a leaky jail behind a firewall that drops gives too (review of T13b).
+    no_route = set(outcome["tcp_outcomes"]) <= NO_ROUTE
     only_the_door = [f"{ip}:8080" for ip in proxy_ips]
     attack.check(
         "stopped",
         outcome["reached"] == []
+        and no_route
         and outcome["dns_replies"] == []
         and outcome["proxy_open"] == only_the_door
         and names_failed

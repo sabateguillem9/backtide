@@ -12,6 +12,7 @@
 """
 
 import importlib.util
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -189,17 +190,18 @@ def _only_in_the_vm(request: pytest.FixtureRequest) -> None:
     _vm._require_dev_vm_user_with_sudo()
 
 
-CLEAN_VM_PREFIX = "lima-backtide-limpia-"
 INSTALLED_SKIP = (
-    "solo en una VM limpia con backtide instalado por install.sh, como root (make vm-limpia-*, "
-    "docs/25, «Resultados de T13-3»)"
+    "solo en una VM limpia con backtide instalado por install.sh, como root (make vm-limpia-* o "
+    "instalar_mac_lab.sh; docs/25, «Resultados de T13-3» y «de T13b»)"
 )
 
 
 def _in_a_clean_vm() -> bool:
     import platform
 
-    return sys.platform == "linux" and platform.node().startswith(CLEAN_VM_PREFIX)
+    from tests import vm_gates
+
+    return vm_gates.is_clean_vm(platform.node(), sys.platform)
 
 
 def _require_installed_clean_vm() -> None:
@@ -211,6 +213,11 @@ def _require_installed_clean_vm() -> None:
         pytest.skip(INSTALLED_SKIP)
     if os.geteuid() != 0:
         pytest.fail("the scenarios of an installation run as root: that is what they test")
+    from tests import vm_gates
+
+    mark = subprocess.run(vm_gates.lab_mark_argv(sudo=False), capture_output=True, check=False)  # noqa: S603
+    if mark.returncode != 0:
+        pytest.fail("no lab network cut here (instalar_lab.sh bloquear): not a lab VM")
     if not (layout.UNIT_DIR / layout.SERVICE_UNIT).is_file():
         pytest.fail(f"backtide is not installed here: run install.sh first ({INSTALLED_SKIP})")
 

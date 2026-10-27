@@ -16,11 +16,17 @@
 # go in an argument: use --clave-archivo FILE, --clave-stdin, or type it when asked.
 set -eu
 
+# On a Mac, backtide lives in a Linux VM of its own: install-mac.sh, next to this file, makes it.
+if [ "$(uname -s)" = Darwin ]; then
+  case "$0" in */install.sh | install.sh) MAC=$(dirname "$0")/install-mac.sh ;; *) MAC= ;; esac
+  [ -n "$MAC" ] && [ -f "$MAC" ] || { printf '%s\n' "backtide: en un Mac, sh install-mac.sh (sin sudo; va junto a install.sh)" >&2; exit 1; }
+  exec sh "$MAC" "$@"
+fi
+
 UV_VERSION=0.12.17
 UV_SHA256_X86_64=fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63
 UV_SHA256_AARCH64=d636d1b678e9e7f367ecb22b46bd1cabbed234d6bc3b4d96365d2b507f72f86c
-# The published release this script installs. Empty until the first release (T14): until then,
-# --desde ARCHIVE --sha256 HEX (for example `git archive --format=tar HEAD`).
+# The published release this script installs: empty until the first (T14); use --desde --sha256.
 BACKTIDE_URL=
 BACKTIDE_SHA256=
 
@@ -29,9 +35,7 @@ say() { printf '%s\n' "backtide: $*"; }
 die() { printf '%s\n' "backtide: $*" >&2; exit 1; }
 
 # Take --desde and --sha256 out; everything else stays, in order, for `backtide instalar`.
-DRY_RUN=0
-SOURCE=
-SOURCE_SHA256=
+DRY_RUN=0 SOURCE= SOURCE_SHA256= NOTICE=1
 left=$#
 while [ "$left" -gt 0 ]; do
   arg=$1; shift; left=$((left - 1))
@@ -41,10 +45,18 @@ while [ "$left" -gt 0 ]; do
       if [ "$arg" = --desde ]; then SOURCE=$1; else SOURCE_SHA256=$1; fi
       shift; left=$((left - 1)) ;;
     --dry-run) DRY_RUN=1; set -- "$@" "$arg" ;;
+    --sin-aviso) NOTICE=0 ;;  # install-mac.sh has shown the notice already
     *) set -- "$@" "$arg" ;;
   esac
 done
 
+[ "$NOTICE" = 0 ] || cat <<'EOF'
+backtide is a PREVIEW, with no human security audit yet.
+  - Use a model key with a spending limit, never a production key.
+  - A rewind does not bring back what already left the machine, and calls to the model are never held.
+  - Supported: Linux (Fedora, Ubuntu) and Macs with Apple Silicon. On Fedora with kernel 7.1+ the
+    process sensor does not start (D24).
+EOF
 [ "$(id -u)" = 0 ] || die "hace falta root: sudo sh install.sh"
 [ -r /etc/os-release ] || die "no se puede leer /etc/os-release"
 DISTRO=$(. /etc/os-release && printf '%s %s' "$ID" "$VERSION_ID")
@@ -94,7 +106,8 @@ umask 022
 mkdir -p "$OPT/uv/$UV_VERSION" "$OPT/releases"
 chmod 0755 "$OPT" "$OPT/uv" "$OPT/releases"
 UV=$OPT/uv/$UV_VERSION/uv
-if [ ! -x "$UV" ] || [ "$("$UV" --version 2>/dev/null)" != "uv $UV_VERSION" ]; then
+# `uv --version` says "uv 0.12.17 (aarch64-unknown-linux-gnu)": only its first two words count.
+if [ ! -x "$UV" ] || [ "$("$UV" --version 2>/dev/null | cut -d' ' -f1,2)" != "uv $UV_VERSION" ]; then
   say "descargando uv $UV_VERSION"
   curl -fsSL --proto =https --tlsv1.2 -o "$WORK/uv.tar.gz" \
     "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$UV_TRIPLE.tar.gz" \

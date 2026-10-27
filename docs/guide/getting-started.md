@@ -4,6 +4,16 @@ This guide takes you from a fresh clone to the 60-second demo: an AI agent delet
 
 backtide is **pre-alpha**. It is a working prototype, not a product. Read the status and the security model in the [README](../../README.md) before you trust it with anything. This guide only covers how to run it.
 
+> **This is a preview.** Read this before you install it:
+>
+> - It has had **no human security audit**. The reviews so far were done by AI agents.
+> - **Do not use production keys.** Make a model key with a spending limit just for this.
+> - **A rewind does not bring back what already left the machine.** An email, a payment or a push that went out stays out; holding those back is the gate's job.
+> - **Calls to the model are never held**: what the agent tells its model provider goes out.
+> - **On Fedora with kernel 7.1 or later, the process sensor does not start** (Tetragon v1.7.1 cannot read those kernels' BTF). Everything else works.
+> - **On a Mac:** when the Mac sleeps, the agent and its alerts sleep, and the agent's files live in the VM, not on your Mac ([details](cli-reference.md#install-macsh-backtide-on-a-mac)).
+> - **Supported:** Linux (Fedora 43 and 44, Ubuntu 24.04 and 26.04) and Macs with Apple Silicon.
+
 The demo costs nothing. The agent runs fixed commands and never calls a model. The test with a real model (it costs money) is in [real-run.md](real-run.md).
 
 ## What you need
@@ -17,7 +27,7 @@ What the repository supports today:
 | Setup | State |
 |---|---|
 | Mac with Apple Silicon (M1 or newer), with [uv](https://docs.astral.sh/uv/) and Lima 2.0.0 or newer | **The supported setup.** Everything in this guide was written for it. |
-| Linux, running the commands directly (Docker + Btrfs) | The code is designed for it, but there is no installer yet. The demo and test scripts refuse to run outside the VM named `vigia-dev`, so `make demo` does not work on a bare Linux host. `make test` and `make lint` do run on Linux (the project's CI runs them on Ubuntu). |
+| Linux, running the commands directly (Docker + Btrfs) | The code is designed for it, and `install.sh` installs it as a service ([cli-reference.md](cli-reference.md#installsh-and-backtide-instalar)). The demo and test scripts refuse to run outside the VM named `vigia-dev`, so `make demo` does not work on a bare Linux host. `make test` and `make lint` do run on Linux (the project's CI runs them on Ubuntu). |
 | Lima on a Linux host | Not tested. |
 | Intel Mac | Not tested. |
 | Windows | Not supported. |

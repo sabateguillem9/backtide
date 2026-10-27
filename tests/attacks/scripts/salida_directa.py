@@ -13,6 +13,7 @@ that fake local service by every address the host has. With the egress proxy on 
 DNS to the proxy, and the proxy's address on the egress network (no route to it).
 """
 
+import errno
 import json
 import socket
 import struct
@@ -41,8 +42,13 @@ def tcp(target):
             probe.settimeout(TIMEOUT)
             probe.connect((address, port))
         return f"{address}:{port}", "CONNECTED"
+    except ConnectionRefusedError:
+        return f"{address}:{port}", "ConnectionRefusedError"
+    except TimeoutError:
+        return f"{address}:{port}", "TimeoutError"
     except OSError as error:
-        return f"{address}:{port}", type(error).__name__
+        # The errno's name (ENETUNREACH, EHOSTUNREACH...): "no route" is told apart from silence.
+        return f"{address}:{port}", errno.errorcode.get(error.errno or 0, type(error).__name__)
 
 
 def udp_dns(address):
@@ -83,6 +89,8 @@ print(
                 k for k, v in tcp_results.items() if v in ("CONNECTED", "ConnectionRefusedError")
             ),
             "tcp_errors": sorted(set(tcp_results.values()) - {"CONNECTED"}),
+            # Every attempt that did not connect, but those to the proxy, and how it failed.
+            "tcp_outcomes": sorted(set(tcp_results.values())),
             # On the proxy a refusal is expected (nothing listens): only CONNECTED is a door.
             "proxy_open": sorted(k for k, v in proxy_results.items() if v == "CONNECTED"),
             "proxy_attempts": len(proxy_results),

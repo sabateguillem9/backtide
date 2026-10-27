@@ -474,6 +474,36 @@ How it behaves:
 - Exit codes: `0` installed and tested; `1` stopped (it says where and how to go on); `2` not root or a bad flag.
 - Uninstalling and upgrading are not there yet (T13-4).
 
+### `install-mac.sh`: backtide on a Mac
+
+backtide needs a Linux kernel (Btrfs for the snapshots, eBPF for the sensor), and Docker Desktop's VM gives neither. So on a Mac, backtide lives in a small Linux VM of its own, made with [Lima](https://lima-vm.io) and Apple's virtualization, and the Linux installer above runs inside it, unchanged. `install-mac.sh` is a short `sh` script at the root of the repository (`sh install.sh` on a Mac hands over to it): read it before you run it. Run it as yourself; it never uses `sudo` on the Mac.
+
+```sh
+git archive --format=tar -o backtide.tar HEAD && shasum -a 256 backtide.tar
+sh install-mac.sh --desde backtide.tar --sha256 <the hash> [--clave-archivo FILE | --clave-stdin | --sin-clave] [--si]
+```
+
+What it does, and nothing else:
+
+1. Checks the Mac: Apple Silicon (Intel Macs are not supported yet), macOS 13.5 or later, at least 8 GiB of memory, 25 GiB free, and that port 8765 is free.
+2. Uses your Lima if it is 2.x. If there is none, it downloads Lima 2.2.1 from Lima's GitHub releases, checks it against the sha256 written in the script, and keeps it in `~/.backtide/lima/2.2.1`. No Homebrew, nothing outside your home.
+3. Checks the archive's sha256 and creates the VM `backtide` from `lima/backtide-mac.yaml` in that archive: Fedora 44 (its image pinned by digest), 4 CPUs, 6 GiB of memory, a 40 GiB disk that only takes the space it uses. **No folder of your Mac is mounted** (it checks from inside the VM before installing anything), and no ssh agent or proxy settings of the Mac go in. It refuses to go on if a Lima `default.yaml`, `override.yaml` or `base.yaml` could change the VM, if a VM called `backtide` exists that is not its own, or if the VM's mounts or forwarded ports are no longer the template's (checked on every run).
+4. Copies the archive into the VM, checks its sha256 again there, and runs `install.sh` inside as the VM's root, with `--si` (the VM is only for backtide).
+5. Leaves a small `backtide` command in `~/.local/bin` (add it to your `PATH`). It runs `sudo backtide …` inside the VM, so every command on this page works from the Mac: `backtide enlace`, `backtide comprobar --despues-de-instalar`, `backtide rebobinar`… If the VM is stopped, it starts it first. `backtide vm estado|arrancar|parar|shell` show, start, stop or open the VM.
+
+Only the web's port is forwarded, to the Mac's `127.0.0.1:8765`: `backtide enlace` prints the link (after checking that the port is held by Lima, not by another program), and it opens in your Mac's browser. No other port of the VM reaches the Mac (tested with Lima 2.2.1). **The other direction is open for the VM itself:** its root and its own programs can reach services listening on your Mac's `127.0.0.1` through Lima's address for the host, `192.168.5.2`. The agent's jail cannot: it has no route there, and a scenario of the battery checks it. **Run it again and it changes nothing**: the VM, Lima and the `backtide` command stay as they are, and the Linux installer inside finds everything done.
+
+**Keys never go in an argument, on the Mac or in the VM.** `--clave-archivo FILE` is read on the Mac and sent to the installer in the VM through standard input (`--clave-stdin` there), so the key is in no command line, no Lima log and no shell history. `--clave-stdin` passes your standard input on the same way, but only from a pipe or a file: from a terminal it is refused, since what you type there would be seen. Without either, and with a terminal, it asks for the key without echo; an empty answer leaves it for later. The Mac's `backtide` does the same with `--clave-archivo`.
+
+**What to know about a Mac:**
+
+- **When the Mac sleeps, the VM sleeps.** The agent stops, and no alert reaches you, until the Mac wakes up. backtide on a Mac watches an agent while you use the Mac; for an agent that runs all night, use a Linux machine.
+- **After a restart of the Mac the VM is stopped.** Any `backtide …` command starts it again, or `backtide vm arrancar`.
+- **The agent's files live in the VM, not on your Mac.** `backtide exportar <folder>` copies them to a new folder inside the VM, and `backtide vm shell` gets you there. Bringing them to the Mac in one step is not there yet.
+- **The VM's clock.** While the Mac sleeps, the VM's clock stops. When it wakes, Lima's guest agent sets it from the Mac's within seconds (measured: a VM two hours behind was right again in under 10 seconds), and until then backtide does not prune old snapshots, because pruning refuses to run on a clock that is not synchronized. `backtide comprobar` says whether it is.
+- **Port 8765 must be free on the Mac.** The web checks that it is called as `127.0.0.1:8765`, so the VM's port and the Mac's must be the same. `make web-demo` uses the same port: close one before the other.
+- **Telegram is not in the installer yet**: it will be set in the web's Settings page.
+
 ### `backtide enlace`
 
 ```sh
