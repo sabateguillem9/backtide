@@ -49,7 +49,7 @@ Two consequences of that table:
 - The gate decides by what a request *does*, not only where it goes. A read passes (it is recorded first). A write or a send to anything else is held, with a short sentence saying what it would do. What the gate cannot see is listed in the design (internal note), section 13: a read can still carry some data in its URL (capped by a budget per host), and a request to the model provider carries the whole conversation.
 - backtide can restore the agent's folder; it cannot take back an email, a payment or a deleted cloud database that was approved or that left through a hole the gate does not cover.
 
-Start with the [documentation guide](docs/guide/README.md). The tasks are in docs/backlog.md (internal note). Most design documents are written in Spanish.
+Start with the [documentation guide](docs/guide/README.md). Most design documents are written in Spanish. The task list and the working setup are kept in the project's private repository.
 
 ## Security model
 

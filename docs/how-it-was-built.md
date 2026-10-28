@@ -1,6 +1,6 @@
 # How backtide was built
 
-This page says who did what, how the work was organised, and what that means for how far you should trust the result. Everything here can be checked in the repository: the git history, the backlog (internal note), the development log (internal note) and the design documents. Most of those documents are in Spanish.
+This page says who did what, how the work was organised, and what that means for how far you should trust the result. The git history and the design documents are in this repository; most of the documents are in Spanish. The working setup (the agents, the skills, the backlog, the development log and the decision record) stays in the project's private repository, so the references to it below are marked *(internal note)* in the public copy.
 
 ## A word from the founder
 
