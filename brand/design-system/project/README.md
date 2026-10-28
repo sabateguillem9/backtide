@@ -143,7 +143,7 @@ These are not style choices; they keep the product web safe (see the docstring o
 
 - Every public page has the `LegalFooter`: the wordmark, Privacy, Legal notice, GitHub, the language switch, and one line on what is collected ("This site collects no data: no cookies, no analytics, no forms.").
 - The language follows the browser, can be changed with the switch, and lives in the address (`?lang=`), never in a cookie.
-- English and Spanish, always both. Strings live in one file per site (`site/i18n.js` or the labs' strings; `backtide/web/i18n.py` for the product).
+- English and Spanish, always both. Strings live in one file per site (`site/strings.js` for the public site; `backtide/web/i18n.py` for the product).
 - The fonts' licences travel with them (`fonts/lora-OFL.txt`, `fonts/dm-sans-OFL.txt`).
 
 ## Files
