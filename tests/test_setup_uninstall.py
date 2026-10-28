@@ -305,6 +305,20 @@ def test_a_network_in_use_is_left_and_the_next_run_removes_it(machine: Machine) 
     assert machine.networks == {}
 
 
+def test_claude_codes_image_is_the_one_removed(machine: Machine, tmp_path: Path) -> None:
+    """D27: an install with --perfil claude-code pulled Claude Code's image; uninstalling takes
+    that one (and says its size), and never OpenClaw's, which it did not pull."""
+    other = new_machine(tmp_path / "other")
+    openclaw = images.AGENTS["openclaw"].ref
+    other.images.add(openclaw)  # someone's own, there before
+    installer(other, no_key=True, profile="claude-code").install()
+    assert images.AGENTS["claude-code"].ref in other.images
+    prompter = Answering()
+    remover(other, prompter).uninstall()
+    assert other.images == {openclaw}
+    assert "unos 3,4 GiB" in said(prompter)
+
+
 def test_an_image_of_someone_else_is_never_removed(machine: Machine, tmp_path: Path) -> None:
     other = new_machine(tmp_path / "other")
     pinned = images.pinned()

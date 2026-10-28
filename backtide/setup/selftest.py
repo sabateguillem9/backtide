@@ -5,8 +5,9 @@ proves, on the real installation and through its systemd units (never a service 
 hand), each check one line like the preflight's (``ok``, ``aviso``, ``falla``):
 
 - the four units are active, and the volume is mounted ``nosuid,nodev,noatime``;
-- the agent started under the service (``agent_start`` in the black box) and answers its health
-  probe (OpenClaw's ``/healthz``);
+- the agent started under the service (``agent_start`` in the black box) and answers its
+  profile's health probe as the service expects (OpenClaw's ``/healthz``; Claude Code's
+  ``claude --version`` with the pinned version, D27);
 - it runs as 61000 in all four ids, with no capability and ``NoNewPrivs``; under SELinux in
   enforcing its process is ``container_t`` (T13-1: Docker without ``selinux-enabled`` runs it as
   ``spc_t`` and says nothing), under AppArmor it has ``docker-default`` in enforce mode;
@@ -26,6 +27,7 @@ import os
 import re
 import secrets
 import socket
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -33,6 +35,7 @@ from pathlib import Path
 from backtide.blackbox import BlackBox, BlackBoxError, load_key
 from backtide.jail import AgentJail, JailError
 from backtide.jail import docker as jail_docker
+from backtide.jail.profile import AgentProfile
 from backtide.service.config import ServiceConfig
 from backtide.setup import layout, networks, preflight, units
 from backtide.setup.host import Host, Runner
@@ -209,10 +212,13 @@ def run_selftest(
         found.append(Check("agent", Status.FAIL, "El agente no ha arrancado bajo backtide",
                            f"Mira `journalctl -u {layout.SERVICE_UNIT}`."))  # fmt: skip
         return found + _verify(config) + security(run)
-    probe = list(config.jail_config().profile.ready_probe or ())
-    healthy = not probe or _wait(
-        lambda: jail.exec(probe, timeout=30).returncode == 0, HEALTH_WAIT, sleep, clock
-    )
+    profile = config.jail_config().profile
+    probe = list(profile.ready_probe or ())
+
+    def answers() -> bool:
+        return probe_answers(profile, jail.exec(probe, timeout=30))
+
+    healthy = not probe or _wait(answers, HEALTH_WAIT, sleep, clock)
     found.append(
         Check("agent", Status.OK, "El agente arrancó bajo backtide y responde")
         if healthy
@@ -334,6 +340,11 @@ def _sensor(
         "pero sus comandos no se graban",
         "Mira `docker logs backtide-sensor`.",
     )
+
+
+def probe_answers(profile: AgentProfile, done: subprocess.CompletedProcess[str]) -> bool:
+    """The agent's health probe answered as its profile expects, as the service checks it."""
+    return done.returncode == 0 and profile.ready_answer(done.stdout) is True
 
 
 def link_in_journal(text: str) -> bool:

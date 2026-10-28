@@ -16,8 +16,10 @@ make help         # every command
 ### What does backtide support?
 
 - **Host:** a Mac with Apple Silicon, with Lima and uv. This is the only setup the quickstart and the demo were written for. See [getting-started.md](getting-started.md).
-- **Installing it as a service:** on Ubuntu 24.04 or 26.04 or Fedora 43 or 44 with `install.sh`, and on a Mac with Apple Silicon with `install-mac.sh`, which makes a Linux VM of its own and runs `install.sh` inside it. See [cli-reference.md](cli-reference.md#install-macsh-backtide-on-a-mac) for what changes on a Mac (sleep, files, the clock).
-- **Agents:** OpenClaw, and Claude Code (`PERFIL=claude-code`). Other agents are designed or planned, not built. The README's status table is the reference.
+- **Installing it as a service:** with `install.sh` on Linux, and on a Mac with Apple Silicon with `install-mac.sh`, which makes a Linux VM of its own (Fedora 44) and runs `install.sh` inside it. See [cli-reference.md](cli-reference.md#install-macsh-backtide-on-a-mac) for what changes on a Mac (sleep, files, the clock).
+  - **Tested:** Fedora 44 and Ubuntu 24.04, on arm64 (`aarch64`) only so far.
+  - **Accepted, untested:** Fedora 43, Ubuntu 26.04 and x86_64 (Intel and AMD). The installer installs on them and warns that nobody has tried them yet; if something fails there, tell us. Other distributions are refused.
+- **Agents:** OpenClaw, and Claude Code (`PERFIL=claude-code` in the development setup, `--perfil claude-code` in the installer). Other agents are designed or planned, not built. The README's status table is the reference.
 - **Models:** Claude through the proxy, or a local model through Ollama. See [real-run.md](real-run.md).
 
 ### What is not supported?
@@ -155,6 +157,14 @@ Most of these are explained in [real-run.md](real-run.md). The short list:
 - **Nothing in the black box for the agent's commands.** In the real run, the process sensor does not run, so commands are not recorded. Files, snapshots, network calls and the gate's decisions are.
 
 The key must never go in a file you create, in a chat, or in a command. It goes in the Settings page only.
+
+## The installed version
+
+- **"backtide ya está instalado aquí con OpenClaw … desinstala antes"** (or with Claude Code). You ran the installer with another `--perfil` than the one the machine has. Nothing was changed. To switch agents: `sudo backtide desinstalar` (it keeps the black box, the agent's work and the keys), then the install command with the new `--perfil`. The new agent starts on the same data; the old agent's `backtide.toml` is kept aside as `/var/lib/backtide/backtide.toml.guardado.<agent>`.
+- **"--telegram necesita el token del bot y aquí no hay terminal para pedirlo".** Without a terminal (a script, `--si` in a pipe), give the token with `--telegram-token-archivo FILE` or `--telegram-token-stdin` and the chat with `--telegram-chat N`. Or leave Telegram out and set it later in the web: `sudo backtide enlace` gives the link, then "Ajustes" ("Settings") > "Avisos" ("Alerts").
+- **"eso no parece un token de bot de Telegram"** or **"el chat de Telegram tiene que ser…".** The token is `<digits>:<letters>`, as BotFather gives it; the chat is your private chat's number (positive). Nothing of Telegram was saved.
+- **"Falta la clave del modelo".** Open the web (`sudo backtide enlace`) and put it in "Ajustes" > "Modelos", or run the installer again with `--clave-archivo FILE`.
+- **"… se admite pero aún no se ha probado".** Your distribution or architecture is accepted but nobody has tried backtide on it yet (only Fedora 44 and Ubuntu 24.04 on arm64 have been). It should work; if something fails, tell us.
 
 ## Still stuck?
 

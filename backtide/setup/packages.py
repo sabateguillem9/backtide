@@ -17,6 +17,10 @@ from pathlib import Path
 from backtide.setup.host import Host
 
 SUPPORTED = {"ubuntu": ("24.04", "26.04"), "fedora": ("43", "44")}
+# What backtide has been tried on (docs/44): the rest of SUPPORTED, and x86_64, are accepted and
+# said to be untested.
+TESTED = {"ubuntu": ("24.04",), "fedora": ("44",)}
+TESTED_ARCHITECTURES = ("aarch64",)
 APT_ENV = ("env", "DEBIAN_FRONTEND=noninteractive")
 # Docker's repository signing keys, as docs.docker.com publishes them (Install Docker Engine on
 # Ubuntu / on Fedora). The fingerprint is what decides; the URL only says where to fetch it.
@@ -48,6 +52,10 @@ class Distro:
     @property
     def supported(self) -> bool:
         return self.version in SUPPORTED.get(self.id, ())
+
+    @property
+    def tested(self) -> bool:
+        return self.version in TESTED.get(self.id, ())
 
 
 @dataclass(frozen=True)

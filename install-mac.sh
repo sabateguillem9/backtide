@@ -2,6 +2,7 @@
 # backtide on a Mac (T13b; docs/25, section 7). Read it before running it: it is short.
 #
 #   sh install-mac.sh --desde ARCHIVO --sha256 HUELLA [--clave-archivo RUTA | --clave-stdin]
+#       [--perfil claude-code] [--telegram [--telegram-token-archivo RUTA] [--telegram-chat N]]
 #   sh install-mac.sh --desinstalar [--borrar-datos] [--si]    (the same as `backtide desinstalar`)
 #
 # backtide needs a Linux kernel (Btrfs and eBPF), so on a Mac it lives in a Linux VM of its own,
@@ -17,7 +18,8 @@
 #   4. copies the archive in and runs the Linux install.sh inside, unchanged, as the VM's root;
 #   5. leaves ~/.local/bin/backtide, which runs `sudo backtide ...` inside the VM.
 # Keys never go in an argument, here or in the VM: --clave-archivo RUTA (read here and sent through
-# standard input), --clave-stdin, or typed when asked (no echo). Running it again changes nothing.
+# standard input), --clave-stdin, or typed when asked (no echo). The Telegram bot's token too
+# (--telegram-token-archivo or typed; after the key's line). Running it again changes nothing.
 # Other arguments go to `backtide instalar` in the VM. --nombre-vm is for the lab only
 # (backtide-prueba-*, with BACKTIDE_MAC_LAB_YAML: tests/install/instalar_mac_lab.sh).
 set -eu
@@ -37,19 +39,22 @@ die() { printf '%s\n' "backtide: $*" >&2; exit 1; }
 hash_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
 quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
-VM=backtide
+VM=backtide TELEGRAM=0 TG_FILE= TG_CHAT=
 SOURCE= SOURCE_SHA256= KEY_FILE= KEY_MODE= PROVIDER=anthropic YES=0 DRY_RUN=0 UNINSTALL=0 ERASE=0
 left=$#
 while [ "$left" -gt 0 ]; do
   arg=$1; shift; left=$((left - 1))
   case "$arg" in
-    --desde | --sha256 | --nombre-vm | --clave-archivo)
+    --desde | --sha256 | --nombre-vm | --clave-archivo | --telegram-token-archivo | --telegram-chat)
       [ "$left" -gt 0 ] || die "$arg necesita un valor"
       value=$1; shift; left=$((left - 1))
       case "$arg" in
         --desde) SOURCE=$value ;; --sha256) SOURCE_SHA256=$value ;; --nombre-vm) VM=$value ;;
-        --clave-archivo) KEY_FILE=$value ;;
+        --clave-archivo) KEY_FILE=$value ;; --telegram-chat) TG_CHAT=$value; TELEGRAM=1 ;;
+        --telegram-token-archivo) TG_FILE=$value; TELEGRAM=1 ;;
       esac ;;
+    --telegram) TELEGRAM=1 ;;
+    --telegram-token-stdin) die "en el Mac, el token va con --telegram-token-archivo RUTA, o se pide sin eco" ;;
     --clave-archivo=*) KEY_FILE=${arg#--clave-archivo=} ;;
     --clave-stdin) KEY_MODE=stdin ;;
     --sin-clave) KEY_MODE=none ;;
@@ -73,6 +78,7 @@ fi
 case "$VM" in [a-z]*) ;; *) die "--nombre-vm: letras minúsculas, cifras y guiones" ;; esac
 case "$VM" in *[!a-z0-9-]*) die "--nombre-vm: letras minúsculas, cifras y guiones" ;; esac
 case "$PROVIDER" in *[!a-z]* | "") die "--proveedor no válido" ;; esac
+case "$TG_CHAT" in 0* | *[!0-9]*) die "--telegram-chat: el número de tu chat privado con el bot (positivo, solo cifras)" ;; esac
 case "$VM" in backtide-prueba-*)
   [ -f "${BACKTIDE_MAC_LAB_YAML:-}" ] || die "las VMs backtide-prueba-* son del laboratorio: hace falta BACKTIDE_MAC_LAB_YAML (su corte de red)" ;;
 esac
@@ -228,7 +234,7 @@ WRAPPER
 
 if [ "$UNINSTALL" = 1 ]; then  # through the `backtide` it left, or a copy of it if it is gone
   BIN=$HOME/.local/bin
-  [ $# = 0 ] && [ "$DRY_RUN" = 0 ] && [ -z "$SOURCE$SOURCE_SHA256$KEY_FILE$KEY_MODE" ] \
+  [ $# = 0 ] && [ "$DRY_RUN$TELEGRAM" = 00 ] && [ -z "$SOURCE$SOURCE_SHA256$KEY_FILE$KEY_MODE" ] \
     || die "--desinstalar solo admite --borrar-datos y --si (sin --dry-run: lo que haría, lo dice antes de preguntar)"
   set --; [ "$ERASE" = 0 ] || set -- --borrar-datos; [ "$YES" = 0 ] || set -- "$@" --si
   ! head -n 2 "$BIN/backtide" 2>/dev/null | grep -q '^# backtide on this Mac' || exec sh "$BIN/backtide" desinstalar "$@"
@@ -245,8 +251,8 @@ backtide is a PREVIEW, with no human security audit yet.
   - Use a model key with a spending limit, never a production key.
   - A rewind does not bring back what already left the machine, and calls to the model are never held.
   - On a Mac: when it sleeps, the agent and its alerts sleep; the agent's files live in the VM.
-  - Supported: Linux (Fedora, Ubuntu) and Macs with Apple Silicon. On Fedora with kernel 7.1+ the
-    process sensor does not start (D24).
+  - Tested: Macs with Apple Silicon (a Fedora 44 VM), and Fedora 44 and Ubuntu 24.04 on arm64. On
+    Fedora with kernel 7.1+ the process sensor does not start (D24).
   - To remove it: backtide desinstalar (keeps your data; --borrar-datos removes everything).
 NOTICE
 
@@ -270,6 +276,9 @@ memory_gib=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 if [ "$KEY_MODE" = file ]; then
   [ -f "$KEY_FILE" ] && [ -r "$KEY_FILE" ] || die "no se puede leer el archivo de la clave $KEY_FILE"
 fi
+[ -z "$TG_FILE" ] || { [ -f "$TG_FILE" ] && [ -r "$TG_FILE" ]; } || die "no se puede leer el archivo del token $TG_FILE"
+if [ "$TELEGRAM" = 1 ] && [ ! -t 0 ] && { [ -z "$TG_FILE" ] || [ -z "$TG_CHAT" ]; }; then
+  die "--telegram sin terminal necesita --telegram-token-archivo RUTA y --telegram-chat NÚMERO"; fi
 
 LIMA_HOME=${LIMA_HOME:-$HOME/.lima}
 case "$LIMA_HOME" in /*) ;; *) LIMA_HOME=$PWD/$LIMA_HOME ;; esac  # the wrapper keeps it absolute
@@ -402,20 +411,38 @@ tar -xf "$a" -C "$d" --no-same-owner; s=$d/install.sh
 sh "$s" --desde "$a" --sha256 "$h" --sin-aviso "$@"'
 install_in_vm() { in_vm sudo sh -c "$INNER" sh "$VM_ARCHIVE" "$GOT" --si "$@"; }
 say "instalando backtide dentro de la VM (la primera vez, unos minutos)"
-case "$KEY_MODE" in
-  file) install_in_vm --clave-stdin "$@" < "$KEY_FILE" 3<&- ;;
-  stdin) install_in_vm --clave-stdin "$@" <&3 3<&- ;;
-  none) install_in_vm --sin-clave "$@" 3<&- ;;
-  *)
-    if ! probe sudo test -e "/var/lib/backtide/keys/$PROVIDER.key" && [ -t 0 ]; then
-      printf 'Clave de %s (no se ve al escribirla; vacío para ponerla después): ' "$PROVIDER"
+# The VM's installer reads, on standard input, the key's line and then the bot token's (D27).
+key= token= KEY_ARG=
+case "$KEY_MODE" in file | stdin) KEY_ARG=--clave-stdin ;; none) KEY_ARG=--sin-clave ;;
+  *) if ! probe sudo test -e "/var/lib/backtide/keys/$PROVIDER.key" && [ -t 0 ]; then
+      printf 'Clave de %s (no se ve al escribirla; vacío para ponerla después en la web, Ajustes > Modelos): ' "$PROVIDER"
       ECHO_OFF=1; stty -echo; read -r key || key=; stty echo; ECHO_OFF=0; printf '\n'
-      if [ -n "$key" ]; then printf '%s\n' "$key" | install_in_vm --clave-stdin "$@" 3<&-; key=
-      else install_in_vm "$@" < /dev/null 3<&-; fi
-    else
-      install_in_vm "$@" < /dev/null 3<&-
+      [ -z "$key" ] || KEY_ARG=--clave-stdin
     fi ;;
-esac || die "la instalación dentro de la VM se ha parado (arriba dice dónde); vuelve a ejecutar esto para seguir"
+esac
+if [ "$TELEGRAM" = 1 ]; then
+  if [ -z "$TG_FILE" ]; then
+    [ -t 0 ] || die "--telegram sin terminal necesita --telegram-token-archivo RUTA (el token nunca va en un argumento)"
+    printf 'Token del bot de Telegram (no se ve al escribirlo): '
+    ECHO_OFF=1; stty -echo; read -r token || token=; stty echo; ECHO_OFF=0; printf '\n'
+    [ -n "$token" ] || die "sin token no se pone Telegram: se puede poner después en la web, Ajustes > Avisos"
+  fi
+  if [ -z "$TG_CHAT" ]; then
+    [ -t 0 ] || die "--telegram sin terminal necesita --telegram-chat NÚMERO"
+    printf 'El número de tu chat privado con el bot: '; read -r TG_CHAT
+    case "$TG_CHAT" in "" | 0* | *[!0-9]*) die "el chat es el número de tu chat privado con el bot (positivo, solo cifras)" ;; esac
+  fi
+  set -- --telegram --telegram-token-stdin --telegram-chat "$TG_CHAT" "$@"
+fi
+[ -z "$KEY_ARG" ] || set -- "$KEY_ARG" "$@"
+secrets_line() {  # one line each, in order; printf is the shell's own: nothing of them in `ps`
+  case "$KEY_MODE" in file) awk 1 < "$KEY_FILE" ;; stdin) awk 1 <&3 ;; *) [ -z "$key" ] || printf '%s\n' "$key" ;; esac
+  if [ "$TELEGRAM" = 0 ]; then :; elif [ -n "$TG_FILE" ]; then awk 1 < "$TG_FILE"; else printf '%s\n' "$token"; fi
+}
+if [ "$KEY_ARG" = --clave-stdin ] || [ "$TELEGRAM" = 1 ]; then secrets_line | install_in_vm "$@" 3<&-
+else install_in_vm "$@" < /dev/null 3<&-; fi \
+  || die "la instalación dentro de la VM se ha parado (arriba dice dónde); vuelve a ejecutar esto para seguir"
+key= token=
 
 # 5. The `backtide` of the Mac: rewritten only when it changes.
 BIN=$HOME/.local/bin
@@ -433,7 +460,7 @@ backtide está instalado en la VM $VM de este Mac y vigila al agente.
   - La web, solo en este Mac: \`backtide enlace\` da su enlace de un uso (http://127.0.0.1:$WEB_PORT/...).
   - El estado: \`backtide comprobar --despues-de-instalar\`; la VM: \`backtide vm estado\`.
   - Quitarlo: \`backtide desinstalar\` (conserva tus datos en la VM, parada; --borrar-datos lo borra todo).
-  - Telegram todavía no: se pondrá en la página Ajustes de la web.
+  - Telegram: $([ "$TELEGRAM" = 1 ] && echo 'puesto, los avisos te llegan al bot.' || echo 'opcional; `backtide enlace` abre la web y se pone en Ajustes > Avisos.')
 Lo que hay que saber de un Mac:
   - Si el Mac duerme, la VM duerme: el agente se para y no llegan avisos hasta que despierta.
   - Tras reiniciar el Mac la VM queda parada: cualquier \`backtide ...\` la arranca, o \`backtide vm arrancar\`.

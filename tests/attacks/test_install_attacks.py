@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from attack_kit import Attack, scenario
+from attack_kit import Attack, battery_profile, scenario
 
 from backtide.blackbox import BlackBox, load_key
 from backtide.jail import AgentJail
@@ -102,6 +102,11 @@ def installed() -> Iterator[Installed]:
 def open_installed() -> Iterator[Installed]:
     """The installed backtide, its agent answering (test_mac_vm_attacks.py uses it too)."""
     config = ServiceConfig.from_file(layout.CONFIG_FILE)
+    # The battery's agent must be the installed one (D27): a scenario run for Claude Code
+    # against an OpenClaw install would prove nothing about Claude Code.
+    assert config.agent_profile.name == battery_profile(), (
+        f"installed agent {config.agent_profile.name}, battery run for {battery_profile()}"
+    )
     box = BlackBox(
         config.blackbox_db,
         load_key(config.blackbox_key),
@@ -246,6 +251,7 @@ def test_the_agent_sees_nothing_of_the_installation(attack: Attack, installed: I
         "/etc/backtide/backtide.toml", "/etc/systemd/system/backtide.service",
         "/var/lib/backtide/keys/anthropic.key", "/var/lib/backtide/blackbox.db",
         "/var/lib/backtide/volume.img", "/opt/backtide/current",
+        "/var/lib/backtide/telegram.toml",
     ]  # fmt: skip
     seen = {}
     for path in paths:

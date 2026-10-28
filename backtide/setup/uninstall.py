@@ -168,7 +168,9 @@ class Uninstaller:
         if m.created["networks"]:
             lines.append(f"las redes de Docker: {', '.join(m.created['networks'])}")
         if m.created["images"]:
-            lines.append(f"las imágenes que descargó ({len(m.created['images'])}, unos 5,5 GiB)")
+            refs = m.created["images"]
+            lines.append(f"las imágenes que descargó ({len(refs)}, unos "
+                         f"{images.approx_total(refs)})")  # fmt: skip
         changed = m.facts.get("daemon_json") or []
         if changed:
             lines.append(

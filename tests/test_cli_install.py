@@ -30,7 +30,7 @@ def as_root(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_imagenes_lists_the_pinned_images(capsys) -> None:
     code, out, _ = run(capsys, "imagenes")
     assert code == 0
-    assert [line.split()[0] for line in out.splitlines()] == [i.ref for i in images.pinned()]
+    assert [line.split()[0] for line in out.splitlines()] == [i.ref for i in images.every()]
 
 
 def test_instalar_needs_root(capsys, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,6 +66,10 @@ def test_there_is_no_option_that_takes_a_key_itself() -> None:
         for flag in action.option_strings:
             if "clave" in flag or "key" in flag:
                 assert flag in ("--clave-archivo", "--clave-stdin", "--sin-clave"), flag
+            if "token" in flag or "telegram" in flag:
+                assert flag in ("--telegram", "--telegram-token-archivo", "--telegram-token-stdin",
+                                "--telegram-chat"), flag  # fmt: skip
+                assert action.nargs == 0 or flag in ("--telegram-token-archivo", "--telegram-chat")
 
 
 def test_instalar_passes_the_options_and_reports_a_stop(
@@ -174,3 +178,60 @@ def test_enlace_never_follows_a_link(capsys, tmp_path: Path) -> None:
     (tmp_path / "enlace").symlink_to(target)
     code, out, _ = run(capsys, "enlace", "--archivo", tmp_path / "enlace")
     assert code == 1 and URL not in out
+
+
+def test_instalar_passes_the_agent_and_telegram(
+    capsys, as_root: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen = {}
+
+    def stopped(self: install.Installer) -> list[str]:
+        seen["options"] = self.options
+        raise install.InstallError("parado")
+
+    monkeypatch.setattr(install.Installer, "install", stopped)
+    run(capsys, "instalar", "--perfil", "claude-code", "--telegram-token-archivo", tmp_path / "t",
+        "--telegram-chat", "424242")  # fmt: skip
+    options = seen["options"]
+    assert options.profile == "claude-code"
+    assert options.telegram and options.telegram_token_file == tmp_path / "t"  # implied
+    assert options.telegram_chat == "424242" and not options.telegram_token_stdin
+    run(capsys, "instalar", "--si")
+    assert seen["options"].profile is None and not seen["options"].telegram
+
+
+def test_claude_code_with_openai_is_a_usage_error(capsys, as_root: None) -> None:
+    code, _, err = run(capsys, "instalar", "--perfil", "claude-code", "--proveedor", "openai")
+    assert code == 2 and "Anthropic" in err
+
+
+def test_an_unknown_agent_is_a_usage_error(capsys, as_root: None) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["instalar", "--perfil", "custom"])
+    assert caught.value.code == 2
+
+
+def test_a_token_comes_from_one_place_only(capsys, as_root: None, tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["instalar", "--telegram-token-archivo", str(tmp_path / "t"),
+              "--telegram-token-stdin"])  # fmt: skip
+    assert caught.value.code == 2
+
+
+def test_solo_comprobar_only_checks_and_says_why_it_would_stop(
+    capsys, as_root: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """install.sh runs it before it switches /opt/backtide/current (review of D27)."""
+    calls = []
+
+    def refuse(self: install.Installer) -> None:
+        calls.append("check")
+        raise install.InstallError("backtide ya está instalado aquí con OpenClaw")
+
+    monkeypatch.setattr(install.Installer, "check_options", refuse)
+    monkeypatch.setattr(install.Installer, "install", lambda self: calls.append("install"))
+    code, _, err = run(capsys, "instalar", "--solo-comprobar", "--perfil", "claude-code")
+    assert code == 1 and calls == ["check"] and "ya está instalado" in err
+    monkeypatch.setattr(install.Installer, "check_options", lambda self: calls.append("ok"))
+    code, _, _ = run(capsys, "instalar", "--solo-comprobar")
+    assert code == 0 and calls == ["check", "ok"]

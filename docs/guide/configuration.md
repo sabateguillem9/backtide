@@ -358,7 +358,7 @@ How to set it up:
 1. In Telegram, talk to @BotFather, send `/newbot`, and follow the steps. It gives you the token.
 2. Use **a bot that is only for backtide**. If the agent ever gets its own Telegram channel, give it a different bot with a different token.
 3. Find your chat id (for example by asking a bot such as @userinfobot) and write `/start` to your new bot once. Telegram does not let a bot write to you before you have written to it.
-4. Put the two values in the file (or in the Settings page), then restart the service. The bot reads the file when the service starts.
+4. Put the two values in the file, in the Settings page ("Ajustes" > "Avisos"), or give them to the installer: `sudo backtide instalar --telegram` asks for the token without echo and for your chat id, writes this file and restarts the service ([details](cli-reference.md#installsh-and-backtide-instalar)). By hand or in Settings, restart the service afterwards: the bot reads the file when the service starts.
 
 Behavior:
 

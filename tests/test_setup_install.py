@@ -13,6 +13,7 @@ import os
 import stat
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -164,7 +165,7 @@ class Machine:
             case ("docker", "image", "inspect", _, _, ref):
                 if ref not in self.images:
                     return Ran(1, "", "No such image")
-                image = next(i for i in images.pinned() if i.ref == ref)
+                image = next(i for i in images.every() if i.ref == ref)
                 return Ran(0, json.dumps([f"{image.repo}@{image.digest}"]), "")
             case ("docker", "pull", "--quiet", ref):
                 self.images.add(ref)
@@ -342,10 +343,20 @@ class FakeAccounts:
 
 
 class Prompter:
-    def __init__(self, *, interactive: bool = False, answers: bool = True, key: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        interactive: bool = False,
+        answers: bool = True,
+        key: str = "",
+        token: str = "",
+        chat: str = "",
+    ) -> None:
         self.interactive = interactive
         self.answers = answers
         self.key = key
+        self.token = token  # what is typed at the Telegram token's prompt
+        self.chat = chat
         self.said: list[str] = []
         self.asked: list[str] = []
 
@@ -358,7 +369,11 @@ class Prompter:
 
     def secret(self, prompt: str) -> str:
         self.asked.append(prompt)
-        return self.key
+        return self.token if "Telegram" in prompt else self.key
+
+    def answer(self, question: str) -> str:
+        self.asked.append(question)
+        return self.chat
 
 
 def new_machine(root: Path) -> Machine:
@@ -948,3 +963,399 @@ def test_a_time_zone_cannot_add_settings_to_the_config(machine: Machine) -> None
     with pytest.raises(InstallError):
         installer(machine, no_key=True, timezone='UTC"\nworkspace_limit = 1\n#').install()
     assert not machine.paths.config_file.exists()
+
+
+# The agent: OpenClaw by default, Claude Code with --perfil claude-code (D27)
+
+TELEGRAM_TOKEN = "987654321:" + "Zq8vN3kT6pR1wX4mB7cJ0hL5sD9fG2aY"  # its shape; nobody's
+CHAT = "424242424"
+
+
+def config_of(machine: Machine):
+    from backtide.service.config import ServiceConfig
+
+    return ServiceConfig.from_file(machine.paths.config_file)
+
+
+def test_openclaw_is_the_default_and_its_config_says_so(machine: Machine) -> None:
+    installer(machine, no_key=True).install()
+    assert 'profile = "openclaw"' in machine.paths.config_file.read_text()
+    assert config_of(machine).agent_profile.name == "openclaw"
+    assert manifest.load(machine.paths.manifest).facts["profile"] == "openclaw"
+    assert machine.paths.gateway_token.exists()
+
+
+def test_claude_code_gets_its_image_its_config_and_no_gateway_token(
+    machine: Machine, key_file: Path
+) -> None:
+    prompter = Prompter()
+    installer(machine, prompter, key_file=key_file, profile="claude-code").install()
+    pulled = {image.ref for image in images.pinned("claude-code")}
+    assert set(machine.images) == pulled
+    assert images.AGENTS["openclaw"].ref not in machine.images  # 4,7 GiB not pulled for nothing
+    config = config_of(machine)
+    assert config.agent_profile.name == "claude-code"
+    text = machine.paths.config_file.read_text()
+    assert 'profile = "claude-code"' in text
+    assert '"openai"' not in text and "models =" not in text and "fallbacks" not in text
+    assert [provider.name for provider in config.proxy_settings().providers] == ["anthropic"]
+    assert not machine.paths.gateway_token.exists()  # OpenClaw's only
+    assert (machine.paths.keys_dir / "anthropic.key").read_text() == KEY + "\n"
+    record = manifest.load(machine.paths.manifest)
+    assert record.facts["profile"] == "claude-code"
+    assert set(record.created["images"]) == pulled
+    assert any("backtide tarea" in line and "backtide entrar" in line for line in prompter.said)
+
+
+def test_a_claude_code_install_run_again_without_perfil_changes_nothing(
+    machine: Machine, key_file: Path
+) -> None:
+    installer(machine, key_file=key_file, profile="claude-code").install()
+    before = snapshot(machine.root)
+    before.pop("var/lib/backtide/install-manifest.json")
+    machine.calls.clear()
+    installer(machine, key_file=key_file).install()
+    installer(machine, key_file=key_file, profile="claude-code").install()
+    after = snapshot(machine.root)
+    after.pop("var/lib/backtide/install-manifest.json")
+    assert after == before
+    assert changes(machine.calls) == []
+    assert config_of(machine).agent_profile.name == "claude-code"
+
+
+@pytest.mark.parametrize(("first", "then"), [("openclaw", "claude-code"),
+                                             ("claude-code", "openclaw")])  # fmt: skip
+def test_another_agent_over_an_install_stops_before_any_change(
+    machine: Machine, first: str, then: str
+) -> None:
+    installer(machine, no_key=True, profile=first).install()
+    before = snapshot(machine.root)
+    machine.calls.clear()
+    with pytest.raises(InstallError, match="desinstala antes") as caught:
+        installer(machine, no_key=True, profile=then).install()
+    assert f"--perfil {then}" in str(caught.value)
+    assert changes(machine.calls) == [] and machine.calls == []
+    assert snapshot(machine.root) == before
+
+
+def uninstalled_keeping_the_config(machine: Machine) -> str:
+    """What `backtide desinstalar` leaves of the config: backtide.toml in the state folder."""
+    text = machine.paths.config_file.read_text()
+    saved = machine.paths.state_dir / "backtide.toml.guardado"
+    saved.write_text(text)
+    saved.chmod(0o600)
+    machine.paths.config_file.unlink()
+    return text
+
+
+def test_after_uninstalling_the_same_agent_comes_back_without_perfil(machine: Machine) -> None:
+    installer(machine, no_key=True, profile="claude-code", daily_usd=Decimal("3")).install()
+    kept = uninstalled_keeping_the_config(machine)
+    installer(machine, no_key=True).install()
+    assert machine.paths.config_file.read_text() == kept
+    assert config_of(machine).agent_profile.name == "claude-code"
+
+
+def test_after_uninstalling_another_agent_starts_on_the_same_data(machine: Machine) -> None:
+    installer(machine, no_key=True, daily_usd=Decimal("3")).install()
+    kept = uninstalled_keeping_the_config(machine)
+    key = (machine.paths.state_dir / "blackbox.key").read_bytes()
+    prompter = Prompter()
+    installer(machine, prompter, no_key=True, profile="claude-code").install()
+    assert config_of(machine).agent_profile.name == "claude-code"
+    aside = machine.paths.state_dir / "backtide.toml.guardado.openclaw"
+    assert aside.read_text() == kept and mode(aside) == 0o600  # never used, never deleted
+    assert not (machine.paths.state_dir / "backtide.toml.guardado").exists()
+    assert (machine.paths.state_dir / "blackbox.key").read_bytes() == key  # the same chain
+    assert any("se aparta" in line and "OpenClaw" in line for line in prompter.said)
+
+
+def test_claude_code_only_speaks_anthropic(machine: Machine) -> None:
+    with pytest.raises(InstallError, match="Anthropic"):
+        installer(machine, no_key=True, profile="claude-code", provider="openai").install()
+    assert machine.calls == []
+
+
+def test_a_dry_run_lists_the_image_of_its_agent(machine: Machine) -> None:
+    prompter = Prompter()
+    installer(machine, prompter, no_key=True, dry_run=True, profile="claude-code").install()
+    text = "\n".join(prompter.said)
+    assert "Agente: Claude Code" in text
+    assert images.AGENTS["claude-code"].ref in text
+    assert images.AGENTS["openclaw"].ref not in text
+    assert changes(machine.calls) == []
+
+
+# Where the key and Telegram go later: the installed web (T12c)
+
+
+def test_without_a_key_it_says_how_to_open_the_web_and_where_in_settings(
+    machine: Machine,
+) -> None:
+    prompter = Prompter()
+    installer(machine, prompter, no_key=True).install()
+    text = "\n".join(prompter.said)
+    assert "Sin clave del modelo (--sin-clave)" in text
+    assert text.count("sudo backtide enlace") >= 3  # the key's line, the summary's two
+    assert "Ajustes > Modelos" in text and "Ajustes > Avisos" in text
+
+
+# Telegram, optional (D27): the token like the key, never in argv nor in a message
+
+
+def telegram_file(machine: Machine) -> Path:
+    return machine.paths.state_dir / "telegram.toml"
+
+
+@pytest.fixture
+def token_file(tmp_path: Path) -> Path:
+    path = tmp_path / "telegram-token.txt"
+    path.write_text(TELEGRAM_TOKEN + "\n")
+    return path
+
+
+def test_without_telegram_nothing_is_written_and_the_web_is_named(machine: Machine) -> None:
+    prompter = Prompter()
+    installer(machine, prompter, no_key=True).install()
+    assert not telegram_file(machine).exists()
+    assert any("Sin Telegram (es opcional)" in line and "Ajustes > Avisos" in line
+               for line in prompter.said)  # fmt: skip
+
+
+def test_telegram_from_a_file_is_written_as_the_settings_page_writes_it(
+    machine: Machine, token_file: Path
+) -> None:
+    from backtide.service.telegram_config import load_telegram
+
+    prompter = Prompter()
+    installer(machine, prompter, no_key=True, telegram=True, telegram_token_file=token_file,
+              telegram_chat=CHAT).install()  # fmt: skip
+    path = telegram_file(machine)
+    assert path.read_text() == f'token = "{TELEGRAM_TOKEN}"\nchat_id = {CHAT}\n'
+    assert mode(path) == 0o600
+    settings = load_telegram(machine.paths.state_dir)
+    assert settings is not None and settings.chat_id == int(CHAT)
+    assert str(path) in manifest.load(machine.paths.manifest).created["files"]
+    assert not any(TELEGRAM_TOKEN in arg for argv in machine.calls for arg in argv)
+    assert not any(TELEGRAM_TOKEN in line for line in prompter.said)
+    assert TELEGRAM_TOKEN not in manifest.load(machine.paths.manifest).to_json()
+    assert TELEGRAM_TOKEN not in machine.paths.config_file.read_text()
+    assert f"Telegram (el token y el chat {CHAT}): creada." in prompter.said
+    assert not any("Ajustes > Avisos" in line for line in prompter.said)
+
+
+def test_telegram_asked_at_the_terminal_without_echo(machine: Machine) -> None:
+    prompter = Prompter(interactive=True, token=TELEGRAM_TOKEN, chat=CHAT)
+    installer(machine, prompter, no_key=True, telegram=True).install()
+    assert any("Token del bot de Telegram" in q and "no se ve" in q for q in prompter.asked)
+    assert any("chat privado" in q for q in prompter.asked)
+    assert TELEGRAM_TOKEN in telegram_file(machine).read_text()
+
+
+def test_the_key_and_the_token_both_from_stdin_one_line_each(machine: Machine) -> None:
+    import io
+
+    run = installer(machine, key_stdin=True, telegram=True, telegram_token_stdin=True,
+                    telegram_chat=CHAT)  # fmt: skip
+    run.stdin = io.BytesIO(f"{KEY}\n{TELEGRAM_TOKEN}\n".encode())
+    run.install()
+    assert (machine.paths.keys_dir / "anthropic.key").read_text() == KEY + "\n"
+    assert TELEGRAM_TOKEN in telegram_file(machine).read_text()
+
+
+def test_the_token_alone_from_stdin(machine: Machine) -> None:
+    import io
+
+    run = installer(machine, no_key=True, telegram=True, telegram_token_stdin=True,
+                    telegram_chat=CHAT)  # fmt: skip
+    run.stdin = io.BytesIO(TELEGRAM_TOKEN.encode() + b"\n")
+    run.install()
+    assert TELEGRAM_TOKEN in telegram_file(machine).read_text()
+
+
+def test_one_line_on_stdin_for_two_secrets_is_refused_without_saying_it(machine: Machine) -> None:
+    import io
+
+    run = installer(machine, key_stdin=True, telegram=True, telegram_token_stdin=True,
+                    telegram_chat=CHAT)  # fmt: skip
+    run.stdin = io.BytesIO(KEY.encode() + b"\n")
+    with pytest.raises(InstallError, match="1 líneas y debían ser 2") as caught:
+        run.install()
+    assert KEY not in str(caught.value)
+
+
+def test_a_token_of_the_wrong_shape_is_refused_without_saying_it(
+    machine: Machine, tmp_path: Path
+) -> None:
+    wrong = tmp_path / "wrong.txt"
+    wrong.write_text("not-a-bot-token-0123456789abcdefghij\n")
+    with pytest.raises(InstallError, match="no parece un token") as caught:
+        installer(machine, no_key=True, telegram=True, telegram_token_file=wrong,
+                  telegram_chat=CHAT).install()  # fmt: skip
+    assert "not-a-bot" not in str(caught.value)
+    assert not telegram_file(machine).exists()
+
+
+@pytest.mark.parametrize("chat", ["-100123456", "abc", "0", ""])
+def test_a_chat_that_is_not_a_private_one_is_refused(
+    machine: Machine, token_file: Path, chat: str
+) -> None:
+    with pytest.raises(InstallError, match="chat privado"):
+        installer(machine, no_key=True, telegram=True, telegram_token_file=token_file,
+                  telegram_chat=chat).install()  # fmt: skip
+    assert not telegram_file(machine).exists()
+
+
+@pytest.mark.parametrize(
+    ("given", "says"),
+    [({}, "--telegram-token-archivo"), ({"telegram_token_stdin": True}, "--telegram-chat")],
+)
+def test_telegram_without_a_terminal_needs_its_sources_before_any_change(
+    machine: Machine, given: dict, says: str
+) -> None:
+    with pytest.raises(InstallError, match=says):
+        installer(machine, no_key=True, telegram=True, **given).install()
+    assert machine.calls == [] and not machine.paths.state_dir.exists()
+
+
+def test_the_same_telegram_twice_changes_nothing(machine: Machine, token_file: Path) -> None:
+    options = {"no_key": True, "telegram": True, "telegram_token_file": token_file,
+               "telegram_chat": CHAT}  # fmt: skip
+    installer(machine, **options).install()
+    before = snapshot(machine.root)
+    before.pop("var/lib/backtide/install-manifest.json")
+    machine.calls.clear()
+    prompter = Prompter()
+    installer(machine, prompter, **options).install()
+    after = snapshot(machine.root)
+    after.pop("var/lib/backtide/install-manifest.json")
+    assert after == before and changes(machine.calls) == []
+    assert f"Telegram (el token y el chat {CHAT}): igual." in prompter.said
+    installer(machine, no_key=True).install()  # without --telegram: kept as it is
+    assert telegram_file(machine).read_bytes() == before["var/lib/backtide/telegram.toml"][4]
+
+
+def test_a_new_telegram_restarts_the_running_service(
+    machine: Machine, token_file: Path, tmp_path: Path
+) -> None:
+    installer(machine, no_key=True).install()
+    machine.calls.clear()
+    installer(machine, no_key=True, telegram=True, telegram_token_file=token_file,
+              telegram_chat=CHAT).install()  # fmt: skip
+    assert ("systemctl", "restart", layout.SERVICE_UNIT) in machine.calls
+    assert ("systemctl", "restart", layout.WEB_UNIT) not in machine.calls
+
+
+def test_the_tests_api_base_is_kept_as_the_settings_page_keeps_it(
+    machine: Machine, token_file: Path
+) -> None:
+    installer(machine, no_key=True).install()
+    path = telegram_file(machine)
+    path.write_text(f'token = "{"1" * 9}:{"B" * 35}"\nchat_id = 7\n'
+                    'api_base = "http://127.0.0.1:8081"\n')  # fmt: skip
+    path.chmod(0o600)
+    installer(machine, no_key=True, telegram=True, telegram_token_file=token_file,
+              telegram_chat=CHAT).install()  # fmt: skip
+    assert path.read_text() == (
+        f'token = "{TELEGRAM_TOKEN}"\nchat_id = {CHAT}\napi_base = "http://127.0.0.1:8081"\n'
+    )
+
+
+# Tested distributions (docs/44): the others are accepted and said to be untested
+
+
+@pytest.mark.parametrize(
+    ("distro", "arch", "untested"),
+    [
+        (FEDORA, "aarch64", []),
+        (UBUNTU, "aarch64", []),
+        (b'ID=fedora\nVERSION_ID=43\nPRETTY_NAME="Fedora Linux 43"\n', "aarch64",
+         ["Fedora Linux 43"]),
+        (b'ID=ubuntu\nVERSION_ID="26.04"\nPRETTY_NAME="Ubuntu 26.04 LTS"\n', "aarch64",
+         ["Ubuntu 26.04 LTS"]),
+        (FEDORA, "x86_64", ["x86_64"]),
+    ],
+)  # fmt: skip
+def test_what_is_untested_is_accepted_and_said(
+    machine: Machine, distro: bytes, arch: str, untested: list[str]
+) -> None:
+    machine.distro = distro
+    machine.machine = lambda: arch  # type: ignore[method-assign]
+    machine.docker = machine.docker_selinux = True  # the fake's Docker key is 44's and 24.04's
+    prompter = Prompter()
+    warnings = installer(machine, prompter, no_key=True).install()
+    said = [w for w in warnings if "aún no se ha probado" in w]
+    assert len(said) == len(untested)
+    for name, warning in zip(untested, said, strict=True):
+        if name == "x86_64":
+            assert name in warning and "aarch64" in warning
+        else:
+            assert name in warning and "Fedora 44 y Ubuntu 24.04" in warning
+
+
+def test_a_config_put_aside_before_is_never_written_over(machine: Machine) -> None:
+    """Review of D27, finding 2: OpenClaw, Claude Code, OpenClaw, Claude Code again, each after
+    an uninstall: the first OpenClaw config put aside is still there, whole."""
+    installer(machine, no_key=True, daily_usd=Decimal("3")).install()
+    first = uninstalled_keeping_the_config(machine)
+    installer(machine, no_key=True, profile="claude-code").install()
+    uninstalled_keeping_the_config(machine)
+    installer(machine, no_key=True, profile="openclaw").install()
+    second = uninstalled_keeping_the_config(machine)
+    prompter = Prompter()
+    installer(machine, prompter, no_key=True, profile="claude-code").install()
+    state = machine.paths.state_dir
+    assert (state / "backtide.toml.guardado.openclaw").read_text() == first
+    assert (state / "backtide.toml.guardado.openclaw.2").read_text() == second
+    assert (state / "backtide.toml.guardado.claude-code").exists()
+    assert any("backtide.toml.guardado.openclaw.2" in line for line in prompter.said)
+
+
+def test_check_options_refuses_before_any_change(machine: Machine) -> None:
+    installer(machine, no_key=True).install()
+    machine.calls.clear()
+    before = snapshot(machine.root)
+    with pytest.raises(InstallError, match="desinstala antes"):
+        installer(machine, no_key=True, profile="claude-code").check_options()
+    installer(machine, no_key=True).check_options()  # the same agent: nothing to refuse
+    assert machine.calls == [] and snapshot(machine.root) == before
+
+
+@pytest.mark.parametrize(
+    ("config", "refused"),
+    [
+        ("no profile line", None),  # an older backtide.toml: OpenClaw
+        ("this is = not [ toml\n", "no sirve"),
+        ('[agent]\nprofile = "../x"\n', "no sirve"),
+    ],
+)
+def test_the_installed_profile_is_read_before_any_command(
+    machine: Machine, config: str, refused: str | None
+) -> None:
+    installer(machine, no_key=True).install()
+    path = machine.paths.config_file
+    if config == "no profile line":
+        text = path.read_text().replace('profile = "openclaw"\n', "")
+        assert "profile" not in text.split("[agent]", 1)[1].split("[", 1)[0]
+        path.write_text(text)
+    else:
+        path.write_text(config)
+    machine.calls.clear()
+    with pytest.raises(InstallError, match=refused or "desinstala antes"):
+        installer(machine, no_key=True, profile="claude-code").install()
+    assert machine.calls == []
+    if refused is None:
+        run = installer(machine, no_key=True)
+        run.check_options()
+        assert run.profile == "openclaw" and machine.calls == []
+
+
+def test_a_bad_chat_stops_the_check_before_any_command(machine: Machine) -> None:
+    """The chat is checked in --solo-comprobar too, terminal or not, before install.sh switches
+    the release in use."""
+    for interactive in (False, True):
+        run = installer(machine, Prompter(interactive=interactive), no_key=True, telegram=True,
+                        telegram_token_stdin=True, telegram_chat="-123")  # fmt: skip
+        with pytest.raises(InstallError, match="chat privado"):
+            run.check_options()
+    assert machine.calls == []

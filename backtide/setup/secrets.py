@@ -11,6 +11,12 @@ Design: docs/25, section 3 ("Entrada de secretos"), T13-3. The rules:
   root in the 0700 keys folder, renamed into place, so the service never reads half a key;
 - no message, exception or log line carries it: errors say what the input IS (a path, a size,
   that it is empty), never what it holds. A second install with the same key changes nothing.
+
+The Telegram bot's token (``--telegram``, D27) follows the same rules: ``--telegram-token-archivo``,
+``--telegram-token-stdin`` or the terminal without echo. When the model's key and the token both
+come from standard input, the key is its first line and the token the second
+(``lines_from_stream``). ``telegram.toml`` is written whole, as the Settings page writes it
+(``write_file``).
 """
 
 import getpass
@@ -66,6 +72,27 @@ def from_stream(stream: BinaryIO) -> str:
     return _one_line(data or b"", "la entrada estándar")
 
 
+def lines_from_stream(stream: BinaryIO, count: int) -> list[str]:
+    """``count`` secrets from standard input, one a line, in order (the key, then the token)."""
+    data = stream.read(count * (MAX_SECRET_BYTES + 1) + 1) or b""
+    if len(data) > count * (MAX_SECRET_BYTES + 1):
+        raise SecretError("la entrada estándar es demasiado grande para ser unas claves")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SecretError("la entrada estándar no es texto UTF-8") from None
+    lines = [line.strip() for line in text.strip().splitlines()]
+    if len(lines) != count or not all(lines):
+        raise SecretError(
+            f"la entrada estándar tiene {len(lines)} líneas y debían ser {count}: la clave del "
+            "modelo en la primera y el token de Telegram en la segunda"
+        )
+    for line in lines:
+        if len(line.encode("utf-8")) > MAX_SECRET_BYTES:
+            raise SecretError("una línea de la entrada estándar es demasiado grande")
+    return lines
+
+
 def ask(prompt: str, *, reader: Callable[[str], str] = getpass.getpass) -> str:
     """Ask for the key at the terminal, without echo. ``reader`` is getpass (the tests')."""
     try:
@@ -100,6 +127,21 @@ def write(folder: Path, name: str, value: str, *, private_dir: bool = True) -> W
     return Written.CREATED if current is None else Written.REPLACED
 
 
+def write_file(folder: Path, name: str, data: bytes, *, private_dir: bool) -> Written:
+    """Write ``data`` whole to ``folder/name`` (0600, atomically), as ``write`` does a key: the
+    same bytes there already are left alone. For ``telegram.toml``, which has several lines."""
+    path = folder / name
+    current = _current_bytes(path)
+    if current == data:
+        return Written.UNCHANGED
+    try:
+        write_private(folder, name, data, private_dir=private_dir)
+    except (SettingsError, OSError) as error:
+        what = error.strerror if isinstance(error, OSError) else str(error)
+        raise SecretError(f"no se puede escribir {path}: {what}") from None
+    return Written.CREATED if current is None else Written.REPLACED
+
+
 def new_token() -> str:
     """A fresh random token (the Gateway's): nobody types it."""
     return secrets.token_urlsafe(TOKEN_BYTES)
@@ -108,10 +150,38 @@ def new_token() -> str:
 def _current(path: Path) -> str | None:
     """What ``path`` holds now, or None if there is nothing there. A link, a folder or a file
     that is not 0600 and ours is never read: it is an error."""
+    if not _private_file(path):
+        return None
+    try:
+        return from_file(path)
+    except SecretError:
+        return ""  # unreadable or empty: different from any key, so it is replaced
+
+
+def _current_bytes(path: Path) -> bytes | None:
+    """``_current`` for a whole file: its bytes, or None if there is none."""
+    if not _private_file(path):
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return b""  # different from any content, so it is replaced
+    try:
+        return os.read(fd, MAX_SECRET_BYTES + 1)
+    except OSError:
+        return b""
+    finally:
+        os.close(fd)
+
+
+def _private_file(path: Path) -> bool:
+    """True if ``path`` is a 0600 regular file of ours, False if there is nothing there; a link,
+    a folder or a file open to others is an error (never read)."""
     try:
         info = os.lstat(path)
     except FileNotFoundError:
-        return None
+        return False
     except OSError as error:
         raise SecretError(f"no se puede mirar {path}: {os.strerror(error.errno or 0)}") from None
     if not stat.S_ISREG(info.st_mode):
@@ -121,10 +191,7 @@ def _current(path: Path) -> str | None:
             f"{path} existe pero no es 0600 de root ({stat.S_IMODE(info.st_mode):04o}, dueño "
             f"{info.st_uid}): revísalo a mano"
         )
-    try:
-        return from_file(path)
-    except SecretError:
-        return ""  # unreadable or empty: different from any key, so it is replaced
+    return True
 
 
 def _one_line(data: bytes, where: str) -> str:

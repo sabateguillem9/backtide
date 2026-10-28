@@ -1,8 +1,10 @@
 """The images an installed backtide runs, pulled by digest (docs/25, section 4, step 4).
 
-Each version of backtide pins its own: the agent's (OpenClaw), the proxy's (mitmproxy) and the
-process sensor's (Tetragon), each ``name[:tag]@sha256:<digest>`` in the module that uses it. This
-is the only list of them (``backtide imagenes`` prints it), so no script copies a digest.
+Each version of backtide pins its own: the agent's (OpenClaw by default, or Claude Code with
+``backtide instalar --perfil claude-code``: D27), the proxy's (mitmproxy) and the process
+sensor's (Tetragon), each ``name[:tag]@sha256:<digest>`` in the module that uses it. This is the
+only list of them (``backtide imagenes`` prints it), so no script copies a digest. An install
+pulls the proxy's, the sensor's and the one agent its profile runs (``pinned``).
 
 ``pull`` asks Docker for the image by its digest and then checks that what Docker holds answers
 to that digest (``RepoDigests``). An image that is already there is not pulled again.
@@ -18,6 +20,7 @@ from backtide.jail import IMAGE as OPENCLAW_IMAGE
 from backtide.jail import proxy_config
 from backtide.jail import sensor as sensor_jail
 from backtide.jail.docker import sanitize
+from backtide.jail.profiles import CLAUDE_CODE, OPENCLAW
 from backtide.setup.host import Ran, Runner
 
 PULL_ATTEMPTS = 3
@@ -35,7 +38,7 @@ class ImageError(Exception):
 class Image:
     role: str  # who runs it, for the person
     ref: str  # name[:tag]@sha256:...
-    approx_size: str  # unpacked, measured in T13-1
+    approx_mib: int  # unpacked, measured (T13-1; Claude Code's in T17a-1, docs/34)
 
     @property
     def repo(self) -> str:
@@ -45,18 +48,51 @@ class Image:
     def digest(self) -> str:
         return _parse(self.ref)[1]
 
+    @property
+    def approx_size(self) -> str:
+        return size_text(self.approx_mib)
 
-def pinned() -> tuple[Image, ...]:
-    return (
-        Image("el agente (OpenClaw)", OPENCLAW_IMAGE, "4,7 GiB"),
-        Image("el proxy de salida (mitmproxy)", proxy_config.IMAGE, "382 MiB"),
-        Image("el sensor de procesos (Tetragon)", sensor_jail.IMAGE, "351 MiB"),
-    )
+
+# The agents an install can run, by their [agent] profile (D27): OpenClaw is the default.
+AGENTS = {
+    OPENCLAW.name: Image("el agente (OpenClaw)", OPENCLAW_IMAGE, 4813),
+    CLAUDE_CODE.name: Image("el agente (Claude Code)", CLAUDE_CODE.image, 2729),
+}
+DEFAULT_AGENT = OPENCLAW.name
+_SERVICES = (
+    Image("el proxy de salida (mitmproxy)", proxy_config.IMAGE, 382),
+    Image("el sensor de procesos (Tetragon)", sensor_jail.IMAGE, 351),
+)
+
+
+def pinned(profile: str = DEFAULT_AGENT) -> tuple[Image, ...]:
+    """What an install with ``profile`` pulls: its agent's image (none for a profile the
+    installer does not know, such as ``custom``), the proxy's and the sensor's."""
+    agent = AGENTS.get(profile)
+    return ((agent,) if agent is not None else ()) + _SERVICES
+
+
+def every() -> tuple[Image, ...]:
+    """Every image this version pins: each agent's, the proxy's and the sensor's."""
+    return (*AGENTS.values(), *_SERVICES)
 
 
 def listing() -> str:
     """What `backtide imagenes` prints: one image a line."""
-    return "\n".join(f"{image.ref}  # {image.role}, {image.approx_size}" for image in pinned())
+    return "\n".join(f"{image.ref}  # {image.role}, {image.approx_size}" for image in every())
+
+
+def size_text(mib: int) -> str:
+    """``4,7 GiB`` or ``382 MiB``, as the person reads it (a decimal comma)."""
+    if mib < 1024:
+        return f"{mib} MiB"
+    return f"{mib / 1024:.1f} GiB".replace(".", ",")
+
+
+def approx_total(refs: list[str]) -> str:
+    """About how much ``refs`` hold on disk, from the pinned images among them."""
+    known = {image.ref: image.approx_mib for image in every()}
+    return size_text(sum(known.get(ref, 0) for ref in refs))
 
 
 def inspect_argv(image: Image) -> tuple[str, ...]:

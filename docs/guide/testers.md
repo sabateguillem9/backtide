@@ -15,12 +15,12 @@ It is a **preview**. It has had no human security audit. Read [The limits](#the-
 ## What you need
 
 - **A machine to put it on:** Linux, or a Mac with Apple Silicon.
-  - Linux: **Fedora 44 or Ubuntu 24.04** are the ones we have tested. The installer also accepts Fedora 43 and Ubuntu 26.04, and others may work, but we have not tried them. Our tests so far ran on ARM (`aarch64`); Intel and AMD (`x86_64`) are accepted by the installer but not tried yet.
+  - Linux: **Fedora 44 or Ubuntu 24.04** are the ones we have tested. The installer also accepts Fedora 43 and Ubuntu 26.04, and says they are untested; it refuses other distributions. Our tests so far ran on ARM (`aarch64`); Intel and AMD (`x86_64`) are accepted by the installer, with the same warning, but not tried yet.
   - Mac: Apple Silicon, macOS 13.5 or later. Intel Macs do not work yet.
 - **Disk:** on Linux, about 18 GiB free in `/var/lib` (the agent's folder lives in a volume of up to 20 GiB that only takes what is written, and the images are about 5.5 GiB). On a Mac, 25 GiB free.
 - **Memory:** the agent alone may use up to 3 GiB. Plan on 6 GiB free for the whole of backtide. A Mac needs 8 GiB in total, because backtide gives its VM 6.
 - **A model key with a spending limit.** Create a new key just for this, in your provider's console, and set a low monthly limit on it (for example 5 dollars). **Never use a production key.** For Anthropic, create the key inside a workspace.
-- **Optional: your own Telegram bot,** to get the notices on your phone. It is not needed to try backtide, and today you set it up by hand (see [Telegram](configuration.md#telegram)).
+- **Optional: your own Telegram bot,** to get the notices on your phone. It is not needed to try backtide. Add `--telegram` to the install command and it asks for the bot's token (without showing it) and your chat id, or set it later in the web's Settings ("Ajustes" > "Avisos"). How to make the bot: [Telegram](configuration.md#telegram).
 
 Two words you will meet:
 
@@ -31,7 +31,7 @@ The installer sets up both for you (it asks before it installs anything that is 
 
 On a Mac there is one more piece: backtide needs a Linux kernel, so the installer makes a small Linux VM of its own with [Lima](https://lima-vm.io). A VM is a whole second computer simulated inside yours. No folder of your Mac is shared with it. You can read what the Mac installer does in [the command line reference](cli-reference.md#install-macsh-backtide-on-a-mac).
 
-The installed version runs **OpenClaw**. Claude Code works in backtide's development setup, but the installer does not set it up yet.
+The installed version runs **OpenClaw** by default. To put **Claude Code** in the jail instead, add `--perfil claude-code` to the install command; you then use it with `sudo backtide entrar` (a session in your terminal) and `sudo backtide tarea "..."`. A machine keeps the agent it was installed with: to switch, uninstall first (your data stays) and install again with the other `--perfil`.
 
 ## Install
 
@@ -80,7 +80,7 @@ Run it as yourself, without `sudo`. It creates the VM and installs backtide insi
 
 The command names are in Spanish, and so is most of what they print. This guide quotes them as they are.
 
-If you skipped the key, run the install command again: it asks again.
+If you skipped the key, put it in the web (next step): "Ajustes" ("Settings") > "Modelos" ("Models"). Or run the install command again: it asks again.
 
 ## Your first 15 minutes
 
@@ -98,13 +98,17 @@ The web shows, live, what the agent does ("Ahora" is "Now", "Historia" is "Histo
 
 ### 2. Talk to your agent
 
-The installed backtide starts OpenClaw by itself and keeps it running. To give it a message, run the line below on the machine. On a Mac, open the VM first with `backtide vm shell` and run the `docker` lines in there; the `backtide …` commands you can run on the Mac itself, without `sudo`.
+The installed backtide starts OpenClaw by itself and keeps it running. To give it a message, run this on the machine (on a Mac, run the `backtide …` lines on the Mac itself, without `sudo`):
 
 ```sh
-sudo docker exec --user 61000:61000 backtide-agente node openclaw.mjs agent --agent main --message "Hello, who are you and what can you do?"
+sudo backtide tarea "Hello, who are you and what can you do?"
 ```
 
-This is the line backtide's own test script uses to talk to OpenClaw. We have not yet tried it by hand on a machine installed with the installer, so if it fails, tell us. The command waits for the answer, which can take a while. All messages go into the same conversation. Avoid the `$` character in the message.
+`tarea` ("task") asks the running backtide first, which records it in the black box, then gives your message to OpenClaw inside its container and prints the reply. The command waits for the answer, which can take a while (15 minutes at most; `--minutos N` changes that, and Ctrl-C stops it). All messages go into the same conversation, the one Telegram uses too, so you can also just write to your bot. Your message reaches the agent as it is, but your own shell still reads `$` and backticks inside double quotes: if the message has them, put it in single quotes.
+
+Those are the two ways to talk to OpenClaw: `tarea` and Telegram. The web shows what it does, and from it you approve, reject and rewind, but it does not send the agent messages. `backtide entrar`, which opens the agent inside your terminal, is only for Claude Code for now: OpenClaw reads Telegram and the web all the time, and what it is told could make it write escape sequences straight into your terminal.
+
+`tarea` with OpenClaw was tested in backtide's development setup. If it fails on your install, tell us.
 
 **This costs money:** the model calls are billed to your account. A few messages are cents.
 
@@ -115,14 +119,14 @@ Keep the web open in another window while you try the four things below.
 **1. Let it write a file and delete it, then rewind.**
 
 ```sh
-sudo docker exec --user 61000:61000 backtide-agente node openclaw.mjs agent --agent main --message "Create the file notes.txt in your work folder with three ideas for a blog."
+sudo backtide tarea "Create the file notes.txt in your work folder with three ideas for a blog."
 sudo backtide instantaneas
 ```
 
 `instantaneas` lists the snapshots (the photos of the agent's folder), newest first. Wait until a new one appears after the file was created, and copy its id from the first column. Then:
 
 ```sh
-sudo docker exec --user 61000:61000 backtide-agente node openclaw.mjs agent --agent main --message "Now delete notes.txt."
+sudo backtide tarea "Now delete notes.txt."
 sudo backtide rebobinar <the id you copied>
 ```
 
@@ -133,7 +137,7 @@ Or do it from the web: in "Instantáneas" (Snapshots), click the arrow on the sn
 **2. Let it read a web page: it passes.**
 
 ```sh
-sudo docker exec --user 61000:61000 backtide-agente node openclaw.mjs agent --agent main --message "Read https://example.com and tell me its title."
+sudo backtide tarea "Read https://example.com and tell me its title."
 ```
 
 A read changes nothing outside, so the gate lets it through without asking. The web's History shows the request as a GET, and no notice reaches you.
@@ -141,7 +145,7 @@ A read changes nothing outside, so the gate lets it through without asking. The 
 **3. Let it send something out: it is held.**
 
 ```sh
-sudo docker exec --user 61000:61000 backtide-agente node openclaw.mjs agent --agent main --message "Make a POST to https://httpbin.org/post with the text hello, using curl."
+sudo backtide tarea "Make a POST to https://httpbin.org/post with the text hello, using curl."
 ```
 
 A **POST** sends data to the outside, to a site you have not allowed, so the gate holds it. That command waits. In a second terminal:
@@ -159,7 +163,7 @@ Try both, in two runs. If you do nothing for 5 minutes, it is rejected and the a
 **4. Look for secrets: it finds none.**
 
 ```sh
-sudo docker exec --user 61000:61000 backtide-agente node openclaw.mjs agent --agent main --message "Look for API keys in your environment and your config files and tell me what you find."
+sudo backtide tarea "Look for API keys in your environment and your config files and tell me what you find."
 ```
 
 The only thing it can find is a fake key (it looks like `backtide-fake-anthropic-…`). Your real key stays outside the agent's container: the proxy swaps the fake for the real one on the way to the model provider.
@@ -247,7 +251,7 @@ backtide is a preview. Read this before you install it.
 
 And two rough edges of the installed version today:
 
-- Telegram is not part of the installer: you set it up by hand ([how](configuration.md#telegram)). Of it, only a hold notice arriving has been seen with a real bot.
-- There is no `backtide` command yet to talk to the agent (the `docker exec` line above is a stopgap), and there is no `backtide actualizar`: to upgrade, uninstall (keeping your data) and install the new version.
+- Telegram is optional (`--telegram` at install, or the web's Settings). Of it, only a hold notice arriving has been seen with a real bot; the installer's part was tried against a fake Telegram.
+- There is no `backtide actualizar`: to upgrade, uninstall (keeping your data) and install the new version.
 
 The full picture is in the [security model](security-model.md) and the [README](../../README.md).

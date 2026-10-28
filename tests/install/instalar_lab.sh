@@ -3,8 +3,11 @@
 # Inside a backtide-limpia-* or backtide-prueba-* VM only, as root, never on the Mac or in vigia-dev:
 #
 #   sudo bash instalar_lab.sh bloquear            # nothing of the agent's leaves the VM
-#   sudo bash instalar_lab.sh instalar REL.tar    # install.sh --desde REL.tar (a `make release`
-#                                                 # archive), made-up key, watching `ps`
+#   sudo bash instalar_lab.sh instalar REL.tar [flags]  # install.sh --desde REL.tar (a `make
+#                                                 # release` archive), made-up key, watching `ps`;
+#                                                 # flags go on to `backtide instalar` (D27:
+#                                                 # --perfil claude-code, --telegram...)
+#   sudo bash instalar_lab.sh token               # a made-up Telegram bot token, in $LAB
 #   sudo bash instalar_lab.sh fugas               # the made-up key in ps, journal, logs, files?
 #   sudo bash instalar_lab.sh estado              # what is there: units, mounts, containers
 #   sudo bash instalar_lab.sh bateria SRC.tar     # the T13 scenarios of the battery, as root
@@ -23,6 +26,7 @@ set -euo pipefail
 
 LAB=/var/lib/backtide-lab
 KEY_FILE=$LAB/made-up.key
+TOKEN_FILE=$LAB/made-up.token  # a Telegram bot token's shape, nobody's (D27)
 PS_LOG=$LAB/ps.log
 
 require_clean_vm_root() {
@@ -46,7 +50,7 @@ cortar() {
   nft add chain inet backtide_lab forward '{ type filter hook forward priority -50; policy accept; }'
   nft add rule inet backtide_lab forward iifname '{ "br-*", "docker0" }' oifname != '{ "br-*", "docker0" }' counter drop
   nft add chain inet backtide_lab output '{ type filter hook output priority -50; policy accept; }'
-  for name in api.anthropic.com api.openai.com platform.claude.com clawhub.ai; do
+  for name in api.anthropic.com api.openai.com platform.claude.com clawhub.ai api.telegram.org; do
     for ip in $(getent ahostsv4 "$name" | awk '{print $1}' | sort -u); do
       nft add rule inet backtide_lab output ip daddr "$ip" counter drop
     done
@@ -74,8 +78,17 @@ UNIT
   systemctl daemon-reload && systemctl enable backtide-lab-bloquear.service >/dev/null 2>&1
 }
 
+token() {
+  mkdir -p "$LAB" && chmod 0700 "$LAB"
+  [ -s "$TOKEN_FILE" ] || { printf '%s:%s\n' "$(shuf -i 100000000-999999999 -n 1)" \
+    "$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 35)" > "$TOKEN_FILE"; }
+  chmod 0600 "$TOKEN_FILE"
+  result token_file "$TOKEN_FILE"
+}
+
 instalar() {
   local src=$1 sha
+  shift
   mkdir -p "$LAB" && chmod 0700 "$LAB"
   if [ ! -s "$KEY_FILE" ]; then
     # Made up here: the shape of an Anthropic key (the installer checks it), nobody's.
@@ -87,7 +100,7 @@ instalar() {
   ( while :; do ps -eww -o pid=,args= >> "$PS_LOG"; sleep 0.2; done ) &
   local watcher=$!
   local start=$SECONDS code=0
-  sh "$LAB/install.sh" --desde "$src" --sha256 "$sha" --si --clave-archivo "$KEY_FILE" \
+  sh "$LAB/install.sh" --desde "$src" --sha256 "$sha" --si --clave-archivo "$KEY_FILE" "$@" \
     > >(tee -a "$LAB/install.log") 2>&1 || code=$?
   kill "$watcher" 2>/dev/null || true
   result install_exit "$code"
@@ -111,6 +124,19 @@ fugas() {
   result ps_samples "$(grep -c . "$PS_LOG")"
   result key_leaks "[${found# }]"
   result key_file "$(stat -c '%U:%G %a' /var/lib/backtide/keys/anthropic.key)"
+  [ -s "$TOKEN_FILE" ] || return 0
+  # The same for the Telegram token (D27): only in telegram.toml.
+  found="" match=(grep -qF -f "$TOKEN_FILE")
+  "${match[@]}" "$PS_LOG" && found="$found ps"
+  journalctl -b --no-pager -o cat 2>/dev/null | "${match[@]}" && found="$found journal"
+  grep -rqF -f "$TOKEN_FILE" /var/log 2>/dev/null && found="$found /var/log"
+  [ ! -e "$LAB/install.log" ] || ! "${match[@]}" "$LAB/install.log" || found="$found install.log"
+  for c in $(docker ps -aq); do docker logs "$c" 2>&1 | "${match[@]}" && found="$found docker-logs:$c"; done
+  while IFS= read -r file; do
+    case "$file" in /var/lib/backtide/telegram.toml | "$TOKEN_FILE") ;; *) found="$found $file" ;; esac
+  done < <(grep -rlF -f "$TOKEN_FILE" /etc /var/lib/backtide /opt/backtide /run /tmp /root 2>/dev/null || true)
+  result token_leaks "[${found# }]"
+  result telegram_file "$(stat -c '%U:%G %a' /var/lib/backtide/telegram.toml 2>/dev/null || echo missing)"
 }
 
 estado() {
@@ -142,7 +168,11 @@ bateria() {
   local src=$1 dir=/root/backtide-tests
   shift
   rm -rf "$dir" && mkdir -p "$dir" && tar -xf "$src" -C "$dir" --no-same-owner
-  ( cd "$dir" && UV_PYTHON_INSTALL_DIR=/opt/backtide/python UV_PYTHON_PREFERENCE=only-managed \
+  # The installed agent (D27): its [agent] profile, OpenClaw when it names none.
+  local perfil
+  perfil=$(python3 -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb")).get("agent", {}).get("profile", "openclaw"))' /etc/backtide/backtide.toml)
+  result battery_profile "$perfil"
+  ( cd "$dir" && BACKTIDE_ATK_PERFIL=$perfil UV_PYTHON_INSTALL_DIR=/opt/backtide/python UV_PYTHON_PREFERENCE=only-managed \
       UV_CACHE_DIR=/root/.cache/uv /opt/backtide/uv/*/uv run --quiet --locked --python 3.12 \
       pytest -m ataques -p no:cacheprovider -rs tests/attacks/test_install_attacks.py "$@" )
 }
@@ -234,12 +264,13 @@ require_clean_vm_root
 case "${1:-}" in
   bloquear) bloquear ;;
   cortar) cortar ;;
-  instalar) require_lab_mark; instalar "${2:?the source archive}" ;;
+  instalar) require_lab_mark; shift; instalar "${1:?the source archive}" "${@:2}" ;;
+  token) require_lab_mark; token ;;
   fugas) require_lab_mark; fugas ;;
   estado) require_lab_mark; estado ;;
   bateria) require_lab_mark; shift; bateria "${1:?the source archive}" "${@:2}" ;;
   senuelos) require_lab_mark; senuelos ;;
   huella) huella "${2:?a file for the fingerprint}" ;;
   desinstalar) require_lab_mark; shift; desinstalar "${1:?the source archive}" "${@:2}" ;;
-  *) sed -n '2,20p' "$0"; exit 2 ;;
+  *) sed -n '2,25p' "$0"; exit 2 ;;
 esac

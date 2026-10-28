@@ -23,8 +23,8 @@ Other guides: [getting started](getting-started.md), [configuration](configurati
 | `backtide gasto` | Show today's and this month's model spending ("spending") |
 | `backtide tope` | Show or change the spending cap ("cap") |
 | `backtide web` | Open the web view on this computer |
-| `backtide entrar` | Open the coding agent in your terminal ("enter") |
-| `backtide tarea` | Give the coding agent one task ("task") |
+| `backtide entrar` | Open the agent in your terminal ("enter") |
+| `backtide tarea` | Give the agent one task or message, and print its answer ("task") |
 | `backtide importar` | Copy a folder from your computer into the agent's workspace ("import") |
 | `backtide exportar` | Copy the agent's work out to a new folder on your computer ("export") |
 | `backtide comprobar` | Check whether this machine can run backtide ("check") |
@@ -292,13 +292,15 @@ backtide rechazar ID [--config FILE]
 
 ## Coding agents: enter, task, import, export
 
-These four commands exist for agents that run as a **shell program** inside the container instead of as a background service. Today that is the `claude-code` profile (Claude Code). With the default OpenClaw profile they stop with exit 2 and explain why. Choose the profile in `[agent] profile` ([configuration](configuration.md)). The design is in docs/34 (internal note) (in Spanish).
+`tarea` works with both profiles: Claude Code (`claude-code`) and the default, OpenClaw. `entrar`, `importar` and `exportar` are for agents that run as a **shell program** inside the container instead of as a background service, which today is only Claude Code; with OpenClaw they stop with exit 2 and say what to use instead. Choose the profile in `[agent] profile` ([configuration](configuration.md)). The design is in docs/34 (internal note) (in Spanish).
+
+To talk to OpenClaw, use `backtide tarea` or Telegram. The web shows what it does and lets you approve, reject and rewind, but it does not send it messages. `tarea` goes through OpenClaw's running Gateway (the OpenClaw process that is the agent), into its main conversation: the same one its Telegram chat uses. There is only that one conversation, so every message continues it and `--continue` changes nothing. There is no `entrar` for OpenClaw yet: it runs all the time and reads Telegram and the web, so what it is told could make it write escape sequences straight into its terminal interface, which would be your terminal (your clipboard, your screen). It comes back once backtide has a relay that filters them.
 
 All four ask the running service first. The service records the request in the black box and checks that the agent is running, before anything happens.
 
 ### `backtide entrar`
 
-Opens the agent's interactive program in your terminal, inside the agent's container, as the agent's user and in its working folder (`/workspace/work`). Everything it does is recorded and can be rewound.
+Opens Claude Code in your terminal, inside the agent's container, as the agent's user and in its working folder (`/workspace/work`). Everything it does is recorded and can be rewound. Claude Code only, for now (see above).
 
 ```sh
 backtide entrar [--config FILE] [--continue]
@@ -308,11 +310,11 @@ backtide entrar [--config FILE] [--continue]
 |---|---|
 | `--continue` | Continue the last conversation (for example after a rewind, when the conversation is restored from the snapshot) |
 
-Prints `Entrando en el agente (sal con /exit o Ctrl-D). Todo lo que haga queda grabado.` When the session ends, backtide puts your terminal back as it was and prints `Sesión de Claude Code cerrada. Estás otra vez en tu terminal.` Exit codes: `0` the session ended normally; `1` it could not open or ended with an error (code 137 means it was cut, for example by a rewind); `2` usage error (for example, not a shell-mode agent).
+What Claude Code writes reaches your terminal as it is: the agent can still change your terminal while the session is open (a filtering relay is planned). Prints `Entrando en el agente (sal con /exit o Ctrl-D). Todo lo que haga queda grabado.` When the session ends, backtide puts your terminal back as it was and prints `Sesión del agente cerrada. Estás otra vez en tu terminal.` Exit codes: `0` the session ended normally; `1` it could not open or ended with an error (code 137 means it was cut, for example by a rewind); `2` usage error (for example, OpenClaw, which has no terminal session yet).
 
 ### `backtide tarea`
 
-Gives the agent one task without opening an interactive session, and prints its answer.
+Gives the agent one task without opening an interactive session, and prints its answer. With Claude Code it runs `claude -p`. With OpenClaw it is one message to its main conversation, through `openclaw agent`, and prints the reply. Whatever the agent writes is printed with its control characters made visible, so it cannot move the cursor, rewrite your screen or reach your clipboard. The black box records the task before it starts, with the first 200 characters of what you asked (anything that looks like a secret struck out first).
 
 ```sh
 backtide tarea "TASK TEXT" [--config FILE] [--continue] [--minutos N]
@@ -321,10 +323,10 @@ backtide tarea "TASK TEXT" [--config FILE] [--continue] [--minutos N]
 | Argument / flag | Default | Effect |
 |---|---|---|
 | `TASK TEXT` | required | What you ask, in quotes. It is passed as one single argument, never through a shell |
-| `--continue` | off | Continue the last conversation. Refused if another task is still running inside the agent |
-| `--minutos N` | `60` | Maximum wait, in minutes. Above 0 and up to 1440 (24 hours) |
+| `--continue` | off | Continue the last conversation. Refused if another task is still running inside the agent. With OpenClaw every task continues its one conversation, so a task is always refused while another one is running |
+| `--minutos N` | `60` (Claude Code), `15` (OpenClaw) | Maximum time, in minutes, with decimals if you like (`0.5` is 30 seconds). From one second (`0.02`) up to 1440 (24 hours) |
 
-When the time runs out, the task is stopped inside the container (`la tarea se ha cortado`). Exit codes: `0` done; `1` it ended with an error, or it was cut by the time limit or a rewind; `2` usage error; `3` unknown (for example the connection to Docker failed and the task may still be running).
+When the time runs out, the task is stopped inside the container (`la tarea se ha cortado`). With OpenClaw, the limit is also OpenClaw's own for that turn, so its Gateway stops the turn there, before anything else it would have done; the stop inside the container comes 30 seconds later, in case it did not. Ctrl-C stops the task inside the container too, and says so. What stops is the task and what it is running; a program the agent started and left running on its own is not part of it (that is what snapshots and the gate are for). Exit codes: `0` done; `1` it ended with an error, or it was cut by the time limit or a rewind; `2` usage error; `3` unknown (for example you pressed Ctrl-C, or the connection to Docker failed, and the task may still be running).
 
 ```sh
 backtide tarea "List the files in this folder and say what the project does" --config ~/backtide-demo-run/backtide.toml
@@ -439,7 +441,7 @@ sudo backtide comprobar
 
 ### `install.sh` and `backtide instalar`
 
-`install.sh` is a short `sh` script at the root of the repository: read it before you run it. It checks that it runs as root on Ubuntu 24.04 or 26.04 or Fedora 43 or 44 (x86_64 or aarch64), checks the sha256 of the release archive and, before it writes anything, that the archive's `requirements.txt` pins every dependency to one version with its sha256. Then it downloads `uv` (pinned by version and sha256), installs the release in `/opt/backtide/releases/<version>-<hash>` and hands over to `backtide instalar`. **Nothing is built on your machine:** it creates a Python 3.12 of uv's own (uv checks it against the hash it carries) and installs only ready-made packages ("wheels"), each checked against its sha256 (`uv pip install --require-hashes --no-build`). If a dependency had no wheel for your machine, or a hash did not match, it stops without installing anything. backtide itself is not installed as a package: its code stays in the release folder, and `/opt/backtide/current/.venv/bin/backtide` runs it with `python -I` (isolated: no `PYTHON*` variables, no current folder).
+`install.sh` is a short `sh` script at the root of the repository: read it before you run it. It checks that it runs as root on Ubuntu 24.04 or 26.04 or Fedora 43 or 44 (x86_64 or aarch64; only Fedora 44 and Ubuntu 24.04 on aarch64 have been tested, and it says so for the others), checks the sha256 of the release archive and, before it writes anything, that the archive's `requirements.txt` pins every dependency to one version with its sha256. Then it downloads `uv` (pinned by version and sha256), installs the release in `/opt/backtide/releases/<version>-<hash>` and hands over to `backtide instalar`. **Nothing is built on your machine:** it creates a Python 3.12 of uv's own (uv checks it against the hash it carries) and installs only ready-made packages ("wheels"), each checked against its sha256 (`uv pip install --require-hashes --no-build`). If a dependency had no wheel for your machine, or a hash did not match, it stops without installing anything. backtide itself is not installed as a package: its code stays in the release folder, and `/opt/backtide/current/.venv/bin/backtide` runs it with `python -I` (isolated: no `PYTHON*` variables, no current folder).
 
 ```sh
 sudo sh install.sh --desde backtide-<version>.tar --sha256 <the hash> [backtide instalar flags]
@@ -475,11 +477,14 @@ make release                     # dist/release/backtide-<version>.tar and its .
 
 `make release COMMIT=<ref>` builds another commit. `make release ARBOL=1` builds from the working tree, uncommitted changes included, for testing only: its name ends in `-arbol` and `release.txt` says so. Building the archive builds nothing either: it copies the commit's files and runs `uv export --frozen`, which only reads `uv.lock`.
 
-`backtide instalar` does the rest, each step checked and recorded in `/var/lib/backtide/install-manifest.json`: the preflight of `comprobar` (any failure stops it before it changes anything), the `backtide-web` account, the folders and their permissions, `btrfs-progs`/`openssl`/`gnupg` if missing, Docker Engine from Docker's own repository if there is none (its signing key is checked by fingerprint), SELinux in Docker on Fedora, the three images by digest, the agent's volume, the config and keys, the two Docker networks, the systemd units, and the self-test. **Run it again and it changes nothing**; cut it half way and the next run goes on from there.
+`backtide instalar` does the rest, each step checked and recorded in `/var/lib/backtide/install-manifest.json`: the preflight of `comprobar` (any failure stops it before it changes anything), the `backtide-web` account, the folders and their permissions, `btrfs-progs`/`openssl`/`gnupg` if missing, Docker Engine from Docker's own repository if there is none (its signing key is checked by fingerprint), SELinux in Docker on Fedora, the three images of its agent by digest, the agent's volume, the config and keys (and Telegram, with `--telegram`), the two Docker networks, the systemd units, and the self-test. **Run it again and it changes nothing**; cut it half way and the next run goes on from there.
 
 ```sh
-sudo backtide instalar [--si] [--dry-run] [--proveedor anthropic|openai]
+sudo backtide instalar [--si] [--dry-run] [--perfil openclaw|claude-code]
+                       [--proveedor anthropic|openai]
                        [--clave-archivo FILE | --clave-stdin | --sin-clave]
+                       [--telegram [--telegram-token-archivo FILE | --telegram-token-stdin]
+                                   [--telegram-chat N]]
                        [--tope-diario N] [--tope-mensual N] [--zona-horaria ZONE]
                        [--subredes A,B] [--volumen-gib N]
 ```
@@ -488,10 +493,15 @@ sudo backtide instalar [--si] [--dry-run] [--proveedor anthropic|openai]
 |---|---|---|
 | `--si` | off | Answer yes to every question (installing packages or Docker, SELinux in Docker). Without it, and without a terminal, it stops at the first question |
 | `--dry-run` | off | Show the checks and the steps; change nothing |
-| `--proveedor` | `anthropic` | Whose key it stores (`keys/<provider>.key`) |
+| `--perfil` | `openclaw` | The agent in the jail: `openclaw` or `claude-code`. It pulls that agent's pinned image only, and writes its `[agent] profile` in the first `backtide.toml`. Once installed, a machine keeps its agent (see below) |
+| `--proveedor` | `anthropic` | Whose key it stores (`keys/<provider>.key`). Claude Code only takes `anthropic` |
 | `--clave-archivo FILE` | none | Read the model's key from `FILE` (one line). Delete the file afterwards |
 | `--clave-stdin` | off | Read the key from standard input |
-| `--sin-clave` | off | No key now: set it later in the web's Settings page |
+| `--sin-clave` | off | No key now: set it later in the web (`sudo backtide enlace` gives its link), Settings > Models |
+| `--telegram` | off | Set up the Telegram bot: its token (without echo) and your chat. Without it Telegram is skipped, and you can set it later in the web, Settings > Alerts |
+| `--telegram-token-archivo FILE` | none | Read the bot's token from `FILE` (one line). Implies `--telegram`. Delete the file afterwards |
+| `--telegram-token-stdin` | off | Read the bot's token from standard input. Implies `--telegram`. With `--clave-stdin` too, the key is the first line and the token the second |
+| `--telegram-chat N` | asked | Your private chat with the bot (a positive number; it is not a secret). Implies `--telegram` |
 | `--tope-diario`, `--tope-mensual` | `5`, `50` | The spending caps in dollars, written to the first `backtide.toml` |
 | `--zona-horaria` | the machine's | The time zone of "a day" for the cap |
 | `--subredes A,B` | chosen | The subnets of the agent's network (A) and the egress one (B). By default two free `/24` from `172.29.0.0/16`, from the top, that no route, address or Docker network uses |
@@ -499,10 +509,13 @@ sudo backtide instalar [--si] [--dry-run] [--proveedor anthropic|openai]
 
 How it behaves:
 
-- **Keys never go in an argument** (`ps` would show them). With a terminal and none of the three key flags, it asks for the key without echo; an empty answer leaves it for the Settings page.
+- **Keys never go in an argument** (`ps` would show them). With a terminal and none of the three key flags, it asks for the key without echo; an empty answer leaves it for the web's Settings page (Settings > Models).
+- **Telegram is optional.** With `--telegram` it asks for the bot's token without echo (or reads it from `--telegram-token-archivo` or `--telegram-token-stdin`, never an argument) and for your chat id (or takes `--telegram-chat`), checks both with the Settings page's own rules, and writes `/var/lib/backtide/telegram.toml` the way the web does (root's, `0600`); if the service is running, it restarts it so the bot reads it. The token is never printed or logged. Without a terminal, `--telegram` needs the token's file or stdin and `--telegram-chat`, or it stops before changing anything. Without `--telegram`, a `telegram.toml` already there is kept, and if there is none it says where to set it later (the web, Settings > Alerts). How to make the bot and find your chat id: 28-telegram.md (internal note).
+- **One agent per machine.** OpenClaw is the default; `--perfil claude-code` installs Claude Code instead, used with [`backtide entrar` and `backtide tarea`](#coding-agents-enter-task-import-export). A second run without `--perfil` keeps the agent the machine has. A run with another `--perfil` stops before changing anything and says how to switch: uninstall first (`sudo backtide desinstalar`, which keeps the data), then install with the new `--perfil`. The new agent starts on the same data (the black box goes on with its chain; the volume keeps the old agent's work and snapshots), and the old agent's saved `backtide.toml` is kept aside as `/var/lib/backtide/backtide.toml.guardado.<agent>`.
+- **Tested so far:** Fedora 44 and Ubuntu 24.04 on aarch64 (arm64). Fedora 43, Ubuntu 26.04 and x86_64 are accepted, and the installer warns that they are untested.
 - An existing `/etc/backtide/backtide.toml` is kept as it is. An existing `volume.img` is never overwritten or formatted again.
 - On Fedora with SELinux enforcing and a Docker that does not use it, it asks before changing Docker: first `live-restore` (a reload, nothing restarts), then `selinux-enabled` and one restart of Docker (your other containers keep running). A Docker that already uses SELinux is not touched.
-- At the end it prints how to open the web (`sudo backtide enlace`) and repeats the warnings.
+- At the end it prints how to open the web (`sudo backtide enlace`), where in Settings to put a missing key or Telegram, and repeats the warnings.
 - Exit codes: `0` installed and tested; `1` stopped (it says where and how to go on); `2` not root or a bad flag.
 - To remove it: [`backtide desinstalar`](#backtide-desinstalar-remove-backtide). Upgrading in place (`backtide actualizar`) is not there yet: uninstall keeping the data, then install the new version.
 
@@ -512,7 +525,8 @@ backtide needs a Linux kernel (Btrfs for the snapshots, eBPF for the sensor), an
 
 ```sh
 shasum -a 256 backtide-<version>.tar     # must be the published hash (see "Getting a release")
-sh install-mac.sh --desde backtide-<version>.tar --sha256 <the hash> [--clave-archivo FILE | --clave-stdin | --sin-clave] [--si]
+sh install-mac.sh --desde backtide-<version>.tar --sha256 <the hash> [--clave-archivo FILE | --clave-stdin | --sin-clave]
+                [--perfil claude-code] [--telegram [--telegram-token-archivo FILE] [--telegram-chat N]] [--si]
 ```
 
 What it does, and nothing else:
@@ -525,7 +539,7 @@ What it does, and nothing else:
 
 Only the web's port is forwarded, to the Mac's `127.0.0.1:8765`: `backtide enlace` prints the link (after checking that the port is held by Lima, not by another program), and it opens in your Mac's browser. No other port of the VM reaches the Mac (tested with Lima 2.2.1). **The other direction is open for the VM itself:** its root and its own programs can reach services listening on your Mac's `127.0.0.1` through Lima's address for the host, `192.168.5.2`. The agent's jail cannot: it has no route there, and a scenario of the battery checks it. **Run it again and it changes nothing**: the VM, Lima and the `backtide` command stay as they are, and the Linux installer inside finds everything done.
 
-**Keys never go in an argument, on the Mac or in the VM.** `--clave-archivo FILE` is read on the Mac and sent to the installer in the VM through standard input (`--clave-stdin` there), so the key is in no command line, no Lima log and no shell history. `--clave-stdin` passes your standard input on the same way, but only from a pipe or a file: from a terminal it is refused, since what you type there would be seen. Without either, and with a terminal, it asks for the key without echo; an empty answer leaves it for later. The Mac's `backtide` does the same with `--clave-archivo`.
+**Keys never go in an argument, on the Mac or in the VM.** `--clave-archivo FILE` is read on the Mac and sent to the installer in the VM through standard input (`--clave-stdin` there), so the key is in no command line, no Lima log and no shell history. `--clave-stdin` passes your standard input on the same way, but only from a pipe or a file: from a terminal it is refused, since what you type there would be seen. Without either, and with a terminal, it asks for the key without echo; an empty answer leaves it for later. The Mac's `backtide` does the same with `--clave-archivo`. **The Telegram bot's token goes the same way:** `--telegram` with `--telegram-token-archivo FILE` (read on the Mac), or typed without echo when asked, and sent after the key's line on the same standard input; `--telegram-token-stdin` is refused on the Mac. Your chat id goes as `--telegram-chat N` or is asked. Without a terminal, `--telegram` needs both the token's file and `--telegram-chat`, or it stops before changing anything. `--perfil` goes on to the installer in the VM as it is.
 
 **What to know about a Mac:**
 
@@ -534,7 +548,7 @@ Only the web's port is forwarded, to the Mac's `127.0.0.1:8765`: `backtide enlac
 - **The agent's files live in the VM, not on your Mac.** `backtide exportar <folder>` copies them to a new folder inside the VM, and `backtide vm shell` gets you there. Bringing them to the Mac in one step is not there yet.
 - **The VM's clock.** While the Mac sleeps, the VM's clock stops. When it wakes, Lima's guest agent sets it from the Mac's within seconds (measured: a VM two hours behind was right again in under 10 seconds), and until then backtide does not prune old snapshots, because pruning refuses to run on a clock that is not synchronized. `backtide comprobar` says whether it is.
 - **Port 8765 must be free on the Mac.** The web checks that it is called as `127.0.0.1:8765`, so the VM's port and the Mac's must be the same. `make web-demo` uses the same port: close one before the other.
-- **Telegram is not in the installer yet**: it will be set in the web's Settings page.
+- **Telegram is optional**: `--telegram` (above), or later in the web (`backtide enlace`), Settings > Alerts.
 
 ### `backtide desinstalar`: remove backtide
 
@@ -542,9 +556,9 @@ Only the web's port is forwarded, to the Mac's `127.0.0.1:8765`: `backtide enlac
 sudo backtide desinstalar [--borrar-datos] [--quitar-docker] [--si] [--dry-run]
 ```
 
-It removes what `backtide instalar` made, and only that: the installer writes down everything it creates or changes in `/var/lib/backtide/install-manifest.json`, and the uninstaller undoes that list. First it stops the agent (`backtide.service`, then the agent's container if it still runs), then it removes, in order: the systemd units (which unmounts the volume and the proxy's tmpfs), backtide's three containers, its two Docker networks, the images it downloaded (about 5.5 GiB), the volume's mount point, `/etc/backtide`, the `/usr/local/bin/backtide` command, the `backtide-web` account and `/opt/backtide` (the program itself, last). If it changed Docker's `daemon.json` (SELinux on Fedora), those two settings go back to what they were, and anything you added to that file since stays: `selinux-enabled` first, with one restart of Docker while `live-restore` keeps your other containers running, then `live-restore` with a reload. Before it changes anything it prints the list and asks.
+It removes what `backtide instalar` made, and only that: the installer writes down everything it creates or changes in `/var/lib/backtide/install-manifest.json`, and the uninstaller undoes that list. First it stops the agent (`backtide.service`, then the agent's container if it still runs), then it removes, in order: the systemd units (which unmounts the volume and the proxy's tmpfs), backtide's three containers, its two Docker networks, the images it downloaded (about 5.4 GiB with OpenClaw, 3.4 GiB with Claude Code: only those of the agent it installed), the volume's mount point, `/etc/backtide`, the `/usr/local/bin/backtide` command, the `backtide-web` account and `/opt/backtide` (the program itself, last). If it changed Docker's `daemon.json` (SELinux on Fedora), those two settings go back to what they were, and anything you added to that file since stays: `selinux-enabled` first, with one restart of Docker while `live-restore` keeps your other containers running, then `live-restore` with a reload. Before it changes anything it prints the list and asks.
 
-**By default it keeps your data**, in `/var/lib/backtide` (root only): the black box with its key and checkpoint, the agent's volume `volume.img` (its work and all its snapshots), the model keys in `keys/`, and a copy of your `backtide.toml`. It prints where they are and how much the volume takes. **To install again over them**, run the same install command as the first time: the black box goes on with the same chain (`backtide verificar` still says it is intact), the old snapshots are still there, and your `backtide.toml` comes back.
+**By default it keeps your data**, in `/var/lib/backtide` (root only): the black box with its key and checkpoint, the agent's volume `volume.img` (its work and all its snapshots), the model keys in `keys/`, `telegram.toml` if there is one, and a copy of your `backtide.toml`. It prints where they are and how much the volume takes. **To install again over them**, run the same install command as the first time: the black box goes on with the same chain (`backtide verificar` still says it is intact), the old snapshots are still there, and your `backtide.toml` comes back.
 
 | Flag | Effect |
 |---|---|
@@ -580,7 +594,7 @@ Prints the one-time link of the installed web (`backtide-web.service`), its run 
 
 ### `backtide imagenes`
 
-Prints the three images this version runs (the agent, the proxy, the sensor), each pinned by digest: the only list of them, the one the installer pulls and checks.
+Prints the images this version runs (each agent's, OpenClaw's and Claude Code's, the proxy's and the sensor's), each pinned by digest: the only list of them. The installer pulls and checks the proxy's, the sensor's and the one of its agent (`--perfil`).
 
 ## `make` commands
 
@@ -609,11 +623,11 @@ The `Makefile` is the normal way to use backtide today. Run `make help` for the 
 | `make web-demo` | Web view on the Mac, no VM, with invented data. Cannot really rewind |
 | `make probar` | **Terminal 1.** Real run: the real agent thinking with a real model through the proxy. **It costs money.** Options below |
 | `make probar-web` | Real run: the web with Settings, approve and rewind on (`--ajustes --aprobar --rebobinar`), port 8766 |
-| `make probar-pedir MSG="…"` | Real run: send one message to the agent and print its answer |
+| `make probar-pedir MSG="…"` | Real run: send one message to the agent and print its answer. It is `backtide tarea`, for either profile |
 | `make probar-instantaneas` | Real run: list the snapshots |
 | `make probar-rebobinar ID=<id>` | Real run: rewind. `SI=1` skips the question |
-| `make probar-entrar` | Claude Code profile: open it in your terminal. `CONTINUAR=1` continues the last conversation |
-| `make probar-tarea MSG="…"` | Claude Code profile: one task and its answer. `CONTINUAR=1` continues |
+| `make probar-entrar` | Claude Code profile: open it in your terminal (`backtide entrar`). `CONTINUAR=1` continues the last conversation |
+| `make probar-tarea MSG="…"` | Real run: one task and its answer (`backtide tarea`). `CONTINUAR=1` continues |
 | `make probar-importar RUTA=…` | Claude Code profile: copy a VM folder in. `REEMPLAZAR=1` writes over, `SECRETOS=1` includes secrets |
 | `make probar-exportar RUTA=…` | Claude Code profile: copy the work out to a new VM folder. `GIT=<folder>` exports only the commits as a bundle, `CONFIG=1` includes `.claude/`, `.mcp.json`, `.vscode/`… |
 | `make probar-parar` | Real run: stop everything, unmount, delete the volume and the key you set in Settings |

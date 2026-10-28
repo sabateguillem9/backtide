@@ -10,6 +10,7 @@ import pytest
 from backtide.jail import IMAGE as OPENCLAW_IMAGE
 from backtide.jail import proxy_config
 from backtide.jail import sensor as sensor_jail
+from backtide.jail.profiles import CLAUDE_CODE
 from backtide.setup import images, manifest, packages
 from backtide.setup.host import Ran
 from backtide.setup.images import ImageError
@@ -21,10 +22,27 @@ from backtide.setup.manifest import Manifest, ManifestError
 def test_the_three_images_come_from_their_modules_and_are_pinned() -> None:
     refs = [image.ref for image in images.pinned()]
     assert refs == [OPENCLAW_IMAGE, proxy_config.IMAGE, sensor_jail.IMAGE]
-    for image in images.pinned():
+    for image in images.every():
         assert image.digest.startswith("sha256:") and len(image.digest) == 71
         assert "@" not in image.repo and ":" not in image.repo.rsplit("/", 1)[-1]
-    assert images.listing().count("@sha256:") == 3
+    assert images.listing().count("@sha256:") == 4  # both agents, the proxy and the sensor
+
+
+def test_claude_code_pulls_its_own_agent_and_the_same_two_others() -> None:
+    """D27: `backtide instalar --perfil claude-code` pulls Claude Code's pinned image (its
+    profile's, by digest), never OpenClaw's."""
+    refs = [image.ref for image in images.pinned("claude-code")]
+    assert refs == [CLAUDE_CODE.image, proxy_config.IMAGE, sensor_jail.IMAGE]
+    assert images.pinned("custom") == images.pinned()[1:]  # its image is the owner's own
+
+
+def test_the_sizes_read_as_the_person_reads_them() -> None:
+    assert images.size_text(382) == "382 MiB"
+    assert images.size_text(4813) == "4,7 GiB"
+    openclaw = [image.ref for image in images.pinned()]
+    assert images.approx_total(openclaw) == "5,4 GiB"
+    assert images.approx_total([image.ref for image in images.pinned("claude-code")]) == "3,4 GiB"
+    assert images.approx_total(["someone/else@sha256:" + "0" * 64]) == "0 MiB"
 
 
 class Docker:
@@ -46,7 +64,7 @@ class Docker:
         ref = argv[-1]
         if ref not in self.have:
             return Ran(1, "", "No such image")
-        image = next(i for i in images.pinned() if i.ref == ref)
+        image = next(i for i in images.every() if i.ref == ref)
         digest = "sha256:" + "0" * 64 if self.wrong_digest else image.digest
         return Ran(0, json.dumps([f"{image.repo}@{digest}"]), "")
 

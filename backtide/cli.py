@@ -387,9 +387,9 @@ def _add_check(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     images = commands.add_parser(
         "imagenes",
         help="lista las imágenes que usa esta versión, fijadas por digest",
-        description="Imprime las imágenes de Docker que esta versión de backtide usa (el agente, "
-        "el proxy y el sensor), cada una fijada por su digest. Es la única lista: el instalador "
-        "descarga estas y comprueba el digest.",
+        description="Imprime las imágenes de Docker que esta versión de backtide usa (cada "
+        "agente, el proxy y el sensor), cada una fijada por su digest. Es la única lista: el "
+        "instalador descarga de ellas las de su agente (--perfil) y comprueba el digest.",
     )
     images.set_defaults(handler=_images)
 
@@ -401,12 +401,24 @@ def _add_check(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "unidades, arranca el servicio y su web, y prueba que todo funciona. Se puede ejecutar "
         "otra vez sin romper nada: solo hace lo que falte. Las claves nunca van en un argumento: "
         "--clave-archivo dice dónde leerla, --clave-stdin la lee de la entrada estándar y, con "
-        "terminal, se pide sin eco. Hace falta root. Sale con 0 si queda instalado y probado, 1 si "
-        "se paró (dice dónde y cómo seguir) y 2 si hay un error de uso.",
+        "terminal, se pide sin eco; el token de Telegram (--telegram), igual. Con --clave-stdin "
+        "y --telegram-token-stdin a la vez, la clave va en la primera línea y el token en la "
+        "segunda. El agente es OpenClaw, o Claude Code con --perfil claude-code; para cambiarlo, "
+        "desinstala antes. Hace falta root. Sale con 0 si queda instalado y probado, 1 si se paró "
+        "(dice dónde y cómo seguir) y 2 si hay un error de uso.",
     )
     install.add_argument("--si", action="store_true", help="contesta que sí a todas las preguntas")
     install.add_argument(
         "--dry-run", action="store_true", help="enseña lo que haría y no cambia nada"
+    )
+    install.add_argument(  # install.sh's check before it switches the release (D27)
+        "--solo-comprobar", action="store_true", help=argparse.SUPPRESS
+    )
+    install.add_argument(
+        "--perfil",
+        choices=("openclaw", "claude-code"),  # backtide.setup.install.PROFILES
+        help="el agente que va en la jaula: openclaw (por defecto) o claude-code; una vez "
+        "instalado se queda el suyo",
     )
     install.add_argument(
         "--proveedor",
@@ -427,7 +439,31 @@ def _add_check(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     keys.add_argument(
         "--sin-clave",
         action="store_true",
-        help="no pide la clave: la pondrás después en la página Ajustes de la web",
+        help="no pide la clave: la pondrás después en la web (`sudo backtide enlace`), "
+        "Ajustes > Modelos",
+    )
+    install.add_argument(
+        "--telegram",
+        action="store_true",
+        help="pone el bot de Telegram: pide su token sin eco y tu chat (sin esto, se pone "
+        "después en la web, Ajustes > Avisos)",
+    )
+    tokens = install.add_mutually_exclusive_group()
+    tokens.add_argument(
+        "--telegram-token-archivo",
+        type=Path,
+        metavar="RUTA",
+        help="con --telegram, lee el token del bot de este archivo (una línea); bórralo después",
+    )
+    tokens.add_argument(
+        "--telegram-token-stdin",
+        action="store_true",
+        help="con --telegram, lee el token del bot de la entrada estándar",
+    )
+    install.add_argument(
+        "--telegram-chat",
+        metavar="NUMERO",
+        help="con --telegram, el número de tu chat privado con el bot (si no, se pregunta)",
     )
     install.add_argument("--tope-diario", metavar="DOLARES", help="tope de gasto diario (5)")
     install.add_argument("--tope-mensual", metavar="DOLARES", help="tope de gasto mensual (50)")
@@ -528,6 +564,15 @@ def _install(args: argparse.Namespace) -> int:
     if not 1 <= args.volumen_gib <= 4096:
         _error("--volumen-gib va de 1 a 4096")
         return EXIT_ERROR
+    if args.perfil == "claude-code" and args.proveedor != "anthropic":
+        _error("Claude Code solo habla con la API de Anthropic: --proveedor anthropic")
+        return EXIT_ERROR
+    telegram = bool(
+        args.telegram
+        or args.telegram_token_archivo is not None
+        or args.telegram_token_stdin
+        or args.telegram_chat is not None
+    )
     options = install.Options(
         yes=args.si,
         dry_run=args.dry_run,
@@ -540,6 +585,11 @@ def _install(args: argparse.Namespace) -> int:
         timezone=args.zona_horaria,
         subnets=args.subredes,
         volume_size=args.volumen_gib * layout.GIB,
+        profile=args.perfil,
+        telegram=telegram,
+        telegram_token_file=args.telegram_token_archivo,
+        telegram_token_stdin=args.telegram_token_stdin,
+        telegram_chat=args.telegram_chat,
     )
     host = SystemHost()
     installer = install.Installer(
@@ -551,6 +601,13 @@ def _install(args: argparse.Namespace) -> int:
         self_test=lambda config: selftest.run_selftest(config, host, run=host_run),
         release=Path(__file__).resolve().parents[1],
     )
+    if args.solo_comprobar:
+        try:
+            installer.check_options()
+        except install.InstallError as error:
+            _error(f"la instalación se ha parado: {error}")
+            return EXIT_FAILED
+        return EXIT_OK
     try:
         installer.install()
     except install.InstallError as error:

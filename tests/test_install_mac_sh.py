@@ -318,8 +318,9 @@ def test_it_is_valid_posix_sh_and_short_enough_to_read() -> None:
         subprocess.run([shell, "-n", str(SCRIPT)], check=True)
     assert TEXT.startswith("#!/bin/sh\n")
     assert "\nset -eu\n" in TEXT
-    # Half of it is the `backtide` it leaves on the Mac, with its uninstall (T13-4).
-    assert len(TEXT.splitlines()) <= 450
+    # Half of it is the `backtide` it leaves on the Mac, with its uninstall (T13-4); Telegram in
+    # the installer (D27) took it a little past 450.
+    assert len(TEXT.splitlines()) <= 475
 
 
 def test_lima_is_pinned_by_version_and_hash_and_checked_before_it_is_unpacked() -> None:
@@ -1266,3 +1267,93 @@ def test_never_says_uninstalled_when_it_could_not_look_inside(mac: Mac, wrapper:
     done = _wrap(mac, wrapper, "desinstalar", "--si")
     assert done.returncode == 1 and "no se ha desinstalado nada" in done.stderr
     assert "está desinstalado" not in done.stdout and wrapper.exists()
+
+
+# -- Telegram and the agent (D27) ----------------------------------------------------------------
+
+TOKEN = "987654321:" + "Inventado" * 4  # made up here; the shape of a bot token, nobody's
+
+
+def _token_file(mac: Mac) -> Path:
+    path = mac.root / "token.txt"
+    path.write_text(TOKEN + "\n")
+    path.chmod(0o600)
+    return path
+
+
+def test_the_key_then_the_token_reach_the_vm_through_stdin(mac: Mac) -> None:
+    key_file = mac.root / "key.txt"
+    key_file.write_text(KEY)  # no final newline: each still gets a line of its own
+    done = mac.install("--clave-archivo", str(key_file), "--telegram-token-archivo",
+                       str(_token_file(mac)), "--telegram-chat", "424242",
+                       "--perfil", "claude-code")  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    call = _install_call(mac)
+    assert call["stdin"] == f"{KEY}\n{TOKEN}\n"
+    argv = call["argv"]
+    for flag in ("--clave-stdin", "--telegram", "--telegram-token-stdin", "--perfil"):
+        assert flag in argv, flag
+    assert argv[argv.index("--telegram-chat") + 1] == "424242"
+    assert argv[argv.index("--perfil") + 1] == "claude-code"  # passed on as it is
+    for c in mac.calls():
+        assert TOKEN not in json.dumps(c.get("argv", c)) and KEY not in json.dumps(c.get("argv"))
+    for path in mac.root.rglob("*"):
+        if path.is_file() and path.name not in ("calls.jsonl", "key.txt", "token.txt"):
+            assert TOKEN.encode() not in path.read_bytes(), path
+    assert TOKEN not in done.stdout + done.stderr
+    assert "puesto, los avisos te llegan al bot" in done.stdout
+
+
+def test_the_token_alone_goes_through_stdin(mac: Mac) -> None:
+    done = mac.install("--sin-clave", "--telegram-token-archivo", str(_token_file(mac)),
+                       "--telegram-chat", "424242")  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    call = _install_call(mac)
+    assert call["stdin"] == TOKEN + "\n"
+    assert "--sin-clave" in call["argv"] and "--telegram-token-stdin" in call["argv"]
+
+
+def test_without_telegram_the_end_says_where_to_put_it(mac: Mac) -> None:
+    done = mac.install("--sin-clave")
+    assert done.returncode == 0, done.stderr
+    assert "Ajustes > Avisos" in done.stdout and "backtide enlace" in done.stdout
+    assert not {"--telegram", "--telegram-token-stdin"} & set(_install_call(mac)["argv"])
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--telegram"], "--telegram-token-archivo RUTA y --telegram-chat"),
+        (["--telegram-chat", "424242"], "--telegram-token-archivo RUTA y --telegram-chat"),
+        (["--telegram-token-stdin"], "--telegram-token-archivo RUTA, o se pide"),
+        (["--telegram-chat", "-100123"], "positivo, solo cifras"),
+        (["--telegram-token-archivo", "/no/such/token"], "no se puede leer el archivo del token"),
+    ],
+)
+def test_telegram_without_what_it_needs_stops_before_any_change(
+    mac: Mac, args: list[str], message: str
+) -> None:
+    done = mac.install("--sin-clave", *args)
+    assert done.returncode == 1 and message in done.stderr
+    _nothing_made(mac)
+
+
+def test_uninstall_takes_no_telegram_option(mac: Mac) -> None:
+    done = mac.run("--desinstalar", "--telegram")
+    assert done.returncode == 1 and "--desinstalar solo admite" in done.stderr
+
+
+def test_a_typed_token_goes_through_stdin_without_echo_and_the_chat_is_asked(mac: Mac) -> None:
+    code, out, (tty, echo_on) = _on_a_terminal(
+        mac, mac.script, "--desde", str(mac.archive), "--sha256", mac.sha, "--si", "--telegram",
+        before=((b"Clave de anthropic", (KEY + "\n").encode()),
+                (b"Token del bot de Telegram", (TOKEN + "\n").encode())),
+        prompt=b"chat privado con el bot", typed=b"424242\n",
+    )  # fmt: skip
+    assert code == 0, out
+    assert TOKEN.encode() not in tty and KEY.encode() not in tty  # neither is echoed
+    assert b"424242" in tty  # the chat id is no secret
+    assert TOKEN not in out and echo_on
+    call = _install_call(mac)
+    assert call["stdin"] == f"{KEY}\n{TOKEN}\n"
+    assert call["argv"][call["argv"].index("--telegram-chat") + 1] == "424242"

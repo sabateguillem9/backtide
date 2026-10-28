@@ -138,3 +138,21 @@ def test_a_link_in_the_webs_journal_is_seen() -> None:
     printed = "Puesto de vigilancia listo, solo en este ordenador. Ejecución: pino-faro-brisa."
     assert not selftest.link_in_journal(printed)
     assert selftest.link_in_journal("  http://127.0.0.1:8765/s/AbCd/?t=TTTT\n")
+
+
+def test_the_health_probe_is_judged_as_the_service_judges_it() -> None:
+    """D27: Claude Code's probe is `claude --version`, and only the pinned version is healthy
+    (the service's own reading, jail/agent.py); OpenClaw's answers by its exit code."""
+    import subprocess
+
+    from backtide.jail.profiles import CLAUDE_CODE, OPENCLAW
+    from backtide.jail.profiles.claude_code import CLAUDE_CODE_VERSION
+
+    def done(code: int, out: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], code, out, "")
+
+    assert selftest.probe_answers(CLAUDE_CODE, done(0, f"{CLAUDE_CODE_VERSION} (Claude Code)\n"))
+    assert not selftest.probe_answers(CLAUDE_CODE, done(0, "2.0.1 (Claude Code)\n"))
+    assert not selftest.probe_answers(CLAUDE_CODE, done(1, f"{CLAUDE_CODE_VERSION} (Claude Code)"))
+    assert selftest.probe_answers(OPENCLAW, done(0, '{"ok":true}'))
+    assert not selftest.probe_answers(OPENCLAW, done(7, ""))

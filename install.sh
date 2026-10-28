@@ -4,7 +4,8 @@
 #   curl -fsSL <url>/install.sh -o install.sh && less install.sh && sudo sh install.sh
 #
 # What it does, and nothing else:
-#   1. checks it runs as root on Ubuntu 24.04/26.04 or Fedora 43/44, x86_64 or aarch64;
+#   1. checks it runs as root on Ubuntu 24.04/26.04 or Fedora 43/44, x86_64 or aarch64 (tested so
+#      far: Fedora 44 and Ubuntu 24.04 on aarch64; the others are accepted and said untested);
 #   2. gets the release (the one this script names, or --desde ARCHIVE --sha256 HEX), checks its
 #      sha256 and, before writing anything, that its requirements.txt pins every dependency with
 #      == and its sha256 (and holds nothing else: no options, URLs, paths or editables);
@@ -16,8 +17,9 @@
 #   5. hands over to `backtide instalar`, which does the rest step by step, asks before it
 #      touches anything that is not backtide's, and can be run again safely.
 # A release is made with `make release` (scripts/release/); a plain `git archive` is refused.
-# Every other argument goes to `backtide instalar` (see `backtide instalar --help`). Keys never
-# go in an argument: use --clave-archivo FILE, --clave-stdin, or type it when asked.
+# Every other argument goes to `backtide instalar` (see `backtide instalar --help`), such as
+# --perfil claude-code or --telegram. Keys never go in an argument: use --clave-archivo FILE,
+# --clave-stdin, or type it when asked.
 set -eu
 
 # On a Mac, backtide lives in a Linux VM of its own: install-mac.sh, next to this file, makes it.
@@ -101,8 +103,9 @@ done
 backtide is a PREVIEW, with no human security audit yet.
   - Use a model key with a spending limit, never a production key.
   - A rewind does not bring back what already left the machine, and calls to the model are never held.
-  - Supported: Linux (Fedora, Ubuntu) and Macs with Apple Silicon. On Fedora with kernel 7.1+ the
-    process sensor does not start (D24).
+  - Tested: Fedora 44 and Ubuntu 24.04 on arm64 (aarch64), and Macs with Apple Silicon. Fedora 43,
+    Ubuntu 26.04 and x86_64 are accepted but untested. On Fedora with kernel 7.1+ the process
+    sensor does not start (D24).
   - To remove it: sudo backtide desinstalar (keeps your data; --borrar-datos removes everything).
 EOF
 [ "$(id -u)" = 0 ] || die "hace falta root: sudo sh install.sh"
@@ -110,11 +113,13 @@ clean_env
 [ -r /etc/os-release ] || die "no se puede leer /etc/os-release"
 DISTRO=$(. /etc/os-release && printf '%s %s' "$ID" "$VERSION_ID")
 case "$DISTRO" in
-  "ubuntu 24.04" | "ubuntu 26.04" | "fedora 43" | "fedora 44") ;;
+  "ubuntu 24.04" | "fedora 44") ;;
+  "ubuntu 26.04" | "fedora 43") say "$DISTRO se admite pero aún no se ha probado (solo Fedora 44 y Ubuntu 24.04)" ;;
   *) die "$DISTRO no es una de las que admite backtide (Ubuntu 24.04 o 26.04, Fedora 43 o 44)" ;;
 esac
 case "$(uname -m)" in
-  x86_64) UV_TRIPLE=x86_64-unknown-linux-gnu; UV_SHA256=$UV_SHA256_X86_64 ;;
+  x86_64) UV_TRIPLE=x86_64-unknown-linux-gnu; UV_SHA256=$UV_SHA256_X86_64
+    say "x86_64 se admite pero aún no se ha probado (solo aarch64)" ;;
   aarch64) UV_TRIPLE=aarch64-unknown-linux-gnu; UV_SHA256=$UV_SHA256_AARCH64 ;;
   *) die "arquitectura $(uname -m) no admitida: x86_64 o aarch64" ;;
 esac
@@ -197,6 +202,9 @@ chmod -R go-w "$OPT"
 # SELinux: what came from the temporary folder keeps its label there (user_tmp_t), and systemd
 # may not run it (seen in Fedora 44, T13-3). Give everything /opt's own labels.
 if command -v restorecon >/dev/null 2>&1; then restorecon -RF "$OPT"; fi
+# What this run would refuse (another agent, --telegram without its token...) stops it here,
+# before the version in use changes.
+"$RELEASE/.venv/bin/backtide" instalar --solo-comprobar "$@" < /dev/null || die "no se ha cambiado la versión en uso"
 ln -sfn "releases/$(basename "$RELEASE")" "$OPT/current.tmp"
 mv -T "$OPT/current.tmp" "$OPT/current"
 

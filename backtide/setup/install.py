@@ -21,11 +21,12 @@ In order:
 7. ``confinement``: SELinux or AppArmor again, now that Docker is there. With SELinux enforcing
    and a Docker that does not use it, with permission (D25): ``live-restore`` first (a reload,
    nothing restarts), then ``selinux-enabled`` and one restart of Docker.
-8. ``images``: the three pinned images, by digest (backtide.setup.images).
+8. ``images``: the three pinned images of its profile, by digest (backtide.setup.images).
 9. ``volume``: the image (never one that exists), its Btrfs (never over another filesystem) and
    the mount point (backtide.setup.volume).
-10. ``config``: ``backtide.toml`` (only if there is none), ``web.toml``, the Gateway's token, the
-    model's key (backtide.setup.secrets) and the black box's file, readable by the web's group.
+10. ``config``: ``backtide.toml`` (only if there is none), ``web.toml``, the Gateway's token
+    (OpenClaw's), the model's key (backtide.setup.secrets), ``telegram.toml`` with
+    ``--telegram`` and the black box's file, readable by the web's group.
 11. ``program``: ``/usr/local/bin/backtide``.
 12. ``networks``: the agent's and the egress network, each with a free subnet
     (backtide.setup.networks).
@@ -37,7 +38,14 @@ In order:
 16. ``selftest``: `backtide comprobar --despues-de-instalar` (backtide.setup.selftest).
 
 Nothing of a key goes into an argument, an environment variable or a message: the key comes from
-a file, stdin or the terminal without echo, and goes to a 0600 file.
+a file, stdin or the terminal without echo, and goes to a 0600 file. The Telegram bot's token
+too (``--telegram``, D27); without it Telegram is left for the web's Settings page.
+
+The agent (D27): OpenClaw by default, or Claude Code with ``--perfil claude-code``. Its profile
+decides the agent's image, the ``[agent]`` and ``[proxy]`` of the first ``backtide.toml`` and
+whether there is a Gateway token. A machine keeps the agent it was installed with: a run with
+another ``--perfil`` stops before any change (uninstall first: the data stays, and the next
+install starts that agent on it; ``_choose_profile``).
 """
 
 import errno
@@ -46,6 +54,7 @@ import os
 import stat
 import sys
 import time
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields, replace
 from decimal import Decimal
@@ -55,8 +64,18 @@ from typing import BinaryIO, Protocol
 from backtide.blackbox import BlackBoxError, create_key
 from backtide.jail.config import network_create_argv as agent_network_argv
 from backtide.jail.docker import sanitize
+from backtide.jail.profiles import NAMED
 from backtide.jail.proxy_config import network_create_argv as egress_network_argv
-from backtide.service.config import STATE_CHECKPOINT, STATE_KEY, ConfigError, ServiceConfig
+from backtide.notify.telegram_api import DEFAULT_API_BASE
+from backtide.service.config import (
+    STATE_CHECKPOINT,
+    STATE_KEY,
+    ConfigError,
+    Secret,
+    ServiceConfig,
+)
+from backtide.service.settings import TELEGRAM, check_chat_id, check_value
+from backtide.service.telegram_config import STATE_TELEGRAM, TelegramSettings, load_telegram
 from backtide.setup import (
     containers,
     images,
@@ -74,6 +93,19 @@ from backtide.setup.manifest import Manifest
 from backtide.setup.preflight import Check, Status
 
 PROVIDERS = ("anthropic", "openai")
+# The agents `backtide instalar --perfil` installs (D27), with the name the person reads.
+OPENCLAW, CLAUDE_CODE = "openclaw", "claude-code"
+PROFILES = (OPENCLAW, CLAUDE_CODE)
+AGENT_NAMES = {OPENCLAW: "OpenClaw", CLAUDE_CODE: "Claude Code"}
+# Where the installed web is opened and where in its Settings each thing goes (T12c).
+OPEN_WEB = "`sudo backtide enlace` da el enlace de la web"
+KEY_PLACE = "la web, Ajustes > Modelos"
+TELEGRAM_PLACE = "la web, Ajustes > Avisos"
+MAX_CONFIG_BYTES = 256 * 1024
+CHAT_REFUSED = (
+    "el chat de Telegram tiene que ser el número de tu chat privado con el bot (positivo, solo "
+    "cifras): no se ha guardado nada de Telegram."
+)
 # The models OpenClaw uses with Anthropic, as `make probar` lists them: the main one and the
 # "utility" one it asks small things at the start of a turn (scripts/demo/probar.py).
 ANTHROPIC_MODELS = ("claude-sonnet-5-5", "claude-haiku-4-5")
@@ -88,6 +120,40 @@ SAVED_CONFIG = "backtide.toml.guardado"
 
 class InstallError(Exception):
     """The installation stopped: the message says what failed and how to go on (in Spanish)."""
+
+
+def agent_name(profile: str) -> str:
+    return AGENT_NAMES.get(profile, f"el perfil {profile}")
+
+
+def profile_of(text: str) -> str | None:
+    """The ``[agent] profile`` a ``backtide.toml`` names (OpenClaw when it names none), or None
+    if it is not TOML or the profile is not a plain name."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    agent = data.get("agent", {})
+    profile = agent.get("profile", OPENCLAW) if isinstance(agent, dict) else OPENCLAW
+    if not isinstance(profile, str) or not profile.replace("-", "").isalnum():
+        return None
+    return profile
+
+
+def untested(distro: packages.Distro | None, machine: str) -> list[str]:
+    """What this machine has that nobody has tried backtide on yet (docs/44): accepted, said."""
+    notes = []
+    if distro is not None and distro.supported and not distro.tested:
+        notes.append(
+            f"{distro.pretty} se admite pero aún no se ha probado: solo Fedora 44 y Ubuntu 24.04 "
+            "lo están. Debería ir; si algo falla, avísanos."
+        )
+    if machine not in packages.TESTED_ARCHITECTURES:
+        notes.append(
+            f"la arquitectura {sanitize(machine, 40)} se admite pero aún no se ha probado: solo "
+            "aarch64 (arm64) lo está. Debería ir; si algo falla, avísanos."
+        )
+    return notes
 
 
 @dataclass(frozen=True)
@@ -155,6 +221,7 @@ class Prompter(Protocol):
     def say(self, text: str) -> None: ...
     def confirm(self, question: str) -> bool: ...
     def secret(self, prompt: str) -> str: ...
+    def answer(self, question: str) -> str: ...
 
 
 @dataclass
@@ -170,6 +237,11 @@ class Options:
     timezone: str | None = None
     subnets: str | None = None
     volume_size: int = layout.VOLUME_SIZE
+    profile: str | None = None  # --perfil; None: the installed one, or OpenClaw
+    telegram: bool = False  # --telegram: the bot's token (never in argv) and the owner's chat
+    telegram_token_file: Path | None = None
+    telegram_token_stdin: bool = False
+    telegram_chat: str | None = None  # --telegram-chat: a chat id, not a secret
 
 
 @dataclass(frozen=True)
@@ -195,8 +267,11 @@ class Installer:
     clock: Callable[[], float] = time.monotonic
     release: Path | None = None
     manifest: Manifest = field(default_factory=Manifest)
+    profile: str = OPENCLAW  # the agent of this run (_choose_profile)
     _manifest_ready: bool = False
     _units_changed: bool = False
+    _restart_service: bool = False  # the service reads something new only when it starts
+    _stdin_values: dict[str, str] | None = None
     _warnings: list[str] = field(default_factory=list)
 
     # -- the whole run ----------------------------------------------------------------------------
@@ -226,6 +301,7 @@ class Installer:
         if self.options.dry_run:
             self.dry_run()
             return []
+        self.check_options()
         for step in self.steps():
             self.prompter.say(f"\n== {step.title}")
             step.action()
@@ -238,7 +314,14 @@ class Installer:
     def dry_run(self) -> None:
         checks = preflight.run_checks(self.host, installing=True)
         self.prompter.say(preflight.report(checks))
+        try:
+            self._choose_profile()
+            self._check_telegram_options()
+        except InstallError as error:
+            self.prompter.say(f"\nLa instalación se pararía aquí: {error}")
+            return
         self.prompter.say("\nCon --dry-run no se cambia nada. Esto es lo que haría la instalación:")
+        self.prompter.say(f"  Agente: {self._agent_name()}.")
         for number, step in enumerate(self.steps(), 1):
             self.prompter.say(f"  {number:2}. {step.title}")
         nocow = self._host_is_btrfs()
@@ -246,20 +329,26 @@ class Installer:
             self.paths.volume_image, self.paths.volume_mount, self.options.volume_size, nocow=nocow
         ):
             self.prompter.say(f"      - {line.describe}")
-        for image in images.pinned():
+        for image in images.pinned(self.profile):
             self.prompter.say(f"      - {image.ref} ({image.role}, {image.approx_size})")
 
     def summary(self) -> None:
         say = self.prompter.say
-        say("\nbacktide está instalado y vigilando al agente.")
+        say(f"\nbacktide está instalado y vigilando al agente ({self._agent_name()}).")
         say("  - La web, solo en este ordenador: `sudo backtide enlace` da su enlace de un uso.")
         say("    En un servidor remoto, el mismo comando dice cómo llegar con `ssh -L`.")
+        if self.profile == CLAUDE_CODE:
+            say('  - Claude Code: `sudo backtide tarea "..."` le da una tarea y `sudo backtide '
+                'entrar` abre una sesión en tu terminal, los dos dentro de la jaula.')  # fmt: skip
         say("  - El estado: `sudo backtide comprobar --despues-de-instalar` y "
             f"`systemctl status {layout.SERVICE_UNIT}`.")  # fmt: skip
         key = self.paths.keys_dir / f"{self.options.provider}.key"
         if not os.path.lexists(key):
-            say("  - Falta la clave del modelo: ponla en la página Ajustes de la web, o vuelve a "
-                "ejecutar el instalador con --clave-archivo <ruta>.")  # fmt: skip
+            say(f"  - Falta la clave del modelo: {OPEN_WEB}; ábrela y ponla en Ajustes > Modelos. "
+                "O vuelve a ejecutar el instalador con --clave-archivo <ruta>.")  # fmt: skip
+        if not os.path.lexists(self.paths.state_dir / STATE_TELEGRAM):
+            say(f"  - Telegram (opcional): {OPEN_WEB}; ábrela y ponlo en Ajustes > Avisos. O "
+                "vuelve a ejecutar el instalador con --telegram.")  # fmt: skip
         say("  - Para quitarlo: `sudo backtide desinstalar` (conserva la caja negra, el trabajo "
             "del agente y las claves; con --borrar-datos, todo).")  # fmt: skip
         if self._warnings:
@@ -281,6 +370,9 @@ class Installer:
         self.prompter.say(preflight.report(checks))
         if preflight.failed(checks):
             raise InstallError("la máquina no sirve todavía: arregla los fallos de arriba.")
+        for note in untested(distro, self.host.machine()):
+            self.prompter.say(f"Aviso: {note}")
+            self._warnings.append(note)
         for check in checks:
             if check.status is Status.WARN and check.key in ("btf", "kernel", "clock", "space"):
                 self._warnings.append(check.summary)
@@ -292,6 +384,7 @@ class Installer:
             self.manifest.add("dirs", self.paths.state_dir)
         if self.release is not None:
             self.manifest.facts["release"] = str(self.release)
+        self.manifest.facts["profile"] = self.profile
         self._manifest_ready = True
         self._save()
 
@@ -397,7 +490,10 @@ class Installer:
         self.prompter.say(again["confinement"].summary)
 
     def images(self) -> None:
-        for image in images.pinned():
+        if self.profile not in images.AGENTS:
+            self.prompter.say(f"El agente de la configuración (perfil {self.profile}) no lo "
+                              "descarga el instalador: tiene que estar ya en Docker.")  # fmt: skip
+        for image in images.pinned(self.profile):
             if images.is_present(image, run=self.run):
                 self.prompter.say(f"Ya está: {image.ref}")
                 continue
@@ -447,6 +543,9 @@ class Installer:
             self.prompter.say(f"{self.paths.config_file} ya existe: se conserva tal cual.")
         else:
             text = self._saved_config(saved)
+            if text is not None and profile_of(text) != self.profile:
+                self._put_aside(saved, text)
+                text = None
             if text is not None:
                 self.prompter.say(f"Se recupera la configuración que guardó la desinstalación "
                                   f"({saved}).")  # fmt: skip
@@ -458,11 +557,12 @@ class Installer:
         self._write(self.paths.web_config_file, self.render_web_config(), layout.WEB_CONFIG_MODE,
                     (root_uid, gid))  # fmt: skip
         self.manifest.add("files", self.paths.web_config_file)
-        if not os.path.lexists(self.paths.gateway_token):
+        if self._needs_gateway_token() and not os.path.lexists(self.paths.gateway_token):
             self._secret(self.paths.state_dir, self.paths.gateway_token.name, secrets.new_token(),
                          private_dir=False)  # fmt: skip
             self.manifest.add("files", self.paths.gateway_token)
         self._model_key()
+        self._telegram()
         self._blackbox_for_the_web(gid)
         try:
             ServiceConfig.from_file(self.paths.config_file)
@@ -572,11 +672,13 @@ class Installer:
         for unit in (layout.SERVICE_UNIT, layout.WEB_UNIT):
             self._check(("systemctl", "enable", unit), f"no se pudo habilitar {unit}")
             active = self.run(("systemctl", "is-active", "--quiet", unit))
+            restart = self._restart_service and unit == layout.SERVICE_UNIT
             if (
                 active is not None
                 and active.returncode == 0
                 and not self._units_changed
                 and not new_release
+                and not restart
             ):
                 self.prompter.say(f"{unit} ya está en marcha.")
                 continue
@@ -587,6 +689,112 @@ class Installer:
             )
         if self.release is not None:
             self.manifest.facts["release_started"] = str(self.release)
+
+    def check_options(self) -> None:
+        """What this run would refuse before any step: another agent over an install, Claude
+        Code with OpenAI, --telegram without its token or chat and no terminal. install.sh runs
+        it (``--solo-comprobar``) before it points /opt/backtide/current at a new release, so a
+        refused run leaves the version in use as it was (review of D27, finding 1)."""
+        self._choose_profile()
+        self._check_telegram_options()
+
+    def _choose_profile(self) -> None:
+        """The agent of this run (D27). A machine keeps the one it was installed with: another
+        ``--perfil`` stops here, before any change. After `backtide desinstalar` (the data and
+        the config kept) the saved config's agent comes back, unless another one is asked for:
+        then that config is put aside (``config``) and the new agent starts on the same data."""
+        asked = self.options.profile
+        if asked is not None and asked not in PROFILES:
+            raise InstallError(f"no hay un agente {asked!r}: {' o '.join(PROFILES)}")
+        installed = self._installed_profile()
+        if installed is not None and asked is not None and asked != installed:
+            raise InstallError(
+                f"backtide ya está instalado aquí con {agent_name(installed)} "
+                f"({self.paths.config_file}): no se cambia de agente sobre una instalación. Para "
+                f"pasar a {agent_name(asked)}, desinstala antes (`sudo backtide desinstalar`: "
+                "conserva la caja negra, el trabajo del agente y las claves) y vuelve a instalar "
+                f"con --perfil {asked}. No se ha tocado nada."
+            )
+        saved = self._saved_config(self.paths.state_dir / SAVED_CONFIG)
+        if installed is None and asked is None and saved is not None:
+            installed = profile_of(saved)
+        self.profile = installed or asked or OPENCLAW
+        if self.profile == CLAUDE_CODE and self.options.provider != "anthropic":
+            raise InstallError(
+                "Claude Code solo habla con la API de Anthropic: su clave es la de anthropic "
+                "(--proveedor anthropic, el de por defecto)."
+            )
+
+    def _installed_profile(self) -> str | None:
+        """The ``[agent] profile`` of the ``backtide.toml`` there is (OpenClaw if it names
+        none), or None without one."""
+        path = self.paths.config_file
+        if not os.path.lexists(path):
+            return None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        except OSError as error:
+            raise InstallError(f"no se puede leer {path}: {error.strerror}") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise InstallError(f"{path} no es un archivo normal: revísalo a mano")
+            text = os.read(fd, MAX_CONFIG_BYTES).decode("utf-8", errors="replace")
+        finally:
+            os.close(fd)
+        found = profile_of(text)
+        if found is None:
+            raise InstallError(f"la configuración no sirve: {path} no es TOML válido, o su "
+                               "[agent] profile no es un nombre")  # fmt: skip
+        return found
+
+    def _put_aside(self, saved: Path, text: str) -> None:
+        """The config `backtide desinstalar` kept is of another agent than the one asked for:
+        kept next to it with that agent's name, never used nor deleted; a new one is written."""
+        old = profile_of(text) or "otro"
+        aside = saved.with_name(f"{SAVED_CONFIG}.{old}")
+        number = 1
+        while True:  # one put aside before is never written over (review of D27, finding 2)
+            try:
+                os.link(saved, aside, follow_symlinks=False)
+                break
+            except FileExistsError:
+                number += 1
+                aside = saved.with_name(f"{SAVED_CONFIG}.{old}.{number}")
+            except OSError as error:
+                raise InstallError(f"no se puede apartar {saved}: {error.strerror}") from None
+        saved.unlink()
+        self.prompter.say(
+            f"La configuración que guardó la desinstalación es de {agent_name(old)}: se aparta "
+            f"a {aside} y se escribe una nueva para {self._agent_name()}. La caja negra, el "
+            "volumen del agente (con el trabajo y las instantáneas de antes) y las claves "
+            "siguen: el agente nuevo arranca sobre ellos."
+        )
+
+    def _check_telegram_options(self) -> None:
+        """With --telegram and no terminal, the token and the chat must come with the run: said
+        before any change, never half way."""
+        options = self.options
+        if options.telegram_chat is not None and not check_chat_id(options.telegram_chat):
+            raise InstallError(CHAT_REFUSED)
+        if not options.telegram or self.prompter.interactive:
+            return
+        if options.telegram_token_file is None and not options.telegram_token_stdin:
+            raise InstallError(
+                "--telegram necesita el token del bot y aquí no hay terminal para pedirlo: "
+                "--telegram-token-archivo <ruta> o --telegram-token-stdin (nunca en un argumento)."
+            )
+        if options.telegram_chat is None:
+            raise InstallError("--telegram necesita tu chat y aquí no hay terminal para pedirlo: "
+                               "--telegram-chat <número>.")  # fmt: skip
+
+    def _needs_gateway_token(self) -> bool:
+        """OpenClaw's Gateway token: only a profile that uses one (or one the installer does not
+        know, such as ``custom``, which may) gets it."""
+        profile = NAMED.get(self.profile)
+        return profile is None or profile.token_env is not None
+
+    def _agent_name(self) -> str:
+        return agent_name(self.profile)
 
     def _saved_config(self, path: Path) -> str | None:
         """The ``backtide.toml`` `backtide desinstalar` kept in the state folder, if it is there
@@ -644,7 +852,8 @@ class Installer:
     # -- pieces -----------------------------------------------------------------------------------
 
     def render_config(self) -> str:
-        """The first ``backtide.toml``: paths, the cap, the budget and the providers. No secret."""
+        """The first ``backtide.toml``: paths, the agent, the cap, the budget and the providers.
+        No secret. Claude Code (D27) picks its own models and only speaks Anthropic's API."""
         options = self.options
         lines = [
             "# backtide's configuration, written by the installer (docs/25). Never a key here:",
@@ -656,6 +865,8 @@ class Installer:
             f"workspace_limit = {options.volume_size // 20}  # 5 % of the volume",
             "",
             "[agent]",
+            "# The agent in the jail: another one needs `backtide desinstalar` first (D27).",
+            f'profile = "{self.profile}"',
             f'memory = "{AGENT_MEMORY}"',
             "",
             "[budget]",
@@ -664,6 +875,17 @@ class Installer:
         ]
         if options.timezone:
             lines.append(f"timezone = {json.dumps(options.timezone)}")  # a TOML string, escaped
+        if self.profile == CLAUDE_CODE:
+            lines += [
+                "",
+                "# Claude Code picks its own models (a main one and a small one): none listed.",
+                "# Its profile lets through the field it sends with every call (diagnostics).",
+                "[[proxy.providers]]",
+                'name = "anthropic"',
+                'kind = "anthropic"',
+                "",
+            ]
+            return "\n".join(lines)
         lines += [
             "",
             "[proxy]",
@@ -694,13 +916,14 @@ class Installer:
         options, name = self.options, f"{self.options.provider}.key"
         key_path = self.paths.keys_dir / name
         value: str | None = None
+        later = f"ponla después en {KEY_PLACE} ({OPEN_WEB})"
         try:
             if options.key_file is not None:
                 value = secrets.from_file(options.key_file)
             elif options.key_stdin:
-                value = secrets.from_stream(self.stdin or sys.stdin.buffer)
+                value = self._from_stdin("key")
             elif options.no_key:
-                self.prompter.say("Sin clave del modelo (--sin-clave): ponla después en Ajustes.")
+                self.prompter.say(f"Sin clave del modelo (--sin-clave): {later}.")
             elif os.path.lexists(key_path):
                 self.prompter.say(f"Ya hay una clave de {options.provider}: se conserva.")
             elif self.prompter.interactive and not options.yes:
@@ -710,10 +933,10 @@ class Installer:
                     reader=self.prompter.secret,
                 )
             else:
-                self.prompter.say(f"Sin clave de {options.provider}: ponla después en Ajustes.")
+                self.prompter.say(f"Sin clave de {options.provider}: {later}.")
         except secrets.SecretError as error:
             if "vacío" in str(error) and options.key_file is None and not options.key_stdin:
-                self.prompter.say("Sin clave por ahora: ponla después en la página Ajustes.")
+                self.prompter.say(f"Sin clave por ahora: {later}.")
                 return
             raise InstallError(str(error)) from None
         if value is None:
@@ -727,6 +950,99 @@ class Installer:
             value = None
         self.prompter.say(f"Clave de {options.provider}: {written.value}.")
         self.manifest.add("files", key_path)
+
+    def _telegram(self) -> None:
+        """``telegram.toml`` with ``--telegram`` (D27), written as the Settings page writes it:
+        the token and the owner's chat, 0600 in the state folder, and the ``api_base`` of a
+        usable file already there kept (the tests' fake Bot API). Without it, nothing changes:
+        a file that is there stays, and Telegram is left for the web."""
+        options, path = self.options, self.paths.state_dir / STATE_TELEGRAM
+        if not options.telegram:
+            if os.path.lexists(path):
+                self.prompter.say("Telegram ya está puesto: se conserva.")
+            else:
+                self.prompter.say(f"Sin Telegram (es opcional): se puede poner después en "
+                                  f"{TELEGRAM_PLACE} ({OPEN_WEB}), o con --telegram.")  # fmt: skip
+            return
+        try:
+            if options.telegram_token_file is not None:
+                token = secrets.from_file(options.telegram_token_file)
+            elif options.telegram_token_stdin:
+                token = self._from_stdin("telegram")
+            else:
+                token = secrets.ask(
+                    "Token del bot de Telegram, el que da BotFather (no se ve al escribirlo): ",
+                    reader=self.prompter.secret,
+                )
+        except secrets.SecretError as error:
+            raise InstallError(f"Telegram: {error}") from None
+        if not check_value(TELEGRAM, token):
+            length = len(token)
+            del token
+            raise InstallError(
+                f"eso no parece un token de bot de Telegram ({length} caracteres; son "
+                "<cifras>:<letras>): no se ha guardado. Cópialo otra vez de BotFather."
+            )
+        chat = self._telegram_chat()
+        api_base = self._telegram_api_base(path)
+        try:
+            TelegramSettings(Secret(token), int(chat), api_base)  # the service's own reading
+        except ConfigError as error:
+            raise InstallError(f"Telegram: {error}") from None
+        lines = [f'token = "{token}"', f"chat_id = {int(chat)}"]
+        del token
+        if api_base != DEFAULT_API_BASE:
+            lines.append(f"api_base = {json.dumps(api_base)}")
+        data = ("\n".join(lines) + "\n").encode()
+        del lines
+        try:
+            written = secrets.write_file(self.paths.state_dir, STATE_TELEGRAM, data,
+                                         private_dir=False)  # fmt: skip
+        except secrets.SecretError as error:
+            raise InstallError(str(error)) from None
+        finally:
+            del data
+        if written is not secrets.Written.UNCHANGED:
+            self._restart_service = True  # the bot reads telegram.toml when the service starts
+        self.prompter.say(f"Telegram (el token y el chat {int(chat)}): {written.value}.")
+        self.manifest.add("files", path)
+
+    def _telegram_chat(self) -> str:
+        chat = self.options.telegram_chat
+        if chat is None:
+            chat = self.prompter.answer(
+                "El número de tu chat privado con el bot (te lo da, por ejemplo, @userinfobot): "
+            ).strip()
+        if not check_chat_id(chat):
+            raise InstallError(CHAT_REFUSED)
+        return chat
+
+    def _telegram_api_base(self, path: Path) -> str:
+        """The ``api_base`` of a usable ``telegram.toml`` already there, or the real Bot API."""
+        if not os.path.lexists(path):
+            return DEFAULT_API_BASE
+        try:
+            current = load_telegram(self.paths.state_dir)
+        except (ConfigError, OSError):
+            return DEFAULT_API_BASE  # unusable: replaced whole, with the real Bot API
+        return current.api_base if current is not None else DEFAULT_API_BASE
+
+    def _from_stdin(self, which: str) -> str:
+        """The model's key (``key``) or the bot's token (``telegram``) from standard input. With
+        both on it, the key is the first line and the token the second; read once, each value
+        handed out once."""
+        if self._stdin_values is None:
+            options = self.options
+            sources = (("key", options.key_stdin), ("telegram", options.telegram_token_stdin))
+            wanted = [name for name, on in sources if on]
+            stream = self.stdin or sys.stdin.buffer
+            if len(wanted) == 1:
+                values = [secrets.from_stream(stream)]
+            else:
+                values = secrets.lines_from_stream(stream, len(wanted))
+            self._stdin_values = dict(zip(wanted, values, strict=True))
+            del values
+        return self._stdin_values.pop(which)
 
     def _secret(self, folder: Path, name: str, value: str, *, private_dir: bool) -> secrets.Written:
         try:

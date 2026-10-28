@@ -31,7 +31,8 @@ def test_it_is_valid_posix_sh_and_short_enough_to_read() -> None:
     assert "\nset -eu\n" in TEXT
     # docs/25 said "unas 100–150 líneas"; T14's check of requirements.txt and the venv without
     # building (about 40 lines) and the review's hardening (about 15) took it past that.
-    assert len(TEXT.splitlines()) <= 210
+    # The check before the version in use changes (review of D27) took it a little past 210.
+    assert len(TEXT.splitlines()) <= 215
 
 
 def test_uv_is_pinned_by_version_and_hash() -> None:
@@ -436,3 +437,29 @@ def test_with_the_real_uv_a_comment_continued_hides_a_line_and_the_check_refuses
     refused = check(tmp_path, requirements)
     assert refused.returncode != 0
     assert "bytes que uv export no escribe" in refused.stderr
+
+
+def test_only_what_was_tried_is_called_tested_and_the_rest_is_said_untested() -> None:
+    """docs/44 and the testers' guide: Fedora 44 and Ubuntu 24.04 on aarch64 are tested; Fedora
+    43, Ubuntu 26.04 and x86_64 are accepted, and the script says they are untested."""
+    notice = TEXT[TEXT.index("backtide is a PREVIEW") :].split("\nEOF\n", 1)[0]
+    assert "Tested: Fedora 44 and Ubuntu 24.04 on arm64" in notice
+    assert "Fedora 43,\n    Ubuntu 26.04 and x86_64 are accepted but untested" in notice
+    distro = TEXT[TEXT.index('case "$DISTRO" in') :].split("\nesac\n", 1)[0]
+    assert '"ubuntu 24.04" | "fedora 44") ;;' in distro
+    assert (
+        '"ubuntu 26.04" | "fedora 43") say "$DISTRO se admite pero aún no se ha probado' in distro
+    )
+    arch = TEXT[TEXT.index('case "$(uname -m)" in') :].split("\nesac\n", 1)[0]
+    assert 'say "x86_64 se admite pero aún no se ha probado (solo aarch64)"' in arch
+    assert "aarch64) UV_TRIPLE" in arch and "se admite" not in arch.split("aarch64)", 1)[1]
+
+
+def test_what_the_run_would_refuse_is_checked_before_the_version_in_use_changes() -> None:
+    """Review of D27, finding 1: another --perfil over an install must not leave the new release
+    in /opt/backtide/current (the service runs from there) when `backtide instalar` refuses."""
+    check = TEXT.index('"$RELEASE/.venv/bin/backtide" instalar --solo-comprobar "$@" < /dev/null')
+    assert TEXT.index('install_release "$RELEASE"') < check < TEXT.index('ln -sfn "releases/')
+    assert TEXT[check:].split("\n", 1)[0].endswith('|| die "no se ha cambiado la versión en uso"')
+    # At column 0, on the script's own path: never inside an if/else that could skip it.
+    assert TEXT[check - 1] == "\n"
