@@ -30,3 +30,6 @@ data/
 
 # Informes internos para el founder (no se publican, D21)
 informes/
+
+# Screenshots of design work: kept locally, not in git
+brand/**/capturas/

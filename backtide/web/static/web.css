@@ -1,4 +1,4 @@
-/* backtide · the lookout post. Tokens from brand/design-system/project/tokens.json: the base
+/* backtide · the lookout post. Tokens from brand/design-system-v1/project/tokens.json: the base
    (paper, ink, the dot, the line) and the app's palette ("app": colour with meaning, T12d).
    Colour is never the only signal: every colour comes with a word, a shape or both. Light by
    default, dark with prefers-color-scheme or the switch (theme.js, web.js). No shadows; the only fade

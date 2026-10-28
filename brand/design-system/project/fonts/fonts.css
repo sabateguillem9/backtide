@@ -1,0 +1,18 @@
+/* backtide · the two typefaces, served from our own files (never Google Fonts: no third
+   party sees who reads the page). Latin subsets, SIL Open Font License 1.1: the licences are
+   lora-OFL.txt and dm-sans-OFL.txt, next to the files. Link this file before bundle.css. */
+@font-face {
+  font-family: "Lora";
+  src: url("lora-latin.woff2") format("woff2");
+  font-weight: 400 700; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "Lora";
+  src: url("lora-italic-latin.woff2") format("woff2");
+  font-weight: 400 700; font-style: italic; font-display: swap;
+}
+@font-face {
+  font-family: "DM Sans";
+  src: url("dm-sans-latin.woff2") format("woff2");
+  font-weight: 100 1000; font-style: normal; font-display: swap;
+}

@@ -48,7 +48,8 @@ from tests.webkit import (
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "backtide" / "web" / "static"
-TOKENS = ROOT / "brand" / "design-system" / "project" / "tokens.json"
+# The product web still follows the first design system until phase 3 of D31.
+TOKENS = ROOT / "brand" / "design-system-v1" / "project" / "tokens.json"
 NOW = START + timedelta(minutes=10)
 HOSTILE = '"><img src=x onerror=alert(1)>‮txt.exe'
 

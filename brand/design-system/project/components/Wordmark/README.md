@@ -1,8 +1,41 @@
 # Wordmark
 
-The name, set in type: `backtide`, always lowercase, Jost Medium with -0.045em tracking.
+The name, set in type: a round dot in `clay-mark`, then `backtide` (or `backtide labs`) in DM Sans 500, lowercase.
 
-- Use it once per page: centered and alone on a landing screen, or small (`wordmark-small`, 22px) as the home link of inner pages.
-- Props: `size` in px (default 64), `tone` `ink` on paper or `paper` on an ink ground.
-- Where the font cannot load (emails, slides, social images), use the outlined SVG from Logos instead.
-- Don't: capitals, other weights, colors, outlines, shadows, or a dot of the i in any shape other than a circle.
+## When to use it
+
+Once per page, as the home link at the top left, and again in the footer. In the product web it is the home link of the header.
+
+## Variants
+
+- default: `body` size, the dot at `size-dot`.
+- `.wordmark--large`: `heading-m` size, the dot at 0.55em. For a cover or a slide.
+- The text may be `backtide` or `backtide labs`; nothing else.
+
+## States
+
+- Hover and focus: none of its own; the focus ring as everywhere.
+
+## Accessibility
+
+- As a link, give it an `aria-label` that says where it goes ("backtide labs, home").
+- The dot is `aria-hidden`.
+
+## Markup
+
+```html
+<a class="wordmark" href="/" aria-label="backtide labs, home">
+  <span class="wordmark__dot" aria-hidden="true"></span><span>backtide labs</span>
+</a>
+```
+
+Styles: `components/bundle.css`, section "Wordmark". Every value is a token.
+
+## In the product web today
+
+`.home` in `base.html`.
+
+## Do not
+
+- No capitals, other weights, colours, outlines or shadows.
+- The dot is always a circle, always clay.

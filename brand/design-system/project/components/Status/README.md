@@ -1,8 +1,39 @@
 # Status
 
-Where a part of the product stands, in one short line: a dot for the state, then how it is solved.
+Where a project stands: its drawing (or a small dot in a ledger) and its word.
 
-- States: `built` (filled `ink` dot, "Built and tested"), `progress` (hollow `ink` dot, "In progress"), `next` (hollow `ink-muted` dot, "Next"). The dot is the brand's one shape, so the states need no icons and no color.
-- Props: `state`, `label` (replaces the state's words, e.g. "Construido y probado", "En marcha", "Lo siguiente"), `children` (how it is solved, under twelve words).
-- On the landing page each crest message carries one (pass it as `Message`'s `status`). Use the same three states on any public progress page.
-- Be honest: `built` only when it has tests that pass. Update the states when the product moves; never leave a promise marked as built.
+## When to use it
+
+In the logbook, the project index and a project's page (`Preview`, `In progress`, `Done`); in a ledger of what works (`Works`, `In progress`).
+
+## Variants
+
+- `.status--preview` (the cairn; tide blue dot), `.status--progress` (the spiral; clay dot), `.status--done` (the moon; sage dot).
+- With an icon: `{{ic:preview}}` etc. at 24px.
+- With a dot: `.status__dot`, for long ledgers where icons would repeat.
+
+## States
+
+- Inside an `.ic-host` (a row, a section), the icon makes its gesture on hover.
+
+## Accessibility
+
+- The word is always there; the icon or dot is `aria-hidden`.
+- Be honest: `Works` or `Done` only with tests that pass.
+
+## Markup
+
+```html
+<span class="status status--preview"><svg class="ic ic-preview" ...></svg><span>Preview</span></span>
+<span class="status status--done"><span class="status__dot" aria-hidden="true"></span><span>Works</span></span>
+```
+
+Styles: `components/bundle.css`, section "Status". Every value is a token.
+
+## In the product web today
+
+Not in the product web (its agent states are `Badge`).
+
+## Do not
+
+- No colour without the word.

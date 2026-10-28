@@ -151,7 +151,7 @@ def test_only_token_colours_still() -> None:
     import json
 
     tokens = json.loads(
-        (STATIC.parents[2] / "brand" / "design-system" / "project" / "tokens.json").read_text()
+        (STATIC.parents[2] / "brand" / "design-system-v1" / "project" / "tokens.json").read_text()
     )
     allowed = set()
     for group in (tokens["color"]["tokens"], tokens["app"]["color"]["tokens"]):

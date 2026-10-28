@@ -3,70 +3,348 @@
   "layout": "files",
   "createdOnFiles": {
     "v": 1,
-    "at": "2026-10-06T17:25:03Z"
+    "at": "2026-10-28T20:00:00Z"
   },
   "title": "backtide",
   "namespace": "Backtide",
-  "libraries": [
-    {
-      "name": "react",
-      "version": "18"
-    },
-    {
-      "name": "react-dom",
-      "version": "18"
-    }
-  ],
+  "version": 2,
+  "libraries": [],
+  "note": "Plain HTML and CSS: no framework. Load fonts/fonts.css, tokens.css, components/bundle.css and motion/motion.css; the living sample is index.html. The first system (v1, React, Jost) is in brand/design-system-v1.",
   "sections": {},
   "groups": [
-    "Logos"
+    "Assets",
+    "Icons"
   ],
   "assetGroups": {
-    "Logos": {
-      "name": "Logos",
+    "Assets": {
+      "name": "Assets",
       "tile": "l",
       "order": [
-        "backtide-wordmark.svg",
-        "backtide-wordmark-white.svg",
-        "backtide-mark.svg",
-        "backtide-mark-white.svg"
+        "favicon-dark.svg",
+        "favicon.svg",
+        "mark.svg",
+        "wordmark-dark.svg",
+        "wordmark.svg"
       ],
       "files": {
-        "backtide-wordmark.svg": {
-          "name": "backtide-wordmark.svg",
-          "blob": "3e597984ba0fe24fb02822d59cff821f",
-          "size": 4468,
+        "favicon-dark.svg": {
+          "name": "favicon-dark.svg",
+          "blob": "793498ae53781dc01b07186f447dbf7e",
+          "size": 165,
           "type": "image/svg+xml"
         },
-        "backtide-wordmark-white.svg": {
-          "name": "backtide-wordmark-white.svg",
-          "blob": "447be42eb1fe8a34c97cb7c1ce209aa5",
-          "size": 4468,
+        "favicon.svg": {
+          "name": "favicon.svg",
+          "blob": "dfd0be5be0c8a99eff59ffcc29cd80c6",
+          "size": 165,
           "type": "image/svg+xml"
         },
-        "backtide-mark.svg": {
-          "name": "backtide-mark.svg",
-          "blob": "e3645c3be9536d76f88e664675ae7e03",
-          "size": 153,
+        "mark.svg": {
+          "name": "mark.svg",
+          "blob": "51e20bb7a7100c9b3e46d3d2a5735138",
+          "size": 160,
           "type": "image/svg+xml"
         },
-        "backtide-mark-white.svg": {
-          "name": "backtide-mark-white.svg",
-          "blob": "ede954997426aa41737c46145ba91b3e",
-          "size": 153,
+        "wordmark-dark.svg": {
+          "name": "wordmark-dark.svg",
+          "blob": "38c54b49dfa23ddbfe4a0d815d0cec76",
+          "size": 328,
+          "type": "image/svg+xml"
+        },
+        "wordmark.svg": {
+          "name": "wordmark.svg",
+          "blob": "8cc2019449930f13a178ff89fe6a9254",
+          "size": 328,
+          "type": "image/svg+xml"
+        }
+      }
+    },
+    "Icons": {
+      "name": "Icons",
+      "tile": "s",
+      "order": [
+        "approve.svg",
+        "ask.svg",
+        "bell.svg",
+        "done.svg",
+        "eye.svg",
+        "flag.svg",
+        "holds.svg",
+        "info.svg",
+        "key.svg",
+        "notebook.svg",
+        "pencil.svg",
+        "preview.svg",
+        "progress.svg",
+        "records.svg",
+        "reject.svg",
+        "rewinds.svg",
+        "scale.svg",
+        "still.svg",
+        "tape.svg",
+        "warning.svg"
+      ],
+      "files": {
+        "approve.svg": {
+          "name": "approve.svg",
+          "blob": "a50ec6dca04c6b9b8fb4161474a9f2c3",
+          "size": 1004,
+          "type": "image/svg+xml"
+        },
+        "ask.svg": {
+          "name": "ask.svg",
+          "blob": "3ba557417e28f838bf4e59d6f20eef83",
+          "size": 1541,
+          "type": "image/svg+xml"
+        },
+        "bell.svg": {
+          "name": "bell.svg",
+          "blob": "91f6dc581ece2f51c38f6921ae8336a6",
+          "size": 1566,
+          "type": "image/svg+xml"
+        },
+        "done.svg": {
+          "name": "done.svg",
+          "blob": "8b2d42392e96360317ae016f008cabad",
+          "size": 2050,
+          "type": "image/svg+xml"
+        },
+        "eye.svg": {
+          "name": "eye.svg",
+          "blob": "c6525647a7c012d2e1f6f714cefe5b7f",
+          "size": 1877,
+          "type": "image/svg+xml"
+        },
+        "flag.svg": {
+          "name": "flag.svg",
+          "blob": "bf9f34752bab66ae3fa783a3915acab3",
+          "size": 1465,
+          "type": "image/svg+xml"
+        },
+        "holds.svg": {
+          "name": "holds.svg",
+          "blob": "f0fbf7dcfb0224cca06cccb2bbebf91d",
+          "size": 1808,
+          "type": "image/svg+xml"
+        },
+        "info.svg": {
+          "name": "info.svg",
+          "blob": "2071252b0b9d835e1f8caf695f11eb80",
+          "size": 1735,
+          "type": "image/svg+xml"
+        },
+        "key.svg": {
+          "name": "key.svg",
+          "blob": "b160cd27641e6783be6a2cb28912ec58",
+          "size": 2070,
+          "type": "image/svg+xml"
+        },
+        "notebook.svg": {
+          "name": "notebook.svg",
+          "blob": "34c712d7e88289348a2814bdeebf3430",
+          "size": 1874,
+          "type": "image/svg+xml"
+        },
+        "pencil.svg": {
+          "name": "pencil.svg",
+          "blob": "ba5ed41e31c0e4c81aac1f581020c1ae",
+          "size": 2350,
+          "type": "image/svg+xml"
+        },
+        "preview.svg": {
+          "name": "preview.svg",
+          "blob": "def2891818a64b6a8461e22977030e75",
+          "size": 3225,
+          "type": "image/svg+xml"
+        },
+        "progress.svg": {
+          "name": "progress.svg",
+          "blob": "125a78486ab6b54278efa1fc893bbd56",
+          "size": 2022,
+          "type": "image/svg+xml"
+        },
+        "records.svg": {
+          "name": "records.svg",
+          "blob": "ffe2c527692a9de7b546539081f18a86",
+          "size": 1606,
+          "type": "image/svg+xml"
+        },
+        "reject.svg": {
+          "name": "reject.svg",
+          "blob": "64aadeaf975b5cab1226317d8736c9c8",
+          "size": 1285,
+          "type": "image/svg+xml"
+        },
+        "rewinds.svg": {
+          "name": "rewinds.svg",
+          "blob": "bbb7618db4f88a507e9b0029dbba8554",
+          "size": 2078,
+          "type": "image/svg+xml"
+        },
+        "scale.svg": {
+          "name": "scale.svg",
+          "blob": "1a2b25a642bda00b3e26c0f780c4554f",
+          "size": 3208,
+          "type": "image/svg+xml"
+        },
+        "still.svg": {
+          "name": "still.svg",
+          "blob": "b71bc0b311d785dc31e264147acc082d",
+          "size": 1407,
+          "type": "image/svg+xml"
+        },
+        "tape.svg": {
+          "name": "tape.svg",
+          "blob": "4d406bef8572eaf8d72a68ac44748deb",
+          "size": 3519,
+          "type": "image/svg+xml"
+        },
+        "warning.svg": {
+          "name": "warning.svg",
+          "blob": "e6bbe06be0d840be3ca16f16c5a35960",
+          "size": 1207,
           "type": "image/svg+xml"
         }
       }
     }
   },
+  "components": [
+    {
+      "name": "AgentTag",
+      "readme": "components/AgentTag/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Badge",
+      "readme": "components/Badge/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Button",
+      "readme": "components/Button/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Card",
+      "readme": "components/Card/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Disclosure",
+      "readme": "components/Disclosure/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Document",
+      "readme": "components/Document/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "EmptyState",
+      "readme": "components/EmptyState/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Field",
+      "readme": "components/Field/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "HoldCard",
+      "readme": "components/HoldCard/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "IndexRow",
+      "readme": "components/IndexRow/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "LanguageSwitch",
+      "readme": "components/LanguageSwitch/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Layers",
+      "readme": "components/Layers/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "LegalFooter",
+      "readme": "components/LegalFooter/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Link",
+      "readme": "components/Link/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "LogbookEntry",
+      "readme": "components/LogbookEntry/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Notice",
+      "readme": "components/Notice/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "SectionHeader",
+      "readme": "components/SectionHeader/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Status",
+      "readme": "components/Status/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Table",
+      "readme": "components/Table/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Tabs",
+      "readme": "components/Tabs/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Timeline",
+      "readme": "components/Timeline/README.md",
+      "css": "components/bundle.css"
+    },
+    {
+      "name": "Wordmark",
+      "readme": "components/Wordmark/README.md",
+      "css": "components/bundle.css"
+    }
+  ],
   "blobs": {},
   "docs": {
-    "sections": []
+    "sections": [
+      {
+        "name": "Brand book",
+        "file": "README.md"
+      },
+      {
+        "name": "Tokens",
+        "file": "tokens.json"
+      },
+      {
+        "name": "Icons",
+        "file": "icons/README.md"
+      },
+      {
+        "name": "Motion",
+        "file": "motion/README.md"
+      }
+    ]
   },
   "lastChange": {
-    "by": "Guillem Sabaté",
+    "by": "backtide",
     "via": "Claude Code",
-    "at": "2026-10-06T18:06:38Z",
-    "note": "The tide calms instead of turning and rewinding. New Status component for where each part stands; Tide gets `calm`, Message gets `status`."
+    "at": "2026-10-28T20:00:00Z",
+    "note": "v2 (D31): ivory, clay, Lora and DM Sans, hand-drawn icons and calm motion, from the approved proposal C2. Light and warm dark themes; components for the product web."
   }
 }

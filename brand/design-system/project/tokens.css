@@ -1,0 +1,345 @@
+/* backtide · design tokens, generated from tokens.json by build.py. Do not edit.
+   Light (ivory) is the default. Dark (charcoal with clay) applies under [data-theme="dark"],
+   or under [data-theme="auto"] when the system prefers dark. Breakpoints cannot be custom
+   properties: medium is max-width 1000px, narrow is max-width 720px. */
+
+:root {
+  color-scheme: light;
+  --paper: #F8F4EC;
+  --band: #F0E9DC;
+  --hover: #F2ECE1;
+  --ink: #1F1C18;
+  --ink-soft: #46403A;
+  --ink-muted: #6A6257;
+  --clay: #A4472A;
+  --clay-mark: #C4673F;
+  --clay-soft: #EFD3C1;
+  --on-ink: #F8F4EC;
+  --ink-hover: #3A352E;
+  --hair: #DDD4C3;
+  --line: #B9AE9C;
+  --edge: #8E8476;
+  --selection: #EBD2C2;
+  --state-preview: #3E5D71;
+  --state-progress: #C4673F;
+  --state-done: #4E6847;
+  --info: #3E5D71;
+  --info-wash: #ECEDE9;
+  --ok: #4E6847;
+  --ok-wash: #ECEDE3;
+  --warn: #7D5E12;
+  --warn-wash: #F2EBDB;
+  --danger: #9C2A3C;
+  --danger-wash: #F3E6E1;
+  --hold-wash: #F4E9DF;
+  --agent-1: #3E5D71;
+  --agent-1-wash: #E9E8E2;
+  --agent-2: #3D6A5E;
+  --agent-2-wash: #E9E9E1;
+  --agent-3: #8A3F6A;
+  --agent-3-wash: #EFE6E2;
+  --agent-4: #5F6526;
+  --agent-4-wash: #ECE9DC;
+  --agent-5: #4F5690;
+  --agent-5-wash: #EAE7E5;
+  --agent-6: #8C4F2B;
+  --agent-6-wash: #EFE7DD;
+  --risk-0: #6A6257;
+  --risk-1: #7D5E12;
+  --risk-2: #A4472A;
+  --risk-3: #9C2A3C;
+  --state-working: #4E6847;
+  --state-idle: #6A6257;
+  --state-frozen: #3E5D71;
+  --state-waiting: #A4472A;
+  --state-rewinding: #6B4A7E;
+  --state-sensor-down: #9C2A3C;
+  --slab-backtide-top: #EFD3C1;
+  --slab-backtide-side: #DDB39B;
+  --slab-sensor-top: #F6F1E7;
+  --slab-sensor-side: #E2D9C8;
+  --slab-proxy-top: #EAE2D3;
+  --slab-proxy-side: #D6CCB9;
+  --slab-agent-top: #DED4C2;
+  --slab-agent-side: #C9BDA7;
+  --font-serif: "Lora", "Iowan Old Style", Georgia, serif;
+  --font-sans: "DM Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --type-display-xl-size: clamp(4rem, 10vw, 8.75rem);
+  --type-display-xl-leading: 0.95;
+  --type-display-xl-weight: 400;
+  --type-display-xl-tracking: -0.032em;
+  --type-display-size: clamp(3.25rem, 7.6vw, 7rem);
+  --type-display-leading: 1;
+  --type-display-weight: 400;
+  --type-display-tracking: -0.028em;
+  --type-title-size: clamp(2.75rem, 5.5vw, 4.5rem);
+  --type-title-leading: 1.05;
+  --type-title-weight: 400;
+  --type-title-tracking: -0.025em;
+  --type-section-size: clamp(2.5rem, 4.6vw, 4rem);
+  --type-section-leading: 1.06;
+  --type-section-weight: 400;
+  --type-section-tracking: -0.022em;
+  --type-heading-l-size: clamp(2rem, 3vw, 2.625rem);
+  --type-heading-l-leading: 1.1;
+  --type-heading-l-weight: 400;
+  --type-heading-l-tracking: -0.016em;
+  --type-heading-m-size: 1.75rem;
+  --type-heading-m-leading: 1.2;
+  --type-heading-m-weight: 400;
+  --type-heading-m-tracking: -0.01em;
+  --type-heading-s-size: 1.375rem;
+  --type-heading-s-leading: 1.25;
+  --type-heading-s-weight: 400;
+  --type-heading-s-tracking: -0.005em;
+  --type-quote-size: clamp(1.625rem, 2.4vw, 2.125rem);
+  --type-quote-leading: 1.3;
+  --type-quote-weight: 400;
+  --type-quote-tracking: -0.012em;
+  --type-tagline-size: clamp(1.5rem, 2.6vw, 2.25rem);
+  --type-tagline-leading: 1.25;
+  --type-tagline-weight: 400;
+  --type-tagline-tracking: normal;
+  --type-aside-size: 1.1875rem;
+  --type-aside-leading: 1.45;
+  --type-aside-weight: 400;
+  --type-aside-tracking: normal;
+  --type-lead-size: clamp(1.1875rem, 1.5vw, 1.375rem);
+  --type-lead-leading: 1.5;
+  --type-lead-weight: 400;
+  --type-lead-tracking: normal;
+  --type-body-size: 1.0625rem;
+  --type-body-leading: 1.65;
+  --type-body-weight: 400;
+  --type-body-tracking: normal;
+  --type-body-ui-size: 0.9375rem;
+  --type-body-ui-leading: 1.55;
+  --type-body-ui-weight: 400;
+  --type-body-ui-tracking: normal;
+  --type-button-size: 1rem;
+  --type-button-leading: 1.2;
+  --type-button-weight: 500;
+  --type-button-tracking: normal;
+  --type-label-size: 0.875rem;
+  --type-label-leading: 1.3;
+  --type-label-weight: 500;
+  --type-label-tracking: normal;
+  --type-caption-size: 0.8125rem;
+  --type-caption-leading: 1.4;
+  --type-caption-weight: 400;
+  --type-caption-tracking: normal;
+  --type-overline-size: 0.6875rem;
+  --type-overline-leading: 1;
+  --type-overline-weight: 500;
+  --type-overline-tracking: 0.06em;
+  --type-code-size: 0.875em;
+  --type-code-leading: 1.5;
+  --type-code-weight: 400;
+  --type-code-tracking: normal;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+  --space-24: 96px;
+  --space-section: clamp(6rem, 11vw, 10rem);
+  --page: 76rem;
+  --page-app: 64rem;
+  --margin: clamp(1.25rem, 5.5vw, 5.5rem);
+  --gap: clamp(1rem, 2vw, 2rem);
+  --measure: 38rem;
+  --measure-narrow: 34rem;
+  --radius-xs: 4px;
+  --radius-s: 6px;
+  --radius-m: 8px;
+  --radius-button: 10px;
+  --radius-l: 12px;
+  --radius-pill: 999px;
+  --radius-round: 50%;
+  --stroke-hair: 1px;
+  --stroke-icon: 1.75px;
+  --stroke-art: 1.6px;
+  --stroke-arrow: 1.5px;
+  --stroke-slab: 1.2px;
+  --stroke-identity: 3px;
+  --size-target: 44px;
+  --size-button: 48px;
+  --size-icon-s: 1.5rem;
+  --size-icon-m: 2.25rem;
+  --size-icon-l: 3.25rem;
+  --size-icon-xl: 6rem;
+  --size-dot: 0.625rem;
+  --ease: cubic-bezier(.22, 1, .36, 1);
+  --ease-reveal: cubic-bezier(.2, .7, .2, 1);
+  --ease-draw: cubic-bezier(.45, 0, .25, 1);
+  --ease-drop: cubic-bezier(.3, .7, .3, 1);
+  --duration-quick: 200ms;
+  --duration-hover: 250ms;
+  --duration-settle: 450ms;
+  --duration-icon: 600ms;
+  --duration-reveal: 750ms;
+  --duration-draw: 850ms;
+  --duration-entrance: 800ms;
+  --duration-page: 600ms;
+  --rise: 14px;
+  --rise-entrance: 18px;
+  --stagger: 80ms;
+  --lift: 12px;
+  --nudge: 3px;
+  --focus-width: 2px;
+  --focus-color: var(--ink);
+  --focus-offset: 3px;
+  --focus-offset-rest: 8px;
+  --focus-radius: 4px;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #1A1815;
+  --band: #25221E;
+  --hover: #201D1A;
+  --ink: #F2ECE2;
+  --ink-soft: #D2C8BA;
+  --ink-muted: #A69C8E;
+  --clay: #E38C68;
+  --clay-mark: #D9774D;
+  --clay-soft: #4A3027;
+  --on-ink: #1A1815;
+  --ink-hover: #DCD5C9;
+  --hair: #34302A;
+  --line: #4D463D;
+  --edge: #7D7366;
+  --selection: #5C3A2B;
+  --state-preview: #8DB3CB;
+  --state-progress: #D9774D;
+  --state-done: #9DBC90;
+  --info: #8DB3CB;
+  --info-wash: #22262A;
+  --ok: #9DBC90;
+  --ok-wash: #232621;
+  --warn: #D9B35E;
+  --warn-wash: #2A261C;
+  --danger: #F08592;
+  --danger-wash: #2C2122;
+  --hold-wash: #2B231E;
+  --agent-1: #8DB3CB;
+  --agent-1-wash: #262827;
+  --agent-2: #86C2B1;
+  --agent-2-wash: #252925;
+  --agent-3: #E59AC4;
+  --agent-3-wash: #2E2526;
+  --agent-4: #C2C77A;
+  --agent-4-wash: #2B2A1F;
+  --agent-5: #A9AFE6;
+  --agent-5-wash: #28272A;
+  --agent-6: #E7A47C;
+  --agent-6-wash: #2E261F;
+  --risk-0: #A69C8E;
+  --risk-1: #D9B35E;
+  --risk-2: #E38C68;
+  --risk-3: #F08592;
+  --state-working: #9DBC90;
+  --state-idle: #A69C8E;
+  --state-frozen: #8DB3CB;
+  --state-waiting: #E38C68;
+  --state-rewinding: #C3A2D6;
+  --state-sensor-down: #F08592;
+  --slab-backtide-top: #5A3A2B;
+  --slab-backtide-side: #472E22;
+  --slab-sensor-top: #3A352F;
+  --slab-sensor-side: #2E2A25;
+  --slab-proxy-top: #332F29;
+  --slab-proxy-side: #2A2621;
+  --slab-agent-top: #2D2924;
+  --slab-agent-side: #24211D;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    color-scheme: dark;
+    --paper: #1A1815;
+    --band: #25221E;
+    --hover: #201D1A;
+    --ink: #F2ECE2;
+    --ink-soft: #D2C8BA;
+    --ink-muted: #A69C8E;
+    --clay: #E38C68;
+    --clay-mark: #D9774D;
+    --clay-soft: #4A3027;
+    --on-ink: #1A1815;
+    --ink-hover: #DCD5C9;
+    --hair: #34302A;
+    --line: #4D463D;
+    --edge: #7D7366;
+    --selection: #5C3A2B;
+    --state-preview: #8DB3CB;
+    --state-progress: #D9774D;
+    --state-done: #9DBC90;
+    --info: #8DB3CB;
+    --info-wash: #22262A;
+    --ok: #9DBC90;
+    --ok-wash: #232621;
+    --warn: #D9B35E;
+    --warn-wash: #2A261C;
+    --danger: #F08592;
+    --danger-wash: #2C2122;
+    --hold-wash: #2B231E;
+    --agent-1: #8DB3CB;
+    --agent-1-wash: #262827;
+    --agent-2: #86C2B1;
+    --agent-2-wash: #252925;
+    --agent-3: #E59AC4;
+    --agent-3-wash: #2E2526;
+    --agent-4: #C2C77A;
+    --agent-4-wash: #2B2A1F;
+    --agent-5: #A9AFE6;
+    --agent-5-wash: #28272A;
+    --agent-6: #E7A47C;
+    --agent-6-wash: #2E261F;
+    --risk-0: #A69C8E;
+    --risk-1: #D9B35E;
+    --risk-2: #E38C68;
+    --risk-3: #F08592;
+    --state-working: #9DBC90;
+    --state-idle: #A69C8E;
+    --state-frozen: #8DB3CB;
+    --state-waiting: #E38C68;
+    --state-rewinding: #C3A2D6;
+    --state-sensor-down: #F08592;
+    --slab-backtide-top: #5A3A2B;
+    --slab-backtide-side: #472E22;
+    --slab-sensor-top: #3A352F;
+    --slab-sensor-side: #2E2A25;
+    --slab-proxy-top: #332F29;
+    --slab-proxy-side: #2A2621;
+    --slab-agent-top: #2D2924;
+    --slab-agent-side: #24211D;
+  }
+}
+
+/* Type styles, one class each. On phones .t-body drops to 1rem (bundle.css). */
+.t-display-xl { font: var(--type-display-xl-weight) var(--type-display-xl-size)/var(--type-display-xl-leading) var(--font-serif); letter-spacing: var(--type-display-xl-tracking); }
+.t-display { font: var(--type-display-weight) var(--type-display-size)/var(--type-display-leading) var(--font-serif); letter-spacing: var(--type-display-tracking); }
+.t-title { font: var(--type-title-weight) var(--type-title-size)/var(--type-title-leading) var(--font-serif); letter-spacing: var(--type-title-tracking); }
+.t-section { font: var(--type-section-weight) var(--type-section-size)/var(--type-section-leading) var(--font-serif); letter-spacing: var(--type-section-tracking); }
+.t-heading-l { font: var(--type-heading-l-weight) var(--type-heading-l-size)/var(--type-heading-l-leading) var(--font-serif); letter-spacing: var(--type-heading-l-tracking); }
+.t-heading-m { font: var(--type-heading-m-weight) var(--type-heading-m-size)/var(--type-heading-m-leading) var(--font-serif); letter-spacing: var(--type-heading-m-tracking); }
+.t-heading-s { font: var(--type-heading-s-weight) var(--type-heading-s-size)/var(--type-heading-s-leading) var(--font-serif); letter-spacing: var(--type-heading-s-tracking); }
+.t-quote { font: var(--type-quote-weight) var(--type-quote-size)/var(--type-quote-leading) var(--font-serif); letter-spacing: var(--type-quote-tracking); }
+.t-tagline { font: italic var(--type-tagline-weight) var(--type-tagline-size)/var(--type-tagline-leading) var(--font-serif); letter-spacing: var(--type-tagline-tracking); }
+.t-aside { font: italic var(--type-aside-weight) var(--type-aside-size)/var(--type-aside-leading) var(--font-serif); letter-spacing: var(--type-aside-tracking); }
+.t-lead { font: var(--type-lead-weight) var(--type-lead-size)/var(--type-lead-leading) var(--font-sans); letter-spacing: var(--type-lead-tracking); }
+.t-body { font: var(--type-body-weight) var(--type-body-size)/var(--type-body-leading) var(--font-sans); letter-spacing: var(--type-body-tracking); }
+.t-body-ui { font: var(--type-body-ui-weight) var(--type-body-ui-size)/var(--type-body-ui-leading) var(--font-sans); letter-spacing: var(--type-body-ui-tracking); }
+.t-button { font: var(--type-button-weight) var(--type-button-size)/var(--type-button-leading) var(--font-sans); letter-spacing: var(--type-button-tracking); }
+.t-label { font: var(--type-label-weight) var(--type-label-size)/var(--type-label-leading) var(--font-sans); letter-spacing: var(--type-label-tracking); }
+.t-caption { font: var(--type-caption-weight) var(--type-caption-size)/var(--type-caption-leading) var(--font-sans); letter-spacing: var(--type-caption-tracking); }
+.t-overline { font: var(--type-overline-weight) var(--type-overline-size)/var(--type-overline-leading) var(--font-sans); letter-spacing: var(--type-overline-tracking); text-transform: uppercase; }
+.t-code { font: var(--type-code-weight) var(--type-code-size)/var(--type-code-leading) var(--font-mono); letter-spacing: var(--type-code-tracking); }
