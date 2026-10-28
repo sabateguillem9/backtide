@@ -5,7 +5,7 @@
 # no limactl (so install-mac.sh fetches its pinned Lima) and the test VM backtide-prueba-m.
 # Never sudo on the Mac, never ~/.lima, vigia-dev or Homebrew.
 #
-#   LAB=$(mktemp -d "$HOME/.btm.XXXX") sh instalar_mac_lab.sh preparar   # archive, key, lab yaml
+#   LAB=$(mktemp -d "$HOME/.btm.XXXX") sh instalar_mac_lab.sh preparar   # release, key, lab yaml
 #   LAB=... sh instalar_mac_lab.sh instalar      # install-mac.sh, watching ps on the Mac
 #   LAB=... sh instalar_mac_lab.sh mac CMD...    # a command with the lab's HOME, PATH, LIMA_HOME
 #   LAB=... sh instalar_mac_lab.sh vm 'CMD'      # bash -c CMD in the test VM, as its Lima user
@@ -36,15 +36,18 @@ result() { printf 'RESULT %s=%s\n' "$1" "$2"; }
 
 preparar() {
   mkdir -p "$LAB/home" "$LAB/tmp" "$LAB/stage"
-  # The code as it is in this tree (tracked and new files; not the landing page), as install.sh
-  # gets it: one tar, checked by its sha256.
+  # What install-mac.sh gets: a release archive (make release, T14) of this tree as it is, tracked
+  # and new files, checked by its sha256. Nothing in it is built, in the VM or here.
+  (cd "$REPO" && uv run --quiet python -m scripts.release.build_release --arbol --salida "$LAB/stage") >/dev/null
+  mv "$LAB/stage"/backtide-*-arbol.tar "$LAB/release.tar" && rm -f "$LAB/stage"/*.sha256
+  shasum -a 256 "$LAB/release.tar" | cut -d' ' -f1 > "$LAB/release.sha256"
+  # The battery needs the tests too: the whole tree (not the landing page), apart.
   (cd "$REPO" && git ls-files -co --exclude-standard | grep -v '^site/' \
     | while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done \
     | COPYFILE_DISABLE=1 tar --no-xattrs --no-fflags --no-acls -cf "$LAB/src.tar" -T -)
-  shasum -a 256 "$LAB/src.tar" | cut -d' ' -f1 > "$LAB/src.sha256"
-  # The lab runs the install-mac.sh of that archive, as a user would (and not the tree's, which
+  # The lab runs the install-mac.sh of the release, as a user would (and not the tree's, which
   # may change while it runs).
-  tar -xOf "$LAB/src.tar" install-mac.sh > "$LAB/install-mac.sh"
+  tar -xOf "$LAB/release.tar" install-mac.sh > "$LAB/install-mac.sh"
   # Made up here: the shape of an Anthropic key (the installer checks it), nobody's.
   [ -s "$LAB/made-up.key" ] || (umask 077 && printf 'sk-ant-api03-%s\n' \
     "$(head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 80)" > "$LAB/made-up.key")
@@ -67,7 +70,7 @@ preparar() {
     echo '    systemctl is-active -q backtide-lab-ps || systemd-run --quiet --unit backtide-lab-ps \'
     echo "      bash -c 'while :; do ps -eww -o pid=,args= >> /var/lib/backtide-lab/ps.log; sleep 0.2; done'"
   } > "$LAB/lab.yaml"
-  result archive "$(cat "$LAB/src.sha256") $(wc -c < "$LAB/src.tar" | tr -d ' ') B"
+  result archive "$(cat "$LAB/release.sha256") $(wc -c < "$LAB/release.tar" | tr -d ' ') B"
   result port "$port"
   lab_env sh -c 'command -v limactl || echo "no limactl on the lab PATH"'
 }
@@ -76,7 +79,7 @@ instalar() {
   ( while :; do ps -axww -o pid=,command= >> "$LAB/mac-ps.log"; sleep 0.2; done ) &
   watcher=$!
   start=$(date +%s) code=0
-  lab_env sh "$LAB/install-mac.sh" --desde "$LAB/src.tar" --sha256 "$(cat "$LAB/src.sha256")" \
+  lab_env sh "$LAB/install-mac.sh" --desde "$LAB/release.tar" --sha256 "$(cat "$LAB/release.sha256")" \
     --nombre-vm "$VM" --si --clave-archivo "$LAB/made-up.key" "$@" \
     > "$LAB/install.$start.log" 2>&1 < /dev/null || code=$?
   kill "$watcher" 2>/dev/null || true

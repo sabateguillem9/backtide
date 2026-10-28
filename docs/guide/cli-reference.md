@@ -436,12 +436,41 @@ sudo backtide comprobar
 
 ### `install.sh` and `backtide instalar`
 
-`install.sh` is a short `sh` script at the root of the repository: read it before you run it. It checks that it runs as root on Ubuntu 24.04 or 26.04 or Fedora 43 or 44 (x86_64 or aarch64), downloads `uv` (pinned by version and sha256), checks the sha256 of the backtide archive, installs it in `/opt/backtide/releases/<version>-<hash>` with its own Python 3.12 and its locked dependencies (the build backend uv uses to install backtide itself, `hatchling`, is not pinned yet), and hands over to `backtide instalar`. There is no published release yet, so today you give it an archive and its hash:
+`install.sh` is a short `sh` script at the root of the repository: read it before you run it. It checks that it runs as root on Ubuntu 24.04 or 26.04 or Fedora 43 or 44 (x86_64 or aarch64), checks the sha256 of the release archive and, before it writes anything, that the archive's `requirements.txt` pins every dependency to one version with its sha256. Then it downloads `uv` (pinned by version and sha256), installs the release in `/opt/backtide/releases/<version>-<hash>` and hands over to `backtide instalar`. **Nothing is built on your machine:** it creates a Python 3.12 of uv's own (uv checks it against the hash it carries) and installs only ready-made packages ("wheels"), each checked against its sha256 (`uv pip install --require-hashes --no-build`). If a dependency had no wheel for your machine, or a hash did not match, it stops without installing anything. backtide itself is not installed as a package: its code stays in the release folder, and `/opt/backtide/current/.venv/bin/backtide` runs it with `python -I` (isolated: no `PYTHON*` variables, no current folder).
 
 ```sh
-git archive --format=tar -o backtide.tar HEAD && sha256sum backtide.tar
-sudo sh install.sh --desde backtide.tar --sha256 <the hash> [backtide instalar flags]
+sudo sh install.sh --desde backtide-<version>.tar --sha256 <the hash> [backtide instalar flags]
 ```
+
+The archive is a **release archive** (see below); a plain `git archive` of the repository is refused, because it has no `requirements.txt`.
+
+#### Getting a release and checking it
+
+There is no published release yet: the first one comes with the preview. When there is one, it is a single uncompressed `backtide-<version>.tar` with its sha256 next to it, published with the release. To check it:
+
+```sh
+sha256sum backtide-<version>.tar            # Linux; on a Mac: shasum -a 256 backtide-<version>.tar
+```
+
+The hash it prints must be exactly the published one. If not, do not use the archive. The installer checks it again (`--sha256`) and refuses an archive that does not match. Inside the archive:
+
+| File | What it is |
+|---|---|
+| `backtide/`, `deploy/`, `lima/backtide-mac.yaml` | backtide's code, its systemd templates, seccomp profile and Tetragon policy, and the Mac VM's template |
+| `install.sh`, `install-mac.sh` | The two installers, the same as in the repository at that commit |
+| `requirements.txt` | The runtime dependencies, exported from `uv.lock`: one `name==version` per package with every sha256 the lock knows for it, and nothing else: no comments, options, URLs or paths, which the installer refuses |
+| `pyproject.toml`, `uv.lock` | Where `requirements.txt` comes from, to check it |
+| `release.txt` | The commit it was built from and the uv that exported `requirements.txt` |
+| `LICENSE`, `README.md`, `SECURITY.md` | |
+
+**You can rebuild it and compare.** The archive is reproducible: the same commit, built with the same uv and the same Python (`release.txt` says which), gives the same bytes and so the same sha256. From a clone of the repository:
+
+```sh
+git checkout <the commit in release.txt>
+make release                     # dist/release/backtide-<version>.tar and its .sha256
+```
+
+`make release COMMIT=<ref>` builds another commit. `make release ARBOL=1` builds from the working tree, uncommitted changes included, for testing only: its name ends in `-arbol` and `release.txt` says so. Building the archive builds nothing either: it copies the commit's files and runs `uv export --frozen`, which only reads `uv.lock`.
 
 `backtide instalar` does the rest, each step checked and recorded in `/var/lib/backtide/install-manifest.json`: the preflight of `comprobar` (any failure stops it before it changes anything), the `backtide-web` account, the folders and their permissions, `btrfs-progs`/`openssl`/`gnupg` if missing, Docker Engine from Docker's own repository if there is none (its signing key is checked by fingerprint), SELinux in Docker on Fedora, the three images by digest, the agent's volume, the config and keys, the two Docker networks, the systemd units, and the self-test. **Run it again and it changes nothing**; cut it half way and the next run goes on from there.
 
@@ -479,8 +508,8 @@ How it behaves:
 backtide needs a Linux kernel (Btrfs for the snapshots, eBPF for the sensor), and Docker Desktop's VM gives neither. So on a Mac, backtide lives in a small Linux VM of its own, made with [Lima](https://lima-vm.io) and Apple's virtualization, and the Linux installer above runs inside it, unchanged. `install-mac.sh` is a short `sh` script at the root of the repository (`sh install.sh` on a Mac hands over to it): read it before you run it. Run it as yourself; it never uses `sudo` on the Mac.
 
 ```sh
-git archive --format=tar -o backtide.tar HEAD && shasum -a 256 backtide.tar
-sh install-mac.sh --desde backtide.tar --sha256 <the hash> [--clave-archivo FILE | --clave-stdin | --sin-clave] [--si]
+shasum -a 256 backtide-<version>.tar     # must be the published hash (see "Getting a release")
+sh install-mac.sh --desde backtide-<version>.tar --sha256 <the hash> [--clave-archivo FILE | --clave-stdin | --sin-clave] [--si]
 ```
 
 What it does, and nothing else:

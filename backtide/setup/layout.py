@@ -15,7 +15,7 @@ GIB = 1024**3
 OPT_DIR = Path("/opt") / NAME  # releases/<version> and the `current` link
 RELEASES = OPT_DIR / "releases"
 CURRENT = OPT_DIR / "current"
-PROGRAM = CURRENT / ".venv" / "bin" / NAME  # what `uv sync` leaves in the release folder
+PROGRAM = CURRENT / ".venv" / "bin" / NAME  # install.sh's launcher (python -I), nothing built
 BIN_LINK = Path("/usr/local/bin") / NAME  # `backtide` on the PATH, pointing at PROGRAM
 
 CONFIG_DIR = Path("/etc") / NAME

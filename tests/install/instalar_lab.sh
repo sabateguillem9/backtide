@@ -3,15 +3,15 @@
 # Inside a backtide-limpia-* or backtide-prueba-* VM only, as root, never on the Mac or in vigia-dev:
 #
 #   sudo bash instalar_lab.sh bloquear            # nothing of the agent's leaves the VM
-#   sudo bash instalar_lab.sh instalar SRC.tar    # install.sh --desde SRC.tar, made-up key,
-#                                                 # watching `ps` the whole time
+#   sudo bash instalar_lab.sh instalar REL.tar    # install.sh --desde REL.tar (a `make release`
+#                                                 # archive), made-up key, watching `ps`
 #   sudo bash instalar_lab.sh fugas               # the made-up key in ps, journal, logs, files?
 #   sudo bash instalar_lab.sh estado              # what is there: units, mounts, containers
 #   sudo bash instalar_lab.sh bateria SRC.tar     # the T13 scenarios of the battery, as root
 #   sudo bash instalar_lab.sh senuelos            # a user, folders and a container that are not
 #                                                 # ours, for the uninstall to leave alone (T13-4)
 #   sudo bash instalar_lab.sh huella FILE         # the machine as the uninstall must leave it
-#   sudo bash instalar_lab.sh desinstalar SRC.tar [flags]  # `backtide desinstalar` from SRC.tar,
+#   sudo bash instalar_lab.sh desinstalar REL.tar [flags]  # `backtide desinstalar` from REL.tar,
 #                                                 # also once /opt/backtide is gone (a second run)
 #
 # Invariant 8: no real key and no real service. The key is made up here (it has the shape of an
@@ -210,8 +210,10 @@ huella() {
 }
 
 desinstalar() {
-  # From the installed program if it is there; else from SRC.tar with a copy of uv kept aside, as
-  # a second run after the first one removed /opt/backtide.
+  # From the installed program if it is there; else from REL.tar (a `make release` archive) with a
+  # copy of uv kept aside, as a second run after the first one removed /opt/backtide. Nothing is
+  # built there either: the archive's own install.sh function makes its venv (wheels by hash,
+  # --no-build) and its launcher.
   local src=$1 dir=/root/backtide-desinstalar
   shift
   [ -x /opt/backtide/uv/0.12.17/uv ] && cp /opt/backtide/uv/0.12.17/uv "$LAB/uv"
@@ -219,9 +221,12 @@ desinstalar() {
     /usr/local/bin/backtide desinstalar "$@"
   else
     rm -rf "$dir" && mkdir -p "$dir" && tar -xf "$src" -C "$dir" --no-same-owner
-    ( cd "$dir" && UV_CACHE_DIR=$LAB/uv-cache UV_PYTHON_INSTALL_DIR=$LAB/python \
-        "$LAB/uv" run --quiet --locked --no-dev --python 3.12 python -c \
-        'import sys; from backtide.cli import main; sys.exit(main(["desinstalar", *sys.argv[1:]]))' "$@" )
+    [ -f "$dir/requirements.txt" ] || { echo "$src is not a release archive (make release)" >&2; return 2; }
+    sed -n '/^install_release() {/,/^}/p' "$dir/install.sh" > "$LAB/install_release.sh"
+    ( . "$LAB/install_release.sh" && cd / && UV=$LAB/uv UV_CACHE_DIR=$LAB/uv-cache \
+        UV_PYTHON_INSTALL_DIR=$LAB/python UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1 \
+        install_release "$dir" ) || { echo "could not make the uninstaller's venv" >&2; return 1; }
+    "$dir/.venv/bin/backtide" desinstalar "$@"
   fi
 }
 

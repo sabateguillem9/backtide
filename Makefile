@@ -20,7 +20,7 @@ MODEL ?= claude-sonnet-5-5
 
 .PHONY: help test lint fmt it ataques demo demo-crear demo-archivos demo-borrar demo-instantaneas \
 	demo-rebobinar demo-parar demo-web web-demo probar probar-web probar-pedir probar-instantaneas \
-	probar-rebobinar probar-parar probar-entrar probar-tarea probar-importar probar-exportar vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
+	probar-rebobinar probar-parar probar-entrar probar-tarea probar-importar probar-exportar release vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -133,6 +133,14 @@ web-demo: ## Web demo on the Mac, no VM: made-up black box and snapshots + the w
 	  n=$$((n+1)); if [ $$n -gt 240 ]; then echo "The demo data did not appear" >&2; exit 1; fi; \
 	  sleep 0.5; done; \
 	uv run python scripts/web-demo/serve.py "$$dir/backtide.toml"
+
+# The release archive install.sh installs (T14; scripts/release/build_release.py): run here, never
+# by the installer, and never published from here (that is the founder's order, by hand).
+release: ## Release archive in dist/release/ with its .sha256 (COMMIT=<ref>, default HEAD; ARBOL=1 the working tree, for the labs only)
+	@case "$(COMMIT)" in *[!0-9A-Za-z._/^~-]*|-*) echo "COMMIT tiene caracteres raros" >&2; exit 2;; esac
+	@case "$(ARBOL)" in ""|1) ;; *) echo "ARBOL solo puede valer 1" >&2; exit 2;; esac
+	@if [ -n "$(ARBOL)" ] && [ -n "$(COMMIT)" ]; then echo "COMMIT o ARBOL, no los dos" >&2; exit 2; fi
+	uv run python -m scripts.release.build_release $(if $(ARBOL),--arbol,--commit $(or $(COMMIT),HEAD))
 
 vm-up: ## Create (first time) and start the dev VM
 	@status=$$(limactl list --format '{{.Status}}' $(VM) 2>/dev/null); \
