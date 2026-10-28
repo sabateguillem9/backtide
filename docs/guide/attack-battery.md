@@ -83,11 +83,11 @@ Counted from `tests/attacks/manifest.toml` at the time of writing:
 
 | | Count |
 |---|---|
-| Entries in the manifest | 86 |
-| **Ready**: have a test that runs today | 80 |
+| Entries in the manifest | 101 |
+| **Ready**: have a test that runs today | 95 |
 | **Pending**: listed, but cannot be written until a later task exists | 6 |
 
-Of the 80 ready scenarios, 74 run with the OpenClaw battery and 12 with the Claude Code battery (6 run with both). In a run for one profile, the scenarios of the other profile are skipped and the report says so.
+Of the 95 ready scenarios, 89 run with the OpenClaw battery and 22 with the Claude Code battery (16 run with both). In a run for one profile, the scenarios of the other profile are skipped and the report says so.
 
 Fifteen of the ready scenarios still have one dimension marked pending (a risk level or a "recorded" check that waits for a feature). There are 18 such cells in total. The run counts them in its summary line, as "comprobaciones pendientes", and never shows them as passed.
 
@@ -270,7 +270,7 @@ What the code **cannot** enforce is that a new feature gets a scenario at all. T
 
 - **It covers the attacks someone thought of.** A passing run means those attacks did not work. It does not mean no attack works.
 - **It is run by hand, in a VM.** The project's CI runs lint and unit tests only. Nobody else has published a run.
-- **Some checks are pending.** Some risk levels and a few "recorded" checks are waiting for later work (18 cells, plus 13 scenarios that do not have a test yet).
+- **Some checks are pending.** Some risk levels and a few "recorded" checks are waiting for later work (18 cells, plus 6 scenarios that do not have a test yet).
 - **Several scenarios are about limits, not victories.** For example, `stopped = "no"` scenarios show that something cannot be prevented from outside, and then show that it is recorded and recoverable.
 - **The scenarios and the code were written by the same team,** with AI assistance. A fresh pair of eyes will find attacks that are missing. That is the point of publishing it: new scenarios are welcome.
 

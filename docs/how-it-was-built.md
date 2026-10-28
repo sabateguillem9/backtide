@@ -129,18 +129,18 @@ First drafts had real bugs, including serious ones. A few that the reviews caugh
 
 ## 6. Numbers
 
-Measured on 2026-10-22, at commit `0800a5a`.
+Measured on 2026-10-28, at commit `482243c`.
 
 | What | Count | How it was counted |
 |---|---|---|
-| Commits | 109, all with a `Co-Authored-By: Claude` line | `git rev-list --count HEAD`, and `git log --format=%B` searched for the trailer. 108 name Claude Opus 5.5 and one names another Claude model. |
-| Calendar | 2026-10-05 to 2026-10-22, commits on 10 different days | `git log --date=short` |
-| Unit tests (Mac) | 9,212; in a run of `make test` that day, 9,208 passed and 4 were skipped | `uv run pytest --collect-only -q` |
-| VM integration tests | 453 | `uv run pytest --collect-only -q -m integration` |
-| Attack battery | 93 scenarios: 80 ready with tests, 13 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
-| Product code | 56,683 lines in 122 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
-| Test code | 101,273 lines in 272 Python files | the same for `tests/` |
-| Documents | 36 numbered documents in `docs/`, plus the backlog, the log and two guides | `ls docs/*.md`. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
-| Specialised agents and skills | 10 agents, 6 skills | `.claude/agents/`, `.claude/skills/` |
+| Commits | 173, all with a `Co-Authored-By: Claude` line | `git rev-list --count HEAD`, and `git log --format=%B` searched for the trailer. 157 name Claude Opus 5.5, 15 Claude Sonnet 5.5 and one another Claude model. |
+| Calendar | 2026-10-05 to 2026-10-28, commits on 15 different days | `git log --date=short` |
+| Unit tests (Mac) | 11,274; in a run of `make test` that day, 11,227 passed, 32 were skipped and 15 are expected failures | `uv run pytest --collect-only -q` |
+| VM integration tests | 507 | `uv run pytest --collect-only -q -m integration` |
+| Attack battery | 101 scenarios: 95 ready with tests, 6 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
+| Product code | 67,191 lines in 144 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
+| Test code | 124,040 lines in 332 Python files | the same for `tests/` |
+| Documents | 45 numbered documents in `docs/`, plus the backlog, the log and two guides | `ls docs/*.md`. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
+| Specialised agents and skills | 15 agents, 6 skills | `.claude/agents/`, `.claude/skills/` |
 
 These numbers are counts, not quality. More tests do not mean fewer bugs, and the test code being larger than the product code says as much about the style as about the coverage.
