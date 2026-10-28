@@ -10,7 +10,8 @@ and revoking one; making a batch stays in Telegram, with its two taps).
 Writes are explicit (decision 10): only with ``backtide web --aprobar``. Without it the page lists
 what waits from the black box (the ``gate/held`` with no end, ``box_holds``), the buttons are
 disabled with a note on how to turn them on, nothing asks the service and the POST does not exist.
-Who can: the service's own user, like the rewind (the socket is 0600 and answers only its uid).
+Who can: the service's own user, like the rewind (the socket is 0600 and answers only its uid),
+or the web's group through the service's narrow socket (``--socket-web``, T12c).
 
 What comes back is checked field by field (``held_request``) before it reaches a page: ids by
 their shape, risks in 0..3, times parsed, texts cut. The agent's texts (recipients, subject, the
@@ -58,7 +59,7 @@ from backtide.web.rewind import (
     WAIT_FOR_SERVICE,
     Availability,
     Redeemed,
-    socket_availability,
+    availability_of,
 )
 from backtide.web.security import TOKEN_BYTES, token_matches
 
@@ -117,47 +118,51 @@ class ControlApprover:
         wait: float = WAIT_FOR_SERVICE,
         peer: PeerCredentials = peer_credentials,
         euid: Callable[[], int] = os.geteuid,
+        server_uid: int | None = None,
+        egid: Callable[[], int] = os.getegid,
     ) -> None:
         self._path = Path(path)
         self.enabled = enabled
         self._wait = wait
         self._peer = peer
         self._euid = euid
+        self._server_uid = server_uid  # the narrow socket's (T12c), else the control socket
+        self._egid = egid
 
     def availability(self) -> Availability:
-        return socket_availability(self._path, enabled=self.enabled, euid=self._euid)
+        return availability_of(
+            self._path,
+            enabled=self.enabled,
+            euid=self._euid,
+            server_uid=self._server_uid,
+            egid=self._egid,
+        )
 
-    def _require(self) -> None:
+    def _require(self) -> dict[str, Any]:
         if not self.enabled:  # the app never gets here without READY; still, never by accident
             raise ControlError("esta web no se lanzó con --aprobar")
+        return {"wait": self._wait, "peer": self._peer, "server_uid": self._server_uid}
 
     def holds(self) -> list[dict[str, Any]]:
-        self._require()
-        return ask_holds(self._path, wait=self._wait, peer=self._peer)
+        return ask_holds(self._path, **self._require())
 
     def decide(self, hold_id: str, verdict: str) -> dict[str, Any]:
-        self._require()
-        return ask_decide(self._path, hold_id, verdict, via="web", wait=self._wait, peer=self._peer)
+        return ask_decide(self._path, hold_id, verdict, via="web", **self._require())
 
     def trust(self, hold_id: str) -> dict[str, Any]:
-        self._require()
-        return ask_trust(self._path, hold_id, wait=self._wait, peer=self._peer)
+        return ask_trust(self._path, hold_id, **self._require())
 
     def trusted(self) -> list[dict[str, Any]]:
-        self._require()
-        return ask_list(self._path, "trusted", wait=self._wait, peer=self._peer)
+        return ask_list(self._path, "trusted", **self._require())
 
     def untrust(self, trust_id: str) -> dict[str, Any]:
-        self._require()
-        return ask_untrust(self._path, trust_id, via="web", wait=self._wait, peer=self._peer)
+        return ask_untrust(self._path, trust_id, via="web", **self._require())
 
     def batches(self) -> list[dict[str, Any]]:
-        self._require()
-        return ask_list(self._path, "batches", wait=self._wait, peer=self._peer)
+        return ask_list(self._path, "batches", **self._require())
 
     def end_batch(self, rule_id: str) -> dict[str, Any]:
-        self._require()
-        return ask_end_batch(self._path, rule_id, via="web", wait=self._wait, peer=self._peer)
+        return ask_end_batch(self._path, rule_id, via="web", **self._require())
 
 
 # -- what the page shows of a hold -----------------------------------------------------------

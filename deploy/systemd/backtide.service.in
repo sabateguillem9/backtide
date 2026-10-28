@@ -12,7 +12,8 @@ AssertPathIsMountPoint=@PROXY_CHANNEL_DIR@
 
 [Service]
 Type=simple
-ExecStart=@PROGRAM@ vigilar --config @CONFIG_FILE@
+# --grupo-web: the web's narrow socket (<state dir>/web.sock, 0660, this group only; T12c).
+ExecStart=@PROGRAM@ vigilar --config @CONFIG_FILE@ --grupo-web @WEB_USER@
 Restart=always
 RestartSec=5
 TimeoutStopSec=120

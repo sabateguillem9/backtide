@@ -45,6 +45,9 @@ The server (inside the service):
   exportar`: the service copies the agent's work folder into the owner's new folder).
   Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
   not a snapshot id) is refused WITHOUT calling the Guardian.
+  The installed web, which is not the service's user, gets a second socket of its own with a
+  closed subset of these commands (``backtide.service.web_control``, T12c): ``WebControlServer``
+  reuses this class, with its own peer check (``refusal_for``) and socket mode and group.
 - One thread per connection (``socketserver``), at most ``MAX_CONNECTIONS`` at a time, so a
   client that connects and says nothing blocks nobody. A rewind runs on its connection's thread;
   if the client goes away the rewind still finishes (it is the person's safety action), and the
@@ -283,7 +286,15 @@ class ControlServer:
     answered) and removes the socket file.
 
     ``allowed_uid`` is the one user it serves (the service's own, by default). ``peer`` reads the
-    credentials of a connection and is replaceable so a test can play another user."""
+    credentials of a connection and is replaceable so a test can play another user.
+
+    ``socket_mode`` and ``socket_group`` are what the socket file is left with: 0600 and the
+    service's own group here; the web's narrow socket (``backtide.service.web_control``, T12c)
+    is 0660 with the web's group, and decides who it serves in ``refusal_for``."""
+
+    socket_mode = 0o600
+    socket_group: int | None = None
+    label = "control socket"  # how the log names it (the web's narrow socket: "web socket")
 
     def __init__(
         self,
@@ -383,19 +394,14 @@ class ControlServer:
         lost (``_Handler`` logs it). The Guardian is called only for a well-formed rewind of a
         valid snapshot id, asked by the allowed user."""
         try:
-            pid, uid, _gid = self._peer(sock)
+            pid, uid, gid = self._peer(sock)
         except ControlError as error:
-            logger.error("control socket: refused a connection, cannot tell who it is: %s", error)
+            logger.error("%s: refused a connection, cannot tell who it is: %s", self.label, error)
             self._reply(sock, _refusal("No se puede saber quién llama: no se atiende."))
             return
-        if uid != self._allowed_uid:
-            logger.warning(
-                "control socket: refused a connection from uid %d (pid %d): only uid %d may ask",
-                uid,
-                pid,
-                self._allowed_uid,
-            )
-            self._reply(sock, _refusal("Solo el usuario que ejecuta backtide puede pedir esto."))
+        refused = self.refusal_for(pid, uid, gid)
+        if refused is not None:
+            self._reply(sock, _refusal(refused))
             return
         try:
             request = self._receive(sock)
@@ -403,6 +409,19 @@ class ControlServer:
         except _BadRequest as bad:
             reply = _refusal(str(bad))
         self._reply(sock, reply)
+
+    def refusal_for(self, pid: int, uid: int, gid: int) -> str | None:
+        """None if the process ``pid`` (``uid``, ``gid``, as the kernel says) may ask; else the
+        reply's text, and the refusal is logged. Here: only the service's own user."""
+        if uid == self._allowed_uid:
+            return None
+        logger.warning(
+            "control socket: refused a connection from uid %d (pid %d): only uid %d may ask",
+            uid,
+            pid,
+            self._allowed_uid,
+        )
+        return "Solo el usuario que ejecuta backtide puede pedir esto."
 
     def _receive(self, sock: socket.socket) -> dict[str, Any]:
         """The request: one JSON object on a line of at most 4 KiB, within the deadline."""
@@ -862,7 +881,8 @@ class ControlServer:
             self._drain(sock)
         except OSError as error:
             logger.warning(
-                "control socket: the client went away before the reply (%s): %s",
+                "%s: the client went away before the reply (%s): %s",
+                self.label,
                 reply.get("outcome"),
                 error,
             )
@@ -949,23 +969,27 @@ class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             ) from None
         # Nobody can connect before ``listen()``, which comes after this check, so there is no
         # window with another mode (and ``umask`` is process-wide: not touched).
+        mode, group = self.control.socket_mode, self.control.socket_group
         try:
-            os.chmod(self._path, 0o600)
+            if group is not None:
+                os.chown(self._path, -1, group, follow_symlinks=False)
+            os.chmod(self._path, mode)
         except OSError as error:
             self._unlink_own_socket()
             raise ControlError(
-                f"no se puede dejar el socket de control {self._path} en 0600: "
+                f"no se puede dejar el socket {self._path} en {mode:04o}: "
                 f"{os.strerror(error.errno or 0)}"
             ) from None
         info = os.lstat(self._path)
         if (
             not stat.S_ISSOCK(info.st_mode)
             or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or stat.S_IMODE(info.st_mode) != mode
+            or (group is not None and info.st_gid != group)
         ):
             self._unlink_own_socket()
             raise ControlError(
-                f"el socket de control {self._path} no ha quedado como debe (de backtide y 0600)"
+                f"el socket {self._path} no ha quedado como debe (de backtide y {mode:04o})"
             )
         return info.st_dev, info.st_ino
 
@@ -1012,7 +1036,7 @@ class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             if not full:
                 self._active += 1
         if full:
-            logger.warning("control socket: too many open connections, one was refused")
+            logger.warning("%s: too many open connections, one was refused", self.control.label)
             try:  # best effort, never blocking: the client then knows nothing was done
                 request.setblocking(False)
                 request.send(
@@ -1039,7 +1063,7 @@ class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             self._active -= 1
 
     def handle_error(self, request: Any, client_address: Any) -> None:
-        logger.exception("control socket: a connection failed")
+        logger.exception("%s: a connection failed", self.control.label)
 
 
 class _Handler(socketserver.BaseRequestHandler):
@@ -1062,6 +1086,7 @@ def ask_rewind(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     via: str = "cli",
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to rewind to ``snapshot_id`` and return its reply, checked:
     a dict whose ``outcome`` is known, ``ok`` a bool, ``message`` a str and ``undo`` a str or
@@ -1086,6 +1111,7 @@ def ask_rewind(
         wait=wait,
         reply_timeout=reply_timeout,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1148,6 +1174,7 @@ def ask_decide(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to approve or reject the held request ``hold_id`` (`backtide
     aprobar` / `rechazar`; ``via="telegram"`` from the bot inside the service, T10-4). Returns
@@ -1167,6 +1194,7 @@ def ask_decide(
         wait=wait,
         reply_timeout=reply_timeout,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1191,6 +1219,7 @@ def ask_holds(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> list[dict[str, Any]]:
     """The held requests the service at ``path`` is waiting on (`backtide retenidas`), checked:
     each a dict with its ``hold_id`` and the texts the CLI shows. ControlError if the reply makes
@@ -1202,6 +1231,7 @@ def ask_holds(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
         max_reply=MAX_LIST_REPLY_BYTES,
@@ -1230,6 +1260,7 @@ def ask_trust(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """ "Aprobar y confiar en este destinatario" from the web (T10-5): the reply, checked:
     ``ok``, ``outcome`` (a ``TrustStatus`` or "refused"), ``message`` and ``hold`` (what
@@ -1241,6 +1272,7 @@ def ask_trust(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1273,6 +1305,7 @@ def _ask_change(
     peer: PeerCredentials,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     raw = _ask(
         Path(path),
@@ -1281,6 +1314,7 @@ def _ask_change(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1307,13 +1341,22 @@ def ask_untrust(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Stop trusting the recipient ``trust_id`` (T10-5). ValueError for a ``via`` that cannot
     ask (nothing sent)."""
     if via not in UNTRUST_REQUESTERS:
         raise ValueError("via is cli or web")
     request = {"cmd": "untrust", "trust_id": trust_id, "via": via}
-    return _ask_change(path, request, wait=wait, peer=peer, sleep=sleep, monotonic=monotonic)
+    return _ask_change(
+        path,
+        request,
+        wait=wait,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+        server_uid=server_uid,
+    )
 
 
 def ask_end_batch(
@@ -1325,12 +1368,21 @@ def ask_end_batch(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Revoke the batch ``rule_id`` (T10-5, the web; T10-4's bot does it in its process)."""
     if via not in UNTRUST_REQUESTERS:
         raise ValueError("via is cli or web")
     request = {"cmd": "end_batch", "rule_id": rule_id, "via": via}
-    return _ask_change(path, request, wait=wait, peer=peer, sleep=sleep, monotonic=monotonic)
+    return _ask_change(
+        path,
+        request,
+        wait=wait,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+        server_uid=server_uid,
+    )
 
 
 def ask_list(
@@ -1341,6 +1393,7 @@ def ask_list(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> list[dict[str, Any]]:
     """``what`` is "trusted" (the recipients trusted from the web) or "batches" (the active
     batch rules): each item a dict with its id (``trust_id`` t-…, ``rule_id`` b-…); anything
@@ -1354,6 +1407,7 @@ def ask_list(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
         max_reply=MAX_LIST_REPLY_BYTES,
@@ -1381,6 +1435,7 @@ def ask_secrets(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """What the service at ``path`` has set (the Settings page, T12e): per kind, as
     ``Settings.status`` says it. ControlError if the reply makes no sense or it could not
@@ -1392,6 +1447,7 @@ def ask_secrets(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1419,6 +1475,7 @@ def ask_set_secret(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to put ``value`` as the key of ``kind`` (and, for Telegram,
     ``chat_id``). Returns its reply, checked: ``ok``, ``outcome``, ``message``, ``applied``.
@@ -1440,6 +1497,7 @@ def ask_set_secret(
             wait=wait,
             reply_timeout=REPLY_TIMEOUT * 6,
             peer=peer,
+            server_uid=server_uid,
             sleep=sleep,
             monotonic=monotonic,
         )
@@ -1457,6 +1515,7 @@ def ask_clear_secret(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to remove the key of ``kind``. Checked like
     ``ask_set_secret``'s reply."""
@@ -1472,6 +1531,7 @@ def ask_clear_secret(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1485,6 +1545,7 @@ def ask_budget(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """What the service says of the spending (``Budget.status``). ControlError if it makes no
     sense. The caller checks each field before showing it."""
@@ -1495,6 +1556,7 @@ def ask_budget(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1518,6 +1580,7 @@ def ask_set_budget(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Ask the service for new spending caps (texts as a person typed them). Its reply, checked:
     ``ok``, ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
@@ -1537,6 +1600,7 @@ def ask_set_budget(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1563,6 +1627,7 @@ def ask_accept_prices(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
 ) -> dict[str, Any]:
     """Accept the new prices waiting whose digest is ``digest`` (B3). The reply, checked: ``ok``,
     ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
@@ -1578,6 +1643,7 @@ def ask_accept_prices(
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
+        server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1634,6 +1700,7 @@ def _ask(
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
     max_reply: int = MAX_REPLY_BYTES,
+    server_uid: int | None = None,
 ) -> bytes:
     """One conversation: connect (retrying while nobody answers), send ``request``, read the
     whole reply (``max_reply`` bytes at most). ``what`` names the request in the messages ("el
@@ -1641,7 +1708,7 @@ def _ask(
     deadline = monotonic() + wait
     while True:
         try:
-            sock = _connect(path, peer)
+            sock = _connect(path, peer, server_uid)
         except ControlUnavailable:
             if monotonic() >= deadline:
                 raise
@@ -1668,7 +1735,11 @@ def _ask(
             ) from None
 
 
-def _connect(path: Path, peer: PeerCredentials) -> socket.socket:
+def _connect(path: Path, peer: PeerCredentials, server_uid: int | None = None) -> socket.socket:
+    """Connect to the socket at ``path`` once it is checked: a real socket (never through a
+    link), owned by ``server_uid`` (our own user by default; root for the web's narrow socket,
+    T12c), and the process answering runs as that user (``SO_PEERCRED``)."""
+    expected = os.geteuid() if server_uid is None else server_uid
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -1679,7 +1750,7 @@ def _connect(path: Path, peer: PeerCredentials) -> socket.socket:
         ) from None
     if not stat.S_ISSOCK(info.st_mode):
         raise ControlError(f"{path} no es un socket (¿un enlace simbólico?): no me conecto.")
-    if info.st_uid != os.geteuid():
+    if info.st_uid != expected:
         raise ControlError(f"El socket {path} es del usuario {info.st_uid}: no me conecto.")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -1695,7 +1766,7 @@ def _connect(path: Path, peer: PeerCredentials) -> socket.socket:
                 f"No se puede conectar al socket de control {path}: {os.strerror(error.errno or 0)}"
             ) from None
         _, uid, _ = peer(sock)  # ControlError if unreadable: nothing is sent
-        if uid != os.geteuid():
+        if uid != expected:
             raise ControlError(
                 f"El que contesta en {path} es el usuario {uid}, no el que ejecuta backtide: "
                 "no le envío nada."

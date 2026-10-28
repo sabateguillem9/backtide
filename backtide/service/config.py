@@ -152,6 +152,7 @@ STATE_TOKEN = "gateway.token"  # noqa: S105 - the file's name, not a secret
 STATE_LOCK = "backtide.lock"
 STATE_PENDING = "rewind.pending"
 STATE_SOCKET = "control.sock"
+STATE_WEB_SOCKET = "web.sock"  # the web's narrow socket (T12c): 0660, the web's group
 STATE_RULES = "rules.toml"  # the risk rules (T08); absent: the ones that ship with backtide
 STATE_PROXY_CA = "proxy-ca"  # the CA's key and certificate: the proxy's /ca (docs/21)
 STATE_AGENT_CA = "agent-ca"  # the CA's certificate alone: the agent's /etc/backtide-ca
@@ -573,6 +574,11 @@ class ServiceConfig:
         return self.state_dir / STATE_SOCKET
 
     @property
+    def web_socket(self) -> Path:
+        """The narrow socket for the web's group (T12c, ``backtide.service.web_control``)."""
+        return self.state_dir / STATE_WEB_SOCKET
+
+    @property
     def rules_file(self) -> Path:
         """The user's risk rules. backtide's own config: it lives in ``state_dir``, which the agent
         never sees (invariant 1)."""
@@ -692,6 +698,7 @@ class ServiceConfig:
             Protected("the black box's checkpoint", self.blackbox_checkpoint),
             Protected("the gateway token", self.gateway_token_file),
             Protected("the control socket", self.control_socket),
+            Protected("the web's socket", self.web_socket),
             Protected("the service lock", self.lock_file),
             Protected("the risk rules", self.rules_file),
             Protected("the providers' real keys", self.keys_dir),

@@ -92,6 +92,13 @@ def build_parser() -> argparse.ArgumentParser:
         "parar al agente y 2 si la configuración no sirve.",
     )
     _add_config(watch)
+    watch.add_argument(
+        "--grupo-web",
+        dest="web_group",
+        metavar="GRUPO",
+        help="abre también el socket estrecho de la web (web.sock, 0660) para ese grupo: la web "
+        "instalada aprueba, rechaza, rebobina y cambia los ajustes por él, y nada más (T12c)",
+    )
     watch.set_defaults(handler=_watch)
 
     listing = commands.add_parser(
@@ -656,6 +663,33 @@ def _verify(args: argparse.Namespace) -> int:
     return EXIT_OK if report.ok else EXIT_TAMPERED
 
 
+def _web_user(name: str | None) -> int | None:
+    """The uid of the account named like the web's group (the installed ``backtide-web``), so
+    the narrow socket takes that user only; None if there is no such account."""
+    import pwd
+
+    try:
+        return None if name is None else pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return None
+
+
+def _web_group(name: str | None) -> int | str | None:
+    """The gid of `vigilar --grupo-web` (T12c), None without it, or why it cannot be (text)."""
+    if name is None:
+        return None
+    import grp
+
+    from backtide.service.web_control import web_group_problem
+
+    try:
+        gid = grp.getgrnam(name).gr_gid
+    except KeyError:
+        return f"no existe el grupo {name!r}"
+    problem = web_group_problem(gid)
+    return f"el grupo {name!r} ({gid}) no sirve: {problem}" if problem else gid
+
+
 def _watch(args: argparse.Namespace) -> int:
     try:
         config = ServiceConfig.from_file(args.config)
@@ -667,9 +701,14 @@ def _watch(args: argparse.Namespace) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    web_group = _web_group(getattr(args, "web_group", None))
+    if isinstance(web_group, str):
+        _error(f"--grupo-web: {web_group}")
+        return EXIT_ERROR
     print("backtide arrancando. Ctrl-C o SIGTERM lo paran, y con él al agente.", flush=True)
     try:
-        serve(config)
+        web = {"web_group": web_group, "web_user": _web_user(args.web_group)}
+        serve(config, **({} if web_group is None else web))
     except ProfileError as error:  # OpenClaw's: UnrewindableConfig
         _error(error.notice)  # the alert and the black box already hold the detail
         return EXIT_ERROR
@@ -1074,8 +1113,9 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "(con su aviso y una confirmación). Con --ajustes, igual, la página Ajustes pone, cambia "
         "y quita las claves de los modelos y el bot de Telegram (nunca las enseña). Con "
         "--aprobar, igual, aprueba y rechaza las peticiones retenidas por la puerta (con una "
-        "confirmación). Como root, sin --rebobinar, --ajustes ni --aprobar no arranca. "
-        "Imprime un "
+        "confirmación). Con --socket-web, todo eso lo pide por el socket estrecho que el servicio "
+        "abre para el grupo de la web, sin ser su usuario: así actúa la web instalada. Como root, "
+        "sin --rebobinar, --ajustes ni --aprobar no arranca. Imprime un "
         "enlace de un solo uso, nuevo en cada ejecución, y el nombre de la ejecución; ábrelo en "
         "el navegador (no abre nada por sí mismo). Ctrl-C la para. Sale con 0 si paró bien, 1 si "
         "no pudo arrancar y 2 si la configuración no sirve.",
@@ -1108,6 +1148,15 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "(hace falta su mismo usuario); sin esto, las enseña con los botones apagados",
     )
     web.add_argument(
+        "--socket-web",
+        dest="web_socket",
+        type=Path,
+        metavar="RUTA",
+        help="pide rebobinar, aprobar y los ajustes (cada uno con su opción) y la lista de "
+        "instantáneas por el socket estrecho de la web (el de `backtide vigilar --grupo-web`), "
+        "no por el socket de control: para una web que no corre con el usuario del servicio",
+    )
+    web.add_argument(
         "--enlace-en",
         dest="link_file",
         type=Path,
@@ -1138,11 +1187,12 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
 
 
 WEB_REWIND_LINES = {
-    "ready": "Rebobinar desde la web: sí. Esta web corre con el mismo usuario que el servicio y se "
-    "lo pide por su socket de control (con el aviso y una confirmación).",
+    "ready": "Rebobinar desde la web: sí. Se lo pide al servicio por su socket (el de control, o "
+    "el estrecho de la web con --socket-web), con el aviso y una confirmación.",
     "no_service": "Rebobinar desde la web: cuando el servicio esté en marcha (`backtide vigilar`).",
-    "other_user": "Rebobinar desde la web: no. Esta web no corre con el usuario del servicio, así "
-    "que solo mira; para rebobinar, `backtide rebobinar`.",
+    "other_user": "Rebobinar desde la web: no. Esta web no corre con el usuario del servicio ni "
+    "tiene el grupo de su socket estrecho, así que solo mira; para rebobinar, `backtide "
+    "rebobinar`.",
     "off": "Rebobinar desde la web: no disponible; para rebobinar, `backtide rebobinar`.",
     "disabled": "Rebobinar desde la web: no; sin `--rebobinar` esta web solo mira. Para rebobinar, "
     "`backtide rebobinar` (o `backtide web --rebobinar` con el usuario del servicio).",
@@ -1192,7 +1242,7 @@ def _web(args: argparse.Namespace) -> int:
     from backtide.web.approve import ControlApprover
     from backtide.web.paths import WebPaths
     from backtide.web.rewind import ControlRewinder
-    from backtide.web.server import DEFAULT_PORT, run_web
+    from backtide.web.server import DEFAULT_PORT, SERVICE_UID, run_web
     from backtide.web.settings import ControlSettings
 
     if _effective_uid() == 0 and not (args.rebobinar or args.ajustes or args.aprobar):
@@ -1208,6 +1258,10 @@ def _web(args: argparse.Namespace) -> int:
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
+    web_socket = getattr(args, "web_socket", None)
+    control, server_uid = paths.control_socket, None
+    if web_socket is not None:
+        control, server_uid = web_socket, SERVICE_UID
 
     def announce(url: str, run_name: str) -> None:
         if args.link_file is not None:
@@ -1230,12 +1284,12 @@ def _web(args: argparse.Namespace) -> int:
                 "navegador). Ctrl-C la para.",
                 flush=True,
             )
-        rewinder = ControlRewinder(paths.control_socket, enabled=args.rebobinar)
+        rewinder = ControlRewinder(control, enabled=args.rebobinar, server_uid=server_uid)
         print(_web_rewind_line(rewinder.availability()), flush=True)
-        settings = ControlSettings(paths.control_socket, enabled=args.ajustes)
+        settings = ControlSettings(control, enabled=args.ajustes, server_uid=server_uid)
         line = WEB_SETTINGS_LINES.get(str(settings.availability()), WEB_SETTINGS_LINES["off"])
         print(line, flush=True)
-        approver = ControlApprover(paths.control_socket, enabled=args.aprobar)
+        approver = ControlApprover(control, enabled=args.aprobar, server_uid=server_uid)
         line = WEB_APPROVE_LINES.get(str(approver.availability()), WEB_APPROVE_LINES["off"])
         print(line, flush=True)
         if _effective_uid() == 0:
@@ -1249,6 +1303,7 @@ def _web(args: argparse.Namespace) -> int:
             can_rewind=args.rebobinar,
             can_set=args.ajustes,
             can_approve=args.aprobar,
+            **({} if web_socket is None else {"web_socket": web_socket}),
         )
     except LinkFileError as error:
         _error(str(error))

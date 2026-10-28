@@ -13,8 +13,10 @@ socket), and as root it refuses to start (``backtide.cli``).
 Who can: the socket is 0600 (connecting to a Unix socket needs write permission on it) and the
 service answers only its own uid (``SO_PEERCRED``). The state folder may be ``g+rx`` for a
 reader (the recipe in ``backtide.web.server``): that lets the reader see the socket, not use it.
-So, with ``--rebobinar``, the button works only when `backtide web` runs as the service's user; a
-web run as a lower-privileged reader cannot ask and says so.
+So, with ``--rebobinar``, the button works only when `backtide web` runs as the service's user, or
+when it is given the service's narrow socket for the web (``--socket-web``, T12c,
+``backtide.service.web_control``): 0660, root's, with the web's group, and the service answers
+only that group and only a closed list of commands. A reader with neither cannot ask and says so.
 ``ControlRewinder.availability`` tells which case this is, without connecting.
 
 Confirmations (``Tickets``): the confirmation page hands out a one-time ticket bound to one
@@ -79,22 +81,77 @@ class ControlRewinder:
         wait: float = WAIT_FOR_SERVICE,
         peer: PeerCredentials = peer_credentials,
         euid: Callable[[], int] = os.geteuid,
+        server_uid: int | None = None,
+        egid: Callable[[], int] = os.getegid,
     ) -> None:
         self._path = Path(path)
         self._enabled = enabled
         self._wait = wait
         self._peer = peer
         self._euid = euid
+        self._server_uid = server_uid
+        self._egid = egid
 
     def availability(self) -> Availability:
         """Can this process ask the service? Without ``enabled`` (``--rebobinar``) it is
-        DISABLED, whatever is there (``socket_availability``)."""
-        return socket_availability(self._path, enabled=self._enabled, euid=self._euid)
+        DISABLED, whatever is there (``availability_of``)."""
+        return availability_of(
+            self._path,
+            enabled=self._enabled,
+            euid=self._euid,
+            server_uid=self._server_uid,
+            egid=self._egid,
+        )
 
     def rewind(self, snapshot_id: str) -> dict[str, Any]:
         if not self._enabled:  # the app never gets here without READY; still, never by accident
             raise ControlError("esta web no se lanzó con --rebobinar")
-        return ask_rewind(self._path, snapshot_id, via="web", wait=self._wait, peer=self._peer)
+        return ask_rewind(
+            self._path,
+            snapshot_id,
+            via="web",
+            wait=self._wait,
+            peer=self._peer,
+            server_uid=self._server_uid,
+        )
+
+
+def availability_of(
+    path: Path,
+    *,
+    enabled: bool,
+    euid: Callable[[], int],
+    server_uid: int | None,
+    egid: Callable[[], int],
+) -> Availability:
+    """``socket_availability`` for the control socket (``server_uid`` None), or
+    ``narrow_availability`` for the web's narrow socket (the service runs as ``server_uid``)."""
+    if server_uid is None:
+        return socket_availability(path, enabled=enabled, euid=euid)
+    return narrow_availability(path, enabled=enabled, server_uid=server_uid, egid=egid)
+
+
+def narrow_availability(
+    path: Path, *, enabled: bool, server_uid: int, egid: Callable[[], int]
+) -> Availability:
+    """Can this process ask the service at its narrow socket ``path`` (T12c)? The socket must be
+    a socket (never followed), of ``server_uid``, with our effective group (the one the service
+    checks with ``SO_PEERCRED``) able to read and write it. Looked at, never connected to."""
+    if not enabled:
+        return Availability.DISABLED
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return Availability.NO_SERVICE
+    except PermissionError:  # the state folder is not ours to go through
+        return Availability.OTHER_USER
+    except OSError:
+        return Availability.OFF
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != server_uid:
+        return Availability.OFF
+    if info.st_gid != egid() or stat.S_IMODE(info.st_mode) & 0o060 != 0o060:
+        return Availability.OTHER_USER
+    return Availability.READY
 
 
 def socket_availability(path: Path, *, enabled: bool, euid: Callable[[], int]) -> Availability:
@@ -173,5 +230,7 @@ __all__ = [
     "Redeemed",
     "Rewinder",
     "Tickets",
+    "availability_of",
+    "narrow_availability",
     "socket_availability",
 ]

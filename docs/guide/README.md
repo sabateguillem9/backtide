@@ -6,6 +6,8 @@ It is **pre-alpha**. Read the [README](../../README.md) first for what works tod
 
 ## I want to try it
 
+**Testing the preview on your own machine?** Read the [guide for preview testers](testers.md): install, try it with your own agent for a few days, remove it, and tell us how it went. It assumes you already run OpenClaw or Claude Code and have 30 minutes. For the development setup and the demo:
+
 1. [Getting started](getting-started.md): what you need, how to set up the development VM, and the 60-second demo (delete, rewind, undo).
 2. [Run it with a real agent](real-run.md): OpenClaw or Claude Code thinking through the proxy, with the gate, Telegram and the web. It costs money, so read it before you start.
 3. [Troubleshooting and FAQ](troubleshooting.md).

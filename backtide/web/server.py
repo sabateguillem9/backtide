@@ -25,9 +25,17 @@ only watches, whoever runs it, and as root it refuses to start (to watch, use a 
   key or the token (``WebPaths`` does not even know where they are), but a bug in it would be a bug
   with those privileges, and in production the service runs as root. Everything a browser can send
   it goes through ``Guard`` first (``backtide.web.security``): a single POST path, from our own
-  page, with the session cookie, the CSRF token and a one-time confirmation. Better still is a
-  narrower socket the service opens for a reader group, which only takes "rewind to a listed
-  snapshot" (task T12c in docs/backlog.md). As root, `backtide web --rebobinar` starts, and says so.
+  page, with the session cookie, the CSRF token and a one-time confirmation. As root,
+  `backtide web --rebobinar` starts, and says so.
+- As a READER given the service's NARROW SOCKET (``--socket-web``, T12c, decision 27): what the
+  installed web does (``backtide-web.service``, as ``backtide-web``). The service (root) opens
+  ``<state_dir>/web.sock`` for that group only (``backtide.service.web_control``), and takes there
+  a closed list: the snapshot list and a rewind to one in it, the held requests and approving or
+  rejecting one, the Settings page's keys and caps. Everything ``--rebobinar``, ``--aprobar`` and
+  ``--ajustes`` turn on goes through it (each still needs its flag), and so does the snapshot list
+  (the volume is root's 0700): no privilege of the service's comes into this process. The socket
+  is a second wall, not the only one: the ``Guard``, the CSRF token and the confirmations are the
+  same.
 
 Not done yet: the data through the control socket (so a reader needs no file at all), and a
 "verified up to event N" that the SERVICE publishes (it holds the key and is the only one that
@@ -43,19 +51,25 @@ import logging
 import re
 import socket
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from types import FrameType
 
 import uvicorn
 
-from backtide.snapshots import Snapshot, SnapshotStore
+from backtide.service.control import ControlError
+from backtide.service.web_control import ask_snapshots
+from backtide.snapshots import Snapshot, SnapshotError, SnapshotStore
 from backtide.web.agents import AgentSource, PendingRequest
 from backtide.web.app import create_app
 from backtide.web.approve import Approver, ControlApprover
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
-from backtide.web.rewind import ControlRewinder
+from backtide.web.rewind import WAIT_FOR_SERVICE, ControlRewinder
 from backtide.web.security import make_prefix, make_run_name, make_token
 from backtide.web.settings import ControlSettings, ControlSpend, SettingsClient
+
+# The installed service runs as root: the narrow socket and the process behind it must be root's.
+SERVICE_UID = 0
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +166,7 @@ def run_web(
     agent_name: str | None = None,
     others: Sequence[AgentSource] = (),
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
+    web_socket: Path | None = None,
 ) -> None:
     """Serve the web of ``paths`` on 127.0.0.1:``port`` until the process is stopped.
     ``announce`` gets the link with the token (printed once, never logged) and the name of
@@ -165,7 +180,9 @@ def run_web(
     buttons disabled, and the POST that decides does not exist; ``approver`` replaces the
     control socket's client (the demo). ``agent_name``,
     ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
-    requests) are only given by the demo today: T17 and T10 will fill them for real."""
+    requests) are only given by the demo today: T17 and T10 will fill them for real.
+    ``web_socket`` is `--socket-web` (T12c): the service's narrow socket for the web's group,
+    asked instead of the control socket for everything, the snapshot list included."""
     sock = bind(port)
     real_port = sock.getsockname()[1]
     token, prefix, run_name = make_token(), make_prefix(), make_run_name()
@@ -174,17 +191,27 @@ def run_web(
     def from_volume() -> list[Snapshot]:
         return SnapshotStore(paths.volume).snapshots()
 
+    control, server_uid = paths.control_socket, None
+    if web_socket is not None:
+        control, server_uid = web_socket, SERVICE_UID
+
+    def from_service() -> list[Snapshot]:
+        try:
+            return ask_snapshots(control, server_uid=SERVICE_UID, wait=WAIT_FOR_SERVICE)
+        except ControlError as error:  # the pages say the list cannot be read
+            raise SnapshotError(str(error)) from None
+
     app = create_app(
         reader=reader,
         port=real_port,
         token=token,
         prefix=prefix,
         run_name=run_name,
-        snapshots=snapshots or from_volume,
-        rewinder=ControlRewinder(paths.control_socket, enabled=can_rewind),
-        settings=settings or ControlSettings(paths.control_socket, enabled=can_set),
-        approver=approver or ControlApprover(paths.control_socket, enabled=can_approve),
-        spend=ControlSpend(paths.control_socket),
+        snapshots=snapshots or (from_volume if web_socket is None else from_service),
+        rewinder=ControlRewinder(control, enabled=can_rewind, server_uid=server_uid),
+        settings=settings or ControlSettings(control, enabled=can_set, server_uid=server_uid),
+        approver=approver or ControlApprover(control, enabled=can_approve, server_uid=server_uid),
+        spend=ControlSpend(control, server_uid=server_uid),
         agent_name=agent_name,
         others=others,
         pending=pending,

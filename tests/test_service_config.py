@@ -688,6 +688,7 @@ def test_the_agent_is_told_what_it_must_never_see(layout: Path) -> None:
         state / "blackbox.checkpoint": (),
         state / "gateway.token": (),
         state / "control.sock": (),
+        state / "web.sock": (),  # T12c: the web's narrow socket
         state / "backtide.lock": (),
         state / "rules.toml": (),
         state / "keys": (),

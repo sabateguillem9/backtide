@@ -52,7 +52,7 @@ Two commands, `verificar` and `web`, only read files, so you can also try them o
 ### Four ideas used on this page
 
 - **The service.** `backtide vigilar` is the one long-running program. It owns the agent's container, takes the snapshots, writes the black box and holds back dangerous requests. Most other commands do nothing by themselves: they ask the service.
-- **The control socket.** A local file (`control.sock`, in the state folder) through which the other commands talk to the service. Only the service's own user can use it, and the agent's container cannot see it. That is why the agent cannot approve its own requests. So run these commands as the same user as the service.
+- **The control socket.** A local file (`control.sock`, in the state folder) through which the other commands talk to the service. Only the service's own user can use it, and the agent's container cannot see it. That is why the agent cannot approve its own requests. So run these commands as the same user as the service. The installed web, which runs as its own unprivileged user, has a second, narrower socket (`web.sock`) for its group only, with a closed list of what it may ask (see `--grupo-web` and `--socket-web` below).
 - **The config file.** `backtide.toml`, described in [configuration](configuration.md). Every command except `verificar` takes `--config` (see below).
 - **The black box.** The append-only log of everything the agent did. Each event carries the hash of the one before, so any edit or deletion breaks the chain.
 
@@ -82,8 +82,10 @@ The exact meaning of each code for each command is given below.
 Runs the service in the foreground. It starts the agent's container, the egress proxy, the process sensor and the file watcher. It takes a snapshot of the agent's folder whenever something changed, writes every event to the black box, and answers the other commands.
 
 ```sh
-backtide vigilar [--config FILE]
+backtide vigilar [--config FILE] [--grupo-web GROUP]
 ```
+
+- `--grupo-web GROUP` also opens the web's narrow socket, `web.sock` in the state folder (mode `660`, that group), for a web that does not run as the service's user. Through it the web can only list the snapshots, the held requests and what keys are set, and ask to rewind (to a snapshot in the list), approve or reject a held request, set or remove a key, and change the spending caps. Nothing else: no resume, no shell, no paths. The service checks the caller's group with the kernel (`SO_PEERCRED`), limits how many requests it takes, and records every change in the black box as coming from the web. The group cannot be root's, the agent's or the proxy's. The installed `backtide.service` passes `--grupo-web backtide-web`.
 
 - Stop it with Ctrl-C or SIGTERM. **That also stops the agent**: backtide never leaves an agent running without a watcher.
 - Only one service can run per state folder. A second `vigilar` stops with an error (exit 1).
@@ -99,7 +101,7 @@ In practice you start it with `make demo` or `make probar`, which first prepare 
 Serves the web view on `127.0.0.1` (this computer only): the live feed of what the agent does, the history with filters, the snapshots, the held requests and the Settings page. By default it only reads. The three flags below switch on the things that change state.
 
 ```sh
-backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes]
+backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes] [--socket-web PATH]
 ```
 
 | Flag | Default | Effect |
@@ -108,13 +110,14 @@ backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes]
 | `--rebobinar` | off | The Snapshots page can rewind (with the same notice as `rebobinar` and a confirmation) |
 | `--aprobar` | off | The Requests page can approve and reject held requests (each behind a confirmation). Without it the buttons are shown switched off |
 | `--ajustes` | off | The Settings page can set and remove API keys, the Telegram bot and the spending cap. Without it the page only explains how to switch it on |
+| `--socket-web PATH` | off | Ask for all of the above, and for the snapshot list, through the service's narrow socket at `PATH` (the one `vigilar --grupo-web` opens) instead of the control socket. For a web that runs as an unprivileged user in that group. The socket and the process answering it must be root's, or nothing is sent. The installed `backtide-web.service` passes `--socket-web /var/lib/backtide/web.sock --rebobinar --aprobar --ajustes` |
 | `--enlace-en FILE` | off | Write the one-time link (and the run name) to `FILE`, mode `600`, instead of printing it, and remove the file when the web stops. The installed `backtide-web.service` uses it so the link never lands in the system journal; `sudo backtide enlace` prints it |
 
 How it behaves:
 
 - It prints a one-time link and a **run name** of three words, for example `luna-pino-boya`. Open the link in your browser; backtide does not open anything itself. The run name must match the one in the page header: if it does not, the page is not from this run. The link works once; afterwards the page uses a cookie.
 - It then prints three lines saying whether rewind, Settings and approval are on or off for this run, and why.
-- `--rebobinar`, `--aprobar` and `--ajustes` ask the service through the control socket, so they only work when the web runs as the same user as the service and `backtide vigilar` is running.
+- `--rebobinar`, `--aprobar` and `--ajustes` ask the service through the control socket, so they only work when the web runs as the same user as the service and `backtide vigilar` is running. With `--socket-web` they ask through the narrow socket instead, which is how the installed web approves, rejects, rewinds and sets keys and caps without the service's privileges.
 - **As root, the web refuses to start** unless at least one of the three flags is given. A viewer that only looks should run as an ordinary user with read permission on the black box. With a flag as root it starts, with a warning.
 - The page language follows your browser's language (Spanish or English). Add `?lang=en` to the address to force English.
 - It reads only the black box, the snapshot folder and the control socket path from the config. It never reads the black box's key.

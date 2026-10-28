@@ -4,7 +4,8 @@ Design: docs/25, sections 1 and 2, with what T13-1 measured. Four units:
 - ``backtide.service``: root, with the capabilities of layout.SERVICE_CAPABILITIES and the
   hardening that coexists with ctypes, docker, the snapshots and the file watcher (all of
   section 2 but ``RestrictSUIDSGID``, which makes openat2 fail);
-- ``backtide-web.service``: the web as ``backtide-web``, with no capability at all;
+- ``backtide-web.service``: the web as ``backtide-web``, with no capability at all; it acts only
+  through the service's narrow socket for its group (``--socket-web``, T12c);
 - the volume's mount and the proxy channel's tmpfs, both with ``[Install]`` so they come back
   after a reboot, and named as ``systemd-escape -p --suffix=mount`` would.
 
@@ -23,6 +24,7 @@ from backtide.jail.proxy_config import (
     PROXY_UID,
     channel_tmpfs_options,
 )
+from backtide.service.config import STATE_WEB_SOCKET
 from backtide.setup import layout
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
@@ -71,6 +73,7 @@ def unit_values() -> dict[str, str]:
         "WEB_USER": layout.WEB_USER,
         "WEB_LINK_FILE": str(layout.WEB_LINK_FILE),
         "WEB_RUN_DIR_NAME": layout.WEB_RUN_DIR.name,
+        "WEB_SOCKET": str(layout.STATE_DIR / STATE_WEB_SOCKET),  # the web's narrow socket (T12c)
         "SERVICE_UNIT": layout.SERVICE_UNIT,
         "CHANNEL_SOURCE": CHANNEL_TMPFS_SOURCE,
         "CHANNEL_OPTIONS": channel_tmpfs_options(CHANNEL_SIZE, PROXY_UID, PROXY_GID),

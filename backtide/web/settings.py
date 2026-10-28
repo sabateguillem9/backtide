@@ -9,7 +9,7 @@ service checks the value and writes the file (``backtide.service.settings``).
 Writes are explicit: only with ``backtide web --ajustes``. Without it the page says how to turn it
 on and asks the service nothing (``Availability.DISABLED``), and the Guard does not even take its
 POST. Who can: the same as the rewind, the service's own user (the socket is 0600 and the service
-answers only its uid).
+answers only its uid), or the web's group through the narrow socket (``--socket-web``, T12c).
 
 What comes back is checked before it reaches a page (``SecretView``): a tail is shown only if it
 is exactly four plain characters, so a broken or hostile reply cannot put more of a key there.
@@ -51,7 +51,7 @@ from backtide.web.rewind import (
     WAIT_FOR_SERVICE,
     Availability,
     Redeemed,
-    socket_availability,
+    availability_of,
 )
 from backtide.web.security import TOKEN_BYTES, token_matches
 
@@ -95,52 +95,51 @@ class ControlSettings:
         wait: float = WAIT_FOR_SERVICE,
         peer: PeerCredentials = peer_credentials,
         euid: Callable[[], int] = os.geteuid,
+        server_uid: int | None = None,
+        egid: Callable[[], int] = os.getegid,
     ) -> None:
         self._path = Path(path)
         self.enabled = enabled
         self._wait = wait
         self._peer = peer
         self._euid = euid
+        self._server_uid = server_uid  # the narrow socket's (T12c), else the control socket
+        self._egid = egid
 
     def availability(self) -> Availability:
-        return socket_availability(self._path, enabled=self.enabled, euid=self._euid)
+        return availability_of(
+            self._path,
+            enabled=self.enabled,
+            euid=self._euid,
+            server_uid=self._server_uid,
+            egid=self._egid,
+        )
 
-    def _require(self) -> None:
+    def _require(self) -> dict[str, Any]:
         if not self.enabled:  # the app never gets here without READY; still, never by accident
             raise ControlError("esta web no se lanzó con --ajustes")
+        return {"wait": self._wait, "peer": self._peer, "server_uid": self._server_uid}
 
     def status(self) -> dict[str, dict[str, Any]]:
-        self._require()
-        return ask_secrets(self._path, wait=self._wait, peer=self._peer)
+        return ask_secrets(self._path, **self._require())
 
     def set_secret(self, kind: str, value: str, chat_id: str | None) -> dict[str, Any]:
-        self._require()
         return ask_set_secret(
-            self._path, kind, value, chat_id=chat_id, via="web", wait=self._wait, peer=self._peer
+            self._path, kind, value, chat_id=chat_id, via="web", **self._require()
         )
 
     def clear_secret(self, kind: str) -> dict[str, Any]:
-        self._require()
-        return ask_clear_secret(self._path, kind, via="web", wait=self._wait, peer=self._peer)
+        return ask_clear_secret(self._path, kind, via="web", **self._require())
 
     def set_budget(self, daily: str | None, monthly: str | None) -> dict[str, Any]:
         """New spending caps (T11), as typed: the service checks them and records the change."""
-        self._require()
         return ask_set_budget(
-            self._path,
-            daily_usd=daily,
-            monthly_usd=monthly,
-            via="web",
-            wait=self._wait,
-            peer=self._peer,
+            self._path, daily_usd=daily, monthly_usd=monthly, via="web", **self._require()
         )
 
     def accept_prices(self, digest: str) -> dict[str, Any]:
         """Accept the new prices waiting that the page showed (``digest``, T11 B3)."""
-        self._require()
-        return ask_accept_prices(
-            self._path, digest=digest, via="web", wait=self._wait, peer=self._peer
-        )
+        return ask_accept_prices(self._path, digest=digest, via="web", **self._require())
 
 
 class SpendClient(Protocol):
@@ -163,17 +162,27 @@ class ControlSpend:
         wait: float = 2.0,
         peer: PeerCredentials = peer_credentials,
         euid: Callable[[], int] = os.geteuid,
+        server_uid: int | None = None,
+        egid: Callable[[], int] = os.getegid,
     ) -> None:
         self._path = Path(path)
         self._wait = wait
         self._peer = peer
         self._euid = euid
+        self._server_uid = server_uid
+        self._egid = egid
 
     def availability(self) -> Availability:
-        return socket_availability(self._path, enabled=True, euid=self._euid)
+        return availability_of(
+            self._path,
+            enabled=True,
+            euid=self._euid,
+            server_uid=self._server_uid,
+            egid=self._egid,
+        )
 
     def spend(self) -> dict[str, Any]:
-        return ask_budget(self._path, wait=self._wait, peer=self._peer)
+        return ask_budget(self._path, wait=self._wait, peer=self._peer, server_uid=self._server_uid)
 
 
 @dataclass(frozen=True)

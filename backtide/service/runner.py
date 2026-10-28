@@ -83,6 +83,7 @@ from backtide.service.settings import Applied, ReloadFailedClosed, Settings
 from backtide.service.spend import Budget
 from backtide.service.telegram_config import load_telegram
 from backtide.service.trust import TrustStore
+from backtide.service.web_control import WebControlServer
 from backtide.snapshots import SnapshotStore, utc_now
 from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
 
@@ -847,6 +848,8 @@ def serve(
     sensor_jail: SensorJailConfig | None = None,
     proxy: ProxyJail | None = None,
     hold_timings: HoldTimings | None = None,
+    web_group: int | None = None,
+    web_user: int | None = None,
 ) -> None:
     """What `backtide vigilar` does: take the lock, build the real service and run it until it is
     told to stop, with the control socket of ``backtide rebobinar`` and ``backtide seguir`` open
@@ -858,7 +861,11 @@ def serve(
 
     With ``<state_dir>/telegram.toml`` (T09) the alerts also go to Telegram and the bot runs
     inside the service, started after the control socket and closed before it; an unusable
-    file is a ConfigError, before anything starts."""
+    file is a ConfigError, before anything starts.
+
+    With ``web_group`` (`--grupo-web`, T12c) the web's narrow socket (``config.web_socket``)
+    opens too, right after the control socket, for that group only (and, with ``web_user``,
+    that user only)."""
     settings = load_telegram(config.state_dir)
     with take_lock(config.lock_file):
         telegram = telegram_parts(config, settings) if settings is not None else None
@@ -899,6 +906,21 @@ def serve(
             budget=egress.budget,
             waiting=egress.waiting,
         )
+        if web_group is not None:
+            listing = store if store is not None else SnapshotStore(config.volume)
+            control = Hooks(
+                control,
+                WebControlServer(
+                    guardian,
+                    config.web_socket,
+                    group=web_group,
+                    user=web_user,
+                    snapshots=listing.snapshots,
+                    settings=settings_service,
+                    budget=egress.budget,
+                    waiting=egress.waiting,
+                ),
+            )
         if telegram is not None:
             snapshots = store if store is not None else SnapshotStore(config.volume)
             telegram.actions.bind(

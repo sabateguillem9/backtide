@@ -61,7 +61,10 @@ def directives(text: str, section: str) -> dict[str, list[str]]:
 # BindPaths=...) fails here until someone looks at it. docs/25, section 2, as measured in T13-1.
 SERVICE = {
     "Type": ["simple"],
-    "ExecStart": [f"{layout.PROGRAM} vigilar --config {layout.CONFIG_FILE}"],
+    # T12c: the web's narrow socket, for the web's group only.
+    "ExecStart": [
+        f"{layout.PROGRAM} vigilar --config {layout.CONFIG_FILE} --grupo-web {layout.WEB_USER}"
+    ],
     "Restart": ["always"],
     "RestartSec": ["5"],
     "TimeoutStopSec": ["120"],
@@ -94,8 +97,10 @@ WEB = {
     "User": [layout.WEB_USER],
     "Group": [layout.WEB_USER],
     # T13-3: the one-time link goes to a file of its own, never to the journal.
+    # T12c (decision 27): it acts only through the service's narrow socket; nothing else granted.
     "ExecStart": [
         f"{layout.PROGRAM} web --config {layout.WEB_CONFIG_FILE} --enlace-en {layout.WEB_LINK_FILE}"
+        f" --socket-web {layout.STATE_DIR / 'web.sock'} --rebobinar --aprobar --ajustes"
     ],
     "RuntimeDirectory": ["backtide-web"],
     "RuntimeDirectoryMode": ["0700"],

@@ -63,7 +63,7 @@ Three kinds of check are named below:
 
 ### 1. The agent's container never sees the black box, the snapshots, backtide's configuration or the Docker socket
 
-*Example:* the agent plants symbolic links to `/`, `/proc/1/root` or the host path of the snapshots, then tries to read through them. Or it hunts for the control socket that `backtide rebobinar` uses.
+*Example:* the agent plants symbolic links to `/`, `/proc/1/root` or the host path of the snapshots, then tries to read through them. Or it hunts for the control socket that `backtide rebobinar` uses, or the narrower one the installed web uses (`web.sock`, which only the web's group may use, and only for a closed list of requests).
 
 *How it is enforced:* the container gets exactly three mounts: its working folder, its own config folder (read-only) and the proxy's certificate (read-only). Nothing else. Before each start backtide compares an existing container with the expected options and refuses any difference. While running, it kills a container that has gained a mount.
 
@@ -71,7 +71,7 @@ Three kinds of check are named below:
 
 - Unit tests: `tests/test_jail_config.py`, `tests/test_jail_mounts.py`, `tests/test_jail_verify.py`.
 - Integration: `tests/integration/test_jail_escape.py` (a compromised agent trying to break out).
-- Scenarios: `enlaces-simbolicos`, `carpeta-cambiada-por-enlace`, `leer-secretos`, `socket-de-control`, `web-desde-la-carcel`, `montar-lo-prohibido`, `matar-el-sensor`, `telegram-de-un-extrano`.
+- Scenarios: `enlaces-simbolicos`, `carpeta-cambiada-por-enlace`, `leer-secretos`, `socket-de-control`, `socket-estrecho-de-la-web`, `web-desde-la-carcel`, `montar-lo-prohibido`, `matar-el-sensor`, `telegram-de-un-extrano`.
 
 ### 2. backtide has more privileges than the agent, never the reverse
 

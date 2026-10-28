@@ -1,8 +1,9 @@
 # backtide's web: the watch post, as an unprivileged user that only reads the black box
-# (docs/25, section 3, decision 15). Written by the installer from
-# deploy/systemd/backtide-web.service.in (backtide/setup/units.py); change the template, not this.
+# (docs/25, section 3, decision 15) and acts only through the service's narrow socket (T12c).
+# Written by the installer from deploy/systemd/backtide-web.service.in (backtide/setup/units.py);
+# change the template, not this.
 [Unit]
-Description=backtide web (read-only watch post on 127.0.0.1)
+Description=backtide web (watch post on 127.0.0.1)
 After=@SERVICE_UNIT@
 
 [Service]
@@ -10,8 +11,10 @@ Type=simple
 User=@WEB_USER@
 Group=@WEB_USER@
 # The one-time link goes to a file of the web's own (0600, in its RuntimeDirectory), never to the
-# journal: `sudo backtide enlace` prints it (T13-3).
-ExecStart=@PROGRAM@ web --config @WEB_CONFIG_FILE@ --enlace-en @WEB_LINK_FILE@
+# journal: `sudo backtide enlace` prints it (T13-3). It approves, rejects, rewinds and changes the
+# keys and caps only by asking the service through its narrow socket for this group (T12c,
+# decision 27): nothing more is granted here, only the socket's path.
+ExecStart=@PROGRAM@ web --config @WEB_CONFIG_FILE@ --enlace-en @WEB_LINK_FILE@ --socket-web @WEB_SOCKET@ --rebobinar --aprobar --ajustes
 RuntimeDirectory=@WEB_RUN_DIR_NAME@
 RuntimeDirectoryMode=0700
 Restart=on-failure

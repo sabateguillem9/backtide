@@ -373,7 +373,7 @@ Behavior:
 
 ## The web: `backtide web`
 
-The web view is read-only unless you switch things on. Each switch is a flag of `backtide web`, and each needs the same user as the service and a running `backtide vigilar`.
+The web view is read-only unless you switch things on. Each switch is a flag of `backtide web`, and each needs a running `backtide vigilar` and either the same user as the service or, with `--socket-web`, the service's narrow socket for the web's group. The installed web uses the second way: it runs as `backtide-web` and has the three switches on ([command-line reference](cli-reference.md#backtide-web)).
 
 | Flag | Default | Switches on |
 |---|---|---|
