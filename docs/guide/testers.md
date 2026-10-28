@@ -37,27 +37,31 @@ The installed version runs **OpenClaw** by default. To put **Claude Code** in th
 
 ### Get the release and check it
 
-> **PLACEHOLDER: the release is not published yet.** The way we publish releases is being finished. This block will be filled in with the real address and hash before the guide goes out.
->
-> - Release: `<RELEASE-URL>`
-> - sha256 of the archive `backtide.tar`: `<RELEASE-SHA256>`
-> - How to get `install.sh` (Linux) or `install-mac.sh` (Mac) next to the archive: `<TO BE WRITTEN with the release>`
-
-Download the archive, then check it. A **sha256** is a fingerprint of a file: change one byte and the fingerprint changes. The check shows that what you downloaded is what we published.
+The release is [backtide 0.1.0 (preview)](https://github.com/sabateguillem9/backtide/releases/tag/v0.1.0). Download the archive and your installer into one folder:
 
 ```sh
-sha256sum backtide.tar          # Linux
-shasum -a 256 backtide.tar      # Mac
+curl -LO https://github.com/sabateguillem9/backtide/releases/download/v0.1.0/backtide-0.1.0.tar
+curl -LO https://github.com/sabateguillem9/backtide/releases/download/v0.1.0/install.sh        # Linux
+curl -LO https://github.com/sabateguillem9/backtide/releases/download/v0.1.0/install-mac.sh    # Mac
 ```
 
-The command must print exactly `<RELEASE-SHA256>`. If it prints anything else, stop and do not run it: tell us. The installer checks the hash again by itself and refuses an archive that does not match.
+The sha256 of `backtide-0.1.0.tar` is `4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862`. It is also on the release page and in `backtide-0.1.0.tar.sha256`.
+
+Then check the archive. A **sha256** is a fingerprint of a file: change one byte and the fingerprint changes. The check shows that what you downloaded is what we published.
+
+```sh
+sha256sum backtide-0.1.0.tar          # Linux
+shasum -a 256 backtide-0.1.0.tar      # Mac
+```
+
+The command must print exactly `4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862`. If it prints anything else, stop and do not run it: tell us. The installer checks the hash again by itself and refuses an archive that does not match.
 
 The installers are short shell scripts. Read yours before you run it.
 
 ### Linux
 
 ```sh
-sudo sh install.sh --desde backtide.tar --sha256 <RELEASE-SHA256>
+sudo sh install.sh --desde backtide-0.1.0.tar --sha256 4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862
 ```
 
 (`--desde` means "from": the archive to install. `--sha256` is the hash you just checked.)
@@ -65,7 +69,7 @@ sudo sh install.sh --desde backtide.tar --sha256 <RELEASE-SHA256>
 ### Mac
 
 ```sh
-sh install-mac.sh --desde backtide.tar --sha256 <RELEASE-SHA256>
+sh install-mac.sh --desde backtide-0.1.0.tar --sha256 4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862
 ```
 
 Run it as yourself, without `sudo`. It creates the VM and installs backtide inside it. At the end it leaves a `backtide` command in `~/.local/bin`: add that folder to your `PATH` if it is not there. From then on, every `backtide` command in this guide works from the Mac **without `sudo`** (it runs `sudo backtide` inside the VM for you).
@@ -209,7 +213,7 @@ The Mac version asks you to type the VM's name before it deletes anything. It ne
 
 ## When something fails
 
-Open an issue at `<ISSUES-URL>` (placeholder: the repository is not public yet, so for now send it to the person who gave you this guide). Please include:
+Open an issue at <https://github.com/sabateguillem9/backtide/issues> (for a security problem, report it privately instead: see [SECURITY.md](../../SECURITY.md)). Please include:
 
 1. The output of `sudo backtide comprobar` (Mac: `backtide comprobar`).
 2. The version: `backtide --version`.

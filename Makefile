@@ -20,7 +20,7 @@ MODEL ?= claude-sonnet-5-5
 
 .PHONY: help test lint fmt it ataques demo demo-crear demo-archivos demo-borrar demo-instantaneas \
 	demo-rebobinar demo-parar demo-web web-demo probar probar-web probar-pedir probar-instantaneas \
-	probar-rebobinar probar-parar probar-entrar probar-tarea probar-importar probar-exportar release vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
+	probar-rebobinar probar-parar probar-entrar probar-tarea probar-importar probar-exportar release publicar vm-up vm-shell vm-estado vm-limpiar vm-down vm-delete
 
 help: ## List the available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -141,6 +141,9 @@ release: ## Release archive in dist/release/ with its .sha256 (COMMIT=<ref>, def
 	@case "$(ARBOL)" in ""|1) ;; *) echo "ARBOL solo puede valer 1" >&2; exit 2;; esac
 	@if [ -n "$(ARBOL)" ] && [ -n "$(COMMIT)" ]; then echo "COMMIT o ARBOL, no los dos" >&2; exit 2; fi
 	uv run python -m scripts.release.build_release $(if $(ARBOL),--arbol,--commit $(or $(COMMIT),HEAD))
+
+publicar: ## Update the public repository from this one's committed history (scripts/publish/sync-public.sh, D32)
+	scripts/publish/sync-public.sh
 
 vm-up: ## Create (first time) and start the dev VM
 	@status=$$(limactl list --format '{{.Status}}' $(VM) 2>/dev/null); \
