@@ -26,6 +26,7 @@ class FakeGuardian:
     asked: list[str] = field(default_factory=list)
     agent_state: str = "frozen"
     pause_reasons: frozenset[str] = frozenset({"user"})
+    late_pause_lifts: bool = False
 
     def pause_by_user(self, *, requested_by: str) -> PauseOutcome:
         self.asked.append(f"pause:{requested_by}")
@@ -174,6 +175,16 @@ def test_status_says_the_state_the_pauses_and_the_newest_snapshot(box: BlackBox)
     assert "la has pedido tú" in text
     assert "hace 3 min" in text
     assert "Peticiones retenidas: 0 (/retenidas). Lotes activos: 0 (/lotes)." in text
+
+
+def test_status_says_whether_a_late_pause_still_goes_on_by_itself(box: BlackBox) -> None:
+    actions, guardian = actions_with(box, [])
+    guardian.pause_reasons = frozenset({"late"})
+    guardian.late_pause_lifts = True
+    assert "sigue solo en cuanto vuelva a comprobar" in actions.status()
+    guardian.late_pause_lifts = False
+    text = actions.status()
+    assert "llegó tarde" in text and "sigue solo" not in text and "/seguir" in text
 
 
 # --- the held requests (T10-4) ---------------------------------------------------------------

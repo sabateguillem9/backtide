@@ -9,12 +9,16 @@ Ollama the proxy reaches by its virtual name ``<provider>.backtide.internal``.
   would pick itself is one of its ``models``.
 - The profile only says what the agent needs: the variables that come from the providers go
   through exactly the same checks as a profile's own (``AgentProfile.for_providers``).
-- The service asks the Ollama its version (``system/provider_local_ready``) from the VM.
+- The service asks the Ollama its version (``system/provider_local_ready``) from the VM, and
+  then how much context it gave the models (``system/provider_local_context``, ``GET /api/ps``):
+  less than the agent needs is risk 2 and an alert, and the start never waits for it.
 - `make probar LOCAL=<model>` writes that config (scripts/demo/probar.py).
 
 Every key here is a fake one, made by the test.
 """
 
+import dataclasses
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -39,11 +43,15 @@ from backtide.jail.profiles.claude_code import (
 )
 from backtide.jail.profiles.openclaw import LOCAL_TIMEOUT_SECONDS, model_settings
 from backtide.notify import AlertLevel
+from backtide.service import egress as egress_module
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.local_models import (
     MIN_OLLAMA_VERSION,
+    ContextNeed,
     LocalModelError,
+    context_of,
     older_than,
+    ollama_contexts,
     ollama_version,
 )
 from backtide.service.proxy_channel import Policy
@@ -508,6 +516,266 @@ def test_a_broken_probe_never_stops_the_egress(tmp_path: Path) -> None:
     world = started(tmp_path, RuntimeError("boom"))
     assert "provider_local" in world.actions()
     assert "provider_local_ready" not in world.actions()
+
+
+# --- the context it gives the models (system/provider_local_context) ------------------------------
+
+
+PS_BODY = (
+    b'{"models":[{"name":"qwen3-coder:30b","model":"qwen3-coder:30b","size":1,'
+    b'"context_length":4096},{"name":"gpt-oss:20b","model":"gpt-oss:20b","context_length":65536},'
+    b'{"name":"old:7b","model":"old:7b"},{"name":"bool:1b","context_length":true},'
+    b'{"name":"huge:1b","context_length":1000000000},{"name":"bad name;rm","context_length":9},'
+    b'"not an entry"]}'
+)
+
+
+def ps(fake: FakeSocket) -> dict[str, int]:
+    return ollama_contexts(MAC, 11434, connect=fake.connect, monotonic=fake.clock)  # type: ignore[arg-type]
+
+
+def test_the_context_is_asked_at_the_fixed_address_only_and_only_numbers_are_kept() -> None:
+    fake = FakeSocket(b"HTTP/1.1 200 OK\r\n\r\n" + PS_BODY)
+    assert ps(fake) == {"qwen3-coder:30b": 4096, "gpt-oss:20b": 65536}
+    assert fake.connected == [((MAC, 11434), 5.0)]
+    assert fake.sent.decode().startswith("GET /api/ps HTTP/1.0\r\n") and fake.closed
+
+
+@pytest.mark.parametrize(
+    ("chunks", "why"),
+    [
+        ((b"HTTP/1.1 404 Not Found\r\n\r\n",), "/api/ps with 404"),
+        ((b'HTTP/1.1 200 OK\r\n\r\n{"models": "all"}',), "which models"),
+        ((b"HTTP/1.1 200 OK\r\n\r\nnot json",), "which models"),
+        ((b"HTTP/1.1 200 OK\r\n\r\n" + b" " * 70_000,), "too long"),
+        ((b"SSH-2.0-OpenSSH_9.6\r\n",), "not an HTTP answer"),
+    ],
+)
+def test_an_answer_that_is_not_a_list_of_models_is_said(
+    chunks: tuple[bytes, ...], why: str
+) -> None:
+    with pytest.raises(LocalModelError, match=why):
+        ps(FakeSocket(*chunks))
+
+
+NESTED = b"[" * 32_000 + b"]" * 32_000  # 64,000 bytes: deep enough for a RecursionError
+
+
+def test_a_deeply_nested_answer_is_not_a_list_of_models_and_the_asking_goes_on(
+    tmp_path: Path,
+) -> None:
+    assert len(NESTED) <= 65_536
+    with pytest.raises(LocalModelError, match="which models"):
+        ps(FakeSocket(b"HTTP/1.1 200 OK\r\n\r\n" + NESTED))
+    answers = [NESTED, b'{"models":[{"name":"m","context_length":4096}]}']
+
+    def ask(address: str, port: int) -> dict[str, int]:
+        return ps(FakeSocket(b"HTTP/1.1 200 OK\r\n\r\n" + answers.pop(0)))
+
+    world = with_context(tmp_path, {})
+    world.records.clear()
+    world.egress._ask_context = ask
+    world.egress._tell_context("ollama", MAC, 11434, ("m",), world.egress._context_rounds["ollama"])
+    assert world.only("provider_local_context")[1] == 2 and not answers
+
+
+def test_a_deeply_nested_version_is_not_a_version() -> None:
+    body = b"[" * 4000 + b"]" * 4000
+    with pytest.raises(LocalModelError, match="version"):
+        ask(FakeSocket(b"HTTP/1.1 200 OK\r\n\r\n" + body))
+
+
+def test_a_slow_ps_is_cut_at_the_deadline() -> None:
+    fake = FakeSocket(OK[:5], OK[5:], step=4.0)
+    with pytest.raises(LocalModelError, match="too slow"):
+        ps(fake)
+
+
+def test_a_model_without_a_tag_is_latest() -> None:
+    loaded = {"llama3:latest": 8192, "qwen3-coder:30b": 4096}
+    assert context_of(loaded, "llama3") == 8192
+    assert context_of(loaded, "qwen3-coder:30b") == 4096
+    assert context_of(loaded, "qwen3-coder") is None and context_of(loaded, "llama3:8b") is None
+
+
+def test_what_each_agent_needs() -> None:
+    claude, claw, custom = (ContextNeed.for_profile(n) for n in ("claude-code", "openclaw", "x"))
+    assert (claude.agent, claude.tokens, claude.setting) == ("Claude Code", 64_000, 65_536)
+    assert (claw.agent, claw.tokens, claw.setting) == ("OpenClaw", 32_768, 32_768)
+    assert (custom.tokens, custom.setting) == (32_768, 32_768)
+
+
+def with_context(
+    tmp_path: Path, *answers: Any, need: ContextNeed | None = None, models: tuple[str, ...] = ()
+) -> World:
+    """An Egress started with a local provider whose Ollama answers /api/ps from ``answers``
+    (one per ask; the last repeats; an exception is raised). Every wait is recorded."""
+    world = World(tmp_path)
+    world.jail.agent_subnets = lambda: ["172.18.0.0/16"]  # type: ignore[attr-defined]
+    asked: list[tuple[str, int]] = []
+    waits: list[float] = []
+    queue = list(answers)
+
+    def ask(address: str, port: int) -> dict[str, int]:
+        asked.append((address, port))
+        answer = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    world.egress._ask_version = lambda address, port: "0.40.8"
+    world.egress._ask_context = ask
+    world.egress._context_need = need or ContextNeed.for_profile("claude-code")
+    world.egress._sleep = waits.append
+    gate = local_gate()
+    if models:
+        gate = dataclasses.replace(gate, models=models)
+    world.egress._policy = Policy(allow_hosts=(), providers=Providers([gate]))
+    world.egress.start(world.hooks)
+    world.asked, world.waits = asked, waits  # type: ignore[attr-defined]
+    return world
+
+
+def test_a_small_context_is_risk_2_with_a_clear_alert_and_never_holds_the_start(
+    tmp_path: Path,
+) -> None:
+    world = with_context(tmp_path, {}, {}, {"m:latest": 4096, "other": 2048})
+    details, risk = world.only("provider_local_context")
+    assert details == {
+        "provider": "ollama", "contexts": {"m": 4096}, "known": True, "low": True,
+        "needed": 64_000, "agent": "Claude Code",
+    }  # fmt: skip
+    assert risk == 2
+    assert [level for level, title in world.alerts if "poco contexto" in title] == [
+        AlertLevel.WARNING
+    ]
+    assert world.waits == [egress_module.CONTEXT_RETRY] * 2  # type: ignore[attr-defined]
+    assert world.asked == [(MAC, 11434)] * 3  # type: ignore[attr-defined]
+    assert world.egress.allows_agent()
+
+
+def test_the_asking_runs_on_its_own_thread_and_the_start_never_waits(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.egress._hooks = world.hooks
+    world.egress._thread = True  # only for _check_version: the watch is not started here
+    world.egress._context_need = ContextNeed.for_profile("claude-code")
+    asked, release = threading.Event(), threading.Event()
+
+    def ask(address: str, port: int) -> dict[str, int]:
+        asked.set()
+        assert release.wait(5)
+        return {"m": 4096}
+
+    world.egress._ask_context = ask
+    world.egress._check_version("ollama", MAC, 11434, ("m",))  # returns while Ollama is asked
+    assert asked.wait(5) and "provider_local_context" not in world.actions()
+    release.set()
+    (thread,) = [t for t in threading.enumerate() if t.name == "ollama-version-ollama"]
+    thread.join(5)
+    assert world.only("provider_local_context")[1] == 2
+
+
+def test_the_alert_says_the_numbers_and_what_to_set(tmp_path: Path) -> None:
+    bodies: list[str] = []
+    world = World(tmp_path)
+    world.hooks = egress_module.EgressHooks(
+        record=world.record,
+        alert=lambda level, title, body, event=None: bodies.append(body),
+        back=world.back,
+    )
+    world.jail.agent_subnets = lambda: ["172.18.0.0/16"]  # type: ignore[attr-defined]
+    world.egress._ask_context = lambda address, port: {"m": 4096}
+    world.egress._context_need = ContextNeed.for_profile("claude-code")
+    world.egress._policy = Policy(allow_hosts=(), providers=Providers([local_gate()]))
+    world.egress.start(world.hooks)
+    (body,) = bodies
+    assert "Tu Ollama tiene 4.096 de contexto para m; Claude Code necesita 64.000" in body
+    assert "no verá sus herramientas" in body
+    assert "OLLAMA_CONTEXT_LENGTH=65536 y reinicia Ollama" in body
+
+
+def test_enough_context_is_recorded_without_an_alert(tmp_path: Path) -> None:
+    world = with_context(tmp_path, {"m": 65_536}, need=ContextNeed.for_profile("openclaw"))
+    details, risk = world.only("provider_local_context")
+    assert (details["low"], details["contexts"], details["needed"], risk) == (
+        False, {"m": 65_536}, 32_768, 0,
+    )  # fmt: skip
+    assert not [title for _, title in world.alerts if "contexto" in title]
+
+
+def test_openclaw_with_32k_is_enough_and_claude_code_is_not(tmp_path: Path) -> None:
+    claw = with_context(tmp_path / "a", {"m": 32_768}, need=ContextNeed.for_profile("openclaw"))
+    assert claw.only("provider_local_context")[1] == 0
+    claude = with_context(tmp_path / "b", {"m": 32_768})
+    assert claude.only("provider_local_context")[1] == 2
+
+
+def test_the_smallest_low_model_is_named(tmp_path: Path) -> None:
+    world = with_context(
+        tmp_path, {"big:30b": 8192, "small:4b": 4096}, models=("big:30b", "small:4b")
+    )
+    details, risk = world.only("provider_local_context")
+    assert details["contexts"] == {"big:30b": 8192, "small:4b": 4096} and risk == 2
+
+
+def test_a_model_never_loaded_gives_up_after_an_hour_unknown(tmp_path: Path) -> None:
+    world = with_context(tmp_path, {"someone-else:7b": 4096})
+    details, risk = world.only("provider_local_context")
+    assert details == {"provider": "ollama", "models": ["m"], "known": False} and risk == 0
+    assert len(world.asked) == egress_module.CONTEXT_TRIES  # type: ignore[attr-defined]
+    assert egress_module.CONTEXT_RETRY * egress_module.CONTEXT_TRIES == 3600
+    assert not [title for _, title in world.alerts if "contexto" in title]
+
+
+def test_an_ollama_that_does_not_answer_is_asked_again(tmp_path: Path) -> None:
+    world = with_context(tmp_path, LocalModelError("does not answer"), {"m": 4096})
+    assert world.only("provider_local_context")[1] == 2
+    assert len(world.asked) == 2  # type: ignore[attr-defined]
+
+
+def test_a_broken_context_probe_never_stops_the_egress(tmp_path: Path) -> None:
+    world = with_context(tmp_path, RuntimeError("boom"))
+    assert "provider_local_ready" in world.actions()
+    assert "provider_local_context" not in world.actions()
+    assert world.egress.allows_agent()
+
+
+def test_the_stop_ends_the_asking(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.jail.agent_subnets = lambda: ["172.18.0.0/16"]  # type: ignore[attr-defined]
+    asks: list[int] = []
+
+    def ask(address: str, port: int) -> dict[str, int]:
+        asks.append(1)
+        world.egress._closing.set()  # the service stops while it waits
+        return {}
+
+    world.egress._ask_context = ask
+    world.egress._context_need = ContextNeed.for_profile("claude-code")
+    world.egress._policy = Policy(allow_hosts=(), providers=Providers([local_gate()]))
+    world.egress.start(world.hooks)
+    assert asks == [1] and "provider_local_context" not in world.actions()
+
+
+def test_a_provider_that_moved_ends_the_older_asking(tmp_path: Path) -> None:
+    world = with_context(tmp_path, {"m": 4096})
+    assert world.egress._context_rounds == {"ollama": 1}
+    world.records.clear()
+    world.egress._tell_context("ollama", MAC, 11434, ("m",), 0)  # an older round: says nothing
+    assert "provider_local_context" not in world.actions()
+    world.egress.reload(Policy(allow_hosts=(), providers=Providers([local_gate("192.168.5.9")])))
+    assert world.egress._context_rounds == {"ollama": 2}
+    assert world.asked[-1] == ("192.168.5.9", 11434)  # type: ignore[attr-defined]
+    assert world.only("provider_local_context")[1] == 2
+
+
+def test_the_probar_view_says_a_small_context_in_one_line() -> None:
+    fields = {"contexts": {"m": 4096}, "needed": 64_000, "agent": "Claude Code"}
+    line = probar.describe(_event(Source.SYSTEM, "provider_local_context", "", low=True, **fields))
+    assert "POCO CONTEXTO: tu Ollama da 4096 y Claude Code necesita 64000" in (line or "")
+    assert "OLLAMA_CONTEXT_LENGTH=65536" in (line or "")
+    calm = probar.describe(_event(Source.SYSTEM, "provider_local_context", "", low=False, **fields))
+    assert "POCO" not in (calm or "")
 
 
 # --- make probar LOCAL=<model> --------------------------------------------------------------------

@@ -61,7 +61,10 @@ REASON_NAMES = {
     "space": "falta espacio",
     "rewind_no_space": "un rebobinado se quedó sin espacio",
     "blackbox": "la caja negra no graba",
+    "late": "el hilo de espacio llegó tarde (no se quita sola)",
 }
+# A late pause the space thread will still lift by itself (``Guardian.late_pause_lifts``).
+LATE_LIFTS = "el hilo de espacio llegó tarde (sigue solo en cuanto vuelva a comprobar)"
 REWIND_WAIT = 10.0  # seconds to wait for the control socket (the service is up: it is ours)
 
 
@@ -71,6 +74,9 @@ class _Guardian(Protocol):
 
     @property
     def pause_reasons(self) -> frozenset[str]: ...
+
+    @property
+    def late_pause_lifts(self) -> bool: ...
 
     def pause_by_user(self, *, requested_by: str) -> PauseOutcome: ...
 
@@ -162,7 +168,11 @@ class GuardianActions:
         lines = [f"Agente: {STATE_NAMES.get(state, state)}."]
         reasons = sorted(self._guardian.pause_reasons)
         if reasons:
-            names = ", ".join(REASON_NAMES.get(reason, reason) for reason in reasons)
+            lifts = self._guardian.late_pause_lifts
+            names = ", ".join(
+                LATE_LIFTS if reason == "late" and lifts else REASON_NAMES.get(reason, reason)
+                for reason in reasons
+            )
             lines.append(f"En pausa: {names}. /seguir lo reanuda.")
         snapshots = self._snapshots()
         if snapshots:

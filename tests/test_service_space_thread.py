@@ -271,7 +271,8 @@ def test_the_watchdog_freezes_the_agent_when_the_space_thread_is_late(live: Worl
     live.guardian.check_watchdog()
     assert live.guardian.agent_state is AgentState.FROZEN
     assert live.only("space_pause").details["conditions"] == ["P4"]
-    assert live.guardian.pause_reasons == {"space"}
+    # Its own reason: the space thread lifts it once it checks again (test_service_space_late.py).
+    assert live.guardian.pause_reasons == {"late"}
 
 
 def test_the_watchdog_leaves_a_stopped_agent_alone(live: World) -> None:

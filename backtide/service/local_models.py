@@ -20,9 +20,17 @@ resolves a local provider's name: it gets a fixed IPv4 and port through the chan
   only, on a bare socket: VERSION_TIMEOUT seconds in all (connecting, headers and body, however
   slowly they drip: review of T20-4), no redirect followed, no chunked answer, at most
   MAX_VERSION_ANSWER bytes in all, and only a version number is taken from it.
+- How much context it gives each model (docs/35 section 11, from the founder's first real test):
+  ``GET /api/ps`` (``ollama_contexts``), the same way and with the same limits (MAX_PS_ANSWER
+  bytes), says the ``context_length`` of each model it has loaded now. That is the number the
+  agent's calls get: neither agent sends ``num_ctx``, so they share the runner Ollama loaded
+  with its own default (``OLLAMA_CONTEXT_LENGTH``, or 4,096 to 256k depending on the memory).
+  ``POST /api/show`` does not say it (only the model's trained maximum, and a ``num_ctx`` its
+  Modelfile may set), and nothing else does before the model is loaded. Only model ids and
+  numbers are taken from the answer. ``ContextNeed`` says how much each agent needs.
 
-Never logs or records anything but names, addresses, ports and versions: none of them is a
-secret.
+Never logs or records anything but names, addresses, ports, versions, model ids and context
+lengths: none of them is a secret.
 """
 
 import json
@@ -31,6 +39,7 @@ import re
 import socket
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv4Network, ip_network
 from typing import Any
 
@@ -46,10 +55,14 @@ OLLAMA_PORT = 11434
 MIN_OLLAMA_VERSION = "0.14.0"
 VERSION_TIMEOUT = 5.0  # seconds IN ALL: Ollama answers /api/version at once, with no model loaded
 MAX_VERSION_ANSWER = 8192  # bytes, headers and body: Ollama's answer is about 150
+MAX_PS_ANSWER = 65536  # bytes: about 500 per loaded model
+MAX_CONTEXT = 100_000_000  # tokens: more than any model; a bigger number is not a context
 _STATUS_RE = re.compile(rb"HTTP/1\.[01] ([0-9]{3})(?: [^\r\n]*)?", re.ASCII)
 _LENGTH_RE = re.compile(rb"content-length: *([0-9]{1,6}) *", re.ASCII | re.IGNORECASE)
 _VERSION_RE = re.compile(r"(\d{1,4})\.(\d{1,4})\.(\d{1,4})(?:[-+][0-9A-Za-z.-]{1,32})?", re.ASCII)
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}", re.ASCII)
 Lookup = Callable[..., list[Any]]  # socket.getaddrinfo
+Connect = Callable[..., socket.socket]
 
 
 class LocalModelError(Exception):
@@ -156,53 +169,161 @@ def ollama_version(
     port: int,
     *,
     timeout: float = VERSION_TIMEOUT,
-    connect: Callable[..., socket.socket] = socket.create_connection,
+    connect: Connect = socket.create_connection,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> str:
     """The version the Ollama at ``address:port`` says it is (``GET /api/version``), checked to
     be one (``0.40.8``, ``0.14.0-rc1``). LocalModelError if it does not answer, takes more than
     ``timeout`` seconds in all ("too slow"), answers anything else than a 200 with that (a
     redirect is not followed, a chunked answer is refused) or says something else."""
+    where = f"{address}:{port}"
+    body = _get(
+        address, port, "/api/version", "its version", MAX_VERSION_ANSWER,
+        timeout=timeout, connect=connect, monotonic=monotonic,
+    )  # fmt: skip
+    try:
+        version = json.loads(body).get("version")
+    except (ValueError, AttributeError, RecursionError):  # nested too deep: not an answer
+        version = None
+    if not isinstance(version, str) or not _VERSION_RE.fullmatch(version):
+        raise LocalModelError(f"{where} does not say an Ollama version")
+    return version
+
+
+def ollama_contexts(
+    address: str,
+    port: int,
+    *,
+    timeout: float = VERSION_TIMEOUT,
+    connect: Connect = socket.create_connection,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, int]:
+    """The models the Ollama at ``address:port`` has loaded now and the context it gave each one
+    (``GET /api/ps``: ``name`` and ``context_length``), asked as ``ollama_version`` asks. A model
+    whose entry has no context (an Ollama from before ``context_length``) or anything that is not
+    a model id and a number is left out. LocalModelError as for the version, or if the answer is
+    not a list of models."""
+    where = f"{address}:{port}"
+    body = _get(
+        address, port, "/api/ps", "which models it has loaded", MAX_PS_ANSWER,
+        timeout=timeout, connect=connect, monotonic=monotonic,
+    )  # fmt: skip
+    try:
+        models = json.loads(body).get("models")
+    except (ValueError, AttributeError, RecursionError):  # nested too deep: not an answer
+        models = None
+    if not isinstance(models, list):
+        raise LocalModelError(f"{where} does not say which models it has loaded")
+    found: dict[str, int] = {}
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        context = entry.get("context_length")
+        if type(context) is not int or not 0 < context <= MAX_CONTEXT:
+            continue
+        for key in ("name", "model"):
+            name = entry.get(key)
+            if isinstance(name, str) and _MODEL_RE.fullmatch(name):
+                found[name] = context
+    return found
+
+
+def context_of(loaded: Mapping[str, int], model: str) -> int | None:
+    """The context ``loaded`` (``ollama_contexts``) gives ``model``, or None if it is not loaded.
+    A model id without a tag is Ollama's ``:latest``."""
+    if model in loaded:
+        return loaded[model]
+    if ":" not in model.rsplit("/", 1)[-1]:
+        return loaded.get(f"{model}:latest")
+    return None
+
+
+@dataclass(frozen=True)
+class ContextNeed:
+    """How much context an agent needs from a local model (docs/probar.md): Claude Code 64,000
+    (Ollama's own guide for it) and OpenClaw 32,768; a custom agent, OpenClaw's, as the least a
+    tool-using agent works with. ``setting`` is what to tell the owner to set
+    ``OLLAMA_CONTEXT_LENGTH`` to: the power of two at or above ``tokens``."""
+
+    agent: str
+    tokens: int
+
+    @classmethod
+    def for_profile(cls, profile: str) -> "ContextNeed":
+        return _NEEDS.get(profile, cls(profile, DEFAULT_CONTEXT_NEED))
+
+    @property
+    def setting(self) -> int:
+        return 1 << max(self.tokens - 1, 1).bit_length()
+
+
+DEFAULT_CONTEXT_NEED = 32_768
+_NEEDS = {
+    "claude-code": ContextNeed("Claude Code", 64_000),
+    "openclaw": ContextNeed("OpenClaw", 32_768),
+}
+
+
+def _get(
+    address: str,
+    port: int,
+    path: str,
+    what: str,
+    limit: int,
+    *,
+    timeout: float,
+    connect: Connect,
+    monotonic: Callable[[], float],
+) -> bytes:
+    """The body of ``GET path`` at ``address:port``: plain HTTP/1.0 on a bare socket,
+    ``timeout`` seconds in all, at most ``limit`` bytes, only a 200 with no chunks.
+    LocalModelError otherwise, saying it could not tell ``what``."""
     deadline = monotonic() + timeout
     where = f"{address}:{port}"
     try:
         link = connect((address, port), timeout=timeout)
     except TimeoutError:
-        raise LocalModelError(f"{where} is too slow to say its version") from None
+        raise LocalModelError(f"{where} is too slow to say {what}") from None
     except OSError as error:
         raise LocalModelError(f"{where} does not answer ({type(error).__name__})") from None
     try:
         link.sendall(
-            f"GET /api/version HTTP/1.0\r\nHost: {where}\r\nAccept: application/json\r\n"
+            f"GET {path} HTTP/1.0\r\nHost: {where}\r\nAccept: application/json\r\n"
             "Connection: close\r\n\r\n".encode("ascii")
         )
-        data = _read_bounded(link, where, deadline, monotonic)
+        data = _read_bounded(link, where, path, what, limit, deadline, monotonic)
     except TimeoutError:
-        raise LocalModelError(f"{where} is too slow to say its version") from None
+        raise LocalModelError(f"{where} is too slow to say {what}") from None
     except OSError as error:
         raise LocalModelError(f"{where} does not answer ({type(error).__name__})") from None
     finally:
         link.close()
-    return _version_in(data, where)
+    return _body_of(data, where, path, what)
 
 
 def _read_bounded(
-    link: socket.socket, where: str, deadline: float, monotonic: Callable[[], float]
+    link: socket.socket,
+    where: str,
+    path: str,
+    what: str,
+    limit: int,
+    deadline: float,
+    monotonic: Callable[[], float],
 ) -> bytes:
     """The whole answer: until the server closes, or until the body its Content-Length gives
-    is in. LocalModelError past the deadline or past MAX_VERSION_ANSWER bytes."""
+    is in. LocalModelError past the deadline or past ``limit`` bytes."""
     data = b""
     while True:
         left = deadline - monotonic()
         if left <= 0:
-            raise LocalModelError(f"{where} is too slow to say its version")
+            raise LocalModelError(f"{where} is too slow to say {what}")
         link.settimeout(left)
-        chunk = link.recv(MAX_VERSION_ANSWER + 1 - len(data))
+        chunk = link.recv(limit + 1 - len(data))
         if not chunk:
             return data
         data += chunk
-        if len(data) > MAX_VERSION_ANSWER:
-            raise LocalModelError(f"{where}'s answer to /api/version is too long")
+        if len(data) > limit:
+            raise LocalModelError(f"{where}'s answer to {path} is too long")
         head, found, body = data.partition(b"\r\n\r\n")
         if found:
             lengths = [_LENGTH_RE.fullmatch(line) for line in head.split(b"\r\n")[1:]]
@@ -211,27 +332,21 @@ def _read_bounded(
                 return data
 
 
-def _version_in(data: bytes, where: str) -> str:
+def _body_of(data: bytes, where: str, path: str, what: str) -> bytes:
     head, found, body = data.partition(b"\r\n\r\n")
     lines = head.split(b"\r\n")
     status = _STATUS_RE.fullmatch(lines[0]) if found else None
     if status is None:
-        raise LocalModelError(f"{where} does not say an Ollama version (not an HTTP answer)")
+        raise LocalModelError(f"{where} does not say {what} (not an HTTP answer)")
     if status.group(1) != b"200":
-        raise LocalModelError(f"{where} answered /api/version with {status.group(1).decode()}")
+        raise LocalModelError(f"{where} answered {path} with {status.group(1).decode()}")
     if any(line.lower().startswith(b"transfer-encoding:") for line in lines[1:]):
-        raise LocalModelError(f"{where} does not say an Ollama version (a chunked answer)")
+        raise LocalModelError(f"{where} does not say {what} (a chunked answer)")
     lengths = [_LENGTH_RE.fullmatch(line) for line in lines[1:]]
     length = next((int(m.group(1)) for m in lengths if m is not None), None)
     if length is not None:
         body = body[:length]
-    try:
-        version = json.loads(body).get("version")
-    except (ValueError, AttributeError):
-        version = None
-    if not isinstance(version, str) or not _VERSION_RE.fullmatch(version):
-        raise LocalModelError(f"{where} does not say an Ollama version")
-    return version
+    return body
 
 
 def older_than(version: str, minimum: str = MIN_OLLAMA_VERSION) -> bool:

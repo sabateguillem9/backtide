@@ -10,10 +10,17 @@ tests need, all in the parts handed to ``runner.serve``:
   (``QuotaVolume.set_limit``: ``sudo -n btrfs qgroup limit``, checked before it runs), because
   setting a qgroup limit needs CAP_SYS_ADMIN;
 - the real gate, but with the host disk read as plenty: the VM keeps its /tmp small, and P6
-  would pause on it before anything the test does (P6 has its own unit tests).
+  would pause on it before anything the test does (P6 has its own unit tests);
+- a late space check on demand (``retraso-del-hilo-de-espacio``, tests/attacks/
+  test_space_late_attacks.py): when ``<state_dir>/SPACE_DELAY_FILE`` holds a number of seconds,
+  the space thread's next reading waits that long first, once (the file is removed). The state
+  directory is backtide's, which the agent never sees (invariant 1).
 """
 
 import sys
+import threading
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,6 +35,27 @@ from tests.integration.conftest import VOLUME_IMAGE, QuotaVolume
 from tests.integration.proxy_kit import test_proxy
 
 PLENTY = HostSpace(total=500 * GIB, free=400 * GIB)
+SPACE_DELAY_FILE = "test-space-delay"
+SPACE_THREAD = "backtide-space"  # the Ticker of Guardian.check_space
+
+
+def delayed_on_demand(gate: Callable[[], Sequence[object]], state_dir: Path) -> Callable[[], list]:
+    """``gate``, but the space thread's next call waits the seconds written in the delay file
+    first (read once, then removed). Only the space thread: a snapshot's own check is not it."""
+    flag = state_dir / SPACE_DELAY_FILE
+
+    def gate_with_delay() -> list:
+        if threading.current_thread().name == SPACE_THREAD:
+            try:
+                seconds = float(flag.read_text())
+                flag.unlink()
+            except (OSError, ValueError):
+                seconds = 0.0
+            if 0 < seconds <= 120:
+                time.sleep(seconds)
+        return list(gate())
+
+    return gate_with_delay
 
 
 def sample_with_plenty_of_host(root: Path, workspace: Path, state_dir: Path) -> space.Sample:
@@ -45,6 +73,8 @@ def serve_on(mnt: Path) -> None:
             config.volume, workspace_limit=config.workspace_limit, set_limit=volume.set_limit
         )
         gate = make_space_gate(config, store, sample=sample_with_plenty_of_host)
+        if gate is not None:
+            gate = delayed_on_demand(gate, config.state_dir)
         # No process sensor: one privileged Tetragon per VM, and it is not what this tests.
         runner.serve(
             config, jail=jail, store=store, space=gate, sensor=False, proxy=test_proxy(config)

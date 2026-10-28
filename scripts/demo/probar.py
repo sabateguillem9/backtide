@@ -63,6 +63,7 @@ from backtide.jail import docker as jail_docker
 from backtide.jail.openclaw import MODEL_ID
 from backtide.jail.profiles import NAMED
 from backtide.service.config import ConfigError, ServiceConfig
+from backtide.service.local_models import ContextNeed
 from scripts.demo import demo
 from scripts.demo.demo import NETWORK, Paths
 
@@ -316,7 +317,25 @@ def describe(event: Event) -> str | None:
         return f"{when}  red         {action:<15} {method} {target}{because}".rstrip()
     if source == "settings":
         return f"{when}  ajustes     {action:<15} {target}"
+    if source == "system" and action == "provider_local_context" and details.get("low"):
+        return f"{when}  sistema     {action:<15} {_low_context(details)}"
     return demo.describe(event)
+
+
+def _low_context(details: dict[str, Any]) -> str:
+    """The line of a local model with too little context: the smallest one, what the agent
+    needs and what to set (the alert says the rest). Only numbers and backtide's own names."""
+    contexts = details.get("contexts")
+    numbers = [c for c in contexts.values() if type(c) is int] if isinstance(contexts, dict) else []
+    needed = details.get("needed")
+    if not numbers or type(needed) is not int:
+        return "POCO CONTEXTO en tu Ollama: mira el aviso"
+    setting = ContextNeed("", needed).setting
+    agent = visible(str(details.get("agent") or "el agente"))
+    return (
+        f"POCO CONTEXTO: tu Ollama da {min(numbers)} y {agent} necesita {needed}. Pon "
+        f"OLLAMA_CONTEXT_LENGTH={setting} y reinicia Ollama"
+    )
 
 
 def visible(text: str, limit: int = 160) -> str:
@@ -394,7 +413,8 @@ def command_up(
         print(
             "Sin clave: tu Ollama no la necesita. Tiene que estar abierto en el Mac, con ese "
             "modelo descargado\n(ollama pull ...); backtide graba su versión al arrancar "
-            "(provider_local_ready).\n",
+            "(provider_local_ready)\ny, en cuanto Ollama carga el modelo, cuánto contexto le da "
+            "(provider_local_context): si es poco, te avisa.\n",
             flush=True,
         )
     else:

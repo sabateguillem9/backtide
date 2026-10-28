@@ -44,7 +44,13 @@ a few points of its life; the watch runs on this module's own thread.
   (``ask_version``, on a thread of its own; T20-4): ``system/provider_local_ready {provider,
   version, minimum, old}``, risk 2 with an alert when it is older than the minimum, or
   ``system/provider_local_unanswered {provider, address, port, why}`` (risk 1) when it does not
-  answer (Ollama closed on the Mac, a wrong port). A refusal of risk 2 toward a local provider
+  answer (Ollama closed on the Mac, a wrong port). On the same thread it then asks how much
+  context that Ollama gave the provider's models (``ask_context``, ``GET /api/ps``): once one of
+  them is loaded, ``system/provider_local_context {provider, contexts, needed, agent, low}``,
+  risk 2 with an alert when a model has less than the agent needs (``ContextNeed``: Claude Code
+  64,000, OpenClaw 32,768). A model is only loaded at its first call, so it asks again every
+  ``CONTEXT_RETRY`` s, ``CONTEXT_TRIES`` times at most (then ``{known: false}``, risk 0). It never
+  holds the start. A refusal of risk 2 toward a local provider
   is told (``local_refusals``, one for the service, docs/35 decision 9): the first of each reason
   at once, then at most one every 10 min; what is held is sent by the watch and at the stop.
 - Nothing raises out of here into the Guardian: failures are recorded and alerted.
@@ -80,7 +86,9 @@ from backtide.service.holds import (
 )
 from backtide.service.local_models import (
     MIN_OLLAMA_VERSION,
+    ContextNeed,
     LocalModelError,
+    context_of,
     older_than,
     outside,
 )
@@ -111,6 +119,12 @@ SILENCE_LIMIT = 15.0  # three pings missed
 RESTARTS_PER_HOUR = 3
 RESTART_WINDOW = 3600.0
 CONNECT_RETRY = 0.25
+# How often, and how many times, the service asks a local Ollama how much context it gave the
+# provider's models, until one of them is loaded (Ollama loads a model at its first call, which
+# may come long after the start: OpenClaw waits for a message). 30 s for an hour.
+CONTEXT_RETRY = 30.0
+CONTEXT_TRIES = 120
+MAX_CONTEXT_MODELS = 8  # the models of one provider that are looked at
 _ERROR_CHARS = 300
 
 
@@ -157,11 +171,19 @@ class Egress:
         budget: Budget | None = None,
         prices: PriceUpdater | None = None,
         ask_version: Callable[[str, int], str] | None = None,
+        ask_context: Callable[[str, int], Mapping[str, int]] | None = None,
+        context_need: ContextNeed | None = None,
     ) -> None:
         self._jail = jail
         # T20-4: how the service asks a local Ollama its version (local_models.ollama_version);
         # None asks nothing (the tests' fake worlds).
         self._ask_version = ask_version
+        # And how much context it gave each model (local_models.ollama_contexts), against what
+        # the agent needs (None: recorded, never "low"). None asks nothing.
+        self._ask_context = ask_context
+        self._context_need = context_need
+        self._context_rounds: dict[str, int] = {}  # a newer ask for a provider ends the older
+        self._closing = threading.Event()  # the stop ends the asking
         # The spending cap (T11): one for the service, handed to every channel. It reads its
         # totals (or rebuilds them from the black box) at the first start, once the box is open;
         # ``prices`` keeps its price table up to date on a thread of its own.
@@ -228,6 +250,7 @@ class Egress:
         """Bring the proxy up and start its watch. False (recorded, alerted) if it is not up."""
         with self._lock:
             self._hooks = hooks
+            self._closing.clear()
             self._close_stale_holds()
             self._note_keys()
             self._note_locals()
@@ -247,6 +270,7 @@ class Egress:
     def stop(self, reason: str = "service_stop") -> None:
         """The watch, the open holds, then the proxy, then the channel (the agent is stopped
         already)."""
+        self._closing.set()  # the asking of a local Ollama's context ends
         if self._ticker is not None:
             self._ticker.close()
             self._ticker = None
@@ -520,7 +544,7 @@ class Egress:
                     continue
                 if before is None:
                     self._record("provider_local", details)
-                    self._check_version(provider.name, address, port)
+                    self._check_version(provider.name, address, port, provider.models)
                 else:
                     logger.warning(
                         "local provider %s moved from %s:%d to %s:%d", provider.name, *before,
@@ -529,26 +553,109 @@ class Egress:
                     details["before"] = f"{before[0]}:{before[1]}"
                     details["applied"] = True
                     self._record("provider_local_changed", details, risk=1)
-                    self._check_version(provider.name, address, port)
+                    self._check_version(provider.name, address, port, provider.models)
                 self._local_states[provider.name] = provider.upstream
             self._note_moves()
         except Exception:
             logger.exception("recording where the local providers are failed")
 
-    def _check_version(self, name: str, address: str, port: int) -> None:
-        """Ask the Ollama of the local provider ``name`` its version, on a thread of its own
-        (the start never waits for it), and record what it says."""
-        if self._ask_version is None:
+    def _check_version(
+        self, name: str, address: str, port: int, models: tuple[str, ...] = ()
+    ) -> None:
+        """Ask the Ollama of the local provider ``name`` its version and then the context of
+        its ``models``, on a thread of its own (the start never waits for it), and record what
+        it says. A newer ask for the same provider (it moved) ends the older one."""
+        if self._ask_version is None and self._ask_context is None:
             return
+        round_ = self._context_rounds.get(name, 0) + 1
+        self._context_rounds[name] = round_
         if not self._thread:
-            self._tell_version(name, address, port)
+            self._ask_local(name, address, port, models, round_)
             return
         threading.Thread(
-            target=self._tell_version,
-            args=(name, address, port),
+            target=self._ask_local,
+            args=(name, address, port, models, round_),
             name=f"ollama-version-{name}",
             daemon=True,
         ).start()
+
+    def _ask_local(
+        self, name: str, address: str, port: int, models: tuple[str, ...], round_: int
+    ) -> None:
+        self._tell_version(name, address, port)
+        self._tell_context(name, address, port, models, round_)
+
+    def _tell_context(
+        self, name: str, address: str, port: int, models: tuple[str, ...], round_: int
+    ) -> None:
+        """Ask until one of ``models`` is loaded (CONTEXT_RETRY s apart, CONTEXT_TRIES times),
+        then ``system/provider_local_context`` (risk 2 and an alert when one has less context
+        than the agent needs). Gives up with ``{known: false}``; ends at the stop or when a newer
+        ask for the provider began. Never raises."""
+        ask = self._ask_context
+        models = tuple(dict.fromkeys(models))[:MAX_CONTEXT_MODELS]
+        if ask is None or not models:
+            return
+        try:
+            for attempt in range(CONTEXT_TRIES):
+                if attempt and self._wait_closing(CONTEXT_RETRY):
+                    return
+                if self._context_rounds.get(name) != round_:
+                    return  # it moved: the newer ask says it
+                try:
+                    loaded = ask(address, port)
+                except LocalModelError as error:
+                    logger.info("local provider %s: %s", name, error)
+                    continue
+                found = {m: c for m in models if (c := context_of(loaded, m)) is not None}
+                if found:
+                    self._say_context(name, found)
+                    return
+            self._record(
+                "provider_local_context",
+                {"provider": name, "models": list(models), "known": False},
+            )
+        except Exception:
+            logger.exception("asking the local provider %s its context failed", name)
+
+    def _wait_closing(self, seconds: float) -> bool:
+        """Wait ``seconds`` (the injected sleep without a thread: the tests); True if the
+        Egress is stopping."""
+        if self._thread:
+            return self._closing.wait(seconds)
+        self._sleep(seconds)
+        return self._closing.is_set()
+
+    def _say_context(self, name: str, found: Mapping[str, int]) -> None:
+        need = self._context_need
+        low = {m: c for m, c in sorted(found.items()) if need is not None and c < need.tokens}
+        details: dict[str, Any] = {
+            "provider": name, "contexts": dict(sorted(found.items())), "known": True,
+            "low": bool(low),
+        }  # fmt: skip
+        if need is not None:
+            details["needed"] = need.tokens
+            details["agent"] = need.agent
+        event = self._record("provider_local_context", details, risk=2 if low else 0)
+        if not low or need is None:
+            return
+        model, context = min(low.items(), key=lambda item: item[1])
+        logger.warning(
+            "local provider %s: Ollama gives %s a context of %d tokens; %s needs %d. Set "
+            "OLLAMA_CONTEXT_LENGTH=%d and restart Ollama", name, model, context, need.agent,
+            need.tokens, need.setting,
+        )  # fmt: skip
+        self._alert(
+            AlertLevel.WARNING,
+            f"El Ollama de {name} tiene poco contexto",
+            f"Tu Ollama tiene {_thousands(context)} de contexto para {model}; {need.agent} "
+            f"necesita {_thousands(need.tokens)}: el modelo no verá sus herramientas ni sus "
+            "instrucciones, porque Ollama corta en silencio lo que no cabe. Pon "
+            f"OLLAMA_CONTEXT_LENGTH={need.setting} y reinicia Ollama (en el Mac: `launchctl "
+            f"setenv OLLAMA_CONTEXT_LENGTH {need.setting}`, y cierra y abre Ollama). Más "
+            "contexto pide más memoria.",
+            event,
+        )
 
     def _tell_version(self, name: str, address: str, port: int) -> None:
         """``system/provider_local_ready`` (risk 2 and an alert when it is older than the
@@ -898,6 +1005,11 @@ class Egress:
     def _alert(self, level: AlertLevel, title: str, body: str, event: Event | None) -> None:
         if self._hooks is not None:
             self._hooks.alert(level, title, body, event)
+
+
+def _thousands(number: int) -> str:
+    """4096 as "4.096", as the owner reads numbers."""
+    return f"{number:,}".replace(",", ".")
 
 
 def _upstreams(policy: Policy) -> dict[str, tuple[str, int]]:

@@ -1903,3 +1903,23 @@ recorded = "yes"
 risk = "n/a"
 recoverable = "n/a"
 held = "n/a"
+
+[[scenario]]
+id = "retraso-del-hilo-de-espacio"
+name = "Aprovechar un retraso del hilo de espacio"
+story = """El hilo que vigila el espacio llega tarde (el Mac sin aire con un modelo local). El \
+agente se congela de verdad y, si el retraso es la única causa, sigue solo en cuanto el hilo \
+vuelve a comprobar, tras un sync, con todo en verde (space_resume {by: space_thread}). Mientras \
+el hilo va tarde, el volumen se llena, para que la pausa se quite con una lectura vieja: la \
+relectura tras el sync lo ve y la pausa queda manual hasta `backtide seguir`. De la última \
+comprobación a la congelación no pasan más de 3 s y un tick. Y el tercer retraso en 10 minutos \
+deja la pausa manual desde el principio."""
+inspired_by = "La primera prueba real con Ollama: el hilo de espacio llegó 4,1 s tarde"
+invariants = [2, 7]
+status = "ready"
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "2"
+recoverable = "yes"
+held = "n/a"

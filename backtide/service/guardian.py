@@ -42,7 +42,12 @@ says something changed, and stops it. Design: docs/19-diseno-t04.md, section 3.
   again; confirmed, the pause opens (``system/space_pause``, an alert that names what holds the
   space); not confirmed, the agent is thawed if nothing else keeps it paused. A watchdog
   (``check_watchdog``, no I/O) freezes the agent if the space thread has not checked for 3 s.
-  Resuming is manual: ``resume()`` (``backtide seguir``) refuses while a condition stands. A pause
+  Resuming is manual: ``resume()`` (``backtide seguir``) refuses while a condition stands. The
+  one exception is a pause whose only cause is that lateness (reason ``late``, from the
+  founder's first real Ollama test): the space thread lifts it itself as soon as it checks
+  again, after a sync, and finds everything clear (``space_resume {by: space_thread}``). A
+  real condition seen meanwhile, the person's pause, a freeze that failed or the third late
+  check in 10 minutes keep it manual. A pause
   survives the service: at boot the open ones are read back from the black box and the agent
   stays stopped until ``backtide seguir``. If freezing fails, the agent is killed.
 
@@ -179,7 +184,20 @@ ALERT_EXCERPT_CHARS = 300
 MAX_REQUESTER_CHARS = 64
 # The pause reasons that are about space or the black box: a rewind that ends green clears them
 # and starts the agent (docs/19, section 4). Any other reason ("user", T09) keeps it stopped.
-SPACE_REASONS = frozenset({"space", "rewind_no_space", "blackbox"})
+SPACE_REASONS = frozenset({"space", "rewind_no_space", "blackbox", "late"})
+# The pause of a late space check (docs/19, section 5): the space thread lifts it itself once
+# it checks again and everything is clear, unless lateness repeats: the LATE_MANUAL_AFTER-th
+# late check within LATE_WINDOW seconds opens a manual pause ("space") instead.
+LATE_REASON = "late"
+LATE_WINDOW = 600.0
+LATE_MANUAL_AFTER = 3
+# ... and, against lateness spaced out on purpose (security review), more than LATE_HOUR_MAX late
+# checks within LATE_HOUR seconds too.
+LATE_HOUR = 3600.0
+LATE_HOUR_MAX = 6
+# A late pause the space thread has not lifted after this many seconds (a hung sync) stops
+# lifting by itself and is told as an error: `backtide seguir` decides.
+LATE_STUCK_AFTER = 60.0
 # Without a space gate (no cap configured), the start after a rewind checks only that the
 # workspace has its cap (P5) and that the signals could be read at all (P4), as before T04d-2.
 _CHECKED_WITHOUT_SPACE_GATE = frozenset({"P4", "P5"})
@@ -420,12 +438,15 @@ class _Blind:
 
 @dataclass(frozen=True)
 class _Held:
-    """What ``_freeze`` did to the agent."""
+    """What ``_freeze`` did to the agent. ``epoch``: the state epoch right after this call froze
+    it (None if it did not freeze it itself), so a later thaw knows the freeze is still that one."""
 
     frozen: bool
     pause_error: Exception | None
     killed: bool
     kill_error: JailError | None
+    epoch: int | None = None
+    armed: bool = False  # it is a late pause the space thread may lift (``_late_epoch`` set)
 
 
 @dataclass(frozen=True)
@@ -558,6 +579,12 @@ class Guardian:
         self._next_space_report = 0.0
         self._bb_streak = 0  # appends that failed in a row (P7)
         self._bb_failing_since: float | None = None
+        self._lates: deque[float] = deque()  # the watchdog's freezes in the last LATE_WINDOW s
+        # The open late pause the space thread may lift: the state epoch of its freeze and the
+        # seq of its space_pause (under freeze_lock). None: there is none to lift.
+        self._late_epoch: int | None = None
+        self._late_pause_seq: int | None = None
+        self._late_since: float | None = None  # when that freeze was made (LATE_STUCK_AFTER)
 
         self._bridge = LogBridge(self._on_log)
         self._stopped = False  # the agent really stopped
@@ -883,14 +910,24 @@ class Guardian:
 
     def _open_pause_reasons(self) -> set[str]:
         """The reasons of the pauses no ``space_resume`` closed: every ``system/space_pause``
-        after the newest ``system/space_resume``. Fails closed: a black box that cannot be read
-        here counts as an open pause."""
+        after the newest ``system/space_resume`` of the person or a rewind. One of the space
+        thread (``by: space_thread``, a late pause lifted) closes only the late pause it names.
+        Fails closed: a black box that cannot be read here counts as an open pause."""
         try:
-            resumed = self._box.events(
-                source="system", action="space_resume", newest_first=True, limit=1
-            )
-            since = resumed[0].seq if resumed else None
+            since = self._last_full_resume()
             pauses = self._box.events(source="system", action="space_pause", since_seq=since)
+            lifted = {
+                event.details.get("pause")
+                for event in self._box.events(
+                    source="system", action="space_resume", since_seq=since
+                )
+                if event.details.get("by") == "space_thread"
+            }
+            pauses = [
+                event
+                for event in pauses
+                if not (event.seq in lifted and event.details.get("reasons") == [LATE_REASON])
+            ]
         except BlackBoxError as error:
             logger.error(
                 "cannot read the open pauses from the black box, so the agent stays paused: %s",
@@ -907,6 +944,25 @@ class Guardian:
         if self._user_pause_open():
             reasons.add("user")
         return reasons
+
+    def _last_full_resume(self) -> int | None:
+        """The seq of the newest ``space_resume`` that closed every pause (the person's or a
+        rewind's; not the space thread's, which closes only its own), or None."""
+        before: int | None = None
+        while True:
+            page = self._box.events(
+                source="system",
+                action="space_resume",
+                before_seq=before,
+                newest_first=True,
+                limit=100,
+            )
+            for event in page:
+                if event.details.get("by") != "space_thread":
+                    return event.seq
+            if len(page) < 100:
+                return None
+            before = page[-1].seq
 
     def _user_pause_open(self) -> bool:
         """The person's pause (T09) is open unless a ``system/user_resume`` says it closed the
@@ -965,7 +1021,12 @@ class Guardian:
                 {"requested_by": "boot", "agent": "stopped", "carried_over": True}, risk=1
             )
             event = event or user_event
-        why = "por falta de espacio" if space_reasons else ""
+        whys = []
+        if space_reasons - {LATE_REASON}:
+            whys.append("por falta de espacio")
+        if LATE_REASON in space_reasons:
+            whys.append("porque el hilo de espacio llegó tarde")
+        why = " y ".join(whys)
         if "user" in reasons:
             why = (why + " y " if why else "") + "porque lo pediste tú (/pausar)"
         self._alert(
@@ -1451,14 +1512,28 @@ class Guardian:
         return found
 
     def _pause(
-        self, violations: Sequence[Violation], *, freeze: bool, frozen_already: bool = False
-    ) -> None:
+        self,
+        violations: Sequence[Violation],
+        *,
+        freeze: bool,
+        frozen_already: bool = False,
+        extra: dict[str, Any] | None = None,
+        told: Callable[["_Held"], tuple[AlertLevel, str, str]] | None = None,
+        arm_late: bool = False,
+    ) -> tuple["_Held", Event | None]:
         """A condition forbids the agent to run: freeze it if it is running, remember why, say
         so. If it cannot be frozen it is killed: an agent that should be paused and is not is
-        the one failure that cannot be left. Resuming is manual (``resume``). ``frozen_already``:
-        the space thread froze it to confirm the condition."""
+        the one failure that cannot be left. Resuming is manual (``resume``), but for a late
+        pause (``check_watchdog``). ``frozen_already``: the space thread froze it to confirm the
+        condition. ``extra`` goes into the event; ``told`` gives the alert's level, title and
+        body from what ``_freeze`` did, when the agent was frozen (a late check: it is not about
+        space). ``arm_late``: a late pause the space thread may lift, if this call froze the
+        agent itself (``_freeze``); the event says whether it can (``auto_resume``). Returns what
+        was done and the event."""
         reasons = {violation.reason for violation in violations}
-        held = self._freeze(reasons, freeze=freeze, frozen_already=frozen_already)
+        held = self._freeze(
+            reasons, freeze=freeze, frozen_already=frozen_already, arm_late=arm_late
+        )
         pause_error = held.pause_error
         killed, kill_error = held.killed, held.kill_error
         # `held.frozen` means "this call froze it"; the event says what the agent is. Frozen by
@@ -1470,7 +1545,10 @@ class Guardian:
             "conditions": [violation.code for violation in violations],
             "reasons": sorted(reasons),
             "frozen": frozen,
+            **(extra or {}),
         }
+        if arm_late:
+            details["auto_resume"] = held.armed
         if pause_error is not None:
             details["pause_error"] = _short(pause_error)
             details["killed"] = killed
@@ -1478,6 +1556,10 @@ class Guardian:
         event = self._record(
             "system", "space_pause", details=details, risk=3 if failed_freeze else 2
         )
+        if held.armed and event is not None:
+            with self.freeze_lock:
+                if self._late_epoch == held.epoch:
+                    self._late_pause_seq = event.seq  # the boot reads which pause it closed
         if killed:
             self._record(
                 "system",
@@ -1496,9 +1578,17 @@ class Guardian:
             outcome = "paused"
         else:
             outcome = "killed" if killed else "still_running"
-        key = "pause:" + ",".join(sorted(v.code for v in violations)) + ":" + outcome
+        late = ":late" if extra and extra.get("late") else ""
+        late += ":auto" if held.armed else ""
+        key = (
+            "pause:" + ",".join(sorted(v.code for v in violations)) + ":"
+            + ",".join(sorted(reasons)) + late + ":" + outcome
+        )  # fmt: skip
         if outcome != "still_running" and not self._due(key, REPEAT_ALERT_EVERY):
-            return  # every pause is recorded; the alert, once an hour per set and outcome
+            return held, event  # every pause is recorded; the alert, once an hour per set
+        if told is not None and pause_error is None:
+            self._alert(*told(held), event)
+            return held, event
         body = self._pause_body(violations)
         if pause_error is None:
             paused = frozen or self.agent_state is AgentState.FROZEN
@@ -1526,17 +1616,23 @@ class Guardian:
                 + body,
                 event,
             )
+        return held, event
 
-    def _freeze(self, reasons: set[str], *, freeze: bool, frozen_already: bool) -> "_Held":
+    def _freeze(
+        self, reasons: set[str], *, freeze: bool, frozen_already: bool, arm_late: bool = False
+    ) -> "_Held":
         """Open ``reasons`` and, with ``freeze``, freeze an agent that can run code, in one
         hold of ``freeze_lock`` (so the space thread never thaws in between). Being stopped,
         or impossible to freeze, it is killed instead: a `docker stop` would wake a frozen
         one, and an agent that should be paused and is not is the one failure that cannot be
         left. Never waits for ``agent_lock``. ``frozen_already``: the space thread froze it to
-        confirm a condition."""
+        confirm a condition. ``arm_late``: if this call froze it and the only reason is
+        ``late``, the space thread may lift that pause (``_late_epoch``, in the same hold)."""
         frozen = False
         pause_error: Exception | None = None
         stopping = False
+        epoch: int | None = None
+        armed = False
         with self.freeze_lock:
             self._pause_reasons |= reasons
             if "user" in reasons:
@@ -1551,9 +1647,15 @@ class Guardian:
                 except Exception as error:
                     pause_error = error
                 else:
+                    self._thaw_to = self._agent_state  # what a late pause goes back to
                     self._agent_state = AgentState.FROZEN
                     self._state_epoch += 1
                     frozen = True
+                    epoch = self._state_epoch
+                    if arm_late and self._pause_reasons == {LATE_REASON}:
+                        self._late_epoch, self._late_pause_seq = epoch, None
+                        self._late_since = self._mono()
+                        armed = True
         if pause_error is not None and self._already_paused():
             pause_error, frozen = None, True
             self._set_state(AgentState.FROZEN)
@@ -1566,7 +1668,7 @@ class Guardian:
             killed = kill_error is None
             if killed:
                 self._set_state(AgentState.STOPPED)
-        return _Held(frozen, pause_error, killed, kill_error)
+        return _Held(frozen, pause_error, killed, kill_error, epoch, armed)
 
     def _already_paused(self) -> bool:
         """``docker pause`` failed: maybe because the agent is frozen already (that counts)."""
@@ -1633,12 +1735,16 @@ class Guardian:
         if blind is not None:
             violations.append(blind)
         if not violations:
+            self._lift_late_pause()
             self._warn_low(warnings)
             self._report_transients()
             return
         epoch = self._freeze_to_confirm()
         if epoch is None:
-            return  # stopped or already frozen: nothing runs, an open pause stays open
+            # Stopped or already frozen: nothing runs, an open pause stays open. A late pause
+            # that meets a confirmed condition becomes a manual one.
+            self._late_pause_meets_a_condition()
+            return
         if epoch is False:
             self._pause(violations, freeze=True)  # could not freeze: tries again, then kills
             return
@@ -1653,9 +1759,13 @@ class Guardian:
         """One pass of the watchdog (every second, no I/O but the freeze): if the space thread
         has not finished a check for more than 3 s while the agent can run code, that is P4,
         and the agent is frozen. A stopped or frozen agent runs nothing, so a late check is
-        harmless then."""
+        harmless then. The pause's reason is ``late`` (the space thread lifts it once it checks
+        again, ``_lift_late_pause``) unless lateness repeats (the LATE_MANUAL_AFTER-th late
+        check in LATE_WINDOW s, or more than LATE_HOUR_MAX in LATE_HOUR s): then ``space``,
+        manual like any other. A late pause not lifted after LATE_STUCK_AFTER s is escalated."""
         if self._space is None or not self._serving:
             return
+        self._escalate_stuck_late()
         with self.freeze_lock:
             can_run = self._agent_state in _CAN_RUN_CODE
             last = self._last_check if self._last_check is not None else self._serving_since
@@ -1665,8 +1775,169 @@ class Guardian:
         if age is not None and 0 <= age <= self._space_config.stale_after:
             return
         late = "ninguna comprobación todavía" if age is None else f"{age:.1f} s sin comprobar"
-        logger.error("the space thread is late (%s): the agent is frozen", late)
-        self._pause([_Blind(f"el hilo de espacio va con retraso ({late})")], freeze=True)
+        now = self._mono()
+        self._lates.append(now)
+        while self._lates and not 0 <= now - self._lates[0] <= LATE_HOUR:
+            self._lates.popleft()
+        recent = sum(1 for moment in self._lates if now - moment <= LATE_WINDOW)
+        hourly = len(self._lates)
+        auto = recent < LATE_MANUAL_AFTER and hourly <= LATE_HOUR_MAX
+        # Info, not error: the space_pause and its own notice say it (the log bridge would
+        # send a second, English alert).
+        logger.info(
+            "the space thread is late (%s): the agent is frozen (late %d times in 10 min, %d in "
+            "an hour)", late, recent, hourly,
+        )  # fmt: skip
+        blind = _Blind(
+            f"el hilo de espacio va con retraso ({late})", reason=LATE_REASON if auto else "space"
+        )
+        extra = {
+            "late": True,
+            "age_s": None if age is None else round(age, 1),
+            "lates": recent,
+            "lates_hour": hourly,
+        }
+
+        def told(held: _Held) -> tuple[AlertLevel, str, str]:
+            return self._late_notice(held.armed, late, recent, hourly)
+
+        self._pause([blind], freeze=True, extra=extra, told=told, arm_late=True)
+
+    def _late_notice(
+        self, lifts: bool, late: str, recent: int, hourly: int
+    ) -> tuple[AlertLevel, str, str]:
+        """What a late freeze tells: that the agent goes on by itself only when this pause
+        really can (``lifts``, decided by ``_freeze``), otherwise that it needs `seguir`."""
+        limit = f"{self._space_config.stale_after:.0f} s"
+        if lifts:
+            return (
+                AlertLevel.WARNING,
+                "El agente se ha congelado un momento",
+                f"El hilo que vigila el espacio ha llegado tarde ({late}; el límite es {limit}), "
+                "seguramente porque el ordenador va muy cargado (un modelo local pensando, por "
+                "ejemplo). Sin esa comprobación el agente no puede seguir, así que está "
+                "congelado. En cuanto el hilo vuelva a comprobar y el espacio esté bien, sigue "
+                f"solo, y queda grabado. Si se repite {LATE_MANUAL_AFTER} veces en 10 minutos (o "
+                f"más de {LATE_HOUR_MAX} en una hora), o si el hilo no vuelve en "
+                f"{LATE_STUCK_AFTER:.0f} s, se queda en pausa hasta `backtide seguir`.",
+            )
+        if recent >= LATE_MANUAL_AFTER:
+            why = f"Ha llegado tarde {recent} veces en 10 minutos"
+        elif hourly > LATE_HOUR_MAX:
+            why = f"Ha llegado tarde {hourly} veces en una hora"
+        else:
+            why = "Otra pausa o congelación coincidió con el retraso"
+        return (
+            AlertLevel.ERROR,
+            "El agente está pausado",
+            f"El hilo que vigila el espacio ha llegado tarde ({late}; el límite es {limit}). "
+            f"{why}, así que esta pausa no se quita sola: el agente sigue congelado aunque haya "
+            "espacio. Suele ser el ordenador muy cargado (un modelo local pensando, por ejemplo). "
+            "Cuando esté más tranquilo, ejecuta `backtide seguir` (o /seguir en Telegram).",
+        )
+
+    def _escalate_stuck_late(self) -> None:
+        """A late pause the space thread has not lifted in LATE_STUCK_AFTER s (a hung ``btrfs
+        filesystem sync``, say): it stops lifting by itself (disarmed in one hold of
+        ``freeze_lock``, so the space thread cannot lift it meanwhile), its pause opens as
+        ``space`` and the person is told, once, to run `backtide seguir`."""
+        with self.freeze_lock:
+            if not self._late_pause_open() or self._late_since is None:
+                return
+            stuck = self._mono() - self._late_since
+            if 0 <= stuck <= LATE_STUCK_AFTER:
+                return
+            self._late_epoch = self._late_pause_seq = self._late_since = None
+        logger.info("the space thread has not checked for %.0f s: the pause is manual now", stuck)
+        self._pause(
+            [_Blind(f"el hilo de espacio no ha vuelto a comprobar en {stuck:.0f} s")],
+            freeze=True,
+            frozen_already=True,
+            extra={"late": True, "stuck": True, "stuck_s": round(stuck)},
+            told=lambda held: (
+                AlertLevel.ERROR,
+                "El agente sigue congelado: el hilo de espacio no vuelve",
+                f"El hilo que vigila el espacio lleva {stuck:.0f} s sin volver a comprobar "
+                "(puede que un `btrfs filesystem sync` se haya quedado colgado). El agente sigue "
+                "congelado y ya no seguirá solo. Cuando el ordenador responda, ejecuta "
+                "`backtide seguir` (o /seguir en Telegram).",
+            ),
+        )
+
+    @property
+    def late_pause_lifts(self) -> bool:
+        """Whether the open pause is a late one the space thread will still lift by itself
+        (`/estado` says so); False for any other pause, or none."""
+        with self.freeze_lock:
+            return self._late_pause_open()
+
+    def _late_pause_open(self) -> bool:
+        """The only open pause is a late one the space thread may lift: the agent still frozen
+        by that very freeze, and no other reason. Called with ``freeze_lock`` held."""
+        return (
+            self._late_epoch is not None
+            and self._pause_reasons == {LATE_REASON}
+            and self._agent_state is AgentState.FROZEN
+            and self._state_epoch == self._late_epoch
+        )
+
+    def _lift_late_pause(self) -> None:
+        """The space thread checked and found nothing: if the only pause is a late one, read
+        again after a sync (as `backtide seguir` does) and, all clear, thaw the agent and close
+        the pause (``space_resume {by: space_thread}``). A red reading leaves it frozen (the next
+        pass confirms it); a thaw that fails opens a manual pause."""
+        with self.freeze_lock:
+            if not self._late_pause_open():
+                return
+        if self._space_verdict():
+            return
+        thaw_error: Exception | None = None
+        with self.freeze_lock:
+            if not self._late_pause_open():
+                return
+            pause_seq = self._late_pause_seq
+            try:
+                self._jail.unpause()
+            except Exception as error:
+                thaw_error = error
+            else:
+                self._pause_reasons.discard(LATE_REASON)
+                self._agent_state = self._thaw_to
+                self._state_epoch += 1
+            self._late_epoch = self._late_pause_seq = self._late_since = None
+        if thaw_error is not None:
+            logger.error("cannot thaw the agent after a late space check: %s", thaw_error)
+            self._pause([_Blind("no se ha podido descongelar al agente")], freeze=False)
+            return
+        logger.info("the space thread checks again and all is clear: the agent is thawed")
+        details = {
+            "by": "space_thread", "reasons": [LATE_REASON], "agent": "thawed", "pause": pause_seq,
+        }  # fmt: skip
+        try:
+            event = self._record("system", "space_resume", details=details)
+        except Exception:  # the agent runs already: it must be said, never swallowed
+            logger.exception("recording that the late pause was lifted failed")
+            event = None
+        if event is None:
+            self._alert(
+                AlertLevel.ERROR,
+                "El agente sigue, pero no se ha grabado",
+                "El hilo de espacio ha vuelto a comprobar y todo está bien, así que el agente está "
+                "en marcha otra vez. Pero la caja negra no ha grabado que se quitó la pausa "
+                "(`space_resume`): si backtide se reinicia, el agente se quedará en pausa hasta "
+                "`backtide seguir`. Mira por qué falla la caja negra.",
+            )
+
+    def _late_pause_meets_a_condition(self) -> None:
+        """A reading was red with the agent frozen by a late pause: confirm it (a sync and a
+        new reading, the agent is frozen already) and, if it stands, open the pause for it.
+        The pause is then manual: its reason is not only ``late`` any more."""
+        with self.freeze_lock:
+            if not self._late_pause_open():
+                return
+        confirmed = self._confirm()
+        if confirmed:
+            self._pause(confirmed, freeze=True, frozen_already=True)
 
     def _sync_if_due(self) -> Violation | None:
         """Every ``SYNC_EVERY`` seconds, if the workspace changed since the last commit, commit:

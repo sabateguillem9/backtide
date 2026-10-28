@@ -67,7 +67,14 @@ from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
 from backtide.service.holds import HoldTimings, HoldWatch
-from backtide.service.local_models import LocalModelError, Lookup, ollama_version, resolve_all
+from backtide.service.local_models import (
+    ContextNeed,
+    LocalModelError,
+    Lookup,
+    ollama_contexts,
+    ollama_version,
+    resolve_all,
+)
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.price_update import PriceUpdater
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
@@ -425,6 +432,9 @@ def build_egress(
         budget=budget,
         prices=prices,
         ask_version=ollama_version,  # T20-4: from the VM, never through the proxy
+        # How much context the Ollama gives its models (GET /api/ps), against the agent's need.
+        ask_context=ollama_contexts,
+        context_need=ContextNeed.for_profile(agent.config.profile.name),
     )
 
 
