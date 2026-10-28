@@ -39,7 +39,8 @@ The server (inside the service):
   ``via``: ``cli`` or ``web``), and the lists ``{"cmd": "trusted"}`` and ``{"cmd": "batches"}``.
   The shell mode (T17a-4, docs/34 section 7, ``backtide.service.shell``): ``{"cmd": "shell",
   "kind": "session" | "task", "continue": bool}`` (`backtide entrar` and `tarea`: recorded, and
-  the container, user and folder for ``docker exec`` come back), ``{"cmd": "import", "name":
+  the container, user and folder for ``docker exec`` come back; a task may add ``"prompt"``, at
+  most 200 characters, recorded struck), ``{"cmd": "import", "name":
   ..., "source": ..., "files": ..., "bytes": ..., "replace": bool}`` (`backtide importar`, the
   same with the import's counts recorded) and ``{"cmd": "export", "dest": ...}`` (`backtide
   exportar`: the service copies the agent's work folder into the owner's new folder).
@@ -92,11 +93,13 @@ from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
 from backtide.service.shell import (
+    PROMPT_RECORDED,
     REPO_RE,
     ExportOutcome,
     ExportStatus,
     ShellOutcome,
     ShellStatus,
+    recorded_prompt,
 )
 from backtide.service.spend import CAP_SHAPE, CapOutcome, check_cap
 from backtide.service.trust import TRUST_ID_RE
@@ -485,11 +488,22 @@ class ControlServer:
     def _shell(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         details: dict[str, Any] | None = None
         if request["cmd"] == "shell":
-            if set(request) != {"cmd", "kind", "continue"}:
-                raise _BadRequest("Una petición de shell lleva `cmd`, `kind` y `continue`.")
+            if set(request) - {"prompt"} != {"cmd", "kind", "continue"}:
+                raise _BadRequest(
+                    "Una petición de shell lleva `cmd`, `kind` y `continue` (y, una tarea, "
+                    "`prompt`)."
+                )
             kind, resume = request["kind"], request["continue"]
             if kind not in SHELL_REQUEST_KINDS or not isinstance(resume, bool):
                 raise _BadRequest("`kind` es session o task, y `continue` es true o false.")
+            if "prompt" in request:
+                prompt = request["prompt"]
+                if kind != "task" or not isinstance(prompt, str) or len(prompt) > PROMPT_RECORDED:
+                    raise _BadRequest(
+                        f"`prompt` es de una tarea: un texto de {PROMPT_RECORDED} caracteres "
+                        "como mucho."
+                    )
+                details = recorded_prompt(prompt)  # struck again here: the record is ours
         else:
             if set(request) != {"cmd", *IMPORT_KEYS}:
                 raise _BadRequest(
@@ -1868,6 +1882,7 @@ def ask_shell(
     *,
     resume: bool = False,
     import_details: Mapping[str, Any] | None = None,
+    prompt: str | None = None,
     wait: float = WAIT_FOR_SERVICE,
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
@@ -1876,12 +1891,16 @@ def ask_shell(
     """Ask the service whether `backtide entrar` (``kind`` "session"), `tarea` ("task") or
     `importar` ("import", with ``import_details``: name, source, files, bytes, replace, and the
     secrets it left out or took) or `exportar --git` ("bundle": the agent makes it) may run
-    now, recorded. Returns ``ok``, ``outcome``, ``message`` and, when ``ok``, the ``container``,
-    ``user`` and ``workdir`` for docker exec, checked. Same retries and errors as ask_rewind."""
+    now, recorded. A task's ``prompt`` goes into the record struck and cut
+    (``backtide.service.shell.recorded_prompt``, on both sides). Returns ``ok``, ``outcome``,
+    ``message`` and, when ``ok``, the ``container``, ``user`` and ``workdir`` for docker exec,
+    checked. Same retries and errors as ask_rewind."""
     if kind == "import":
         request: dict[str, Any] = {"cmd": "import", **dict(import_details or {})}
     elif kind in SHELL_REQUEST_KINDS:
         request = {"cmd": "shell", "kind": kind, "continue": resume}
+        if kind == "task" and prompt is not None:
+            request["prompt"] = recorded_prompt(prompt)["prompt"]
     else:
         raise ValueError(f"unknown kind {kind!r}")
     raw = _ask(

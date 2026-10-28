@@ -3,11 +3,16 @@ thinking with Claude through the proxy, the gate asking on Telegram and on the w
 
     python -m scripts.demo.probar up [--modelo <id>] [--internet-falso] [--perfil claude-code]
                                      [--local <Ollama model>]
-    python -m scripts.demo.probar pedir <message in base64>          # OpenClaw
-    python -m scripts.demo.probar entrar [--continue]                # Claude Code (T17a-4)
+    python -m scripts.demo.probar pedir <message in base64>          # = tarea (D27)
+    python -m scripts.demo.probar entrar [--continue]
     python -m scripts.demo.probar tarea <message in base64> [--continue]
     python -m scripts.demo.probar importar <folder> [--reemplazar] [--incluir-secretos]
     python -m scripts.demo.probar exportar <new folder> [--git <repository folder>]
+
+Whatever the agent, the owner talks to it with backtide's own `tarea` and `entrar` (backtide/
+shell_cli.py, D27), through the running service, the same way an installed backtide does:
+OpenClaw gets a turn of its CLI through its Gateway. `pedir` is `tarea`; `entrar`, `importar`
+and `exportar` are for Claude Code only (backtide itself says so for `entrar`).
 
 With ``--perfil claude-code`` the agent is Claude Code (backtide/jail/profiles/claude_code.py)
 instead of OpenClaw: the same volume, proxy, gate, Settings page and Telegram, and the owner
@@ -92,7 +97,6 @@ WORKSPACE_LIMIT = 192 * 1024**2  # the demo's cap: enough for a test, and a full
 # the start and froze the agent for metadata (seen in the VM). Sparse, so it costs what it holds.
 IMAGE_SIZE = 8 * demo.GIB
 CYCLE_INTERVAL = 10  # seconds between "did anything change?" checks (the demo's is 5)
-TURN_TIMEOUT = 660.0  # OpenClaw's own turn timeout is 600 s; a held write can wait 90 s in it
 MAX_MESSAGE_BYTES = 16 * 1024
 OPENCLAW = "openclaw"
 CLAUDE_CODE = "claude-code"
@@ -451,7 +455,7 @@ def command_up(
 
 
 TALK = {
-    OPENCLAW: 'Para hablarle: make probar-pedir MSG="...".',
+    OPENCLAW: 'Para hablarle: make probar-pedir MSG="...", la web (make probar-web) o Telegram.',
     CLAUDE_CODE: "Para trabajar con él: make probar-entrar (en tu terminal) o make probar-tarea "
     'MSG="...". Para darle código: make probar-importar RUTA=...; para sacarlo: make '
     "probar-exportar RUTA=....",
@@ -480,43 +484,30 @@ def decode_message(encoded: str) -> str:
     return message
 
 
-def agent_turn_argv(message: str) -> list[str]:
-    """One turn of OpenClaw's own CLI through its Gateway, in its main session (so one message
-    remembers the ones before): what `openclaw agent --message` does, as the agent's user."""
-    return ["node", "openclaw.mjs", "agent", "--agent", "main", "--message", message]
-
-
 def command_pedir(paths: Paths, encoded: str) -> int:
+    """`make probar-pedir MSG=...`: the message to the running test's agent, through backtide's
+    own `backtide tarea` (D27): the one way to talk to it, as an installed backtide does."""
     message = decode_message(encoded)
     demo.require_demo_mount(paths)
-    config = _config(paths)
-    if config.agent_profile.name != OPENCLAW:
-        raise demo.DemoError(
-            'esta prueba es con Claude Code: usa make probar-tarea MSG="..." o make probar-entrar'
-        )
-    jail = AgentJail(replace(config.jail_config(), allow_shared_ids=True))
-    if not jail.is_running():
-        raise demo.DemoError("el agente no está en marcha: arranca `make probar` en otra terminal")
+    _config(paths)  # a test is there, with a config that holds
     if not is_local(paths) and not has_real_key(paths):
         print("Aviso: aún no has puesto la clave de Anthropic en Ajustes (make probar-web).")
-    print(f"Tú: {visible(message, 400)}\nEl agente piensa (con {model_of(paths)})...", flush=True)
-    result = jail.exec(agent_turn_argv(message), timeout=TURN_TIMEOUT)
-    sys.stdout.write("\nEl agente:\n" + jail_docker.sanitize(result.stdout))
-    if result.stderr.strip():
-        sys.stderr.write(jail_docker.sanitize(result.stderr))
-    if result.returncode != 0:
-        raise demo.DemoError(f"OpenClaw terminó con código {result.returncode}")
-    return 0
+    model = model_of(paths)
+    thinking = f" (con {model})" if model else ""
+    print(f"Tú: {visible(message, 400)}\nEl agente piensa{thinking}...", flush=True)
+    return command_shell(paths, "tarea", "--", message)
 
 
 def command_shell(paths: Paths, command: str, *argv: str) -> int:
-    """`backtide entrar`, `tarea`, `importar` or `exportar` for the running test (Claude Code):
-    backtide's own commands, through the running service (backtide/shell_cli.py)."""
+    """`backtide entrar`, `tarea`, `importar` or `exportar` for the running test: backtide's own
+    commands, through the running service (backtide/shell_cli.py). `importar` and `exportar`
+    are Claude Code's only; `tarea` is both agents' (D27), and `entrar` is refused by backtide
+    itself for OpenClaw, with what to use instead."""
     demo.require_demo_mount(paths)
-    if _config(paths).agent_profile.name != CLAUDE_CODE:
+    if command in ("importar", "exportar") and _config(paths).agent_profile.name != CLAUDE_CODE:
         raise demo.DemoError(
-            "esta prueba es con OpenClaw: arranca `make probar PERFIL=claude-code` para "
-            'usar Claude Code (con OpenClaw: make probar-pedir MSG="...")'
+            f"esta prueba es con OpenClaw, y `{command}` es para Claude Code: arranca `make "
+            'probar PERFIL=claude-code` (con OpenClaw: make probar-pedir MSG="...")'
         )
     return run_backtide(command, "--config", str(paths.config), *argv)
 
@@ -545,9 +536,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     up.add_argument("--perfil", choices=PROFILES, default=OPENCLAW, help="el agente")
     up.add_argument("--local", help="un modelo de tu Ollama del Mac, en vez de Claude (T20-4)")
-    enter = commands.add_parser("entrar", help="Claude Code en tu terminal")
+    enter = commands.add_parser("entrar", help="el agente en tu terminal")
     enter.add_argument("--continue", dest="resume", action="store_true")
-    task = commands.add_parser("tarea", help="una tarea a Claude Code, y su respuesta")
+    task = commands.add_parser("tarea", help="una tarea al agente, y su respuesta")
     task.add_argument("mensaje", help="la tarea, en base64 (lo hace el Makefile)")
     task.add_argument("--continue", dest="resume", action="store_true")
     bring = commands.add_parser("importar", help="una carpeta de la VM al agente")
@@ -557,7 +548,7 @@ def build_parser() -> argparse.ArgumentParser:
     take = commands.add_parser("exportar", help="la carpeta de trabajo del agente, a la VM")
     take.add_argument("ruta")
     take.add_argument("--git", help="solo los commits de ese repositorio, como un bundle")
-    ask = commands.add_parser("pedir", help="un mensaje al agente, y su respuesta")
+    ask = commands.add_parser("pedir", help="un mensaje al agente, y su respuesta (= tarea)")
     ask.add_argument("mensaje", help="el mensaje, en base64 (lo hace el Makefile)")
     commands.add_parser("instantaneas", help="lista las instantáneas")
     rewind = commands.add_parser("rebobinar", help="vuelve a una instantánea")

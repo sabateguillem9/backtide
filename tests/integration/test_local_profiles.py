@@ -10,9 +10,23 @@ For each agent, one turn ends with the fake Ollama's answer and:
 - the black box has its ``llm/request {local: true}`` and nothing toward the virtual name was
   refused (``net/blocked``): what each agent asks for, measured;
 - the service asked that Ollama its version from the VM (``system/provider_local_ready``).
+
+And D27 (the "day 3b" of docs/44): the owner talks to OpenClaw with backtide's own `tarea`
+(backtide/shell_cli.py), the real CLI through the running service: a turn of its CLI through its
+Gateway, recorded first as ``system/agent_shell`` with what was asked, one at a time (a second
+one while the first runs is refused), and stopped at its deadline by the Gateway itself: a later
+effect of the turn (a tool call the fake model sends after the deadline) never happens, even with
+the CLI killed so it cannot ask for an abort. `entrar` is refused for OpenClaw (Claude Code's
+only, for now).
 """
 
 import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,13 +46,16 @@ from tests.integration.ollama_kit import (
     start_fake_ollama,
     with_neighbour,
 )
-from tests.integration.service_kit import Service, run_cli, wait_until
+from tests.integration.service_kit import REPO, Service, run_cli, wait_until
 
 pytestmark = pytest.mark.integration
 
 LOCAL = "ollama"  # the name an owner would write; OpenClaw takes it for its own Ollama plugin
 VIRTUAL = f"{LOCAL}.backtide.internal"
 TURN_TIMEOUT = 360.0
+LATE_SECONDS = (
+    20.0  # how long the fake Ollama holds a T20-LATE call (proxy_fixtures/fake_ollama.py)
+)
 # What a local provider may be asked through the proxy (docs/35, section 6.2, step 4).
 MODEL_PATHS = {
     "/v1/chat/completions",
@@ -196,6 +213,143 @@ def test_openclaw_ends_a_turn_with_the_local_model(openclaw: Lab) -> None:
 
 def test_openclaw_the_service_asked_its_version(openclaw: Lab) -> None:
     check_version_asked(openclaw)
+
+
+def shell_events(lab: Lab, kind: str) -> list:
+    return [e for e in lab.service.events("agent_shell", "system") if e.target == kind]
+
+
+def test_openclaw_answers_backtide_tarea(openclaw: Lab) -> None:
+    """`backtide tarea` with OpenClaw: one turn through its Gateway, the prompt one argument
+    whatever it starts with, the answer printed; recorded first. --continue is the same turn:
+    there is one conversation."""
+    before = len(shell_events(openclaw, "task"))
+    for extra in ((), ("--continue",)):
+        done = run_cli(openclaw.service, "tarea", *extra, "--", "-rf say the phrase")
+        assert done.returncode == 0, (done.stdout[-2000:], done.stderr[-2000:])
+        assert done.stdout.strip() == REPLY_TEXT, done.stdout[-2000:]
+    events = shell_events(openclaw, "task")[before:]
+    assert [e.details["continue"] for e in events] == [False, True]
+    assert {(e.details["prompt"], e.details["slash"]) for e in events} == {
+        ("-rf say the phrase", False)
+    }
+    check_calls(openclaw)
+    # The prompt is the one OpenClaw got, as it was written, never split or read as an option:
+    # its own record of the turn (``finalPromptText``) for the argv `tarea` builds.
+    shell = openclaw.service.config.agent_profile.shell
+    assert shell is not None
+    argv = shell.task_argv("-rf say the phrase; $(id)", seconds=120)
+    turn = openclaw.service.jail.exec(argv, timeout=TURN_TIMEOUT, max_output=8 * 1024 * 1024)
+    assert turn.returncode == 0, turn.stderr[-2000:]
+    assert (
+        json.loads(turn.stdout)["result"]["meta"]["finalPromptText"] == "-rf say the phrase; $(id)"
+    )
+
+
+def start_cli(service: Service, command: str, *args: str) -> subprocess.Popen[str]:
+    """The real `backtide <command>`, as run_cli runs it, but in the background."""
+    return subprocess.Popen(
+        [sys.executable, "-m", "tests.integration.cli_main", command, "--config",
+         str(service.config_path), *args],
+        cwd=REPO,
+        env={**os.environ, "PYTHONPATH": str(REPO), "PYTHONUNBUFFERED": "1"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )  # fmt: skip
+
+
+def last_asked(lab: Lab) -> str:
+    """What the fake model saw last (roles and this turn's text), for a failure's message."""
+    seen = [
+        {"roles": r.get("roles"), "turn": r.get("turn")} for r in lab.ollama.stats()["requests"]
+    ]
+    return json.dumps(seen[-3:], ensure_ascii=False)
+
+
+def late_asked(lab: Lab) -> int:
+    """How many model calls carried a T20-LATE trigger in their last user message."""
+    return sum(1 for r in lab.ollama.stats()["requests"] if r.get("late"))
+
+
+def exists(lab: Lab, path: str) -> bool:
+    return lab.service.jail.exec(["/usr/bin/test", "-e", path]).returncode == 0
+
+
+def test_openclaw_tarea_goes_one_at_a_time_and_the_late_effect_happens_with_time(
+    openclaw: Lab,
+) -> None:
+    """The positive control of the deadline test below: with time to spare, the fake model's
+    late call (after LATE_SECONDS) runs and writes its file. Meanwhile, a second `tarea` is
+    refused, since OpenClaw has one conversation: the check finds the task backtide started
+    (``pgrep -P 0``: started by docker exec)."""
+    tag = uuid.uuid4().hex[:12]
+    first = start_cli(openclaw.service, "tarea", "--minutos", "1", f"T20-LATE-{tag} write it")
+    try:
+        wait_until(
+            lambda: openclaw.ollama.slow()["now"] >= 1,
+            60,
+            "the late call to be held",
+            context=lambda: last_asked(openclaw),
+        )
+        second = run_cli(openclaw.service, "tarea", "say the phrase")
+        assert second.returncode == 1, (second.stdout[-2000:], second.stderr[-2000:])
+        assert "una sola conversación" in second.stderr, second.stderr[-2000:]
+        out, err = first.communicate(timeout=TURN_TIMEOUT)
+    finally:
+        if first.poll() is None:
+            first.kill()
+    assert first.returncode == 0, (out[-2000:], err[-2000:])
+    assert exists(openclaw, f"/workspace/work/tarde-{tag}"), "the late call never ran"
+
+
+def test_openclaw_tarea_is_stopped_at_its_deadline_by_the_gateway(openclaw: Lab) -> None:
+    """--minutos is the turn's own deadline, and the Gateway enforces it. The fake model holds
+    the call LATE_SECONDS (20 s) and then asks the agent to write ``work/tarde-<tag>``; the
+    deadline is 12 s, after any turn's start. The CLI inside is killed (SIGKILL) as soon as the
+    call is held, so it never asks the Gateway to abort: only the deadline can stop the turn.
+    Past the slow call and a margin: no file, no later model call of that turn, and the next
+    `tarea` is not refused as busy. (What the agent itself starts and detaches is not a turn:
+    snapshots and the gate are for that.) Without --timeout the turn would run on in the
+    Gateway and write the file."""
+    tag = uuid.uuid4().hex[:12]
+    late_before = late_asked(openclaw)
+    task = start_cli(openclaw.service, "tarea", "--minutos", "0.2", f"T20-LATE-{tag} write it")
+    try:
+        wait_until(
+            lambda: late_asked(openclaw) > late_before,
+            60,
+            "the late call to be asked",
+            context=lambda: last_asked(openclaw),
+        )
+        held = time.monotonic()
+        killed = openclaw.service.jail.exec(["/usr/bin/pkill", "-KILL", "-f", "openclaw.mjs agent"])
+        assert killed.returncode == 0, "the CLI turn was not running to be killed"
+        out, err = task.communicate(timeout=60)
+    finally:
+        if task.poll() is None:
+            task.send_signal(signal.SIGKILL)
+    assert task.returncode == 1, (out[-2000:], err[-2000:])
+    requests = len(openclaw.local_requests())
+    time.sleep(max(0.0, held + LATE_SECONDS + 8.0 - time.monotonic()))  # and a margin
+    assert not exists(openclaw, f"/workspace/work/tarde-{tag}"), "the turn ran past its deadline"
+    assert len(openclaw.local_requests()) == requests, "the turn asked its model again"
+    assert late_asked(openclaw) == late_before + 1
+    after = run_cli(openclaw.service, "tarea", "say the phrase")
+    assert after.returncode == 0, (after.stdout[-2000:], after.stderr[-2000:])
+    assert after.stdout.strip() == REPLY_TEXT
+
+
+def test_openclaw_backtide_entrar_is_refused(openclaw: Lab) -> None:
+    """No terminal session for OpenClaw in the preview: an always-on agent fed by Telegram and
+    the web could write escape sequences into its terminal UI's tty. Refused before asking the
+    service, pointing to `tarea`, the web and Telegram."""
+    before = len(shell_events(openclaw, "session"))
+    done = run_cli(openclaw.service, "entrar")
+    assert done.returncode == 2, (done.stdout[-2000:], done.stderr[-2000:])
+    assert "solo para Claude Code" in done.stderr and "backtide tarea" in done.stderr
+    assert len(shell_events(openclaw, "session")) == before
 
 
 # --- Claude Code ----------------------------------------------------------------------------------

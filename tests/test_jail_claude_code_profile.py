@@ -16,9 +16,11 @@ from backtide.jail.config import container_env, create_env, docker_create_argv, 
 from backtide.jail.profile import (
     MAX_PROMPT,
     REVIEWED_RESERVED_ENV,
+    TASK_FAILED,
     AgentProfile,
     ProfileError,
     ShellCommands,
+    TaskAnswer,
     check_prompt,
 )
 from backtide.jail.profiles import NAMED, OPENCLAW, claude_code
@@ -88,7 +90,7 @@ def test_claude_code_is_a_named_profile_of_the_shell_mode() -> None:
     assert profile.allow_hosts == ("registry.npmjs.org", "pypi.org", "files.pythonhosted.org")
     assert profile.token_env is None
     assert profile.config_names == ("claude.json",)
-    assert OPENCLAW.mode == "service" and OPENCLAW.shell is None
+    assert OPENCLAW.mode == "service"  # with shell commands of its own (D27: test_jail_openclaw)
 
 
 def test_its_jail_from_backtide_toml(layout: Path) -> None:
@@ -263,25 +265,35 @@ def test_a_reviewed_name_cannot_also_be_the_fake_keys_variable() -> None:
 # --- the shell mode -----------------------------------------------------------------------------
 
 
-def test_a_shell_profile_has_shell_commands_and_only_it() -> None:
+def test_a_shell_profile_has_shell_commands_with_a_session() -> None:
     shell = ShellCommands(session=("agent",), task=("agent", "-p"), resume="--continue")
-    with pytest.raises(ValueError, match='if and only if its mode is "shell"'):
+    with pytest.raises(ValueError, match='"shell" mode has shell commands with a session'):
         profile_with(mode="shell")
-    with pytest.raises(ValueError, match='if and only if its mode is "shell"'):
-        profile_with(shell=shell)
+    with pytest.raises(ValueError, match='"shell" mode has shell commands with a session'):
+        profile_with(mode="shell", shell=ShellCommands(session=(), task=("agent", "-p")))
     with pytest.raises(ValueError, match="mode must be one of"):
         profile_with(mode="daemon")
     assert profile_with(mode="shell", shell=shell).shell is shell
+    # A service agent may have them too (OpenClaw, D27), with or without a session.
+    assert profile_with(shell=shell).shell is shell
+    assert profile_with(shell=ShellCommands(session=(), task=("agent",))).mode == "service"
 
 
 @pytest.mark.parametrize(
     "fields",
     [
-        {"session": ()},
+        {"task": ()},
         {"session": ("-x",)},
         {"task": ("agent\n",)},
         {"resume": "continue"},
         {"resume": "--continue now"},
+        {"prompt_flag": "-m"},
+        {"prompt_flag": "--message=x"},
+        {"timeout_flag": "timeout"},
+        {"answer": "json"},
+        {"default_minutes": 0},
+        {"default_minutes": 1.5},
+        {"default_minutes": 24 * 60 + 1},
         {"seed_input": "print(1)"},  # an input without a seed
         {"seed": ("python3",), "seed_input": "x" * (16 * 1024 + 1)},
     ],
@@ -303,6 +315,46 @@ def test_the_commands_of_claude_code() -> None:
     # A prompt that looks like an option is still the prompt: it goes after "--".
     assert shell.task_argv("--version", resume=True) == [*task, "--continue", "--", "--version"]
     assert shell.seed == ("python3", "-I", "-") and shell.seed_input == SEED
+
+
+def test_a_prompt_flag_glues_the_prompt_to_its_option() -> None:
+    """For a program that takes the prompt only as an option's value (OpenClaw's --message):
+    one argument, ``--message=<prompt>``, which is the value whatever it starts with."""
+    shell = ShellCommands(
+        session=(), task=("agent", "turn"), prompt_flag="--message", timeout_flag="--timeout"
+    )
+    assert shell.task_argv("-rf x=y\nmás") == ["agent", "turn", "--message=-rf x=y\nmás"]
+    assert shell.task_argv("hola", seconds=120) == [
+        "agent",
+        "turn",
+        "--timeout=120",
+        "--message=hola",
+    ]
+    # Without a resume flag every run continues the one conversation: --continue adds nothing.
+    assert shell.one_conversation and shell.task_argv("hola", resume=True)[-1] == "--message=hola"
+    for seconds in (0, -1, 1.5, True):
+        with pytest.raises(ValueError):
+            shell.task_argv("hola", seconds=seconds)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="no interactive session"):
+        shell.session_argv()
+    # Without a timeout flag the deadline is the timeout around it alone.
+    claude = CLAUDE_CODE.shell
+    assert claude is not None and not claude.one_conversation
+    assert "--timeout=60" not in claude.task_argv("hola", seconds=60)
+
+
+@pytest.mark.parametrize(
+    ("printed", "expected"),
+    [
+        ('{"type": "result", "is_error": false, "result": "hecho"}', TaskAnswer("hecho")),
+        ('{"is_error": true, "result": "falló"}', TaskAnswer("falló", TASK_FAILED)),
+        ('{"result": 3}', None),
+        ("[]", None),
+        ("not json", None),
+    ],
+)
+def test_the_answer_of_claude_code(printed: str, expected: TaskAnswer | None) -> None:
+    assert claude_code.task_answer(printed) == expected
 
 
 @pytest.mark.parametrize("prompt", ["", "   ", "a\0b", "x" * (MAX_PROMPT + 1), None])

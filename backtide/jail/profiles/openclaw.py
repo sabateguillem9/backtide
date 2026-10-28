@@ -32,8 +32,14 @@ from backtide.jail.profile import (
     CONTAINER_CONFIG_DIR,
     CONTAINER_STATE,
     CONTAINER_WORK,
+    TASK_BUSY,
+    TASK_FAILED,
+    TASK_OK,
+    TASK_TIMED_OUT,
     AgentProfile,
     ProfileError,
+    ShellCommands,
+    TaskAnswer,
 )
 
 if TYPE_CHECKING:
@@ -83,6 +89,26 @@ ENV = (
 )
 # OpenClaw has its own HTTP dispatcher, which reads the proxy from here (T06-1, P9).
 PROXY_URL_ENV = ("OPENCLAW_PROXY_URL",)
+
+# How the owner talks to OpenClaw from the terminal (D27; backtide/shell_cli.py): `backtide tarea`,
+# as the agent's user in /workspace/work, through the running Gateway (the CLI reads its token
+# from OPENCLAW_GATEWAY_TOKEN, which docker exec inherits), always in the main agent's main
+# session: the same conversation as Telegram's, so there is one and every run continues it (no
+# resume flag). Measured in the VM with 2026.9.8 (tests/integration/test_local_profiles.py): one
+# turn of `openclaw agent --json`. The prompt goes glued to --message (``--message=<prompt>``: a
+# prompt that starts with "-" is still its value). --timeout is the turn's own deadline, which
+# the Gateway enforces (killing the CLI alone would leave the turn running there; on SIGTERM the
+# CLI also asks the Gateway to abort it). It exits 1 on an error or a timeout, after printing its
+# JSON: ``status`` and ``result.payloads[].text``.
+# No `backtide entrar` (session) for now: OpenClaw runs all the time and reads Telegram and the
+# web, so whatever it is told could write escape sequences (OSC 52 to the clipboard...) straight
+# into a terminal UI's tty, the owner's terminal. It comes back with a terminal relay that
+# filters them (docs/backlog.md, "Después").
+NODE = "/usr/local/bin/node"
+CLI = "/app/openclaw.mjs"
+TASK = (NODE, CLI, "agent", "--agent", "main", "--json")
+TASK_MINUTES = 15  # a turn of a chat agent, not a programming task: 15 minutes unless told
+_STATUS = {"ok": TASK_OK, "completed": TASK_OK, "timeout": TASK_TIMED_OUT, "in_flight": TASK_BUSY}
 
 # The only channel allowed (rule 1); the others hold ratchet credentials or are not verified.
 CHANNELS = ("telegram",)
@@ -740,6 +766,33 @@ def check_config(files: Mapping[str, str]) -> None:
     check_rewindable(json.loads(files[CONFIG_FILE]))
 
 
+def task_answer(output: str) -> TaskAnswer | None:
+    """The answer of ``openclaw agent --json``: the texts of its ``result.payloads``, with
+    ``status`` saying how the turn ended; for a failed command (``ok: false``), its error's
+    message. None when it printed something else."""
+    try:
+        answer = json.loads(output)
+    except ValueError:
+        return None
+    if not isinstance(answer, dict):
+        return None
+    if answer.get("ok") is False:
+        error = answer.get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        return TaskAnswer(message if isinstance(message, str) else "", TASK_FAILED)
+    status = answer.get("status")
+    result = answer.get("result")
+    payloads = result.get("payloads") if isinstance(result, dict) else None
+    if not isinstance(status, str) or not isinstance(payloads, list | None):
+        return None
+    texts = [
+        item["text"]
+        for item in payloads or []
+        if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
+    ]
+    return TaskAnswer("\n\n".join(texts), _STATUS.get(status, TASK_FAILED))
+
+
 def gateway_answer(output: str) -> bool:
     """Whether /healthz said ``{"ok": true}``."""
     try:
@@ -769,4 +822,12 @@ OPENCLAW = AgentProfile(
     # The fake keys go in openclaw.json (model_settings), never in a variable; and OpenClaw sends
     # no field the gate's lists lack (probar's param:fallbacks is the owner's allow_provider_tools).
     provider_params=(),
+    shell=ShellCommands(
+        session=(),
+        task=TASK,
+        prompt_flag="--message",
+        timeout_flag="--timeout",
+        answer=task_answer,
+        default_minutes=TASK_MINUTES,
+    ),
 )

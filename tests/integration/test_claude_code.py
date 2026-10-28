@@ -258,7 +258,7 @@ def test_entrar_opens_claude_code_on_a_terminal(lab: Lab) -> None:
     finally:
         term.close()
     assert code == 0, term.text()[-2000:]
-    assert "Sesión de Claude Code cerrada. Estás otra vez en tu terminal." in term.text()
+    assert "Sesión del agente cerrada. Estás otra vez en tu terminal." in term.text()
     seeded = json.loads((service.store.workspace / "agente" / "home" / ".claude.json").read_text())
     assert seeded["hasCompletedOnboarding"] is True
     assert seeded["projects"]["/workspace/work"]["hasTrustDialogAccepted"] is True

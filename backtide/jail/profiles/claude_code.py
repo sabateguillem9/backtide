@@ -55,9 +55,12 @@ from backtide.jail.profile import (
     HOME_DIR,
     PROVIDER_NAME_RULE,
     SHELL_MODE,
+    TASK_FAILED,
+    TASK_OK,
     AgentProfile,
     ProfileError,
     ShellCommands,
+    TaskAnswer,
     is_provider_name,
 )
 
@@ -294,6 +297,18 @@ def model_env(
     )
 
 
+def task_answer(output: str) -> TaskAnswer | None:
+    """The answer of ``claude -p --output-format json``: its ``result``, failed when
+    ``is_error``; None when it printed something else."""
+    try:
+        answer = json.loads(output)
+    except ValueError:
+        return None
+    if not isinstance(answer, dict) or not isinstance(answer.get("result"), str):
+        return None
+    return TaskAnswer(answer["result"], TASK_FAILED if answer.get("is_error") is True else TASK_OK)
+
+
 def version_answer(output: str) -> bool:
     """Whether ``claude --version`` printed the pinned version."""
     return output.strip() == f"{CLAUDE_CODE_VERSION} (Claude Code)"
@@ -339,7 +354,12 @@ def _claude_code(provider: str) -> AgentProfile:
         provider_env=env,
         mode=SHELL_MODE,
         shell=ShellCommands(
-            session=SESSION, task=TASK, resume=RESUME, seed=SEED_ARGV, seed_input=SEED
+            session=SESSION,
+            task=TASK,
+            resume=RESUME,
+            seed=SEED_ARGV,
+            seed_input=SEED,
+            answer=task_answer,
         ),
     )
 

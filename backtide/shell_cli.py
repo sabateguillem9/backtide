@@ -1,5 +1,8 @@
 """`backtide entrar`, `tarea`, `importar` and `exportar`: the owner and an agent of the ``shell``
-mode (T17a-4, docs/34 section 7 and decision 3). Messages for the user are in Spanish.
+mode (T17a-4, docs/34 section 7 and decision 3). Messages for the user are in Spanish. Since D27
+`entrar` and `tarea` also reach an agent of the ``service`` mode whose profile has shell commands
+(OpenClaw: its terminal UI and a turn of its CLI, through its running Gateway), with the same
+protections; `importar` and `exportar` stay for the shell mode.
 
 They run as the owner, on the host, like `backtide rebobinar`: each asks the running service
 first, over its control socket (backtide/service/control.py), which checks that the agent is a
@@ -9,8 +12,10 @@ shell one and is running, and records the request in the black box before anythi
   ``docker exec -i`` as the agent, then ``docker exec -it`` of its interactive program, as the
   agent's user, in its working folder, connected to this terminal. What the agent prints goes
   straight to the terminal (docs/34, R5).
-- `tarea`: ``docker exec`` of the headless run with the prompt as one argument after ``--``,
-  and the answer printed (Claude Code: ``result`` of its JSON). The output is bounded.
+- `tarea`: ``docker exec`` of the headless run with the prompt as one argument (after ``--``,
+  or glued to the profile's option: OpenClaw's ``--message=<prompt>``), and the answer printed
+  (Claude Code: ``result`` of its JSON; OpenClaw: the texts of its JSON's payloads), with its
+  control characters escaped. The output is bounded.
 - `importar`: a host folder into the agent's working folder, as a tar stream into ``tar -x``
   run as the agent (so it can write nothing the agent itself cannot). The host folder is read
   without following links: a link is skipped and named, and so is anything that is not a file
@@ -62,7 +67,15 @@ from backtide.blackbox.redact import strike_text
 from backtide.blackbox.secret_words import CONFIG_WORDS, ENV_WORDS
 from backtide.jail import docker
 from backtide.jail.docker import JailError
-from backtide.jail.profile import CONTAINER_HOME, SHELL_MODE, ShellCommands, check_prompt
+from backtide.jail.profile import (
+    CONTAINER_HOME,
+    SHELL_MODE,
+    TASK_BUSY,
+    TASK_OK,
+    TASK_TIMED_OUT,
+    ShellCommands,
+    check_prompt,
+)
 from backtide.service.config import ServiceConfig
 from backtide.service.control import (
     ControlError,
@@ -80,7 +93,7 @@ EXIT_ERROR = 2
 EXIT_PROBLEM = 3
 SEED_TIMEOUT = 30.0
 SEED_MAX_OUTPUT = 64 * 1024
-TASK_MAX_OUTPUT = 8 * 1024 * 1024  # the JSON of one `claude -p`: its answer and a few counters
+TASK_MAX_OUTPUT = 8 * 1024 * 1024  # the JSON of one run: its answer and its counters
 MAX_IMPORT_BYTES = 1024**3  # 1 GiB: the workspace has its own cap anyway
 MAX_IMPORT_ENTRIES = 100_000
 MAX_IMPORT_DEPTH = 64
@@ -91,15 +104,24 @@ IMPORT_TIMEOUT = 30 * 60.0
 # which signals the run's whole process group and kills it KILL_AFTER seconds later.
 TIMEOUT = "/usr/bin/timeout"
 KILL_AFTER = 30
+# A task program with a deadline of its own (``ShellCommands.timeout_flag``: OpenClaw's, which
+# its Gateway enforces) gets it first; the timeout around it comes GRACE seconds later, as the
+# backstop that kills what is left.
+GRACE = 30
 TIMED_OUT = 124  # timeout's code when it stopped the run; 137 when it had to kill it
 PROBE_TIMEOUT = 30.0
+# By their paths: never a pgrep or pkill the agent put earlier in the PATH of a docker exec.
+PGREP = "/usr/bin/pgrep"
+PKILL = "/usr/bin/pkill"
+MAX_MINUTES = 24 * 60
 # `entrar`: when the session ends, what the agent may have left in the terminal is undone: a soft
-# reset (DECSTR), out of the alternate screen, no mouse reporting, no bracketed paste, cursor on.
+# reset (DECSTR), out of the alternate screen, no mouse reporting, no bracketed paste, cursor on,
+# and the colour palette back to the terminal's own (OSC 104).
 TERMINAL_RESET = (
     "\x1b[!p\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
-    "\x1b[?2004l\x1b[?25h"
+    "\x1b[?2004l\x1b[?25h\x1b]104\x07"
 )
-SESSION_CLOSED = "Sesión de Claude Code cerrada. Estás otra vez en tu terminal."
+SESSION_CLOSED = "Sesión del agente cerrada. Estás otra vez en tu terminal."
 SETTLE = 0.1  # what the terminal still answers to the agent's last queries arrives meanwhile
 BUNDLE_TIMEOUT = 10 * 60.0
 EXPORTED_WARNING = (
@@ -147,16 +169,39 @@ def printable(text: str, *, keep_lines: bool = False) -> str:
 
 
 def shell_of(config: ServiceConfig) -> ShellCommands | None:
-    """The profile's shell commands, or None (and the error said) for a service-mode agent."""
+    """The profile's shell commands for `importar` and `exportar`, or None (and the error said)
+    for a service-mode agent."""
     profile = config.agent_profile
     if profile.mode != SHELL_MODE or profile.shell is None:
         error(
             f"el agente de esta instalación (perfil {profile.name}) no es de modo shell: "
-            "`backtide entrar`, `tarea`, `importar` y `exportar` son para agentes de programación "
-            'como claude-code ([agent] profile = "claude-code").'
+            "`backtide importar` y `exportar` son para agentes de programación como claude-code "
+            '([agent] profile = "claude-code"). Para hablarle: `backtide tarea "…"`.'
         )
         return None
     return profile.shell
+
+
+def talk_of(config: ServiceConfig, *, session: bool = False) -> ShellCommands | None:
+    """The profile's shell commands for `tarea` (and, with ``session``, `entrar`), or None (and
+    the error said) when the agent has none: Claude Code and OpenClaw have them (D27)."""
+    profile = config.agent_profile
+    shell = profile.shell
+    if shell is None:
+        error(
+            f"el agente de esta instalación (perfil {profile.name}) no se puede usar desde la "
+            "terminal: `backtide entrar` y `tarea` son para claude-code y openclaw."
+        )
+        return None
+    if session and not shell.session:
+        error(
+            f"`backtide entrar` es solo para Claude Code por ahora: el agente de esta instalación "
+            f"(perfil {profile.name}) no tiene una sesión en tu terminal. Háblale con "
+            '`backtide tarea "…"` o por Telegram; la web (`backtide enlace`) enseña lo que hace '
+            "y desde ella apruebas, rechazas y rebobinas."
+        )
+        return None
+    return shell
 
 
 def _ask(config: ServiceConfig, kind: str, **options: Any) -> dict[str, Any] | None:
@@ -231,7 +276,7 @@ def _stdin_fd() -> int:
 
 
 def entrar(config: ServiceConfig, *, resume: bool = False, run: Runner = _interactive) -> int:
-    shell = shell_of(config)
+    shell = talk_of(config, session=True)
     if shell is None:
         return EXIT_ERROR
     reply = _ask(config, "session", resume=resume)
@@ -268,9 +313,10 @@ def entrar(config: ServiceConfig, *, resume: bool = False, run: Runner = _intera
     print(SESSION_CLOSED)
     if code == 0:
         return EXIT_OK
+    again = "backtide entrar --continue" if shell.resume else "backtide entrar"
     print(
         f"La sesión ha terminado con el código {code} (137: cortada, por ejemplo por un "
-        "rebobinado). `backtide entrar --continue` retoma la conversación.",
+        f"rebobinado). `{again}` retoma la conversación.",
         file=sys.stderr,
     )
     return EXIT_FAILED
@@ -279,41 +325,59 @@ def entrar(config: ServiceConfig, *, resume: bool = False, run: Runner = _intera
 # -- tarea ---------------------------------------------------------------------------------------
 
 
-def tarea(config: ServiceConfig, prompt: str, *, resume: bool = False, minutes: float = 60) -> int:
-    shell = shell_of(config)
+def tarea(
+    config: ServiceConfig, prompt: str, *, resume: bool = False, minutes: float | None = None
+) -> int:
+    shell = talk_of(config)
     if shell is None:
         return EXIT_ERROR
+    if minutes is None:
+        minutes = shell.default_minutes
+    seconds = round(minutes * 60) if 0 < minutes <= MAX_MINUTES else 0
+    if seconds < 1:
+        error(
+            f"--minutos va de un segundo (0.02) a {MAX_MINUTES} (un día), con decimales si "
+            "hace falta: por ejemplo 0.5 o 30"
+        )
+        return EXIT_ERROR
     try:
-        argv = shell.task_argv(check_prompt(prompt), resume=resume)
+        argv = shell.task_argv(check_prompt(prompt), resume=resume, seconds=seconds)
     except ValueError as problem:
         error(f"la tarea no vale: {problem}")
         return EXIT_ERROR
-    if not 0 < minutes <= 24 * 60:
-        error("--minutos tiene que estar entre 1 y 1440")
-        return EXIT_ERROR
-    reply = _ask(config, "task", resume=resume)
+    reply = _ask(config, "task", resume=resume, prompt=prompt)
     if reply is None:
         return EXIT_FAILED
     pattern = _task_pattern(shell)
-    if resume:
+    if resume or shell.one_conversation:  # two runs of one conversation never go at once (M4)
         running = _task_running(reply, pattern)
         if running is not False:
             error(
-                "ya hay una tarea en marcha dentro del agente: espera a que termine antes de "
-                "seguir la conversación con --continue"
+                _BUSY[shell.one_conversation]
                 if running
                 else "no se ha podido comprobar si hay otra tarea en marcha, así que no se sigue "
                 "la conversación: inténtalo de nuevo"
             )
             return EXIT_FAILED
-    seconds = round(minutes * 60)
+    limit = seconds + (GRACE if shell.timeout_flag else 0)
     try:
         done = docker.run(
-            [*_exec_prefix(reply), TIMEOUT, "-k", str(KILL_AFTER), str(seconds), *argv],
-            timeout=seconds + KILL_AFTER + 30,
+            [*_exec_prefix(reply), TIMEOUT, "-k", str(KILL_AFTER), str(limit), *argv],
+            timeout=limit + KILL_AFTER + 30,
             check=False,
             max_output=TASK_MAX_OUTPUT,
         )
+    except KeyboardInterrupt:  # Ctrl-C: the docker CLI does not pass it on, so stop it inside
+        stopped = _stop_task(reply, pattern)
+        error(
+            "has cortado la tarea con Ctrl-C. "
+            + (
+                "Se ha parado dentro del agente."
+                if stopped
+                else "Puede seguir en marcha dentro del agente: mira la caja negra."
+            )
+        )
+        return EXIT_PROBLEM
     except JailError as problem:
         stopped = _stop_task(reply, pattern)
         error(
@@ -327,19 +391,40 @@ def tarea(config: ServiceConfig, prompt: str, *, resume: bool = False, minutes: 
         return EXIT_PROBLEM
     if done.returncode in (TIMED_OUT, 137):
         error(
-            f"la tarea se ha cortado: pasó de {minutes:g} minutos (--minutos)"
+            _timed_out(minutes)
             if done.returncode == TIMED_OUT
             else "la tarea se ha cortado (se pasó del tiempo, o un rebobinado la paró)"
         )
         return EXIT_FAILED
-    return _report_task(done)
+    return _report_task(done, shell, minutes)
+
+
+_BUSY = {
+    False: "ya hay una tarea en marcha dentro del agente: espera a que termine antes de seguir la "
+    "conversación con --continue",
+    True: "ya hay una tarea en marcha dentro del agente, y este agente tiene una sola "
+    "conversación: espera a que termine",
+}
+
+
+def _timed_out(minutes: float) -> str:
+    return f"la tarea se ha cortado: pasó de {minutes:g} minutos (--minutos)"
 
 
 def _task_pattern(shell: ShellCommands) -> str:
-    """What ``pgrep -f`` finds of a task (M4): the timeout around the profile's task program.
-    An extended regex: the dots of the path are literal."""
-    program = shell.task[0].replace(".", "[.]")
-    return f"^{TIMEOUT} -k {KILL_AFTER} [0-9]+ {program} "
+    """What ``pgrep -f`` finds of a task (M4): the timeout around the profile's whole task
+    program, as `tarea` starts it (OpenClaw's: ``.../openclaw.mjs agent --agent main --json``).
+    An extended regex with every special character literal. With ``-P 0`` (see _task_running)
+    it only finds what a docker exec started: the agent can write the same command line, but
+    never a process without a parent in its container (its own orphans go to the container's
+    init)."""
+    program = " ".join(_literal(arg) for arg in shell.task)
+    return f"^{_literal(TIMEOUT)} -k {KILL_AFTER} [0-9]+ {program}( |$)"
+
+
+def _literal(text: str) -> str:
+    """``text`` as a POSIX extended regex that matches only itself."""
+    return "".join(f"[{c}]" if c in ".[]()*+?{}|$" else f"\\{c}" if c in "\\^" else c for c in text)
 
 
 def _task_running(reply: dict[str, Any], pattern: str) -> bool | None:
@@ -348,7 +433,7 @@ def _task_running(reply: dict[str, Any], pattern: str) -> bool | None:
     uid = reply["user"].split(":")[0]
     try:
         found = docker.run(
-            [*_exec_prefix(reply), "pgrep", "-u", uid, "-f", pattern],
+            [*_exec_prefix(reply), PGREP, "-P", "0", "-u", uid, "-f", pattern],
             check=False,
             timeout=PROBE_TIMEOUT,
         )
@@ -358,13 +443,15 @@ def _task_running(reply: dict[str, Any], pattern: str) -> bool | None:
 
 
 def _stop_task(reply: dict[str, Any], pattern: str) -> bool:
-    """A task this side gave up on (its docker CLI timed out or broke) is stopped inside: a
-    TERM to its timeout, which passes it to the whole run and kills it ``KILL_AFTER`` seconds
-    later. True if nothing of it is left running, or it was signalled."""
+    """A task this side gave up on (its docker CLI timed out or broke, or the owner pressed
+    Ctrl-C) is stopped inside: a TERM to its timeout, which passes it to the task program (OpenClaw
+    then asks its Gateway to abort the turn) and kills it ``KILL_AFTER`` seconds later. True if
+    nothing of it is left running, or it was signalled. What the agent itself started and
+    detached from the task is not this: the snapshots and the gate are."""
     uid = reply["user"].split(":")[0]
     try:
         done = docker.run(
-            [*_exec_prefix(reply), "pkill", "-TERM", "-u", uid, "-f", pattern],
+            [*_exec_prefix(reply), PKILL, "-TERM", "-P", "0", "-u", uid, "-f", pattern],
             check=False,
             timeout=PROBE_TIMEOUT,
         )
@@ -373,18 +460,25 @@ def _stop_task(reply: dict[str, Any], pattern: str) -> bool:
     return done.returncode in (0, 1)
 
 
-def _report_task(done: subprocess.CompletedProcess[str]) -> int:
-    """Print the answer of a headless run: ``result`` of its JSON (Claude Code)."""
-    try:
-        answer = json.loads(done.stdout)
-    except ValueError:
-        answer = None
-    if not isinstance(answer, dict) or not isinstance(answer.get("result"), str):
+def _report_task(
+    done: subprocess.CompletedProcess[str], shell: ShellCommands, minutes: float
+) -> int:
+    """Print the answer of a headless run, as the profile reads it (``shell.answer``), with its
+    control characters escaped."""
+    answer = shell.answer(done.stdout)
+    if answer is None:
         tail = (done.stderr or done.stdout).strip()[-2000:]
         error(f"la tarea ha terminado con el código {done.returncode} y sin respuesta: {tail}")
         return EXIT_FAILED
-    print(printable(answer["result"], keep_lines=True))
-    if done.returncode != 0 or answer.get("is_error") is True:
+    if answer.text:
+        print(printable(answer.text, keep_lines=True))
+    if answer.outcome == TASK_TIMED_OUT:
+        error(_timed_out(minutes))
+        return EXIT_FAILED
+    if answer.outcome == TASK_BUSY:
+        error(_BUSY[True])
+        return EXIT_FAILED
+    if done.returncode != 0 or answer.outcome != TASK_OK:
         error(f"la tarea ha terminado con un error (código {done.returncode})")
         return EXIT_FAILED
     return EXIT_OK

@@ -1,7 +1,9 @@
 """What the service answers to `backtide entrar`, `backtide tarea` and `backtide exportar` (T17a-4).
 
-Design: docs/34-diseno-t17-cualquier-agente.md, section 7 and decision 3. Only for an agent of
-the ``shell`` mode (Claude Code): its container waits, and the owner runs the agent inside it.
+Design: docs/34-diseno-t17-cualquier-agente.md, section 7 and decision 3. For an agent of the
+``shell`` mode (Claude Code): its container waits, and the owner runs the agent inside it. Since
+D27, `entrar` and `tarea` also reach an agent of the ``service`` mode whose profile has shell
+commands (OpenClaw: a turn or its terminal UI, through its running Gateway).
 
 - `entrar` and `tarea` ask the service first (``Guardian.open_shell``, over the control socket):
   the agent must be running (not paused, not being rewound), and the black box records who
@@ -20,12 +22,30 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from backtide.blackbox.redact import strike_text
+
 # `entrar`, `tarea`, `importar`, and `exportar --git` (the agent makes a bundle in the jail)
 SHELL_KINDS = frozenset({"session", "task", "import", "bundle"})
 # `exportar --git <repo>`: a folder of the work folder ("." is the work folder itself), by
 # parts of letters, digits, '.', '_' and '-', never "." or ".." as a part.
 _PART = r"(?!\.\.?(?:/|$))[A-Za-z0-9._-]{1,100}"
 REPO_RE = re.compile(rf"\.|{_PART}(?:/{_PART}){{0,15}}", re.ASCII)
+
+
+# What the black box keeps of a `backtide tarea` prompt (``system/agent_shell``): struck of
+# anything that looks like a secret first, then cut to this many characters.
+PROMPT_RECORDED = 200
+
+
+def recorded_prompt(prompt: str) -> dict[str, Any]:
+    """The ``system/agent_shell`` details of a task's prompt: ``prompt``, struck
+    (``strike_text``) and cut to PROMPT_RECORDED characters, in that order (a secret cut in half
+    first would no longer be struck), and ``slash`` when it starts with "/" (an agent's own
+    command, such as OpenClaw's ``/new``)."""
+    return {
+        "prompt": strike_text(prompt)[:PROMPT_RECORDED],
+        "slash": prompt.lstrip().startswith("/"),
+    }
 
 
 class ShellStatus(StrEnum):
@@ -70,6 +90,6 @@ class ExportOutcome:
 
 
 NOT_SHELL_MESSAGE = (
-    "El agente de esta instalación no es de modo shell (perfil {profile}): `backtide entrar`, "
-    "`backtide tarea` y `backtide exportar` son para agentes de programación como claude-code."
+    "El agente de esta instalación (perfil {profile}) no tiene esa orden: `backtide importar` y "
+    "`backtide exportar` son para agentes de programación como claude-code."
 )

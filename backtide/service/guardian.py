@@ -2539,17 +2539,21 @@ class Guardian:
     ) -> ShellOutcome:
         """Whether the owner may run the agent now (``kind``: "session" for `backtide entrar`,
         "task" for `backtide tarea`, "import" for `backtide importar`), recorded first as
-        ``system/agent_shell``: only for a shell profile, with the agent running (not stopped,
-        starting, paused or being rewound: ``agent_lock`` waits for a rewind to end). The reply
-        names the container, the agent's user and its working folder for ``docker exec``.
-        ``details`` (the import's counts) go into the event as they are. Never raises."""
+        ``system/agent_shell``: "session" and "task" for a profile with shell commands (Claude
+        Code, and OpenClaw since D27: a turn through its Gateway), "session" only if it has an
+        interactive one, and "import" and "bundle" only for a shell profile; always with the
+        agent running (not stopped, starting, paused or being rewound: ``agent_lock`` waits for
+        a rewind to end). The reply names the container, the agent's user and its working
+        folder for ``docker exec``. ``details`` (the import's counts) go into the event as they
+        are. Never raises."""
         profile = self._jail.config.profile
-        if profile.mode != SHELL_MODE:
+        if kind not in SHELL_KINDS:
+            return ShellOutcome(ShellStatus.FAILED, "Esa orden no existe.")
+        talks = profile.shell is not None and (kind == "task" or bool(profile.shell.session))
+        if not (talks if kind in ("session", "task") else profile.mode == SHELL_MODE):
             return ShellOutcome(
                 ShellStatus.NOT_SHELL, NOT_SHELL_MESSAGE.format(profile=profile.name)
             )
-        if kind not in SHELL_KINDS:
-            return ShellOutcome(ShellStatus.FAILED, "Esa orden no existe.")
         requester = str(requested_by)[:MAX_REQUESTER_CHARS] or "unknown"
         with self.agent_lock:
             if not self._serving:

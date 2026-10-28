@@ -151,16 +151,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
-    """`backtide entrar`, `tarea`, `importar` and `exportar` (T17a-4): only for an agent of the
-    shell mode (Claude Code), through the running service (backtide/shell_cli.py)."""
+    """`backtide entrar`, `tarea`, `importar` and `exportar` (T17a-4), through the running service
+    (backtide/shell_cli.py): `tarea` for Claude Code and OpenClaw (D27), `entrar`, `importar` and
+    `exportar` only for an agent of the shell mode (Claude Code)."""
     enter = commands.add_parser(
         "entrar",
         help="abre el agente de programación en tu terminal (claude-code)",
         description="Abre Claude Code dentro de su jaula, conectado a este terminal, como el "
         "usuario del agente y en su carpeta de trabajo. Se lo pide antes al servicio en marcha, "
-        "que lo graba. Todo lo que haga el agente queda grabado y se puede rebobinar. Sale con "
-        "0 si la sesión terminó bien, 1 si no se pudo abrir o terminó con error y 2 si hay un "
-        "error de uso (por ejemplo, un agente que no es de modo shell).",
+        "que lo graba. Todo lo que haga el agente queda grabado y se puede rebobinar. Con "
+        "OpenClaw no hay sesión en la terminal por ahora: háblale con `backtide tarea` o por "
+        "Telegram. Sale con 0 si la sesión terminó bien, 1 si no se pudo abrir o "
+        "terminó con error y 2 si hay un error de uso (por ejemplo, un agente sin sesión).",
     )
     _add_config(enter)
     enter.add_argument(
@@ -173,11 +175,14 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
 
     task = commands.add_parser(
         "tarea",
-        help='le da una tarea al agente de programación y enseña su respuesta: tarea "…"',
-        description="Lanza `claude -p` dentro de la jaula con la tarea como un solo argumento y "
-        "enseña la respuesta. Se lo pide antes al servicio en marcha, que lo graba. Sale con 0 si "
-        "la tarea terminó bien, 1 si no, 2 si hay un error de uso y 3 si no se sabe (por "
-        "ejemplo, se acabó el tiempo: la tarea puede seguir dentro).",
+        help='le da una tarea al agente y enseña su respuesta: tarea "…"',
+        description="Lanza dentro de la jaula `claude -p` (Claude Code) o un turno de `openclaw "
+        "agent` por su Gateway (OpenClaw, en su conversación principal, la misma de Telegram), "
+        "con la tarea como un solo argumento, y enseña la respuesta. Se lo pide antes al "
+        "servicio en marcha, que lo graba junto con el principio de lo que pides (tachado lo que "
+        "parezca un secreto). Ctrl-C la para dentro del agente. Sale con 0 si la tarea terminó "
+        "bien, 1 si no, 2 si hay un error de uso y 3 si no se sabe (por ejemplo, se cortó con "
+        "Ctrl-C o falló docker: la tarea puede seguir dentro).",
     )
     _add_config(task)
     task.add_argument("prompt", metavar="tarea", help="lo que le pides, entre comillas")
@@ -185,10 +190,15 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "--continue",
         dest="resume",
         action="store_true",
-        help="sigue la última conversación (la de la instantánea, tras un rebobinado)",
+        help="sigue la última conversación (la de la instantánea, tras un rebobinado); con "
+        "OpenClaw no cambia nada: siempre sigue la suya",
     )
     task.add_argument(
-        "--minutos", type=float, default=60, help="tiempo máximo de espera (por defecto 60)"
+        "--minutos",
+        type=float,
+        default=None,
+        help="tiempo máximo, con decimales si hace falta (por defecto 60 con Claude Code y 15 "
+        "con OpenClaw)",
     )
     task.set_defaults(handler=_task)
 

@@ -85,9 +85,7 @@ TIMEOUT = ["/usr/bin/timeout", "-k", "30"]
 # --- refusals common to the four ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "argv", [["entrar"], ["tarea", "hola"], ["importar", "/srv"], ["exportar", "/srv/x"]]
-)
+@pytest.mark.parametrize("argv", [["importar", "/srv"], ["exportar", "/srv/x"]])
 def test_a_service_mode_agent_is_refused_with_a_clear_message(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], calls: Calls, argv: list[str]
 ) -> None:
@@ -95,6 +93,53 @@ def test_a_service_mode_agent_is_refused_with_a_clear_message(
     code = main([*argv, "--config", str(path)])
     err = capsys.readouterr().err
     assert code == 2 and "no es de modo shell" in err and "claude-code" in err
+    assert "backtide tarea" in err  # what to use with it instead
+    assert calls.asked == [] and calls.runs == []
+
+
+@pytest.mark.parametrize("argv", [["entrar"], ["tarea", "hola"]])
+def test_an_agent_without_shell_commands_is_refused_with_a_clear_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    calls: Calls,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+) -> None:
+    import dataclasses
+
+    from backtide.jail.profiles import OPENCLAW
+
+    monkeypatch.setattr(
+        ServiceConfig,
+        "agent_profile",
+        property(lambda _: dataclasses.replace(OPENCLAW, shell=None)),
+    )
+    code = main([*argv, "--config", str(write_config(tmp_path, "openclaw"))])
+    err = capsys.readouterr().err
+    assert code == 2 and "no se puede usar desde la terminal" in err
+    assert calls.asked == [] and calls.runs == []
+
+
+def test_entrar_without_an_interactive_session_points_to_tarea_and_telegram(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    calls: Calls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dataclasses
+
+    from backtide.jail.profile import ShellCommands
+    from backtide.jail.profiles import OPENCLAW
+
+    talk = ShellCommands(session=(), task=("/bin/agent",))
+    monkeypatch.setattr(
+        ServiceConfig,
+        "agent_profile",
+        property(lambda _: dataclasses.replace(OPENCLAW, shell=talk)),
+    )
+    code = main(["entrar", "--config", str(write_config(tmp_path, "openclaw"))])
+    err = capsys.readouterr().err
+    assert code == 2 and "backtide tarea" in err and "Telegram" in err
     assert calls.asked == [] and calls.runs == []
 
 
@@ -225,6 +270,7 @@ def test_the_terminal_guard_flushes_pending_input_restores_and_resets(
             os.read(follower, 100)  # nothing left to type into the owner's shell
         assert out.getvalue() == shell_cli.TERMINAL_RESET
         assert "\x1b[!p" in out.getvalue() and "\x1b[?1049l" in out.getvalue()
+        assert out.getvalue().endswith("\x1b]104\x07")  # the palette, back to the terminal's
         assert "\x1b[?2004l" in out.getvalue() and "\x1b[?1000l" in out.getvalue()
     finally:
         os.close(leader)
@@ -266,9 +312,9 @@ def test_tarea_runs_claude_p_with_the_prompt_after_dashes(
     assert shell_cli.tarea(config, "-rf todo", resume=True) == 0
     probe, _ = calls.runs.pop(0)  # --continue: no other task runs (pgrep finds none)
     assert probe[: len(PREFIX)] == PREFIX and probe[len(PREFIX) : -1] == [
-        "pgrep", "-u", "61000", "-f",
+        "/usr/bin/pgrep", "-P", "0", "-u", "61000", "-f",
     ]  # fmt: skip
-    assert calls.asked == [("task", {"resume": True})]
+    assert calls.asked == [("task", {"resume": True, "prompt": "-rf todo"})]
     ((argv, options),) = calls.runs
     assert argv == [*PREFIX, *TIMEOUT, "3600", CLAUDE, "-p", "--output-format", "json",
                     *SETTINGS, "--continue", "--", "-rf todo"]  # fmt: skip
@@ -311,7 +357,7 @@ def test_a_task_this_side_gave_up_on_is_stopped_inside(
     real = calls.run
 
     def timing_out(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
-        if "claude" in " ".join(args) and "pkill" not in args:
+        if "claude" in " ".join(args) and shell_cli.PKILL not in args:
             calls.runs.append((list(args), options))
             raise docker.JailError("timed out")
         return real(args, **options)
@@ -321,7 +367,8 @@ def test_a_task_this_side_gave_up_on_is_stopped_inside(
     (_, _), (kill, _) = calls.runs
     assert kill[: len(PREFIX)] == PREFIX
     assert kill[len(PREFIX) :] == [
-        "pkill", "-TERM", "-u", "61000", "-f", shell_cli._task_pattern(config.agent_profile.shell),  # noqa: SLF001
+        "/usr/bin/pkill", "-TERM", "-P", "0", "-u", "61000", "-f",
+        shell_cli._task_pattern(config.agent_profile.shell),  # noqa: SLF001
     ]  # fmt: skip
     assert "Se ha parado dentro del agente" in capsys.readouterr().err
 
@@ -331,11 +378,16 @@ def test_the_task_pattern_finds_the_task_and_only_it() -> None:
 
     from backtide.jail.profiles import CLAUDE_CODE
 
+    assert CLAUDE_CODE.shell is not None
     pattern = re.compile(shell_cli._task_pattern(CLAUDE_CODE.shell))  # noqa: SLF001
-    task = " ".join(["/usr/bin/timeout", "-k", "30", "3600", CLAUDE, "-p", "--", "hola"])
+    run = ["/usr/bin/timeout", "-k", "30", "3600", *CLAUDE_CODE.shell.task_argv("hola")]
+    task = " ".join(run)
     assert pattern.search(task)
+    assert pattern.search(" ".join(run[:4] + list(CLAUDE_CODE.shell.task)))  # nothing after
     assert not pattern.search(task.replace(".local", "xlocal"))  # the dots are literal
     assert not pattern.search(f"sh -c {task}") and not pattern.search(f"{CLAUDE} -p hola")
+    # The whole program, not just its first word: an interactive session is not a task.
+    assert not pattern.search(" ".join([*run[:4], CLAUDE, *SETTINGS]))
 
 
 @pytest.mark.parametrize(("code", "said"), [(124, "pasó de 60 minutos"), (137, "se ha cortado")])
@@ -359,7 +411,7 @@ def test_a_second_continue_waits_for_the_first(
     not start a second run of the same conversation."""
     calls.results = [subprocess.CompletedProcess([], pgrep, "", "")]
     assert shell_cli.tarea(config, "sigue", resume=True) == 1
-    assert len(calls.runs) == 1 and calls.runs[0][0][len(PREFIX)] == "pgrep"
+    assert len(calls.runs) == 1 and calls.runs[0][0][len(PREFIX)] == "/usr/bin/pgrep"
     assert "tarea en marcha" in capsys.readouterr().err
 
 
@@ -1069,3 +1121,213 @@ def test_a_refused_export_is_a_usage_error(
     monkeypatch.setattr(shell_cli, "ask_export", refused)
     assert shell_cli.exportar(config, "/tmp/x") == 2  # noqa: S108
     assert "ya existe" in capsys.readouterr().err
+
+
+# --- OpenClaw (D27): a turn through its Gateway ----------------------------------------------
+
+
+@pytest.fixture
+def claw(tmp_path: Path) -> ServiceConfig:
+    return ServiceConfig.from_file(write_config(tmp_path, "openclaw"))
+
+
+OPENCLAW_TURN = [
+    "/usr/local/bin/node", "/app/openclaw.mjs", "agent", "--agent", "main", "--json",
+]  # fmt: skip
+NOT_RUNNING = subprocess.CompletedProcess([], 1, "", "")  # pgrep: no other task
+
+
+def turn(text: str, status: str = "ok", code: int = 0) -> subprocess.CompletedProcess[str]:
+    import json
+
+    body = {"runId": "r1", "status": status, "result": {"payloads": [{"text": text}]}}
+    return subprocess.CompletedProcess([], code, json.dumps(body, indent=2), "")
+
+
+def test_tarea_with_openclaw_is_one_turn_through_its_gateway(
+    claw: ServiceConfig, calls: Calls, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Argv only, the prompt glued to --message, its own deadline and the timeout around it,
+    bounded, and the answer printed with its control characters escaped. Its one conversation
+    is checked first: no other task of it runs (M4)."""
+    calls.results = [NOT_RUNNING, turn("hecho\n\x1b]0;evil\x07 ok")]
+    assert shell_cli.tarea(claw, "-rf todo; $(rm x)", minutes=2) == 0
+    assert calls.asked == [("task", {"resume": False, "prompt": "-rf todo; $(rm x)"})]
+    (probe, _), (argv, options) = calls.runs
+    assert probe[len(PREFIX) : len(PREFIX) + 3] == ["/usr/bin/pgrep", "-P", "0"]
+    assert probe[-1] == shell_cli._task_pattern(claw.agent_profile.shell)  # noqa: SLF001
+    # Its own deadline first (the Gateway stops the turn there), the timeout around it after.
+    assert argv == [*PREFIX, *TIMEOUT, "150", *OPENCLAW_TURN, "--timeout=120",
+                    "--message=-rf todo; $(rm x)"]  # fmt: skip
+    assert options["max_output"] == shell_cli.TASK_MAX_OUTPUT and options["timeout"] > 150 + 30
+    out = capsys.readouterr().out
+    assert "hecho\n" in out and "\x1b" not in out and "\x07" not in out
+
+
+def test_tarea_with_openclaw_waits_15_minutes_unless_told(
+    claw: ServiceConfig, config: ServiceConfig, calls: Calls
+) -> None:
+    calls.results = [NOT_RUNNING, turn("ok"), answer("ok")]
+    assert shell_cli.tarea(claw, "hola") == 0
+    assert calls.runs[1][0][len(PREFIX) + 3] == str(15 * 60 + shell_cli.GRACE)
+    assert "--timeout=900" in calls.runs[1][0]
+    assert shell_cli.tarea(config, "hola") == 0  # Claude Code: 60
+    assert calls.runs[2][0][len(PREFIX) + 3] == "3600"
+
+
+def test_tarea_with_openclaw_continue_is_the_same_turn(claw: ServiceConfig, calls: Calls) -> None:
+    calls.results = [NOT_RUNNING, turn("ok")]
+    assert shell_cli.tarea(claw, "sigue", resume=True, minutes=60) == 0
+    assert calls.asked == [("task", {"resume": True, "prompt": "sigue"})]
+    assert calls.runs[1][0][-2:] == ["--timeout=3600", "--message=sigue"]
+
+
+@pytest.mark.parametrize("pgrep", [0, 2])
+def test_a_second_openclaw_task_waits_for_the_first(
+    claw: ServiceConfig, calls: Calls, capsys: pytest.CaptureFixture[str], pgrep: int
+) -> None:
+    """Its one conversation is shared by every task: even without --continue, a second one does
+    not start while another runs (or when that cannot be said)."""
+    calls.results = [subprocess.CompletedProcess([], pgrep, "", "")]
+    assert shell_cli.tarea(claw, "otra") == 1
+    assert len(calls.runs) == 1
+    err = capsys.readouterr().err
+    assert ("una sola conversación" if pgrep == 0 else "no se ha podido comprobar") in err
+
+
+@pytest.mark.parametrize(
+    ("result", "said"),
+    [
+        (turn("", "timeout", 1), "pasó de 15 minutos"),
+        (turn("", "in_flight", 0), "una sola conversación"),
+        (turn("a medias", "error", 1), "terminado con un error"),
+        (turn("ok", "ok", 1), "terminado con un error"),
+        (subprocess.CompletedProcess([], 1, "", "gateway closed \x1b[2J"), "sin respuesta"),
+    ],
+)
+def test_an_openclaw_turn_that_went_wrong_exits_with_1(
+    claw: ServiceConfig,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+    result: subprocess.CompletedProcess[str],
+    said: str,
+) -> None:
+    calls.results = [NOT_RUNNING, result]
+    assert shell_cli.tarea(claw, "hola") == 1
+    err = capsys.readouterr().err
+    assert said in err and "\x1b" not in err
+
+
+def test_an_openclaw_error_message_is_printed_escaped(
+    claw: ServiceConfig, calls: Calls, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    message = "no gateway \x1b]52;c;bWFyaw==\x07\x1b[2J"
+    envelope = {"ok": False, "error": {"type": "cli_error", "message": message}}
+    calls.results = [NOT_RUNNING, subprocess.CompletedProcess([], 1, json.dumps(envelope), "")]
+    assert shell_cli.tarea(claw, "hola") == 1
+    printed = capsys.readouterr()
+    both = printed.out + printed.err
+    assert "\x1b" not in both and "\x07" not in both
+    assert "no gateway \\x1b]52;c;bWFyaw==\\x07\\x1b[2J" in printed.out
+
+
+def stopped_by(
+    claw: ServiceConfig, calls: Calls, monkeypatch: pytest.MonkeyPatch, raised: BaseException
+) -> int:
+    """`tarea` where the run raises ``raised``; returns its exit code."""
+    real = calls.run
+
+    def failing(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        if "--json" in args:
+            calls.runs.append((list(args), options))
+            raise raised
+        return real(args, **options)
+
+    calls.results = [NOT_RUNNING]
+    monkeypatch.setattr(docker, "run", failing)
+    return shell_cli.tarea(claw, "hola")
+
+
+@pytest.mark.parametrize("raised", [docker.JailError("timed out"), KeyboardInterrupt()])
+def test_an_openclaw_turn_this_side_gave_up_on_is_stopped_inside(
+    claw: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+    raised: BaseException,
+) -> None:
+    """The docker CLI timed out, or the owner pressed Ctrl-C (which the docker CLI does not pass
+    on): a TERM to the timeout around the turn, which passes it to the CLI, which asks the
+    Gateway to abort the turn (OpenClaw's SIGTERM handling). Exit 3: it may not have stopped."""
+    assert stopped_by(claw, calls, monkeypatch, raised) == 3
+    kill = calls.runs[-1][0]
+    assert kill[len(PREFIX) : len(PREFIX) + 4] == ["/usr/bin/pkill", "-TERM", "-P", "0"]
+    assert kill[-1] == shell_cli._task_pattern(claw.agent_profile.shell)  # noqa: SLF001
+    err = capsys.readouterr().err
+    assert "Se ha parado dentro del agente" in err
+    assert ("Ctrl-C" in err) is isinstance(raised, KeyboardInterrupt)
+
+
+def test_ctrl_c_with_a_stop_that_fails_says_it_may_run_on(
+    claw: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls.results = [NOT_RUNNING, subprocess.CompletedProcess([], 2, "", "")]  # pkill broke
+    real = calls.run
+
+    def interrupted(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        if "--json" in args:
+            raise KeyboardInterrupt
+        return real(args, **options)
+
+    monkeypatch.setattr(docker, "run", interrupted)
+    assert shell_cli.tarea(claw, "hola") == 3
+    assert "Puede seguir en marcha" in capsys.readouterr().err
+
+
+def test_the_openclaw_task_pattern_finds_the_turn_and_only_it() -> None:
+    import re
+
+    from backtide.jail.profiles import OPENCLAW
+
+    pattern = re.compile(shell_cli._task_pattern(OPENCLAW.shell))  # noqa: SLF001
+    timeout = ["/usr/bin/timeout", "-k", "30", "60"]
+    assert pattern.search(" ".join([*timeout, *OPENCLAW_TURN, "--timeout=30", "--message=x"]))
+    assert not pattern.search("node openclaw.mjs gateway")
+    assert not pattern.search(" ".join(OPENCLAW_TURN))
+    # Anchored to the CLI itself: any other node under a timeout is not a task.
+    assert not pattern.search(" ".join([*timeout, "/usr/local/bin/node", "/workspace/x.mjs"]))
+    assert not pattern.search(" ".join([*timeout, *OPENCLAW_TURN[:3], "--agent", "otro"]))
+
+
+@pytest.mark.parametrize("minutes", [0.001, 0.008, 0, -1, 1441])
+def test_minutes_that_give_no_second_are_refused_saying_what_is_accepted(
+    claw: ServiceConfig, calls: Calls, capsys: pytest.CaptureFixture[str], minutes: float
+) -> None:
+    assert shell_cli.tarea(claw, "hola", minutes=minutes) == 2
+    assert "un segundo (0.02) a 1440" in capsys.readouterr().err and calls.asked == []
+
+
+def test_one_second_is_enough(claw: ServiceConfig, calls: Calls) -> None:
+    calls.results = [NOT_RUNNING, turn("ok")]
+    assert shell_cli.tarea(claw, "hola", minutes=0.02) == 0
+    assert "--timeout=1" in calls.runs[1][0]
+
+
+def test_entrar_with_openclaw_is_refused_pointing_to_tarea_and_telegram(
+    tmp_path: Path, calls: Calls, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Not in the preview: an always-on agent fed by Telegram and the web could write escape
+    sequences straight into its terminal UI's tty (the owner's terminal, its clipboard). It
+    comes back with a filtering relay (backlog)."""
+    opened: list[list[str]] = []
+    config = ServiceConfig.from_file(write_config(tmp_path, "openclaw"))
+    assert shell_cli.entrar(config, run=lambda argv: opened.append(argv) or 0) == 2
+    err = capsys.readouterr().err
+    assert "solo para Claude Code" in err
+    assert "backtide tarea" in err and "Telegram" in err and "backtide enlace" in err
+    assert calls.asked == [] and calls.runs == [] and opened == []

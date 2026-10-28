@@ -79,7 +79,7 @@ If `make probar-web` says no test is running, start `make probar` first.
 make probar-pedir MSG="Hello, who are you and what can you do?"
 ```
 
-This sends one message and waits for the answer. It can take a while, and minutes if a request is held. All messages go into the same conversation, so the agent remembers the earlier ones. Avoid the `$` character in the message: `make` swallows it.
+This sends one message and waits for the answer. It can take a while, and minutes if a request is held. All messages go into the same conversation, so the agent remembers the earlier ones. Avoid the `$` character in the message: `make` swallows it. Underneath it is `backtide tarea`, the same command an installed backtide uses. `make probar-entrar` is for Claude Code only, for now.
 
 ### Five things to ask it
 
@@ -122,7 +122,7 @@ The same test with Claude Code in the cage instead of OpenClaw. The key still go
    The import **leaves out anything that looks like a secret** and tells you what: files such as `.env*`, `.npmrc`, `.netrc`, private keys (`id_*`, `*.pem`, `*.key`), `.aws`, `.ssh` and `.gnupg` folders, a `.git/config` whose remote has a user and password or a token, and agent configuration files that hold something that may be a key. `SECRETOS=1` includes them, knowing the agent will be able to read them. It never imports your whole home folder or `~/.ssh`, `~/.aws`, `~/.config` or `~/.claude`. The full list of rules is in probar.md (internal note) (in Spanish).
 
 4. Work with it:
-   - `make probar-entrar` opens Claude Code in your terminal. Leave with `/exit`. When you leave, backtide resets your terminal and prints "Sesión de Claude Code cerrada. Estás otra vez en tu terminal." The session has really ended only when `make` gives you your prompt back: the agent can print text that looks like backtide's. `CONTINUAR=1` continues the last conversation.
+   - `make probar-entrar` opens Claude Code in your terminal. Leave with `/exit`. When you leave, backtide resets your terminal and prints "Sesión del agente cerrada. Estás otra vez en tu terminal." The session has really ended only when `make` gives you your prompt back: the agent can print text that looks like backtide's. `CONTINUAR=1` continues the last conversation.
    - `make probar-tarea MSG="..."` runs one task without an interface and prints the answer. `CONTINUAR=1` continues the previous conversation.
 5. Get the code out: `make probar-exportar RUTA=/path/to/new/folder`. backtide takes a snapshot and copies the agent's work folder to a folder that must not exist yet (it never overwrites). It leaves out symlinks, every git repository and everything that starts with a dot (except a short list of harmless ones like `.gitignore`), because tools can run such files automatically when you open the folder (hooks, editor tasks, direnv). It tells you what it left out; `CONFIG=1` includes those files, and you should read each one before opening the folder. To get the commits: `make probar-exportar RUTA=/path/to/new/project.bundle GIT=project`. That produces a git *bundle* (a single file with the commits). Review it with `git log -p` before extracting.
 

@@ -98,7 +98,7 @@ probar-entrar: ## Prueba con Claude Code: ábrelo en tu terminal (CONTINUAR=1 si
 	@case "$(CONTINUAR)" in ""|1) ;; *) echo "CONTINUAR solo puede valer 1" >&2; exit 2;; esac
 	$(VM_SH) '$(PROBAR_VM) entrar $(if $(CONTINUAR),--continue)'
 
-probar-tarea: ## Prueba con Claude Code: una tarea y su respuesta (MSG="..."; CONTINUAR=1 sigue la conversación)
+probar-tarea: ## Prueba real: una tarea y su respuesta, con los dos agentes (MSG="..."; CONTINUAR=1 sigue la conversación)
 	@test -n "$$MSG" || { echo 'Di qué le pides: make probar-tarea MSG="..."' >&2; exit 2; }
 	@case "$(CONTINUAR)" in ""|1) ;; *) echo "CONTINUAR solo puede valer 1" >&2; exit 2;; esac
 	@m=$$(printf '%s' "$$MSG" | base64 | tr -d '\n'); \

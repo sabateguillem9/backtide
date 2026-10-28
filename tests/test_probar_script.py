@@ -141,12 +141,9 @@ def encoded(text: str) -> str:
     return base64.b64encode(text.encode()).decode()
 
 
-def test_the_message_arrives_whole_and_goes_as_one_argument() -> None:
+def test_the_message_arrives_whole() -> None:
     message = "Escribe 'hola'; rm -rf / $(date) `id` \"x\""
     assert probar.decode_message(encoded(message)) == message
-    argv = probar.agent_turn_argv(message)
-    assert argv[-2:] == ["--message", message]  # never through a shell
-    assert argv[:4] == ["node", "openclaw.mjs", "agent", "--agent"]
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "%%%", base64.b64encode(b"\xff\xfe").decode()])
@@ -266,12 +263,42 @@ def test_the_claude_code_commands_go_to_backtides_own(
         ("exportar", *config, "--", "/home/me/salida"),
         ("exportar", *config, "--git", "proyecto", "--", "/home/me/p.bundle"),
     ]
-    assert probar.main(["pedir", encoded("hola")]) == 1  # that one is OpenClaw's
+    assert probar.main(["pedir", encoded("-hola")]) == 0  # pedir is tarea, for both agents
+    assert ran[-1] == ("tarea", *config, "--", "-hola")
 
 
-def test_with_openclaw_the_claude_code_commands_say_how_to_start_it(
-    paths: demo.Paths, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("profile", [probar.OPENCLAW, probar.CLAUDE_CODE])
+def test_pedir_is_backtides_own_tarea(
+    paths: demo.Paths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    profile: str,
+) -> None:
+    """D27: one way to talk to the agent, the product's (`backtide tarea`), never a docker exec
+    of its own: the message is one argument after "--", whatever it looks like."""
+    ran = mounted(paths, monkeypatch, profile)
+    message = "-rf; $(date) `id`\nmás"
+    assert probar.main(["pedir", encoded(message)]) == 0
+    assert ran == [("tarea", "--config", str(paths.config), "--", message)]
+    assert "Tú: -rf; $(date) `id`U+000Amás" in capsys.readouterr().out
+
+
+def test_with_openclaw_tarea_is_backtides_own(
+    paths: demo.Paths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ran = mounted(paths, monkeypatch, probar.OPENCLAW)
-    assert probar.main(["entrar"]) == 1
+    assert probar.main(["tarea", encoded("hola"), "--continue"]) == 0
+    assert ran == [("tarea", "--config", str(paths.config), "--continue", "--", "hola")]
+    assert "probar-entrar" not in probar.TALK[probar.OPENCLAW]
+
+
+@pytest.mark.parametrize("argv", [["importar", "/home/me/repo"], ["exportar", "/home/me/x"]])
+def test_with_openclaw_importar_and_exportar_say_how_to_start_claude_code(
+    paths: demo.Paths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    ran = mounted(paths, monkeypatch, probar.OPENCLAW)
+    assert probar.main(argv) == 1
     assert "PERFIL=claude-code" in capsys.readouterr().err and ran == []

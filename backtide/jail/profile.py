@@ -293,37 +293,89 @@ def _no_provider_env(providers: "tuple[ModelProvider, ...]") -> tuple[tuple[str,
     return ()
 
 
+TASK_OK = "ok"
+TASK_FAILED = "failed"
+TASK_TIMED_OUT = "timed_out"  # the agent's own deadline (``ShellCommands.timeout_flag``) cut it
+TASK_BUSY = "busy"  # the agent ran nothing: another run of the same conversation was going on
+TASK_OUTCOMES = (TASK_OK, TASK_FAILED, TASK_TIMED_OUT, TASK_BUSY)
+
+
+@dataclass(frozen=True)
+class TaskAnswer:
+    """What a headless run answered, read from what it printed: the text for the owner (the
+    agent's: printed with its control characters escaped) and how the run ended."""
+
+    text: str
+    outcome: str = TASK_OK
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or self.outcome not in TASK_OUTCOMES:
+            raise ValueError(f"a task answer is a text and one of {', '.join(TASK_OUTCOMES)}")
+
+
+def plain_answer(output: str) -> TaskAnswer:
+    """The answer of a headless run that prints only its answer: all of it."""
+    return TaskAnswer(output)
+
+
 @dataclass(frozen=True)
 class ShellCommands:
-    """How the owner reaches an agent of the ``shell`` mode (docs/34, decision 3), run with
-    ``docker exec`` as the agent's user, in the profile's working folder. Each is an argv inside
-    the container, never through a shell; the profile names the agent's program by its path.
+    """How the owner talks to the agent from the terminal (docs/34, decision 3; D27 of
+    docs/decisiones.md), run with ``docker exec`` as the agent's user, in the profile's working
+    folder. Each is an argv inside the container, never through a shell; the profile names the
+    agent's program by its path. A ``shell``-mode agent always has them (Claude Code); a
+    ``service``-mode one may (OpenClaw: a turn of its own CLI through its running Gateway).
 
-    - ``session``: `backtide entrar`, the agent's interactive program and its arguments.
-    - ``task``: `backtide tarea`, the headless run; ``--`` and the prompt go after it, so a
-      prompt that starts with ``-`` is never read as an option.
+    - ``session``: `backtide entrar`, the agent's interactive program and its arguments; empty
+      when the agent has none usable (`entrar` then refuses and says what to use instead).
+    - ``task``: `backtide tarea`, the headless run. The prompt goes after it as one argument:
+      after ``--`` (so a prompt that starts with ``-`` is never read as an option), or, with
+      ``prompt_flag``, as ``<prompt_flag>=<prompt>``, for a program that takes it only as an
+      option's value (OpenClaw's ``--message``): glued with ``=``, it is that value whatever it
+      starts with.
+    - ``timeout_flag``: the task program's own deadline, ``<timeout_flag>=<seconds>`` (OpenClaw's
+      ``--timeout``: its Gateway stops the turn there, which killing the CLI alone would not).
+      Empty when the program has none: the ``timeout`` around it is enough.
     - ``resume``: the flag that resumes the last conversation (Claude Code's ``--continue``),
-      for both.
+      for both. Empty when there is one conversation and every run continues it (OpenClaw's
+      main session, the same one Telegram talks to).
+    - ``answer``: reads what the task printed (TaskAnswer), or None when it is not an answer.
+    - ``default_minutes``: how long a task may run when `tarea` is not told (``--minutos``).
     - ``seed`` and ``seed_input``: run before a session with ``seed_input`` on its stdin (Claude
       Code: the first-run answers in ``~/.claude.json``). Inside the container, as the agent:
       it has no more power than the agent itself, and it never decides anything about security."""
 
     session: tuple[str, ...]
     task: tuple[str, ...]
-    resume: str
+    resume: str = ""
     seed: tuple[str, ...] = ()
     seed_input: str = ""
+    prompt_flag: str = ""
+    timeout_flag: str = ""
+    answer: Callable[[str], TaskAnswer | None] = plain_answer
+    default_minutes: int = 60
 
     def __post_init__(self) -> None:
         for label, argv in (("session", self.session), ("task", self.task)):
             _args(f"shell {label}", argv)
-            if not argv:
-                raise ValueError(f"shell {label} must name a program")
-            _match(f"shell {label} program", argv[0], _PROGRAM_RE)
+            if argv:
+                _match(f"shell {label} program", argv[0], _PROGRAM_RE)
+        if not self.task:
+            raise ValueError("shell task must name a program")
         _args("shell seed", self.seed)
         if self.seed:
             _match("shell seed program", self.seed[0], _PROGRAM_RE)
-        _match("shell resume flag", self.resume, _FLAG_RE)
+        for label, flag in (
+            ("resume flag", self.resume),
+            ("prompt flag", self.prompt_flag),
+            ("timeout flag", self.timeout_flag),
+        ):
+            if flag:
+                _match(f"shell {label}", flag, _FLAG_RE)
+        if not callable(self.answer):
+            raise ValueError("shell answer must be callable")
+        if type(self.default_minutes) is not int or not 0 < self.default_minutes <= 24 * 60:
+            raise ValueError("shell default_minutes must be a whole number of minutes, up to a day")
         if (
             not isinstance(self.seed_input, str)
             or "\0" in self.seed_input
@@ -334,15 +386,31 @@ class ShellCommands:
                 f"shell seed_input must be text of at most {MAX_SEED_INPUT} bytes, for a seed"
             )
 
-    def session_argv(self, *, resume: bool = False) -> list[str]:
-        """The argv of `backtide entrar` inside the container."""
-        return [*self.session, *([self.resume] if resume else [])]
+    @property
+    def one_conversation(self) -> bool:
+        """Whether every run continues the same conversation (no ``resume`` flag)."""
+        return not self.resume
 
-    def task_argv(self, prompt: str, *, resume: bool = False) -> list[str]:
+    def session_argv(self, *, resume: bool = False) -> list[str]:
+        """The argv of `backtide entrar` inside the container (ValueError without a session)."""
+        if not self.session:
+            raise ValueError("this agent has no interactive session")
+        return [*self.session, *([self.resume] if resume and self.resume else [])]
+
+    def task_argv(
+        self, prompt: str, *, resume: bool = False, seconds: int | None = None
+    ) -> list[str]:
         """The argv of `backtide tarea "<prompt>"` inside the container (ValueError for a prompt
-        that cannot be one argument: empty, too long, or with a NUL)."""
+        that cannot be one argument: empty, too long, or with a NUL). ``seconds`` is the
+        program's own deadline, for a profile with a ``timeout_flag``."""
         check_prompt(prompt)
-        return [*self.task, *([self.resume] if resume else []), "--", prompt]
+        deadline = []
+        if self.timeout_flag and seconds is not None:
+            if type(seconds) is not int or seconds <= 0:
+                raise ValueError("the task's deadline must be a positive number of seconds")
+            deadline = [f"{self.timeout_flag}={seconds}"]
+        given = [f"{self.prompt_flag}={prompt}"] if self.prompt_flag else ["--", prompt]
+        return [*self.task, *([self.resume] if resume and self.resume else []), *deadline, *given]
 
 
 def check_prompt(prompt: object) -> str:
@@ -386,7 +454,9 @@ class AgentProfile:
       agent (T20-4, Claude Code with a local model: its base URL and model ids), never a key.
       ``for_providers`` adds them to ``env``, so they go through exactly the same checks.
     - ``mode``: ``"service"`` (the command is the agent) or ``"shell"`` (the container waits and
-      the owner runs the agent in it: ``shell`` says how, and only a shell profile has one).
+      the owner runs the agent in it). ``shell`` says how the owner talks to it from the
+      terminal (`backtide entrar` and `tarea`): a shell profile always has it, with a session;
+      a service one may (OpenClaw, D27).
     - ``env`` may hold a reserved name only for a named profile, and only one of the exact pairs
       of ``REVIEWED_RESERVED_ENV``.
     - ``allow_hosts``: hosts this agent reads from all day that join the gate's allowed list
@@ -427,8 +497,8 @@ class AgentProfile:
             raise ValueError(f"mode must be one of {', '.join(MODES)}")
         if self.shell is not None and not isinstance(self.shell, ShellCommands):
             raise ValueError("shell must be ShellCommands")
-        if (self.mode == SHELL_MODE) != (self.shell is not None):
-            raise ValueError('a profile has shell commands if and only if its mode is "shell"')
+        if self.mode == SHELL_MODE and (self.shell is None or not self.shell.session):
+            raise ValueError('a profile of the "shell" mode has shell commands with a session')
         _text("version", self.version, allow_empty=False)
         _match("image (pinned by digest)", self.image, PINNED_IMAGE_RE)
         _match("entrypoint", self.entrypoint, _PROGRAM_RE)

@@ -1,6 +1,7 @@
 """The service's side of `backtide entrar`, `tarea`, `importar` and `exportar` (T17a-4,
-``Guardian.open_shell`` and ``Guardian.export``): only for a shell profile, only with the agent
-running, always recorded first. The Guardian is test_service_guardian.py's, with its fakes."""
+``Guardian.open_shell`` and ``Guardian.export``): `entrar` and `tarea` for a profile with shell
+commands (OpenClaw too, D27), `importar` and `exportar` only for a shell profile, only with the
+agent running, always recorded first. The Guardian is test_service_guardian.py's, with its fakes."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,13 +57,49 @@ def test_an_import_records_its_counts(shell_world: World) -> None:
     }
 
 
-def test_a_service_agent_is_never_opened(world: World) -> None:  # noqa: F811
+def test_openclaw_is_opened_for_a_task_and_recorded_with_what_was_asked(world: World) -> None:  # noqa: F811
+    """D27: `tarea` reaches OpenClaw too (a turn through its Gateway), recorded first like
+    Claude Code's, with what was asked (struck and cut by the control socket)."""
     shellable(world, OPENCLAW)
     world.guardian.start()
-    outcome = world.guardian.open_shell("session", requested_by="cli")
+    asked = {"prompt": "/new hola [tachado]", "slash": True}
+    outcome = world.guardian.open_shell("task", requested_by="cli", details=asked)
+    assert outcome.ready and outcome.workdir == "/workspace/work"
+    assert world.only("agent_shell").details == {
+        **asked,
+        "kind": "task",
+        "continue": False,
+        "requested_by": "cli",
+    }
+
+
+@pytest.mark.parametrize("kind", ["session", "import", "bundle"])
+def test_openclaw_is_never_opened_for_a_session_an_import_or_an_export(
+    world: World,  # noqa: F811
+    kind: str,
+) -> None:  # noqa: F811
+    shellable(world, OPENCLAW)
+    world.guardian.start()
+    outcome = world.guardian.open_shell(kind, requested_by="cli")
     assert outcome.status is ShellStatus.NOT_SHELL and "openclaw" in outcome.message
     assert not world.events("agent_shell")
     assert world.guardian.export("/tmp/x", requested_by="cli").status is ExportStatus.NOT_SHELL  # noqa: S108
+
+
+def test_an_agent_without_shell_commands_is_never_opened(world: World) -> None:  # noqa: F811
+    import dataclasses
+
+    from backtide.jail.profile import ShellCommands
+
+    shellable(world, dataclasses.replace(OPENCLAW, shell=None))
+    world.guardian.start()
+    for kind in ("session", "task"):
+        assert world.guardian.open_shell(kind, requested_by="cli").status is ShellStatus.NOT_SHELL
+    no_session = ShellCommands(session=(), task=("/bin/agent",))
+    shellable(world, dataclasses.replace(OPENCLAW, shell=no_session))
+    assert world.guardian.open_shell("session", requested_by="cli").status is ShellStatus.NOT_SHELL
+    assert world.guardian.open_shell("task", requested_by="cli").ready
+    assert [e.target for e in world.events("agent_shell")] == ["task"]
 
 
 def test_before_the_service_runs_nothing_is_opened(world: World) -> None:  # noqa: F811

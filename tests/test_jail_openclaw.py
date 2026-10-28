@@ -782,3 +782,68 @@ def test_check_does_not_modify_the_config(base: Config) -> None:
 def test_a_problem_is_a_plain_value() -> None:
     problem = RewindProblem("a.b", "because")
     assert (problem.path, problem.why) == ("a.b", "because")
+
+
+# --- talking to it from the terminal (D27: `backtide tarea` and `entrar`) ---------------------
+
+
+def test_the_commands_to_talk_to_openclaw() -> None:
+    """A turn of its own CLI through the running Gateway, always in the main session
+    (Telegram's too): one conversation, so no resume flag. No terminal session for now: an
+    always-on agent could write escape sequences into its terminal UI's tty."""
+    from backtide.jail.profiles import OPENCLAW
+    from backtide.jail.profiles.openclaw import CLI, NODE
+
+    shell = OPENCLAW.shell
+    assert shell is not None and OPENCLAW.mode == "service" and shell.one_conversation
+    assert shell.task_argv("-rf todo", seconds=600) == [
+        NODE, CLI, "agent", "--agent", "main", "--json", "--timeout=600", "--message=-rf todo",
+    ]  # fmt: skip
+    assert shell.session == () and shell.default_minutes == 15
+    assert "--deliver" not in shell.task
+    assert not shell.seed
+
+
+# What `openclaw agent --json` printed in the VM with 2026.9.8 (tests/integration/
+# test_local_profiles.py), cut to what is read.
+TURN = {
+    "runId": "c208b14f",
+    "status": "ok",
+    "summary": "completed",
+    "result": {
+        "payloads": [{"text": "uno", "mediaUrl": None}, {"text": "  "}, {"text": "dos"}],
+        "meta": {"durationMs": 1783},
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("printed", "text", "outcome"),
+    [
+        (TURN, "uno\n\ndos", "ok"),
+        ({**TURN, "status": "timeout", "result": {"payloads": []}}, "", "timed_out"),
+        ({**TURN, "status": "error", "result": {}}, "", "failed"),
+        ({"runId": "x", "status": "in_flight"}, "", "busy"),
+        ({**TURN, "status": "whatever"}, "uno\n\ndos", "failed"),
+        (
+            {"ok": False, "error": {"type": "cli_error", "message": "no gateway"}},
+            "no gateway",
+            "failed",
+        ),
+        ({"ok": False}, "", "failed"),
+    ],
+)
+def test_the_answer_of_a_turn(printed: object, text: str, outcome: str) -> None:
+    from backtide.jail.profiles.openclaw import task_answer
+
+    answer = task_answer(json.dumps(printed))
+    assert answer is not None and (answer.text, answer.outcome) == (text, outcome)
+
+
+@pytest.mark.parametrize(
+    "printed", ["not json", "[]", '{"status": 3}', '{"status": "ok", "result": {"payloads": 1}}']
+)
+def test_what_is_not_an_answer(printed: str) -> None:
+    from backtide.jail.profiles.openclaw import task_answer
+
+    assert task_answer(printed) is None

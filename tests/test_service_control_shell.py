@@ -90,6 +90,28 @@ def test_a_shell_request_reaches_the_guardian(
     assert (kind, resume, details) == ("session", True, None) and by.startswith("cli (uid ")
 
 
+def test_a_tasks_prompt_is_recorded_struck_and_cut(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    """What was asked goes into the record (``system/agent_shell``), struck of what looks like a
+    secret BEFORE it is cut (a secret cut in half would not be struck), at most 200 characters,
+    and ``slash`` for an agent's own command."""
+    secret = "sk-ant-api03-" + "A1b2C3d4" * 8
+    prompt = f"usa la clave {secret} y " + "x" * 400
+    assert ask_shell(server.path, "task", prompt=prompt, peer=me)["ok"]
+    assert ask_shell(server.path, "task", prompt="  /new", peer=me)["ok"]
+    (_, _, _, first), (_, _, _, second) = guardian.shells
+    assert secret not in first["prompt"] and secret[:20] not in first["prompt"]
+    assert first["prompt"].startswith("usa la clave ") and len(first["prompt"]) == 200
+    assert first["slash"] is False
+    assert second == {"prompt": "  /new", "slash": True}
+    # Sent raw to the socket, it is struck there too: the record is the service's.
+    reply = send(
+        server, {"cmd": "shell", "kind": "task", "continue": False, "prompt": f"k {secret}"}
+    )
+    assert reply["ok"] and secret not in guardian.shells[-1][3]["prompt"]
+
+
 @pytest.mark.parametrize(
     "request_",
     [
@@ -98,6 +120,9 @@ def test_a_shell_request_reaches_the_guardian(
         {"cmd": "shell", "kind": "root", "continue": False},
         {"cmd": "shell", "kind": "task", "continue": "yes"},
         {"cmd": "shell", "kind": "task", "continue": False, "argv": ["sh"]},
+        {"cmd": "shell", "kind": "session", "continue": False, "prompt": "hola"},
+        {"cmd": "shell", "kind": "task", "continue": False, "prompt": 3},
+        {"cmd": "shell", "kind": "task", "continue": False, "prompt": "x" * 201},
         {"cmd": "import", "name": "r", "source": "/s", "files": 1, "bytes": 1},
         {"cmd": "import", "name": "r", "source": "/s", "files": -1, "bytes": 1, "replace": False},
         {"cmd": "import", "name": "r", "source": "/s", "files": True, "bytes": 1, "replace": False},
