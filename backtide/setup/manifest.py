@@ -17,7 +17,7 @@ from typing import Any
 
 VERSION = 1
 MAX_BYTES = 256 * 1024
-KINDS = ("files", "dirs", "users", "groups", "units", "networks", "packages", "docker")
+KINDS = ("files", "dirs", "users", "groups", "units", "networks", "images", "packages", "docker")
 
 
 class ManifestError(Exception):

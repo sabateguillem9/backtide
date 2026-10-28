@@ -56,6 +56,10 @@ def save():
     state_path.write_text(json.dumps(state))
 if args == ["--version"]:
     print(f"limactl version {state.get('version', '2.2.1')}")
+elif args[:2] == ["list", "--quiet"]:
+    if state.get("list_fails"):
+        print("cannot read instances", file=sys.stderr); sys.exit(1)
+    print("".join(f"{name}\n" for name in vms), end="")
 elif args[0] == "list":
     name = args[-1]
     if name not in vms:
@@ -68,6 +72,8 @@ elif args[0] == "list":
               ":: [1 65535] 127.0.0.1 [1 65535] any true;"))
     elif "Mounts" in form:
         print(state.get("mounts_len", "0"))
+    elif "Images" in form:
+        print(state.get("image_urls", "https://example.test/fedora-44.qcow2 "))
     else:
         print(vms[name])
 elif args[0] == "create":
@@ -87,6 +93,10 @@ elif args[0] == "stop":
     listener.unlink(missing_ok=True)
 elif args[0] == "copy":
     pass
+elif args[:2] == ["delete", "--force"]:
+    vms.pop(args[-1], None); save()
+    import shutil
+    shutil.rmtree(home / args[-1], ignore_errors=True)
 elif args[0] == "shell":
     command = args[args.index("--") + 1:] if "--" in args else []
     if state.get("shell_fails"):
@@ -98,7 +108,19 @@ elif args[0] == "shell":
     elif command[:3] == ["sudo", "test", "-e"]:
         sys.exit(0 if state.get("key_in_vm") else 1)
     elif command[:3] == ["sudo", "sh", "-c"]:
+        state["backtide_in_vm"] = True; save()
         sys.exit(state.get("install_exit", 0))
+    elif command[:2] == ["sh", "-c"] and "/usr/local/bin/backtide" in command[2]:
+        if state.get("probe_fails"):
+            sys.exit(255)
+        found = state.get("program_in_vm", "/usr/local/bin/backtide")
+        print(found if state.get("backtide_in_vm") else "ninguno")
+    elif command[:3] in (["sudo", "backtide", "desinstalar"],
+                         ["sudo", "/opt/backtide/current/.venv/bin/backtide", "desinstalar"]):
+        if state.get("uninstall_exit", 0):
+            sys.exit(state["uninstall_exit"])
+        state["backtide_in_vm"] = False; save()
+        print("backtide se ha desinstalado.")
 """
 
 FAKE_CURL = r"""
@@ -113,7 +135,10 @@ shutil.copy(os.environ["FAKE_LIMA_TARBALL"], out)
 FAKE_SHASUM = r"""
 import hashlib, sys
 path = sys.argv[-1]
-print(hashlib.sha256(open(path, "rb").read()).hexdigest() + "  " + path)
+if path == "256":  # shasum -a 256, reading standard input
+    print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")
+else:
+    print(hashlib.sha256(open(path, "rb").read()).hexdigest() + "  " + path)
 """
 
 
@@ -164,6 +189,7 @@ class Mac:
             "FAKE_CALLS": str(self.calls_file),
             "FAKE_LIMA_TARBALL": str(self.lima_tarball),
             "FAKE_LISTENER_FILE": str(self.root / "listener"),
+            "FAKE_STTY_LOG": str(self.root / "stty.log"),
         }
         env.update(extra)
         return env
@@ -246,6 +272,8 @@ def mac(tmp_path: Path, short_dir: Path) -> Mac:
         fake / "df",
         'echo "Filesystem 1K-blocks Used Available"; echo "x 1 1 ${FAKE_FREE_K:-209715200}"',
     )
+    # The real stty, writing down how it was called: the tests check echo goes back on.
+    _write_sh(fake / "stty", 'echo "$*" >> "$FAKE_STTY_LOG"; exec /bin/stty "$@"')
     _write_fake(fake / "curl", FAKE_CURL)
     _write_fake(fake / "shasum", FAKE_SHASUM)
     lima_tarball = tmp_path / "lima.tar.gz"
@@ -290,7 +318,8 @@ def test_it_is_valid_posix_sh_and_short_enough_to_read() -> None:
         subprocess.run([shell, "-n", str(SCRIPT)], check=True)
     assert TEXT.startswith("#!/bin/sh\n")
     assert "\nset -eu\n" in TEXT
-    assert len(TEXT.splitlines()) <= 350  # half of it is the `backtide` it leaves on the Mac
+    # Half of it is the `backtide` it leaves on the Mac, with its uninstall (T13-4).
+    assert len(TEXT.splitlines()) <= 450
 
 
 def test_lima_is_pinned_by_version_and_hash_and_checked_before_it_is_unpacked() -> None:
@@ -316,7 +345,9 @@ def test_it_never_pipes_a_download_into_a_shell_and_uses_no_homebrew() -> None:
             r"'[^']*'", "''", re.sub(r'"[^"]*"', '""', line)
         )  # what runs, not what it says
         if re.search(r"\bsudo\b", code) and not code.lstrip().startswith("#"):
-            assert re.search(r"\b(in_vm|probe) sudo|-- sudo backtide", code), line
+            assert re.search(
+                r"\b(in_vm|probe) sudo|-- sudo (/opt/backtide/current/\.venv/bin/)?backtide", code
+            ), line
 
 
 def test_the_archive_is_checked_before_anything_is_written() -> None:
@@ -799,16 +830,34 @@ def test_no_lima_call_ever_gets_the_keys_descriptor(mac: Mac) -> None:
     assert _install_call(mac)["stdin"] == KEY + "\n"
 
 
-def _on_a_terminal(mac: Mac, script: Path, *args: str, typed: bytes = b"", signal: int = 0):
-    """Run ``script`` with its standard input on a pseudo-terminal (as when typed by a person);
-    type ``typed`` once it asks, or send ``signal`` instead. Returns (exit code, all output)."""
+def _on_a_terminal(
+    mac: Mac,
+    script: Path,
+    *args: str,
+    typed: bytes = b"",
+    signal: int = 0,
+    prompt: bytes = b"no se ve al escribirla",
+    before: tuple[tuple[bytes, bytes], ...] = (),
+):
+    """Run ``script`` in a session of its own whose controlling terminal is a pseudo-terminal,
+    with its standard input there (as when typed by a person) and its output on a pipe. Answer
+    each ``before`` prompt, then type ``typed`` at ``prompt``, or send ``signal`` to the whole
+    process group instead (what Ctrl-C does). Returns (exit code, the output, and what the
+    terminal itself showed: the echo of what was typed, and whether the last `stty` it ran put
+    echo back on)."""
+    import fcntl
     import os
     import pty
     import select
-    import signal as signals
+    import termios
     import time
 
     master, slave = pty.openpty()
+
+    def own_terminal() -> None:
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
     proc = subprocess.Popen(
         ["/bin/sh", str(script), *args],
         stdin=slave,
@@ -816,37 +865,51 @@ def _on_a_terminal(mac: Mac, script: Path, *args: str, typed: bytes = b"", signa
         stderr=subprocess.STDOUT,
         cwd=mac.root,
         env=mac.env(),
+        preexec_fn=own_terminal,  # noqa: PLW1509 - a test: a session and a terminal of its own
     )
-    os.close(slave)
-    out = b""
+    out, tty = b"", b""
     deadline = time.monotonic() + 30
-    asked = False
+    steps = [*before, (prompt, typed)]
     while proc.poll() is None and time.monotonic() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], 0.2)
-        if ready:
-            chunk = os.read(proc.stdout.fileno(), 4096)
-            out += chunk
-        if not asked and b"no se ve al escribirla" in out:
-            asked = True
+        ready, _, _ = select.select([proc.stdout, master], [], [], 0.2)
+        if proc.stdout in ready:
+            out += os.read(proc.stdout.fileno(), 4096)
+        if master in ready:
+            tty += os.read(master, 4096)
+        if steps and steps[0][0] in out:
             time.sleep(0.3)
-            if signal:
-                proc.send_signal(signal)
+            if len(steps) == 1 and signal:
+                os.killpg(proc.pid, signal)
             else:
-                os.write(master, typed)
+                os.write(master, steps[0][1])
+            steps.pop(0)
     out += proc.stdout.read() or b""
     proc.wait(timeout=10)
+    while select.select([master], [], [], 0.2)[0]:
+        chunk = os.read(master, 4096)
+        if not chunk:
+            break
+        tty += chunk
+    os.close(slave)
+    log = mac.root / "stty.log"
+    stty = log.read_text().split("\n")[:-1] if log.exists() else []
+    echo_on = not stty or stty[-1] == "echo"  # whatever turned echo off turned it back on
     os.close(master)
-    assert signals  # imported for the callers' constants
-    return proc.returncode, out.decode(errors="replace")
+    return proc.returncode, out.decode(errors="replace"), (tty, echo_on)
 
 
 def test_a_typed_key_goes_through_stdin_without_echo(mac: Mac) -> None:
-    code, out = _on_a_terminal(
-        mac, mac.script, "--desde", str(mac.archive), "--sha256", mac.sha, "--si",
-        typed=(KEY + "\n").encode(),
+    """The key typed at its prompt never shows on the terminal (stty -echo); as a control, the
+    answer typed at the question before it does."""
+    code, out, (tty, echo_on) = _on_a_terminal(
+        mac, mac.script, "--desde", str(mac.archive), "--sha256", mac.sha,
+        before=((b"\xc2\xbfSeguimos?", b"si\n"),), typed=(KEY + "\n").encode(),
     )  # fmt: skip
     assert code == 0, out
-    assert KEY not in out  # not echoed, never printed
+    assert b"si" in tty  # the control: an answer that is no secret is echoed
+    assert KEY.encode() not in tty and KEY[:20].encode() not in tty  # the key is not
+    assert KEY not in out  # nor printed
+    assert echo_on and "-echo" in (mac.root / "stty.log").read_text()  # off, then on again
     call = _install_call(mac)
     assert call["stdin"] == KEY + "\n" and "--clave-stdin" in call["argv"]
     assert KEY not in json.dumps(call["argv"])
@@ -855,11 +918,12 @@ def test_a_typed_key_goes_through_stdin_without_echo(mac: Mac) -> None:
 def test_ctrl_c_at_the_key_prompt_stops_the_whole_install(mac: Mac) -> None:
     import signal
 
-    code, out = _on_a_terminal(
+    code, out, (_, echo_on) = _on_a_terminal(
         mac, mac.script, "--desde", str(mac.archive), "--sha256", mac.sha, "--si",
         signal=signal.SIGINT,
     )  # fmt: skip
     assert code == 130, out
+    assert echo_on and "-echo" in (mac.root / "stty.log").read_text()  # the trap put it back
     installs = [
         c
         for c in _shell_calls(mac)
@@ -871,7 +935,7 @@ def test_ctrl_c_at_the_key_prompt_stops_the_whole_install(mac: Mac) -> None:
 
 
 def test_clave_stdin_from_a_terminal_is_refused(mac: Mac) -> None:
-    code, out = _on_a_terminal(
+    code, out, _ = _on_a_terminal(
         mac, mac.script, "--desde", str(mac.archive), "--sha256", mac.sha, "--si", "--clave-stdin"
     )
     assert code == 1 and "--clave-archivo" in out
@@ -880,7 +944,7 @@ def test_clave_stdin_from_a_terminal_is_refused(mac: Mac) -> None:
 
 def test_the_wrapper_refuses_clave_stdin_from_a_terminal(mac: Mac, wrapper: Path) -> None:
     first = len(mac.calls())
-    code, out = _on_a_terminal(mac, wrapper, "instalar", "--clave-stdin")
+    code, out, _ = _on_a_terminal(mac, wrapper, "instalar", "--clave-stdin")
     assert code == 1 and "--clave-archivo" in out
     assert [c for c in mac.calls()[first:] if c.get("argv", [""])[0] == "shell"] == []
 
@@ -969,3 +1033,236 @@ def test_vm_text_shown_on_the_mac_has_no_terminal_escapes(mac: Mac) -> None:
     done = mac.install("--sin-clave")
     assert done.returncode == 1 and "carpetas del Mac" in done.stderr
     assert "\x1b" not in done.stderr and "\x07" not in done.stderr
+
+
+# -- uninstalling (T13-4) ------------------------------------------------------------------------
+
+
+def _ours_lima(mac: Mac) -> Path:
+    return mac.home / ".backtide" / "lima" / "2.2.1" / "bin" / "limactl"
+
+
+def _verbs(mac: Mac, first: int = 0) -> list[list[str]]:
+    return [c["argv"] for c in mac.calls()[first:] if "argv" in c and c["argv"][0] != "--version"]
+
+
+def _inner(argv: list[str]) -> list[str]:
+    return argv[argv.index("--") + 1 :] if "--" in argv else []
+
+
+def test_uninstall_keeps_the_vm_stopped_with_the_data(mac: Mac, wrapper: Path) -> None:
+    first = len(mac.calls())
+    done = _wrap(mac, wrapper, "desinstalar", "--si")
+    assert done.returncode == 0, done.stderr
+    verbs = _verbs(mac, first)
+    inner = [_inner(v) for v in verbs if v[0] == "shell"]
+    assert ["sudo", "backtide", "desinstalar", "--si"] in inner
+    assert verbs[-1] == ["stop", "backtide"]
+    assert not any(v[0] == "delete" for v in verbs)
+    assert mac.state()["vms"] == {"backtide": "Stopped"}
+    assert not wrapper.exists()
+    assert _ours_lima(mac).exists()  # the VM still needs it
+    assert "PARADA" in done.stdout and "/var/lib/backtide" in done.stdout
+    assert "--desinstalar --borrar-datos" in done.stdout
+    assert f"LIMA_HOME={mac.lima_home} " in done.stdout  # not the default one: said
+
+
+def test_a_second_uninstall_says_there_is_nothing_to_remove(mac: Mac, wrapper: Path) -> None:
+    assert _wrap(mac, wrapper, "desinstalar", "--si").returncode == 0
+    first = len(mac.calls())
+    done = mac.run("--desinstalar", "--si")
+    assert done.returncode == 0, done.stderr
+    assert "No queda nada de backtide que quitar" in done.stdout
+    assert [v[0] for v in _verbs(mac, first)] == ["list"]  # it only looked
+
+
+def test_install_mac_sh_desinstalar_is_the_wrappers_uninstall(mac: Mac, wrapper: Path) -> None:
+    done = mac.run("--desinstalar", "--si")
+    assert done.returncode == 0, done.stderr
+    assert mac.state()["vms"] == {"backtide": "Stopped"} and not wrapper.exists()
+
+
+def test_without_the_wrapper_install_mac_sh_still_uninstalls(mac: Mac, wrapper: Path) -> None:
+    wrapper.unlink()
+    mac.set_state(vms={"backtide": "Running"})
+    done = mac.run("--desinstalar", "--si")
+    assert done.returncode == 0, done.stderr
+    assert mac.state()["vms"] == {"backtide": "Stopped"}
+    assert mac.state()["backtide_in_vm"] is False
+    assert list((mac.root / "tmp").iterdir()) == []  # its copy of the wrapper is gone
+
+
+def test_installing_again_after_an_uninstall_reuses_the_vm(mac: Mac, wrapper: Path) -> None:
+    assert _wrap(mac, wrapper, "desinstalar", "--si").returncode == 0
+    first = len(mac.calls())
+    assert mac.install("--sin-clave").returncode == 0
+    assert not any(v[0] == "create" for v in _verbs(mac, first))
+    assert wrapper.exists()
+
+
+def test_a_half_finished_uninstall_goes_on(mac: Mac, wrapper: Path) -> None:
+    mac.set_state(uninstall_exit=1)
+    done = _wrap(mac, wrapper, "desinstalar", "--si")
+    assert done.returncode == 1 and "vuelve a ejecutarla" in done.stderr
+    assert wrapper.exists()  # so it can be run again
+    mac.set_state(uninstall_exit=0)
+    assert _wrap(mac, wrapper, "desinstalar", "--si").returncode == 0
+    assert not wrapper.exists() and mac.state()["vms"] == {"backtide": "Stopped"}
+
+
+def test_erasing_deletes_the_vm_our_lima_and_its_cache(mac: Mac, wrapper: Path) -> None:
+    cache = mac.home / "Library" / "Caches" / "lima" / "download" / "by-url-sha256"
+    url = "https://example.test/fedora-44.qcow2"
+    ours = cache / hashlib.sha256(url.encode()).hexdigest()
+    other = cache / ("0" * 64)  # someone else's download
+    ours.mkdir(parents=True)
+    other.mkdir()
+    done = _wrap(mac, wrapper, "desinstalar", "--borrar-datos", "--si")
+    assert done.returncode == 0, done.stderr
+    assert ["delete", "--force", "backtide"] in _verbs(mac)
+    assert mac.state()["vms"] == {}
+    assert not wrapper.exists()
+    assert not (mac.home / ".backtide").exists()
+    assert not mac.lima_home.exists()  # the install made it: it goes with the VM
+    assert not ours.exists() and other.exists()  # and the cache, not empty, stays
+    assert "para siempre" in done.stdout
+
+
+def test_erasing_removes_limas_cache_folders_once_empty(mac: Mac, wrapper: Path) -> None:
+    cache = mac.home / "Library" / "Caches" / "lima"
+    url = "https://example.test/fedora-44.qcow2"
+    (cache / "download" / "by-url-sha256" / hashlib.sha256(url.encode()).hexdigest()).mkdir(
+        parents=True
+    )
+    assert _wrap(mac, wrapper, "desinstalar", "--borrar-datos", "--si").returncode == 0
+    assert not cache.exists() and (mac.home / "Library" / "Caches").exists()
+
+
+def test_erasing_keeps_our_lima_when_another_vm_uses_it(mac: Mac, wrapper: Path) -> None:
+    mac.set_state(vms={**mac.state()["vms"], "otra": "Running"})
+    done = _wrap(mac, wrapper, "desinstalar", "--borrar-datos", "--si")
+    assert done.returncode == 0, done.stderr
+    assert mac.state()["vms"] == {"otra": "Running"}
+    assert not any(v[:1] == ["delete"] and v[-1] == "otra" for v in _verbs(mac))
+    assert not any(v[:1] == ["stop"] and v[-1] == "otra" for v in _verbs(mac))
+    assert _ours_lima(mac).exists() and mac.lima_home.exists()
+    assert "la usan otras VMs" in done.stdout
+
+
+def test_erasing_never_touches_the_users_own_lima(mac: Mac) -> None:
+    own = _with_limactl_on_path(mac)
+    mac.lima_home.mkdir(parents=True)  # theirs, from before
+    assert mac.install("--sin-clave").returncode == 0
+    done = _wrap(mac, _wrapper(mac), "desinstalar", "--borrar-datos", "--si")
+    assert done.returncode == 0, done.stderr
+    assert own.exists() and mac.lima_home.exists()
+    assert not (mac.home / ".backtide").exists()
+
+
+def test_erasing_asks_for_the_vms_name(mac: Mac, wrapper: Path) -> None:
+    asks = b"escribe el nombre de la VM"
+    code, out, _ = _on_a_terminal(
+        mac, wrapper, "desinstalar", "--borrar-datos", typed=b"otra\n", prompt=asks
+    )
+    assert code == 1 and "no coincide" in out
+    assert mac.state()["vms"] == {"backtide": "Running"} and wrapper.exists()
+    code, out, _ = _on_a_terminal(
+        mac, wrapper, "desinstalar", "--borrar-datos", typed=b"backtide\n", prompt=asks
+    )
+    assert code == 0, out
+    assert mac.state()["vms"] == {}
+
+
+def test_uninstalling_without_a_terminal_needs_si(mac: Mac, wrapper: Path) -> None:
+    first = len(mac.calls())
+    for args in (["desinstalar"], ["desinstalar", "--borrar-datos"]):
+        done = _wrap(mac, wrapper, *args)
+        assert done.returncode == 1 and "--si" in done.stderr
+    assert [v[0] for v in _verbs(mac, first)] == ["list", "list"]
+    assert wrapper.exists()
+
+
+def test_a_vm_called_backtide_that_is_not_ours_is_never_uninstalled(
+    mac: Mac, wrapper: Path
+) -> None:
+    (mac.lima_home / "backtide" / "lima.yaml").write_text("images: []\n")
+    first = len(mac.calls())
+    done = _wrap(mac, wrapper, "desinstalar", "--borrar-datos", "--si")
+    assert done.returncode == 1 and "no es la de backtide" in done.stderr
+    assert [v[0] for v in _verbs(mac, first)] == ["list"]
+
+
+def test_desinstalar_takes_only_its_two_options(mac: Mac, wrapper: Path) -> None:
+    done = _wrap(mac, wrapper, "desinstalar", "--quitar-docker")
+    assert done.returncode == 1 and "--borrar-datos y --si" in done.stderr
+
+
+# -- the review of T13-4 (revisor-seguridad R1, R3, R4; guardian-invariantes G5) --------------
+
+
+def test_erasing_never_removes_lima_home_when_lima_cannot_list_its_vms(
+    mac: Mac, wrapper: Path
+) -> None:
+    """R1 + G5: another VM is there, and `limactl list` fails: no answer is no proof of none."""
+    mac.set_state(vms={**mac.state()["vms"], "otra": "Running"}, list_fails=True)
+    (mac.lima_home / "otra").mkdir()
+    done = _wrap(mac, wrapper, "desinstalar", "--borrar-datos", "--si")
+    assert done.returncode == 1 and "no puede listar sus VMs" in done.stderr
+    assert mac.lima_home.exists() and (mac.lima_home / "otra").exists()
+    assert _ours_lima(mac).exists()
+
+
+def test_erasing_never_removes_a_lima_home_with_something_unknown_in_it(
+    mac: Mac, wrapper: Path
+) -> None:
+    (mac.lima_home / "_disks").mkdir()  # Lima's extra disks: someone's data
+    done = _wrap(mac, wrapper, "desinstalar", "--borrar-datos", "--si")
+    assert done.returncode == 1 and "_disks" in done.stderr
+    assert (mac.lima_home / "_disks").exists()
+
+
+def test_erasing_keeps_lima_home_when_our_vm_was_not_there(mac: Mac, wrapper: Path) -> None:
+    """Without our VM in it, nothing says that LIMA_HOME holds only what the install made."""
+    mac.set_state(vms={})
+    done = _wrap(mac, wrapper, "desinstalar", "--borrar-datos", "--si")
+    assert done.returncode == 0, done.stderr
+    assert mac.lima_home.exists()
+
+
+def test_erasing_needs_the_installs_lima(mac: Mac, wrapper: Path) -> None:
+    import shutil as sh
+
+    sh.rmtree(_ours_lima(mac).parents[1])
+    done = mac.run("desinstalar", "--borrar-datos", "--si", script=wrapper)
+    assert done.returncode == 1 and "no está" in done.stderr
+    assert mac.lima_home.exists() and wrapper.exists()
+
+
+@pytest.mark.parametrize("extra", [["--dry-run"], ["--quitar-docker"], ["--sin-clave"],
+                                   ["--clave-archivo", "/etc/hosts"]])  # fmt: skip
+def test_install_mac_sh_desinstalar_refuses_any_other_option(
+    mac: Mac, wrapper: Path, extra: list[str]
+) -> None:
+    """R3: never a --dry-run dropped in silence and a real uninstall instead."""
+    first = len(mac.calls())
+    done = mac.run("--desinstalar", *extra)
+    assert done.returncode == 1 and "--desinstalar solo admite" in done.stderr
+    assert mac.calls()[first:] == [] and wrapper.exists()
+
+
+def test_the_uninstall_inside_goes_on_with_the_program_when_the_command_is_gone(
+    mac: Mac, wrapper: Path
+) -> None:
+    """R4: a run inside that stopped after taking /usr/local/bin/backtide: /opt's program."""
+    mac.set_state(program_in_vm="/opt/backtide/current/.venv/bin/backtide")
+    first = len(mac.calls())
+    assert _wrap(mac, wrapper, "desinstalar", "--si").returncode == 0
+    inner = [_inner(v) for v in _verbs(mac, first) if v[0] == "shell"]
+    assert ["sudo", "/opt/backtide/current/.venv/bin/backtide", "desinstalar", "--si"] in inner
+
+
+def test_never_says_uninstalled_when_it_could_not_look_inside(mac: Mac, wrapper: Path) -> None:
+    mac.set_state(probe_fails=True)
+    done = _wrap(mac, wrapper, "desinstalar", "--si")
+    assert done.returncode == 1 and "no se ha desinstalado nada" in done.stderr
+    assert "está desinstalado" not in done.stdout and wrapper.exists()

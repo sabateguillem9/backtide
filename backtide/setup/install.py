@@ -57,7 +57,17 @@ from backtide.jail.config import network_create_argv as agent_network_argv
 from backtide.jail.docker import sanitize
 from backtide.jail.proxy_config import network_create_argv as egress_network_argv
 from backtide.service.config import STATE_CHECKPOINT, STATE_KEY, ConfigError, ServiceConfig
-from backtide.setup import images, layout, manifest, networks, packages, preflight, secrets, units
+from backtide.setup import (
+    containers,
+    images,
+    layout,
+    manifest,
+    networks,
+    packages,
+    preflight,
+    secrets,
+    units,
+)
 from backtide.setup import volume as volume_steps
 from backtide.setup.host import Host, Ran, Runner
 from backtide.setup.manifest import Manifest
@@ -72,6 +82,8 @@ DOCKER_WAIT = 90.0  # seconds for Docker to answer after it is installed or rest
 NOLOGIN = ("/usr/sbin/nologin", "/sbin/nologin")
 DIR_MODE_CONFIG = 0o755
 FILE_MODE_PUBLIC = 0o644
+# Where `backtide desinstalar` keeps backtide.toml (with the data), for the next install.
+SAVED_CONFIG = "backtide.toml.guardado"
 
 
 class InstallError(Exception):
@@ -83,6 +95,7 @@ class Paths:
     """Every path the installer touches. ``installed()`` is the real layout; the Mac tests put
     the same tree under a temporary folder (``under``)."""
 
+    opt_dir: Path = layout.OPT_DIR  # install.sh's: releases/, current, uv/, python/, cache/
     program: Path = layout.PROGRAM
     bin_link: Path = layout.BIN_LINK
     config_dir: Path = layout.CONFIG_DIR
@@ -247,8 +260,8 @@ class Installer:
         if not os.path.lexists(key):
             say("  - Falta la clave del modelo: ponla en la página Ajustes de la web, o vuelve a "
                 "ejecutar el instalador con --clave-archivo <ruta>.")  # fmt: skip
-        say("  - Para desinstalar (T13-4, aún no está): el manifiesto de lo que se creó está en "
-            f"{self.paths.manifest}.")  # fmt: skip
+        say("  - Para quitarlo: `sudo backtide desinstalar` (conserva la caja negra, el trabajo "
+            "del agente y las claves; con --borrar-datos, todo).")  # fmt: skip
         if self._warnings:
             say("\nAvisos:")
             for warning in self._warnings:
@@ -393,6 +406,8 @@ class Installer:
                 images.pull(image, run=self.run, run_long=self.run_long, sleep=self.sleep)
             except images.ImageError as error:
                 raise InstallError(str(error)) from None
+            self.manifest.add("images", image.ref)  # ours: the uninstaller may remove it
+            self._save()
 
     def volume(self) -> None:
         image, mount = self.paths.volume_image, self.paths.volume_mount
@@ -427,12 +442,19 @@ class Installer:
         gid = self._web_gid()
         root_uid, root_gid = self.owner
         written = False
+        saved = self.paths.state_dir / SAVED_CONFIG
         if os.path.lexists(self.paths.config_file):
             self.prompter.say(f"{self.paths.config_file} ya existe: se conserva tal cual.")
         else:
-            self._write(self.paths.config_file, self.render_config(), 0o600, self.owner)
+            text = self._saved_config(saved)
+            if text is not None:
+                self.prompter.say(f"Se recupera la configuración que guardó la desinstalación "
+                                  f"({saved}).")  # fmt: skip
+            self._write(self.paths.config_file, text or self.render_config(), 0o600, self.owner)
             self.manifest.add("files", self.paths.config_file)
             written = True
+        if written and os.path.lexists(saved):
+            saved.unlink()  # back in /etc/backtide: one copy only
         self._write(self.paths.web_config_file, self.render_web_config(), layout.WEB_CONFIG_MODE,
                     (root_uid, gid))  # fmt: skip
         self.manifest.add("files", self.paths.web_config_file)
@@ -461,6 +483,8 @@ class Installer:
             if error.errno != errno.EINVAL:
                 raise InstallError(f"no se puede mirar {link}: {error.strerror}") from None
             current = ""  # a file that is not a link
+        if self.paths.program.is_relative_to(self.paths.opt_dir):
+            self.manifest.add("dirs", self.paths.opt_dir)  # install.sh's, all of it backtide's
         if current == str(target):
             return
         if current is not None:
@@ -492,6 +516,8 @@ class Installer:
                     chosen = networks.choose(taken, len(missing))
             except networks.NetworkError as error:
                 raise InstallError(str(error)) from None
+        # The roles their labels say, for the uninstaller (removed only with them, T13-4).
+        self.manifest.facts["network_roles"] = containers.expected_networks(config)
         subnets = self.manifest.facts.setdefault("subnets", {})
         for (label, name, argv), subnet in zip(missing, chosen, strict=True):
             if networks.clashes(subnet, routes):
@@ -536,6 +562,9 @@ class Installer:
             self.manifest.facts["quota_enable"] = "done"
 
     def start(self) -> None:
+        # What the service will make, for the uninstaller (removed only with these labels).
+        self.manifest.facts["containers"] = containers.expected_containers(self._service_config())
+        self._save()
         started = self.manifest.facts.get("release_started")
         new_release = self.release is not None and started not in (None, str(self.release))
         if new_release:
@@ -559,6 +588,25 @@ class Installer:
         if self.release is not None:
             self.manifest.facts["release_started"] = str(self.release)
 
+    def _saved_config(self, path: Path) -> str | None:
+        """The ``backtide.toml`` `backtide desinstalar` kept in the state folder, if it is there
+        and root's 0600 regular file; None otherwise (then the installer writes a new one)."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner[0]:
+                return None
+            if stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 64 * 1024:
+                return None
+            return os.read(fd, 64 * 1024).decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        finally:
+            os.close(fd)
+
     def _fresh_containers(self) -> None:
         """Another version of backtide in /opt/backtide/current: the containers the service made
         for the one before mount its code (the proxy, the gate) and backtide rightly refuses a
@@ -568,11 +616,18 @@ class Installer:
         self.prompter.say("Otra versión de backtide: se rehacen sus contenedores.")
         self._check(("systemctl", "stop", layout.SERVICE_UNIT), "backtide no se paró")
         config = self._service_config()
-        for name in (config.jail_config().name, config.proxy_jail_config().name,
-                     config.sensor_jail_config().name):  # fmt: skip
-            ran = self.run(("docker", "rm", "--force", name))
-            if ran is None or (ran.returncode != 0 and "No such container" not in ran.stderr):
-                raise InstallError(f"no se pudo quitar el contenedor {name}")
+        for name, role in containers.expected_containers(config).items():
+            # Only one that carries backtide's label (T13-4): never someone's of the same name.
+            try:
+                found = containers.remove("container", name, role, run=self.run)
+            except containers.DockerObjectError as error:
+                raise InstallError(str(error)) from None
+            if found is containers.Found.NOT_OURS:
+                raise InstallError(
+                    f"hay un contenedor {name} que no lleva la etiqueta de backtide: no se toca. "
+                    "Si es tuyo, cámbiale el nombre; si es de una versión vieja de backtide, "
+                    f"quítalo con `docker rm --force {name}` y vuelve a instalar."
+                )
 
     def selftest(self) -> None:
         if self.self_test is None:
@@ -841,9 +896,14 @@ class Installer:
         return data, True
 
     def _write_daemon(self, path: Path, settings: dict[str, object], existed: bool) -> None:
+        """daemon.json with backtide's settings. One that was there keeps its mode (never more
+        open than 0644; review of T13-4, R8); a new one is 0644, as Docker's own."""
         self._ensure_dir(path.parent, DIR_MODE_CONFIG, self.owner, keep_mode=True)
         text = json.dumps(settings, indent=2, sort_keys=True) + "\n"
-        self._write(path, text, FILE_MODE_PUBLIC, self.owner)
+        mode = FILE_MODE_PUBLIC
+        if existed:
+            mode = stat.S_IMODE(os.lstat(path).st_mode) & FILE_MODE_PUBLIC
+        self._write(path, text, mode, self.owner)
         if not existed:
             self.manifest.add("files", path)
 

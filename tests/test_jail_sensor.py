@@ -45,6 +45,7 @@ SENSOR_ID = "ab" * 32
 EXPECTED_ARGV = [
     "create",
     "--name", "backtide-sensor",
+    "--label", "backtide.role=sensor",  # T13-4: the uninstaller removes only what carries it
     "--privileged", "--pid=host", "--cgroupns=host",
     "--network", "none",
     "--restart", "no",

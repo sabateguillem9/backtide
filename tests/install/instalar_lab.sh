@@ -8,6 +8,11 @@
 #   sudo bash instalar_lab.sh fugas               # the made-up key in ps, journal, logs, files?
 #   sudo bash instalar_lab.sh estado              # what is there: units, mounts, containers
 #   sudo bash instalar_lab.sh bateria SRC.tar     # the T13 scenarios of the battery, as root
+#   sudo bash instalar_lab.sh senuelos            # a user, folders and a container that are not
+#                                                 # ours, for the uninstall to leave alone (T13-4)
+#   sudo bash instalar_lab.sh huella FILE         # the machine as the uninstall must leave it
+#   sudo bash instalar_lab.sh desinstalar SRC.tar [flags]  # `backtide desinstalar` from SRC.tar,
+#                                                 # also once /opt/backtide is gone (a second run)
 #
 # Invariant 8: no real key and no real service. The key is made up here (it has the shape of an
 # Anthropic key and is nobody's). `bloquear` drops, before Docker exists, everything Docker's
@@ -142,6 +147,84 @@ bateria() {
       pytest -m ataques -p no:cacheprovider -rs tests/attacks/test_install_attacks.py "$@" )
 }
 
+senuelos() {
+  # Someone else's things, made after Docker is there: none may change in an uninstall.
+  getent passwd vecino >/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin vecino
+  mkdir -p /etc/vecino /var/lib/vecino /opt/vecino
+  echo "de otro" > /etc/vecino/ajustes; echo "de otro" > /var/lib/vecino/datos; echo "de otro" > /opt/vecino/programa
+  docker image inspect busybox:1.37 >/dev/null 2>&1 || docker pull --quiet busybox:1.37 >/dev/null
+  docker network inspect vecino-net >/dev/null 2>&1 || docker network create --internal vecino-net >/dev/null
+  docker container inspect vecino-web >/dev/null 2>&1 \
+    || docker run -d --name vecino-web --network vecino-net --restart unless-stopped busybox:1.37 sleep infinity >/dev/null
+  # A setting of the person's own in Docker's daemon.json, added after the install.
+  python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("/etc/docker/daemon.json")
+d = json.loads(p.read_text()) if p.exists() else {}
+d["max-concurrent-downloads"] = 2
+p.write_text(json.dumps(d, indent=2) + "\n")
+PY
+  # And one with the name of backtide's own sensor but not its label (review of T13-4): it must
+  # survive the uninstall. The name is free only with backtide stopped (its sensor goes with the
+  # service; a labelled one left behind is the lab's own to remove), so this goes right before
+  # `desinstalar`.
+  systemctl stop backtide.service 2>/dev/null || true
+  if [ "$(docker container inspect --format '{{index .Config.Labels "backtide.role"}}' backtide-sensor 2>/dev/null)" = sensor ]; then
+    docker rm --force backtide-sensor >/dev/null
+  fi
+  docker container inspect backtide-sensor >/dev/null 2>&1 \
+    || docker run -d --name backtide-sensor --network none busybox:1.37 sleep infinity >/dev/null
+  result decoys "$(docker inspect --format '{{.Name}} {{.State.StartedAt}}' vecino-web backtide-sensor | tr '\n' ' ')"
+}
+
+huella() {
+  # What an uninstall must leave as it found it, one sorted line each, to diff before and after.
+  local out=$1
+  {
+    set +e +o pipefail  # a missing user or file is an answer here, not a failure
+    systemctl list-unit-files --no-legend 'backtide*' 'var-lib-backtide*' 2>/dev/null | sed 's/^/unit /'
+    findmnt -rn -o TARGET,FSTYPE | awk '$1 ~ /backtide/ {print "mount " $0}'
+    losetup -n -O NAME,BACK-FILE 2>/dev/null | awk '{print "loop " $2}'
+    for name in backtide-web vecino; do getent passwd "$name" | cut -d: -f1,6,7 | sed 's/^/user /'; getent group "$name" | cut -d: -f1 | sed 's/^/group /'; done
+    for path in /etc/backtide /opt/backtide /var/lib/backtide /var/lib/backtide-agent /usr/local/bin/backtide \
+                /etc/vecino /var/lib/vecino /opt/vecino \
+                /etc/yum.repos.d/docker-ce.repo /etc/pki/rpm-gpg/backtide-docker-ce.asc \
+                /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc; do
+      [ -e "$path" ] || [ -L "$path" ] && echo "path $path $(stat -c '%U:%G %a' "$path")"
+    done
+    for file in /etc/vecino/ajustes /var/lib/vecino/datos /opt/vecino/programa /etc/docker/daemon.json; do
+      [ -e "$file" ] && echo "sha $file $(sha256sum "$file" | cut -d' ' -f1)"
+    done
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      docker ps -a --format 'container {{.Names}} {{.Image}}'
+      docker network ls --format 'network {{.Name}}'
+      docker image ls --format 'image {{.Repository}}' | sort -u
+      docker inspect --format 'decoy-started {{.Name}} {{.State.StartedAt}}' vecino-web backtide-sensor 2>/dev/null || true
+    else
+      echo "docker absent"
+    fi
+    { rpm -qa 'docker-ce*' 'containerd*' 2>/dev/null || dpkg-query -W -f '${Package}\n' 'docker-ce*' 'containerd*' 2>/dev/null; } | sed 's/^/package /'
+    rpmkeys --list 2>/dev/null | grep -i docker | sed 's/^/rpmkey /' || true
+  } | sort > "$out"
+  result fingerprint "$out $(wc -l < "$out") lines"
+}
+
+desinstalar() {
+  # From the installed program if it is there; else from SRC.tar with a copy of uv kept aside, as
+  # a second run after the first one removed /opt/backtide.
+  local src=$1 dir=/root/backtide-desinstalar
+  shift
+  [ -x /opt/backtide/uv/0.12.17/uv ] && cp /opt/backtide/uv/0.12.17/uv "$LAB/uv"
+  if [ -x /usr/local/bin/backtide ]; then
+    /usr/local/bin/backtide desinstalar "$@"
+  else
+    rm -rf "$dir" && mkdir -p "$dir" && tar -xf "$src" -C "$dir" --no-same-owner
+    ( cd "$dir" && UV_CACHE_DIR=$LAB/uv-cache UV_PYTHON_INSTALL_DIR=$LAB/python \
+        "$LAB/uv" run --quiet --locked --no-dev --python 3.12 python -c \
+        'import sys; from backtide.cli import main; sys.exit(main(["desinstalar", *sys.argv[1:]]))' "$@" )
+  fi
+}
+
 require_clean_vm_root
 case "${1:-}" in
   bloquear) bloquear ;;
@@ -150,5 +233,8 @@ case "${1:-}" in
   fugas) require_lab_mark; fugas ;;
   estado) require_lab_mark; estado ;;
   bateria) require_lab_mark; shift; bateria "${1:?the source archive}" "${@:2}" ;;
-  *) sed -n '2,15p' "$0"; exit 2 ;;
+  senuelos) require_lab_mark; senuelos ;;
+  huella) huella "${2:?a file for the fingerprint}" ;;
+  desinstalar) require_lab_mark; shift; desinstalar "${1:?the source archive}" "${@:2}" ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

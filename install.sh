@@ -29,7 +29,6 @@ UV_SHA256_AARCH64=d636d1b678e9e7f367ecb22b46bd1cabbed234d6bc3b4d96365d2b507f72f8
 # The published release this script installs: empty until the first (T14); use --desde --sha256.
 BACKTIDE_URL=
 BACKTIDE_SHA256=
-
 OPT=/opt/backtide
 say() { printf '%s\n' "backtide: $*"; }
 die() { printf '%s\n' "backtide: $*" >&2; exit 1; }
@@ -56,6 +55,7 @@ backtide is a PREVIEW, with no human security audit yet.
   - A rewind does not bring back what already left the machine, and calls to the model are never held.
   - Supported: Linux (Fedora, Ubuntu) and Macs with Apple Silicon. On Fedora with kernel 7.1+ the
     process sensor does not start (D24).
+  - To remove it: sudo backtide desinstalar (keeps your data; --borrar-datos removes everything).
 EOF
 [ "$(id -u)" = 0 ] || die "hace falta root: sudo sh install.sh"
 [ -r /etc/os-release ] || die "no se puede leer /etc/os-release"

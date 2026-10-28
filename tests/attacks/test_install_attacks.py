@@ -544,3 +544,147 @@ def test_installing_again_keeps_the_agents_history(attack: Attack, installed: In
         f"archivo del agente sigue ahí y las {len(snaps)} instantáneas de antes también",
     )
     host_file.unlink()
+
+
+# -- uninstalling (T13-4, the review's battery for invariant 7) --------------------------------
+#
+# Destructive: each one ends with backtide uninstalled (its data kept). They run only when the
+# lab asks for them (BACKTIDE_LAB_DESTRUCTIVO=1), at the end of an installed lab's run or in a
+# clean VM of their own; anywhere else they are skipped, saying so.
+
+DESTRUCTIVE = os.environ.get("BACKTIDE_LAB_DESTRUCTIVO") == "1"
+destructive = pytest.mark.skipif(
+    not DESTRUCTIVE,
+    reason="uninstalls backtide: only with BACKTIDE_LAB_DESTRUCTIVO=1, in a clean lab VM",
+)
+_BEFORE: dict[str, object] = {}  # what the first of them saw while backtide-web still existed
+
+GROUP_PROBE = """
+import errno, json, os, sys
+def tried(fn):
+    try:
+        fn()
+        return "ok"
+    except OSError as error:
+        return errno.errorcode.get(error.errno, str(error.errno))
+state, db = sys.argv[1], sys.argv[2]
+print(json.dumps({"list_state": tried(lambda: os.listdir(state)),
+                  "open_blackbox": tried(lambda: os.close(os.open(db, os.O_RDONLY)))}))
+"""
+
+
+def group_probe(user: str) -> dict[str, str]:
+    """As ``user``: list the state folder and open the black box. Only errno names come back."""
+    ran = sh("runuser", "-u", user, "--", "python3", "-I", "-c", GROUP_PROBE,
+             str(layout.STATE_DIR), str(layout.BLACKBOX_DB), check=False)  # fmt: skip
+    return json.loads(ran.stdout.strip().splitlines()[-1]) if ran.stdout.strip() else {}
+
+
+def web_group_before() -> None:
+    """backtide-web's gid, and the control: its own user opens the black box (0640, its group)."""
+    if "gid" in _BEFORE:
+        return
+    import grp
+
+    _BEFORE["gid"] = grp.getgrnam(layout.WEB_USER).gr_gid
+    _BEFORE["control"] = group_probe(layout.WEB_USER)
+
+
+def sha256_of(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@destructive
+@scenario("desinstalar-con-un-montaje-debajo")
+def test_uninstall_never_deletes_through_a_mount_under_its_folders(attack: Attack) -> None:
+    """The agent's volume bind-mounted under /opt/backtide (a mistake, or someone's trick): an
+    rmtree of /opt/backtide would go into it and delete the agent's work and its snapshots."""
+    assert layout.BIN_LINK.is_symlink(), "backtide is not installed here"
+    web_group_before()
+    config = ServiceConfig.from_file(layout.CONFIG_FILE)
+    store = SnapshotStore(config.volume)
+    witness = config.jail_config().agent_dir / f"eco-{secrets.token_hex(4)}.txt"
+    witness.write_text("el trabajo del agente\n")
+    os.chown(witness, 61000, 61000)
+    digest, snaps = sha256_of(witness), {s.id for s in store.snapshots()}
+    eco = layout.OPT_DIR / "eco"
+    eco.mkdir()
+    sh("mount", "--bind", str(layout.VOLUME_MOUNT), str(eco))
+    try:
+        first = sh(str(layout.BIN_LINK), "desinstalar", "--si", check=False, timeout=1800)
+        kept = (
+            sha256_of(witness) == digest
+            and snaps <= {s.id for s in store.snapshots()}
+            and layout.BIN_LINK.is_symlink()
+            and (layout.UNIT_DIR / layout.SERVICE_UNIT).is_file()
+        )
+        said = " ".join(first.stderr.split())
+    finally:
+        sh("umount", str(eco))
+        eco.rmdir()
+    attack.check(
+        "stopped",
+        first.returncode == 1 and "hay algo montado" in said and kept,
+        f"con el volumen montado en {eco}, `backtide desinstalar --si` sale con "
+        f"{first.returncode} («hay algo montado»: {'hay algo montado' in said}) antes de tocar "
+        f"nada: el archivo del agente con la misma huella, las {len(snaps)} instantáneas, la "
+        f"orden y las unidades siguen ({kept})",
+    )
+    second = sh(str(layout.BIN_LINK), "desinstalar", "--si", check=False, timeout=1800)
+    look = Path("/root") / f"eco-ro-{secrets.token_hex(4)}"
+    look.mkdir()
+    sh("mount", "-o", "loop,ro,nosuid,nodev,noexec", str(layout.VOLUME_IMAGE), str(look))
+    try:
+        inside = look / witness.relative_to(config.volume)
+        survived = inside.is_file() and sha256_of(inside) == digest
+        snaps_after = {p.name for p in (look / "snapshots").iterdir()}
+    finally:
+        sh("umount", str(look))
+        look.rmdir()
+    attack.check(
+        "recoverable",
+        second.returncode == 0
+        and survived
+        and snaps <= snaps_after
+        and not layout.OPT_DIR.exists()
+        and not layout.BIN_LINK.exists(),
+        f"desmontado, otra vez sale con {second.returncode} y quita backtide; en la imagen del "
+        f"volumen, que se conserva, siguen el archivo del agente ({survived}) y las "
+        f"{len(snaps)} instantáneas de antes ({snaps <= snaps_after})",
+    )
+
+
+@destructive
+@scenario("grupo-reciclado-lee-la-caja-negra")
+def test_a_recycled_gid_cannot_read_the_kept_black_box(attack: Attack) -> None:
+    """After a default uninstall the black box stays, and backtide-web's group goes. A group
+    made later that gets the same gid must not read it (the state folder and blackbox.db go to
+    root's group first)."""
+    if layout.BIN_LINK.is_symlink():
+        web_group_before()
+        done = sh(str(layout.BIN_LINK), "desinstalar", "--si", check=False, timeout=1800)
+        assert done.returncode == 0, done.stderr[-400:]
+    assert "gid" in _BEFORE, "backtide must be installed when the first of these scenarios runs"
+    gid = int(str(_BEFORE["gid"]))
+    group, user = "reciclado", "reciclado"
+    sh("groupadd", "--gid", str(gid), group)
+    try:
+        sh("useradd", "--system", "--no-create-home", "--no-user-group", "--gid", group,
+           "--shell", "/usr/sbin/nologin", user)  # fmt: skip
+        try:
+            seen = group_probe(user)
+        finally:
+            sh("userdel", user, check=False)
+    finally:
+        sh("groupdel", group, check=False)
+    control = _BEFORE.get("control") or {}
+    attack.check(
+        "stopped",
+        seen == {"list_state": "EACCES", "open_blackbox": "EACCES"}
+        and isinstance(control, dict)
+        and control.get("open_blackbox") == "ok",
+        f"un grupo nuevo con el gid {gid} de backtide-web, y un usuario en él: {seen}; el "
+        f"control, antes de desinstalar y como backtide-web: {control}",
+    )

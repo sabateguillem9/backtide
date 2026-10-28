@@ -13,6 +13,7 @@ backtide is **pre-alpha**. It is a working prototype, not a product. Read the st
 > - **On Fedora with kernel 7.1 or later, the process sensor does not start** (Tetragon v1.7.1 cannot read those kernels' BTF). Everything else works.
 > - **On a Mac:** when the Mac sleeps, the agent and its alerts sleep, and the agent's files live in the VM, not on your Mac ([details](cli-reference.md#install-macsh-backtide-on-a-mac)).
 > - **Supported:** Linux (Fedora 43 and 44, Ubuntu 24.04 and 26.04) and Macs with Apple Silicon.
+> - **To remove it:** `sudo backtide desinstalar` on Linux, `backtide desinstalar` on a Mac. By default it keeps your data (the black box, the agent's work and its snapshots, the keys); `--borrar-datos` removes everything, for good ([details](cli-reference.md#backtide-desinstalar-remove-backtide)).
 
 The demo costs nothing. The agent runs fixed commands and never calls a model. The test with a real model (it costs money) is in [real-run.md](real-run.md).
 

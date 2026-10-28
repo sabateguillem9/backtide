@@ -2,6 +2,7 @@
 # backtide on a Mac (T13b; docs/25, section 7). Read it before running it: it is short.
 #
 #   sh install-mac.sh --desde ARCHIVO --sha256 HUELLA [--clave-archivo RUTA | --clave-stdin]
+#   sh install-mac.sh --desinstalar [--borrar-datos] [--si]    (the same as `backtide desinstalar`)
 #
 # backtide needs a Linux kernel (Btrfs and eBPF), so on a Mac it lives in a Linux VM of its own,
 # made with Lima and Apple's virtualization. As you, never with sudo, it does this and nothing else:
@@ -37,7 +38,7 @@ hash_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
 quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 VM=backtide
-SOURCE= SOURCE_SHA256= KEY_FILE= KEY_MODE= PROVIDER=anthropic YES=0 DRY_RUN=0
+SOURCE= SOURCE_SHA256= KEY_FILE= KEY_MODE= PROVIDER=anthropic YES=0 DRY_RUN=0 UNINSTALL=0 ERASE=0
 left=$#
 while [ "$left" -gt 0 ]; do
   arg=$1; shift; left=$((left - 1))
@@ -53,6 +54,8 @@ while [ "$left" -gt 0 ]; do
     --clave-stdin) KEY_MODE=stdin ;;
     --sin-clave) KEY_MODE=none ;;
     --si) YES=1 ;;
+    --desinstalar) UNINSTALL=1 ;;
+    --borrar-datos) ERASE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --proveedor) [ "$left" -gt 0 ] || die "--proveedor necesita un valor"
       PROVIDER=$1; set -- "$@" "$arg" "$1"; shift; left=$((left - 1)) ;;
@@ -74,6 +77,169 @@ case "$VM" in backtide-prueba-*)
   [ -f "${BACKTIDE_MAC_LAB_YAML:-}" ] || die "las VMs backtide-prueba-* son del laboratorio: hace falta BACKTIDE_MAC_LAB_YAML (su corte de red)" ;;
 esac
 
+# The `backtide` of the Mac, as text: written by the install and, to uninstall, run from a copy.
+wrapper_text() {
+  printf '%s\n' '#!/bin/sh' \
+    "# backtide on this Mac: it runs inside the VM $VM (Lima). Written by install-mac.sh (T13b)." \
+    '# `backtide vm estado|arrancar|parar|shell` handle the VM; anything else is `sudo backtide`' \
+    '# in it. --clave-archivo RUTA is read here and sent through standard input, never as an argument.' \
+    'set -eu' "LIMACTL=$(quote "$LIMACTL")" "VM=$VM" "PORT=$HOST_PORT" \
+    "LIMA_HOME=$(quote "$LIMA_HOME"); export LIMA_HOME"
+  cat <<'WRAPPER'
+die() { echo "backtide: $*" >&2; exit 1; }
+for file in default.yaml override.yaml base.yaml; do
+  [ ! -e "$LIMA_HOME/_config/$file" ] || die "$LIMA_HOME/_config/$file cambiaría la VM (podría montar carpetas tuyas): quítalo"
+done
+status=$("$LIMACTL" list --format '{{.Status}}' "$VM" 2>/dev/null < /dev/null || true)
+if [ "${1:-}" = desinstalar ]; then  # T13-4: by default the VM stays, stopped, with the data in it
+  shift; erase=0 yes=0 me=$HOME/.local/bin/backtide
+  for arg in "$@"; do case "$arg" in --borrar-datos) erase=1 ;; --si) yes=1 ;;
+    *) die "en el Mac, desinstalar solo admite --borrar-datos y --si" ;; esac; done
+  [ -x "$LIMACTL" ] || die "no está $LIMACTL (la Lima de esta instalación): no se toca nada"
+  [ -z "$status" ] || head -n 1 "$LIMA_HOME/$VM/lima.yaml" 2>/dev/null | grep -q '^# backtide-mac:' \
+    || die "la VM $VM no es la de backtide: no se toca"
+  ours() { head -n 2 "$me" 2>/dev/null | grep -q '^# backtide on this Mac'; }
+  if [ "$erase" = 0 ] && { [ -z "$status" ] || { [ "$status" = Stopped ] && ! ours; }; }; then
+    echo "No queda nada de backtide que quitar${status:+: la VM $VM sigue, parada, con tus datos}."; exit 0
+  fi
+  if [ "$erase" = 1 ]; then
+    echo "Se borrará PARA SIEMPRE la VM $VM y todo lo que tiene: la caja negra, el trabajo del agente y sus instantáneas."
+    if [ "$yes" = 0 ]; then
+      [ -t 0 ] || die "sin terminal hace falta --si"
+      printf 'Para seguir, escribe el nombre de la VM (%s): ' "$VM"; read -r answer
+      [ "$answer" = "$VM" ] || die "el nombre no coincide: no se ha tocado nada"
+    fi
+    urls=
+    if [ -n "$status" ]; then
+      urls=$("$LIMACTL" list --format '{{range .Config.Images}}{{.Location}} {{end}}' "$VM" < /dev/null)
+      "$LIMACTL" delete --force "$VM" < /dev/null || die "Lima no pudo borrar la VM $VM"
+    fi
+    # The VMs left in LIMA_HOME; no answer is no proof there are none (review of T13-4, R1).
+    others=$("$LIMACTL" list --quiet < /dev/null 2>/dev/null) || die "Lima no puede listar sus VMs: no se borra nada más"
+    # A LIMA_HOME the install made, emptied of our VM just now, holding only Lima's own files.
+    if [ -n "$status" ] && [ -z "$others" ] && [ "$(cat "$HOME/.backtide/lima-home" 2>/dev/null)" = "$LIMA_HOME" ]; then
+      for entry in "$LIMA_HOME"/* "$LIMA_HOME"/.[!.]*; do
+        [ -e "$entry" ] || continue
+        case "${entry##*/}" in
+          _networks | _cache) ;;
+          _config) for f in "$entry"/* "$entry"/.[!.]*; do [ -e "$f" ] || continue
+              case "${f##*/}" in networks.yaml | user | user.pub) ;; *) die "$LIMA_HOME tiene $f, que no es de Lima: no se borra" ;; esac; done ;;
+          *) die "$LIMA_HOME tiene ${entry##*/}, que no es de Lima ni de backtide: no se borra" ;;
+        esac
+      done
+      rm -rf "$LIMA_HOME"
+    fi
+    case "$LIMACTL" in "$HOME/.backtide/lima/"*/bin/limactl)  # ours: only if no other VM uses it
+      if [ -n "$others" ]; then
+        echo "backtide: la Lima de $HOME/.backtide se queda: la usan otras VMs"
+      else
+        for url in $urls; do  # Lima's download of the VM's image, in its cache (by the URL's hash)
+          h=$(printf '%s' "$url" | shasum -a 256 | cut -d' ' -f1)
+          case "$h" in *[!0-9a-f]* | "") continue ;; esac
+          [ "${#h}" != 64 ] || rm -rf "$HOME/Library/Caches/lima/download/by-url-sha256/$h"
+        done
+        rm -rf "${LIMACTL%/bin/limactl}"
+        c=$HOME/Library/Caches/lima; rmdir "$c/download/by-url-sha256" "$c/download" "$c" 2>/dev/null || true
+      fi ;;
+    esac
+    [ -n "$others" ] || rm -f "$HOME/.backtide/lima-home"
+    rmdir "$HOME/.backtide/lima" "$HOME/.backtide" 2>/dev/null || true
+  else
+    if [ "$yes" = 0 ]; then
+      [ -t 0 ] || die "sin terminal hace falta --si"
+      printf 'Se quitará backtide de la VM %s, que se queda parada con tus datos. ¿Seguimos? [s/N] ' "$VM"
+      read -r answer; case "$answer" in s | S | si | sí | Si | Sí) ;; *) die "no se ha tocado nada" ;; esac
+    fi
+    [ "$status" = Running ] || "$LIMACTL" start --tty=false "$VM" < /dev/null >&2
+    # The command, or the program itself if a run that stopped took the command already (R4).
+    inner=$("$LIMACTL" shell --workdir / "$VM" -- sh -c 'for p in /usr/local/bin/backtide /opt/backtide/current/.venv/bin/backtide; do [ -x "$p" ] && { echo "$p"; exit 0; }; done; echo ninguno' < /dev/null) \
+      || die "no se pudo mirar dentro de la VM $VM: no se ha desinstalado nada; vuelve a ejecutarlo"
+    stopped="la desinstalación dentro de la VM se ha parado (arriba dice dónde): vuelve a ejecutarla"
+    case "$inner" in
+      ninguno) ;;
+      /usr/local/bin/backtide) "$LIMACTL" shell --workdir / "$VM" -- sudo backtide desinstalar --si < /dev/null || die "$stopped" ;;
+      /opt/backtide/current/.venv/bin/backtide)
+        "$LIMACTL" shell --workdir / "$VM" -- sudo /opt/backtide/current/.venv/bin/backtide desinstalar --si < /dev/null || die "$stopped" ;;
+      *) die "respuesta rara de la VM: no se ha desinstalado nada" ;;
+    esac
+    "$LIMACTL" stop "$VM" < /dev/null || die "Lima no pudo parar la VM $VM"
+  fi
+  ! ours || rm -f "$me"
+  if [ "$erase" = 1 ]; then echo "backtide está desinstalado: la VM $VM y la caja negra se han borrado para siempre."; exit 0; fi
+  lh=; [ "$LIMA_HOME" = "$HOME/.lima" ] || lh="LIMA_HOME=$LIMA_HOME "
+  cat <<EOF
+backtide está desinstalado. La VM $VM se queda PARADA con tus datos ($(du -sh "$LIMA_HOME/$VM" | cut -f1) en $LIMA_HOME/$VM):
+la caja negra y su clave, el trabajo del agente y sus instantáneas, y las claves, en /var/lib/backtide.
+  - Volver a instalar sobre ellos: el mismo \`sh install-mac.sh --desde ...\` (usa esta VM).
+  - Verlos: $lh$LIMACTL start $VM y luego $lh$LIMACTL shell $VM.
+  - Borrarlo todo, para siempre: sh install-mac.sh --desinstalar --borrar-datos.
+EOF
+  exit 0
+fi
+[ -n "$status" ] || die "no existe la VM $VM: vuelve a ejecutar install-mac.sh"
+# The web's port on this Mac must be Lima's forward to the VM, and nobody else's.
+web_port_is_ours() {
+  n=0
+  while :; do
+    who=$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
+    [ -z "$who" ] || break
+    n=$((n + 1)); [ "$n" -lt 15 ] || die "el puerto $PORT del Mac no está reenviado a la VM: \`backtide vm parar\` y otra vez"
+    sleep 1
+  done
+  [ "$who" = "$(cat "$LIMA_HOME/$VM/ha.pid" 2>/dev/null)" ] \
+    || die "el puerto $PORT del Mac lo tiene otro programa (pid $who), no la VM: el enlace llegaría a él"
+}
+if [ "${1:-}" = vm ]; then
+  case "${2:-}" in
+    estado) exec "$LIMACTL" list "$VM" ;;
+    arrancar) exec "$LIMACTL" start --tty=false "$VM" ;;
+    parar) exec "$LIMACTL" stop "$VM" ;;
+    shell) exec "$LIMACTL" shell --workdir / "$VM" ;;
+    *) echo "uso: backtide vm estado|arrancar|parar|shell" >&2; exit 2 ;;
+  esac
+fi
+if [ "$status" != Running ]; then
+  echo "backtide: la VM $VM está parada; arrancándola..." >&2
+  "$LIMACTL" start --tty=false "$VM" < /dev/null >&2
+  web_port_is_ours
+elif [ "${1:-}" = enlace ]; then
+  web_port_is_ours
+fi
+key=
+left=$#
+while [ "$left" -gt 0 ]; do
+  arg=$1; shift; left=$((left - 1))
+  case "$arg" in
+    --clave-archivo) [ "$left" -gt 0 ] || { echo "backtide: --clave-archivo necesita un valor" >&2; exit 2; }
+      key=$1; shift; left=$((left - 1)); set -- "$@" --clave-stdin ;;
+    --clave-archivo=*) key=${arg#--clave-archivo=}; set -- "$@" --clave-stdin ;;
+    --clave-stdin) [ ! -t 0 ] || die "--clave-stdin lee de una tubería o un archivo, no de la terminal: usa --clave-archivo RUTA"
+      set -- "$@" "$arg" ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+done
+if [ -n "$key" ]; then
+  [ -f "$key" ] && [ -r "$key" ] || die "no se puede leer $key"
+  exec "$LIMACTL" shell --workdir / "$VM" -- sudo backtide "$@" < "$key"
+fi
+exec "$LIMACTL" shell --workdir / "$VM" -- sudo backtide "$@"
+WRAPPER
+}
+
+if [ "$UNINSTALL" = 1 ]; then  # through the `backtide` it left, or a copy of it if it is gone
+  BIN=$HOME/.local/bin
+  [ $# = 0 ] && [ "$DRY_RUN" = 0 ] && [ -z "$SOURCE$SOURCE_SHA256$KEY_FILE$KEY_MODE" ] \
+    || die "--desinstalar solo admite --borrar-datos y --si (sin --dry-run: lo que haría, lo dice antes de preguntar)"
+  set --; [ "$ERASE" = 0 ] || set -- --borrar-datos; [ "$YES" = 0 ] || set -- "$@" --si
+  ! head -n 2 "$BIN/backtide" 2>/dev/null | grep -q '^# backtide on this Mac' || exec sh "$BIN/backtide" desinstalar "$@"
+  LIMA_HOME=${LIMA_HOME:-$HOME/.lima}; HOST_PORT=$WEB_PORT; export LIMA_HOME
+  LIMACTL=$(command -v limactl 2>/dev/null || true)
+  "${LIMACTL:-false}" --version 2>/dev/null | grep -q '^limactl version [2-9]' || LIMACTL=$HOME/.backtide/lima/$LIMA_VERSION/bin/limactl
+  [ -x "$LIMACTL" ] || { say "no hay Lima ni orden backtide: no queda nada de backtide que quitar"; exit 0; }
+  copy=$(mktemp "${TMPDIR:-/tmp}/backtide-desinstalar.XXXXXX"); wrapper_text > "$copy"
+  code=0; sh "$copy" desinstalar "$@" || code=$?; rm -f "$copy"; exit "$code"
+fi
+
 cat <<'NOTICE'
 backtide is a PREVIEW, with no human security audit yet.
   - Use a model key with a spending limit, never a production key.
@@ -81,6 +247,7 @@ backtide is a PREVIEW, with no human security audit yet.
   - On a Mac: when it sleeps, the agent and its alerts sleep; the agent's files live in the VM.
   - Supported: Linux (Fedora, Ubuntu) and Macs with Apple Silicon. On Fedora with kernel 7.1+ the
     process sensor does not start (D24).
+  - To remove it: backtide desinstalar (keeps your data; --borrar-datos removes everything).
 NOTICE
 
 # 1. The Mac.
@@ -188,6 +355,8 @@ if [ -z "$status" ]; then
   free_gib=$(( $(df -k "$HOME" | awk 'NR == 2 {print $4}') / 1048576 ))
   [ "$free_gib" -ge "$MIN_FREE_GIB" ] || die "quedan $free_gib GiB libres; hacen falta $MIN_FREE_GIB (la VM, Fedora y las imágenes)"
   # Lima's ssh socket lives in the VM's folder, with its real path: it must fit in 104 bytes.
+  # A LIMA_HOME made here is ours to remove with the VM (`backtide desinstalar --borrar-datos`).
+  if [ ! -e "$LIMA_HOME" ]; then mkdir -p "$HOME/.backtide" && printf '%s\n' "$LIMA_HOME" > "$HOME/.backtide/lima-home"; fi
   mkdir -p "$LIMA_HOME"
   sock="$(cd "$LIMA_HOME" && pwd -P)/$VM/ssh.sock.0123456789abcdef"
   [ "${#sock}" -lt 104 ] || die "la ruta de Lima ($LIMA_HOME) es demasiado larga para sus sockets: usa un LIMA_HOME más corto"
@@ -251,68 +420,7 @@ esac || die "la instalación dentro de la VM se ha parado (arriba dice dónde); 
 # 5. The `backtide` of the Mac: rewritten only when it changes.
 BIN=$HOME/.local/bin
 mkdir -p "$BIN"
-{
-  printf '%s\n' '#!/bin/sh' \
-    "# backtide on this Mac: it runs inside the VM $VM (Lima). Written by install-mac.sh (T13b)." \
-    '# `backtide vm estado|arrancar|parar|shell` handle the VM; anything else is `sudo backtide`' \
-    '# in it. --clave-archivo RUTA is read here and sent through standard input, never as an argument.' \
-    'set -eu' "LIMACTL=$(quote "$LIMACTL")" "VM=$VM" "PORT=$HOST_PORT" \
-    "LIMA_HOME=$(quote "$LIMA_HOME"); export LIMA_HOME"
-  cat <<'WRAPPER'
-die() { echo "backtide: $*" >&2; exit 1; }
-for file in default.yaml override.yaml base.yaml; do
-  [ ! -e "$LIMA_HOME/_config/$file" ] || die "$LIMA_HOME/_config/$file cambiaría la VM (podría montar carpetas tuyas): quítalo"
-done
-status=$("$LIMACTL" list --format '{{.Status}}' "$VM" 2>/dev/null < /dev/null || true)
-[ -n "$status" ] || die "no existe la VM $VM: vuelve a ejecutar install-mac.sh"
-# The web's port on this Mac must be Lima's forward to the VM, and nobody else's.
-web_port_is_ours() {
-  n=0
-  while :; do
-    who=$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
-    [ -z "$who" ] || break
-    n=$((n + 1)); [ "$n" -lt 15 ] || die "el puerto $PORT del Mac no está reenviado a la VM: \`backtide vm parar\` y otra vez"
-    sleep 1
-  done
-  [ "$who" = "$(cat "$LIMA_HOME/$VM/ha.pid" 2>/dev/null)" ] \
-    || die "el puerto $PORT del Mac lo tiene otro programa (pid $who), no la VM: el enlace llegaría a él"
-}
-if [ "${1:-}" = vm ]; then
-  case "${2:-}" in
-    estado) exec "$LIMACTL" list "$VM" ;;
-    arrancar) exec "$LIMACTL" start --tty=false "$VM" ;;
-    parar) exec "$LIMACTL" stop "$VM" ;;
-    shell) exec "$LIMACTL" shell --workdir / "$VM" ;;
-    *) echo "uso: backtide vm estado|arrancar|parar|shell" >&2; exit 2 ;;
-  esac
-fi
-if [ "$status" != Running ]; then
-  echo "backtide: la VM $VM está parada; arrancándola..." >&2
-  "$LIMACTL" start --tty=false "$VM" < /dev/null >&2
-  web_port_is_ours
-elif [ "${1:-}" = enlace ]; then
-  web_port_is_ours
-fi
-key=
-left=$#
-while [ "$left" -gt 0 ]; do
-  arg=$1; shift; left=$((left - 1))
-  case "$arg" in
-    --clave-archivo) [ "$left" -gt 0 ] || { echo "backtide: --clave-archivo necesita un valor" >&2; exit 2; }
-      key=$1; shift; left=$((left - 1)); set -- "$@" --clave-stdin ;;
-    --clave-archivo=*) key=${arg#--clave-archivo=}; set -- "$@" --clave-stdin ;;
-    --clave-stdin) [ ! -t 0 ] || die "--clave-stdin lee de una tubería o un archivo, no de la terminal: usa --clave-archivo RUTA"
-      set -- "$@" "$arg" ;;
-    *) set -- "$@" "$arg" ;;
-  esac
-done
-if [ -n "$key" ]; then
-  [ -f "$key" ] && [ -r "$key" ] || die "no se puede leer $key"
-  exec "$LIMACTL" shell --workdir / "$VM" -- sudo backtide "$@" < "$key"
-fi
-exec "$LIMACTL" shell --workdir / "$VM" -- sudo backtide "$@"
-WRAPPER
-} > "$WORK/backtide"
+wrapper_text > "$WORK/backtide"
 if ! cmp -s "$WORK/backtide" "$BIN/backtide"; then
   chmod 0755 "$WORK/backtide" && mv "$WORK/backtide" "$BIN/backtide"
   say "orden backtide en $BIN/backtide"
@@ -324,6 +432,7 @@ cat <<EOF
 backtide está instalado en la VM $VM de este Mac y vigila al agente.
   - La web, solo en este Mac: \`backtide enlace\` da su enlace de un uso (http://127.0.0.1:$WEB_PORT/...).
   - El estado: \`backtide comprobar --despues-de-instalar\`; la VM: \`backtide vm estado\`.
+  - Quitarlo: \`backtide desinstalar\` (conserva tus datos en la VM, parada; --borrar-datos lo borra todo).
   - Telegram todavía no: se pondrá en la página Ajustes de la web.
 Lo que hay que saber de un Mac:
   - Si el Mac duerme, la VM duerme: el agente se para y no llegan avisos hasta que despierta.

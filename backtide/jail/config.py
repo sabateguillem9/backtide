@@ -88,6 +88,12 @@ NO_NEW_PRIVILEGES = "no-new-privileges=true"
 # the agent already runs, so the cycle (its snapshots) and the sensor's hooks wait behind it.
 MAX_READY_TIMEOUT = 600.0
 LOG_DRIVER = "local"
+# Docker labels on what backtide makes, so the uninstaller (and the installer, on a version
+# change) only ever removes a container or network that is backtide's (T13-4), not one that
+# merely has the same name.
+ROLE_LABEL = "backtide.role"
+AGENT_LABEL = f"{ROLE_LABEL}=agent"
+AGENT_NETWORK_LABEL = f"{ROLE_LABEL}=agent-network"
 LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}  # bounded: the agent prints what it likes
 
 # The egress proxy (docs/21, sections 1 and 2): its alias exists only on the agent's network.
@@ -455,6 +461,7 @@ def docker_create_argv(config: AgentJailConfig) -> list[str]:
     argv = [
         "create",
         "--name", config.name,
+        "--label", AGENT_LABEL,
         "--hostname", config.hostname,
         "--user", f"{config.uid}:{config.gid}",
         "--cap-drop", "ALL",
@@ -498,6 +505,7 @@ def network_create_argv(config: AgentJailConfig) -> list[str]:
     return [
         "network", "create",
         "--driver", "bridge",
+        "--label", AGENT_NETWORK_LABEL,
         "--internal",
         "--opt", "com.docker.network.bridge.gateway_mode_ipv4=isolated",
         "--opt", "com.docker.network.bridge.gateway_mode_ipv6=isolated",

@@ -432,6 +432,35 @@ def _add_check(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     )
     install.set_defaults(handler=_install)
 
+    uninstall = commands.add_parser(
+        "desinstalar",
+        help="quita backtide de esta máquina; por defecto conserva los datos",
+        description="Quita lo que creó `backtide instalar`, y solo eso (lo dice su manifiesto): "
+        "para el agente, quita las unidades, los contenedores, las redes y las imágenes de "
+        "backtide, /etc/backtide, /opt/backtide, la orden y el usuario backtide-web, y deja los "
+        "ajustes de Docker como estaban. Por defecto CONSERVA los datos en /var/lib/backtide: la "
+        "caja negra y su clave, el volumen con el trabajo del agente y sus instantáneas, y las "
+        "claves; instalar otra vez sigue con ellos. Docker se queda salvo con --quitar-docker. Se "
+        "puede ejecutar otra vez: sigue donde se quedó. Hace falta root. Sale con 0 si queda "
+        "desinstalado (o no había nada), 1 si se paró y 2 si hay un error de uso.",
+    )
+    uninstall.add_argument(
+        "--borrar-datos",
+        action="store_true",
+        help="borra también los datos, para siempre: pide escribir el nombre de la máquina",
+    )
+    uninstall.add_argument(
+        "--quitar-docker",
+        action="store_true",
+        help="quita también Docker, su repositorio y su clave, si los instaló backtide y no hay "
+        "otros contenedores",
+    )
+    uninstall.add_argument("--si", action="store_true", help="no pregunta (ni el nombre)")
+    uninstall.add_argument(
+        "--dry-run", action="store_true", help="enseña lo que quitaría y no cambia nada"
+    )
+    uninstall.set_defaults(handler=_uninstall)
+
 
 def _check(args: argparse.Namespace) -> int:
     """`backtide comprobar` and `backtide comprobar --despues-de-instalar`."""
@@ -517,6 +546,43 @@ def _install(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _uninstall(args: argparse.Namespace) -> int:
+    """`backtide desinstalar` (T13-4): backtide.setup.uninstall does the work."""
+    import time
+    from functools import partial
+
+    from backtide.setup import uninstall
+    from backtide.setup.host import run as host_run
+
+    if _effective_uid() != 0:
+        _error("desinstalar necesita root: `sudo backtide desinstalar`.")
+        return EXIT_ERROR
+    remover = uninstall.Uninstaller(
+        host=SystemHost(),
+        run=host_run,
+        run_long=partial(host_run, timeout=1800.0),
+        prompter=TerminalPrompter(),
+        options=uninstall.Options(
+            yes=args.si,
+            erase_data=args.borrar_datos,
+            remove_docker=args.quitar_docker,
+            dry_run=args.dry_run,
+        ),
+        sleep=time.sleep,
+    )
+    try:
+        remover.uninstall()
+    except uninstall.UninstallError as error:
+        _error(f"la desinstalación se ha parado: {error}")
+        if remover.started:
+            _error("Lo hecho hasta aquí está apuntado; vuelve a ejecutarla para seguir.")
+        return EXIT_FAILED
+    except KeyboardInterrupt:
+        _error("interrumpido: vuelve a ejecutar `sudo backtide desinstalar` para seguir.")
+        return EXIT_FAILED
+    return EXIT_OK
+
+
 class TerminalPrompter:
     """Questions and keys through /dev/tty, so they work under `curl ... | sudo sh` too."""
 
@@ -537,6 +603,12 @@ class TerminalPrompter:
             tty.write(f"{question} [s/N] ")
             tty.flush()
             return tty.readline().strip().lower() in YES_ANSWERS
+
+    def answer(self, question: str) -> str:
+        with open(self.TTY, "r+", encoding="utf-8", errors="replace") as tty:
+            tty.write(question)
+            tty.flush()
+            return tty.readline().strip()
 
     def secret(self, prompt: str) -> str:
         import getpass

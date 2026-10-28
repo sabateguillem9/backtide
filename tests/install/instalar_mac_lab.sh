@@ -14,6 +14,8 @@
 #   LAB=... [ATK_PATH=...] sh instalar_mac_lab.sh bateria-dev [ARGS] # the whole battery as in
 #                                   vigia-dev (make ataques), as the Lima user, backtide stopped
 #   LAB=... sh instalar_mac_lab.sh fugas         # the made-up key on the Mac side and in the VM
+#   LAB=... sh instalar_mac_lab.sh desinstalar [--borrar-datos] [--si]  # install-mac.sh --desinstalar
+#   LAB=... sh instalar_mac_lab.sh huella        # what of backtide is on the lab's Mac (T13-4)
 #   LAB=... sh instalar_mac_lab.sh borrar        # deletes the test VM and $LAB
 #
 # Invariant 8: the key is made up here and is nobody's. The VM gets the lab's network cut
@@ -177,6 +179,16 @@ sudo systemctl start 'var-lib-backtide\\x2dagent.mount' backtide.service backtid
 exit \$rc"
 }
 
+desinstalar() {
+  lab_env sh "$LAB/install-mac.sh" --desinstalar --nombre-vm "$VM" "$@" < /dev/null
+}
+
+huella() {
+  # The lab's Mac side, as an uninstall leaves it: its home, its Lima folder and Lima's VMs.
+  (cd "$LAB" && find home l -maxdepth 4 -not -name '*.sock' -not -path '*/Library/Caches/lima/*/*/*' 2>/dev/null | sort)
+  [ ! -x "$LIMACTL" ] || result vms "[$(lab_env "$LIMACTL" list --format '{{.Name}}:{{.Status}}' 2>/dev/null | tr '\n' ' ')]"
+}
+
 borrar() {
   if [ -x "$LIMACTL" ]; then lab_env "$LIMACTL" delete --force "$VM" || true; fi
   case "$LAB" in */.btm.*) rm -rf "$LAB" ;; *) echo "not removing $LAB: not a .btm.* folder" >&2; exit 2 ;; esac
@@ -192,6 +204,8 @@ case "${1:-}" in
   alcance) alcance ;;
   bateria-dev) shift; bateria_dev "$@" ;;
   fugas) fugas ;;
+  desinstalar) shift; desinstalar "$@" ;;
+  huella) huella ;;
   borrar) borrar ;;
-  *) sed -n '2,16p' "$0"; exit 2 ;;
+  *) sed -n '2,18p' "$0"; exit 2 ;;
 esac

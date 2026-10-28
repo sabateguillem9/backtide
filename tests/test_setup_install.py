@@ -7,6 +7,7 @@ volume formatted and mounted, the units started. The files are real, under a tem
 group of ``backtide-web`` are made up.
 """
 
+import hashlib
 import json
 import os
 import stat
@@ -32,6 +33,15 @@ UBUNTU = (
 )
 DOCKER_FPR = {"fedora": "060A61C51B558A7F742B77AAC52FEB6B621E9F35",
               "ubuntu": "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"}  # fmt: skip
+
+
+def docker_id(name: str) -> str:
+    """The fake Docker's ID for an object: 64 hex characters, from its name."""
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+SERVICE_CONTAINERS = {"backtide-agente": "agent", "backtide-egress": "proxy",
+                      "backtide-sensor": "sensor"}  # fmt: skip
 BTF = b"\x9f\xeb\x01\x00" + (24).to_bytes(4, "little") + b"\0" * 80
 
 
@@ -55,6 +65,24 @@ class Machine:
     fail: dict[tuple[str, ...], int] = field(default_factory=dict)  # argv prefix: times to fail
     routes: list[dict] = field(default_factory=list)
     extra_keys: list[str] = field(default_factory=list)  # more keys in Docker's download
+    # Docker's containers and networks, by name: their labels (the service makes the three).
+    containers: dict[str, dict[str, str]] = field(default_factory=dict)
+    network_labels: dict[str, dict[str, str]] = field(default_factory=dict)
+    busy_networks: set[str] = field(default_factory=set)  # with someone else's container on
+    channel_mounted: bool = False
+    groups: set[str] = field(default_factory=set)
+    usergroups: bool = True  # userdel takes the user's own group with it
+    primary_gid: dict[str, int] = field(default_factory=dict)  # an account's other primary group
+    groupdels: list[tuple[str, list[str]]] = field(default_factory=list)
+    extra_mounts: list[Path] = field(default_factory=list)  # someone else's, the tests' witnesses
+    mountinfo_readable: bool = True
+
+    def passwd_line(self, name: str) -> str:
+        uid = self.users[name]
+        gid = self.primary_gid.get(name, uid)
+        shell = "/usr/sbin/nologin" if name != "alguien" else "/bin/bash"
+        home = "/nonexistent" if name != "alguien" else "/home/alguien"
+        return f"{name}:x:{uid}:{gid}::{home}:{shell}\n"
 
     # Host
 
@@ -73,6 +101,13 @@ class Machine:
             "/proc/filesystems": b"nodev\ttmpfs\n\tbtrfs\n",
             "/sys/kernel/btf/vmlinux": BTF,
         }
+        mounts = [self.paths.volume_mount] if self.mounted else []
+        mounts += [self.paths.channel_dir] if self.channel_mounted else []
+        mounts += self.extra_mounts
+        files["/proc/self/mountinfo" if self.mountinfo_readable else "-"] = "".join(
+            f"36 25 0:32 / {str(m).replace(' ', chr(92) + '040')} rw,noatime - x y rw\n"
+            for m in mounts
+        ).encode()
         if self.selinux:
             files["/sys/fs/selinux/enforce"] = b"1"
         else:
@@ -86,6 +121,7 @@ class Machine:
             "/sys/fs/cgroup/cgroup.controllers",
             "/run/systemd/system",
             "/usr/sbin/nologin",
+            *(() if self.mountinfo_readable else ("/proc/self",)),
         }
 
     def free_bytes(self, path: str) -> int | None:
@@ -135,6 +171,12 @@ class Machine:
                 return Ran(0, ref + "\n", "")
             case ("docker", "network", "ls", *_):
                 return Ran(0, "\n".join(self.networks), "")
+            case ("docker", "network", "inspect", "--format", "{{.Id}} {{json .Labels}}", name):
+                if name not in self.networks:
+                    return Ran(1, "", f"Error response from daemon: network {name} not found")
+                return Ran(
+                    0, f"{docker_id(name)} {json.dumps(self.network_labels.get(name, {}))}", ""
+                )
             case ("docker", "network", "inspect", "--format", _, *names):
                 lines = [json.dumps([{"Subnet": self.networks[n]}]) for n in names
                          if n in self.networks]  # fmt: skip
@@ -142,11 +184,58 @@ class Machine:
             case ("docker", "network", "create", *rest):
                 subnet = rest[rest.index("--subnet") + 1]
                 self.networks[rest[-1]] = subnet
+                if "--label" in rest:
+                    key, _, value = rest[rest.index("--label") + 1].partition("=")
+                    self.network_labels[rest[-1]] = {key: value}
+                return ok
+            case ("docker", "network", "rm", object_id):
+                name = next((n for n in self.networks if docker_id(n) == object_id), object_id)
+                if name in self.busy_networks:
+                    return Ran(1, "", f"Error response from daemon: error while removing network: "
+                                      f"network {name} has active endpoints")  # fmt: skip
+                self.networks.pop(name, None)
+                self.network_labels.pop(name, None)
+                return ok
+            case ("docker", "container", "inspect", "--format", _, name):
+                if name not in self.containers:
+                    return Ran(1, "", f"Error response from daemon: No such container: {name}")
+                return Ran(0, f"{docker_id(name)} {json.dumps(self.containers[name] or None)}", "")
+            case ("docker", "rm", "--force", object_id):
+                name = next((n for n in self.containers if docker_id(n) == object_id), object_id)
+                if self.containers.pop(name, None) is None:
+                    return Ran(1, "", f"Error response from daemon: No such container: {name}")
+                return ok
+            case ("docker", "ps", "--all", "--quiet"):
+                return Ran(0, "".join(f"{n}\n" for n in self.containers), "")
+            case ("docker", "image", "rm", ref):
+                if ref in self.images:
+                    self.images.discard(ref)
+                    return Ran(0, f"Untagged: {ref}\n", "")
+                return Ran(1, "", f"Error response from daemon: No such image: {ref}")
+            case ("getent", "passwd"):
+                return Ran(0, "".join(self.passwd_line(n) for n in self.users), "")
+            case ("getent", "passwd", name):
+                if name not in self.users:
+                    return Ran(2, "", "")
+                return Ran(0, self.passwd_line(name), "")
+            case ("getent", "group", name):
+                return Ran(0, f"{name}:x:990:\n", "") if name in self.groups else Ran(2, "", "")
+            case ("userdel", name):
+                self.users.pop(name, None)
+                if self.usergroups:  # USERGROUPS_ENAB: the user's own group goes with it
+                    self.groups.discard(name)
+                return ok
+            case ("groupdel", name):
+                # What the group held at that moment, for the tests (review of T13-4, G6).
+                holders = [u for u in self.users if self.primary_gid.get(u, self.users[u]) == 990]
+                self.groupdels.append((name, holders))
+                self.groups.discard(name)
                 return ok
             case ("ip", *_):
                 return Ran(0, json.dumps(self.routes) if "route" in argv else "[]", "")
             case ("useradd", *_, name):
                 self.users[name] = WEB_UID
+                self.groups.add(name)
                 return ok
             case ("stat", "-f", "-c", "%T", _):
                 return Ran(0, "btrfs\n" if self.distro == FEDORA else "ext4\n", "")
@@ -169,12 +258,24 @@ class Machine:
                 if units.volume_unit_name() in names:
                     self.mounted = True
                     self.paths.volume_mount.chmod(0o755)  # mkfs leaves the new root 0755
+                self.channel_mounted |= units.channel_unit_name() in names
                 self.active.update(names)
+                return ok
+            case ("systemctl", "disable", "--now", *names):
+                self.mounted &= units.volume_unit_name() not in names
+                self.channel_mounted &= units.channel_unit_name() not in names
+                self.active.difference_update(names)
+                return ok
+            case ("systemctl", "stop", *names):
+                self.active.difference_update(names)
                 return ok
             case ("systemctl", "is-active", "--quiet", name):
                 return ok if name in self.active else Ran(3, "", "")
             case ("systemctl", "start" | "restart", name):
                 self.active.add(name)
+                if name == layout.SERVICE_UNIT:  # the service makes its three containers
+                    for container, role in SERVICE_CONTAINERS.items():
+                        self.containers.setdefault(container, {"backtide.role": role})
                 return ok
             case ("systemctl", "restart", "docker.service"):
                 return ok
@@ -198,9 +299,22 @@ class Machine:
                 return ok
             case ("rpm", "--import", _):
                 return ok
+            case ("rpm", "-q", "--quiet", name):  # dnf brought this weak dependency, not the rest
+                return ok if self.docker and name == "docker-buildx-plugin" else Ran(1, "", "")
             case ("dnf", "-y", "install", *packages) | ("env", _, "apt-get", "install", *packages):
                 if "docker-ce" in packages:
                     self.docker = True
+                return ok
+            case ("dnf", "-y", "remove", *packages) | (
+                "env",
+                _,
+                "apt-get",
+                "purge",
+                "-y",
+                *packages,
+            ):
+                if "docker-ce" in packages:
+                    self.docker = False
                 return ok
             case ("env", _, "apt-get", "update"):
                 return ok
@@ -777,9 +891,10 @@ def test_another_release_makes_the_containers_again(machine: Machine, tmp_path: 
     newer.release = tmp_path / "releases/0.1.0-bbbbbbbbbbbb"
     newer.install()
     removed = [argv[-1] for argv in machine.calls if argv[:2] == ("docker", "rm")]
-    assert removed == ["backtide-agente", "backtide-egress", "backtide-sensor"]
+    names = ["backtide-agente", "backtide-egress", "backtide-sensor"]
+    assert removed == [docker_id(name) for name in names]  # by the ID that was checked (R7)
     stop = machine.calls.index(("systemctl", "stop", layout.SERVICE_UNIT))
-    first_rm = machine.calls.index(("docker", "rm", "--force", "backtide-agente"))
+    first_rm = machine.calls.index(("docker", "rm", "--force", docker_id("backtide-agente")))
     assert stop < first_rm < machine.calls.index(("systemctl", "restart", layout.SERVICE_UNIT))
     assert manifest.load(machine.paths.manifest).facts["release_started"] == str(newer.release)
 

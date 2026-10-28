@@ -103,6 +103,12 @@ def pull(
     return True
 
 
+def by_digest(ref: str) -> str:
+    """``repo:tag@sha256:...`` as ``repo@sha256:...``: how Docker names a pulled digest."""
+    repo, digest = _parse(ref)
+    return f"{repo}@{digest}"
+
+
 def _holds_digest(image: Image, ran: Ran | None) -> bool:
     if ran is None or ran.returncode != 0:
         return False

@@ -66,6 +66,7 @@ ENTRYPOINT = "/usr/bin/tetragon"
 BTF = Path("/sys/kernel/btf/vmlinux")
 PRIVILEGES = ("--privileged", "--pid=host", "--cgroupns=host")
 NETWORK = "none"
+LABEL = "backtide.role=sensor"  # on the container (T13-4: the uninstaller checks it)
 LOG_DRIVER = "local"
 LOG_OPTIONS = {"max-size": "10m", "max-file": "3"}
 
@@ -502,6 +503,7 @@ def sensor_create_argv(config: SensorJailConfig) -> list[str]:
     argv = [
         "create",
         "--name", config.name,
+        "--label", LABEL,
         *PRIVILEGES,
         "--network", NETWORK,
         "--restart", "no",  # the Guardian starts and watches it

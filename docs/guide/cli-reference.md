@@ -472,7 +472,7 @@ How it behaves:
 - On Fedora with SELinux enforcing and a Docker that does not use it, it asks before changing Docker: first `live-restore` (a reload, nothing restarts), then `selinux-enabled` and one restart of Docker (your other containers keep running). A Docker that already uses SELinux is not touched.
 - At the end it prints how to open the web (`sudo backtide enlace`) and repeats the warnings.
 - Exit codes: `0` installed and tested; `1` stopped (it says where and how to go on); `2` not root or a bad flag.
-- Uninstalling and upgrading are not there yet (T13-4).
+- To remove it: [`backtide desinstalar`](#backtide-desinstalar-remove-backtide). Upgrading in place (`backtide actualizar`) is not there yet: uninstall keeping the data, then install the new version.
 
 ### `install-mac.sh`: backtide on a Mac
 
@@ -503,6 +503,40 @@ Only the web's port is forwarded, to the Mac's `127.0.0.1:8765`: `backtide enlac
 - **The VM's clock.** While the Mac sleeps, the VM's clock stops. When it wakes, Lima's guest agent sets it from the Mac's within seconds (measured: a VM two hours behind was right again in under 10 seconds), and until then backtide does not prune old snapshots, because pruning refuses to run on a clock that is not synchronized. `backtide comprobar` says whether it is.
 - **Port 8765 must be free on the Mac.** The web checks that it is called as `127.0.0.1:8765`, so the VM's port and the Mac's must be the same. `make web-demo` uses the same port: close one before the other.
 - **Telegram is not in the installer yet**: it will be set in the web's Settings page.
+
+### `backtide desinstalar`: remove backtide
+
+```sh
+sudo backtide desinstalar [--borrar-datos] [--quitar-docker] [--si] [--dry-run]
+```
+
+It removes what `backtide instalar` made, and only that: the installer writes down everything it creates or changes in `/var/lib/backtide/install-manifest.json`, and the uninstaller undoes that list. First it stops the agent (`backtide.service`, then the agent's container if it still runs), then it removes, in order: the systemd units (which unmounts the volume and the proxy's tmpfs), backtide's three containers, its two Docker networks, the images it downloaded (about 5.5 GiB), the volume's mount point, `/etc/backtide`, the `/usr/local/bin/backtide` command, the `backtide-web` account and `/opt/backtide` (the program itself, last). If it changed Docker's `daemon.json` (SELinux on Fedora), those two settings go back to what they were, and anything you added to that file since stays: `selinux-enabled` first, with one restart of Docker while `live-restore` keeps your other containers running, then `live-restore` with a reload. Before it changes anything it prints the list and asks.
+
+**By default it keeps your data**, in `/var/lib/backtide` (root only): the black box with its key and checkpoint, the agent's volume `volume.img` (its work and all its snapshots), the model keys in `keys/`, and a copy of your `backtide.toml`. It prints where they are and how much the volume takes. **To install again over them**, run the same install command as the first time: the black box goes on with the same chain (`backtide verificar` still says it is intact), the old snapshots are still there, and your `backtide.toml` comes back.
+
+| Flag | Effect |
+|---|---|
+| `--borrar-datos` | Also delete the data, **for good**: the black box and its key, the volume with the agent's work and its snapshots, the keys. And `/etc/backtide` goes whole, your own `prices.toml` included. It asks you to type the machine's name first (or `--si`). Once it is done, what the agent did can no longer be checked or recovered. To keep a copy, stop at the question and copy `/var/lib/backtide` and `/etc/backtide` somewhere first |
+| `--quitar-docker` | Also remove Docker (`docker-ce`, `docker-ce-cli`, `containerd.io`), its repository and its signing key, **only if backtide installed them** and no other container is left. Without it, Docker stays, with its repository, so it keeps getting updates: you may be using it for other things by now. Docker's own data (`/var/lib/docker`, `/var/lib/containerd`) is never deleted. Use it together with `--borrar-datos` if you want both: once the data (and the manifest with it) is gone, nothing remembers that backtide installed Docker, and a later `--quitar-docker` leaves it |
+| `--si` | Do not ask (not even the machine's name). Without it, and without a terminal, it stops before changing anything |
+| `--dry-run` | Print what it would remove; change nothing |
+
+How it keeps to "only what is ours":
+
+- It refuses a manifest that is not root's own `0600` file, or a state folder others can write: either would let someone else pick what gets removed.
+- It never touches a path outside backtide's folders (`/opt/backtide`, `/etc/backtide`, `/var/lib/backtide`, `/var/lib/backtide-agent`) or the few exact files the installer writes elsewhere (its units, the command, Docker's repository and key, `daemon.json`), whatever the manifest says. Each path is opened one folder at a time without following links, and checked to be root's.
+- A container or network is removed only if it carries backtide's `backtide.role` label: one that only has the same name is left, and it says so. An image is removed only if backtide downloaded it; if another container uses it, it stays.
+- Without `--borrar-datos`, your own files in `/etc/backtide` (a `prices.toml` you wrote, say) stay, and so does the folder. With it, the whole folder goes. The packages the installer added (`btrfs-progs`, `gnupg`…) stay too: other programs may use them.
+- Nothing is deleted while something is mounted under it: if something other than backtide's own volume and proxy tmpfs is mounted under a folder it would delete, it stops before changing anything.
+- Only backtide's own four units and the `backtide-web` account are ever removed, by their exact names. The group goes after its user, and only if no other account has it as its primary group.
+- Containers and networks are removed by the ID of the object whose label was checked.
+
+**Run it again** and it says there is nothing left to remove. If it stopped half way (a mount that was busy, a network another container uses), fix that and run it again: it goes on from where it stopped. Note that once it finishes the program itself is gone: to delete the kept data later without reinstalling, `sudo rm -rf /var/lib/backtide`. Exit codes: `0` removed, or nothing to remove; `1` stopped (it says where); `2` not root or a bad flag.
+
+**On a Mac**, `backtide desinstalar` (the Mac's own command) or `sh install-mac.sh --desinstalar` does it for the VM:
+
+- **By default it keeps the VM, stopped, with your data in it.** It runs the Linux uninstall above inside the VM (keeping the data), stops the VM and removes `~/.local/bin/backtide`. Nothing of backtide runs any more; the VM's files and the Lima it needs stay on your Mac, and it prints how much disk the VM takes. To install again over the data, run the same `sh install-mac.sh --desde …`: it uses that VM. To look at the data, `limactl start backtide` and `limactl shell backtide` (it prints the full path of `limactl`). Why not copy the data to a Mac folder instead: the agent's volume is a 20 GiB sparse Btrfs image whose snapshots only make sense inside Linux, and installing again would then need an import step. Keeping the VM is the simplest way that loses nothing.
+- **`--borrar-datos` deletes the VM**, and with it the black box, the agent's work and its snapshots, for good, after you type the VM's name (or `--si`). If it downloaded Lima into `~/.backtide/lima` and no other VM is left in your Lima folder, that Lima goes too, with its download of the VM's image in `~/Library/Caches/lima` and the Lima folder the install made. **It never touches your own Lima, other VMs, `~/.lima` if it was there before, or Homebrew.**
 
 ### `backtide enlace`
 

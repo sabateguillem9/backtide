@@ -73,6 +73,7 @@ SYSCTLS = {"net.ipv4.ip_forward": "0", "net.ipv6.conf.all.forwarding": "0"}
 # Set on the egress network when backtide creates it, and required when it is reused: a network
 # someone else made (Docker's default ``bridge``, say) is never taken for the proxy's way out.
 EGRESS_LABEL = "backtide.role=egress"
+PROXY_LABEL = "backtide.role=proxy"  # on the container (T13-4: the uninstaller checks it)
 _RESERVED_NETWORKS = frozenset({"bridge", "host", "none", "default"})
 
 _FIXED_ENV = (
@@ -288,6 +289,7 @@ def proxy_create_argv(config: ProxyJailConfig) -> list[str]:
     argv = [
         "create",
         "--name", config.name,
+        "--label", PROXY_LABEL,
         "--user", f"{config.uid}:{config.gid}",
         "--cap-drop", "ALL",
         "--security-opt", NO_NEW_PRIVILEGES,

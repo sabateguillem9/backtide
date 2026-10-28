@@ -1821,6 +1821,44 @@ risk = "n/a"
 recoverable = "yes"
 held = "n/a"
 
+# Desinstalar (T13-4, la revisión): destructivos, solo con BACKTIDE_LAB_DESTRUCTIVO=1 en una VM
+# del laboratorio; cada uno acaba con backtide desinstalado y sus datos conservados.
+
+[[scenario]]
+id = "desinstalar-con-un-montaje-debajo"
+name = "Desinstalar no borra a través de un montaje dentro de sus carpetas"
+story = """Alguien (un error o una trampa) monta el volumen del agente dentro de `/opt/backtide`, la \
+carpeta que la desinstalación borra entera. `backtide desinstalar --si` se para antes de tocar \
+nada («hay algo montado»): el archivo del agente con la misma huella, sus instantáneas, la orden \
+y las unidades siguen. Desmontado, otra vez quita backtide, y en la imagen del volumen siguen el \
+archivo y las instantáneas."""
+inspired_by = "Un rm -rf que cruza un montaje y borra lo de otro sistema de archivos"
+invariants = [4, 7]
+status = "ready"
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "yes"
+held = "n/a"
+
+[[scenario]]
+id = "grupo-reciclado-lee-la-caja-negra"
+name = "Un grupo nuevo con el gid de backtide-web no lee la caja negra conservada"
+story = """Tras desinstalar conservando los datos, el grupo `backtide-web` ya no existe y la caja \
+negra sigue. Un grupo creado después con el mismo gid, y un usuario en él, no pueden listar la \
+carpeta de estado ni abrir `blackbox.db` (`EACCES`), porque pasaron al grupo de root antes de \
+quitar el grupo. Control: antes de desinstalar, el usuario `backtide-web` sí la abría."""
+inspired_by = "Un gid que se reutiliza y hereda los archivos que dejó otro grupo"
+invariants = [1, 7]
+status = "ready"
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
 # El Mac (T13b, revisión de T13b): solo en una VM del laboratorio del Mac (backtide-prueba-*),
 # instalada por install-mac.sh, con backtide en marcha y la web reenviada.
 

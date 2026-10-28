@@ -12,7 +12,9 @@ Changed on purpose three times since, each time with a script that proved nothin
 T17a-3 (``BASH_ENV`` and ``CLAUDE_ENV_FILE`` at /dev/null), the security review of the profiles
 (``--no-healthcheck``, and the profile's own variables by name in the argv, their values in the
 docker CLI's environment: ``create_cli_env`` is create_env now) and rule 13 of check_rewindable
-(openclaw.json only: ``browser.enabled`` false and ``gateway.nodes.browser.mode`` "off").
+(openclaw.json only: ``browser.enabled`` false and ``gateway.nodes.browser.mode`` "off"), and
+T13-4 (a ``--label backtide.role=...`` after ``--name`` in the create argv and after the driver in
+the network's, so the uninstaller only removes what is backtide's; nothing else moved).
 """
 
 import copy
