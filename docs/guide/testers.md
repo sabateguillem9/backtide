@@ -45,7 +45,7 @@ curl -LO https://github.com/sabateguillem9/backtide/releases/download/v0.1.0/ins
 curl -LO https://github.com/sabateguillem9/backtide/releases/download/v0.1.0/install-mac.sh    # Mac
 ```
 
-The sha256 of `backtide-0.1.0.tar` is `4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862`. It is also on the release page and in `backtide-0.1.0.tar.sha256`.
+The sha256 of `backtide-0.1.0.tar` is `e82b7f253804c98620e836252d066e5233fec1ada66eee104775c6739c89c702`. It is also on the release page and in `backtide-0.1.0.tar.sha256`.
 
 Then check the archive. A **sha256** is a fingerprint of a file: change one byte and the fingerprint changes. The check shows that what you downloaded is what we published.
 
@@ -54,14 +54,14 @@ sha256sum backtide-0.1.0.tar          # Linux
 shasum -a 256 backtide-0.1.0.tar      # Mac
 ```
 
-The command must print exactly `4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862`. If it prints anything else, stop and do not run it: tell us. The installer checks the hash again by itself and refuses an archive that does not match.
+The command must print exactly `e82b7f253804c98620e836252d066e5233fec1ada66eee104775c6739c89c702`. If it prints anything else, stop and do not run it: tell us. The installer checks the hash again by itself and refuses an archive that does not match.
 
 The installers are short shell scripts. Read yours before you run it.
 
 ### Linux
 
 ```sh
-sudo sh install.sh --desde backtide-0.1.0.tar --sha256 4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862
+sudo sh install.sh --desde backtide-0.1.0.tar --sha256 e82b7f253804c98620e836252d066e5233fec1ada66eee104775c6739c89c702
 ```
 
 (`--desde` means "from": the archive to install. `--sha256` is the hash you just checked.)
@@ -69,7 +69,7 @@ sudo sh install.sh --desde backtide-0.1.0.tar --sha256 4a7a5ac78822c0a6ce65b58c9
 ### Mac
 
 ```sh
-sh install-mac.sh --desde backtide-0.1.0.tar --sha256 4a7a5ac78822c0a6ce65b58c9ae3e6731e8806185132969bfdcc7796e9b0f862
+sh install-mac.sh --desde backtide-0.1.0.tar --sha256 e82b7f253804c98620e836252d066e5233fec1ada66eee104775c6739c89c702
 ```
 
 Run it as yourself, without `sudo`. It creates the VM and installs backtide inside it. At the end it leaves a `backtide` command in `~/.local/bin`: add that folder to your `PATH` if it is not there. From then on, every `backtide` command in this guide works from the Mac **without `sudo`** (it runs `sudo backtide` inside the VM for you).
