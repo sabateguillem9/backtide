@@ -103,7 +103,8 @@ Everything is in `motion/` (`motion.css`, `boot.js`, `motion.js`); see `motion/R
 
 - **What moves:** the entrance on load (the bar fades, the headline rises out of a soft blur word by word, the lead and actions follow, the drawing draws itself); blocks that rise into view once as you scroll, with their rule growing and their icon drawing; each icon's own small gesture when you point at its row (once, never looping); the language indicator sliding; underlines drawing from the left; a cross-fade between pages, with a title that flies to its place (view transitions).
 - **How much:** 14px of rise, 80ms between siblings (at most five steps), 450 to 850ms, with `ease` (`cubic-bezier(.22, 1, .36, 1)`) for arrivals and `ease-reveal` (`cubic-bezier(.2, .7, .2, 1)`) for reveals. Only transform, opacity and a stroke's dash move.
-- **What never moves:** text while you read it, anything in a loop (except a live state's dot in the product web, which breathes), the scroll itself (no scroll-jacking), layout properties, anything with `prefers-reduced-motion` (then everything is there, still), and anything while the tab is hidden (paused). Nothing is hidden unless JavaScript said so first, so without JavaScript every page reads the same.
+- **Idle, on the public site only (D34):** on backtide labs and its project pages a drawing may idle: now and then, a smaller and slower version of its own gesture (the eye blinks, the bell sways a degree, the flag ripples, the reels turn back), mostly at rest, each on its own period so a page never pulses in unison, only while on screen. Opt in with `data-idle` and load `motion/idle.css` and `motion/idle.js`. Never in the product web, never in the hero, never on a state's drawing. See `motion/README.md`.
+- **What never moves:** text while you read it, anything in a loop (except a live state's dot in the product web, which breathes, and the drawings' idle on the public site), the scroll itself (no scroll-jacking), layout properties, anything with `prefers-reduced-motion` (then everything is there, still), and anything while the tab is hidden (paused). Nothing is hidden unless JavaScript said so first, so without JavaScript every page reads the same.
 
 ## Focus and accessibility
 
@@ -157,7 +158,7 @@ These are not style choices; they keep the product web safe (see the docstring o
 | `fonts/` | Lora and DM Sans (woff2, Latin), `fonts.css`, the two OFL licences |
 | `components/` | `bundle.css` (every component), `bundle.js` (language indicator, Layers), one folder per component with its README |
 | `icons/` | `hand.py`, `build.py`, `svg/*.svg`, `icons.js`, the drawing rule |
-| `motion/` | `motion.css`, `boot.js`, `motion.js` and their README |
+| `motion/` | `motion.css`, `boot.js`, `motion.js`, `idle.css` and `idle.js` (public site only) and their README |
 | `assets/` | Favicon, mark and wordmark |
 | `index.html` | The living sample (generated from `index.tpl.html`) |
 | `sample/` | The sample page's own CSS and JS, and the wordmark export page |
@@ -166,4 +167,4 @@ These are not style choices; they keep the product web safe (see the docstring o
 
 To work on it: edit `tokens.json`, the template or the CSS, then run `python3 brand/design-system/project/build.py`, and serve this folder (`python3 -m http.server 4175 --directory brand/design-system/project`, or the `design-system` entry of `.claude/launch.json`).
 
-Load order in a page: `fonts/fonts.css`, `tokens.css`, `components/bundle.css`, `motion/motion.css`; `motion/boot.js` in `<head>`; `icons/icons.js` (if it builds icons), `components/bundle.js` and `motion/motion.js` at the end of `<body>`.
+Load order in a page: `fonts/fonts.css`, `tokens.css`, `components/bundle.css`, `motion/motion.css`; `motion/boot.js` in `<head>`; `icons/icons.js` (if it builds icons), `components/bundle.js` and `motion/motion.js` at the end of `<body>`. On the public site, `motion/idle.css` right after `motion/motion.css` and `motion/idle.js` right after `motion/motion.js`.

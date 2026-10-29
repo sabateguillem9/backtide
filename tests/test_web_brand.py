@@ -218,6 +218,35 @@ def test_each_page_loads_only_our_files_in_the_systems_order(web: TestClient) ->
         assert response.status_code == 200 and "font" in response.headers["content-type"]
 
 
+IDLE_MARKS = (
+    "idle.css",
+    "idle.js",
+    "data-idle",
+    "ic--idle",
+    "ic--idling",
+    "bt-idle-",
+    "BacktideIdle",
+)
+
+
+def test_the_drawings_stay_still_here_the_idle_is_the_public_sites_only(web: TestClient) -> None:
+    """D34: on the public site the drawings may idle; the product web, where people approve
+    and reject, keeps them still. It never ships the system's motion/idle.css or idle.js and
+    never opts a drawing in, so only a live agent's dot ever loops here."""
+    assert sorted(p.name for p in (STATIC / "motion").iterdir()) == ["boot.js", "motion.css"]
+    for path in WEB.rglob("*"):
+        if path.is_file() and path.suffix in {".html", ".css", ".js", ".py"}:
+            text = path.read_text()
+            for mark in IDLE_MARKS:
+                assert mark not in text, f"{mark} in {path.relative_to(WEB)}"
+    for page in ("/ahora", "/historia?accion=nada", "/instantaneas"):
+        html = web.get(page).text
+        for mark in IDLE_MARKS:
+            assert mark not in html, (page, mark)
+    # The system's motion.css itself has no idle in it: the idle lives in its own file.
+    assert "idle" not in (STATIC / "motion" / "motion.css").read_text()
+
+
 def test_the_page_follows_the_system_theme_until_the_switch_says_otherwise(
     web: TestClient,
 ) -> None:

@@ -1,0 +1,90 @@
+/* backtide · idle drawings (D34). The public site only: backtide labs and its project pages.
+   The product web never loads this file or idle.js: it is where people approve and reject,
+   and there only a live agent's dot breathes.
+
+   A drawing that idles makes, now and then, a smaller and slower version of its own gesture:
+   the eye blinks, the bell sways a degree, the flag ripples, the reels turn back. Every cycle
+   is mostly rest (the movement takes about a fifth of it, the blink far less), each drawing has its own
+   period (7 to 12.3 s) and motion/idle.js gives each one a phase, so a page of drawings never
+   pulses in unison. Only transform moves, eased with the system's curves, in the icon's own
+   48 units (at 24px half a unit is a quarter of a pixel). The clay moves only with its drawing.
+
+   How to opt in, and what idle.js does: see motion/README.md. In short, data-idle on a
+   container (data-idle="off" rests it again) or .ic--idle on one drawing; idle.js adds
+   .ic--idling only while the drawing is on screen, and these rules need it.
+
+   It never fights the gesture: while the drawing's .ic-host is pointed at or has keyboard
+   focus, the idle rule stops matching and the gesture plays alone; afterwards the idle starts
+   again from rest. It never runs with reduced motion, with the tab hidden, off screen or
+   without JavaScript. Load it after motion/motion.css. */
+
+/* A drawing's phase: idle.js gives .ic--phase-0 ... -6, 1.6 s apart, so
+   even the first movements after a page opens are spread over ten seconds. */
+.ic--phase-1 { --idle-at: 1.6s; } .ic--phase-2 { --idle-at: 3.2s; } .ic--phase-3 { --idle-at: 4.8s; }
+.ic--phase-4 { --idle-at: 6.4s; } .ic--phase-5 { --idle-at: 8s; } .ic--phase-6 { --idle-at: 9.6s; }
+
+/* Pivots the gestures do not set already (motion.css has the rest), in 48 units. */
+.ic-notebook .ic-g-page { transform-origin: 24px 26px; }
+
+/* Every cycle starts and ends at rest. Each step between keyframes is eased with ease-draw
+   (slow in, slow out); the blink, the quickest, with ease. */
+@keyframes bt-idle-spin { 0%, 58% { transform: none; } 66% { transform: rotate(-9deg); } 73% { transform: rotate(1.2deg); } 78%, 100% { transform: none; } }
+@keyframes bt-idle-stones { 0%, 62% { transform: none; } 68% { transform: rotate(-1.4deg); } 74% { transform: rotate(.9deg); } 79% { transform: rotate(-.3deg); } 83%, 100% { transform: none; } }
+@keyframes bt-idle-moon { 0%, 40% { transform: none; } 52% { transform: translateY(-1.2px); } 64%, 100% { transform: none; } }
+@keyframes bt-idle-drift { 0%, 36% { transform: none; } 48% { transform: translateX(1.1px); } 60%, 100% { transform: none; } }
+@keyframes bt-idle-reels { 0%, 52% { transform: none; } 74%, 100% { transform: rotate(-360deg); } }
+@keyframes bt-idle-page { 0%, 52% { transform: none; } 60% { transform: scaleX(.9) skewY(2deg); } 70%, 100% { transform: none; } }
+@keyframes bt-idle-write { 0%, 56% { transform: none; } 60% { transform: translate(-.9px, .9px); } 64% { transform: translate(.4px, -.4px); } 68% { transform: translate(-.6px, .6px); } 74%, 100% { transform: none; } }
+@keyframes bt-idle-weigh { 0%, 52% { transform: none; } 59% { transform: rotate(2.2deg); } 66% { transform: rotate(-1.3deg); } 71% { transform: rotate(.4deg); } 75%, 100% { transform: none; } }
+@keyframes bt-idle-step { 0%, 50% { transform: none; } 60% { transform: translateX(1.6px); } 72%, 100% { transform: none; } }
+@keyframes bt-idle-loop { 0%, 54% { transform: none; } 63% { transform: rotate(-20deg); } 75%, 100% { transform: none; } }
+@keyframes bt-idle-unlatch { 0%, 52% { transform: none; } 59% { transform: translateY(-1.3px); } 67%, 100% { transform: none; } }
+@keyframes bt-idle-nod { 0%, 56% { transform: none; } 61% { transform: translateY(.9px); } 66% { transform: none; } 70% { transform: translateY(.5px); } 75%, 100% { transform: none; } }
+@keyframes bt-idle-shake { 0%, 52% { transform: none; } 57% { transform: translateX(-.9px); } 62% { transform: translateX(.7px); } 67% { transform: translateX(-.3px); } 72%, 100% { transform: none; } }
+@keyframes bt-idle-hop { 0%, 55% { transform: none; } 63% { transform: translateY(-1.6px); } 71% { transform: translateY(.2px); } 76%, 100% { transform: none; } }
+@keyframes bt-idle-rock { 0%, 54% { transform: none; } 60% { transform: rotate(-1.6deg); } 66% { transform: rotate(1deg); } 71% { transform: rotate(-.3deg); } 75%, 100% { transform: none; } }
+@keyframes bt-idle-turn { 0%, 54% { transform: none; } 61%, 66% { transform: rotate(-7deg); } 75%, 100% { transform: none; } }
+@keyframes bt-idle-ring { 0%, 54% { transform: none; } 59% { transform: rotate(2.4deg); } 64% { transform: rotate(-1.8deg); } 68% { transform: rotate(.8deg); } 72% { transform: rotate(-.3deg); } 76%, 100% { transform: none; } }
+@keyframes bt-idle-ripple { 0%, 50% { transform: none; } 58% { transform: skewY(-2.5deg) scaleX(.97); } 66% { transform: skewY(1.4deg); } 72%, 100% { transform: none; } }
+@keyframes bt-idle-blink { 0%, 80% { transform: none; } 81.6% { transform: scaleY(.12); } 83.4%, 100% { transform: none; } }
+@keyframes bt-idle-sink { 0%, 40% { transform: none; } 52% { transform: translateY(.9px); } 64%, 100% { transform: none; } }
+@keyframes bt-idle-float { 0%, 54% { transform: none; } 62% { transform: translateY(-1.2px); } 72%, 100% { transform: none; } }
+
+/* Which group of which drawing idles, and how long its cycle is. The :not() leaves the
+   drawing to its gesture while its host is pointed at or focused. */
+.ic--idling .ic-g:not(.ic-host:hover *, .ic-host:focus-visible *) {
+  animation-duration: var(--idle-period, 10s);
+  animation-timing-function: var(--ease-draw);
+  animation-delay: var(--idle-at, 0s);
+  animation-iteration-count: infinite;
+}
+.ic--idling.ic-progress .ic-g-spin:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 9.2s; animation-name: bt-idle-spin; }
+.ic--idling.ic-preview .ic-g-stones:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 11.3s; animation-name: bt-idle-stones; }
+.ic--idling.ic-done .ic-g-moon:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 10.4s; animation-name: bt-idle-moon; }
+.ic--idling.ic-done .ic-g-water:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 7.6s; animation-name: bt-idle-drift; }
+.ic--idling.ic-tape :is(.ic-g-reelL, .ic-g-reelR):not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 12s; animation-name: bt-idle-reels; }
+.ic--idling.ic-notebook .ic-g-page:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 10.7s; animation-name: bt-idle-page; }
+.ic--idling.ic-pencil .ic-g-pencil:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 8.6s; animation-name: bt-idle-write; }
+.ic--idling.ic-scale .ic-g-beam:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 11.6s; animation-name: bt-idle-weigh; }
+.ic--idling.ic-records .ic-g-dot:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 7.3s; animation-name: bt-idle-step; }
+.ic--idling.ic-rewinds .ic-g-loop:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 9.6s; animation-name: bt-idle-loop; }
+.ic--idling.ic-holds .ic-g-shackle:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 10.1s; animation-name: bt-idle-unlatch; }
+.ic--idling.ic-approve .ic-g-tick:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 8.9s; animation-name: bt-idle-nod; }
+.ic--idling.ic-reject .ic-g-cross:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 10.9s; animation-name: bt-idle-shake; }
+.ic--idling.ic-info .ic-g-mark:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 7.9s; animation-name: bt-idle-hop; }
+.ic--idling.ic-warning .ic-g-sign:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 11.9s; animation-name: bt-idle-rock; }
+.ic--idling.ic-key .ic-g-key:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 9.9s; animation-name: bt-idle-turn; }
+.ic--idling.ic-bell .ic-g-bell:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 9.1s; animation-name: bt-idle-ring; }
+.ic--idling.ic-flag .ic-g-cloth:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 7.1s; animation-name: bt-idle-ripple; }
+.ic--idling.ic-eye .ic-g-eye:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 12.3s; animation-name: bt-idle-blink; animation-timing-function: var(--ease); }
+.ic--idling.ic-still .ic-g-sun:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 11.1s; animation-name: bt-idle-sink; }
+.ic--idling.ic-still .ic-g-water:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 8.3s; animation-name: bt-idle-drift; animation-direction: reverse; }
+.ic--idling.ic-ask .ic-g-bubble:not(.ic-host:hover *, .ic-host:focus-visible *) { --idle-period: 8.4s; animation-name: bt-idle-float; }
+
+/* Never with reduced motion (idle.js does not even start), never with the tab hidden. These
+   repeat what motion.css already says for everything, so this file keeps its word alone. */
+.still .ic--idling .ic-g { animation: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  .ic--idling .ic-g { animation: none !important; }
+}
+.is-hidden .ic--idling .ic-g { animation-play-state: paused !important; }

@@ -55,6 +55,7 @@ The last seven are the glyphs of a player's bar (the demo film on the site). The
 - Sizes: `.ic` 24px, `.ic--m` 36px, `.ic--l` 52px, `.ic--xl` 96px. **The stroke is set in the icon's own units** (`--ic-stroke = 1.75 x 48 / size in px`), so a new size must set its own `--ic-stroke`. `vector-effect: non-scaling-stroke` is not used inline: with it, Chrome measures the dashes on screen and an icon larger than 48px is drawn only in part.
 - `pathLength="1"` on every stroke lets it draw itself (`stroke-dashoffset` 1 to 0) in the entrance and the reveal.
 - Put the icon inside an `.ic-host` (a row, a section, a card) for its gesture on hover and keyboard focus.
+- On the public site only, put it inside a `data-idle` container (or give it `.ic--idle`) for its slow idle; see `../motion/README.md`.
 
 ## The rule for drawing a new icon
 
@@ -66,6 +67,6 @@ So that a new one looks drawn by the same hand:
 4. **Colour, in this order.** Ink for the drawing; `faint` for the ground, water lines, ruled lines and secondary detail; **one touch of clay**: a filled dot (`fill`, radius 2 to 4.2), or one clay stroke (`clay`), or a pale clay fill under one ink shape (`soft`). Never two of them.
 5. **The ground.** If the object stands on something, draw a faint line under it (`preview`, `flag`) or water (`done`, `still`).
 6. **Seeds.** Give the icon its own block of ten seeds (the next free one is 280). Never reuse a seed: two strokes with the same seed wobble the same way and look stamped.
-7. **A gesture.** Name the groups (`("bell", "ink", ...)` becomes `ic-g-bell`) and give the moving group one gesture in `motion/motion.css`, with its pivot in 48 units: a turn, a hop, a sway, a blink. Once, under 1 s, never looping; add it for `:hover` and for `:focus-visible`.
+7. **A gesture.** Name the groups (`("bell", "ink", ...)` becomes `ic-g-bell`) and give the moving group one gesture in `motion/motion.css`, with its pivot in 48 units: a turn, a hop, a sway, a blink. Once, under 1 s, never looping; add it for `:hover` and for `:focus-visible`. Then its idle in `motion/idle.css` (D34, public site only): a smaller, slower version of the same gesture, `transform` only, with its own period between 7 and 12.5 s that no other drawing uses, moving for at most a quarter of it (`tests/test_site.py` checks all of that).
 8. **A meaning.** One line in `MEANING` (`@icon("name", "...")`), and a row in the table above.
 9. **Check it** at 18, 24, 36, 52 and 96px on the sample page, in both themes, before and after its gesture.

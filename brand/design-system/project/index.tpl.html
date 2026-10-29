@@ -16,6 +16,7 @@
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="components/bundle.css">
 <link rel="stylesheet" href="motion/motion.css">
+<link rel="stylesheet" href="motion/idle.css">
 <link rel="stylesheet" href="sample/swatches.css">
 <link rel="stylesheet" href="sample/sample.css">
 <script src="motion/boot.js"></script>
@@ -131,11 +132,11 @@
       <div class="section-head ic-host" data-reveal>
         {{ic:pencil}}
         <h2 id="icons-title" class="section-head__title">Drawings</h2>
-        <p class="section-head__lead">{{icon-count}} icons drawn by a steady hand: one regular 1.75px stroke at any size, faint strokes for the ground, and one touch of clay. The last seven are a player's controls: ink only, no gesture. Point at one of the others to see its gesture.</p>
+        <p class="section-head__lead">{{icon-count}} icons drawn by a steady hand: one regular 1.75px stroke at any size, faint strokes for the ground, and one touch of clay. The last seven are a player's controls: ink only, no gesture. Point at one of the others to see its gesture. On the public site the drawings may also idle, now and then, with a smaller and slower version of it; the product web keeps them still.</p>
       </div>
     </div>
-    <ul class="icon-sheet" data-icon-sheet data-reveal-group>{{icons}}</ul>
-    <p class="btn-row ds-after"><button class="btn btn--secondary btn--small" type="button" data-replay="icons">Draw them again</button></p>
+    <ul class="icon-sheet" data-icon-sheet data-idle data-reveal-group>{{icons}}</ul>
+    <p class="btn-row ds-after"><button class="btn btn--secondary btn--small" type="button" data-replay="icons">Draw them again</button><button class="btn btn--secondary btn--small" type="button" data-idle-toggle hidden>Rest them</button></p>
   </section>
 
   <!-- ============================================================ motion -->
@@ -143,7 +144,7 @@
     <div class="grid">
       <div class="section-head" data-reveal>
         <h2 id="motion-title" class="section-head__title">Movement</h2>
-        <p class="section-head__lead">Calm and once. Things arrive, settle and stay. Nothing loops but a live state, nothing moves with reduced motion, and nothing runs while the tab is hidden.</p>
+        <p class="section-head__lead">Calm and once. Things arrive, settle and stay. Nothing loops but a live state in the product web and, on the public site only, a drawing's slow idle. Nothing moves with reduced motion, and nothing runs while the tab is hidden.</p>
       </div>
     </div>
     <div class="ds-split">
@@ -597,6 +598,7 @@
 <script src="icons/icons.js"></script>
 <script src="components/bundle.js"></script>
 <script src="motion/motion.js"></script>
+<script src="motion/idle.js"></script>
 <script src="sample/sample.js"></script>
 </body>
 </html>

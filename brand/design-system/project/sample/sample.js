@@ -65,6 +65,18 @@
     if (b) replay(targets[b.getAttribute("data-replay")]());
   });
 
+  // The idle drawings (D34): rest them, or let them idle again. Only when they can idle.
+  var sheet = document.querySelector("[data-icon-sheet]");
+  var idle = document.querySelector("[data-idle-toggle]");
+  if (sheet && idle && window.BacktideIdle) {
+    idle.hidden = false;
+    idle.addEventListener("click", function () {
+      var resting = sheet.getAttribute("data-idle") !== "off";
+      sheet.setAttribute("data-idle", resting ? "off" : "");
+      idle.textContent = resting ? "Let them idle" : "Rest them";
+    });
+  }
+
   // The curves: four dots cross the same track, each with its own easing.
   var ease = document.querySelector("[data-ease-demo]");
   var play = document.querySelector("[data-play-ease]");
