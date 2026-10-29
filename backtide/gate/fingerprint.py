@@ -91,11 +91,13 @@ def fingerprint(
     body: bytes | None,
     trailers: Iterable[tuple[str, str]] = (),
     canonical: bytes | None = None,
+    encoded: bytes | None = None,
 ) -> str:
     """The fingerprint of a request, 64 hex characters. ``headers`` and ``trailers`` are the
     request's own (every one counts but VOLATILE_HEADERS); ``body`` the decoded one.
-    ``canonical``: a translator's canonical bytes, in place of the body (T10-3). ValueError for
-    a key that is not KEY_BYTES long."""
+    ``canonical``: a translator's canonical bytes, in place of the body (T10-3). ``encoded``: the
+    raw bytes of a body sent with a Content-Encoding, which count as well (G1, 2026-10-29).
+    ValueError for a key that is not KEY_BYTES long."""
     if not isinstance(key, bytes) or len(key) != KEY_BYTES:
         raise ValueError("a fingerprint key is 32 bytes")
     if canonical is not None:
@@ -115,6 +117,8 @@ def fingerprint(
             hashlib.sha256(content).digest(),
         )
     )
+    if encoded is not None:
+        message += _field(hashlib.sha256(encoded).digest())
     return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 

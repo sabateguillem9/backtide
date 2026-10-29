@@ -52,6 +52,12 @@ class Headers:
         kept = [(k, v) for k, v in self.items() if k.lower() != name.lower()]
         self.fields = tuple((k.encode(), v.encode()) for k, v in [*kept, (name, value)])
 
+    def __delitem__(self, name: str) -> None:
+        if self.get(name) is None:
+            raise KeyError(name)
+        kept = [(k, v) for k, v in self.items() if k.lower() != name.lower()]
+        self.fields = tuple((k.encode(), v.encode()) for k, v in kept)
+
 
 @dataclass
 class Request:
@@ -439,6 +445,52 @@ def test_a_body_that_cannot_be_checked_is_refused(
     assert blocked(Flow(request))[:2] == (code, [f"blocked:{reason}"])
 
 
+def _gzip_with(flag: int, field: bytes, payload: bytes = b"") -> bytes:
+    """A gzip member (RFC 1952) whose header carries ``field`` under ``flag``, around a
+    deflate stream of ``payload``: valid for zlib, which skips the field."""
+    body = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    deflated = body.compress(payload) + body.flush()
+    header = bytes([0x1F, 0x8B, 8, flag, 0, 0, 0, 0, 0, 255]) + field
+    trailer = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "little")
+    return header + deflated + trailer + (len(payload) & 0xFFFFFFFF).to_bytes(4, "little")
+
+
+HIDDEN = b"exfiltrated " * 4096  # 48 KiB the decoding would skip
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _gzip_with(0x10, HIDDEN + b"\0"),  # FCOMMENT
+        _gzip_with(0x08, HIDDEN + b"\0"),  # FNAME
+        _gzip_with(0x04, len(HIDDEN[:60000]).to_bytes(2, "little") + HIDDEN[:60000]),  # FEXTRA
+        _gzip_with(0x10, HIDDEN + b"\0", b"a real body"),  # with a body too
+        gzip.compress(b""),  # nothing at all, and only the encoding's own bytes go out
+    ],
+    ids=["comment", "name", "extra", "comment-and-body", "empty"],
+)
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_bytes_the_decoding_would_skip_never_leave(raw: bytes, method: str) -> None:
+    """A GET whose gzip body decodes to nothing passed as a plain read with its header's free
+    fields (code review of 2026-10-29, G1). Such a body cannot be checked: refused."""
+    assert zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw) in (b"", b"a real body")
+    request = Request(
+        method=method,
+        headers=Headers([("Host", "example.com"), ("Content-Encoding", "gzip")]),
+        raw_content=raw,
+    )
+    assert blocked(Flow(request))[:2] == (400, ["blocked:undecodable"])
+
+
+def test_a_provider_answer_keeps_the_lenient_decoding() -> None:
+    """Only what the agent sends is held to the stricter rule; an answer is decoded as before."""
+    assert addon.decode_body(gzip.compress(b""), "gzip") == b""
+    assert addon.decode_body(_gzip_with(0x08, b"name\0", b"x"), "gzip") == b"x"
+    with pytest.raises(addon.Undecodable):
+        addon.decode_body(_gzip_with(0x08, b"name\0", b"x"), "gzip", sent=True)
+    assert addon.decode_body(gzip.compress(b"x"), "gzip", sent=True) == b"x"
+
+
 @pytest.mark.parametrize("encoding", ["gzip", "deflate", "identity"])
 def test_a_body_the_gate_can_decode_is_recorded_decoded(encoding: str) -> None:
     text = b'{"note": "hello from the agent"}'
@@ -806,7 +858,7 @@ def test_the_decoded_body_is_let_go_before_waiting_for_the_ack(
         def __del__(self) -> None:
             freed.append("decoded")
 
-    monkeypatch.setattr(addon, "decode_body", lambda raw, encoding: Tracked(raw or b""))
+    monkeypatch.setattr(addon, "decode_body", lambda raw, encoding, **_: Tracked(raw or b""))
     seen: list[list[str]] = []
 
     class Watching(FakeChannel):
@@ -1715,13 +1767,20 @@ def test_the_fingerprint_follows_the_body_the_method_and_the_query() -> None:
     assert base != fp(raw_content=b'{"a": 1}', path="/api?x=1")
 
 
-def test_a_fingerprint_is_of_the_decoded_body() -> None:
-    plain = Request(raw_content=b'{"a": 1}')
-    packed = Request(
-        raw_content=gzip.compress(b'{"a": 1}'),
-        headers=Headers([("Host", "example.com"), ("content-encoding", "gzip")]),
-    )
-    assert facts_of(Flow(request=plain))["fp"] == facts_of(Flow(request=packed))["fp"]
+def test_a_fingerprint_counts_the_bytes_that_go_out() -> None:
+    """The decoded body, and for an encoded one its raw bytes too (code review G1): the same
+    JSON compressed another way is another request, never a retry of an approved one."""
+
+    def packed(raw: bytes) -> Flow:
+        headers = Headers([("Host", "example.com"), ("content-encoding", "gzip")])
+        return Flow(request=Request(raw_content=raw, headers=headers))
+
+    plain = facts_of(Flow(request=Request(raw_content=b'{"a": 1}')))["fp"]
+    once = facts_of(packed(gzip.compress(b'{"a": 1}', mtime=0)))["fp"]
+    assert once == facts_of(packed(gzip.compress(b'{"a": 1}', mtime=0)))["fp"]
+    assert once != plain
+    assert once != facts_of(packed(gzip.compress(b'{"a": 1}', mtime=7)))["fp"]
+    assert once != facts_of(packed(gzip.compress(b'{"a": 2}', mtime=0)))["fp"]
 
 
 UPGRADE = Headers([("Host", "example.com"), ("Upgrade", "websocket")])

@@ -6,6 +6,7 @@ the same fingerprint; another key gives another one (and nobody without the key 
 it).
 """
 
+import gzip
 from typing import Any
 
 import pytest
@@ -133,6 +134,18 @@ def test_fields_cannot_be_shifted_into_each_other() -> None:
     the host) never collides."""
     assert of(path="/a", body=b"bc") != of(path="/ab", body=b"c")
     assert of(method="GE", host="tapi.fake.test") != of(method="GET", host="api.fake.test")
+
+
+def test_the_bytes_of_an_encoded_body_count_as_they_go_out() -> None:
+    """The same decoded body can be compressed many ways; an approval is for the bytes that
+    leave, so a retry with other compressed bytes is another request (code review G1)."""
+    plain = of(encoded=gzip.compress(BASE["body"], mtime=0))
+    assert plain == of(encoded=gzip.compress(BASE["body"], mtime=0))
+    assert plain != of()  # with and without an encoding
+    assert plain != of(encoded=gzip.compress(BASE["body"], mtime=1))
+    assert plain != of(encoded=gzip.compress(BASE["body"], compresslevel=1, mtime=0))
+    canonical = {"canonical": b"semantic"}
+    assert of(**canonical, encoded=b"a") != of(**canonical, encoded=b"b")
 
 
 def test_another_key_is_another_fingerprint() -> None:

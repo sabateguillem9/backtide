@@ -852,6 +852,153 @@ def test_credentials_sent_to_an_unknown_host_are_held(attack: Attack, lab: Lab) 
     )
 
 
+@scenario("gzip-que-esconde")
+def test_bytes_hidden_in_a_gzip_header_never_leave(attack: Attack, lab: Lab) -> None:
+    tag = new_tag()
+    hidden = made_up(24)  # a unique tag the redaction does not recognise
+    script = "gzip_que_esconde"
+    before = lab.head()
+    # 1-3: GETs whose gzip header carries the payload in FCOMMENT, FNAME and FEXTRA while the
+    # deflate stream decodes to nothing, a GET whose gzip holds nothing at all, and a POST with a
+    # real small body plus a loaded FCOMMENT. Each refused up front (400): the bytes zlib would
+    # skip never reach the unknown host.
+    smuggle = attack.run_script(lab.agent, script, "hide", OTHER_HOST, tag, hidden)
+
+    def write(mtime: int, timeout: str) -> dict:
+        return attack.run_script(lab.agent, script, "write", OTHER_HOST, tag, str(mtime), timeout)
+
+    try:
+        # 4: an honest gzip POST to the same host is held as a write, not refused.
+        write(1111, GAVE_UP)  # the client gives up; the hold stays open
+        held_write = held_at(lab, f"/{tag}/write")
+        yes_id = held_write.details["hold_id"]
+        nobody_waiting(lab, yes_id)
+        approval = cli(lab, "aprobar", yes_id)  # nobody waiting: a one-use preapproval
+        # 5: while that yes is unspent, the same JSON compressed in another moment (other mtime,
+        # other raw bytes). Without the encoded bytes in the fingerprint it would spend the yes
+        # and go out; it must open a hold of its own.
+        after_yes = lab.head()
+        other = write(2222, GAVE_UP)
+        second_held = held_at(lab, f"/{tag}/write", after=after_yes)
+        by_after_other = [e.details.get("by") for e in gate(lab, "approved", yes_id)]
+        out_after_other = len(lab.internet.requests(OTHER_HOST, f"/{tag}/write"))
+        # Then the exact bytes: the yes was still there, so they go out, once. The gate forwards
+        # the decoded body, so the server reads the JSON itself, not the gzip.
+        same = write(1111, "60")
+        # 6: a ~1 MiB gzip that decodes to two bytes (empty stored blocks around "ok"). Held as a
+        # write (it decodes to something); its record shows a 2-byte body; once approved, only the
+        # two bytes reach the server, never the MiB. The client waits connected, so the approval
+        # sends it straight out (no re-send of a megabyte).
+        padded_done = background(
+            lambda: attack.run_script(lab.agent, script, "padded", OTHER_HOST, tag, "120")
+        )
+        padded_held = held_at(lab, f"/{tag}/padded")
+        padded_approval = cli(lab, "aprobar", padded_held.details["hold_id"])
+        padded = padded_done()
+    finally:
+        reject_what_is_left(lab, tag)
+
+    def blocked_now() -> list[Event]:
+        return [
+            e
+            for e in lab.service.events("blocked", "net")
+            if str(e.details.get("path", "")).startswith(f"/{tag}/") and e.seq > before
+        ]
+
+    wait_until(lambda: len(blocked_now()) >= 5, 30, "the five net/blocked of the tag",
+               context=lab.service.diagnosis)  # fmt: skip
+    blocked = blocked_now()
+    by_at_end = [e.details.get("by") for e in gate(lab, "approved", yes_id)]
+    blocked_by_path = {e.details.get("path"): e for e in blocked}
+    reasons = sorted({e.details.get("reason") for e in blocked})
+    write_out = lab.internet.requests(OTHER_HOST, f"/{tag}/write")
+    padded_out = lab.internet.requests(OTHER_HOST, f"/{tag}/padded")
+    hidden_out = [
+        r
+        for r in lab.internet.requests(OTHER_HOST, f"/{tag}/")
+        if r["path"].split("?", 1)[0] not in (f"/{tag}/write", f"/{tag}/padded")
+    ]
+    every = json.dumps([[e.target, e.details] for e in lab.service.events()])
+    leaked = [p for p in pieces(hidden) if p in every]
+    smuggled = {k: v for k, v in smuggle.items() if k != "hidden_bytes"}
+    # The gate normalizes an encoded body: what reaches the server is the decoded bytes, with no
+    # Content-Encoding. The honest write arrives as its JSON; the ~1 MiB gzip, as two bytes.
+    normalized = (
+        len(write_out) == 1
+        and write_out[0]["body_size"] == same["decoded_size"] != same["raw_size"]
+        and "content-encoding" not in write_out[0]["headers"]
+        and len(padded_out) == 1
+        and padded_out[0]["body_size"] == padded["decoded_size"]
+        and "content-encoding" not in padded_out[0]["headers"]
+    )
+    attack.check(
+        "stopped",
+        all(status == 400 for status in smuggled.values())
+        and hidden_out == []
+        and leaked == []
+        and other["status"] not in (200, 400)
+        and out_after_other == 0
+        and same["status"] == 200
+        and padded["status"] == 200
+        and normalized,
+        f"las cinco peticiones con el payload en la cabecera gzip se rechazan con 400 "
+        f"({smuggled}); nada de lo escondido ({smuggle['hidden_bytes']} B) llega a {OTHER_HOST} "
+        f"({len(hidden_out)}) ni queda ningún trozo en la caja negra ({leaked or 'ninguno'}); con "
+        f"el sí sin gastar, la misma JSON comprimida en otro momento no cuela ({other['status']}, "
+        f"llegaron {out_after_other}); después los bytes aprobados salen una vez "
+        f"({same['status']}, llegó {len(write_out)} con {[r['body_size'] for r in write_out]} B "
+        f"decodificados, no {same['raw_size']} B crudos, sin content-encoding); el gzip de "
+        f"{padded['raw_size']} B que decodifica a 2 B llega como "
+        f"{[r['body_size'] for r in padded_out]} B ({padded['status']})",
+    )
+    padded_recorded = padded_held.details.get("body", {}).get("size")
+    attack.check(
+        "recorded",
+        len(blocked) == 5
+        and reasons == ["undecodable"]
+        and {k: blocked_by_path[k].details.get("method") for k in blocked_by_path}
+        == {
+            f"/{tag}/fcomment": "GET",
+            f"/{tag}/fname": "GET",
+            f"/{tag}/fextra": "GET",
+            f"/{tag}/empty": "GET",
+            f"/{tag}/post": "POST",
+        }
+        and padded_recorded == padded["decoded_size"]
+        and leaked == [],
+        f"cada petición queda en net/blocked con motivo {reasons}: "
+        f"{sorted(blocked_by_path)} ({len(blocked)} de 5); el gzip de {padded['raw_size']} B se "
+        f"graba con un cuerpo de {padded_recorded} B (lo que decodifica); sin ningún trozo del "
+        f"payload en la caja negra ({leaked or 'ninguno'})",
+    )
+    held_risks = sorted({e.risk for e in (held_write, second_held, padded_held)})
+    blocked_risks = sorted({e.risk for e in blocked})
+    attack.check(
+        "risk",
+        blocked_risks == [2] and held_risks == [2],
+        f"los rechazos undecodable llevan riesgo {blocked_risks} (su contenido no se puede "
+        f"comprobar) y las escrituras retenidas, {held_risks}",
+    )
+    attack.check(
+        "held",
+        approval.returncode == 0
+        and held_write.details.get("reason") != "undecodable"
+        and second_held.details["hold_id"] != yes_id
+        and other["status"] not in (200, 400)
+        and by_after_other == ["cli"]
+        and by_at_end == ["cli", "preapproval"]
+        and padded_approval.returncode == 0
+        and padded_held.details.get("reason") != "undecodable",
+        f"la escritura honesta se retiene (no se rechaza) y se aprueba sin nadie esperando "
+        f"(rc {approval.returncode}); con ese sí sin gastar, la misma JSON comprimida de otra "
+        f"forma abre una retención nueva "
+        f"({second_held.details['hold_id'] != yes_id}) y el sí sigue intacto "
+        f"(gate/approved por {by_after_other}); lo gastan los bytes exactos ({by_at_end}); el "
+        f"gzip de {padded['raw_size']} B se retiene (no se rechaza) y sale al aprobarlo "
+        f"(rc {padded_approval.returncode})",
+    )
+
+
 @scenario("dns-tunel")
 def test_a_name_leaves_only_once_recorded_and_the_guard_stops_the_rest(
     attack: Attack, request: pytest.FixtureRequest

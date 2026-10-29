@@ -485,7 +485,7 @@ class Gate:
         refusal = None
         try:
             body: bytes | None = decode_body(
-                request.raw_content, request.headers.get("content-encoding")
+                request.raw_content, request.headers.get("content-encoding"), sent=True
             )
         except Undecodable as error:
             body, refusal = None, error.reason
@@ -498,6 +498,7 @@ class Gate:
         if refusal is not None:
             self._block(refusal, flow, fields)
             return
+        encoded = _encoded(request)
         if self._private_literal(request.host):
             # A fixed rule, before the allowed list (which never allows an IP): risk 2, not 1.
             # After the real key's search, so a real key towards one is still real_key (risk 3).
@@ -516,6 +517,18 @@ class Gate:
             return
         fields["body"] = body
         provider = config.providers.for_host(request.host)
+        if encoded is not None and provider is None:
+            # What leaves is what was read (security review of the G1 fix): a deflate stream has
+            # room of its own (empty stored blocks, free Huffman tables) that decodes to nothing,
+            # so the owner would approve "ok" and megabytes would leave. The body goes out
+            # decoded, as backtide checked and recorded it; its raw bytes still count in the
+            # fingerprint. A chunked body mitmproxy frames again; a length is made true. (To a
+            # provider, check_request refuses an encoded body: no model client sends one.)
+            request.raw_content = body
+            del request.headers["content-encoding"]
+            if _has_header(request, "content-length"):
+                request.headers["content-length"] = str(len(body or b""))
+            headers = _header_pairs(request.headers)
         if provider is None and self._unknown_virtual(request.host):
             # T20: a virtual name of backtide's that no local provider has. It stands for a
             # private place and is never resolved: refused before backtide is asked.
@@ -591,7 +604,7 @@ class Gate:
         else:
             event = record.request_event(fields, config.scrubber)
             reading = self._read(request, headers, body, config, trailers)
-            gate = self._gate_facts(request, headers, body, config, trailers, reading)
+            gate = self._gate_facts(request, headers, body, config, trailers, reading, encoded)
             shape = None if reading is None else reading.shape
             reading = None  # its canonical text lives no longer than the fingerprint needs
         # Up to max_pending requests wait for their ack at once: each keeps only mitmproxy's raw
@@ -722,6 +735,7 @@ class Gate:
         config: GateConfig,
         trailers: list[tuple[str, str]],
         reading: Reading | None = None,
+        encoded: bytes | None = None,
     ) -> dict[str, Any]:
         """What backtide decides a request on (docs/32, section 6): its fingerprint (every header
         but the volatile ones, and the trailers, count: security review of T10-2, M2; with a
@@ -742,6 +756,7 @@ class Gate:
             body=body,
             trailers=trailers,
             canonical=None if reading is None else reading.canonical,
+            encoded=encoded,
         )
         overridden = any(name.strip().lower() in OVERRIDE_HEADERS for name, _ in headers)
         plain = [pair for pair in headers if pair[0].strip().lower() not in CREDENTIAL_HEADERS]
@@ -1490,19 +1505,30 @@ class Undecodable(Exception):
 
 
 _ZLIB_WBITS = {"gzip": 16 + zlib.MAX_WBITS, "x-gzip": 16 + zlib.MAX_WBITS}
+# FEXTRA, FNAME and FCOMMENT of a gzip header (RFC 1952, 2.3.1): free bytes zlib skips.
+_GZIP_FREE_FIELDS = 0x04 | 0x08 | 0x10
 
 
-def decode_body(raw: bytes | None, encoding: str | None, limit: int = BODY_LIMIT) -> bytes | None:
+def decode_body(
+    raw: bytes | None, encoding: str | None, limit: int = BODY_LIMIT, *, sent: bool = False
+) -> bytes | None:
     """The body as the server will read it, decoded with a cap (a 16 MiB gzip can hold
     gigabytes: never decompressed without one). Only identity, gzip and deflate, once;
     anything else (br, zstd, two encodings in a row, a stream that does not end) cannot be
-    checked and so does not go out."""
+    checked and so does not go out.
+
+    ``sent``: a body the agent sends. Bytes the decoding skips would leave unseen (code review of
+    2026-10-29, G1), so a gzip header with a name, a comment or extra fields, and an encoded
+    body that decodes to nothing, are refused. The rest of the free room in an encoding (the
+    deflate stream's own) never leaves: the gate forwards the decoded body (``request``)."""
     if raw is None or not raw:
         return raw
     name = (encoding or "").strip().lower()
     if name in ("", "identity"):
         return raw
     if name in _ZLIB_WBITS:
+        if sent and len(raw) >= 4 and raw[3] & _GZIP_FREE_FIELDS:
+            raise Undecodable("undecodable")
         candidates = [_ZLIB_WBITS[name]]
     elif name == "deflate":
         candidates = [zlib.MAX_WBITS, -zlib.MAX_WBITS]  # zlib-wrapped, or raw as some send it
@@ -1516,10 +1542,20 @@ def decode_body(raw: bytes | None, encoding: str | None, limit: int = BODY_LIMIT
             continue
         if len(data) > limit or decompressor.unconsumed_tail:
             raise Undecodable("too_large")
-        if not decompressor.eof or decompressor.unused_data:
+        if not decompressor.eof or decompressor.unused_data or (sent and not data):
             raise Undecodable("undecodable")
         return data
     raise Undecodable("undecodable")
+
+
+def _encoded(request: Any) -> bytes | None:
+    """The raw bytes of a body sent with a Content-Encoding, or None. They count in the
+    fingerprint as they go out: the same decoded body can be encoded many ways, and an
+    approval is for the bytes that leave (code review of 2026-10-29, G1)."""
+    name = (request.headers.get("content-encoding") or "").strip().lower()
+    if name in ("", "identity") or not request.raw_content:
+        return None
+    return bytes(request.raw_content)
 
 
 def _has_header(request: Any, name: str) -> bool:
