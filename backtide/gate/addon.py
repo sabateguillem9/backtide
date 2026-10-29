@@ -529,6 +529,7 @@ class Gate:
             if _has_header(request, "content-length"):
                 request.headers["content-length"] = str(len(body or b""))
             headers = _header_pairs(request.headers)
+            fields["headers"] = headers  # recorded as it leaves, with the body that leaves
         if provider is None and self._unknown_virtual(request.host):
             # T20: a virtual name of backtide's that no local provider has. It stands for a
             # private place and is never resolved: refused before backtide is asked.
