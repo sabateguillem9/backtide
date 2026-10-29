@@ -54,6 +54,8 @@ class History:
     def add(self, contributions: Mapping[str, float], now: float) -> None:
         second = math.floor(now)
         for rule_id, weight in contributions.items():
+            if weight <= 0:
+                continue  # nothing to count, and nothing to keep
             buckets = self._buckets.setdefault(rule_id, deque())
             if buckets and buckets[-1][0] >= second:
                 last_second, last_weight = buckets[-1]
@@ -77,9 +79,12 @@ def assess(event: Observation, history: History, rules: Sequence[Rule]) -> Asses
             continue
         if rule.burst is not None:
             weight = _weight(rule, event)
-            contributions[rule.id] = weight
             if weight <= 0:
-                continue  # it adds nothing (a summary without deletes): not part of the burst
+                # It adds nothing (a summary without deletes): not part of the burst, and not
+                # kept either (code review of 2026-10-29, B1: a flood of creates grew the
+                # history by one zero a second, never pruned).
+                continue
+            contributions[rule.id] = weight
             seen = history.total(rule.id, rule.burst.window, event.ts) + weight
             if seen < rule.burst.count:
                 continue

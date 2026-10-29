@@ -166,6 +166,21 @@ def test_a_burst_that_sums_a_field_weighs_each_event_by_it() -> None:
     assert run(rules, events) == [0, 0, 0, 3]
 
 
+def test_a_flood_that_weighs_nothing_leaves_no_history() -> None:
+    """Code review of 2026-10-29, B1: summaries without deletes were kept as zeros, one bucket a
+    second and never pruned (about 80 MB a day for a flood of creates)."""
+    rules = rules_from(
+        'risk = 3\naction = "summary"\nburst = { count = 100, window = 60, sum = "counts.delete" }'
+    )
+    history = History()
+    for second in range(5_000):
+        result = assess(seen("summary", ts=float(second), counts={"create": 50}), history, rules)
+        history.add(result.contributions, float(second))
+    assert history.rules_tracked == 0
+    history.add({"r": 0.0, "s": -1.0}, 1.0)
+    assert history.rules_tracked == 0
+
+
 @pytest.mark.parametrize("value", [-5, "9", True, None, float("nan")])
 def test_a_sum_field_that_is_not_a_positive_number_weighs_nothing(value: object) -> None:
     rules = rules_from(
