@@ -28,7 +28,7 @@ SENSITIVE_BASE = (
 # "client_secret" or "SIGNING_KEY" are secret but "input_tokens", "token_count" or "key_id"
 # are not.
 SENSITIVE_WORDS = (
-    r"(?:token|secret|passw(?:or)?d|api[-_]?key|private[-_]?key|access[-_]?key"
+    r"(?:token|secret|passw(?:or)?d|pass[-_]?phrase|api[-_]?key|private[-_]?key|access[-_]?key"
     r"|(?:secret|signing|encryption|master)[-_]?key|authorization|cookie)"
 )
 

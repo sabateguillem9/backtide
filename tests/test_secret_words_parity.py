@@ -128,6 +128,12 @@ SECRETS = [
     (f"curl -H 'X-Signing-Key: {_S}' x.invalid", _S, ALL),
     (f"Master-Key: {_S}", _S, ALL),
     (f'{{"master_key": "{_S}"}}', _S, TEXT),
+    # passphrase (code review of 2026-10-29, J1): gpg's and borg's.
+    (f"gpg --batch --passphrase {_S} -c f", _S, ALL),
+    (f"gpg --passphrase={_S} -c f", _S, ALL),
+    (f"BORG_PASSPHRASE={_S} borg create ::a .", _S, ALL),
+    (f"export PASSPHRASE={_S}; duplicity", _S, ALL),
+    (f'{{"passphrase": "{_S}"}}', _S, TEXT),
     (f"{{'signing_key': '{_S}'}}", _S, TEXT),
     (f"env SIGNING_KEY={_S} run", _S, ALL),
     (f"Bearer {_S}", _S, ALL),
@@ -256,6 +262,9 @@ KNOWN_LEAKS = [
     ("/bin/true", f'--private-key MYSQL_PWD="{_P} y"'),
     ("/bin/true", f"X-Master-Key: secret='{_P} y'"),
     ("/bin/true", f'config set signing_key token: "{_P} y"'),
+    # The same with passphrase (code review of 2026-10-29): its value is the word that names
+    # the next secret (TOKEN = '…'), which then loses its anchor.
+    ("/bin/true", f"\"passphrase=tokenpass:TOKEN = '=={_P}# "),
 ]
 
 
@@ -287,6 +296,8 @@ LOOK_ALIKES = [
     "sk-short-key",
     "key_id=7 keys=3 --keys 4",
     "echo signing done; master branch",
+    "gpg --passphrase-fd 0 --passphrase-file pw.txt -c f",  # a secret word must END the name
+    "passphrase_hint=blue",
 ]
 
 
@@ -340,6 +351,8 @@ def test_the_flag_words_hold_every_sensitive_word() -> None:
         assert flag.fullmatch(name), name
     for name in ("access_key", "signing-key", "encryption_key", "masterkey", "authorization"):
         assert flag.fullmatch(name), name
+    for name in ("passphrase", "pass-phrase", "PASS_PHRASE"):
+        assert flag.fullmatch(name), name
     for name in ("pass", "pwd", "auth", "apikey"):
         assert flag.fullmatch(name), name
 
@@ -356,3 +369,12 @@ def test_redact_and_procs_stay_linear_on_runs_of_secret_flags(unit: str, tail: s
     large = unit * (size // len(unit)) + tail
     assert_linear(strike_text, small, large, 8, floor=0.01, cap=2.0, label=f"redact {unit!r}")
     assert_linear(safe_text, small, large, 8, floor=0.01, cap=2.0, label=f"procs {unit!r}")
+
+
+def test_an_unquoted_netrc_password_is_an_accepted_residual() -> None:
+    """Code review of 2026-10-29, J4, accepted (docs/23): `password <word>` is ordinary prose, so
+    a netrc line's bare password is struck by no barrier. The real defence is that the agent
+    never holds real passwords. If this starts failing, a barrier strikes it now: update docs/23."""
+    text = f"sh -c 'echo machine h login u password {_S} > ~/.netrc'"
+    for barrier in (*BARRIERS.values(), _chain):
+        assert _S in barrier(text)

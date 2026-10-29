@@ -114,6 +114,54 @@ def test_secrets_in_argv(attack: Attack, agent, battery_sensor) -> None:
     )
 
 
+@scenario("frase-de-paso")
+def test_a_passphrase_on_the_command_line(attack: Attack, agent, battery_sensor) -> None:
+    # The review of 2026-10-29 (J1): passphrase is a secret word. The secrets are made inside
+    # the container (the script prints them).
+    marker = f"fpas-{secrets_module.token_hex(4)}"
+    attack.watch(battery_sensor, agent.jail)
+    outcome = attack.run_script(agent, "frase_de_paso", marker)
+    forms, run_tag = outcome["forms"], outcome["run_tag"]
+    attack.recorded_exec(argv=f"{marker}-fin")  # the sentinel: every command is in by now
+
+    # Recorded: each command, by its own binary (or the /bin/true stand-in), with its value
+    # struck to [REDACTED] and its tag still in sight.
+    missing = []
+    for form in forms:
+        seen = attack.recorded_exec(argv=form["tag"], binary=form["binary"], timeout=10.0)
+        if not any("[REDACTED]" in str(e.details.get("argv", "")) for e in seen):
+            missing.append((form["form"], [e.details.get("argv") for e in seen]))
+    stand_ins = sorted({form["form"].split()[1] for form in forms if form["stand_in"]})
+    attack.check(
+        "recorded",
+        missing == [],
+        f"el sensor grabó los {len(forms)} comandos con frase de paso (gpg, sh -c con borg y "
+        f"export, env; sin la herramienta en la imagen, /bin/true con el mismo texto: "
+        f"{stand_ins or 'ninguna'}), cada uno con su valor tachado como [REDACTED]; sin grabar "
+        f"o sin tachar: {missing or 'ninguno'}",
+    )
+
+    # Stopped: no value, no 8-character piece of one, not even the run's prefix in the box; and
+    # none in Tetragon's own file or logs (the first barrier strikes all five forms too).
+    box_text = repr([(e.target, e.details) for e in battery_sensor.box.events()])
+    file_text = battery_sensor.events_text() + battery_sensor.sensor_logs()
+    in_box = [f["form"] for f in forms if f["value"] in box_text]
+    pieces = [
+        f["form"]
+        for f in forms
+        if any(f["value"][i : i + 8] in box_text for i in range(len(f["value"]) - 7))
+    ]
+    in_file = [f["form"] for f in forms if f["value"] in file_text]
+    attack.check(
+        "stopped",
+        in_box == [] and pieces == [] and run_tag not in box_text and in_file == [],
+        f"ninguna de las {len(forms)} frases de paso inventadas llega a la caja negra "
+        f"({in_box or 'ninguna'}), ni un trozo de 8 caracteres ({pieces or 'ninguno'}), ni el "
+        f"prefijo de la tanda ({run_tag in box_text}); tampoco al archivo de Tetragon ni a sus "
+        f"logs ({in_file or 'ninguna'})",
+    )
+
+
 @scenario("esconder-comandos")
 def test_hiding_commands(attack: Attack, agent, battery_sensor) -> None:
     marker = _marker()
