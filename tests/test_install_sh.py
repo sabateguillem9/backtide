@@ -477,8 +477,9 @@ def test_files_named_on_the_command_line_are_made_absolute_before_moving_to_root
     script = (
         'die() { echo "$*" >&2; exit 2; }\n' + function("absolute") + loop + 'printf "%s\\n" "$@"\n'
     )
-    args = ["--clave-archivo", "k.txt", "--telegram-token-archivo=t.txt", "--clave-archivo=/abs",
-            "--desde", "b.tar", "--perfil", "claude-code", "--telegram-token-archivo", "-"]  # fmt: skip
+    args = ["--clave-archivo", "k.txt", "--telegram-token-archivo=t.txt",
+            "--clave-archivo=/abs", "--desde", "b.tar", "--perfil", "claude-code",
+            "--telegram-token-archivo", "-"]  # fmt: skip
     ran = subprocess.run(["sh", "-c", script, "install.sh", *args], cwd=tmp_path,
                          capture_output=True, text=True, check=True)  # fmt: skip
     here = os.path.realpath(tmp_path)

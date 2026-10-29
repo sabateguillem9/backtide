@@ -570,7 +570,8 @@ def test_an_installed_service_exports_only_into_its_folder(
     folder = tmp_path / "backtide-export"
     folder.mkdir()
     assert check_destination(str(folder / "mine"), protected, inside=folder) == folder / "mine"
-    for elsewhere in (tmp_path / "mine", tmp_path / "nope" / "mine", Path("/tmp/mine")):
+    private_tmp = Path("/tmp") / "mine"  # what PrivateTmp hid  # noqa: S108
+    for elsewhere in (tmp_path / "mine", tmp_path / "nope" / "mine", private_tmp):
         with pytest.raises(ExportError, match=f"solo puede exportar dentro de {folder}"):
             check_destination(str(elsewhere), protected, inside=folder)
     (folder / "out").symlink_to(tmp_path)  # a way out by a link
