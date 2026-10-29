@@ -61,6 +61,12 @@ def folder_snapshots(folder: Path) -> Callable[[], list[Snapshot]]:
     return listing
 
 
+def demo_english(home: Path) -> bool:
+    """Whether seed.py made the data in English (``--english``: the demo video)."""
+    path = home / "agents.json"
+    return path.is_file() and json.loads(path.read_text()).get("english") is True
+
+
 def demo_agents(home: Path) -> tuple[str | None, list[AgentSource]]:
     """The main agent's name and the other agents of ``agents.json`` (none if it is missing)."""
     path = home / "agents.json"
@@ -105,6 +111,7 @@ def demo_requests(
 
 
 DEMO_DECIDED = "Esto es la demo: no ha salido nada ni se ha escrito nada."
+DEMO_DECIDED_EN = "This is the demo: nothing went out and nothing was written."
 
 
 class DemoApprover:
@@ -114,8 +121,9 @@ class DemoApprover:
 
     enabled = True
 
-    def __init__(self, requests: Path) -> None:
+    def __init__(self, requests: Path, said: str = DEMO_DECIDED) -> None:
         self._requests = requests
+        self._said = said
         self._lock = threading.Lock()
         self._decided: set[str] = set()
         self._trusted: list[dict[str, Any]] = [
@@ -153,18 +161,18 @@ class DemoApprover:
     def decide(self, hold_id: str, verdict: str) -> dict[str, Any]:
         with self._lock:
             if hold_id in self._decided or self._open(hold_id) is None:
-                return {"ok": False, "outcome": "unknown", "message": DEMO_DECIDED}
+                return {"ok": False, "outcome": "unknown", "message": self._said}
             self._decided.add(hold_id)
         outcome = "released" if verdict == "approve" else "rejected"
-        return {"ok": True, "outcome": outcome, "message": DEMO_DECIDED}
+        return {"ok": True, "outcome": outcome, "message": self._said}
 
     def trust(self, hold_id: str) -> dict[str, Any]:
         with self._lock:
             found = self._open(hold_id)
             if hold_id in self._decided or found is None:
-                return {"ok": False, "outcome": "unknown", "message": DEMO_DECIDED, "hold": None}
+                return {"ok": False, "outcome": "unknown", "message": self._said, "hold": None}
             if not found.get("trustable"):
-                return {"ok": False, "outcome": "not_trustable", "message": DEMO_DECIDED,
+                return {"ok": False, "outcome": "not_trustable", "message": self._said,
                         "hold": None}  # fmt: skip
             self._decided.add(hold_id)
             translator = str(found.get("translator") or "telegram")
@@ -177,7 +185,7 @@ class DemoApprover:
                     "by": "web",
                 }  # fmt: skip
             )
-        return {"ok": True, "outcome": "trusted", "message": DEMO_DECIDED, "hold": "released"}
+        return {"ok": True, "outcome": "trusted", "message": self._said, "hold": "released"}
 
     def trusted(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -189,7 +197,7 @@ class DemoApprover:
             gone = len(kept) != len(self._trusted)
             self._trusted = kept
         outcome = "removed" if gone else "unknown"
-        return {"ok": gone, "outcome": outcome, "message": DEMO_DECIDED}
+        return {"ok": gone, "outcome": outcome, "message": self._said}
 
     def batches(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -201,7 +209,7 @@ class DemoApprover:
             gone = len(kept) != len(self._batches)
             self._batches = kept
         outcome = "ended" if gone else "unknown"
-        return {"ok": gone, "outcome": outcome, "message": DEMO_DECIDED}
+        return {"ok": gone, "outcome": outcome, "message": self._said}
 
 
 DEMO_SAID = "Esto es la demo: no se ha escrito nada y el cambio dura hasta que la pares."
@@ -298,7 +306,8 @@ def main(argv: list[str]) -> int:
         )
         print(f"Nombre de esta ejecución: {run_name}\nCtrl-C la para.", flush=True)
 
-    approver = DemoApprover(config.parent / "requests.json")
+    said = DEMO_DECIDED_EN if demo_english(config.parent) else DEMO_DECIDED
+    approver = DemoApprover(config.parent / "requests.json", said)
     run_web(
         paths,
         port,

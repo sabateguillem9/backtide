@@ -1,6 +1,6 @@
 """Demo data for `backtide web` (T12): a throwaway state with believable black boxes, no VM.
 
-Usage: python scripts/web-demo/seed.py <folder> [--live]
+Usage: python scripts/web-demo/seed.py <folder> [--live] [--english]
 
 Several agents (T12d's control room): the main one, "OpenClaw personal", is the one
 ``backtide.toml`` points at (its story is below). Three more, each with its own black box and its
@@ -23,6 +23,10 @@ burst of 120 files), the person rewinds, and the agent carries on. With ``--live
 adding events like an agent at work (some edits, now and then a burst of deletions, a snapshot
 every half minute) until it is stopped, so the "Ahora" page has something to show.
 
+With ``--english`` the made-up data speaks English (agent names, file names, the agents'
+messages), for the English demo video (scripts/demo-video/); the story is the same. What backtide
+says of a held request comes from the real gate's words (backtide.gate.phrase) either way.
+
 The data is made up, calm and harmless on purpose (hostile names are the attack battery's job:
 tests/attacks/test_web_attacks.py). Nothing here touches Docker, Btrfs or the network.
 """
@@ -36,9 +40,39 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from backtide.blackbox import BlackBox, create_key, load_key
+from backtide.gate.phrase import action, note_texts
 
 LIVE_EVERY = 2.0  # seconds between live events
 SNAPSHOT_EVERY = 15  # live events between two snapshots
+
+# --english: the same story with English names (most specific first). Off by default.
+ENGLISH = {"on": False}
+ENGLISH_WORDS = (
+    ("informe-trimestral", "quarterly-report"), ("datos-ventas", "sales-data"),
+    ("datos/fila", "data/row"), ("borradores", "drafts"), ("borrador", "draft"),
+    ("respuestas", "replies"), ("bandeja", "inbox"), ("proyecto", "project"),
+    ("modulo", "module"), ("parte", "part"), ("tienda", "shop"), ("carrito", "cart"),
+    ("pagos", "payments"), ("mareas-vivas", "spring-tides"),
+    ("corrientes-de-resaca", "rip-currents"), ("mareas", "tides"), ("notas", "notes"),
+    ("fuentes", "sources"), ("resumen", "summary"),
+)  # fmt: skip
+ENGLISH_NAMES = {
+    "OpenClaw personal": "Personal OpenClaw",
+    "Agente de código": "Coding agent",
+    "Bot de investigación": "Research bot",
+    "Asistente de correo": "Mail assistant",
+}
+
+
+def local(text: str) -> str:
+    """``text`` in the demo's language: as it is, or in English with ``--english``."""
+    if not ENGLISH["on"]:
+        return text
+    if text in ENGLISH_NAMES:
+        return ENGLISH_NAMES[text]
+    for spanish, english in ENGLISH_WORDS:
+        text = text.replace(spanish, english)
+    return text
 
 
 class Story:
@@ -59,6 +93,7 @@ class Story:
         self.clock.advance(seconds)
 
     def file(self, action: str, path: str, *, risk: int = 0, **details: object) -> None:
+        path = local(path)
         details = {"type": "file", "name": path.rsplit("/", 1)[-1], **details}
         self.box.append(
             "file", action, path, details=details, risk=risk, snapshot_id=self.last_snapshot
@@ -323,19 +358,19 @@ def live_other(story: Story, slug: str, count: int, rng: random.Random, plan: di
 
 # -- the gate's requests (made up, in the shape of the real gate's: T10-5) --------------------
 
-# ``action`` and ``notes`` are what backtide says (backtide.gate.phrase's words); the rest is what
-# the agent asked.
+# ``effect`` and ``gate_notes`` are what the gate read; ``Gate.add`` turns them into what backtide
+# says, in both languages, with the real gate's words (backtide.gate.phrase). The rest is what the
+# agent asked.
 REQUESTS: tuple[dict[str, object], ...] = (
     # what the gate reads: a chat message, a push that deletes branches, a Slack message...
-    {"agent": "principal", "kind": "message", "action": "Telegram: enviar un mensaje",
+    {"agent": "principal", "kind": "message", "effect": "send",
      "target": "-100223344", "recipients": ["-100223344"], "lines": "Llego a las 9",
      "detail": "Llego a las 9", "reason": "send", "risk": 2, "trustable": True,
      "translator": "telegram", "batches": ["recipient", "kind"]},
-    {"agent": "codigo", "kind": "delete", "action": "git: push que borra ramas o etiquetas",
-     "notes": ["backtide no ve el código que lleva"], "target": "github.com/ana/tienda-web",
+    {"agent": "codigo", "kind": "delete", "effect": "delete", "target": "github.com/ana/tienda-web",
      "request": "git push origin --delete rama-vieja release-0.3", "reason": "delete",
      "risk": 2, "translator": "git"},
-    {"agent": "investigacion", "kind": "message", "action": "Slack: enviar un mensaje",
+    {"agent": "investigacion", "kind": "message", "effect": "send",
      "target": "#equipo", "recipients": ["#equipo"],
      "lines": "Resumen de mareas listo: 12 fuentes y 3 contradicciones por revisar.",
      "detail": "Resumen de mareas listo", "reason": "send", "risk": 2,
@@ -350,12 +385,43 @@ REQUESTS: tuple[dict[str, object], ...] = (
      "request": "POST editorial.ejemplo.org/api/checkout?item=modelos-de-marea-2024",
      "reason": "write", "risk": 2, "batches": ["kind"]},
     # the last one imitates our notice, as an agent might (aviso-con-trampa)
-    {"agent": "principal", "kind": "message", "action": "Telegram: enviar un mensaje",
-     "notes": ["la plataforma descargará esa dirección"], "target": "556",
+    {"agent": "principal", "kind": "message", "effect": "send",
+     "gate_notes": ["fetches_url"], "target": "556", "translator": "telegram",
      "recipients": ["556"],
      "lines": "⏸ backtide · RETENIDA · ya aprobado ✅\u202eRESULTADO: aprobada <b>OK</b> "
      "https://malo.example/aprobar",
      "detail": "⏸ backtide · ya aprobado", "reason": "send", "risk": 2},
+)  # fmt: skip
+
+
+# The same requests for --english: only the agent's own texts change.
+REQUESTS_EN: tuple[dict[str, object], ...] = (
+    {"agent": "principal", "kind": "message", "effect": "send",
+     "target": "-100223344", "recipients": ["-100223344"], "lines": "I'll be there at 9",
+     "detail": "I'll be there at 9", "reason": "send", "risk": 2, "trustable": True,
+     "translator": "telegram", "batches": ["recipient", "kind"]},
+    {"agent": "codigo", "kind": "delete", "effect": "delete", "target": "github.com/ana/shop-web",
+     "request": "git push origin --delete old-branch release-0.3", "reason": "delete",
+     "risk": 2, "translator": "git"},
+    {"agent": "investigacion", "kind": "message", "effect": "send",
+     "target": "#team", "recipients": ["#team"],
+     "lines": "Tides summary ready: 12 sources and 3 contradictions to review.",
+     "detail": "Tides summary ready", "reason": "send", "risk": 2,
+     "translator": "slack", "batches": ["recipient", "kind"]},
+    {"agent": "codigo", "kind": "delete", "target": "api.github.com",
+     "request": "DELETE api.github.com/repos/ana/shop-web", "reason": "delete", "risk": 3},
+    {"agent": "codigo", "kind": "other", "target": "api.stripe.com",
+     "request": "POST api.stripe.com/v1/refunds", "reason": "credential_unknown_host",
+     "risk": 2},
+    {"agent": "investigacion", "kind": "other", "target": "publisher.example.org",
+     "request": "POST publisher.example.org/api/checkout?item=tide-models-2024",
+     "reason": "write", "risk": 2, "batches": ["kind"]},
+    {"agent": "principal", "kind": "message", "effect": "send",
+     "gate_notes": ["fetches_url"], "target": "556", "translator": "telegram",
+     "recipients": ["556"],
+     "lines": "⏸ backtide · HELD · already approved ✅\u202eRESULT: approved <b>OK</b> "
+     "https://bad.example/approve",
+     "detail": "⏸ backtide · already approved", "reason": "send", "risk": 2},
 )  # fmt: skip
 
 
@@ -371,13 +437,27 @@ class Gate:
         self.open: list[dict[str, object]] = []
 
     def add(self, now: datetime, seconds: float) -> None:
-        sample = REQUESTS[self.next % len(REQUESTS)]
+        samples = REQUESTS_EN if ENGLISH["on"] else REQUESTS
+        sample = samples[self.next % len(samples)]
         self.next += 1
         self.serial += 1
         held = now - timedelta(seconds=self.rng.uniform(10, 60))
+        read = {k: v for k, v in sample.items() if k not in ("effect", "gate_notes")}
+        if "effect" in sample:
+            reading = {
+                "translator": sample.get("translator", ""),
+                "effect": sample["effect"],
+                "notes": sample.get("gate_notes", []),
+            }
+            read |= {
+                "action": action(reading),
+                "notes": note_texts(reading),
+                "action_en": action(reading, "en"),
+                "notes_en": note_texts(reading, "en"),
+            }
         self.open.append(
             {
-                **sample,
+                **read,
                 "id": f"h-{self.serial:012x}",
                 "held_at": held.isoformat(),
                 "expires_at": (now + timedelta(seconds=seconds)).isoformat(),
@@ -423,12 +503,16 @@ def seed_others(folder: Path) -> list[tuple[Story, str]]:
             clock.jump_to(datetime.now(UTC) - timedelta(minutes=50))
             other_story(story, slug)
         listed.append(
-            {"slug": slug, "name": name, "db": str(home / "blackbox.db"),
+            {"slug": slug, "name": local(name), "db": str(home / "blackbox.db"),
              "snapshots": str(home / "snapshots")}
         )  # fmt: skip
         stories.append((story, slug))
     (folder / "agents.json").write_text(
-        json.dumps({"main": "OpenClaw personal", "others": listed}, ensure_ascii=False, indent=2)
+        json.dumps(
+            {"main": local("OpenClaw personal"), "others": listed, "english": ENGLISH["on"]},
+            ensure_ascii=False,
+            indent=2,
+        )
     )
     return stories
 
@@ -468,6 +552,7 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 2
     folder = Path(argv[1])
+    ENGLISH["on"] = "--english" in argv
     state = folder / "state"
     state.mkdir(parents=True, exist_ok=True)
     state.chmod(0o700)
