@@ -4,6 +4,9 @@
   [data-theme="dark"] (or [data-theme="auto"] with a dark system preference), plus one
   class per type style (.t-display, .t-body...).
 - The icons (icons/build.py): svg/*.svg and icons.js.
+- The mark, estela (assets/mark.py): assets/mark, lockup, lockup-stacked, lockup-labs and
+  favicon, light and -dark, and components/Wordmark/mark.html, the drawing every Wordmark puts
+  before the name (written into the sample page wherever it says {{mark}}).
 - index.html, the living sample page, from index.tpl.html: the token tables, the contrast
   table, the icon sheet and every {{ic:name}} are written in as static markup, so the page
   reads the same without JavaScript and needs nothing inline.
@@ -24,15 +27,16 @@ import re
 HERE = pathlib.Path(__file__).resolve().parent
 
 
-def _load_icons():
-    """icons/build.py, loaded by its path (both scripts are called build.py)."""
-    spec = importlib.util.spec_from_file_location("backtide_icons", HERE / "icons" / "build.py")
+def _load(name, path):
+    """A script of the system, loaded by its path (icons/build.py shares this one's name)."""
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-icons = _load_icons()
+icons = _load("backtide_icons", HERE / "icons" / "build.py")
+mark = _load("backtide_mark", HERE / "assets" / "mark.py")
 
 TOKENS = json.loads((HERE / "tokens.json").read_text())
 THEMES = ("light", "dark")
@@ -376,6 +380,7 @@ def render_page(rows):
         "icon-count": str(len(icons.ICONS)),
         "arrow": ARROW.format(d="M3 8h10M9 4l4 4-4 4"),
         "arrow-back": ARROW.format(d="M13 8H3M7 4L3 8l4 4"),
+        "mark": mark.inline(),
     }
 
     def rep(m):
@@ -393,6 +398,7 @@ def main():
     (HERE / "tokens.css").write_text(tokens_css())
     print("wrote tokens.css")
     icons.main()
+    mark.main()
     (HERE / "sample").mkdir(exist_ok=True)
     (HERE / "sample" / "swatches.css").write_text(swatches_css())
     (HERE / "index.html").write_text(render_page(rows))

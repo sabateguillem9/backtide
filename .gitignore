@@ -34,3 +34,6 @@ informes/
 # Screenshots of design work: kept locally, not in git
 brand/**/capturas/
 site/capturas/
+
+# wrangler dev (local preview of the site Worker)
+.wrangler/

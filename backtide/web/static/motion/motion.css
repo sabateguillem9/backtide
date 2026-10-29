@@ -54,6 +54,14 @@
 .anim .enter-icon :is(.ic-fill, .ic-soft) { animation: bt-pop .5s var(--ease) calc(var(--at, 0ms) + 650ms) both; }
 .ic-fill, .ic-soft { transform-box: fill-box; transform-origin: center; }
 
+/* The wordmark's mark (.enter-mark on the Wordmark, in a header): the dot comes back from the
+   right and its line draws itself behind it, from far to near. Once, on load, on the public
+   site only: the product web never marks it. Paths with pathLength="1". */
+@keyframes bt-come-back { from { opacity: 0; transform: translateX(12px); } }
+@keyframes bt-draw-back { from { stroke-dashoffset: -1; } }
+.anim .enter-mark .wordmark__dot { animation: bt-come-back var(--duration-draw) var(--ease) var(--at, 0ms) both; }
+.anim .enter-mark .wordmark__trail { stroke-dasharray: 1 1; animation: bt-draw-back var(--duration-draw) var(--ease) calc(var(--at, 0ms) + 60ms) both; }
+
 /* The hero drawing: the shore draws, the wave curls, the dot rolls in and settles. */
 /* No non-scaling-stroke here either: it breaks the drawing of a dashed path (see .ic). The art
    is drawn at about its own size (400 units for 380px), so 1.6 units read as 1.6px. */

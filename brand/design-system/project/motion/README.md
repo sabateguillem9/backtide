@@ -17,6 +17,7 @@ Calm and once. Things arrive, settle and stay.
 | A rule that grows on load | `.enter-rule` on the element with the border | |
 | A list whose items rise one by one, then their icons draw | `.enter-list` | 80 ms apart, at most five steps |
 | An icon that draws itself on load | `.enter-icon` around it | |
+| The mark comes back and leaves its line, on load (public site only) | `.enter-mark` on the header's `Wordmark` | `duration-draw`; never in the product web |
 | Delay any of these | `.at-1` ... `.at-8` | 100 ms steps |
 | Rise into view on scroll, once | `data-reveal` (or `"rise"`) | Only what is below the fold at load |
 | A top rule that draws on scroll | `data-reveal="line"` (or `"rise line"`) | |

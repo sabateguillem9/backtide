@@ -84,11 +84,16 @@ h1 {
 }
 .brand { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); }
 .wordmark {
-  display: inline-flex; align-items: center; gap: 0.6em; min-height: var(--size-target);
+  display: inline-flex; align-items: center; gap: 0.4em; min-height: var(--size-target);
   font: var(--type-button-weight) var(--type-body-size)/1 var(--font-sans); letter-spacing: -0.005em;
   color: var(--ink); text-decoration: none; white-space: nowrap;
 }
-.wordmark__dot { width: var(--size-dot); height: var(--size-dot); flex: none; border-radius: var(--radius-round); background: var(--clay-mark); }
+/* The mark, estela (the system's components/Wordmark/mark.html, copied unchanged into base.html):
+   the clay dot and the line it leaves behind, in the name's ink, as tall as the dot, its middle
+   on the middle of the x-height. Still here: the web never marks it .enter-mark. */
+.wordmark__mark { height: var(--size-dot); width: auto; flex: none; overflow: visible; translate: 0 0.08em; }
+.wordmark__trail { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; }
+.wordmark__dot { fill: var(--clay-mark); }
 .run { font-size: var(--type-caption-size); color: var(--ink-muted); }
 .top nav { display: flex; flex-wrap: wrap; gap: 0 var(--space-8); }
 .top nav a {

@@ -115,6 +115,6 @@
 /* sample/wordmark.html: the wordmark large, for the exported PNGs. */
 .export-page { margin: 0; }
 .export { margin: 0; padding: 2.5rem 3rem; display: inline-block; }
-.export__mark { font-size: 4rem; gap: 0.5em; }
-.export__mark .wordmark__dot { width: 0.5em; height: 0.5em; }
+.export__mark { font-size: 4rem; }
+.export__mark .wordmark__mark { height: 0.6em; }
 .ds-tokens tbody th { white-space: nowrap; }

@@ -1,12 +1,13 @@
 """The product web on the design system v2 (D31, phase 3).
 
 `backtide web` copies the system's files unchanged from `brand/design-system/project/` (tokens,
-fonts and their licences, motion, the favicon) and draws its icons with the system's own paths;
-these tests pin every copy to its source, so a change of the system is copied again, never
-edited here. The web's own stylesheet (`web.css`) uses only the system's tokens: no colour,
-font, curve or time written by hand, no shadows, no gradients. Every page loads only our own
-files, in the system's order, and the text colours the web uses keep 4.5:1 (3:1 for shapes and
-control edges) on the grounds they sit on, in both themes. Static, plus a rendered page.
+fonts and their licences, motion, the favicons, the mark in the header) and draws its icons with
+the system's own paths; these tests pin every copy to its source, so a change of the system is
+copied again, never edited here. The web's own stylesheet (`web.css`) uses only the system's
+tokens: no colour, font, curve or time written by hand, no shadows, no gradients. Every page
+loads only our own files, in the system's order, and the text colours the web uses keep 4.5:1
+(3:1 for shapes and control edges) on the grounds they sit on, in both themes. Static, plus a
+rendered page.
 
 To copy the icons again: ``uv run python -m tests.test_web_brand`` (rewrites
 ``backtide/web/templates/icons.html`` from ``icons/icons.js``).
@@ -28,6 +29,8 @@ WEB = ROOT / "backtide" / "web"
 STATIC = WEB / "static"
 TEMPLATES = WEB / "templates"
 ICONS = TEMPLATES / "icons.html"
+# The mark the Wordmark draws before the name (written by the system's assets/mark.py).
+MARK = (SYSTEM / "components" / "Wordmark" / "mark.html").read_text().strip()
 
 # The system's files, copied unchanged (static path -> system path).
 COPIES = {
@@ -261,12 +264,38 @@ def test_the_page_follows_the_system_theme_until_the_switch_says_otherwise(
     assert 'root.setAttribute("data-theme", "auto")' in js, "back to the system, not to light"
 
 
-def test_the_wordmark_is_the_clay_dot_and_the_name_in_lowercase(web: TestClient) -> None:
+def test_the_wordmark_is_the_systems_mark_and_the_name_in_lowercase(web: TestClient) -> None:
+    """The header draws the system's mark, estela (components/Wordmark/mark.html, copied
+    character for character), then the name: the dot in clay, the line in the name's ink."""
     html = web.get("/ahora").text
     home = re.search(r'<a class="home wordmark"[^>]*>(.*?)</a>', html, re.S)
-    assert home and '<span class="wordmark__dot" aria-hidden="true"></span>' in home.group(1)
+    assert home and home.group(1).startswith(MARK), "copy mark.html again, unchanged"
     assert re.sub(r"<[^>]+>", "", home.group(1)).strip() == "backtide"
     assert "Backtide" not in html and "BACKTIDE" not in html
+    assert "wordmark__dot" in MARK and 'aria-hidden="true"' in MARK
+    css = (STATIC / "web.css").read_text()
+    assert re.search(r"\.wordmark__dot \{ fill: var\(--clay-mark\); \}", css)
+    assert re.search(r"\.wordmark__trail \{[^}]*stroke: currentColor;", css)
+
+
+def test_the_marks_drawing_is_the_systems_mark_file() -> None:
+    """The inline mark and assets/mark.svg are one drawing: the same line and the same dot."""
+    svg = (SYSTEM / "assets" / "mark.svg").read_text()
+    line = re.search(r'<path d="([^"]+)"', svg)
+    dot = re.search(r'<circle cx="([\d.]+)" cy="([\d.]+)" r="([\d.]+)"', svg)
+    assert line and dot
+    assert f'd="{line.group(1)}"' in MARK
+    assert f'cx="{dot.group(1)}" cy="{dot.group(2)}" r="{dot.group(3)}"' in MARK
+    # Nothing inline: no style, no colour of its own, no script; the classes paint it.
+    assert not re.search(r"style|<script|\son[a-z]+=|fill=|stroke=|#[0-9A-Fa-f]{3,8}", MARK)
+
+
+def test_the_mark_stays_still_here(web: TestClient) -> None:
+    """The mark's entrance (.enter-mark) is the public site's: the product web never plays it."""
+    for path in TEMPLATES.rglob("*.html"):
+        assert "enter-mark" not in path.read_text(), path.name
+    for page in ("/ahora", "/historia?accion=nada", "/instantaneas"):
+        assert "enter-mark" not in web.get(page).text, page
 
 
 def test_the_markup_is_still_strict(web: TestClient) -> None:

@@ -22,39 +22,74 @@
       "order": [
         "favicon-dark.svg",
         "favicon.svg",
-        "mark.svg",
-        "wordmark-dark.svg",
-        "wordmark.svg"
+        "lockup-dark.svg",
+        "lockup-labs-dark.svg",
+        "lockup-labs.svg",
+        "lockup-stacked-dark.svg",
+        "lockup-stacked.svg",
+        "lockup.svg",
+        "mark-dark.svg",
+        "mark.svg"
       ],
       "files": {
         "favicon-dark.svg": {
           "name": "favicon-dark.svg",
-          "blob": "793498ae53781dc01b07186f447dbf7e",
-          "size": 165,
+          "blob": "1bf14af44c4ba9b7a550e640c0899893",
+          "size": 697,
           "type": "image/svg+xml"
         },
         "favicon.svg": {
           "name": "favicon.svg",
-          "blob": "dfd0be5be0c8a99eff59ffcc29cd80c6",
-          "size": 165,
+          "blob": "69e9bff1aef48b68637c6ff98c6294d6",
+          "size": 697,
+          "type": "image/svg+xml"
+        },
+        "lockup-dark.svg": {
+          "name": "lockup-dark.svg",
+          "blob": "515cebcda3b666d1cfb5aa76377f0148",
+          "size": 1008,
+          "type": "image/svg+xml"
+        },
+        "lockup-labs-dark.svg": {
+          "name": "lockup-labs-dark.svg",
+          "blob": "d5f97fa1dc37e36b2ded11e2c773bc3a",
+          "size": 1013,
+          "type": "image/svg+xml"
+        },
+        "lockup-labs.svg": {
+          "name": "lockup-labs.svg",
+          "blob": "c245ed5a08ad5e05deb54849bae9a4ea",
+          "size": 1013,
+          "type": "image/svg+xml"
+        },
+        "lockup-stacked-dark.svg": {
+          "name": "lockup-stacked-dark.svg",
+          "blob": "06abd8cbd3dbe76d1fd80bd7b28a42ee",
+          "size": 1030,
+          "type": "image/svg+xml"
+        },
+        "lockup-stacked.svg": {
+          "name": "lockup-stacked.svg",
+          "blob": "af31d0e351f9291f62a76159a937b4b1",
+          "size": 1030,
+          "type": "image/svg+xml"
+        },
+        "lockup.svg": {
+          "name": "lockup.svg",
+          "blob": "15476ee25726dac796c08486b7477e7e",
+          "size": 1008,
+          "type": "image/svg+xml"
+        },
+        "mark-dark.svg": {
+          "name": "mark-dark.svg",
+          "blob": "0ce78833ee45322541cd678586db25ca",
+          "size": 769,
           "type": "image/svg+xml"
         },
         "mark.svg": {
           "name": "mark.svg",
-          "blob": "51e20bb7a7100c9b3e46d3d2a5735138",
-          "size": 160,
-          "type": "image/svg+xml"
-        },
-        "wordmark-dark.svg": {
-          "name": "wordmark-dark.svg",
-          "blob": "38c54b49dfa23ddbfe4a0d815d0cec76",
-          "size": 328,
-          "type": "image/svg+xml"
-        },
-        "wordmark.svg": {
-          "name": "wordmark.svg",
-          "blob": "8cc2019449930f13a178ff89fe6a9254",
-          "size": 328,
+          "blob": "fbee5d78f672f9ca9784cac31cde9997",
+          "size": 769,
           "type": "image/svg+xml"
         }
       }
