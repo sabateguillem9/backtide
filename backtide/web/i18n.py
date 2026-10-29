@@ -257,8 +257,8 @@ ES: dict[str, str] = {
     "`backtide aprobar`.",
     "hold.off.off": "Desde esta web no se decide: usa Telegram o `backtide aprobar`.",
     "nav.holds": "Peticiones",
-    "rewind.off.agent": "Desde aquí solo se rebobina el agente que lleva el servicio. Los demás "
-    "llegan con T17.",
+    "rewind.off.agent": "Desde aquí solo se rebobina el agente que lleva el servicio. Los demás, "
+    "todavía no.",
     "lang.label": "Idioma",
     "agent.label": "El agente",
     "state.watched": "vigilado",
@@ -309,7 +309,7 @@ ES: dict[str, str] = {
     "chat.help": "Por ahora respondo con reglas, sin IA. Puedes preguntar:",
     "chat.help.summary": "«¿Qué ha hecho en la última hora?», «en los últimos 30 minutos», «hoy»",
     "chat.help.state": "«¿Cómo está el agente?»",
-    "chat.help.later": "Las preguntas en lenguaje natural llegan con T15.",
+    "chat.help.later": "Las preguntas en lenguaje natural llegarán más adelante.",
     "chat.unknown": "Eso todavía no lo sé responder.",
     "chat.state": "El agente está {state}.",
     "chat.window": "Desde las {from_} hasta las {to}:",
@@ -997,7 +997,7 @@ EN: dict[str, str] = {
     "hold.off.off": "This web does not decide: use Telegram or `backtide aprobar`.",
     "nav.holds": "Requests",
     "rewind.off.agent": "From here only the agent the service runs can be rewound. The others "
-    "arrive with T17.",
+    "cannot be rewound yet.",
     "lang.label": "Language",
     "agent.label": "Your agent",
     "state.watched": "watched",
@@ -1047,7 +1047,7 @@ EN: dict[str, str] = {
     "chat.help": "For now I answer with rules, without AI. You can ask:",
     "chat.help.summary": '"What has it done in the last hour?", "in the last 30 minutes", "today"',
     "chat.help.state": '"How is the agent?"',
-    "chat.help.later": "Natural-language questions arrive with T15.",
+    "chat.help.later": "Natural-language questions will come later.",
     "chat.unknown": "I do not know how to answer that yet.",
     "chat.state": "Your agent is {state}.",
     "chat.window": "From {from_} to {to}:",

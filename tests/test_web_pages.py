@@ -138,7 +138,7 @@ def test_asking_returns_the_question_and_the_answer_as_a_fragment(web: TestClien
 
 def test_asking_without_htmx_returns_a_whole_page(web: TestClient) -> None:
     html = web.get("/ahora/preguntar", params={"q": "ayuda"}).text
-    assert "<html" in html and "T15" in html
+    assert "<html" in html and "llegarán más adelante" in html
 
 
 def test_the_question_is_echoed_escaped(web: TestClient) -> None:

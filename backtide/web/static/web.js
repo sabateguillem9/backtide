@@ -415,9 +415,10 @@
   }
 
   function snapshotRows() {
-    var list = document.querySelector(".snaplist");
-    if (!list) return;
-    stagger(list.querySelectorAll(".snaprow"), 24);
+    // One list per group (last 10 minutes, last hour, today, before): every row previews.
+    var lists = Array.prototype.slice.call(document.querySelectorAll(".snaplist"));
+    if (!lists.length) return;
+    stagger(document.querySelectorAll(".snaplist .snaprow"), 24);
     if (!tide) return;
     var hint = document.querySelector(".preview-hint");
     if (hint) hint.hidden = false;
@@ -434,14 +435,19 @@
       row.classList.add("is-previewing");
       if (!retractTo(row.getAttribute("data-rewind-to") || "")) restore();
     }
-    list.querySelectorAll(".snaprow").forEach(function (row) {
-      row.addEventListener("mouseenter", function () { show(row); });
-      row.addEventListener("focusin", function () { show(row); });
-      row.addEventListener("click", function () { show(current === row ? null : row); });
-    });
-    list.addEventListener("mouseleave", function () { show(null); });
-    list.addEventListener("focusout", function (event) {
-      if (!list.contains(event.relatedTarget)) show(null);
+    function inLists(node) {
+      return lists.some(function (list) { return list.contains(node); });
+    }
+    lists.forEach(function (list) {
+      list.querySelectorAll(".snaprow").forEach(function (row) {
+        row.addEventListener("mouseenter", function () { show(row); });
+        row.addEventListener("focusin", function () { show(row); });
+        row.addEventListener("click", function () { show(current === row ? null : row); });
+      });
+      list.addEventListener("mouseleave", function () { show(null); });
+      list.addEventListener("focusout", function (event) {
+        if (!inLists(event.relatedTarget)) show(null);
+      });
     });
   }
 

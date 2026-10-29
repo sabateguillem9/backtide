@@ -919,6 +919,19 @@ def test_the_preview_says_where_you_would_go_back_to(tmp_path: Path) -> None:
     assert clocks == ["17:57:00", "17:30:00", "15:00:00", "12:00:00"]
     js = (STATIC / "web.js").read_text()
     assert "function previewSentence" in js and "data-template" in js
+    assert html.count('<ol class="snaplist">') == 4, "one list per group"
+    rows = js[js.index("function snapshotRows") : js.index("// -- the rewind (T12b)")]
+    assert 'querySelectorAll(".snaplist")' in rows, "every group's rows preview, not the first"
+    assert 'querySelector(".snaplist")' not in rows
+
+
+def test_no_task_number_reaches_the_page() -> None:
+    """Backlog numbers (T17, T12b...) are ours: the user never reads one."""
+    from backtide.web.i18n import EN, ES
+
+    for table in (ES, EN):
+        leaks = {key: text for key, text in table.items() if re.search(r"\bT\d{2}", text)}
+        assert not leaks, leaks
 
 
 def test_the_confirmation_tells_where_you_go_back_to_above_the_fixed_notice(tmp_path: Path) -> None:

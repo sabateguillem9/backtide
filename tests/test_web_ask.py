@@ -156,9 +156,9 @@ def test_today_starts_at_local_midnight(story) -> None:
     assert "Archivos: 2 creados" in text  # everything since 00:00 UTC, including old.txt
 
 
-def test_help_and_unknown_point_to_t15(story) -> None:
-    assert "T15" in ask("ayuda", story)
-    assert "T15" in ask("escríbeme un poema", story)
+def test_help_and_unknown_say_free_questions_come_later(story) -> None:
+    assert "llegarán más adelante" in ask("ayuda", story)
+    assert "llegarán más adelante" in ask("escríbeme un poema", story)
     assert "Eso todavía no lo sé responder." in ask("escríbeme un poema", story)
 
 
