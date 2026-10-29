@@ -38,7 +38,7 @@ Before you start:
 backtide's own brakes during this test:
 
 - **Only the listed models reach the provider.** The proxy refuses any call to another model. With OpenClaw, that means yours plus OpenClaw's small helper model.
-- **Spend cap.** The proxy prices every model response from the usage the provider reports. Defaults: $5 a day and $50 a month, editable in Settings. It warns you at 50, 80 and 100 %, and at the limit it rejects new calls without sending them. See the spend-cap design (internal note) (in Spanish).
+- **Spend cap.** The proxy prices every model response from the usage the provider reports. Defaults: $5 a day and $50 a month, editable in Settings. It warns you at 50, 80 and 100 %, and at the limit it rejects new calls without sending them. See [configuration](configuration.md).
 - **Request limits.** At most 20 requests per second and 100,000 per day.
 - **Reads to unknown sites** are limited to 256 KiB per site and 2 MiB in total per hour. After that they are held.
 
@@ -103,7 +103,7 @@ This sends one message and waits for the answer. It can take a while, and minute
 
 ### Telegram (optional)
 
-backtide can send its alerts and hold notices to your phone and let you approve or reject there. You need your own bot and the file `~/.config/backtide/telegram.toml` inside the VM (mode 600). How to create the bot is in 28-telegram.md (internal note) (in Spanish). `make probar` copies the file without reading or showing it.
+backtide can send its alerts and hold notices to your phone and let you approve or reject there. You need your own bot and the file `~/.config/backtide/telegram.toml` inside the VM (mode 600). How to create the bot is in [configuration](configuration.md#telegram). `make probar` copies the file without reading or showing it.
 
 Before you start, send `/start` to your bot from your Telegram chat. Telegram does not let a bot message you before you have talked to it first (the error appears as "chat not found" in terminal 1).
 
@@ -119,20 +119,20 @@ The same test with Claude Code in the cage instead of OpenClaw. The key still go
 2. Terminal 2: `make probar-web`, and paste the key in Settings.
 3. Give it code: `make probar-importar RUTA=/path/to/your/folder`. The folder must be one the VM can see (for example inside this repository). The copy goes to `/workspace/work/<name>` in the agent's folder. Symlinks are skipped, and the command tells you which. If the folder already exists there, it is left alone; `REEMPLAZAR=1` writes over it.
 
-   The import **leaves out anything that looks like a secret** and tells you what: files such as `.env*`, `.npmrc`, `.netrc`, private keys (`id_*`, `*.pem`, `*.key`), `.aws`, `.ssh` and `.gnupg` folders, a `.git/config` whose remote has a user and password or a token, and agent configuration files that hold something that may be a key. `SECRETOS=1` includes them, knowing the agent will be able to read them. It never imports your whole home folder or `~/.ssh`, `~/.aws`, `~/.config` or `~/.claude`. The full list of rules is in probar.md (internal note) (in Spanish).
+   The import **leaves out anything that looks like a secret** and tells you what: files such as `.env*`, `.npmrc`, `.netrc`, private keys (`id_*`, `*.pem`, `*.key`), `.aws`, `.ssh` and `.gnupg` folders, a `.git/config` whose remote has a user and password or a token, and agent configuration files that hold something that may be a key. `SECRETOS=1` includes them, knowing the agent will be able to read them. It never imports your whole home folder or `~/.ssh`, `~/.aws`, `~/.config` or `~/.claude`.
 
 4. Work with it:
    - `make probar-entrar` opens Claude Code in your terminal. Leave with `/exit`. When you leave, backtide resets your terminal and prints "Sesión del agente cerrada. Estás otra vez en tu terminal." The session has really ended only when `make` gives you your prompt back: the agent can print text that looks like backtide's. `CONTINUAR=1` continues the last conversation.
    - `make probar-tarea MSG="..."` runs one task without an interface and prints the answer. `CONTINUAR=1` continues the previous conversation.
 5. Get the code out: `make probar-exportar RUTA=/path/to/new/folder`. backtide takes a snapshot and copies the agent's work folder to a folder that must not exist yet (it never overwrites). It leaves out symlinks, every git repository and everything that starts with a dot (except a short list of harmless ones like `.gitignore`), because tools can run such files automatically when you open the folder (hooks, editor tasks, direnv). It tells you what it left out; `CONFIG=1` includes those files, and you should read each one before opening the folder. To get the commits: `make probar-exportar RUTA=/path/to/new/project.bundle GIT=project`. That produces a git *bundle* (a single file with the commits). Review it with `git log -p` before extracting.
 
-   **What was exported was written by the agent.** Do not run anything from it (git, make, npm, tests, an editor) without reviewing it. Export to a folder inside the VM and **outside the repository**, for example `RUTA=$HOME/exported`; backtide refuses a destination inside its own repository or a Python environment. The details of the exclusion rules are in probar.md (internal note) (in Spanish).
+   **What was exported was written by the agent.** Do not run anything from it (git, make, npm, tests, an editor) without reviewing it. Export to a folder inside the VM and **outside the repository**, for example `RUTA=$HOME/exported`; backtide refuses a destination inside its own repository or a Python environment.
 
 Everything is recorded in the black box: who opened a session or a task, what you imported and exported, and what the agent did. If you rewind with a session open, the session is cut; `CONTINUAR=1` resumes from the snapshot. What already left (an export, an approved push) does not come back. A `git push` from the cage is held by the gate.
 
 ## A local model (Ollama on your Mac)
 
-Both agents can think with a model on your own Mac through Ollama instead of Claude. No key, no cost, and what you tell the model does not leave your machine. The design is in 35-diseno-t20-modelo-local.md (internal note) (in Spanish).
+Both agents can think with a model on your own Mac through Ollama instead of Claude. No key, no cost, and what you tell the model does not leave your machine.
 
 The agent does not know where your Mac is. It calls `https://ollama.backtide.internal`, a name only the proxy understands, and the proxy forwards it to your Ollama, only on the model routes (never `/api/pull`, `/api/delete` or the account routes).
 
@@ -191,11 +191,10 @@ So in a real run, **the agent's commands are not recorded** (neither OpenClaw's 
 - "Inline API key ... temporarily disabled": OpenClaw stops using the key for a while (30 seconds to a few minutes) after the provider says it is invalid. Fix the key in Settings and wait.
 - Calls are rejected with "tope de gasto de backtide alcanzado": you reached the daily or monthly cap. Raise it in Settings if you want to continue; it applies from the next call.
 - The web link no longer works: `Ctrl-C` and run `make probar-web` again.
-- Always set the key from Settings. Writing `keys/anthropic.key` by hand is possible but fragile; see probar.md (internal note) (in Spanish) if you must.
+- Always set the key from Settings. Writing `keys/anthropic.key` by hand is possible but fragile.
 - More: [troubleshooting.md](troubleshooting.md).
 
 ## Where to go next
 
-- What the gate sees and what it cannot: 32-diseno-t10-puerta.md (internal note) (in Spanish), and [security-model.md](security-model.md).
+- What the gate sees and what it cannot: [security-model.md](security-model.md).
 - All commands: [cli-reference.md](cli-reference.md). All settings: [configuration.md](configuration.md).
-- The full source of this guide, with more detail: probar.md (internal note) (in Spanish).

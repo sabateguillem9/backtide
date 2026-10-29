@@ -40,7 +40,7 @@ No. `make demo` runs fixed commands and calls no model. `make probar` (the real 
 
 ### Why is the output in Spanish?
 
-The command line (`backtide`, the demo scripts) and many design documents are in Spanish for now. The web view has an English and a Spanish version, chosen from your browser's language; the EN and ES links in the page switch it. Design documents linked from this guide say "in Spanish" when they are.
+The command line (`backtide`, the demo scripts) is in Spanish for now. The web view has an English and a Spanish version, chosen from your browser's language; the EN and ES links in the page switch it.
 
 ### Why is the VM called `vigia-dev`?
 
@@ -169,6 +169,6 @@ The key must never go in a file you create, in a chat, or in a command. It goes 
 ## Still stuck?
 
 - Check `make vm-estado`, then `make vm-limpiar` if there are leftovers, then try again.
-- The step-by-step guides: [getting-started.md](getting-started.md) and [real-run.md](real-run.md). The long Spanish versions are demo.md (internal note) and probar.md (internal note).
+- The step-by-step guides: [getting-started.md](getting-started.md) and [real-run.md](real-run.md).
 - Open an issue and say what you ran and what you saw. Do not paste keys, tokens or the contents of the black box. For a security problem, follow [SECURITY.md](../../SECURITY.md) instead.
 - Contributing: [CONTRIBUTING.md](../../CONTRIBUTING.md).

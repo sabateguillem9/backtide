@@ -46,10 +46,10 @@ Developed and tested against OpenClaw, on Linux with Docker and Btrfs.
 Two consequences of that table:
 
 - The agent reaches the internet only through the proxy. Everything it sends is recorded first. By default reads to any host pass and writes to hosts you have not allowed are held; in the strict mode only the hosts you allow (its model provider by default) are reachable.
-- The gate decides by what a request *does*, not only where it goes. A read passes (it is recorded first). A write or a send to anything else is held, with a short sentence saying what it would do. What the gate cannot see is listed in the design (internal note), section 13: a read can still carry some data in its URL (capped by a budget per host), and a request to the model provider carries the whole conversation.
+- The gate decides by what a request *does*, not only where it goes. A read passes (it is recorded first). A write or a send to anything else is held, with a short sentence saying what it would do. What the gate cannot see is in the [security model](docs/guide/security-model.md): a read can still carry some data in its URL (capped by a budget per host), and a request to the model provider carries the whole conversation.
 - backtide can restore the agent's folder; it cannot take back an email, a payment or a deleted cloud database that was approved or that left through a hole the gate does not cover.
 
-Start with the [documentation guide](docs/guide/README.md). Most design documents are written in Spanish. The task list and the working setup are kept in the project's private repository.
+Start with the [documentation guide](docs/guide/README.md). The task list, the design document of each task and the working setup are kept in the project's private repository.
 
 ## Security model
 
@@ -105,7 +105,7 @@ make demo-rebobinar # rewind to the good snapshot
 make demo-parar     # stop everything and clean up
 ```
 
-The step-by-step script is in docs/demo.md (internal note), in Spanish.
+The step-by-step walk-through is in [getting started](docs/guide/getting-started.md).
 
 **Web view**
 
@@ -118,7 +118,7 @@ Both print a one-time link. Open it in your browser. `make web-demo` uses invent
 
 **Real run: OpenClaw thinking with Claude (hands-on test)**
 
-`make probar` starts the same cage with the real OpenClaw talking to Claude through the proxy, the gate and Telegram. It costs money (your Anthropic account pays for the model calls) and needs a key with a spending limit. Read docs/probar.md (internal note) first, in Spanish. The key goes in the web's Settings page (`make probar-web`), never in a file or a chat, and the agent only ever sees a fake one.
+`make probar` starts the same cage with the real OpenClaw talking to Claude through the proxy, the gate and Telegram. It costs money (your Anthropic account pays for the model calls) and needs a key with a spending limit. Read the [real run guide](docs/guide/real-run.md) first. The key goes in the web's Settings page (`make probar-web`), never in a file or a chat, and the agent only ever sees a fake one.
 
 The demo scripts use `sudo` inside the VM for a few fixed commands (mount, chown, umount, quota limit). They live in `scripts/demo/` and are never part of the product code.
 
@@ -156,7 +156,7 @@ The closest project to backtide is [nono](https://nono.sh) (Apache-2.0, by the S
 
 backtide makes a different trade-off. Where nono reduces an agent's authority from *inside its own process tree and user*, backtide records it *from the outside*: the agent runs in a hardened container with no direct egress, while a separate, higher-privileged service watches every process and connection from the kernel (eBPF/Tetragon), records each command, file, network call and model request into an append-only, hash-chained black box the agent can never reach, and snapshots the whole workspace every two minutes so you can rewind — and un-rewind — to any point. Holding back irreversible or outbound actions *by their content* until you approve them from your phone is the gate, now built and tested (see [What works today](#what-works-today) for what is and is not tried with a real bot).
 
-nono is the better fit for "give a coding agent least privilege on my laptop"; backtide is built for "record everything from outside, hold back what's irreversible, and rewind." They compose: you can run backtide's container with nono inside it. A hands-on comparison (in Spanish) is in docs/31 (internal note).
+nono is the better fit for "give a coding agent least privilege on my laptop"; backtide is built for "record everything from outside, hold back what's irreversible, and rewind." They compose: you can run backtide's container with nono inside it.
 
 ## Contributing and reporting problems
 

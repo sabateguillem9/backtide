@@ -6,14 +6,14 @@ VM_SH := limactl shell --workdir "$(CURDIR)" $(VM) -- sh -c
 # Inside the VM, the Linux virtualenv lives outside the shared folder (the Mac uses .venv).
 # Recursive (=) on purpose: $$HOME must reach the VM's shell unexpanded.
 UV_VM = UV_PROJECT_ENVIRONMENT="$$HOME/.venvs/vigia" uv run --locked
-# The recordable demo (docs/demo.md): scripts/demo/demo.py, inside the VM.
+# The recordable demo (docs/guide/getting-started.md): scripts/demo/demo.py, inside the VM.
 DEMO_VM = $(UV_VM) python -m scripts.demo.demo
 
-# The web of the demo (docs/demo.md): in the VM, on the config that `make demo` writes. A port
+# The web of the demo (docs/guide/getting-started.md): in the VM, on the config that `make demo` writes. A port
 # apart from the Mac's own `make web-demo`, so both can be open at once (Lima forwards the VM's).
 DEMO_WEB_CONFIG = $$HOME/backtide-demo-run/backtide.toml
 DEMO_WEB_PORT = 8766
-# The founder's hands-on test (docs/probar.md): the real OpenClaw thinking with Claude. It lives
+# The founder's hands-on test (docs/guide/real-run.md): the real OpenClaw thinking with Claude. It lives
 # where the demo lives (same folder, config path and web port), so the two never run together.
 PROBAR_VM = $(UV_VM) python -m scripts.demo.probar
 MODEL ?= claude-sonnet-5-5
@@ -48,7 +48,7 @@ ataques: ## Evil-agent battery inside the VM (PERFIL=claude-code for Claude Code
 	@case "$(PERFIL)" in ""|openclaw|claude-code) ;; *) echo "PERFIL es openclaw o claude-code" >&2; exit 2;; esac
 	$(VM_SH) 'BACKTIDE_ATK_PERFIL=$(or $(PERFIL),openclaw) $(UV_VM) pytest -m ataques -q --tb=short $(ATK_PATH) $(ATK)'
 
-demo: ## Demo: volume + `backtide vigilar` in front (terminal 1; docs/demo.md)
+demo: ## Demo: volume + `backtide vigilar` in front (terminal 1; docs/guide/getting-started.md)
 	$(VM_SH) '$(DEMO_VM) up'
 
 demo-crear: ## Demo: the agent creates some files
@@ -70,20 +70,20 @@ demo-rebobinar: ## Demo: rewind (ID=<snapshot>, default the one demo-crear left;
 demo-parar: ## Demo: stop everything, unmount and delete the demo volume (also the old vigia-demo-* names)
 	$(VM_SH) '$(DEMO_VM) parar'
 
-demo-web: ## Demo: the web of the running demo, in the VM (open the link on the Mac; docs/demo.md)
+demo-web: ## Demo: the web of the running demo, in the VM (open the link on the Mac; docs/guide/getting-started.md)
 	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
 	@if lsof -nP -iTCP:$(DEMO_WEB_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
 	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay demo en marcha: lanza antes make demo (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --rebobinar --aprobar'
 
-probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5; PERFIL=claude-code para Claude Code; LOCAL=<modelo de tu Ollama> en vez de Claude), en primer plano (terminal 1; docs/probar.md)
+probar: ## Prueba real: OpenClaw con Claude (MODEL=..., por defecto claude-sonnet-5-5; PERFIL=claude-code para Claude Code; LOCAL=<modelo de tu Ollama> en vez de Claude), en primer plano (terminal 1; docs/guide/real-run.md)
 	@case "$(MODEL)" in ""|*[!0-9A-Za-z._:/@+-]*) echo "MODEL tiene caracteres raros" >&2; exit 2;; esac
 	@case "$(LOCAL)" in *[!0-9A-Za-z._:/@+-]*) echo "LOCAL tiene caracteres raros" >&2; exit 2;; esac
 	@case "$(FALSO)" in ""|1) ;; *) echo "FALSO solo puede valer 1" >&2; exit 2;; esac
 	@case "$(PERFIL)" in ""|openclaw|claude-code) ;; *) echo "PERFIL es openclaw o claude-code" >&2; exit 2;; esac
 	$(VM_SH) '$(PROBAR_VM) up --modelo $(MODEL) $(if $(FALSO),--internet-falso) $(if $(PERFIL),--perfil $(PERFIL)) $(if $(LOCAL),--local $(LOCAL))'
 
-probar-web: ## Prueba real: la web con Ajustes, aprobar y rebobinar (abre el enlace en el Mac; docs/probar.md)
+probar-web: ## Prueba real: la web con Ajustes, aprobar y rebobinar (abre el enlace en el Mac; docs/guide/real-run.md)
 	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
 	@if lsof -nP -iTCP:$(DEMO_WEB_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
@@ -125,7 +125,7 @@ probar-rebobinar: ## Prueba real: rebobina (ID=<instantánea>; SI=1 salta la pre
 probar-parar: ## Prueba real: para todo, desmonta y borra el volumen (y la clave que pusiste en Ajustes)
 	$(VM_SH) '$(DEMO_VM) parar'
 
-web-demo: ## Web demo on the Mac, no VM: made-up black box and snapshots + the web; Ctrl-C stops (docs/demo.md)
+web-demo: ## Web demo on the Mac, no VM: made-up black box and snapshots + the web; Ctrl-C stops (docs/guide/getting-started.md)
 	@dir=$$(mktemp -d "$${TMPDIR:-/tmp}/backtide-web-demo.XXXXXX") || exit 1; \
 	seeder=; trap 'kill $$seeder 2>/dev/null; rm -rf "$$dir"' EXIT INT TERM; \
 	uv run python scripts/web-demo/seed.py "$$dir" --live >/dev/null & seeder=$$!; \

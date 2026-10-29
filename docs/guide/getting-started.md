@@ -141,7 +141,7 @@ You need two terminals, both in the repository folder. Output from backtide is i
 
 ### Optional: Telegram alerts
 
-If the VM has a file `~/.config/backtide/telegram.toml` (mode 600) with your own bot's token and chat id, `make demo` copies it to its state folder and alerts reach your phone. Without it the demo works the same, with no Telegram. How to create the bot is in 28-telegram.md (internal note) (in Spanish). The held-request buttons do not appear in this demo, because the agent sends nothing out; you can see them in the [real run](real-run.md).
+If the VM has a file `~/.config/backtide/telegram.toml` (mode 600) with your own bot's token and chat id, `make demo` copies it to its state folder and alerts reach your phone. Without it the demo works the same, with no Telegram. How to create the bot is in [configuration](configuration.md#telegram). The held-request buttons do not appear in this demo, because the agent sends nothing out; you can see them in the [real run](real-run.md).
 
 ## 5. The web view
 
@@ -196,7 +196,6 @@ Things to know about the link:
 
 - If something fails: [troubleshooting.md](troubleshooting.md).
 - How the pieces fit together: [how-it-works.md](how-it-works.md), and what the security model promises: [security-model.md](security-model.md).
-- The same demo with every talking point, in Spanish: demo.md (internal note).
 - A test with a real agent and a real model: [real-run.md](real-run.md).
 - All commands: [cli-reference.md](cli-reference.md). Settings: [configuration.md](configuration.md).
 - Contributing: [CONTRIBUTING.md](../../CONTRIBUTING.md).

@@ -1,6 +1,6 @@
 # How backtide was built
 
-This page says who did what, how the work was organised, and what that means for how far you should trust the result. The git history and the design documents are in this repository; most of the documents are in Spanish. The working setup (the agents, the skills, the backlog, the development log and the decision record) stays in the project's private repository, so the references to it below are marked *(internal note)* in the public copy.
+This page says who did what, how the work was organised, and what that means for how far you should trust the result. The code, its tests and the git history are in this repository. The working setup (the agents, the skills, the backlog, the development log, the decision record) and the design document of each task, mostly in Spanish, stay in the project's private repository, so the references to it below are marked *(internal note)* in the public copy.
 
 ## A word from the founder
 
@@ -125,7 +125,7 @@ First drafts had real bugs, including serious ones. A few that the reviews caugh
 - **The reviewer is an AI too.** The code, the tests and the reviews come from the same family of models. They may share blind spots, and a bug that the author did not imagine may not occur to the reviewer either. The sensor's passwords in clear show this: several review passes missed them.
 - **Tests written by the same team.** A green test means the code does what the team thought of testing. The VM tests and the attack battery are not in CI, so their results come from the runs recorded in the documents. Some tests have been flaky at times, and the log says so.
 - **Experimental and pre-alpha.** Developed and tested on one machine, in one Fedora VM, against OpenClaw and fake servers. The installer and most real-world use (T13, T16) do not exist yet.
-- **Known limits of the threat model.** What the gate cannot stop is listed in 32, section 13 (internal note): data hidden in reads, what goes to the model provider, WebSockets, anything a translator misreads as a read. What backtide does not protect against at all, such as a container escape, a compromised host or anything already sent, is in the [README](../README.md#security-model) and in [SECURITY.md](../SECURITY.md).
+- **Known limits of the threat model.** What the gate cannot stop is listed in the [security model](guide/security-model.md): data hidden in reads, what goes to the model provider, WebSockets, anything a translator misreads as a read. What backtide does not protect against at all, such as a container escape, a compromised host or anything already sent, is in the [README](../README.md#security-model) and in [SECURITY.md](../SECURITY.md).
 
 ## 6. Numbers
 

@@ -31,7 +31,7 @@ Attack tests behave like a hostile agent: they delete data, fill disks, follow s
 - Small modules and clear functions. No abstractions before they are needed.
 - No silent exceptions on the security path. If something fails, record it and alert.
 - Do not add a dependency without discussing it first.
-- Code, comments, identifiers and commit messages are in English. The command line and many design documents in `docs/` are currently in Spanish.
+- Code, comments, identifiers and commit messages are in English. The command line is currently in Spanish.
 - Never commit secrets. Test fixtures use obvious fake values.
 
 ## Pull requests

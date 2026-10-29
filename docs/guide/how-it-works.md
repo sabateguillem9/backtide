@@ -96,8 +96,6 @@ Cutting off the **end** of the chain would not break it, because nothing comes a
 
 What this does **not** do is stop someone who owns the host and has the key. They could rewrite the database and the checkpoint together. The black box makes tampering **detectable** against the agent and against people without the key. It does not make it impossible. A copy of the checkpoint outside the machine (for example in Telegram) was planned but is not built. See [known limits](security-model.md#honest-limits).
 
-Design: docs/11 (internal note) (in Spanish).
-
 ## Snapshots and rewind
 
 backtide uses **Btrfs**, a Linux file system, to photograph the agent's working folder. Btrfs works by **copy-on-write**: when you take a snapshot, it does not copy any data. It just remembers the current state. When a file is changed later, Btrfs writes the new version to a new place and leaves the old one where it was, so both versions exist. That makes a snapshot almost instant and almost free.
@@ -124,8 +122,6 @@ Two honest limits. Snapshots are **crash-consistent**: they capture the files as
 
 The agent also has a **disk quota** on its folder (Btrfs "simple quotas") so it cannot fill the volume. The quota follows the folder across rewinds. If free space still runs low, the service freezes the agent (`docker pause`) and tells you. Resume with `backtide seguir` when there is room.
 
-Design: docs/10 (internal note) and docs/19 (internal note) (in Spanish).
-
 ## The cage
 
 The agent runs in a container built with these settings, all of which are in `backtide/jail/config.py`:
@@ -141,8 +137,6 @@ The agent runs in a container built with these settings, all of which are in `ba
 backtide does not trust that the container is what it asked for. Before every start, it compares the existing container with the expected settings, field by field, and refuses any difference (for example a leftover container with an extra mount). While the service runs, it checks again every cycle and kills a container that shows something it must not.
 
 The cage is not a virtual machine. The agent shares the host's kernel. See [honest limits](security-model.md#honest-limits).
-
-Design: docs/13 (internal note) and docs/16 (internal note) (in Spanish).
 
 ## The proxy and the fake key
 
@@ -161,8 +155,6 @@ The proxy applies fixed rules before it even asks the service: only ports 80 and
 
 The proxy also counts how much each model call costs. See [the spend cap](#the-spend-cap).
 
-Design: docs/21 (internal note) (in Spanish).
-
 ## The sensor
 
 The **sensor** sees what the agent does from below, at the level of the kernel. It uses **eBPF**: a Linux feature that lets small, checked programs run inside the kernel at chosen points (for example "when any program starts" or "when any program opens a connection"), and report what happened. Because it runs in the kernel, the agent cannot turn it off or hide from it by changing its own files. **Tetragon** is the tool that loads the eBPF programs and writes the events.
@@ -178,8 +170,6 @@ Two more watchers complete the picture:
 
 By default the agent keeps running if the sensor goes down (with a warning). With `[sensor] required = true` in the configuration, the service stops the agent whenever the sensor is blind.
 
-Design: docs/23 (internal note) (in Spanish).
-
 ## Risk levels
 
 Every event gets a risk level from 0 to 3 **before** it is recorded, from a list of rules:
@@ -194,8 +184,6 @@ Every event gets a risk level from 0 to 3 **before** it is recorded, from a list
 Examples of the default rules: deleting 20 files in a minute is level 2, deleting 100 is level 3, and rewriting 300 files in a minute is level 2. The rules use simple patterns (globs, not regular expressions) on purpose, because the agent chooses the file names and commands the rules read, and a badly written regular expression could be made to hang the watcher.
 
 Rules only raise a level, never lower it. If a rule fails, the event is recorded anyway with level 2 at least. The default rules are in `backtide/analyzer/default_rules.toml`. You can replace them with your own file in backtide's state folder.
-
-Design: docs/27 (internal note) (in Spanish).
 
 ## The approval gate
 
@@ -219,15 +207,11 @@ When something is held:
 
 To cut down the number of questions, you can approve a **batch** ("everything to this recipient this session", "sends of this kind for 1 hour") or mark a recipient as **trusted**. Batches are never offered for deletions, forwards, risk 3, or anything that carried a secret. A pause or a rewind ends them all. Anything the service forgets on a restart is forgotten in the safe direction: open holds are expired, not approved.
 
-Design: docs/32 (internal note) (in Spanish), which also lists what the gate cannot see.
-
 ## The spend cap
 
 Model calls cost money, and an agent in a loop can spend a lot. The proxy prices each model response from the provider's own usage report, and the service keeps the totals for the day and the month. A call that would go over the limit is refused **before** it reaches the provider. The defaults are $5 a day and $50 a month, which you can change on the Settings page. You get notices at 50 %, 80 % and 100 %.
 
 What the service cannot measure, it charges high: a stream cut short is charged its whole `max_tokens`, and a call that never got an answer is charged its estimate. So the cap errs on the side of stopping early. It is still an estimate and **not your provider's bill**. Keep a spending limit in your provider's console as well.
-
-Design: docs/24 (internal note) and docs/33 (internal note) (in Spanish).
 
 ## Telegram and the web
 
@@ -236,8 +220,6 @@ Two ways to look at backtide and act on it. Both talk to the service through its
 **Telegram.** The service runs a Telegram bot. It sends you alerts with **Pause** and **Rewind** buttons, held-request notices with **Approve / Reject / View**, and answers `/pausar`, `/seguir`, `/estado`, `/retenidas` and `/lotes`. Only one private chat, yours, is obeyed. Groups, other people and forwarded messages are ignored (and recorded as `telegram_ignored`). The bot polls Telegram, so no port is opened to the internet. The bot's token lives in backtide's state folder, never in the agent's container. Use a bot made only for backtide. Status: the bot is tested against a fake Telegram API. With a real bot, only the notice of a held request has been seen arriving so far; `/estado`, `/pausar`, `/seguir` and approving from the phone have not yet been tried by hand.
 
 **The web.** `backtide web` serves a page on `127.0.0.1` (your own machine only). It shows a live feed, the history with filters, snapshots, and held requests. It prints a one-time link; the first visit trades it for a session cookie. By default it **only reads**. Rewind, approve/reject and the Settings page each need their own flag (`--rebobinar`, `--aprobar`, `--ajustes`), and each action asks for a confirmation first. The web never holds the black box's key, so it cannot verify or forge anything.
-
-Design: docs/28 (internal note) (in Spanish).
 
 ## Where the code lives
 
@@ -254,7 +236,7 @@ Design: docs/28 (internal note) (in Spanish).
 | `web` | The web page |
 | `cli` | The `backtide` command |
 
-Other agents than OpenClaw are described in docs/34 (internal note) (in Spanish); a Claude Code profile exists and has its own attack scenarios, but OpenClaw is the agent the project is tested against most.
+Besides OpenClaw, a Claude Code profile exists and has its own attack scenarios, but OpenClaw is the agent the project is tested against most.
 
 ## Where to go next
 

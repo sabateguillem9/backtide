@@ -526,7 +526,7 @@ def _config(paths: Paths) -> ServiceConfig:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="probar", description="La prueba de backtide (docs/probar.md)."
+        prog="probar", description="La prueba de backtide (docs/guide/real-run.md)."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     up = commands.add_parser("up", help="prepara todo y arranca el servicio en primer plano")

@@ -737,7 +737,9 @@ def feed_black_box(paths: Paths, stop: threading.Event, show: Any = None) -> Non
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="demo", description="La demo de backtide (docs/demo.md).")
+    parser = argparse.ArgumentParser(
+        prog="demo", description="La demo de backtide (docs/guide/getting-started.md)."
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("up", help="prepara el volumen y arranca el servicio en primer plano")
     commands.add_parser("crear", help="el agente crea archivos de trabajo")

@@ -146,7 +146,7 @@ local = "http://host.lima.internal:11434"
 models = ["qwen3-coder"]
 ```
 
-Claude Code and local-model support exist in the code and have tests and attack scenarios in the VM. They have had less hands-on use than the OpenClaw path. Design notes: docs/34 (internal note) and docs/35 (internal note), both in Spanish.
+Claude Code and local-model support exist in the code and have tests and attack scenarios in the VM. They have had less hands-on use than the OpenClaw path.
 
 ## `[proxy]`: the only way out
 
@@ -203,7 +203,7 @@ The real key is **not** here. Put it in `<state_dir>/keys/anthropic.key` (mode `
 
 ## `[gate]`: what is held, and for how long
 
-The **gate** is the part of the proxy that decides by what a request *does*. A read passes (after being recorded). A write or a send goes to a **hold**: it waits for you to approve it. If you do not answer, it is rejected. Full design: docs/32 (internal note) (in Spanish).
+The **gate** is the part of the proxy that decides by what a request *does*. A read passes (after being recorded). A write or a send goes to a **hold**: it waits for you to approve it. If you do not answer, it is rejected. What it cannot see: [security model](security-model.md).
 
 | Key | Default | Range | Effect |
 |---|---|---|---|
@@ -337,7 +337,7 @@ target = [".ssh/*", "*/.ssh/*"]
 
 ## Telegram
 
-Telegram gives you alerts with **Pause** and **Rewind** buttons, `/pausar`, `/seguir`, `/estado`, and approval of held requests with `/retenidas` and `/lotes`. Design and safety rules: docs/28 (internal note) (in Spanish).
+Telegram gives you alerts with **Pause** and **Rewind** buttons, `/pausar`, `/seguir`, `/estado`, and approval of held requests with `/retenidas` and `/lotes`.
 
 The bot is configured by a single file, `<state_dir>/telegram.toml`, mode `600`, not in `backtide.toml`:
 
@@ -504,4 +504,4 @@ auto_prices = true
 required = false
 ```
 
-Before starting `backtide vigilar` with it, create the state folder (`chmod 700`), put `gateway.token` in it (for OpenClaw), and set the Anthropic key from the Settings page. The ready-made way to see a working config is to run `make probar` and read the file it writes, `~/backtide-demo-run/backtide.toml`, in the VM. The step-by-step guide is [real run](real-run.md) (in Spanish: docs/probar.md (internal note)).
+Before starting `backtide vigilar` with it, create the state folder (`chmod 700`), put `gateway.token` in it (for OpenClaw), and set the Anthropic key from the Settings page. The ready-made way to see a working config is to run `make probar` and read the file it writes, `~/backtide-demo-run/backtide.toml`, in the VM. The step-by-step guide is [real run](real-run.md).
