@@ -1,3 +1,4 @@
+{% from "icons.html" import ic %}
 {# The Settings page (T12e): what is set, never a key. A row shows "set, ends in …XXXX, changed
    on …" (the last four characters at most, and only what backtide.web.settings checked) or "not
    set". Changing or removing goes through a confirmation page of its own (settings_step.html).
@@ -14,10 +15,10 @@
 <main class="settings">
   <h1>{{ t('settings.title') }}</h1>
   <p class="lede">{{ t('settings.lede') }}</p>
-  {% if not ready %}<p class="settings-off" data-state="{{ state }}"><span class="setting-dot" aria-hidden="true"></span><span>{{ t.code('settings.off.' ~ state) }}</span></p>{% endif %}
-  {% for group, kinds in (('models', ('anthropic', 'openai')), ('alerts', ('telegram',))) %}
+  {% if not ready %}<div class="notice notice--info settings-off" role="note" data-state="{{ state }}">{{ ic('info') }}<p class="notice__text">{{ t.code('settings.off.' ~ state) }}</p></div>{% endif %}
+  {% for group, kinds, icon in (('models', ('anthropic', 'openai'), 'key'), ('alerts', ('telegram',), 'bell')) %}
   <section class="settings-group" aria-labelledby="settings-{{ group }}">
-    <h2 class="section-title" id="settings-{{ group }}">{{ t('settings.group.' ~ group) }}</h2>
+    <h2 class="section-title" id="settings-{{ group }}">{{ ic(icon, 'ic--m') }}{{ t('settings.group.' ~ group) }}</h2>
     <p class="note">{{ t('settings.group.' ~ group ~ '.note') }}</p>
     <ul class="settings-list">
       {% for row in rows if row.kind in kinds %}
@@ -44,7 +45,7 @@
   {# The spending cap (T11): today's and this month's spending against their caps, the date of
      the prices, and "Cambiar" (with --ajustes). Read from the service, never from a file. #}
   <section class="settings-group" aria-labelledby="settings-spend">
-    <h2 class="section-title" id="settings-spend">{{ t('settings.group.spend') }}</h2>
+    <h2 class="section-title" id="settings-spend">{{ ic('scale', 'ic--m') }}{{ t('settings.group.spend') }}</h2>
     <p class="note">{{ t('settings.group.spend.note') }}</p>
     <ul class="settings-list">
       <li class="setting {{ 'is-problem' if spend and (spend.blocked or not spend.available) else ('is-set' if spend else 'is-unknown') }}" data-kind="tope">

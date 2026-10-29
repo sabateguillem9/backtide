@@ -389,15 +389,22 @@ def test_htmx_and_the_font_are_served_by_us(client: TestClient) -> None:
     for path, kind in (
         ("/static/vendor/htmx.min.js", "javascript"),
         ("/static/vendor/htmx-sse.js", "javascript"),
-        ("/static/fonts/jost-latin.woff2", "font"),
+        ("/static/fonts/lora-latin.woff2", "font"),
+        ("/static/fonts/dm-sans-latin.woff2", "font"),
+        ("/static/fonts/fonts.css", "css"),
         ("/static/web.css", "css"),
     ):
         response = client.get(path)
         assert response.status_code == 200, path
         assert kind in response.headers["content-type"], path
-    css = client.get("/static/web.css").text
-    assert not re.search(r"url\((?!\"?fonts/)", css), "the CSS loads only our own fonts"
-    assert "googleapis" not in css
+    for sheet in ("web.css", "tokens.css", "motion/motion.css"):
+        css = client.get(f"/static/{sheet}").text
+        assert "url(" not in css, f"{sheet} loads nothing"
+    fonts = client.get("/static/fonts/fonts.css").text
+    assert re.findall(r"url\(([^)]*)\)", fonts), "fonts.css names its fonts"
+    for target in re.findall(r"url\(([^)]*)\)", fonts):
+        assert re.fullmatch(r'"[a-z-]+\.woff2"', target), f"fonts.css loads only ours: {target}"
+    assert "googleapis" not in fonts
 
 
 def test_static_files_cannot_be_escaped(client: TestClient) -> None:

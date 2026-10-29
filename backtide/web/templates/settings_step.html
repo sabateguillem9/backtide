@@ -1,3 +1,4 @@
+{% from "icons.html" import ic %}
 {# One step of a change of the Settings page (T12e): its confirmation (a form with a one-time
    ticket), its result, or why not now. Plain forms, no JavaScript needed: the POST is a normal
    navigation, which carries our Origin (Referrer-Policy: same-origin). The key is typed into a
@@ -38,7 +39,7 @@
       <label class="setting-check"><input type="checkbox" name="confirmo" value="si" required> <span>{{ say('settings.confirm.box', row.kind, tail=row.tail) if row.tail else say('settings.confirm.box.plain', row.kind) }}</span></label>
       {% endif %}
       <div class="settings-actions">
-        <button class="settings-yes" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('settings.confirm.save') }}</span></button>
+        <button class="settings-yes" type="submit"><span>{{ t('settings.confirm.save') }}</span>{% include "arrow.html" %}</button>
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>
@@ -61,7 +62,7 @@
         <p class="setting-hint" id="setting-cap-hint">{{ t('settings.hint.cap') }}</p>
       </div>
       <div class="settings-actions">
-        <button class="settings-yes" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('settings.confirm.save') }}</span></button>
+        <button class="settings-yes" type="submit"><span>{{ t('settings.confirm.save') }}</span>{% include "arrow.html" %}</button>
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>
@@ -80,7 +81,7 @@
       <input type="hidden" name="accion" value="set">
       <input type="hidden" name="huella" value="{{ spend.pending_digest }}">
       <div class="settings-actions">
-        <button class="settings-yes" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('settings.prices.accept') }}</span></button>
+        <button class="settings-yes" type="submit"><span>{{ t('settings.prices.accept') }}</span>{% include "arrow.html" %}</button>
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>
@@ -91,7 +92,7 @@
     {% if consequence == 'unused' %}
     <p class="note">{{ t('settings.confirm.clear.unused') }}</p>
     {% else %}
-    <p class="settings-warning"><span class="dot dot-{{ 2 if consequence == 'in_use' else 1 }}" aria-hidden="true"></span><span>{{ t.code('settings.confirm.clear.' ~ consequence) }}</span></p>
+    <p class="settings-warning">{{ ic('warning') }}<span>{{ t.code('settings.confirm.clear.' ~ consequence) }}</span></p>
     {% endif %}
     <form class="settings-form" method="post" action="{{ base }}/ajustes/guardar">
       <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -99,7 +100,7 @@
       <input type="hidden" name="tipo" value="{{ row.kind }}">
       <input type="hidden" name="accion" value="clear">
       <div class="settings-actions">
-        <button class="settings-yes is-remove" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ say('settings.confirm.remove', row.kind) }}</span></button>
+        <button class="settings-yes is-remove" type="submit"><span>{{ say('settings.confirm.remove', row.kind) }}</span></button>
         <a class="settings-cancel" href="{{ base }}/ajustes">{{ t('settings.confirm.no') }}</a>
       </div>
     </form>

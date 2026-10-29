@@ -12,9 +12,9 @@
   var root = document.documentElement;
   var SVG = "http://www.w3.org/2000/svg";
   var reduce = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
-  var EASE_ARRIVE = "cubic-bezier(0.33, 1, 0.68, 1)";
-  var EASE_TRAVEL = "cubic-bezier(0.37, 0, 0.63, 1)";
-  var EASE_FALL = "cubic-bezier(0.32, 0, 0.67, 0)";
+  // The design system's curves (tokens.json, motion): ease to arrive, ease-drop to come down.
+  var EASE_ARRIVE = "cubic-bezier(.22, 1, .36, 1)";
+  var EASE_FALL = "cubic-bezier(.3, .7, .3, 1)";
 
   function moving() {
     return !(reduce && reduce.matches) && typeof Element.prototype.animate === "function";
@@ -31,14 +31,8 @@
     return isNaN(ms) ? null : ms;
   }
 
-  // A page transition the browser skips (a fast second click) is not an error worth a console line.
-  window.addEventListener("pagereveal", function (event) {
-    var transition = event.viewTransition;
-    if (!transition) return;
-    ["ready", "finished", "updateCallbackDone"].forEach(function (name) {
-      if (transition[name] && transition[name].catch) transition[name].catch(function () {});
-    });
-  });
+  // A page transition the browser skips is quieted in theme.js, which runs before the first
+  // paint: pagereveal fires before this deferred file runs.
 
   // -- a hidden tab rests ---------------------------------------------------------------------
 
@@ -166,7 +160,8 @@
     go.onfinish = function () { ring.remove(); };
   }
 
-  // Something happened: the dot hops (its hops are the agent's activity) and the sea swells.
+  // Something happened: the dot hops once (its hops are the agent's activity). The line itself
+  // never moves (design system v2, Timeline: "the line is the record").
   var hopping = null;
   function stir() {
     if (!tide || !moving() || document.hidden) return;
@@ -181,16 +176,10 @@
       );
       hopping.onfinish = function () { hopping = null; };
     }
-    var swell = frame.querySelector(".tide-swell");
-    if (swell && !(swell.getAnimations && swell.getAnimations().length)) {
-      swell.animate(
-        [{ transform: "scale(1, 1)" }, { transform: "scale(1, 1.6)" }, { transform: "scale(1, 1)" }],
-        { duration: 1800, easing: EASE_TRAVEL }
-      );
-    }
   }
 
-  // The heartbeat: calm while the agent works, still when it rests, quicker after a risk 3.
+  // The live dot: it breathes while the agent works, still when it rests, and pulses after a
+  // risk 3 (web.css). The only loop of the page, paused with the tab hidden.
   var lastMove = 0;
   var alertUntil = 0;
   var heartTimer = 0;
@@ -528,9 +517,9 @@
   document.body.addEventListener("htmx:sendError", failed);
 
   // -- light and dark ---------------------------------------------------------------------------
-  // The page follows the system (web.css) until the person flips the switch; the choice is kept
-  // in local storage (theme.js applies it before the page paints). Flipping back to what the
-  // system says forgets the choice, so the page follows the system again.
+  // The page follows the system (data-theme="auto", tokens.css) until the person flips the
+  // switch; the choice is kept in local storage (theme.js applies it before the page paints).
+  // Flipping back to what the system says forgets the choice: the page is "auto" again.
 
   var themeSwitch = document.querySelector(".theme-switch");
   var darkQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -559,7 +548,7 @@
     themeSwitch.addEventListener("click", function () {
       var next = shownTheme() === "dark" ? "light" : "dark";
       if (next === systemTheme()) {
-        root.removeAttribute("data-theme");
+        root.setAttribute("data-theme", "auto");
         remember(null);
       } else {
         root.setAttribute("data-theme", next);

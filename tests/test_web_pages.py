@@ -403,19 +403,19 @@ def test_a_reason_this_version_does_not_know_is_shown_escaped(tmp_path: Path) ->
 
 def test_the_language_follows_the_browser_and_the_switch_remembers_it(web: TestClient) -> None:
     english = web.get("/ahora", headers={"accept-language": "en-GB,en;q=0.9"}).text
-    assert '<html lang="en">' in english and "The agent started" in english
+    assert '<html lang="en" ' in english and "The agent started" in english
     assert "History" in english and "Only on this computer" in english
     switched = web.get("/ahora?lang=en")
-    assert '<html lang="en">' in switched.text
+    assert '<html lang="en" ' in switched.text
     cookie = switched.headers["set-cookie"]
     assert "backtide_lang=en" in cookie and "HttpOnly" in cookie and "SameSite=strict" in cookie
-    assert '<html lang="en">' in web.get("/historia").text  # remembered
-    assert '<html lang="es">' in web.get("/historia?lang=es").text
+    assert '<html lang="en" ' in web.get("/historia").text  # remembered
+    assert '<html lang="es" ' in web.get("/historia?lang=es").text
 
 
 def test_a_made_up_language_is_ignored(web: TestClient) -> None:
     response = web.get("/ahora?lang=xx<script>")
-    assert '<html lang="es">' in response.text and "set-cookie" not in response.headers
+    assert '<html lang="es" ' in response.text and "set-cookie" not in response.headers
 
 
 def test_the_switch_links_keep_the_filters(web: TestClient) -> None:

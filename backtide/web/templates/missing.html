@@ -1,7 +1,9 @@
 {% extends "base.html" %}
+{% from "icons.html" import ic %}
 {% block title %}{{ t('notfound.title') }}{% endblock %}
 {% block main %}
-<main class="watch">
+<main class="watch gate-page ic-host">
+  {{ ic('still', 'ic--l') }}
   <h1>{{ t('notfound.title') }}</h1>
   <p class="lede">{{ t('notfound.body') }}</p>
 </main>

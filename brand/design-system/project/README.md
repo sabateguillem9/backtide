@@ -1,6 +1,6 @@
 # backtide · design system
 
-The one source of style for everything backtide shows: the public site (`site/`, backtide labs) and the product web (`backtide web`). Decided on 2026-10-28 (D31), from the approved proposal `brand/propuestas-labs/c2-limpia/`. The first system (white first, Jost, the dot and the tide) is kept in `brand/design-system-v1/`; the product web follows it until phase 3.
+The one source of style for everything backtide shows: the public site (`site/`, backtide labs) and the product web (`backtide web`). Decided on 2026-10-28 (D31), from the approved proposal `brand/propuestas-labs/c2-limpia/`. The first system (white first, Jost, the dot and the tide) is kept in `brand/design-system-v1/`; no page uses it any more (the site moved in phase 2, the product web in phase 3).
 
 Open `index.html` (served from this folder, see "Files") to see every token, the type scale, the drawings, the motion and every component in its states, in both themes.
 

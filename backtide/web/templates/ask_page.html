@@ -1,8 +1,9 @@
 {% extends "base.html" %}
+{% from "icons.html" import ic %}
 {% block title %}{{ t('ask.title') }}{% endblock %}
 {% block main %}
 <main class="watch asking a-{{ agent.colour }}">
-  <h1>{{ t('ask.title') }}</h1>
+  <div class="page-head ic-host">{{ ic('ask', 'ic--l') }}<h1>{{ t('ask.title') }}</h1></div>
   <p class="lede">{{ t('ask.lede') }}</p>
   <p class="suggest">
     <span class="muted">{{ t('ask.try') }}</span>

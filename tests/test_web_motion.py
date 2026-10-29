@@ -117,13 +117,18 @@ def _blocks(css: str, at_rule: str) -> list[tuple[int, str]]:
 
 
 def test_keyframes_and_transitions_move_only_transform_and_opacity() -> None:
+    """The web's own CSS moves transform and opacity; the one exception is the system's focus
+    ring, which closes in (outline-offset) as it appears. Its keyframes are the system's
+    (motion/motion.css, copied unchanged), so web.css defines none of its own."""
     css = (STATIC / "web.css").read_text()
-    for _, body in _blocks(css, "keyframes"):
-        props = set(re.findall(r"([a-z-]+)\s*:", body))
-        assert props <= {"transform", "opacity"}, props
+    assert not _blocks(css, "keyframes"), "the keyframes are the system's (motion/motion.css)"
     for value in re.findall(r"transition\s*:\s*([^;}]+)", css):
-        for part in re.split(r",(?![^(]*\))", value):  # commas outside cubic-bezier(...)
-            assert part.split()[0] in {"transform", "opacity"}, value
+        for part in re.split(r",(?![^(]*\))", value):  # commas outside var(...) or calc(...)
+            assert part.split()[0] in {"transform", "opacity", "outline-offset", "outline-color"}, (
+                value
+            )
+    for name in set(re.findall(r"animation\s*:\s*(bt-[\w-]+)", css)):
+        assert f"@keyframes {name} " in (STATIC / "motion" / "motion.css").read_text(), name
 
 
 def test_every_animation_and_transition_waits_for_no_preference() -> None:
@@ -135,33 +140,17 @@ def test_every_animation_and_transition_waits_for_no_preference() -> None:
     ]
     for match in re.finditer(r"\b(animation|transition)\s*:", css):
         inside = any(lo <= match.start() <= hi for lo, hi in allowed)
-        in_keyframes = any(
-            s <= match.start() <= s + len(b) + 20 for s, b in _blocks(css, "keyframes")
-        )
-        # the dot button's hover nudge is the brand component's own (bundle.css)
-        brand_button = css.rfind(".dot-button {", 0, match.start()) > css.rfind(
-            "}", 0, match.start()
-        )
-        assert inside or in_keyframes or brand_button, css[match.start() - 80 : match.start() + 40]
+        assert inside, css[match.start() - 80 : match.start() + 40]
 
 
 def test_only_token_colours_still() -> None:
-    """Every colour of the page is a token of the brand (the base or the app's palette, T12d),
-    and there are still no shadows and no gradients in the CSS."""
-    import json
-
-    tokens = json.loads(
-        (STATIC.parents[2] / "brand" / "design-system-v1" / "project" / "tokens.json").read_text()
-    )
-    allowed = set()
-    for group in (tokens["color"]["tokens"], tokens["app"]["color"]["tokens"]):
-        for token in group:
-            value = token["value"]
-            allowed |= set(value.values()) if isinstance(value, dict) else {value}
+    """Every colour of the page is a token of the design system v2 (tokens.css, copied from
+    brand/design-system/project/ and pinned by test_web_brand): web.css writes none by hand, and
+    there are still no shadows and no gradients."""
     css = (STATIC / "web.css").read_text()
-    used = set(re.findall(r"#[0-9a-fA-F]{3,8}\b", css))
-    assert used <= {c for c in allowed if c.startswith("#")}, used - allowed
+    assert not re.findall(r"#[0-9a-fA-F]{3,8}\b", css)
     assert not re.search(r"rgba?\(|hsla?\(|gradient|box-shadow", css)
+    assert "var(--paper)" in css and "var(--ink)" in css
 
 
 # -- the tide ---------------------------------------------------------------------------------
@@ -235,7 +224,8 @@ def test_the_dot_lives_outside_what_the_stream_replaces(web: TestClient) -> None
     )
     assert swapped and "tide-head" not in swapped.group(1)
     assert 'class="tide-head"' in html and 'class="tide-frame can-rewind" data-tide' in html
-    assert 'stroke="url(#tide-fade)"' in html, "the tide's fade-in, drawn by the SVG itself"
+    assert "Gradient" not in html and "url(#" not in html, "no fade: the line is the record (v2)"
+    assert 'class="tide-axis"' in html, "the timeline's hairline axis"
 
 
 def test_counters_and_the_last_move_are_there_without_javascript(web: TestClient) -> None:

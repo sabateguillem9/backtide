@@ -1,8 +1,9 @@
+{% from "icons.html" import ic %}
 {% if filters.bad_time %}<p class="note">{{ t('hist.badtime') }}</p>{% endif %}
 {% if unreadable %}
 <p class="note">{{ t('box.unreadable') }}</p>
 {% elif not events %}
-<p class="note">{{ t('hist.none') }}</p>
+<div class="empty ic-host">{{ ic('notebook') }}<p class="empty__title">{{ t('hist.none') }}</p></div>
 {% else %}
 <div class="events">
 {% include "history_rows.html" %}

@@ -1,3 +1,4 @@
+{% from "icons.html" import ic %}
 {# One step of the rewind (T12b): the confirmation, the result, or why not now. A fragment for
    HTMX inside #rewind-panel, or the body of rewind_page.html without JavaScript. Nothing here
    comes from the agent: the notice is backtide/service/notice.py, the message is the service's
@@ -6,6 +7,7 @@
    Referrer-Policy: same-origin (with no-referrer it would be "Origin: null", and refused). #}
 <section class="rewind-step" data-view="{{ view }}"{% if view == 'result' %} data-outcome="{{ outcome }}"{% endif %}{% if snap %} data-rewind-to="{{ snap.taken_at.isoformat() }}"{% endif %} aria-labelledby="rewind-title">
 {% if view == 'confirm' %}
+  {{ ic('rewinds', 'ic--m') }}
   <h2 id="rewind-title" tabindex="-1">{{ t('rewind.confirm.title') }}</h2>
   <p class="rewind-snap"><span class="snaptitle">{{ day_time(snap.taken_at) }}</span> <span class="sid">{{ vis(snap.id, 80) }}</span></p>
   <p class="rewind-summary">{{ t('rewind.summary', time=day_time(snap.taken_at), ago=age(snap.taken_at)) }}</p>
@@ -20,7 +22,7 @@
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <input type="hidden" name="ticket" value="{{ ticket }}">
     <div class="rewind-actions">
-      <button class="rewind-yes" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('rewind.confirm.yes') }}</span></button>
+      <button class="rewind-yes" type="submit">{% include "arrow.html" %}<span>{{ t('rewind.confirm.yes') }}</span></button>
       <a class="rewind-cancel" href="{{ base }}/instantaneas">{{ t('rewind.confirm.no') }}</a>
     </div>
     <p class="note rewind-working">{{ t('rewind.working') }}</p>

@@ -49,7 +49,7 @@ from tests.webkit import (
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "backtide" / "web" / "static"
 # The product web still follows the first design system until phase 3 of D31.
-TOKENS = ROOT / "brand" / "design-system-v1" / "project" / "tokens.json"
+TOKENS = ROOT / "brand" / "design-system" / "project" / "tokens.json"
 NOW = START + timedelta(minutes=10)
 HOSTILE = '"><img src=x onerror=alert(1)>‮txt.exe'
 
@@ -172,7 +172,8 @@ def test_a_card_tells_the_state_the_last_action_and_todays_counts(room: TestClie
     assert 'class="is-risky"' in code
     assert "1 petición espera tu sí" in text and "espera tu sí" in text
     assert 'class="card-in st-waiting"' in code, "a request waiting: that is its state"
-    assert 'class="mini-tide"' in code and 'id="fade-codigo"' in code
+    assert 'class="mini-tide"' in code and 'class="tide-axis"' in code
+    assert "Gradient" not in code, "no fade (design system v2): the line is the record"
 
 
 def test_the_feed_merges_every_agent_newest_first(room: TestClient) -> None:
@@ -566,9 +567,10 @@ def test_every_app_colour_is_at_least_4_5_to_1_on_paper_and_on_the_washes() -> N
 
 
 def test_the_css_carries_every_app_token_in_both_themes() -> None:
+    """The web loads tokens.css, the system's own (an unchanged copy, test_web_brand)."""
     tokens = json.loads(TOKENS.read_text())
-    css = (STATIC / "web.css").read_text()
-    light = css[: css.index("@media (prefers-color-scheme: dark)")]
+    css = (STATIC / "tokens.css").read_text()
+    light = css[: css.index(':root[data-theme="dark"]')]
     dark = css[css.index(':root[data-theme="dark"]') :]
     for token in tokens["app"]["color"]["tokens"]:
         name, value = token["name"], token["value"]
@@ -577,8 +579,8 @@ def test_the_css_carries_every_app_token_in_both_themes() -> None:
 
 
 def test_dark_follows_the_system_and_the_switch() -> None:
-    css = (STATIC / "web.css").read_text()
-    assert '@media (prefers-color-scheme: dark) {\n  :root:not([data-theme="light"])' in css
+    css = (STATIC / "tokens.css").read_text()
+    assert '@media (prefers-color-scheme: dark) {\n  :root[data-theme="auto"]' in css
     assert ':root[data-theme="dark"] {' in css
     js = (STATIC / "theme.js").read_text()
     assert "localStorage" in js and "innerHTML" not in js

@@ -18,6 +18,7 @@ ES: dict[str, str] = {
     # chrome
     "app.name": "backtide",
     "app.local": "Solo en este ordenador",
+    "app.home": "backtide, sala de control",
     "run.label": "Nombre de esta ejecución: tiene que ser el mismo que imprimió `backtide web`",
     "nav.now": "Ahora",
     "nav.history": "Historia",
@@ -69,6 +70,8 @@ ES: dict[str, str] = {
     "wait.lede": "backtide las ha frenado antes de que salieran de tu ordenador. Si no contestas, "
     "se rechazan solas.",
     "wait.none": "Nada espera tu sí ahora mismo.",
+    "wait.none.hint": "Cuando un agente quiera borrar, pagar o enviar algo fuera, se parará "
+    "aquí hasta que decidas.",
     "wait.unreadable": "No se puede leer la lista de peticiones ahora mismo, así que no se sabe "
     "si alguna espera tu sí. Se vuelve a intentar sola.",
     "wait.stale": "Esta lista puede no estar al día: no se ha podido leer otra vez. Se vuelve a "
@@ -449,6 +452,8 @@ ES: dict[str, str] = {
     "rewind.err.busy": "Ya hay un rebobinado en marcha. Espera a que termine: no se ha hecho "
     "nada más.",
     "snaps.empty": "No hay instantáneas todavía.",
+    "snaps.empty.hint": "Aparecerán aquí a medida que backtide guarde la carpeta del agente: "
+    "cada una es un punto al que volver.",
     "snaps.unreadable": "No se puede leer el volumen de instantáneas desde aquí.",
     "snaps.fallback": "Esto es lo que dice la caja negra.",
     "snaps.more": "Se muestran las {n} más nuevas.",
@@ -754,6 +759,7 @@ ES: dict[str, str] = {
 EN: dict[str, str] = {
     "app.name": "backtide",
     "app.local": "Only on this computer",
+    "app.home": "backtide, control room",
     "run.label": "Name of this run: it must be the one `backtide web` printed",
     "nav.now": "Now",
     "nav.history": "History",
@@ -804,6 +810,8 @@ EN: dict[str, str] = {
     "wait.lede": "backtide stopped them before they left your computer. If you do not answer, "
     "they are rejected on their own.",
     "wait.none": "Nothing is waiting for your yes right now.",
+    "wait.none.hint": "When an agent wants to delete, pay or send something out, it stops here "
+    "until you decide.",
     "wait.unreadable": "The list of requests cannot be read right now, so it is not known "
     "whether any is waiting for your yes. It tries again on its own.",
     "wait.stale": "This list may not be up to date: it could not be read again. It tries again "
@@ -1178,6 +1186,8 @@ EN: dict[str, str] = {
     "page and check the snapshots before trying again.",
     "rewind.err.busy": "A rewind is already running. Wait for it to finish: nothing else was done.",
     "snaps.empty": "No snapshots yet.",
+    "snaps.empty.hint": "They appear here as backtide saves your agent's folder: each one is a "
+    "point to go back to.",
     "snaps.unreadable": "The snapshot volume cannot be read from here.",
     "snaps.fallback": "This is what the black box says.",
     "snaps.more": "Showing the {n} newest.",

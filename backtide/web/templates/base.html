@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="{{ lang }}">
+<html lang="{{ lang }}" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,7 +9,13 @@
 {% block head %}{% endblock %}
 <title>{% block title %}{{ t('app.name') }}{% endblock %} · {{ t('app.name') }}</title>
 <link rel="icon" href="{{ base }}/static/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="{{ base }}/static/favicon-dark.svg" type="image/svg+xml" media="(prefers-color-scheme: dark)">
+{# The design system v2 (D31): its files, copied unchanged, in its order; then the web's own. #}
+<link rel="stylesheet" href="{{ base }}/static/fonts/fonts.css">
+<link rel="stylesheet" href="{{ base }}/static/tokens.css">
+<link rel="stylesheet" href="{{ base }}/static/motion/motion.css">
 <link rel="stylesheet" href="{{ base }}/static/web.css">
+<script src="{{ base }}/static/motion/boot.js"></script>
 <script src="{{ base }}/static/theme.js"></script>
 <script src="{{ base }}/static/vendor/htmx.min.js" defer></script>
 <script src="{{ base }}/static/vendor/htmx-sse.js" defer></script>
@@ -21,7 +27,7 @@
 <div class="topbar">
 <header class="top">
   <div class="brand">
-    <a class="home" href="{{ base }}/panel">{{ t('app.name') }}</a>
+    <a class="home wordmark" href="{{ base }}/panel" aria-label="{{ t('app.home') }}"><span class="wordmark__dot" aria-hidden="true"></span><span>{{ t('app.name') }}</span></a>
     <span class="run" title="{{ t('run.label') }}">{{ run_name }}</span>
   </div>
   {% if active %}

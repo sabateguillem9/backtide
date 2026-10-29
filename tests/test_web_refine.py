@@ -58,12 +58,24 @@ def titles(html: str) -> list[str]:
 
 
 def test_the_agents_text_is_drawn_without_ligatures() -> None:
-    """Jost joins "--" into a dash: `git reset --hard` must not read as `git reset –hard`."""
+    """A font may join "--" into a dash: `git reset --hard` must not read as `git reset –hard`."""
     css = (STATIC / "web.css").read_text()
     rule = re.search(r"\n\.name \{([^}]*)\}", css)
     assert rule, "the .name rule"
     assert "font-variant-ligatures: none" in rule.group(1)
     assert '"liga" 0' in rule.group(1) and '"calt" 0' in rule.group(1)
+
+
+def test_no_rule_can_bring_ligatures_back() -> None:
+    """A `font:` shorthand resets the ligature settings of the element it styles, so the guard
+    sits on every element with !important, and nothing turns a ligature feature back on."""
+    css = (STATIC / "web.css").read_text()
+    assert "*, *::before, *::after { font-variant-ligatures: none !important; }" in css
+    assert not re.search(r'"(liga|clig|dlig|calt)" 1|font-variant-ligatures:(?!\s*none)', css)
+    name_rules = re.findall(r"\n([^\n{}]*\.name[^\n{}]*)\{([^}]*)\}", css)
+    assert name_rules, "the agent's names are styled"
+    for selector, body in name_rules:
+        assert not re.search(r"(^|;)\s*font:", body), selector
 
 
 # -- a request, by what it wants to do -----------------------------------------------------------

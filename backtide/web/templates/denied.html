@@ -1,7 +1,9 @@
 {% extends "base.html" %}
+{% from "icons.html" import ic %}
 {% block title %}{{ t('auth.title') }}{% endblock %}
 {% block main %}
-<main class="watch">
+<main class="watch gate-page ic-host">
+  {{ ic('key', 'ic--l') }}
   <h1>{{ t('auth.title') }}</h1>
   <p class="lede">{{ t('auth.bad') if bad_link else t('auth.body') }}</p>
 </main>

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "icons.html" import ic %}
 {% block title %}{{ t('now.title') }}{% endblock %}
 {% block main %}
 <main class="watch a-{{ agent.colour }}" hx-ext="sse" sse-connect="{{ abase }}/ahora/stream?after={{ head }}">
@@ -15,7 +16,7 @@
   {% include "tide_frame.html" %}
   {% if unreadable %}<p class="note">{{ t('box.unreadable') }}</p>{% endif %}
   <div class="feed" id="feed" role="log" aria-live="polite" sse-swap="lines" hx-swap="beforeend">
-    {% if not lines and not unreadable %}<div class="empty"><p class="note">{{ t('now.empty') }}</p><p class="note">{{ t('now.empty.hint') }}</p></div>{% endif %}
+    {% if not lines and not unreadable %}<div class="empty ic-host">{{ ic('eye') }}<p class="empty__title">{{ t('now.empty') }}</p><p class="empty__text">{{ t('now.empty.hint') }}</p></div>{% endif %}
     {% for line in lines %}
     {% set oob = false %}
     {% include "line.html" %}

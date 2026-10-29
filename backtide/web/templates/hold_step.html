@@ -1,3 +1,4 @@
+{% from "icons.html" import ic %}
 {# One step of a decision on a held request (T10-5): its confirmation (a form with a one-time
    ticket bound to that verb and that id), its result, or why not now. Plain forms, no
    JavaScript needed: the POST is a normal navigation, which carries our Origin
@@ -16,7 +17,7 @@
     <h2 id="hold-step-title">{{ t('hold.confirm.' ~ verb) }}</h2>
     {% if hold %}
     <div class="hold-one">
-      <p class="hold-id"><span class="sid">{{ hold.id }}</span> · <span class="dot dot-{{ hold.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ hold.risk) }} · {{ t('wait.left') }} <span class="num">{{ countdown(hold.left(now)) }}</span></p>
+      <p class="hold-id"><span class="sid">{{ hold.id }}</span> · <span class="hold-risk risk-{{ hold.risk }}"><span class="dot dot-{{ hold.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ hold.risk) }}</span> · {{ t('wait.left') }} <span class="num">{{ countdown(hold.left(now)) }}</span></p>
       {% if hold.action %}<p class="req-what" lang="es">{{ hold.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
       {% if hold.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ hold.notes | join('; ') }}.</span></p>{% endif %}
       {% if hold.domains %}<p class="req-notes"><span class="muted">{{ t('hold.domains') }}</span> {% for d in hold.domains %}<span class="name">{{ vis_mid(d, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
@@ -39,8 +40,8 @@
     <p class="hold-rule-what"><span lang="es">{{ api(trust.translator) }}</span> · <span class="name">{{ vis_mid(trust.recipient, 120) }}</span></p>
     {% endif %}
     <p class="note">{{ t('hold.confirm.' ~ verb ~ '.note') }}</p>
-    {% if verb == 'confiar' %}<p class="settings-warning"><span class="dot dot-2" aria-hidden="true"></span><span>{{ t('hold.confirm.confiar.warning') }}</span></p>
-    {% if trust_note %}<p class="settings-warning" data-trust-note="{{ trust_note }}"><span class="dot dot-2" aria-hidden="true"></span><span>{{ t('hold.confirm.confiar.' ~ trust_note) }}</span></p>{% endif %}
+    {% if verb == 'confiar' %}<p class="settings-warning">{{ ic('warning') }}<span>{{ t('hold.confirm.confiar.warning') }}</span></p>
+    {% if trust_note %}<p class="settings-warning" data-trust-note="{{ trust_note }}">{{ ic('warning') }}<span>{{ t('hold.confirm.confiar.' ~ trust_note) }}</span></p>{% endif %}
     {% if others %}<p class="note" data-others="{{ others }}">{{ t('hold.confirm.confiar.others', n=others) }}</p>{% endif %}{% endif %}
     <form class="settings-form" method="post" action="{{ base }}/peticiones/decidir">
       <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -51,13 +52,15 @@
       <label class="setting-check"><input type="checkbox" name="confirmo" value="si" required> <span>{{ t('hold.confirm.confiar.box') }}</span></label>
       {% endif %}
       <div class="settings-actions">
-        <button class="settings-yes{% if verb in ('rechazar', 'revocar', 'olvidar') %} is-remove{% endif %}" type="submit"><span class="dot-button" aria-hidden="true">{% include "arrow.html" %}</span><span>{{ t('hold.confirm.' ~ verb ~ '.yes') }}</span></button>
+        <button class="settings-yes{% if verb in ('rechazar', 'revocar', 'olvidar') %} is-remove{% endif %}" type="submit"><span>{{ t('hold.confirm.' ~ verb ~ '.yes') }}</span>{% if verb not in ('rechazar', 'revocar', 'olvidar') %}{% include "arrow.html" %}{% endif %}</button>
         <a class="settings-cancel" href="{{ base }}/peticiones">{{ t('hold.confirm.no') }}</a>
       </div>
     </form>
   {% elif view == 'result' %}
+    {# The colour says whether the step worked; the drawing says what it means: a tick only when
+       something goes out or is trusted, a cross when it stays in, a warning when nobody knows. #}
     {% set good = outcome in ('released', 'preapproved', 'rejected', 'trusted', 'ended', 'removed') %}
-    <h2 id="hold-step-title" class="settings-outcome is-{{ 'ok' if good else ('none' if outcome == 'unknown' else 'bad') }}"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('hold.out.' ~ outcome) if t.has('hold.out.' ~ outcome) else t('hold.out.other') }}</span></h2>
+    <h2 id="hold-step-title" class="settings-outcome is-{{ 'ok' if good else ('none' if outcome == 'unknown' else 'bad') }}">{{ ic('approve' if outcome in ('released', 'preapproved', 'trusted') else ('reject' if outcome in ('rejected', 'ended', 'removed') else 'warning'), 'ic--m') }}<span>{{ t('hold.out.' ~ outcome) if t.has('hold.out.' ~ outcome) else t('hold.out.other') }}</span></h2>
     {% if hold_out and t.has('hold.out.' ~ hold_out) %}<p>{{ t('hold.out.' ~ hold_out) }}</p>{% endif %}
     {% if message %}<p class="settings-said"><span class="muted">{{ t('rewind.said') }}</span> <span lang="es">{{ vis(message, 600) }}</span></p>{% endif %}
     <p class="settings-actions"><a class="settings-back" href="{{ base }}/peticiones">{{ t('holds.back') }}</a></p>

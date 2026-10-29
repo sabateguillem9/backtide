@@ -1,13 +1,10 @@
 <div class="tide-window"><div class="tide-inner">
 <svg class="tide" viewBox="0 0 {{ tide.width | int }} {{ tide.height | int }}" role="img" aria-label="{{ t('tide.label', n=tide.total) if tide.hours == 24 else t('tide.label.hours', h=tide.hours, n=tide.total) }}">
-  <defs>
-    <linearGradient id="tide-fade" gradientUnits="userSpaceOnUse" x1="{{ tide.left }}" y1="0" x2="{{ tide.fade_to }}" y2="0">
-      <stop offset="0" stop-color="currentColor" stop-opacity="0"/>
-      <stop offset="1" stop-color="currentColor" stop-opacity="1"/>
-    </linearGradient>
-  </defs>
-  <path class="tide-line" d="{{ tide.path }}" stroke="url(#tide-fade)"/>
-  <g class="tide-swell"><path class="tide-line" d="{{ tide.swell }}" stroke="currentColor"/></g>
+  {# The Timeline of the design system v2: a hairline axis, the day's line in the agent's colour
+     on it (no fade: the line is the record), the snapshots on the line, now at the right. #}
+  <path class="tide-axis" d="M{{ tide.left }} {{ tide.base }}H{{ tide.right }}"/>
+  <path class="tide-line" d="{{ tide.path }}"/>
+  <g class="tide-swell"><path class="tide-line" d="{{ tide.swell }}"/></g>
   {% for mark in tide.marks %}
   <circle class="tide-mark" cx="{{ mark.x }}" cy="{{ mark.y }}" r="3.5" data-at="{{ mark.at }}"><title>{{ mark.ts }}</title></circle>
   {% endfor %}

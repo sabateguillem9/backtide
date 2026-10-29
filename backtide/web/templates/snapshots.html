@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "icons.html" import ic %}
 {% block title %}{{ t('snaps.title') }}{% endblock %}
 {% block main %}
 <main class="snapshots a-{{ agent.colour if agent else 1 }}">
@@ -8,10 +9,10 @@
   {% include "tide_frame.html" %}
   <p class="note preview-hint" data-default="{{ t.raw('snaps.preview') }}" data-template="{{ t.raw('snaps.preview.to') }}" hidden>{{ t('snaps.preview') }}</p>
   {% if error and box_unreadable %}<p class="note">{{ t('snaps.unreadable') }} {{ t('box.unreadable') }}</p>{% elif error %}<p class="note source">{{ t('snaps.from_box') }}</p>{% endif %}
-  {% if rows and rewind_state != 'ready' %}<p class="note rewind-off">{{ t('rewind.off.' ~ rewind_state) }}</p>{% endif %}
+  {% if rows and rewind_state != 'ready' %}<div class="notice notice--info rewind-off" role="note">{{ ic('info') }}<p class="notice__text">{{ t('rewind.off.' ~ rewind_state) }}</p></div>{% endif %}
   <div id="rewind-panel" class="rewind-panel" aria-live="polite"></div>
   {% if not rows %}
-  <p class="note">{{ t('snaps.empty') }}</p>
+  <div class="empty ic-host">{{ ic('flag') }}<p class="empty__title">{{ t('snaps.empty') }}</p><p class="empty__text">{{ t('snaps.empty.hint') }}</p></div>
   {% else %}
   {# Grouped by how far back they are (T12f-2c): the last 10 minutes, the last hour, the rest of
      today, before. Newest first, so the groups come in that order; an empty one is not drawn. #}

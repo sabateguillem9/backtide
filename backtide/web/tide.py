@@ -28,7 +28,6 @@ BUCKETS = 144  # ten minutes each
 BUSY = 40  # events in ten minutes that already make a full swell
 STEP = 1.5  # distance between two points of the path
 SWELL_SPAN = 60.0  # the stretch before the head that swells when something happens
-FADE = 0.22  # the fade-in at the start of the line, as a fraction of its length
 _KERNEL = (0.06, 0.12, 0.2, 0.24, 0.2, 0.12, 0.06)  # a gentle smoothing between buckets
 
 
@@ -51,7 +50,6 @@ class Tide:
     base: float = BASE
     path: str = ""  # the line from the start to where the swell begins
     swell: str = ""  # the last stretch, which the page swells when events arrive
-    fade_to: float = PAD  # where the fade-in ends
     events: int = 0  # events read in the window
     more: bool = False  # there were more events than were read
     hours: int = 24  # how far back the line goes
@@ -177,7 +175,6 @@ def build_tide(
         len(points),
         path=_path(xs[: at + 1], ys[: at + 1]),
         swell=_path(xs[at:], ys[at:]),
-        fade_to=round(left + span * FADE, 1),
         events=len(moments),
         more=more,
         hours=max(round(window / timedelta(hours=1)), 1),

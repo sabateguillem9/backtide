@@ -3,8 +3,7 @@
   <label class="label" for="q">{{ t('chat.label') }}</label>
   <div class="field">
     <input id="q" name="q" type="text" maxlength="200" autocomplete="off" placeholder="{{ t('chat.placeholder') }}">
-    <span class="field-line"></span>
-    <button class="dot-button" type="submit" aria-label="{{ t('chat.send') }}">{% include "arrow.html" %}</button>
+    <button class="ask-send" type="submit"><span>{{ t('chat.send') }}</span>{% include "arrow.html" %}</button>
   </div>
   {# Questions the rules answer (ask.py): one click asks them. Without JavaScript they are
      plain links to the chat's own page. #}

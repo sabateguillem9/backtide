@@ -547,3 +547,23 @@ def test_the_web_decides_through_the_control_socket_as_web(
     finally:
         server.close()
     assert ControlApprover(server.path, enabled=False).availability() is Availability.DISABLED
+
+
+@pytest.mark.parametrize(
+    ("verb", "outcome", "drawing"),
+    [
+        ("aprobar", "released", "approve"),
+        ("aprobar", "unknown_outcome", "warning"),
+        ("aprobar", "failed", "warning"),
+        ("rechazar", "rejected", "reject"),
+    ],
+)
+def test_the_result_is_drawn_by_what_it_means(
+    web: TestClient, fake: FakeApprover, verb: str, outcome: str, drawing: str
+) -> None:
+    """A rejected request never shows the approve tick, and "nobody knows" never shows a cross."""
+    fake.outcome = outcome
+    done = post(web, confirm(web, verb))
+    assert done.status_code == 200, done.text[:300]
+    drawn = re.findall(r'class="ic ic-([a-z]+) ic--m"', done.text)
+    assert drawn == [drawing], (outcome, drawn)

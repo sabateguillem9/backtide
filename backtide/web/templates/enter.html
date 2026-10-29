@@ -1,8 +1,10 @@
 {% extends "base.html" %}
+{% from "icons.html" import ic %}
 {% block head %}<meta http-equiv="refresh" content="0;url={{ target }}">{% endblock %}
 {% block title %}{{ t('enter.title') }}{% endblock %}
 {% block main %}
-<main class="watch">
+<main class="watch gate-page ic-host">
+  {{ ic('key', 'ic--l') }}
   <h1>{{ t('enter.title') }}</h1>
   <p class="lede">{{ t('enter.body') }}</p>
   <p class="note"><a href="{{ target }}">{{ t('enter.link') }}</a></p>

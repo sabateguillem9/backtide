@@ -1,0 +1,196 @@
+/* backtide · motion. Calm and once: things arrive, settle and stay. Only transform, opacity,
+   stroke-dashoffset and (once, on the headline) a blur that clears ever move.
+
+   Three switches on <html>, set by motion/boot.js before the first paint:
+   .anim     play the entrance (CSS only). Never set for a hidden tab or reduced motion.
+   .still    reduced motion: everything visible and quiet from the start.
+   .is-hidden the tab is hidden: everything that runs is paused.
+   Every hidden state below is the "from" of an animation or waits for a class that only
+   JavaScript adds, so without JavaScript nothing is ever hidden. */
+
+@keyframes bt-fade { from { opacity: 0; } }
+@keyframes bt-rise { from { opacity: 0; transform: translateY(var(--rise)); } }
+@keyframes bt-rise-blur { from { opacity: 0; transform: translateY(var(--rise-entrance)); filter: blur(8px); } }
+@keyframes bt-draw { from { stroke-dashoffset: 1; } }
+@keyframes bt-grow { from { transform: scaleX(0); } }
+@keyframes bt-pop { from { opacity: 0; transform: scale(.4); } }
+@keyframes bt-roll {
+  0% { opacity: 0; transform: translateX(196px); }
+  15% { opacity: 1; }
+  82% { transform: translateX(-4px); }
+  100% { transform: translateX(0); }
+}
+@keyframes bt-spin-back { from { transform: rotate(320deg); } }
+
+/* ================================================================ the entrance (on load)
+   Mark what enters; .at-1 ... .at-8 delay it by 100 ms steps. */
+.at-1 { --at: 100ms; } .at-2 { --at: 200ms; } .at-3 { --at: 300ms; } .at-4 { --at: 400ms; }
+.at-5 { --at: 500ms; } .at-6 { --at: 600ms; } .at-7 { --at: 700ms; } .at-8 { --at: 800ms; }
+
+.anim .enter-fade { animation: bt-fade var(--duration-reveal) var(--ease) var(--at, 0ms) both; }
+.anim .enter-rise { animation: bt-rise var(--duration-reveal) var(--ease) var(--at, 0ms) both; }
+/* The headline: each word (.w) rises out of a soft blur, 120 ms apart. */
+.anim .enter-title .w { display: inline-block; animation: bt-rise-blur var(--duration-entrance) var(--ease) var(--at, 0ms) both; }
+.anim .enter-title .w + .w { animation-delay: calc(var(--at, 0ms) + 120ms); }
+.anim .enter-title .w + .w + .w { animation-delay: calc(var(--at, 0ms) + 240ms); }
+/* A rule that grows from the left (put it on an element with a top or bottom border). */
+.enter-rule { position: relative; }
+.anim .enter-rule { border-color: transparent; }
+.anim .enter-rule::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: calc(-1 * var(--stroke-hair)); height: var(--stroke-hair);
+  background: var(--line); transform-origin: left; animation: bt-grow var(--duration-draw) var(--ease) var(--at, 0ms) both;
+}
+/* A list whose children rise one after the other, then their icons draw. */
+.anim .enter-list > * { animation: bt-rise var(--duration-reveal) var(--ease) calc(var(--at, 0ms) + var(--d, 0ms)) both; }
+.anim .enter-list .ic :is(.ic-ink, .ic-clay, .ic-faint) { animation: bt-draw var(--duration-draw) var(--ease) calc(var(--at, 0ms) + var(--d, 0ms) + 200ms) both; }
+.anim .enter-list .ic :is(.ic-fill, .ic-soft) { animation: bt-pop .5s var(--ease) calc(var(--at, 0ms) + var(--d, 0ms) + 650ms) both; }
+.enter-list > :nth-child(2), .d-1 { --d: 80ms; }
+.enter-list > :nth-child(3), .d-2 { --d: 160ms; }
+.enter-list > :nth-child(4), .d-3 { --d: 240ms; }
+.enter-list > :nth-child(5), .d-4 { --d: 320ms; }
+.enter-list > :nth-child(n + 6), .d-5 { --d: 400ms; }
+/* An icon that draws itself in. */
+.anim .enter-icon :is(.ic-ink, .ic-clay, .ic-faint) { animation: bt-draw var(--duration-draw) var(--ease) calc(var(--at, 0ms) + 150ms) both; }
+.anim .enter-icon :is(.ic-fill, .ic-soft) { animation: bt-pop .5s var(--ease) calc(var(--at, 0ms) + 650ms) both; }
+.ic-fill, .ic-soft { transform-box: fill-box; transform-origin: center; }
+
+/* The hero drawing: the shore draws, the wave curls, the dot rolls in and settles. */
+/* No non-scaling-stroke here either: it breaks the drawing of a dashed path (see .ic). The art
+   is drawn at about its own size (400 units for 380px), so 1.6 units read as 1.6px. */
+.art-line { fill: none; stroke: var(--ink); stroke-width: var(--stroke-art); stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 1 1; }
+.art-dot { fill: var(--clay-mark); }
+.anim .art-shore { animation: bt-draw .8s var(--ease) calc(var(--at, 0ms) + 200ms) both; }
+.anim .art-curl { animation: bt-draw .9s var(--ease-draw) calc(var(--at, 0ms) + 420ms) both; }
+.anim .art-roll { animation: bt-roll .9s var(--ease) calc(var(--at, 0ms) + 950ms) both; }
+.anim .art-dot { transform-box: fill-box; transform-origin: center; animation: bt-spin-back .9s var(--ease) calc(var(--at, 0ms) + 950ms) both; }
+
+/* ================================================================ revealed on scroll, once
+   motion.js marks [data-reveal] elements below the fold (.rv rise, .ln line) and adds .in
+   when each one enters the screen. Transitions exist only on the way in. */
+.rv.in { transition: opacity var(--duration-reveal) var(--ease-reveal) var(--d, 0ms), transform var(--duration-reveal) var(--ease-reveal) var(--d, 0ms); }
+.rv:not(.in) { opacity: 0; transform: translateY(var(--rise)); }
+.rv.in .ic :is(.ic-ink, .ic-clay, .ic-faint) { transition: stroke-dashoffset var(--duration-draw) var(--ease) calc(var(--d, 0ms) + 150ms); }
+.rv:not(.in) .ic :is(.ic-ink, .ic-clay, .ic-faint) { stroke-dashoffset: 1; }
+.rv.in .ic :is(.ic-fill, .ic-soft) { transition: opacity .4s var(--ease) calc(var(--d, 0ms) + 700ms), transform .5s var(--ease) calc(var(--d, 0ms) + 700ms); }
+.rv:not(.in) .ic :is(.ic-fill, .ic-soft) { opacity: 0; transform: scale(.4); }
+.ln { position: relative; border-top-color: transparent !important; }
+.ln::before {
+  content: ""; position: absolute; left: 0; right: 0; top: calc(-1 * var(--stroke-hair)); height: var(--stroke-hair);
+  background: var(--ln, var(--line)); transform-origin: left;
+}
+.ln.in::before { transition: transform .9s var(--ease) var(--d, 0ms); }
+.ln:not(.in)::before { transform: scaleX(0); }
+.foot__inner { --ln: var(--hair); }
+/* A drawing whose strokes draw themselves as it enters ([data-reveal="draw"]). */
+.dr.in :is(.art-line, .ic-ink, .ic-clay, .ic-faint) { transition: stroke-dashoffset 1.1s var(--ease-draw); }
+.dr:not(.in) :is(.art-line, .ic-ink, .ic-clay, .ic-faint) { stroke-dashoffset: 1; }
+
+/* ================================================================ Inside the box
+   The layers drop one by one onto a stack, the stack opens, and the dot settles last. */
+.l0 { --s: 276px; --dd: 420ms; } .l1 { --s: 184px; --dd: 280ms; }
+.l2 { --s: 92px; --dd: 140ms; }  .l3 { --s: 0px; --dd: 0ms; }
+.layers.pre .drop, .layers.pre .settle { opacity: 0; }
+.layers.pre .layer { transform: translateY(var(--s)); }
+.layers.play .drop { animation: bt-drop .55s var(--ease-drop) var(--dd) both; }
+.layers.play .layer { animation: bt-separate .85s var(--ease) 1.05s both; }
+.layers.play .settle { animation: bt-settle .55s var(--ease) 1.85s both; }
+@keyframes bt-drop { from { opacity: 0; transform: translateY(-70px); } 80% { opacity: 1; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+@keyframes bt-separate { from { transform: translateY(var(--s)); } to { transform: none; } }
+@keyframes bt-settle { from { opacity: 0; transform: translateY(-12px); } 70% { opacity: 1; transform: translateY(1.5px); } to { opacity: 1; transform: none; } }
+
+/* ================================================================ icon gestures
+   Each icon makes one small gesture of its own when the pointer reaches its host (.ic-host:
+   a row, a section, a card) or the host takes focus. Once, never looping. Pivots are in the
+   icon's 48 x 48 units. */
+.ic-g { transform-box: view-box; transition: transform var(--duration-icon) var(--ease); }
+.ic-g-spin, .ic-g-loop, .ic-g-shackle, .ic-g-moon, .ic-g-dot, .ic-g-pencil,
+.ic-g-tick, .ic-g-cross, .ic-g-mark, .ic-g-eye, .ic-g-sun, .ic-g-bubble { transform-origin: 24px 24px; }
+.ic-g-stones { transform-origin: 24px 43px; }
+.ic-g-reelL { transform-origin: 17.5px 23.6px; }
+.ic-g-reelR { transform-origin: 30.5px 23.6px; }
+.ic-g-book { transform-origin: 24px 37px; }
+.ic-g-beam { transform-origin: 24px 13px; }
+.ic-g-sign { transform-origin: 24px 39px; }
+.ic-g-key { transform-origin: 14.5px 24px; }
+.ic-g-bell { transform-origin: 24px 9px; }
+.ic-g-cloth { transform-origin: 14px 16px; }
+
+@keyframes bt-wobble { 25% { transform: rotate(-7deg); } 55% { transform: rotate(4deg); } 80% { transform: rotate(-1.5deg); } }
+@keyframes bt-unlatch { 40% { transform: translateY(-3px); } }
+@keyframes bt-scribble { 30% { transform: translate(-1.6px, 1.6px); } 65% { transform: translate(1px, -1px); } }
+@keyframes bt-weigh { 25% { transform: rotate(6deg); } 60% { transform: rotate(-3.5deg); } 85% { transform: rotate(1deg); } }
+@keyframes bt-tick { from { stroke-dashoffset: 1; } }
+@keyframes bt-shake { 25% { transform: translateX(-2px); } 55% { transform: translateX(1.5px); } 80% { transform: translateX(-.5px); } }
+@keyframes bt-hop { 40% { transform: translateY(-3.5px); } 70% { transform: translateY(.5px); } }
+@keyframes bt-ring { 20% { transform: rotate(12deg); } 45% { transform: rotate(-9deg); } 70% { transform: rotate(4deg); } 90% { transform: rotate(-1deg); } }
+@keyframes bt-sway { 35% { transform: skewY(-6deg) scaleX(.94); } 70% { transform: skewY(3deg); } }
+@keyframes bt-blink { 45% { transform: scaleY(.12); } }
+
+@media (hover: hover) {
+  .ic-host:hover .ic-g-spin { transform: rotate(-32deg); }
+  .ic-host:hover .ic-g-stones { animation: bt-wobble .8s var(--ease); }
+  .ic-host:hover .ic-g-moon { transform: translateY(-2.5px); }
+  .ic-host:hover :is(.ic-g-reelL, .ic-g-reelR) { transform: rotate(-180deg); transition-duration: .8s; }
+  .ic-host:hover .ic-g-book { transform: rotate(-4deg); }
+  .ic-host:hover .ic-g-pencil { animation: bt-scribble .7s var(--ease); }
+  .ic-host:hover .ic-g-beam { animation: bt-weigh .9s var(--ease); }
+  .ic-host:hover .ic-g-dot { transform: translateX(3px); }
+  .ic-host:hover .ic-rewinds .ic-g-loop { transform: rotate(-120deg); transition-duration: .8s; }
+  .ic-host:hover .ic-g-shackle { animation: bt-unlatch .7s var(--ease); }
+  .ic-host:hover .ic-g-tick .ic-ink { animation: bt-tick .6s var(--ease); }
+  .ic-host:hover .ic-g-cross { animation: bt-shake .6s var(--ease); }
+  .ic-host:hover .ic-g-mark { animation: bt-hop .7s var(--ease); }
+  .ic-host:hover .ic-g-sign { animation: bt-wobble .8s var(--ease); }
+  .ic-host:hover .ic-g-key { transform: rotate(-28deg); }
+  .ic-host:hover .ic-g-bell { animation: bt-ring .9s var(--ease); }
+  .ic-host:hover .ic-g-cloth { animation: bt-sway .9s var(--ease); }
+  .ic-host:hover .ic-g-eye { animation: bt-blink .45s var(--ease); }
+  .ic-host:hover .ic-g-sun { transform: translateY(-3px); }
+  .ic-host:hover .ic-g-bubble { transform: translateY(-2px); }
+}
+/* The same gestures for the keyboard. */
+.ic-host:focus-visible .ic-g-spin { transform: rotate(-32deg); }
+.ic-host:focus-visible .ic-g-stones { animation: bt-wobble .8s var(--ease); }
+.ic-host:focus-visible .ic-g-moon { transform: translateY(-2.5px); }
+.ic-host:focus-visible :is(.ic-g-reelL, .ic-g-reelR) { transform: rotate(-180deg); transition-duration: .8s; }
+.ic-host:focus-visible .ic-g-book { transform: rotate(-4deg); }
+.ic-host:focus-visible .ic-g-pencil { animation: bt-scribble .7s var(--ease); }
+.ic-host:focus-visible .ic-g-beam { animation: bt-weigh .9s var(--ease); }
+.ic-host:focus-visible .ic-g-dot { transform: translateX(3px); }
+.ic-host:focus-visible .ic-rewinds .ic-g-loop { transform: rotate(-120deg); transition-duration: .8s; }
+.ic-host:focus-visible .ic-g-shackle { animation: bt-unlatch .7s var(--ease); }
+.ic-host:focus-visible .ic-g-tick .ic-ink { animation: bt-tick .6s var(--ease); }
+.ic-host:focus-visible .ic-g-cross { animation: bt-shake .6s var(--ease); }
+.ic-host:focus-visible .ic-g-mark { animation: bt-hop .7s var(--ease); }
+.ic-host:focus-visible .ic-g-sign { animation: bt-wobble .8s var(--ease); }
+.ic-host:focus-visible .ic-g-key { transform: rotate(-28deg); }
+.ic-host:focus-visible .ic-g-bell { animation: bt-ring .9s var(--ease); }
+.ic-host:focus-visible .ic-g-cloth { animation: bt-sway .9s var(--ease); }
+.ic-host:focus-visible .ic-g-eye { animation: bt-blink .45s var(--ease); }
+.ic-host:focus-visible .ic-g-sun { transform: translateY(-3px); }
+.ic-host:focus-visible .ic-g-bubble { transform: translateY(-2px); }
+
+/* ================================================================ live states (the product web)
+   A dot that breathes while an agent works, pulses quicker while it waits for you or has
+   lost its sensor. The only things that loop, and they stop with the tab hidden. */
+@keyframes bt-breathe { 50% { opacity: .45; } }
+@keyframes bt-pulse { 0%, 100% { transform: scale(1); } 40% { transform: scale(1.35); } }
+.badge--working .badge__dot, .badge--rewinding .badge__dot { animation: bt-breathe 2.8s ease-in-out infinite; }
+.badge--waiting .badge__dot, .badge--sensor-down .badge__dot { animation: bt-pulse 1.4s var(--ease) infinite; }
+
+/* ================================================================ between pages
+   A cross-fade, and an element named .vt-title flies to its place on the next page. */
+@media (prefers-reduced-motion: no-preference) {
+  @view-transition { navigation: auto; }
+}
+.vt-title { view-transition-name: page-title; }
+::view-transition-group(*) { animation-duration: var(--duration-page); animation-timing-function: var(--ease-reveal); }
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: .35s; }
+
+/* ================================================================ still, hidden */
+.still *, .still *::before, .still *::after { transition: none !important; animation: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+}
+.is-hidden *, .is-hidden *::before, .is-hidden *::after { animation-play-state: paused !important; }
