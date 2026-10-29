@@ -25,6 +25,7 @@ from backtide.jail.proxy_config import (
     channel_tmpfs_options,
 )
 from backtide.service.config import STATE_WEB_SOCKET
+from backtide.service.export import EXPORT_DIR_ENV
 from backtide.setup import layout
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
@@ -68,6 +69,8 @@ def unit_values() -> dict[str, str]:
         "STATE_DIR": str(layout.STATE_DIR),
         "VOLUME_IMAGE": str(layout.VOLUME_IMAGE),
         "VOLUME_MOUNT": str(layout.VOLUME_MOUNT),
+        "EXPORT_DIR": str(layout.EXPORT_DIR),
+        "EXPORT_DIR_ENV": EXPORT_DIR_ENV,
         "PROXY_CHANNEL_DIR": str(layout.PROXY_CHANNEL_DIR),
         "CAPABILITIES": " ".join(layout.SERVICE_CAPABILITIES),
         "WEB_USER": layout.WEB_USER,

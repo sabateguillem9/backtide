@@ -83,6 +83,7 @@ few milliseconds, so freezing never waits for a long ``docker stop``.
 """
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -113,6 +114,7 @@ from backtide.service.config import ServiceConfig
 from backtide.service.egress import EgressHooks
 from backtide.service.export import (
     BUNDLE_RE,
+    EXPORT_DIR_ENV,
     ExportError,
     check_destination,
     export_bundle,
@@ -2647,8 +2649,13 @@ class Guardian:
             config.agent_ca_dir,
             self._store.root,
         )
+        # An installed service (its unit sets it: deploy/systemd/backtide.service.in) can only
+        # write there; a development one (make probar) anywhere it may.
+        inside = os.environ.get(EXPORT_DIR_ENV)
         try:
-            target = check_destination(destination, protected)
+            target = check_destination(
+                destination, protected, inside=Path(inside) if inside else None
+            )
         except ExportError as error:
             return ExportOutcome(ExportStatus.INVALID, f"No se ha exportado nada: {error}.")
         with self.agent_lock:
@@ -2691,17 +2698,29 @@ class Guardian:
                 result = export_tree(agent / work, target, include_config=include_config is True)
             else:
                 result = export_bundle(agent / HOME_DIR, bundle, target)
-        except ExportError as error:
+        except Exception as error:
+            # Never only an ExportError (S2 of the code review: a raw OSError left no
+            # export_failed): whatever stopped the copy is recorded, and the owner told.
+            if not isinstance(error, ExportError):
+                logger.exception("export: the copy failed")
             self._record(
                 "system",
                 "export_failed",
                 str(target),
-                details={**what, "error": _short(error), "requested_by": requester},
+                details={
+                    **what,
+                    # an OSError may quote a name the agent chose: only its kind is kept
+                    "error": _short(error)
+                    if isinstance(error, ExportError)
+                    else type(error).__name__,
+                    "requested_by": requester,
+                },
                 risk=1,
                 snapshot_id=snapshot.id,
             )
+            shown = error if isinstance(error, ExportError) else "ha fallado algo inesperado"
             return ExportOutcome(
-                ExportStatus.FAILED, f"No se ha exportado: {error}.", str(target), snapshot.id
+                ExportStatus.FAILED, f"No se ha exportado: {shown}.", str(target), snapshot.id
             )
         details = {**what, **result.details(), "requested_by": requester}
         self._record(

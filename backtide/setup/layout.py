@@ -32,6 +32,9 @@ MANIFEST = STATE_DIR / "install-manifest.json"  # what the installer made (docs/
 # The volume's mount point is NOT inside STATE_DIR: the agent writes the volume, and the state
 # must never be in it (ServiceConfig refuses one inside the other).
 VOLUME_MOUNT = Path("/var/lib") / f"{NAME}-agent"
+# Where `backtide exportar` writes the owner's copies: the only folder besides the state and the
+# volume that the service's unit lets it write (code review of 2026-10-29, S1). Root's alone.
+EXPORT_DIR = Path("/var/lib") / f"{NAME}-export"
 VOLUME_LABEL = NAME
 
 WEB_USER = f"{NAME}-web"  # a system account: no login, no home (docs/25, section 3)

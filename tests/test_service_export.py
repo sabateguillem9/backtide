@@ -556,3 +556,55 @@ def test_a_bundle_never_overwrites(tmp_path: Path) -> None:
     with pytest.raises(ExportError, match="nunca se sobrescribe"):
         export.export_bundle(bundle_home(tmp_path), BUNDLE, out)
     assert out.read_text() == "mine"
+
+
+# -- code review of 2026-10-29 ---------------------------------------------------------------
+
+
+def test_an_installed_service_exports_only_into_its_folder(
+    tmp_path: Path, protected: list[Path]
+) -> None:
+    """S1: systemd lets an installed service write only its export folder; elsewhere the owner
+    hears where to export, not a misleading "no existe" (ProtectHome) or a copy lost in a
+    private /tmp."""
+    folder = tmp_path / "backtide-export"
+    folder.mkdir()
+    assert check_destination(str(folder / "mine"), protected, inside=folder) == folder / "mine"
+    for elsewhere in (tmp_path / "mine", tmp_path / "nope" / "mine", Path("/tmp/mine")):
+        with pytest.raises(ExportError, match=f"solo puede exportar dentro de {folder}"):
+            check_destination(str(elsewhere), protected, inside=folder)
+    (folder / "out").symlink_to(tmp_path)  # a way out by a link
+    with pytest.raises(ExportError, match="por un enlace"):
+        check_destination(str(folder / "out" / "mine"), protected, inside=folder)
+
+
+def test_a_wide_folder_needs_few_descriptors(tmp_path: Path) -> None:
+    """S2: one descriptor per queued subfolder ran out in a node_modules; now only the path
+    being walked is open, so 300 folders copy with 40 descriptors to spare."""
+    import resource
+
+    work = tmp_path / "work"
+    for i in range(300):
+        (work / "node_modules" / f"pkg{i}").mkdir(parents=True)
+        (work / "node_modules" / f"pkg{i}" / "index.js").write_text("x")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    already = len(os.listdir("/dev/fd"))  # what the test run holds open already
+    resource.setrlimit(resource.RLIMIT_NOFILE, (already + 40, hard))
+    try:
+        result = export_tree(work, tmp_path / "out")
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert (result.files, result.folders) == (300, 301)
+    assert (tmp_path / "out" / "node_modules" / "pkg299" / "index.js").read_text() == "x"
+
+
+def test_a_folder_that_cannot_be_read_is_an_export_error(
+    source: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing(*_: object) -> None:
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(export, "_count", failing)
+    with pytest.raises(ExportError, match="no se puede leer la carpeta de trabajo"):
+        export_tree(source, tmp_path / "out")
+    assert not (tmp_path / "out").exists()

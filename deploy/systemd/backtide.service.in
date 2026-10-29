@@ -22,7 +22,10 @@ UMask=0077
 CapabilityBoundingSet=@CAPABILITIES@
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=@STATE_DIR@ @VOLUME_MOUNT@
+# The owner's exported copies (`backtide exportar`): the one more folder it may write, and
+# where it is told to write them (code review of 2026-10-29, S1).
+ReadWritePaths=@STATE_DIR@ @VOLUME_MOUNT@ -@EXPORT_DIR@
+Environment=@EXPORT_DIR_ENV@=@EXPORT_DIR@
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelModules=yes

@@ -564,6 +564,7 @@ def test_the_second_run_finds_the_same_manifest(machine: Machine, key_file: Path
     [
         ("useradd",),
         ("dnf", "-y", "install"),
+        ("systemctl", "reload", "docker.service"),  # I1: after live-restore was written
         ("docker", "pull"),
         ("mkfs.btrfs", "-O"),
         ("docker", "network", "create"),
@@ -595,6 +596,20 @@ def test_an_install_cut_at_any_step_goes_on_from_there(
         ), kind
     assert machine.networks == clean.networks and machine.images == clean.images
     assert manifest.load(machine.paths.manifest).steps == manifest.load(clean.paths.manifest).steps
+
+
+def test_a_config_written_before_a_bad_key_is_still_backtides(
+    machine: Machine, key_file: Path, tmp_path: Path
+) -> None:
+    """I2 of the code review: the config is recorded as soon as it is written, so a run that
+    stops at a key of the wrong shape does not leave it looking like the person's."""
+    bad = tmp_path / "bad.txt"
+    bad.write_text("not a key\n")
+    with pytest.raises(InstallError):
+        installer(machine, key_file=bad).install()
+    assert str(machine.paths.config_file) in manifest.load(machine.paths.manifest).created["files"]
+    installer(machine, key_file=key_file).install()
+    assert str(machine.paths.config_file) in manifest.load(machine.paths.manifest).created["files"]
 
 
 def test_a_cut_between_mounting_and_sealing_seals_without_preparing_again(

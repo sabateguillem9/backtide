@@ -464,7 +464,7 @@ backtide está instalado en la VM $VM de este Mac y vigila al agente.
 Lo que hay que saber de un Mac:
   - Si el Mac duerme, la VM duerme: el agente se para y no llegan avisos hasta que despierta.
   - Tras reiniciar el Mac la VM queda parada: cualquier \`backtide ...\` la arranca, o \`backtide vm arrancar\`.
-  - Los archivos del agente viven en la VM, no en tu Mac: \`backtide exportar\` los copia a una carpeta
-    de la VM y \`backtide vm shell\` te lleva allí (traerlos al Mac de un paso aún no está).
+  - Los archivos del agente viven en la VM, no en tu Mac: \`backtide exportar /var/lib/backtide-export/<nombre>\`
+    los copia allí, dentro de la VM, y \`backtide vm shell\` te lleva (traerlos al Mac de un paso aún no está).
   - Al despertar, Lima pone la hora de la VM con la del Mac en unos segundos; \`backtide comprobar\` lo mira.
 EOF

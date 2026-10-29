@@ -173,6 +173,7 @@ class Paths:
     blackbox_db: Path = layout.BLACKBOX_DB
     volume_image: Path = layout.VOLUME_IMAGE
     volume_mount: Path = layout.VOLUME_MOUNT
+    export_dir: Path = layout.EXPORT_DIR
     channel_dir: Path = layout.PROXY_CHANNEL_DIR
     manifest: Path = layout.MANIFEST
     unit_dir: Path = layout.UNIT_DIR
@@ -427,6 +428,8 @@ class Installer:
             self.manifest.add("dirs", self.paths.keys_dir)
         if self._ensure_dir(self.paths.config_dir, DIR_MODE_CONFIG, (root_uid, root_gid)):
             self.manifest.add("dirs", self.paths.config_dir)
+        if self._ensure_dir(self.paths.export_dir, 0o700, self.owner):
+            self.manifest.add("dirs", self.paths.export_dir)
 
     def tools(self) -> None:
         missing = packages.missing_tools(self.host)
@@ -551,6 +554,7 @@ class Installer:
                                   f"({saved}).")  # fmt: skip
             self._write(self.paths.config_file, text or self.render_config(), 0o600, self.owner)
             self.manifest.add("files", self.paths.config_file)
+            self._save()  # before anything below can stop the run (code review I2)
             written = True
         if written and os.path.lexists(saved):
             saved.unlink()  # back in /etc/backtide: one copy only
@@ -1176,23 +1180,32 @@ class Installer:
         )
         path = self.paths.daemon_json
         settings, existed = self._daemon_settings(path)
+        # A daemon.json an earlier, cut run made is ours, not the person's: no backup of it.
+        existed = existed and not self.manifest.has("files", path)
         backup = self.paths.state_dir / "docker-daemon.json.antes"
         if existed and not os.path.lexists(backup):
             self._write(backup, path.read_text(encoding="utf-8"), 0o600, self.owner)
             self.manifest.add("files", backup)
+            self._save()
+        # Each change is recorded BEFORE it is made (code review of 2026-10-29, I1): a run cut
+        # after writing but before saving took its own change for the person's setting next
+        # time, and the uninstall left it. Undoing a change that was not made yet is harmless.
         changed = self.manifest.facts.setdefault("daemon_json", [])
+        if not existed:
+            self.manifest.add("files", path)
         if settings.get("live-restore") is not True:
-            settings["live-restore"] = True
-            self._write_daemon(path, settings, existed)
             if "live-restore" not in changed:
                 changed.append("live-restore")
+            self._save()
+            settings["live-restore"] = True
+            self._write_daemon(path, settings, existed)
             self._check(("systemctl", "reload", "docker.service"), "Docker no recargó su ajuste")
             self._wait_for_docker()
-        settings["selinux-enabled"] = True
-        self._write_daemon(path, settings, existed)
         if "selinux-enabled" not in changed:
             changed.append("selinux-enabled")
         self._save()
+        settings["selinux-enabled"] = True
+        self._write_daemon(path, settings, existed)
         self._check(("systemctl", "restart", "docker.service"), "Docker no volvió a arrancar")
         self._wait_for_docker()
 

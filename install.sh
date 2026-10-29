@@ -83,6 +83,11 @@ install_release() {
     && chmod 0755 "$1/.venv/bin/backtide.new" && mv "$1/.venv/bin/backtide.new" "$1/.venv/bin/backtide"
 }
 
+# A file named for `backtide instalar` (--*-archivo), from where this ran: `cd /` comes first (I3).
+absolute() {
+  case "$1" in /* | -) printf '%s' "$1" ;; *) printf '%s/%s' "$(pwd)" "$1" ;; esac
+}
+
 # Take --desde and --sha256 out; everything else stays, in order, for `backtide instalar`.
 DRY_RUN=0 SOURCE= SOURCE_SHA256= NOTICE=1
 left=$#
@@ -93,6 +98,9 @@ while [ "$left" -gt 0 ]; do
       [ "$left" -gt 0 ] || die "$arg necesita un valor"
       if [ "$arg" = --desde ]; then SOURCE=$1; else SOURCE_SHA256=$1; fi
       shift; left=$((left - 1)) ;;
+    --*-archivo) [ "$left" -gt 0 ] || die "$arg necesita un valor"
+      set -- "$@" "$arg" "$(absolute "$1")"; shift; left=$((left - 1)) ;;
+    --*-archivo=*) set -- "$@" "${arg%%=*}=$(absolute "${arg#*=}")" ;;
     --dry-run) DRY_RUN=1; set -- "$@" "$arg" ;;
     --sin-aviso) NOTICE=0 ;;  # install-mac.sh has shown the notice already
     *) set -- "$@" "$arg" ;;
@@ -166,8 +174,9 @@ RELEASE=$OPT/releases/$VERSION-$(printf '%s' "$GOT" | cut -c1-12)
 if [ "$DRY_RUN" = 1 ]; then
   say "--dry-run: instalaría uv $UV_VERSION en $OPT/uv, la versión $VERSION en $RELEASE (sin"
   say "construir nada) y después ejecutaría \`backtide instalar\`. No se ha cambiado nada."
-  [ -x "$OPT/current/.venv/bin/backtide" ] && exec "$OPT/current/.venv/bin/backtide" instalar "$@"
-  exit 0
+  [ -x "$OPT/current/.venv/bin/backtide" ] || { say "la máquina NO se ha comprobado: sin --dry-run, se comprueba antes de cambiar nada"; exit 0; }
+  say "lo de abajo es de la versión ya instalada, no de $VERSION"
+  exec "$OPT/current/.venv/bin/backtide" instalar "$@"
 fi
 
 umask 022

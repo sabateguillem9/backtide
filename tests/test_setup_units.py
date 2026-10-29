@@ -73,7 +73,9 @@ SERVICE = {
     "CapabilityBoundingSet": [" ".join(layout.SERVICE_CAPABILITIES)],
     "NoNewPrivileges": ["yes"],
     "ProtectSystem": ["strict"],
-    "ReadWritePaths": [f"{layout.STATE_DIR} {layout.VOLUME_MOUNT}"],
+    # The export folder with "-": a service whose folder is missing still starts (S1).
+    "ReadWritePaths": [f"{layout.STATE_DIR} {layout.VOLUME_MOUNT} -{layout.EXPORT_DIR}"],
+    "Environment": [f"BACKTIDE_EXPORT_DIR={layout.EXPORT_DIR}"],
     "ProtectHome": ["yes"],
     "PrivateTmp": ["yes"],
     "ProtectKernelModules": ["yes"],
@@ -156,6 +158,8 @@ def test_no_placeholder_or_specifier_is_left(rendered: dict[str, str]) -> None:
 
 def test_no_secret_reaches_a_unit(rendered: dict[str, str]) -> None:
     for name, text in rendered.items():
+        # One variable only, and not a secret: where `backtide exportar` may write (S1).
+        text = text.replace(f"Environment=BACKTIDE_EXPORT_DIR={layout.EXPORT_DIR}\n", "")
         lowered = text.lower()
         assert "environment" not in lowered, name
         assert "credential" not in lowered, name

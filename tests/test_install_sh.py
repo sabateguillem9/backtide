@@ -31,8 +31,9 @@ def test_it_is_valid_posix_sh_and_short_enough_to_read() -> None:
     assert "\nset -eu\n" in TEXT
     # docs/25 said "unas 100–150 líneas"; T14's check of requirements.txt and the venv without
     # building (about 40 lines) and the review's hardening (about 15) took it past that.
-    # The check before the version in use changes (review of D27) took it a little past 210.
-    assert len(TEXT.splitlines()) <= 215
+    # The check before the version in use changes (review of D27) took it a little past 210,
+    # and the code review of 2026-10-29 (absolute file paths, I3; an honest --dry-run, I4) to 221.
+    assert len(TEXT.splitlines()) <= 222
 
 
 def test_uv_is_pinned_by_version_and_hash() -> None:
@@ -463,3 +464,32 @@ def test_what_the_run_would_refuse_is_checked_before_the_version_in_use_changes(
     assert TEXT[check:].split("\n", 1)[0].endswith('|| die "no se ha cambiado la versión en uso"')
     # At column 0, on the script's own path: never inside an if/else that could skip it.
     assert TEXT[check - 1] == "\n"
+
+
+def test_files_named_on_the_command_line_are_made_absolute_before_moving_to_root(
+    tmp_path: Path,
+) -> None:
+    """I3 of the code review of 2026-10-29: `cd /` came before `backtide instalar` read a
+    relative --clave-archivo, which failed only at step 10, after pulling the images."""
+    start = TEXT.index("# Take --desde and --sha256 out")
+    loop = TEXT[start : TEXT.index("\ndone\n", start) + len("\ndone\n")]
+    assert TEXT.index(loop) < TEXT.index("\ncd /")
+    script = (
+        'die() { echo "$*" >&2; exit 2; }\n' + function("absolute") + loop + 'printf "%s\\n" "$@"\n'
+    )
+    args = ["--clave-archivo", "k.txt", "--telegram-token-archivo=t.txt", "--clave-archivo=/abs",
+            "--desde", "b.tar", "--perfil", "claude-code", "--telegram-token-archivo", "-"]  # fmt: skip
+    ran = subprocess.run(["sh", "-c", script, "install.sh", *args], cwd=tmp_path,
+                         capture_output=True, text=True, check=True)  # fmt: skip
+    here = os.path.realpath(tmp_path)
+    assert ran.stdout.splitlines() == [
+        "--clave-archivo", f"{here}/k.txt", f"--telegram-token-archivo={here}/t.txt",
+        "--clave-archivo=/abs", "--perfil", "claude-code", "--telegram-token-archivo", "-",
+    ]  # fmt: skip
+
+
+def test_a_dry_run_with_nothing_installed_says_nothing_was_checked() -> None:
+    """I4: exiting 0 after two lines read like a passed check."""
+    dry = TEXT[TEXT.index('if [ "$DRY_RUN" = 1 ]; then') :]
+    dry = dry[: dry.index("\nfi\n")]
+    assert "NO se ha comprobado" in dry and "versión ya instalada" in dry

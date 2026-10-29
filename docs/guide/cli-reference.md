@@ -366,7 +366,7 @@ backtide exportar DEST [--config FILE] [--git FOLDER] [--incluir-config]
 
 | Argument / flag | Default | Effect |
 |---|---|---|
-| `DEST` | required | An absolute path that does **not exist yet**, in a folder that does. It cannot be inside a folder backtide protects. backtide never writes over anything |
+| `DEST` | required | An absolute path that does **not exist yet**, in a folder that does. It cannot be inside a folder backtide protects. backtide never writes over anything. On an **installed** backtide it must be inside `/var/lib/backtide-export/` (root's): the service is sandboxed by systemd and cannot write anywhere else. The uninstaller removes that folder only when it is empty |
 | `--git FOLDER` | off | Export only the git commits of that repository (a folder of `/workspace/work`, or `.` for the whole work folder), as one git **bundle** file at `DEST`. The agent makes the bundle inside its container |
 | `--incluir-config` | off | Also copy what your tools can run or read by themselves when you open the folder (see below). Cannot be combined with `--git` |
 
@@ -545,7 +545,7 @@ Only the web's port is forwarded, to the Mac's `127.0.0.1:8765`: `backtide enlac
 
 - **When the Mac sleeps, the VM sleeps.** The agent stops, and no alert reaches you, until the Mac wakes up. backtide on a Mac watches an agent while you use the Mac; for an agent that runs all night, use a Linux machine.
 - **After a restart of the Mac the VM is stopped.** Any `backtide …` command starts it again, or `backtide vm arrancar`.
-- **The agent's files live in the VM, not on your Mac.** `backtide exportar <folder>` copies them to a new folder inside the VM, and `backtide vm shell` gets you there. Bringing them to the Mac in one step is not there yet.
+- **The agent's files live in the VM, not on your Mac.** `backtide exportar /var/lib/backtide-export/<name>` copies them to a new folder there, inside the VM, and `backtide vm shell` gets you there. Bringing them to the Mac in one step is not there yet.
 - **The VM's clock.** While the Mac sleeps, the VM's clock stops. When it wakes, Lima's guest agent sets it from the Mac's within seconds (measured: a VM two hours behind was right again in under 10 seconds), and until then backtide does not prune old snapshots, because pruning refuses to run on a clock that is not synchronized. `backtide comprobar` says whether it is.
 - **Port 8765 must be free on the Mac.** The web checks that it is called as `127.0.0.1:8765`, so the VM's port and the Mac's must be the same. `make web-demo` uses the same port: close one before the other.
 - **Telegram is optional**: `--telegram` (above), or later in the web (`backtide enlace`), Settings > Alerts.

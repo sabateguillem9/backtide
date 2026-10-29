@@ -682,3 +682,24 @@ def test_erasing_takes_all_of_etc_backtide_with_it(machine: Machine) -> None:
     assert not machine.paths.config_dir.exists()
     guide = (Path(__file__).parents[1] / "docs" / "guide" / "cli-reference.md").read_text()
     assert "`/etc/backtide` goes whole, your own `prices.toml` included" in guide
+
+
+def test_the_owners_exported_copies_are_never_removed_nor_announced(machine: Machine) -> None:
+    """Code review of 2026-10-29: the export folder goes only when empty; with copies in it, it
+    is neither listed among what goes nor removed, even with --borrar-datos."""
+    copy = machine.paths.export_dir / "mine" / "notes.txt"
+    copy.parent.mkdir()
+    copy.write_text("mine\n")
+    prompter = Answering()
+    assert remover(machine, prompter, erase_data=True).uninstall()
+    assert copy.read_text() == "mine\n"
+    said = "\n".join(prompter.said)
+    assert "tus copias exportadas" in said
+    listed = said.split("== ", 1)[0]  # what the confirmation lists, before the first step
+    assert str(machine.paths.export_dir) not in listed
+
+
+def test_an_empty_export_folder_goes_with_the_rest(machine: Machine) -> None:
+    assert machine.paths.export_dir.is_dir()
+    assert remover(machine).uninstall()
+    assert not machine.paths.export_dir.exists()

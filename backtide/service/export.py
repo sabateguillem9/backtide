@@ -55,7 +55,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any
@@ -102,6 +102,11 @@ CONFIG_NAMES = frozenset(
 CONFIG_SUFFIXES = (".code-workspace",)  # a VS Code workspace: its settings, tasks, extensions
 
 
+# Set by an installed service's unit (deploy/systemd/backtide.service.in): the only folder that
+# systemd lets the service write the owner's copies to (code review of 2026-10-29, S1).
+EXPORT_DIR_ENV = "BACKTIDE_EXPORT_DIR"
+
+
 class ExportError(Exception):
     """The export cannot be done. The message is Spanish, for the owner; it quotes the owner's
     destination, never a name from the workspace."""
@@ -136,11 +141,15 @@ class ExportResult:
         }
 
 
-def check_destination(text: object, protected: Iterable[Path]) -> Path:
+def check_destination(
+    text: object, protected: Iterable[Path], *, inside: Path | None = None
+) -> Path:
     """The owner's destination as a Path, or ExportError: an absolute path without ``..``, NUL or
     trailing separators, whose parent folder exists, that does not exist itself, and that is
     neither inside nor around any of ``protected`` (after resolving the parent's links: the
-    owner's own path may have them)."""
+    owner's own path may have them). With ``inside`` (an installed service, which systemd keeps
+    from writing anywhere else: code review of 2026-10-29, S1), it must also be in that folder,
+    checked first so that the owner hears where to export instead of a misleading error."""
     if not isinstance(text, str) or not text or len(text) > MAX_PATH or "\0" in text:
         raise ExportError("la carpeta de destino no es una ruta válida")
     path = Path(text)
@@ -148,6 +157,11 @@ def check_destination(text: object, protected: Iterable[Path]) -> Path:
         raise ExportError(f"el destino tiene que ser una ruta absoluta y sin '..': {text}")
     if path == path.parent:
         raise ExportError("el destino no puede ser la raíz")
+    if inside is not None and not path.is_relative_to(inside):
+        raise ExportError(
+            f"en una instalación, backtide solo puede exportar dentro de {inside} (el servicio "
+            f"está aislado y no ve otras carpetas): por ejemplo {inside / 'mi-trabajo'}"
+        )
     try:
         parent = path.parent.resolve(strict=True)
     except OSError:
@@ -157,6 +171,8 @@ def check_destination(text: object, protected: Iterable[Path]) -> Path:
     if os.path.lexists(path):
         raise ExportError(f"ya existe {path}: elige una carpeta nueva (nunca se sobrescribe nada)")
     target = parent / path.name
+    if inside is not None and not target.is_relative_to(Path(os.path.realpath(inside))):
+        raise ExportError(f"{path} sale de {inside} por un enlace: elige una carpeta dentro")
     _refuse_code_places(target, path)
     for folder in protected:
         guarded = Path(os.path.realpath(folder))
@@ -216,8 +232,14 @@ def export_tree(source: Path, destination: Path, *, include_config: bool = False
             f"({os.strerror(error.errno or 0)}): ¿es un enlace?"
         ) from None
     try:
-        root_is_repo = _shaped_like_a_repo(source_fd)
-        counted = _count(source_fd, root_is_repo, include_config)
+        try:
+            root_is_repo = _shaped_like_a_repo(source_fd)
+            counted = _count(source_fd, root_is_repo, include_config)
+        except OSError as error:
+            raise ExportError(
+                f"no se puede leer la carpeta de trabajo en la instantánea "
+                f"({os.strerror(error.errno or 0)}): no se ha copiado nada"
+            ) from None
         if counted.bytes > MAX_BYTES or counted.files + counted.folders > MAX_ENTRIES:
             raise ExportError(
                 f"la carpeta de trabajo es demasiado grande para exportarla ({counted.bytes} "
@@ -357,31 +379,45 @@ def _kind(dir_fd: int, name: str) -> tuple[str, os.stat_result]:
     return "other", info
 
 
+def _enter(stack: list[Any], fd: int, *rest: Any) -> None:
+    """Push the folder open at ``fd`` with its sorted names; ``fd`` is closed if they cannot
+    be read. The walks below keep a folder open only while it is on the path being walked: at
+    most MAX_DEPTH + 1 of them however wide a folder is (code review of 2026-10-29, S2: one
+    per queued subfolder ran out of descriptors in a node_modules)."""
+    try:
+        names = iter(sorted(os.listdir(fd)))
+    except BaseException:
+        os.close(fd)
+        raise
+    stack.append((fd, *rest, names))
+
+
 def _count(root_fd: int, root_is_repo: bool, include_config: bool) -> ExportResult:
     """What the copy would take, without writing anything (nor counting what it skips)."""
     tally = _Tally()
     flags = (root_is_repo, include_config)
-    stack = [(os.dup(root_fd), 0)]
+    stack: list[tuple[int, int, Iterator[str]]] = []
+    _enter(stack, os.dup(root_fd), 0)
     try:
         while stack:
-            fd, depth = stack.pop()
-            try:
-                for name in sorted(os.listdir(fd)):
-                    kind, info = _kind(fd, name)
-                    if kind == "link" or _skip(name, kind, fd, depth, flags):
-                        continue
-                    if kind == "file":
-                        tally.files += 1
-                        tally.bytes += info.st_size
-                    elif kind == "dir" and depth + 1 <= MAX_DEPTH:
-                        tally.folders += 1
-                        stack.append((os.open(name, _DIR_FLAGS, dir_fd=fd), depth + 1))
-                    if tally.files + tally.folders > MAX_ENTRIES or tally.bytes > MAX_BYTES:
-                        return tally.result()
-            finally:
-                os.close(fd)
+            fd, depth, names = stack[-1]
+            name = next(names, None)
+            if name is None:
+                os.close(stack.pop()[0])
+                continue
+            kind, info = _kind(fd, name)
+            if kind == "link" or _skip(name, kind, fd, depth, flags):
+                continue
+            if kind == "file":
+                tally.files += 1
+                tally.bytes += info.st_size
+            elif kind == "dir" and depth + 1 <= MAX_DEPTH:
+                tally.folders += 1
+                _enter(stack, os.open(name, _DIR_FLAGS, dir_fd=fd), depth + 1)
+            if tally.files + tally.folders > MAX_ENTRIES or tally.bytes > MAX_BYTES:
+                return tally.result()
     finally:
-        for fd, _ in stack:
+        for fd, *_ in stack:
             os.close(fd)
     return tally.result()
 
@@ -391,54 +427,70 @@ def _copy(
 ) -> ExportResult:
     tally = _Tally()
     flags = (root_is_repo, include_config)
-    stack = [(os.dup(source_fd), os.dup(destination_fd), 0, "")]
+    stack: list[tuple[int, int, int, str, Iterator[str]]] = []
+    destination = os.dup(destination_fd)
+    try:
+        _enter(stack, os.dup(source_fd), destination, 0, "")
+    except BaseException:
+        os.close(destination)
+        raise
     try:
         while stack:
-            src, dst, depth, prefix = stack.pop()
-            try:
-                for name in sorted(os.listdir(src)):
-                    kind, info = _kind(src, name)
-                    relative = f"{prefix}{name}"
-                    if kind == "link":
-                        tally.skipped_links += 1
-                    elif why := _skip(name, kind, src, depth, flags):
-                        tally.skip(why, relative)
-                    elif kind == "dir":
-                        if depth + 1 > MAX_DEPTH:
-                            tally.skipped_other += 1
-                            continue
-                        child = os.open(name, _DIR_FLAGS, dir_fd=src)
-                        try:
-                            os.mkdir(name, 0o700, dir_fd=dst)
-                            made = os.open(name, _DIR_FLAGS, dir_fd=dst)
-                        except FileExistsError:  # the destination ignores case (APFS)
-                            os.close(child)
-                            tally.skip("case", relative)
-                            continue
-                        except BaseException:
-                            os.close(child)
-                            raise
-                        os.fchmod(made, info.st_mode & _KEPT_BITS | 0o700)
-                        tally.folders += 1
-                        stack.append((child, made, depth + 1, f"{relative}/"))
-                    elif kind == "file":
-                        try:
-                            copied = _copy_file(src, dst, name)
-                        except FileExistsError:  # the destination ignores case (APFS)
-                            tally.skip("case", relative)
-                            continue
-                        if copied:
-                            tally.files += 1
-                            tally.bytes += info.st_size
-                        else:
-                            tally.skipped_other += 1
-                    else:
-                        tally.skipped_other += 1
-            finally:
+            src, dst, depth, prefix, names = stack[-1]
+            name = next(names, None)
+            if name is None:
+                stack.pop()
                 os.close(src)
                 os.close(dst)
+                continue
+            kind, info = _kind(src, name)
+            relative = f"{prefix}{name}"
+            if kind == "link":
+                tally.skipped_links += 1
+            elif why := _skip(name, kind, src, depth, flags):
+                tally.skip(why, relative)
+            elif kind == "dir":
+                if depth + 1 > MAX_DEPTH:
+                    tally.skipped_other += 1
+                    continue
+                child = os.open(name, _DIR_FLAGS, dir_fd=src)
+                try:
+                    os.mkdir(name, 0o700, dir_fd=dst)
+                    made = os.open(name, _DIR_FLAGS, dir_fd=dst)
+                except FileExistsError:  # the destination ignores case (APFS)
+                    os.close(child)
+                    tally.skip("case", relative)
+                    continue
+                except BaseException:
+                    os.close(child)
+                    raise
+                try:
+                    os.fchmod(made, info.st_mode & _KEPT_BITS | 0o700)
+                except BaseException:
+                    os.close(child)
+                    os.close(made)
+                    raise
+                tally.folders += 1
+                try:
+                    _enter(stack, child, made, depth + 1, f"{relative}/")
+                except BaseException:
+                    os.close(made)
+                    raise
+            elif kind == "file":
+                try:
+                    copied = _copy_file(src, dst, name)
+                except FileExistsError:  # the destination ignores case (APFS)
+                    tally.skip("case", relative)
+                    continue
+                if copied:
+                    tally.files += 1
+                    tally.bytes += info.st_size
+                else:
+                    tally.skipped_other += 1
+            else:
+                tally.skipped_other += 1
     finally:
-        for src, dst, _, _ in stack:
+        for src, dst, *_ in stack:
             os.close(src)
             os.close(dst)
     return tally.result()

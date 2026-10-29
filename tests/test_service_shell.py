@@ -182,6 +182,34 @@ def test_an_export_that_fails_is_recorded(shell_world: World, tmp_path: Path) ->
     assert shell_world.only("export_failed").risk == 1
 
 
+def test_any_failure_of_the_copy_is_recorded(
+    shell_world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2: not only an ExportError: a raw error is recorded too, by its kind only (an OSError
+    may quote a name the agent chose), and the owner is told."""
+    from backtide.service import guardian
+
+    def failing(*_: object, **__: object) -> None:
+        raise OSError(24, "Too many open files", "agent-chosen-name")
+
+    monkeypatch.setattr(guardian, "export_tree", failing)
+    outcome = shell_world.guardian.export(str(tmp_path / "out"), requested_by="cli")
+    assert outcome.status is ExportStatus.FAILED and "inesperado" in outcome.message
+    assert shell_world.only("export_failed").details["error"] == "OSError"
+
+
+def test_an_installed_service_says_where_to_export(
+    shell_world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backtide.service.export import EXPORT_DIR_ENV
+
+    folder = tmp_path / "backtide-export"
+    folder.mkdir()
+    monkeypatch.setenv(EXPORT_DIR_ENV, str(folder))
+    outcome = shell_world.guardian.export(str(tmp_path / "out"), requested_by="cli")
+    assert outcome.status is ExportStatus.INVALID and str(folder) in outcome.message
+
+
 def test_no_snapshot_no_export(shell_world: World, tmp_path: Path) -> None:
     from backtide.snapshots import SnapshotError
 

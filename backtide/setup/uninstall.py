@@ -28,7 +28,8 @@ half way (a busy mount, a network someone else is using) is run again and goes o
 5. ``docker_settings``: ``selinux-enabled`` back with one restart of Docker (``live-restore``
    still on, so other containers keep running), then ``live-restore`` with a reload.
 6. ``docker``: with --quitar-docker only.
-7. ``config``, ``program``, ``accounts``: ``/etc/backtide``, the command, ``backtide-web``.
+7. ``config``, ``exports``, ``program``, ``accounts``: ``/etc/backtide``, the export folder (only
+   when empty: the copies are the owner's), the command, ``backtide-web``.
 8. ``data``: with --borrar-datos, ``/var/lib/backtide``; without it, the manifest is kept with
    what is left, for the next install.
 9. ``opt``: ``/opt/backtide``, the program itself, last (this program runs from it: everything
@@ -146,6 +147,7 @@ class Uninstaller:
             ("Ajustes de Docker", self.docker_settings),
             ("Docker", self.docker),
             ("Configuración", self.config),
+            ("Copias exportadas", self.exports),
             (f"Usuario {layout.WEB_USER}", self.accounts),
             ("Datos", self.data),
             # The command and the program last: until then a run that stops can be run again.
@@ -604,6 +606,20 @@ class Uninstaller:
                 self._rmtree(Path(item))
         self._unlink(self.paths.manifest)
 
+    def exports(self) -> None:
+        """The folder of `backtide exportar`: removed when empty; what the owner exported is
+        theirs, even with --borrar-datos (which erases backtide's data, not the owner's)."""
+        folder = self.paths.export_dir
+        if not self.manifest.has("dirs", folder):
+            return
+        if self._exists(folder) and self._listdir(folder):
+            self._left.append(f"{folder}: tus copias exportadas, que no se tocan")
+            return
+        if not self._exists(folder) or self._rmdir(folder):
+            self._did(f"carpeta {folder}")
+        self.manifest.remove("dirs", folder)
+        self._save()
+
     def opt(self) -> None:
         folder = self.paths.opt_dir
         if not self.manifest.has("dirs", folder):
@@ -734,6 +750,8 @@ class Uninstaller:
                 continue  # said apart: back as it was, not removed
             if path == self.paths.volume_mount and not os.path.lexists(path):
                 continue
+            if path == self.paths.export_dir and self._exists(path) and self._listdir(path):
+                continue  # the owner's copies: kept, and said so after (exports)
             if self._ours(path) and os.path.lexists(path) and path not in found:
                 found.append(path)
         return found
@@ -956,6 +974,7 @@ class Uninstaller:
         p = self.paths
         trees = (p.opt_dir, p.config_dir, p.state_dir, p.volume_mount)
         exact = {p.bin_link, p.apt_keyring, p.apt_source, p.dnf_repo, p.rpm_key, p.daemon_json,
+                 p.export_dir,  # the folder only, emptied by nobody but the owner
                  *(p.unit_dir / name for name in self._unit_names)}  # fmt: skip
         return path in exact or any(path == t or path.is_relative_to(t) for t in trees)
 
