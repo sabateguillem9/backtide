@@ -18,8 +18,8 @@
     {% if hold %}
     <div class="hold-one">
       <p class="hold-id"><span class="sid">{{ hold.id }}</span> · <span class="hold-risk risk-{{ hold.risk }}"><span class="dot dot-{{ hold.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ hold.risk) }}</span> · {{ t('wait.left') }} <span class="num">{{ countdown(hold.left(now)) }}</span></p>
-      {% if hold.action %}<p class="req-what" lang="es">{{ hold.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
-      {% if hold.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ hold.notes | join('; ') }}.</span></p>{% endif %}
+      {% set ours = hold.words(t.language) %}{% if ours.action %}<p class="req-what" lang="{{ ours.lang }}">{{ ours.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
+      {% if ours.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="{{ ours.lang }}">{{ ours.notes | join('; ') }}.</span></p>{% endif %}
       {% if hold.domains %}<p class="req-notes"><span class="muted">{{ t('hold.domains') }}</span> {% for d in hold.domains %}<span class="name">{{ vis_mid(d, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
       <div class="req-agent">
         <p class="req-agent-head">{{ t('hold.agent') }}</p>
@@ -33,11 +33,11 @@
       <p><a class="settings-back" href="{{ base }}/peticiones/ver?id={{ hold.id | urlencode }}">{{ t('wait.view') }}</a></p>
     </div>
     {% elif batch %}
-    <p class="hold-rule-what">{{ t('holds.batch.' ~ batch.scope) }}{% if batch.translator %} · <span lang="es">{{ api(batch.translator) }}</span>{% endif %}</p>
+    <p class="hold-rule-what">{{ t('holds.batch.' ~ batch.scope) }}{% if batch.translator %} · <span lang="{{ t.language }}">{{ api(batch.translator) }}</span>{% endif %}</p>
     {% if batch.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in batch.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
     {% if batch.request %}<p><span class="name">{{ vis(batch.request, 300) }}</span></p>{% endif %}
     {% elif trust %}
-    <p class="hold-rule-what"><span lang="es">{{ api(trust.translator) }}</span> · <span class="name">{{ vis_mid(trust.recipient, 120) }}</span></p>
+    <p class="hold-rule-what"><span lang="{{ t.language }}">{{ api(trust.translator) }}</span> · <span class="name">{{ vis_mid(trust.recipient, 120) }}</span></p>
     {% endif %}
     <p class="note">{{ t('hold.confirm.' ~ verb ~ '.note') }}</p>
     {% if verb == 'confiar' %}<p class="settings-warning">{{ ic('warning') }}<span>{{ t('hold.confirm.confiar.warning') }}</span></p>

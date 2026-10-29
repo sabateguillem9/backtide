@@ -94,3 +94,46 @@ def test_a_long_recipient_is_cut_in_the_middle_keeping_its_domain() -> None:
     assert cut_middle("ana@ejemplo.com") == "ana@ejemplo.com"
     said = describe(reading(translator="gmail", recipients=[long], first_lines=None))
     assert said.endswith(".malo.io") and "…(" in said
+
+
+# -- the English web (the gate's phrases in both languages) ---------------------------------------
+
+
+def test_every_word_we_say_in_spanish_we_also_say_in_english() -> None:
+    from backtide.gate import phrase
+
+    pairs = (
+        (phrase._API, phrase._API_EN),
+        (phrase._GIT, phrase._GIT_EN),
+        (phrase._VERBS, phrase._VERBS_EN),
+        (phrase._NOTES, phrase._NOTES_EN),
+    )
+    for spanish, english in pairs:
+        assert set(spanish) == set(english), set(spanish) ^ set(english)
+        assert all(english.values())
+    assert set(phrase._WORDS["es"]) == set(phrase._WORDS["en"])
+    assert set(phrase._NO_API) == set(phrase.LANGUAGES)
+
+
+def test_the_phrase_speaks_english_only_when_asked() -> None:
+    from backtide.gate.phrase import action, api_name, note_texts
+
+    push = reading(translator="git", effect="delete", notes=["moves_ref"], cut=True)
+    assert action(push) == "git: push que borra ramas o etiquetas"
+    assert action(push, "en") == "git: push that deletes branches or tags"
+    assert note_texts(push, "en") == [
+        "it moves a branch or tag that already exists: backtide cannot know if it is a forced push",
+        "backtide does not see the code it carries",
+        "cut short: it was too long",
+    ]
+    assert action(reading(translator="gmail", effect="forward"), "en") == "Gmail: forward an email"
+    assert action(reading(effect="unknown"), "en") == (
+        "Telegram: a request backtide does not understand"
+    )
+    assert api_name("read_post", "en") == "A search engine" and api_name("?", "en") == "An API"
+    assert action(push, "fr") == action(push), "a language we do not speak reads as Spanish"
+
+
+def test_the_record_and_the_notice_stay_in_spanish() -> None:
+    """describe() is what the black box keeps (proxy_channel): its words do not move."""
+    assert describe(reading()) == "Telegram: enviar un mensaje al chat 556: «hola»"

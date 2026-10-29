@@ -21,7 +21,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, tzinfo
-from typing import Any
+from typing import Any, NamedTuple
 
 from backtide.blackbox import Event, Source
 from backtide.gate.phrase import api_name
@@ -141,6 +141,14 @@ class Roster:
 # -- the gate's requests (T10) ------------------------------------------------------------------
 
 
+class OurWords(NamedTuple):
+    """A hold's phrase and notes (backtide.gate.phrase) in one language."""
+
+    lang: str
+    action: str
+    notes: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class PendingRequest:
     """Something an agent wants to do that the gate held until you say yes. ``target`` and
@@ -159,9 +167,12 @@ class PendingRequest:
     # T10-5: a hold of the real gate (``backtide.web.approve.held_request``). ``action`` and
     # ``notes`` are OUR words (backtide.gate.phrase); the rest is the agent's, cut and shown as
     # such. ``seq`` is its gate/held ("Ver"); ``waiting``, whether the agent waits connected;
-    # ``batches`` and ``trustable``, what the person may make of it.
+    # ``batches`` and ``trustable``, what the person may make of it. ``action`` and ``notes``
+    # are in Spanish; ``action_en`` and ``notes_en`` the same words in English (``words``).
     action: str = ""
     notes: tuple[str, ...] = ()
+    action_en: str = ""
+    notes_en: tuple[str, ...] = ()
     recipients: tuple[str, ...] = ()
     more_recipients: int = 0
     reply_to: tuple[str, ...] = ()
@@ -203,8 +214,19 @@ class PendingRequest:
     @property
     def api(self) -> str:
         """The API in our words ("Telegram", "Gmail"), or "" when backtide does not name it."""
-        name = api_name(self.translator)
-        return "" if name == api_name("") else name
+        return self.api_in("es")
+
+    def api_in(self, lang: str) -> str:
+        name = api_name(self.translator, lang)
+        return "" if name == api_name("", lang) else name
+
+    def words(self, lang: str) -> "OurWords":
+        """Our phrase and notes in ``lang``, and the language they are really in: Spanish when
+        there is no English (a request from a demo file), so the page can say so (``lang=``)."""
+        # English only when it is all there: a phrase without its notes would drop a warning.
+        if lang == "en" and self.action and self.action_en and (self.notes_en or not self.notes):
+            return OurWords("en", self.action_en, self.notes_en)
+        return OurWords("es", self.action, self.notes)
 
     @property
     def want(self) -> str:
@@ -264,6 +286,8 @@ def request_from(data: Mapping[str, Any]) -> PendingRequest:
             expires_at=expires,
             action=str(data.get("action", ""))[:200],
             notes=tuple(str(n)[:200] for n in data.get("notes", []) if isinstance(n, str)),
+            action_en=str(data.get("action_en", ""))[:200],
+            notes_en=tuple(str(n)[:200] for n in data.get("notes_en", []) if isinstance(n, str)),
             recipients=tuple(
                 str(r)[:200] for r in data.get("recipients", []) if isinstance(r, str)
             )[:5],

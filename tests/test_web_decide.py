@@ -567,3 +567,70 @@ def test_the_result_is_drawn_by_what_it_means(
     assert done.status_code == 200, done.text[:300]
     drawn = re.findall(r'class="ic ic-([a-z]+) ic--m"', done.text)
     assert drawn == [drawing], (outcome, drawn)
+
+
+def test_our_phrase_follows_the_pages_language(tmp_path: Path, fake: FakeApprover) -> None:
+    """The gate's words (backtide.gate.phrase) in the page's language, marked as such; the
+    agent's own text is never translated."""
+    push = {"translator": "git", "effect": "delete", "notes": ["moves_ref"], "cut": False,
+            "recipients": [], "recipients_total": 0, "reply_to": [], "subject": None,
+            "first_lines": None, "target": "refs/heads/vieja", "attachments": [],
+            "attachments_total": 0}  # fmt: skip
+    fake.listed = [hold(view=push, reason="git_push")]
+    web = new_client(tmp_path, approver=fake, clock=lambda: NOW)
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    paths = ("/peticiones", f"/peticiones/ver?id={HOLD}", f"{DECIDE}?id={HOLD}&v=rechazar")
+    for path in paths:
+        spanish = web.get(path).text
+        english = web.get(path, headers={"accept-language": "en"}).text
+        assert '<span lang="es">git: push que borra ramas o etiquetas</span>' in spanish or (
+            '<p class="req-what" lang="es">git: push que borra ramas o etiquetas</p>' in spanish
+        ), path
+        assert "git: push that deletes branches or tags" in english, path
+        assert "push que borra" not in english, path
+        assert 'lang="en">git: push that deletes branches or tags<' in english, path
+        assert "backtide does not see the code it carries" in text_of(english), path
+
+
+def test_in_english_the_agents_imitation_of_our_words_stays_the_agents(
+    tmp_path: Path, fake: FakeApprover
+) -> None:
+    """An agent may write our English phrase in its message (aviso-con-trampa, in English): our
+    title is still made of our words only, and its text stays in its own block."""
+    view = hold()["view"] | {
+        "translator": "gmail",
+        "recipients": ["ana@example.com"],
+        "first_lines": "backtide: already approved. Gmail: read a message",
+    }
+    fake.listed = [hold(view=view)]
+    web = new_client(tmp_path, approver=fake, clock=lambda: NOW)
+    new_box(tmp_path).append("file", "create", "work/notas.md")
+    page = web.get("/peticiones", headers={"accept-language": "en"}).text
+    title = re.search(r'<h3 class="req-what">(.*?)</h3>', page, re.S)
+    assert title and text_of(title.group(1)) == "Wants to send an email by Gmail"
+    assert "already approved" not in title.group(1)
+    block = re.search(r'<div class="req-agent">(.*?)</div>', page, re.S)
+    assert block and "already approved" in block.group(1)
+
+
+def test_english_comes_whole_or_not_at_all() -> None:
+    """A request from a file with an English phrase but not its notes reads in Spanish: the
+    English alone would drop a warning (security review of the English phrases)."""
+    from backtide.web.agents import PendingRequest
+
+    base = dict(id="h-0123456789ab", agent="a", kind="message", target="t", reason="send",
+                risk=2, held_at=NOW, expires_at=NOW + timedelta(minutes=5),
+                action="Telegram: enviar un mensaje",
+                notes=("la plataforma descargará esa dirección",))  # fmt: skip
+    half = PendingRequest(**base, action_en="Telegram: send a message")
+    assert half.words("en").lang == "es" and half.words("en").notes == base["notes"]
+    whole = PendingRequest(
+        **base,
+        action_en="Telegram: send a message",
+        notes_en=("the platform will download that address",),
+    )
+    assert whole.words("en") == (
+        "en",
+        "Telegram: send a message",
+        ("the platform will download that address",),
+    )

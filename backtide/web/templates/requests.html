@@ -35,9 +35,9 @@
     <div class="req-main">
     <p class="req-who"><a href="{{ who.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(who), 48) }}</span></a> <span class="muted">{{ t('wait.held') }} <time data-ago datetime="{{ r.held_at.isoformat() }}">{{ age(r.held_at) }}</time></span></p>
     {% if r.action or r.request %}
-    <h3 class="req-what">{% if r.want == 'ours' %}<span lang="es">{{ r.action }}</span>{% else %}{{ say('want.' ~ r.want, target=r.target_name, api=r.api) }}{% endif %}</h3>
+    {% set ours = r.words(t.language) %}<h3 class="req-what">{% if r.want == 'ours' %}<span lang="{{ ours.lang }}">{{ ours.action }}</span>{% else %}{{ say('want.' ~ r.want, target=r.target_name, api=r.api_in(t.language)) }}{% endif %}</h3>
     {% if not (cost == 'delete' and r.reason == 'delete') %}<p class="req-cost">{{ t('cost.' ~ cost) }}</p>{% endif %}
-    {% if r.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ r.notes | join('; ') }}.</span></p>{% endif %}
+    {% if ours.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="{{ ours.lang }}">{{ ours.notes | join('; ') }}.</span></p>{% endif %}
     <div class="req-agent">
       <p class="req-agent-head">{{ t('hold.agent') }}</p>
       {% if r.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in r.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}{% if r.more_recipients %} <span class="muted">{{ t('hold.more', n=r.more_recipients) }}</span>{% endif %}</p>{% endif %}

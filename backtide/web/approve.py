@@ -230,6 +230,8 @@ def held_request(
         }
         ours = action(reading)
         notes = tuple(note_texts(reading))
+        ours_en = action(reading, "en")
+        notes_en = tuple(note_texts(reading, "en"))
         recipients = _texts(view.get("recipients"), MAX_RECIPIENT_CHARS)
         total = view.get("recipients_total")
         more = max(0, total - len(recipients)) if type(total) is int else 0
@@ -248,6 +250,7 @@ def held_request(
         trust_off = _trust_off(translator, view.get("effect"), recipients)
     else:
         ours, notes, recipients, more = "", (), (), 0
+        ours_en, notes_en = "", ()
         subject = lines = translator = trust_off = ""
         attachments, reply_to = (), ()
         request = " ".join(
@@ -274,6 +277,8 @@ def held_request(
         detail=subject or lines,
         action=ours,
         notes=notes,
+        action_en=ours_en,
+        notes_en=notes_en,
         recipients=recipients,
         more_recipients=more,
         reply_to=reply_to,

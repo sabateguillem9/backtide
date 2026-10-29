@@ -22,7 +22,7 @@
     <ul class="hold-rules">
       {% for b in batches %}
       <li class="hold-rule">
-        <p class="hold-rule-what">{{ t('holds.batch.' ~ b.scope) }}{% if b.translator %} · <span lang="es">{{ api(b.translator) }}</span>{% endif %}</p>
+        <p class="hold-rule-what">{{ t('holds.batch.' ~ b.scope) }}{% if b.translator %} · <span lang="{{ t.language }}">{{ api(b.translator) }}</span>{% endif %}</p>
         {% if b.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in b.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
         {% if b.request %}<p><span class="name">{{ vis(b.request, 300) }}</span></p>{% endif %}
         <p class="muted">{% if b.until %}{{ t('holds.until', when=stamp(b.until)) }} · {% endif %}{{ t('holds.uses', n=b.uses) }}</p>
@@ -43,7 +43,7 @@
     <ul class="hold-rules">
       {% for x in trusted %}
       <li class="hold-rule">
-        <p class="hold-rule-what"><span lang="es">{{ api(x.translator) }}</span> · <span class="name">{{ vis_mid(x.recipient, 120) }}</span></p>
+        <p class="hold-rule-what"><span lang="{{ t.language }}">{{ api(x.translator) }}</span> · <span class="name">{{ vis_mid(x.recipient, 120) }}</span></p>
         <p class="muted">{% if x.added_at %}{{ t('holds.added', when=stamp(x.added_at)) }}{% endif %}</p>
         <p><a class="req-no" href="{{ base }}/peticiones/decidir?id={{ x.trust_id | urlencode }}&amp;v=olvidar">{{ t('holds.forget') }}</a></p>
       </li>

@@ -10,8 +10,8 @@
   <section class="settings-step" aria-labelledby="hold-view-title">
     <h2 id="hold-view-title"><span class="sid">{{ hold_id }}</span> · <span class="dot dot-{{ risk }}" aria-hidden="true"></span>{{ t('risk.' ~ risk) }}</h2>
     {% if hold %}
-    {% if hold.action %}<p class="req-what" lang="es">{{ hold.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
-    {% if hold.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="es">{{ hold.notes | join('; ') }}.</span></p>{% endif %}
+    {% set ours = hold.words(t.language) %}{% if ours.action %}<p class="req-what" lang="{{ ours.lang }}">{{ ours.action }}</p>{% else %}<p class="req-what">{{ t('hold.plain') }}</p>{% endif %}
+    {% if ours.notes %}<p class="req-notes"><span class="muted">{{ t('hold.notes') }}</span> <span lang="{{ ours.lang }}">{{ ours.notes | join('; ') }}.</span></p>{% endif %}
     <p class="muted">{{ t('wait.left') }} <span class="num">{{ countdown(hold.left(now)) }}</span></p>
     {% else %}
     <p class="note">{{ t('hold.view.closed') }}</p>

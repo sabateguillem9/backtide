@@ -1,5 +1,9 @@
 """The sentence a held request is told with (docs/32, sections 4 and 11): what a translator's
-reading says it does, in Spanish, in one line that reads well on a phone. Pure: no I/O.
+reading says it does, in one line that reads well on a phone. Pure: no I/O.
+
+Spanish is the language of the black box, the Telegram notice and the terminal, and the default
+of every function here. ``action``, ``note_texts`` and ``api_name`` also speak English
+(``lang="en"``) for the English web: the same words, from the tables below, never the agent's.
 
 ``describe(reading)`` takes a checked ``gate.reading`` (``protocol.check_reading``). Its words are
 ours; the agent's texts (recipients, subject, first lines, target, attachment names) are only
@@ -26,9 +30,13 @@ _API = {
     "git": "git",
     "read_post": "Un buscador",
 }
+_API_EN = {**_API, "read_post": "A search engine"}
+_NO_API = {"es": "Una API", "en": "An API"}
 # A push (translate/git.py): what it does, and what backtide cannot know of it (a note).
 _GIT = {"change": "push a un repositorio", "delete": "push que borra ramas o etiquetas"}
 _GIT_UNSEEN = "backtide no ve el código que lleva"
+_GIT_EN = {"change": "push to a repository", "delete": "push that deletes branches or tags"}
+_GIT_UNSEEN_EN = "backtide does not see the code it carries"
 _MAIL = frozenset({"gmail", "graph_mail"})
 _VERBS = {
     "send": "enviar",
@@ -37,6 +45,14 @@ _VERBS = {
     "delete": "borrar",
     "admin": "cambiar la administración",
     "read": "leer",
+}
+_VERBS_EN = {
+    "send": "send",
+    "forward": "forward",
+    "change": "change",
+    "delete": "delete",
+    "admin": "change account settings",
+    "read": "read",
 }
 _NOTES = {
     "content_unseen": "no se ve qué lleva",
@@ -58,6 +74,52 @@ _NOTES = {
         "mueve una rama o etiqueta que ya existe: backtide no puede saber si es un push forzado"
     ),
 }
+_NOTES_EN = {
+    "content_unseen": "what it carries cannot be seen",
+    "batch": "an API batch with other requests",
+    "too_large": "too large to read",
+    "secret_seen": "it carried a secret (struck out)",
+    "deletes_message": "it deletes a message",
+    "to_trash": "to the trash",
+    "webhook": "through a webhook",
+    "alternative_differs": "its HTML says something other than its text",
+    "idn_domain": "a domain with non-Latin characters",
+    "method_override": "a header changes its method",
+    "duplicate": "a repeated field",
+    "bad_address": "a recipient that cannot be understood",
+    "translator_failed": "the translator failed",
+    "fetches_url": "the platform will download that address",
+    "inline_message": "an inline message: it may be in any chat",
+    "moves_ref": (
+        "it moves a branch or tag that already exists: backtide cannot know if it is a forced push"
+    ),
+}
+# Everything else our phrase says, by language. A language we do not speak reads as Spanish.
+_WORDS: dict[str, dict[str, Any]] = {
+    "es": {
+        "api": _API,
+        "git": _GIT,
+        "git_unseen": _GIT_UNSEEN,
+        "verbs": _VERBS,
+        "notes": _NOTES,
+        "unknown": "una petición que backtide no entiende",
+        "mail": "un correo",
+        "message": "un mensaje",
+        "cut": "resumida: era demasiado larga",
+    },
+    "en": {
+        "api": _API_EN,
+        "git": _GIT_EN,
+        "git_unseen": _GIT_UNSEEN_EN,
+        "verbs": _VERBS_EN,
+        "notes": _NOTES_EN,
+        "unknown": "a request backtide does not understand",
+        "mail": "an email",
+        "message": "a message",
+        "cut": "cut short: it was too long",
+    },
+}
+LANGUAGES = tuple(_WORDS)
 # Quote marks the agent could use to close our «…» and write after it as if it were ours
 # (review of T10-3, L8): inside a quote they become plain ones.
 _QUOTES = str.maketrans(
@@ -68,34 +130,43 @@ _QUOTES = str.maketrans(
 _BRACKETS = str.maketrans({"(": "[", ")": "]", "（": "[", "）": "]"})
 
 
-def api_name(translator: str) -> str:
+def _words(lang: str) -> dict[str, Any]:
+    return _WORDS.get(lang, _WORDS["es"])
+
+
+def api_name(translator: str, lang: str = "es") -> str:
     """The API's name in our words ("Telegram", "Gmail"...), never the agent's."""
-    return _API.get(translator, "Una API")
+    return _words(lang)["api"].get(translator, _NO_API.get(lang, _NO_API["es"]))
 
 
-def action(reading: Mapping[str, Any]) -> str:
+def action(reading: Mapping[str, Any], lang: str = "es") -> str:
     """ "<API>: <qué hace>", only our words (T10-4's notice puts the agent's apart)."""
+    words = _words(lang)
     translator = str(reading.get("translator", ""))
     effect = str(reading.get("effect", "unknown"))
     if effect == "unknown":
-        what = "una petición que backtide no entiende"
-    elif translator == "git" and effect in _GIT:
-        what = _GIT[effect]
+        what = words["unknown"]
+    elif translator == "git" and effect in words["git"]:
+        what = words["git"][effect]
     else:
-        noun = ("un correo" if translator in _MAIL else "un mensaje") if effect in (
+        noun = (words["mail"] if translator in _MAIL else words["message"]) if effect in (
             "send", "forward"
         ) else ""  # fmt: skip
-        what = " ".join(part for part in (_VERBS.get(effect, "cambiar"), noun) if part)
-    return f"{api_name(translator)}: {what}"
+        what = " ".join(
+            part for part in (words["verbs"].get(effect, words["verbs"]["change"]), noun) if part
+        )
+    return f"{api_name(translator, lang)}: {what}"
 
 
-def note_texts(reading: Mapping[str, Any]) -> list[str]:
+def note_texts(reading: Mapping[str, Any], lang: str = "es") -> list[str]:
     """The reading's notes in our words (our fixed texts, never the agent's)."""
-    texts = [_NOTES[note] for note in reading.get("notes") or [] if note in _NOTES]
-    if reading.get("translator") == "git" and reading.get("effect") in _GIT:
-        texts.append(_GIT_UNSEEN)
+    words = _words(lang)
+    notes = words["notes"]
+    texts = [notes[note] for note in reading.get("notes") or [] if note in notes]
+    if reading.get("translator") == "git" and reading.get("effect") in words["git"]:
+        texts.append(words["git_unseen"])
     if reading.get("cut"):
-        texts.append("resumida: era demasiado larga")
+        texts.append(words["cut"])
     return list(dict.fromkeys(texts))
 
 

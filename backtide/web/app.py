@@ -368,7 +368,7 @@ def create_app(
             # The list read from the black box may miss older holds (finding 7).
             "holds_partial": lambda: box_cache.get("partial") is True,
             "vis_mid": visible_middle,
-            "api": api_name,
+            "api": lambda translator: api_name(translator, t.language),
         }
 
     def _page(
