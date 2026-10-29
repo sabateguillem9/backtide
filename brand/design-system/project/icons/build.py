@@ -430,6 +430,97 @@ def _ask():
     ]
 
 
+# ---- controls: the film's player on the site ---------------------------------------------
+# Glyphs for a player's bar, by the same hand, in ink only: they stand in a row of buttons,
+# each with its word as a label, and the one clay thing of a player is its play dot or its
+# playhead. They have no gesture: they change into one another instead (play and pause).
+
+
+def _speaker(seed):
+    """The speaker shared by sound and sound-off: a small box and its cone."""
+    return line(
+        [(7, 19.2), (14, 19), (23.6, 10.6), (24, 37.4), (14.2, 29.2), (6.8, 29), (7, 19.2)],
+        seed,
+        amp=0.35,
+        step=5,
+    )
+
+
+def _corner(points, seed):
+    return line(points, seed, amp=0.25, step=4)
+
+
+@icon("play", "Play: a triangle pointing on.")
+def _play():
+    return [
+        (
+            "play",
+            "ink",
+            line([(17.4, 11), (38.4, 23.8), (17.6, 37), (17.4, 11)], 211, amp=0.4, step=6),
+        ),
+    ]
+
+
+@icon("pause", "Pause: two upright strokes.")
+def _pause():
+    return [
+        ("bars", "ink", line([(18, 12), (18.3, 36)], 221, amp=0.3, step=5)),
+        ("bars", "ink", line([(30.2, 12), (29.9, 36)], 222, amp=0.3, step=5)),
+    ]
+
+
+@icon("sound", "Sound on: a speaker and two waves.")
+def _sound():
+    return [
+        ("speaker", "ink", _speaker(231)),
+        ("waves", "ink", arc(24, 24, 7.6, -42, 42, 232, amp=0.25, n=6)),
+        ("waves", "ink", arc(24, 24, 14.4, -46, 46, 233, amp=0.3, n=8)),
+    ]
+
+
+@icon("sound-off", "Sound off: the speaker with a small cross.")
+def _sound_off():
+    return [
+        ("speaker", "ink", _speaker(241)),
+        ("cross", "ink", line([(31.4, 19.4), (40.6, 28.6)], 242, amp=0.2, step=3)),
+        ("cross", "ink", line([(40.6, 19.4), (31.4, 28.6)], 243, amp=0.2, step=3)),
+    ]
+
+
+@icon("captions", "Captions: a screen with two lines of words.")
+def _captions():
+    return [
+        (
+            "screen",
+            "ink",
+            line([(5.4, 11), (42.6, 10.6), (43, 37.2), (5, 37.4), (5.4, 11)], 251, amp=0.4, step=6),
+        ),
+        ("words", "ink", line([(12, 25.4), (22, 25.2)], 252, amp=0.2, step=3)),
+        ("words", "ink", line([(26.4, 25.2), (36, 25.1)], 253, amp=0.2, step=3)),
+        ("words", "ink", line([(12, 31), (30.6, 30.8)], 254, amp=0.2, step=4)),
+    ]
+
+
+@icon("full-screen", "Full screen: four corners opening out.")
+def _full_screen():
+    return [
+        ("corners", "ink", _corner([(6.6, 17), (6.4, 6.6), (17, 6.4)], 261)),
+        ("corners", "ink", _corner([(31, 6.4), (41.4, 6.6), (41.6, 17)], 262)),
+        ("corners", "ink", _corner([(41.6, 31), (41.4, 41.4), (31, 41.6)], 263)),
+        ("corners", "ink", _corner([(17, 41.6), (6.6, 41.4), (6.4, 31)], 264)),
+    ]
+
+
+@icon("full-screen-exit", "Leave full screen: four corners folding in.")
+def _full_screen_exit():
+    return [
+        ("corners", "ink", _corner([(17.2, 6.4), (17, 17), (6.4, 17.2)], 271)),
+        ("corners", "ink", _corner([(30.8, 6.4), (31, 17), (41.6, 17.2)], 272)),
+        ("corners", "ink", _corner([(41.6, 30.8), (31, 31), (30.8, 41.6)], 273)),
+        ("corners", "ink", _corner([(6.4, 30.8), (17, 31), (17.2, 41.6)], 274)),
+    ]
+
+
 # ---------------------------------------------------------------- output
 
 
