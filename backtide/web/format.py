@@ -19,8 +19,11 @@ def stamp(moment: datetime, tz: tzinfo) -> str:
 
 
 def local_tz() -> tzinfo:
-    local = datetime.now().astimezone().tzinfo
-    return local if local is not None else UTC
+    """The machine's zone with its changes of time, the service's own (code review of
+    2026-10-29, W2: today's fixed offset put every time an hour off across a change)."""
+    from backtide.service.spend import local_zone  # the web reads the service's rule
+
+    return local_zone()
 
 
 def age(t: Translator, elapsed: timedelta) -> str:

@@ -210,6 +210,31 @@ def test_a_box_that_appears_later_is_picked_up(tmp_path: Path) -> None:
     assert any("El agente ha arrancado" in e["data"] for e in of_kind(events, "lines"))
 
 
+def test_a_box_that_appears_later_with_a_history_is_joined_at_its_end(tmp_path: Path) -> None:
+    """Code review of 2026-10-29, W3: a box readable only after the stream opened was replayed
+    from event 1. It begins near the end, as when the box could be read at once."""
+    from backtide.web.app import SHOWN_LINES
+
+    def write() -> None:  # the whole box appears at once, as one that was there all along
+        import os
+
+        build = tmp_path / "build"
+        build.mkdir()
+        box = new_box(build)
+        for i in range(SHOWN_LINES + 40):
+            box.append("file", "create", f"old-{i:03d}.txt")
+        box.close()
+        for made in sorted(build.iterdir()):
+            os.replace(made, tmp_path / made.name)
+
+    events = stream(tmp_path, "?after=0", write=write, seconds=0.6)
+    import re
+
+    shown = " ".join(e["data"] for e in of_kind(events, "lines"))
+    first = min(int(n) for n in re.findall(r'id="l-([0-9]+)"', shown))
+    assert first == 41, "begins SHOWN_LINES before the end, never at event 1"
+
+
 def test_a_missing_box_does_not_break_the_stream(tmp_path: Path) -> None:
     events = stream(tmp_path, "?after=0", seconds=0.3)
     assert not of_kind(events, "lines") and not of_kind(events, "state")

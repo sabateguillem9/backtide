@@ -749,7 +749,26 @@ def test_the_stream_keeps_the_last_list_when_it_cannot_read_it(tmp_path: Path, b
     assert sent, "the failure is told"
     assert 'id="req-r7"' in sent[-1], "the last list it read stays"
     assert "puede no estar al día" in text_of(sent[-1])
-    assert len(sent) == 1, "said once, not on every poll"
+    # The list as it is when the stream opens (W1), then the failure: each said once.
+    assert len(sent) == 2, "said once, not on every poll"
+    assert "puede no estar al día" not in text_of(sent[0])
+
+
+def test_a_hold_that_came_before_the_stream_opened_reaches_the_panel(tmp_path: Path, boxes) -> None:
+    """Code review of 2026-10-29, W1: the stream took what it read at its start as already on
+    the page, so a hold that came between the page and its stream (or during a reconnect)
+    never appeared, and could time out unseen. It is sent on the first round."""
+    web = new_client(
+        tmp_path,
+        stream_seconds=0.3,
+        poll_interval=0.02,
+        clock=lambda: NOW,
+        pending=lambda: [request(id="r9", agent="principal")],
+    )
+    events = parse_sse(web.get("/panel/stream").text)
+    sent = [e["data"] for e in events if e.get("event") == "requests"]
+    assert len(sent) == 1 and 'id="req-r9"' in sent[0]
+    assert any(str(e.get("event", "")).startswith("card-") for e in events)
 
 
 def test_a_cards_key_follows_its_version_not_where_it_lives_in_memory(tmp_path: Path) -> None:

@@ -34,6 +34,7 @@ from backtide.service.retenidas import decide as decide_hold
 from backtide.service.retenidas import listing as list_holds
 from backtide.service.runner import ServiceLocked, ServiceRunning, serve, take_lock
 from backtide.service.seguir import seguir
+from backtide.service.spend import local_zone
 from backtide.setup import layout, preflight
 from backtide.setup.host import SystemHost
 from backtide.snapshots import Snapshot, SnapshotError, SnapshotStore
@@ -1128,8 +1129,7 @@ def _now() -> datetime:
 
 
 def _local_tz() -> tzinfo:
-    local = datetime.now().astimezone().tzinfo
-    return local if local is not None else UTC
+    return local_zone()  # with its changes of time (code review of 2026-10-29, W2)
 
 
 def _error(message: str) -> None:

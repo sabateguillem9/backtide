@@ -1492,9 +1492,13 @@ def create_app(
         last_sent = last_tide = loop.time()
         fresh_tide = False
         reader_ = agent.reader
+        # The page saw nothing: begin near the end, not at the beginning, also when the box
+        # can only be read later (code review of 2026-10-29, W3: it replayed the whole history).
+        unanchored = start == 0
         try:
-            if start == 0:  # the page saw nothing: begin near the end, not at the beginning
+            if unanchored:
                 seq = max(0, await asyncio.to_thread(reader_.head_seq) - SHOWN_LINES)
+                unanchored = False
             else:  # rebuild the open burst the page ended on, so it keeps growing in place
                 primed = await asyncio.to_thread(_recent, reader_, PRIME_EVENTS, start)
                 seen = {line.id for line in narrator.feed(reversed(primed))}
@@ -1505,6 +1509,9 @@ def create_app(
             if await request.is_disconnected():
                 return
             try:
+                if unanchored:
+                    seq = max(0, await asyncio.to_thread(reader_.head_seq) - SHOWN_LINES)
+                    unanchored = False
                 batch = await asyncio.to_thread(reader_.events, since_seq=seq, limit=STREAM_BATCH)
                 if failing:
                     logger.info("the black box can be read again")
@@ -1587,25 +1594,25 @@ def create_app(
         narrators = [Narrator() for _ in agents]
         seen: list[set[int]] = [set() for _ in agents]
         seqs = list(starts)
+        # Nothing counts as already shown: the first round sends the requests and every card
+        # (code review of 2026-10-29, W1: a hold that came between the page and its stream, or
+        # during a reconnect, never reached the panel and could time out unseen).
         sent_cards: dict[str, Any] = {}
         sent_requests: tuple[Any, ...] | None = None
+        last_good: list[Any] | None = None
         last_sent = loop.time()
         last_requests = float("-inf")
+        unanchored = [seq == 0 for seq in seqs]  # W3: begin at the end once it can be read
         for i, agent in enumerate(agents):
             try:
-                if seqs[i] == 0:
+                if unanchored[i]:
                     seqs[i] = await asyncio.to_thread(agent.reader.head_seq)
+                    unanchored[i] = False
                 else:
                     primed = await asyncio.to_thread(_recent, agent.reader, PRIME_EVENTS, seqs[i])
                     seen[i] = {line.id for line in narrators[i].feed(reversed(primed))}
             except BoxUnavailable:
                 pass
-        # Cards the page drew: send again only what changes from here.
-        requests, now, failed = await asyncio.to_thread(_requests)
-        for one in await asyncio.to_thread(_cards, requests, now):
-            sent_cards[one.agent.slug] = one.key
-        sent_requests = (_requests_key(requests), failed)
-        last_good = None if failed else requests
         yield b"retry: 2000\n\n"
         while loop.time() < deadline:
             if await request.is_disconnected():
@@ -1614,6 +1621,9 @@ def create_app(
             changed: list[tuple[Agent, Line, bool]] = []
             for i, agent in enumerate(agents):
                 try:
+                    if unanchored[i]:
+                        seqs[i] = await asyncio.to_thread(agent.reader.head_seq)
+                        unanchored[i] = False
                     batch = await asyncio.to_thread(
                         agent.reader.events, since_seq=seqs[i], limit=STREAM_BATCH
                     )
