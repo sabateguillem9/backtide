@@ -433,7 +433,7 @@ sudo backtide comprobar
 - Each line is `[ok]`, `[aviso]` (a warning: something works less, or the installer will do it with your permission) or `[falla]` (a failure: backtide cannot run safely here). Under each warning or failure, how to fix it.
 - Without `sudo` it still runs, with a warning: some checks (Docker, SELinux) may come out short.
 - **Fedora 43 and 44 with kernel 7.1 or later:** the process sensor (Tetragon v1.7.1) cannot read their BTF yet, so the agent runs but its commands are not recorded. `comprobar` warns about it. Ubuntu 24.04 and 26.04 are fine. It goes away with Tetragon 1.8.
-- What else it looks at (T13-3): whether backtide's two Docker networks overlap a route of the machine that is not Docker's (a VPN or your LAN). A clash is a warning that says how to move them (`--subredes`).
+- What else it looks at: whether backtide's two Docker networks overlap a route of the machine that is not Docker's (a VPN or your LAN). A clash is a warning that says how to move them (`--subredes`).
 - `--despues-de-instalar` ("after installing"), as root, tests the installed backtide for real: its four systemd units are active; the volume is mounted `nosuid,nodev,noatime`; the agent started under the service and answers; it runs as uid 61000 with no capability (and as `container_t` under SELinux, or with its AppArmor profile); from inside it nothing connects without the proxy; the black box verifies; the process sensor sees a test command (a warning only, see the kernel note above); the web listens, left its link and its journal holds no link; and `systemd-analyze security` of both services is at or under the level measured in clean VMs. It is the installer's last step.
 - Exit codes: `0` no failure (warnings do not count); `1` at least one failure; `2` (with `--despues-de-instalar`) not root or a bad config.
 
@@ -451,7 +451,7 @@ The archive is a **release archive** (see below); a plain `git archive` of the r
 
 #### Getting a release and checking it
 
-There is no published release yet: the first one comes with the preview. When there is one, it is a single uncompressed `backtide-<version>.tar` with its sha256 next to it, published with the release. To check it:
+The current release is [0.1.0 (preview)](https://github.com/sabateguillem9/backtide/releases/tag/v0.1.0). It is a single uncompressed `backtide-<version>.tar` with its sha256 next to it, published with the release. To check it:
 
 ```sh
 sha256sum backtide-<version>.tar            # Linux; on a Mac: shasum -a 256 backtide-<version>.tar

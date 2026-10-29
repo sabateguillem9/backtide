@@ -1,0 +1,51 @@
+name: I tried it
+description: Tell us how far you got and what was confusing. This is the feedback we most want.
+labels: [feedback]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        You do not need a bug for this form. If you ran the install or the demo, even only part of it, we want to know how it went. A report that says "I got stuck at step 3" is useful.
+
+        **Never paste API keys, tokens or the contents of your black box.**
+  - type: dropdown
+    id: what
+    attributes:
+      label: What did you try?
+      multiple: true
+      options:
+        - The web demo with invented data (`make web-demo`)
+        - The 60-second demo in the development VM (`make demo`)
+        - The installer on Linux (`install.sh`)
+        - The installer on a Mac (`install-mac.sh`)
+        - The real run with my own agent
+        - I only read the documentation
+    validations:
+      required: true
+  - type: textarea
+    id: far
+    attributes:
+      label: How far did you get?
+      description: The last step that worked, and about how long it took. Did you install it without help?
+    validations:
+      required: true
+  - type: textarea
+    id: confusing
+    attributes:
+      label: What was confusing or got in the way?
+      description: A step, a word, a message, a notice that came at a bad time.
+  - type: input
+    id: agent
+    attributes:
+      label: Which agent do you use, and where does it run?
+      placeholder: "OpenClaw on a Linux server"
+  - type: textarea
+    id: system
+    attributes:
+      label: Your system
+      description: Operating system, architecture (for example Fedora 44 on aarch64, or a Mac with Apple Silicon) and the output of `backtide --version`, if you got that far.
+  - type: textarea
+    id: use
+    attributes:
+      label: Would you use it, and what is missing?
+      description: An honest "no" helps as much as a "yes".

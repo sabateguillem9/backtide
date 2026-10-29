@@ -33,7 +33,7 @@ Developed and tested against OpenClaw, on Linux with Docker and Btrfs.
 | Outbound proxy (mitmproxy): the agent's only way out. Every request is recorded in the black box before it leaves; with no recording, nothing leaves. The agent only ever sees a fake API key; the proxy swaps in the real one. Private addresses, OAuth logins and provider-side tools are refused; writes to unknown destinations are held (the strict mode `unknown_hosts = "deny"` refuses them) | Works |
 | Process and connection sensor (Tetragon, eBPF): every command and connection of the agent, recorded from the kernel; losses are reported, never silent | Works |
 | Risk rules: each event gets a level from 0 to 3; risk 3 takes an evidence snapshot and alerts | Works |
-| The approval gate: the proxy holds writes and other outgoing actions until you approve them (from the terminal, Telegram or the web) and rejects them if you do not answer in 5 minutes. Reads pass without asking. Translators read the content of Gmail, Microsoft mail, Telegram, Slack and Discord requests, so the notice says who gets what. Batches ("everything to this recipient", "sends of this kind for 1 hour") and trusted recipients cut down the number of questions | Works, tested in the VM against a fake internet and with the real OpenClaw. Mail trust is switched off until backtide knows your own accounts |
+| The approval gate: the proxy holds writes and other outgoing actions until you approve them (from the terminal, Telegram or the web) and rejects them if you do not answer in 5 minutes. Reads pass without asking. Translators read the content of Gmail, Microsoft mail, Telegram, Slack, Discord and GitHub requests (and some search-by-POST APIs), so the notice says who gets what. Batches ("everything to this recipient", "sends of this kind for 1 hour") and trusted recipients cut down the number of questions | Works, tested in the VM against a fake internet and with the real OpenClaw. Mail trust is switched off until backtide knows your own accounts |
 | Telegram: alerts with Pause and Rewind buttons, `/pausar`, `/seguir`, `/estado`, and approval of held requests with `/retenidas` and `/lotes` | Works against a fake Bot API in tests. With a real bot, the founder has so far seen only a hold notice arrive; `/estado`, `/pausar`, `/seguir` and approving from the phone are not yet tried by hand |
 | Settings page in the web (`backtide web --ajustes`): put, change or remove the model API keys and the Telegram bot token from the browser. Keys are write-only: the page shows only the last four characters | Works. The Telegram change applies on restart |
 | First real run (`make probar`): the real OpenClaw in its cage thinking with Claude through the proxy, with the gate, Telegram notice and web | Done once by the founder (60 model calls, two rewinds from the web, a held `POST` rejected and another approved). It is a hands-on test, not part of the automatic tests |
@@ -43,7 +43,7 @@ Developed and tested against OpenClaw, on Linux with Docker and Btrfs.
 | Installer: `install.sh` on Linux (Fedora, Ubuntu) and `install-mac.sh` on a Mac with Apple Silicon (backtide in a small Lima VM), with OpenClaw or Claude Code (`--perfil`) and optional Telegram (`--telegram`); `backtide desinstalar` removes it, keeping the data by default | Preview. Tested on clean Fedora 44 and Ubuntu 24.04 VMs and on a Mac, all arm64; x86_64 is not tested yet |
 | Codex and other agents | Planned |
 
-Two consequences of that table:
+Three consequences of that table:
 
 - The agent reaches the internet only through the proxy. Everything it sends is recorded first. By default reads to any host pass and writes to hosts you have not allowed are held; in the strict mode only the hosts you allow (its model provider by default) are reachable.
 - The gate decides by what a request *does*, not only where it goes. A read passes (it is recorded first). A write or a send to anything else is held, with a short sentence saying what it would do. What the gate cannot see is in the [security model](docs/guide/security-model.md): a read can still carry some data in its URL (capped by a budget per host), and a request to the model provider carries the whole conversation.
@@ -146,6 +146,7 @@ Python modules in `backtide/`:
 | `service` | The long-running service: snapshot cycle, rewind, pause, holds and batches, settings, control socket |
 | `notify` | Alerts and the Telegram bot, with the held-request notices and their buttons |
 | `web` | The web view: live feed, history, snapshots, held requests, Settings. It only reads, unless you switch on rewind, approval or settings |
+| `setup` | The installer, the machine check and the uninstaller (`backtide instalar`, `comprobar`, `desinstalar`) |
 | `cli` | The `backtide` command |
 
 Each black-box event has an `id`, `ts`, `source` (exec, file, net, llm, gate, snapshot), `action`, `target`, `details`, `risk` (0 to 3), `snapshot_id`, `prev_hash` and `hash`.

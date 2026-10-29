@@ -28,7 +28,7 @@ Please test only in your own VM and test containers, never against a machine or 
 
 ## Supported versions
 
-Pre-alpha. Only the latest commit on the main branch is supported. There are no releases yet.
+Pre-alpha. Only the latest preview release ([0.1.0](https://github.com/sabateguillem9/backtide/releases/tag/v0.1.0)) and the latest commit on the main branch are supported.
 
 ## Scope
 
@@ -71,7 +71,7 @@ Status note: invariants 3 and 6 are implemented (the proxy and the gate exist an
 - Social engineering of maintainers or users.
 - Findings in code under `scripts/demo/` and `scripts/web-demo/`. They are demo tools, and they use `sudo` and relaxed settings on purpose inside the dev VM.
 - Denial of service against the local web view, where the attacker is already the machine's user.
-- Missing hardening in a feature marked "in progress" or "not working yet" in the README.
+- Missing hardening in a feature marked "Preview" or "Planned" in the README.
 - Automated scanner output without a working scenario.
 
 Known and tracked, not new findings: small filesystem information leaks available to the agent (free space, device counters, mount ids). They are listed in the backlog.

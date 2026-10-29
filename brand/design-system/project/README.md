@@ -141,7 +141,7 @@ These are not style choices; they keep the product web safe (see the docstring o
 - **How it is drawn:** with the icons' steady hand on their 48 grid and fixed seeds (`assets/mark.py`, run by `build.py`). The line in `ink`, the dot in `clay-mark`, the mark's only clay; the line never touches the dot. The line's stroke is 2.5 units on the 48 grid, the stem of DM Sans 500 beside the word, 2.6 units on the favicon's 32 grid. The favicon is a simplified drawing (fewer waves, a thicker line) that still reads at 16 px.
 - **The wordmark** is the mark, then the name in DM Sans 500, lowercase (`Wordmark` component, which draws the mark inline from `components/Wordmark/mark.html` so it follows the theme). On the site it is "backtide labs"; on a project's page and in the product web, "backtide".
 - **Its motion:** once, on load, in the header of the public site (`.enter-mark`): the dot comes back from the right and its line draws itself behind it. Never in the product web, which stays still; never in a loop; never with reduced motion or a hidden tab.
-- **The files** (`assets/`, light and `-dark`): `mark.svg`, the mark alone; `lockup.svg`, the mark and "backtide" in a row; `lockup-stacked.svg`, the mark above the name; `lockup-labs.svg`, with "backtide labs"; `favicon.svg`, on an ivory (or charcoal) rounded square. See `assets/README.md`. There is no text-only file: the name alone is just typed.
+- **The files** (`assets/`, light and `-dark`): `mark.svg`, the mark alone; `lockup.svg`, the mark and "backtide" in a row; `lockup-stacked.svg`, the mark above the name; `lockup-labs.svg`, with "backtide labs"; `favicon.svg`, on an ivory (or charcoal) rounded square; `social.png`, the repository's social preview (1280 x 640, rendered from `assets/social/` by its `render.mjs`). See `assets/README.md`. There is no text-only file: the name alone is just typed.
 - Clear space around the mark and the wordmark: at least the height of the dot on every side. Never stretch, recolour, flip, outline or shadow it.
 
 ## Legal and languages
@@ -162,7 +162,7 @@ These are not style choices; they keep the product web safe (see the docstring o
 | `components/` | `bundle.css` (every component), `bundle.js` (language indicator, Layers), one folder per component with its README |
 | `icons/` | `hand.py`, `build.py`, `svg/*.svg`, `icons.js`, the drawing rule |
 | `motion/` | `motion.css`, `boot.js`, `motion.js`, `idle.css` and `idle.js` (public site only) and their README |
-| `assets/` | The mark (estela): `mark.py`, which draws it, and the mark, the lockups and the favicon, light and dark |
+| `assets/` | The mark (estela): `mark.py`, which draws it, and the mark, the lockups and the favicon, light and dark; `social.png`, the repository's social preview, and its source in `social/` |
 | `index.html` | The living sample (generated from `index.tpl.html`) |
 | `sample/` | The sample page's own CSS and JS, and the wordmark export page |
 | `capturas/` | Screenshots of the sample page |

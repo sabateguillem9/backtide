@@ -2,7 +2,7 @@
 
 This page lists everything you can configure in backtide: the files, the options in them, their defaults and what each one does. It also says what is safe to change and what is deliberately not configurable.
 
-> **Status: pre-alpha.** Every name and default below was read from the code of this repository. The installer is not written yet, so there is no wizard: today the config file is written for you by `make demo` and `make probar`, or by hand. Read the [security model](security-model.md) before you loosen anything.
+> **Status: pre-alpha.** Every name and default below was read from the code of this repository. The installer (`install.sh`, `backtide instalar`) writes the config file for you; in the development setup, `make demo` and `make probar` write their own. You can also write it by hand. Read the [security model](security-model.md) before you loosen anything.
 
 Other guides: [command-line reference](cli-reference.md), [getting started](getting-started.md), [real run](real-run.md), [troubleshooting](troubleshooting.md).
 

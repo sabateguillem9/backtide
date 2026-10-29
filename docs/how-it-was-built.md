@@ -12,7 +12,7 @@ This page says who did what, how the work was organised, and what that means for
 
 - **The founder** decided what backtide is and what it must never do: the product, its scope, its security rules (the eight invariants in CLAUDE.md (internal note) and [SECURITY.md](../SECURITY.md)), and the choices that each design document put to the founder. The project's rules require the founder's approval for every new privileged command (`sudo`) and every new dependency. The founder ran the first end-to-end test with a real model.
 - **Claude Code**, with Anthropic's Claude models, wrote nearly all of the code, the tests, the design documents, the attack scenarios and the security reviews. It worked as a small team of specialised agents, each with written instructions, described below.
-- **Every one of the 109 commits** in the history carries a `Co-Authored-By: Claude` line.
+- **Every commit** in the history carries a `Co-Authored-By: Claude` line.
 - **No human security expert has reviewed this code.** The security reviews were done by an AI agent too. Section 5 explains what that means.
 
 ## 2. The process
@@ -51,7 +51,7 @@ This page says who did what, how the work was organised, and what that means for
 
 ### The rest of the team
 
-The agents live in .claude/agents/ (internal note). The project started on 2026-10-05 with three: the security reviewer, the evil agent and an OpenClaw researcher. The other seven were added on 2026-10-19:
+The agents live in .claude/agents/ (internal note). The project started on 2026-10-05 with two: the security reviewer and the evil agent. Seven more were added on 2026-10-19:
 
 - `equipo-id`, the research agent described above.
 - `investigador-mercado` looks at competitors and at what people say online.
@@ -61,7 +61,7 @@ The agents live in .claude/agents/ (internal note). The project started on 2026-
 - `equipo-frontend` builds the web view inside the brand and its strict content security policy, and checks it in a browser.
 - `equipo-creativo` drafts texts. They are drafts only, for the founder to decide on.
 
-The OpenClaw researcher, `investigador-openclaw`, reads OpenClaw's documentation and code for exact facts, so that the integration does not rest on guesses.
+Six more came on 2026-10-22, around the checks before each commit and the reviews (`verificador-commit`, `vigia-ci`, `guardian-invariantes`, `juez-hallazgos`, `diferencial-tachado`) and `investigador-agentes`, which reads the documentation and code of OpenClaw, Claude Code and other agents for exact facts, so that the integrations do not rest on guesses.
 
 ### Continuous integration
 
@@ -117,30 +117,30 @@ First drafts had real bugs, including serious ones. A few that the reviews caugh
 - **A disguised delete inside a batch** (gate, T10-4). A `POST` with `X-HTTP-Method-Override: DELETE` fitted into an approved batch of `POST` requests to the same host. Now that header blocks batching and is treated as a delete.
 - **"Approve and trust" released other held messages** (gate, T10-5). Trusting a recipient from one held message let a second held message to the same recipient leave without approval. Now each one is decided on its own.
 - **A cut stream was almost free under the spending cap** (T11). If the client closed the stream just before the final usage figures, backtide charged almost nothing. Now an incomplete answer is charged its full `max_tokens`. The rule since then: what backtide does not know is charged high, never low (33 (internal note)).
-- **`exportar` could plant code that runs on the host** (T17a-4). A `.git/config` written by the agent (an fsmonitor, a pager, hooks) or a hidden bare repository would run as soon as the owner used git in the exported folder. Now `.git` folders and repository-shaped folders are never copied, and commits leave as a git bundle (34 (internal note)). The attack scenario for this is still missing.
+- **`exportar` could plant code that runs on the host** (T17a-4). A `.git/config` written by the agent (an fsmonitor, a pager, hooks) or a hidden bare repository would run as soon as the owner used git in the exported folder. Now `.git` folders and repository-shaped folders are never copied, and commits leave as a git bundle (34 (internal note)). Two attack scenarios cover it (`exportar-planta-git` and `exportar-planta-config`).
 
 ## 5. Limits
 
 - **No human security audit.** Nobody outside the project has reviewed backtide. Do not rely on it to protect anything you cannot afford to lose.
 - **The reviewer is an AI too.** The code, the tests and the reviews come from the same family of models. They may share blind spots, and a bug that the author did not imagine may not occur to the reviewer either. The sensor's passwords in clear show this: several review passes missed them.
 - **Tests written by the same team.** A green test means the code does what the team thought of testing. The VM tests and the attack battery are not in CI, so their results come from the runs recorded in the documents. Some tests have been flaky at times, and the log says so.
-- **Experimental and pre-alpha.** Developed and tested on one machine, in one Fedora VM, against OpenClaw and fake servers. The installer and most real-world use (T13, T16) do not exist yet.
+- **Experimental and pre-alpha.** Developed in one Fedora VM, against OpenClaw, Claude Code and fake servers. The 0.1.0 preview installer was tried on clean Fedora 44 and Ubuntu 24.04 machines (arm64) and on an Apple Silicon Mac. There is almost no real-world use yet.
 - **Known limits of the threat model.** What the gate cannot stop is listed in the [security model](guide/security-model.md): data hidden in reads, what goes to the model provider, WebSockets, anything a translator misreads as a read. What backtide does not protect against at all, such as a container escape, a compromised host or anything already sent, is in the [README](../README.md#security-model) and in [SECURITY.md](../SECURITY.md).
 
 ## 6. Numbers
 
-Measured on 2026-10-28, at commit `482243c`.
+Measured on 2026-10-29 in this public repository, at commit `9add602`.
 
 | What | Count | How it was counted |
 |---|---|---|
-| Commits | 173, all with a `Co-Authored-By: Claude` line | `git rev-list --count HEAD`, and `git log --format=%B` searched for the trailer. 157 name Claude Opus 5.5, 15 Claude Sonnet 5.5 and one another Claude model. |
-| Calendar | 2026-10-05 to 2026-10-28, commits on 15 different days | `git log --date=short` |
-| Unit tests (Mac) | 11,274; in a run of `make test` that day, 11,227 passed, 32 were skipped and 15 are expected failures | `uv run pytest --collect-only -q` |
+| Commits | 135, all with a `Co-Authored-By: Claude` line | `git rev-list --count HEAD`, and `git log --format=%B` searched for the trailer. 129 name Claude Opus 5.5 and 6 Claude Sonnet 5.5. This copy keeps only the commits that touch the product; the private repository has 196. |
+| Calendar | 2026-10-05 to 2026-10-29, commits on 15 different days | `git log --date=short` |
+| Unit tests (Mac) | 11,251; in a run of `make test` that day, 11,204 passed, 32 were skipped and 15 are expected failures | `uv run pytest --collect-only -q` |
 | VM integration tests | 507 | `uv run pytest --collect-only -q -m integration` |
 | Attack battery | 101 scenarios: 95 ready with tests, 6 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
-| Product code | 67,191 lines in 144 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
-| Test code | 124,040 lines in 332 Python files | the same for `tests/` |
-| Documents | 45 numbered documents in `docs/`, plus the backlog, the log and two guides | `ls docs/*.md`. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
-| Specialised agents and skills | 15 agents, 6 skills | `.claude/agents/`, `.claude/skills/` |
+| Product code | 67,298 lines in 144 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
+| Test code | 124,152 lines in 333 Python files | the same for `tests/` |
+| Documents | 45 numbered design and study documents, plus the backlog, the log and the decision record, kept in the private repository; here, the guide in `docs/guide/` and this page | `ls docs/*.md` in the private repository. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
+| Specialised agents and skills | 15 agents, 6 skills | `.claude/agents/`, `.claude/skills/`, in the private repository |
 
 These numbers are counts, not quality. More tests do not mean fewer bugs, and the test code being larger than the product code says as much about the style as about the coverage.

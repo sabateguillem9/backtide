@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security problem (private)
+    url: https://github.com/sabateguillem9/backtide/security/advisories/new
+    about: Do not open a public issue for a vulnerability. Use GitHub's private vulnerability reporting (the Security tab, then "Report a vulnerability"). See SECURITY.md for the scope and what to expect.

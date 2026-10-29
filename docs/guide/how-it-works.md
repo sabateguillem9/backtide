@@ -234,6 +234,7 @@ Two ways to look at backtide and act on it. Both talk to the service through its
 | `service` | The long-running service: snapshot cycle, holds, spend cap, control socket |
 | `notify` | Alerts and the Telegram bot |
 | `web` | The web page |
+| `setup` | The installer, the machine check and the uninstaller (`backtide instalar`, `comprobar`, `desinstalar`) |
 | `cli` | The `backtide` command |
 
 Besides OpenClaw, a Claude Code profile exists and has its own attack scenarios, but OpenClaw is the agent the project is tested against most.

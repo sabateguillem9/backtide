@@ -29,7 +29,8 @@
         "lockup-stacked.svg",
         "lockup.svg",
         "mark-dark.svg",
-        "mark.svg"
+        "mark.svg",
+        "social.png"
       ],
       "files": {
         "favicon-dark.svg": {
@@ -91,6 +92,12 @@
           "blob": "fbee5d78f672f9ca9784cac31cde9997",
           "size": 769,
           "type": "image/svg+xml"
+        },
+        "social.png": {
+          "name": "social.png",
+          "blob": "a79025ce08b07633c36b0e51b6a04043",
+          "size": 43414,
+          "type": "image/png"
         }
       }
     },

@@ -1,0 +1,28 @@
+name: Idea
+description: Suggest a change or a new feature.
+labels: [idea]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. backtide is pre-alpha and moves quickly, so please open an issue to talk about a change before you write a large one (see [CONTRIBUTING.md](https://github.com/sabateguillem9/backtide/blob/main/CONTRIBUTING.md)).
+
+        For a security problem, do not open an issue: see [SECURITY.md](https://github.com/sabateguillem9/backtide/blob/main/SECURITY.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem do you have?
+      description: What were you doing, and what got in the way? Start from the problem, not from the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: What would you do about it?
+    validations:
+      required: true
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: Have you seen it in another tool?
+      description: Optional. Which tool, and how does it work there?

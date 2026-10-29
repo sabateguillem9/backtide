@@ -1,0 +1,54 @@
+name: Bug report
+description: Something does not work as the guide says it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. backtide is a preview, so bugs are expected and useful.
+
+        **Never paste API keys, tokens (including your Telegram bot token) or the contents of your black box.** backtide strikes secrets from what it records, but read what you paste and remove anything private.
+
+        If you think you found a **security problem**, do not open a public issue. Report it privately: see [SECURITY.md](https://github.com/sabateguillem9/backtide/blob/main/SECURITY.md).
+  - type: textarea
+    id: ran
+    attributes:
+      label: What you ran
+      description: The exact command or the steps, as you typed them. Say whether it was the installer, the demo (`make demo`), the real run or an installed backtide.
+    validations:
+      required: true
+  - type: textarea
+    id: saw
+    attributes:
+      label: What you saw
+      description: The output or the error, and what you expected instead. Most messages are in Spanish; paste them as they are.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: backtide version
+      description: The output of `backtide --version`, or the commit if you run from a clone.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Operating system and architecture
+      description: "Linux: the first lines of `/etc/os-release` and `uname -m`. Mac: `sw_vers -productVersion` and `uname -m`."
+      placeholder: "Fedora 44, aarch64"
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `backtide comprobar`
+      description: Run `sudo backtide comprobar` (on a Mac, `backtide comprobar`) and paste the result. Optional, but it often answers the question.
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: Service log
+      description: "The last lines of `sudo journalctl -u backtide.service -n 100 --no-pager` (on a Mac, inside `backtide vm shell`). Remove anything private first."
+      render: text

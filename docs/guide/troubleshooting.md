@@ -1,4 +1,4 @@
-# Troubleshooting and FAQ
+# Troubleshooting
 
 backtide is **pre-alpha**. This page lists the problems the project's own scripts can hit, and what is and is not supported. It only says what the repository backs up. If your problem is not here, open an issue (not for a security problem: use [SECURITY.md](../../SECURITY.md)).
 

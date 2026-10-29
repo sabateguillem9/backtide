@@ -10,7 +10,8 @@ It is **pre-alpha**. Read the [README](../../README.md) first for what works tod
 
 1. [Getting started](getting-started.md): what you need, how to set up the development VM, and the 60-second demo (delete, rewind, undo).
 2. [Run it with a real agent](real-run.md): OpenClaw or Claude Code thinking through the proxy, with the gate, Telegram and the web. It costs money, so read it before you start.
-3. [Troubleshooting and FAQ](troubleshooting.md).
+3. [Frequently asked questions](faq.md): is it ready, who wrote it, why not git, what it records, why a VM, what it costs.
+4. [Troubleshooting](troubleshooting.md): problems the scripts can hit, and what is and is not supported.
 
 ## I want to understand it
 
@@ -27,4 +28,4 @@ It is **pre-alpha**. Read the [README](../../README.md) first for what works tod
 
 ## A note on languages
 
-The code, the command names' help, the guides in this folder, the README and the security policy are in English. The command names (`vigilar`, `verificar`, `rebobinar`, …) are in Spanish; the [command line reference](cli-reference.md) has a table with their English meaning.
+The code, the guides in this folder, the README and the security policy are in English. The command names (`vigilar`, `verificar`, `rebobinar`, …) and their help text are in Spanish; the [command line reference](cli-reference.md) has a table with their English meaning.
