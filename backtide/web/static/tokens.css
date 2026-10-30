@@ -188,6 +188,7 @@
   --duration-draw: 850ms;
   --duration-entrance: 800ms;
   --duration-page: 600ms;
+  --duration-boil: 280ms;
   --rise: 14px;
   --rise-entrance: 18px;
   --stagger: 80ms;

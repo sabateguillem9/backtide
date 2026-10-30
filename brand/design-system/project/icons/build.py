@@ -25,7 +25,21 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from hand import TREMOR, circle, crescent, f, line, smooth, spiral, wave  # noqa: E402
+import hand  # noqa: E402
+from hand import (  # noqa: E402
+    TREMOR,
+    circle,
+    clay_dot,
+    coil,
+    drawn,
+    f,
+    line,
+    outline,
+    ring,
+    ripple,
+    smooth,
+    stroke,
+)
 
 TOKENS = HERE.parent / "tokens.json"
 DRAWN = ("ink", "clay", "faint")  # stroked classes, drawn on with pathLength="1"
@@ -93,136 +107,244 @@ def dot(cx, cy, r, seed):
 
 ICONS: dict[str, list[tuple[str, str, str]]] = {}
 MEANING: dict[str, str] = {}
+# The boil (motion/boil.js): for a drawing by the field hand, its parts drawn again as frames
+# 1 and 2 (only the tremor changes). The steady hand ignores the frame, so its drawings have none.
+BOIL: dict[str, list[list[str]]] = {}
 
 
 def icon(name, meaning):
     def register(fn):
         ICONS[name] = fn()
         MEANING[name] = meaning
+        frames = []
+        for k in range(1, hand.FRAMES):
+            hand.frame(k)
+            frames.append([d for _g, _c, d in fn()])
+        hand.frame(0)
+        if any(fd != d for fr in frames for fd, (_g, _c, d) in zip(fr, ICONS[name], strict=True)):
+            BOIL[name] = [list(ds) for ds in zip(*frames, strict=True)]
         return fn
 
     return register
 
 
-@icon("progress", "In progress: a spiral still being drawn.")
+# ---- drawn by the field hand (hand.py), the first round of the redesign (2026-10-30) ------
+# The drawings shown on backtide labs. One clay dot each, of radius hand.DOT, set down last and
+# never touching the ink (README.md, "The clay dot"). Group names and pivots are the old ones,
+# so motion.css and idle.css move them as before.
+
+
+@icon("progress", "In progress: a spiral still being drawn out from its dot.")
 def _progress():
+    # The dot sits at the centre, where the spiral starts; the spiral starts far enough out
+    # that the two never touch (about 1.5 units of paper at 24 px).
     return [
-        ("spin", "ink", spiral(24, 24, 1.2, 16.5, 2.25, 11, amp=0.45)),
-        ("spin", "fill", dot(24, 24, 2.2, 12)),
+        ("spin", "ink", drawn(coil(24, 24, 5.8, 16, 1.6, 11, a0=200))),
+        ("spin", "fill", clay_dot(24, 24, 12)),
     ]
 
 
-@icon("preview", "Preview: a cairn that stands up on its own.")
+@icon("preview", "Preview: a cairn that stands up on its own, a pebble set on top.")
 def _preview():
     return [
-        ("ground", "faint", line([(5, 44), (24, 43.4), (43, 44)], 21, amp=0.4, step=6)),
-        ("stones", "ink", circle(24, 37.5, 15, 22, amp=0.6, ry=5.4)),
-        ("stones", "ink", circle(23, 27.5, 10.8, 23, amp=0.5, ry=4.4)),
-        ("stones", "ink", circle(24.6, 19.7, 7, 24, amp=0.4, ry=3.4)),
-        ("stones", "fill", circle(24.2, 13.8, 3.6, 25, amp=0.2, ry=2.5, closed=True)),
+        ("ground", "faint", drawn(*outline([(5, 43.6), (24, 43), (43.2, 43.8)], 21, closed=False))),
+        ("stones", "ink", drawn(ring(24, 37.2, 14.6, 22, ry=5.2, tilt=-2))),
+        ("stones", "ink", drawn(ring(23.2, 27, 10.6, 23, ry=4.6, tilt=3))),
+        ("stones", "ink", drawn(ring(24.4, 18.6, 7, 24, ry=3.6, tilt=-4))),
+        ("stones", "fill", clay_dot(24.6, 10.8, 25)),
     ]
 
 
-@icon("done", "Done: a moon over still water.")
+def _moon(cx, cy, r, seed):
+    """A crescent opening to the right: the outer arc and the inner one, two strokes whose ends
+    cross at the horns."""
+    top, bot = math.radians(-58), math.radians(58)
+    outer = [
+        (cx + r * math.cos(a), cy + r * math.sin(a))
+        for a in (bot + (2 * math.pi - (bot - top)) * i / 40 for i in range(41))
+    ]
+    ox = r * 0.5
+    h_top, h_bot = outer[-1], outer[0]
+    rin = math.dist(h_top, (cx + ox, cy))
+    at = math.atan2(h_top[1] - cy, h_top[0] - cx - ox) % (2 * math.pi)
+    ab = math.atan2(h_bot[1] - cy, h_bot[0] - cx - ox) % (2 * math.pi)
+    inner = [
+        (cx + ox + rin * math.cos(a), cy + rin * math.sin(a))
+        for a in (at + (ab - at) * i / 30 for i in range(31))
+    ]
+    return drawn(
+        stroke(outer, f"{seed}/out", run=(0.6, 1.2)), stroke(inner, f"{seed}/in", run=(0.4, 1.0))
+    )
+
+
+@icon("done", "Done: a moon over still water, its light on the water.")
 def _done():
     return [
-        ("moon", "soft", crescent(22, 17, 10, 31, amp=0.3)),
-        ("moon", "ink", crescent(22, 17, 10, 31, amp=0.3)),
-        ("water", "ink", line([(5, 33), (24, 32.4), (43, 33)], 32, amp=0.4, step=6)),
-        ("water", "faint", line([(13, 39), (35, 38.6)], 33, amp=0.3, step=6)),
+        ("moon", "ink", _moon(21, 16.5, 10.4, 31)),
+        ("water", "ink", drawn(*outline([(4.6, 31.6), (24, 31), (43.4, 31.8)], 32, closed=False))),
+        ("water", "faint", drawn(stroke([(9, 37.6), (17.4, 37.3)], 33, press=False))),
+        ("water", "faint", drawn(stroke([(27.4, 37.4), (38.6, 37.1)], 34, press=False))),
+        ("water", "faint", drawn(stroke([(14, 42.6), (32, 42.3)], 35, press=False))),
+        ("water", "fill", clay_dot(22.4, 37.4, 36)),
     ]
 
 
 @icon("tape", "backtide itself: a cassette whose reels turn back.")
 def _tape():
+    # No clay dot: backtide's own object; the mark beside its name carries the dot.
+    lx, rx, cy = 17.5, 30.5, 21.8  # the reels' pivots, as in motion.css
     return [
-        (
-            "tape",
-            "ink",
-            line([(5, 13), (43, 12.4), (43.4, 36.4), (4.6, 37), (5, 13)], 41, amp=0.45, step=6),
-        ),
+        ("tape", "ink", drawn(*outline([(5, 11), (43, 10.6), (43.3, 37), (4.7, 37.3)], 41))),
         (
             "tape",
             "faint",
-            line([(12, 18.4), (36, 18), (36.2, 29), (11.8, 29.4), (12, 18.4)], 42, amp=0.3, step=5),
+            drawn(
+                *outline([(11.4, 15), (36.6, 14.8), (36.8, 28.6), (11.2, 28.8)], 42, press=False)
+            ),
         ),
         (
             "tape",
             "ink",
-            line([(12, 37), (14.4, 31.6), (33.6, 31.4), (36, 36.8)], 43, amp=0.3, step=4),
+            drawn(
+                *outline(
+                    [(13.2, 37.2), (15.6, 32.4), (32.4, 32.2), (34.8, 37)],
+                    43,
+                    closed=False,
+                    press=False,
+                )
+            ),
         ),
-        ("reelL", "ink", circle(17.5, 23.6, 3.6, 44, amp=0.2)),
-        ("reelL", "ink", line([(17.5, 23.6), (17.5, 20.4)], 45, amp=0.1, step=2)),
-        ("reelL", "fill", dot(17.5, 23.6, 1.6, 46)),
-        ("reelR", "ink", circle(30.5, 23.6, 3.6, 47, amp=0.2)),
-        ("reelR", "ink", line([(30.5, 23.6), (30.5, 20.4)], 48, amp=0.1, step=2)),
+        ("reelL", "ink", drawn(coil(lx, cy, 1.1, 4.4, 1.5, 44, a0=200))),
+        ("reelR", "ink", drawn(coil(rx, cy, 1.1, 4.4, 1.5, 47, a0=20))),
     ]
 
 
-@icon("notebook", "The logbook, the history: an open notebook.")
+@icon("notebook", "The logbook, the history: an open notebook, its last line and full stop.")
 def _notebook():
     return [
-        ("book", "ink", line([(5, 15), (15, 11.5), (24, 15.5)], 51, curve=True)),
-        ("book", "ink", line([(24, 15.5), (33, 11.5), (43, 15)], 52, curve=True)),
-        ("book", "ink", line([(5, 15), (5.4, 37)], 53, amp=0.3, step=5)),
-        ("book", "ink", line([(43, 15), (42.6, 37)], 54, amp=0.3, step=5)),
+        ("book", "ink", drawn(stroke([(5, 14.6), (15, 11), (24, 15.2)], 51, curve=True))),
+        ("book", "ink", drawn(stroke([(24, 15.2), (33, 11), (43, 14.6)], 52, curve=True))),
+        ("book", "ink", drawn(stroke([(5, 14.6), (5.4, 37.4)], 53))),
+        ("book", "ink", drawn(stroke([(43, 14.6), (42.6, 37.4)], 54))),
         (
             "book",
             "ink",
-            line([(5.4, 37), (15, 33.6), (24, 37.6), (33, 33.6), (42.6, 37)], 55, curve=True),
+            drawn(
+                stroke(
+                    [(5.4, 37.4), (15, 33.8), (24, 38), (33, 33.8), (42.6, 37.4)], 55, curve=True
+                )
+            ),
         ),
-        ("page", "clay", line([(24, 15.5), (24, 37.6)], 56, amp=0.3, step=5)),
-        ("page", "faint", line([(10, 21), (19, 19)], 57, amp=0.2, step=4)),
-        ("page", "faint", line([(10, 26), (18, 24.4)], 58, amp=0.2, step=4)),
+        ("book", "faint", drawn(stroke([(28.6, 22.4), (35.4, 21)], 59, press=False))),
+        ("book", "fill", clay_dot(37.8, 26.1, 50)),
+        ("book", "faint", drawn(stroke([(28.6, 27.6), (33.8, 26.6)], "59/2", press=False))),
+        ("page", "ink", drawn(stroke([(24, 15.2), (24, 38)], 56))),
+        ("page", "faint", drawn(stroke([(10, 21.4), (19.4, 19.6)], 57, press=False))),
+        ("page", "faint", drawn(stroke([(10, 26.6), (18.4, 25)], 58, press=False))),
     ]
 
 
-@icon("pencil", "How it was made, writing, editing: a pencil and its trail.")
+@icon("pencil", "How it was made, writing, editing: a sharpened pencil, its point on the paper.")
 def _pencil():
-    ax, ay, bx, by = 15.0, 35.0, 37.0, 13.0
-    px, py = 2.6, 2.6  # half width, perpendicular to the axis
-    tx, ty = 9.4, 40.6  # the point
+    # Drawn with a calmer hand than the rest (amp 0.35, crisp corners): a well-made tool.
+    tx, ty = 11.2, 37.8  # the point
+    ux, uy, vx, vy = 0.7071, -0.7071, 0.7071, 0.7071  # along the pencil, across it
+
+    def at(s, t):
+        return (tx + ux * s + vx * t, ty + uy * s + vy * t)
+
+    w, cone, body, ferrule, end = 3.4, 8.2, 29.6, 33.2, 36.4
+    calm = {"amp": 0.35, "run": (0.0, 0.25)}
     return [
-        ("pencil", "ink", line([(ax + px, ay + py), (bx + px, by + py)], 61, amp=0.3, step=5)),
-        ("pencil", "ink", line([(ax - px, ay - py), (bx - px, by - py)], 62, amp=0.3, step=5)),
-        ("pencil", "ink", line([(bx + px, by + py), (bx - px, by - py)], 63, amp=0.2, step=3)),
+        ("pencil", "ink", drawn(stroke([at(cone, w), at(body, w)], 61, **calm))),
+        ("pencil", "ink", drawn(stroke([at(cone, -w), at(body, -w)], 62, **calm))),
         (
             "pencil",
             "ink",
-            line([(ax + px, ay + py), (tx, ty), (ax - px, ay - py)], 64, amp=0.2, step=3),
+            drawn(stroke([at(cone, w), at(0, 0), at(cone, -w)], 64, press=False, **calm)),
         ),
+        ("pencil", "ink", drawn(stroke([at(2.9, 1.25), at(2.9, -1.25)], 65, press=False, **calm))),
+        ("pencil", "faint", drawn(stroke([at(cone, w), at(cone, -w)], 63, press=False, **calm))),
         (
             "pencil",
-            "fill",
-            smooth([(tx, ty), (tx + 2.4, ty - 0.6), (tx + 0.6, ty - 2.4)], closed=True),
-        ),
-        (
-            "pencil",
-            "faint",
-            line(
-                [(bx - 3.4 + px, by + 3.4 + py), (bx - 3.4 - px, by + 3.4 - py)],
-                65,
-                amp=0.2,
-                step=3,
+            "ink",
+            drawn(
+                *outline(
+                    [at(body, w), at(ferrule, w), at(ferrule, -w), at(body, -w)],
+                    67,
+                    press=False,
+                    amp=0.35,
+                    over=(-0.2, 0.5),
+                )
             ),
         ),
-        ("trail", "faint", wave(12, 42, 44.5, 1.2, 10, 66, jitter=0.2, step=1.5)),
+        (
+            "pencil",
+            "ink",
+            drawn(
+                stroke(
+                    [
+                        at(ferrule, w),
+                        at(end, w * 0.8),
+                        at(end + 0.9, 0),
+                        at(end, -w * 0.8),
+                        at(ferrule, -w),
+                    ],
+                    68,
+                    curve=True,
+                    press=False,
+                    **calm,
+                )
+            ),
+        ),
+        ("trail", "faint", drawn(ripple(14.6, 41, 42.8, 0.9, 8, 66, press=False, tremor=0.3))),
+        ("trail", "fill", clay_dot(*at(-4.4, 0), 69)),
     ]
 
 
-@icon("scale", "Legal, rules, weighing a decision: a balance.")
+@icon("scale", "Legal, rules, weighing a decision: a balance, its pivot in clay.")
 def _scale():
+    # The same calm hand as the pencil: a well-made instrument. The clay dot is the pivot's
+    # finial, above the beam, never touching it.
+    calm = {"amp": 0.35, "run": (0.0, 0.2)}
     parts = [
-        ("post", "ink", line([(24, 13), (24.3, 40)], 71, amp=0.3, step=5)),
-        ("post", "ink", line([(14, 41), (34, 40.6)], 72, amp=0.3, step=5)),
-        ("beam", "ink", line([(8, 14.4), (24, 13.6), (40, 14.2)], 73, amp=0.3, step=5)),
-        ("beam", "fill", dot(24, 12.4, 2.3, 74)),
+        ("post", "ink", drawn(stroke([(24, 14.6), (24.1, 40.4)], 71, **calm))),
+        ("post", "ink", drawn(stroke([(15.4, 40.8), (32.8, 40.6)], 72, press=False, **calm))),
+        (
+            "beam",
+            "ink",
+            drawn(stroke([(8.4, 13.9), (24, 13.5), (39.6, 13.8)], 73, curve=True, **calm)),
+        ),
+        ("beam", "fill", clay_dot(24, 7.8, 74)),
     ]
-    for x, seed in ((8.0, 75), (40.0, 79)):
+    for x, seed in ((8.4, 75), (39.6, 79)):
+        y = 13.9 if x < 24 else 13.8
         parts += [
-            ("beam", "ink", line([(x, 14.4), (x - 4.2, 26)], seed, amp=0.2, step=4)),
-            ("beam", "ink", line([(x, 14.4), (x + 4.2, 26)], seed + 1, amp=0.2, step=4)),
-            ("beam", "ink", arc(x, 25.6, 5.4, 0, 180, seed + 2, amp=0.2, n=10)),
+            ("beam", "ink", drawn(stroke([(x, y), (x - 4.4, 26.4)], seed, press=False, **calm))),
+            (
+                "beam",
+                "ink",
+                drawn(stroke([(x, y), (x + 4.4, 26.4)], seed + 1, press=False, **calm)),
+            ),
+            (
+                "beam",
+                "ink",
+                drawn(
+                    stroke(
+                        [
+                            (x - 5.2, 26.4),
+                            (x - 3.4, 29.4),
+                            (x, 30.6),
+                            (x + 3.4, 29.4),
+                            (x + 5.2, 26.4),
+                        ],
+                        seed + 2,
+                        curve=True,
+                        press=False,
+                        **calm,
+                    )
+                ),
+            ),
         ]
     return parts
 
@@ -233,52 +355,70 @@ def _records():
         (
             "trace",
             "ink",
-            wave(
-                5,
-                33,
-                27,
-                3.6,
-                11.5,
-                81,
-                jitter=0.25,
-                step=1.2,
-                fade=lambda t: (1 - t) ** 0.9 + 0.08,
+            drawn(
+                ripple(
+                    4.6, 31.4, 24, 5.4, 11.5, 81, fade=lambda t: (1 - t) ** 0.85 + 0.1, tremor=0.6
+                )
             ),
         ),
-        ("dot", "fill", dot(38.5, 27, 4.2, 82)),
+        ("trace", "faint", drawn(stroke([(6, 35.4), (30, 35)], 83, press=False))),
+        ("dot", "fill", clay_dot(36.8, 23.6, 82)),
     ]
 
 
 @icon("rewinds", "It rewinds: a loop that turns back on itself.")
 def _rewinds():
+    r, a_end = 14.4, -312
+    tip = (24 + r * math.cos(math.radians(a_end)), 24 + r * math.sin(math.radians(a_end)))
+    a = math.radians(a_end)
+    tx, ty = math.sin(a), -math.cos(a)  # the way the loop travels at its end
+    wings = []
+    for sgn in (1, -1):
+        s = math.radians(36 * sgn)
+        bx, by = -tx * 5.6, -ty * 5.6
+        wings.append(
+            (
+                tip[0] + bx * math.cos(s) - by * math.sin(s),
+                tip[1] + bx * math.sin(s) + by * math.cos(s),
+            )
+        )
+    arc_pts = [
+        (24 + r * math.cos(math.radians(d)), 24 + r * math.sin(math.radians(d)))
+        for d in (-36 + (a_end + 36) * i / 48 for i in range(49))
+    ]
     return [
-        ("loop", "ink", arc(24, 24, 14, -40, -310, 91, amp=0.4, n=26)),
-        ("loop", "ink", arrowhead(24, 24, 14, -310, 92)),
-        ("loop", "fill", dot(24, 24, 3.2, 93)),
+        ("loop", "ink", drawn(stroke(arc_pts, 91, run=(0.0, 0.2)))),
+        (
+            "loop",
+            "ink",
+            drawn(
+                stroke([wings[0], tip], 92, press=False, run=(0.3, 0.6)),
+                stroke([wings[1], tip], 94, press=False, run=(0.2, 0.5)),
+            ),
+        ),
+        ("loop", "fill", clay_dot(24, 24, 93)),
     ]
 
 
 @icon("holds", "It holds, a held request: a padlock.")
 def _holds():
-    shackle = [(17, 22.4)] + [
-        (24 + 7 * math.cos(math.radians(a)), 15 + 7 * math.sin(math.radians(a)))
-        for a in range(180, 361, 20)
-    ]
-    shackle += [(31, 22)]
+    shackle = (
+        [(16.8, 23.4)]
+        + [
+            (24 + 7.2 * math.cos(math.radians(a)), 15.4 + 7.2 * math.sin(math.radians(a)))
+            for a in range(180, 361, 15)
+        ]
+        + [(31.2, 21.6)]
+    )
     return [
-        ("shackle", "ink", smooth(shackle)),
+        ("shackle", "ink", drawn(stroke(shackle, 104, run=(0.0, 0.3)))),
         (
             "body",
             "ink",
-            line(
-                [(12, 22.4), (36, 21.8), (36.6, 41.4), (11.6, 41.8), (12, 22.4)],
-                101,
-                amp=0.45,
-                step=6,
-            ),
+            drawn(*outline([(11.2, 22.4), (36.8, 21.9), (37.2, 41.6), (10.8, 42)], 101)),
         ),
-        ("body", "fill", dot(24, 30.6, 2.6, 102)),
-        ("body", "ink", line([(24, 32.6), (24.2, 36.4)], 103, amp=0.15, step=2)),
+        ("body", "fill", clay_dot(24, 29.6, 102)),
+        ("body", "ink", drawn(stroke([(24, 34), (24.2, 37.4)], 103, press=False))),
     ]
 
 
@@ -452,11 +592,21 @@ def _corner(points, seed):
 
 @icon("play", "Play: a triangle pointing on.")
 def _play():
+    # The one control by the field hand (the founder's decision of 2026-10-30): in the film's
+    # dot it boils like a drawing. Calm and crisp, so it stays a plain play triangle.
     return [
         (
             "play",
             "ink",
-            line([(17.4, 11), (38.4, 23.8), (17.6, 37), (17.4, 11)], 211, amp=0.4, step=6),
+            drawn(
+                *outline(
+                    [(17.4, 11), (38.4, 23.8), (17.6, 37)],
+                    211,
+                    amp=0.3,
+                    press=False,
+                    over=(-0.2, 0.5),
+                )
+            ),
         ),
     ]
 
@@ -582,7 +732,8 @@ def file_svg(name, colours):
 JS_HEAD = """/* backtide · the hand-drawn icons, generated by icons/build.py. Do not edit by hand.
    Use: BacktideIcons.make("holds", "extra classes") returns an <svg> built node by node with
    createElementNS (never markup), aria-hidden, ready for a page under a strict CSP.
-   Colours and motion come from bundle.css and motion.css (.ic, .ic-ink, .ic-g-...). */
+   Colours and motion come from bundle.css and motion.css (.ic, .ic-ink, .ic-g-...).
+   BacktideIcons.frames("tape") gives the boil frames of a drawing by the field hand. */
 (function () {
   "use strict";
   var SVG = "http://www.w3.org/2000/svg";
@@ -613,7 +764,22 @@ JS_TAIL = """;
     }
     return svg;
   }
-  window.BacktideIcons = { names: Object.keys(DATA), make: make };
+  // The boil (motion/boil.js): for each path of a drawing, in the order make() and the pages
+  // write them (grouped), its frames [still, 1, 2]; null for a drawing that does not boil.
+  function frames(name) {
+    var parts = DATA[name] || [];
+    if (!parts.length || !parts[0].b) return null;
+    var order = [], seen = {};
+    for (var i = 0; i < parts.length; i++) {
+      if (seen[parts[i].g]) continue;
+      seen[parts[i].g] = true;
+      for (var j = 0; j < parts.length; j++) {
+        if (parts[j].g === parts[i].g) order.push([parts[j].d].concat(parts[j].b));
+      }
+    }
+    return order;
+  }
+  window.BacktideIcons = { names: Object.keys(DATA), make: make, frames: frames };
 })();
 """
 
@@ -627,9 +793,13 @@ def main():
             old.unlink()
     for name in ICONS:
         (out / f"{name}.svg").write_text(file_svg(name, colours))
-    data = {
-        name: [{"g": g, "c": cls, "d": d} for g, cls, d in parts] for name, parts in ICONS.items()
-    }
+    data = {}
+    for name, parts in ICONS.items():
+        boil = BOIL.get(name)
+        data[name] = [
+            {"g": g, "c": cls, "d": d, **({"b": boil[i]} if boil else {})}
+            for i, (g, cls, d) in enumerate(parts)
+        ]
     (HERE / "icons.js").write_text(JS_HEAD + json.dumps(data, separators=(",", ":")) + JS_TAIL)
     print(f"wrote {len(ICONS)} icons: svg/*.svg and icons.js")
 

@@ -114,8 +114,8 @@
 .ic-g-spin, .ic-g-loop, .ic-g-shackle, .ic-g-moon, .ic-g-dot, .ic-g-pencil,
 .ic-g-tick, .ic-g-cross, .ic-g-mark, .ic-g-eye, .ic-g-sun, .ic-g-bubble { transform-origin: 24px 24px; }
 .ic-g-stones { transform-origin: 24px 43px; }
-.ic-g-reelL { transform-origin: 17.5px 23.6px; }
-.ic-g-reelR { transform-origin: 30.5px 23.6px; }
+.ic-g-reelL { transform-origin: 17.5px 21.8px; }
+.ic-g-reelR { transform-origin: 30.5px 21.8px; }
 .ic-g-book { transform-origin: 24px 37px; }
 .ic-g-beam { transform-origin: 24px 13px; }
 .ic-g-sign { transform-origin: 24px 39px; }

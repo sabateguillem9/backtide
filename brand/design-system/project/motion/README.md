@@ -6,6 +6,7 @@ Calm and once. Things arrive, settle and stay.
 - `motion.css`: every keyframe and transition that is not a component's own hover.
 - `motion.js` (end of `<body>`): reveal on scroll, Inside the box, the hidden tab, `BacktideMotion.swap(fn)`.
 - `idle.css` and `idle.js` (after `motion.css` and `motion.js`): the drawings' slow idle, **for the public site only** (D34). The product web never loads them.
+- `boil.js` (after `idle.js`, and after `icons/icons.js`): the line boil of the field hand's drawings, **for the public site only** (the founder's decision of 2026-10-30). The product web never loads it.
 
 ## What to mark
 
@@ -25,6 +26,7 @@ Calm and once. Things arrive, settle and stay.
 | Stagger siblings on scroll | `data-reveal-group` on the parent | Adds `.d-0` ... `.d-5` |
 | An icon's gesture on hover and focus | `.ic-host` on its row, card or section | |
 | Drawings that idle, slowly, while on screen (public site only) | `data-idle` on a container, or `.ic--idle` on one drawing | Needs `idle.css` and `idle.js`; `data-idle="off"` rests them again |
+| A field drawing's line boils (public site only) | Nothing more: it boils while it idles and while its `.ic-host` is pointed at or focused | Needs `icons.js` and `boil.js`; `data-boil="off"` keeps a drawing or a container still |
 | A title that flies to the next page | `.vt-title` on both pages | Cross-document view transitions |
 | A change in place, cross-faded | `BacktideMotion.swap(() => ...)` | Falls back to a plain change |
 
@@ -66,11 +68,19 @@ On backtide labs and its project pages a drawing may idle: now and then it makes
 
 The seven player controls never idle: they are controls.
 
+## The line boil (the public site only, 2026-10-30)
+
+Approved by the founder on 2026-10-30, as a second exception to "nothing loops", for the public site only. A drawing by the field hand (`icons/README.md`) has three frames of its line that differ only in their tremor; `boil.js` swaps its paths' `d` from one to the next every `duration-boil` (280 ms, about 3.6 frames a second), stepped and never tweened, so the line seems drawn again and again, like hand-drawn animation, while its shape stays.
+
+- **When:** while the drawing idles (`.ic--idling`, which `idle.js` gives only while it is opted in and on screen) and while its `.ic-host` is pointed at or has keyboard focus (any field drawing on the site, the states' too: the person asked for it). The film's play glyph, in the poster's clay dot, opts into the idle layer (`.ic--idle`) only to boil; it has no idle movement of its own. When it stops it goes back to frame 0, the drawing in the markup.
+- **Stops:** with `prefers-reduced-motion` (and `.still`), with the tab hidden (and it rests every drawing), and without JavaScript (the markup is frame 0). `BacktideBoil.stop()` and `.start()` exist for the icon lab.
+- **What changes:** only the `d` attribute of the drawing's own paths: no markup, no style, no storage. The gesture and the idle (`transform`) go on as before on top of it.
+
 ## Never
 
 - Nothing moves with `prefers-reduced-motion: reduce`: `.still` and the media query turn every animation and transition off, and every page is complete and still.
 - Nothing runs while the tab is hidden: `.is-hidden` pauses every animation; the entrance is not played for a hidden tab; `BacktideMotion.swap` does not transition.
-- Nothing loops, except a live agent state's dot in the product web (breathe, pulse) and, on the public site only, the drawings' idle (D34); both stop in the cases above, and the idle off screen too.
-- Only `transform`, `opacity` and `stroke-dashoffset` move (and the headline's blur, once). Never layout, never colour as motion, never the scroll.
+- Nothing loops, except a live agent state's dot in the product web (breathe, pulse) and, on the public site only, the drawings' idle (D34) and their line boil (2026-10-30); all stop in the cases above, and the idle and the boil off screen too.
+- Only `transform`, `opacity` and `stroke-dashoffset` move (and the headline's blur, once, and on the public site a field drawing's line between its boil frames). Never layout, never colour as motion, never the scroll.
 - Nothing is hidden unless JavaScript said so first: without JavaScript the page reads the same.
 - Never `innerHTML`; these files only add and remove classes.

@@ -2,7 +2,9 @@
 
 `backtide web` copies the system's files unchanged from `brand/design-system/project/` (tokens,
 fonts and their licences, motion, the favicons, the mark in the header) and draws its icons with
-the system's own paths; these tests pin every copy to its source, so a change of the system is
+the system's plain set (the steady hand, frozen in ``icons/plain.json``: the product web keeps
+its icons plain and still, while the public site has the field hand and its boil); these tests
+pin every copy to its source, so a change of the system is
 copied again, never edited here. The web's own stylesheet (`web.css`) uses only the system's
 tokens: no colour, font, curve or time written by hand, no shadows, no gradients. Every page
 loads only our own files, in the system's order, and the text colours the web uses keep 4.5:1
@@ -10,7 +12,7 @@ loads only our own files, in the system's order, and the text colours the web us
 rendered page.
 
 To copy the icons again: ``uv run python -m tests.test_web_brand`` (rewrites
-``backtide/web/templates/icons.html`` from ``icons/icons.js``).
+``backtide/web/templates/icons.html`` from ``icons/plain.json``).
 """
 
 import json
@@ -68,10 +70,17 @@ DRAWN = ("ink", "clay", "faint")
 
 
 def icons_data() -> dict[str, list[dict[str, str]]]:
-    code = (SYSTEM / "icons" / "icons.js").read_text()
-    match = re.search(r"var DATA = (\{.*?\});\n", code, re.S)
-    assert match
-    return json.loads(match.group(1))
+    """The plain set the product web draws from (icons/README.md, "Two sets")."""
+    return json.loads((SYSTEM / "icons" / "plain.json").read_text())["icons"]
+
+
+def test_the_product_web_keeps_the_plain_steady_hand() -> None:
+    """The founder's decision of 2026-10-30: the field hand and its boil are the public site's;
+    the product web keeps the plain drawings. The plain set has no boil frames, and every icon
+    the web draws is there."""
+    plain = icons_data()
+    assert set(WEB_ICONS) <= set(plain)
+    assert all("b" not in part for parts in plain.values() for part in parts)
 
 
 def render_icons() -> str:
@@ -248,6 +257,24 @@ def test_the_drawings_stay_still_here_the_idle_is_the_public_sites_only(web: Tes
             assert mark not in html, (page, mark)
     # The system's motion.css itself has no idle in it: the idle lives in its own file.
     assert "idle" not in (STATIC / "motion" / "motion.css").read_text()
+
+
+BOIL_MARKS = ("boil.js", "BacktideBoil", "data-boil", "duration-boil")
+
+
+def test_the_lines_never_boil_here_the_boil_is_the_public_sites_only(web: TestClient) -> None:
+    """The line boil (motion/boil.js, 2026-10-30) runs on the public site only: the product web
+    never ships it, its icons carry only the still frame, and no page names it."""
+    for path in WEB.rglob("*"):
+        if path.is_file() and path.suffix in {".html", ".js", ".py"}:
+            text = path.read_text()
+            for mark in BOIL_MARKS:
+                assert mark not in text, f"{mark} in {path.relative_to(WEB)}"
+    assert not (STATIC / "motion" / "boil.js").exists()
+    for page in ("/ahora", "/historia?accion=nada", "/instantaneas"):
+        html = web.get(page).text
+        for mark in BOIL_MARKS:
+            assert mark not in html, (page, mark)
 
 
 def test_the_page_follows_the_system_theme_until_the_switch_says_otherwise(
