@@ -381,7 +381,8 @@ _SEGMENT_RE = re.compile(r"""(?:[^;|&\r\n)`'"]++|'[^'\r\n]*+'?|"[^"\r\n]*+"?)*+"
 # A strike that may hide a command (argv_struck_long, risk 1): it holds a shell separator,
 # substitution or redirection, a quote followed by a space (it crossed an element), or it
 # crosses a space and is long or reaches the end of the text. A value of token characters
-# alone, however long (an AWS session token), cannot carry a command.
+# alone, however long (an AWS session token), cannot carry a command, except when it is quoted
+# in an interpreter's script: there it can be code between two strings (_note_code).
 _LONG_STRIKE = 64
 _SCRIPT_CHARS = frozenset(";|&$(`\n<>")
 _CROSSED_RE = re.compile(r"[\"'][ \t]|\\\"")
@@ -616,14 +617,19 @@ def safe_text(
     elif ctx is not None and ctx.scrub is not None:
         text = ctx.scrub(text)
     found = _tool_of(tool) if tool else None
+    code = notes is not None and _runs_code(tool, text)
     if len(text) > 2 * _WINDOW:
         # The head window always ends at an artificial cut; the tail ends where the text does.
-        head = _strike_patterns(text[: _WINDOW + _MARGIN], tool=found, open_end=True, notes=notes)
-        tail = _strike_patterns(_tail_window(text), tool=found, open_end=cut, notes=notes)
+        head = _strike_patterns(
+            text[: _WINDOW + _MARGIN], tool=found, open_end=True, notes=notes, code=code
+        )
+        tail = _strike_patterns(
+            _tail_window(text), tool=found, open_end=cut, notes=notes, code=code
+        )
         return _join(
             _shown(_cut_head(head, _WINDOW)), _shown(_cut_tail(tail, _WINDOW)), limit, total
         )
-    clean = _shown(_strike_patterns(text, tool=found, open_end=cut, notes=notes))
+    clean = _shown(_strike_patterns(text, tool=found, open_end=cut, notes=notes, code=code))
     if len(clean.encode("utf-8")) <= limit:
         return clean
     return _join(clean, clean, limit, total)
@@ -829,11 +835,13 @@ def _strike_patterns(
     tool: _Tool | None = None,
     open_end: bool = False,
     notes: set[str] | None = None,
+    code: bool = False,
 ) -> str:
     """Our command-line forms and redact()'s patterns struck (not cut, not escaped): first the
     tool's own flags (when the binary is one of _TOOLS), then the tools inside scripts, then
-    the generic forms. ``open_end``: the text ends at an artificial cut."""
-    strike = _striker(notes)
+    the generic forms. ``open_end``: the text ends at an artificial cut. ``code``: an
+    interpreter may run it (_runs_code), for the notes."""
+    strike = _striker(notes, code)
     # A subcommand (docker login) is looked for at the start: a window that does not start
     # the command (the tail of a long one) gets the tool's flags only through the scripts.
     if tool is not None and (tool.subcommand is None or tool.subcommand.match(text)):
@@ -843,16 +851,21 @@ def _strike_patterns(
     for pattern in _ARGV_PATTERNS[open_end]:
         text = pattern.sub(strike, text)
     text = strike_text(
-        text, on_strike=None if notes is None else lambda m: _note(m, notes), structured=False
+        text,
+        on_strike=None if notes is None else lambda m: _note(m, notes, code),
+        structured=False,
     )
     late = _LATE_PATTERNS[open_end] + (_ENV_LATE[open_end] if tool is _ENV_TOOL else ())
     for pattern in late:
         text = pattern.sub(strike, text)
     # Last (T27-9, docs/46): a clean literal holds no whitespace, shell character or bracket,
-    # but between two strings of a Ruby or Perl script ('+exit!+') it can still be code: a strike
-    # of anything but word characters is noted.
+    # but between two strings of a Ruby or Perl script ('+exit!+') it can still be code: noted
+    # as _note_code says.
     return strike_structured(
-        text, FLAG_WORDS, on_strike=None if notes is None else lambda s: _note_literal(s, notes)
+        text,
+        FLAG_WORDS,
+        on_strike=None if notes is None else lambda s: _note_code(s, notes, code),
+        open_end=open_end,
     )
 
 
@@ -893,45 +906,74 @@ def _strike_scripts(text: str, strike: Callable[[re.Match[str]], str]) -> str:
     return "".join(out)
 
 
-def _striker(notes: set[str] | None) -> Callable[[re.Match[str]], str]:
+def _striker(notes: set[str] | None, code: bool = False) -> Callable[[re.Match[str]], str]:
     if notes is None:
         return _strike
 
     def strike(match: re.Match[str]) -> str:
-        _note(match, notes)
+        _note(match, notes, code)
         return _strike(match)
 
     return strike
 
 
 _WORD_RE = re.compile(r"\w*", re.ASCII)
+_TOKEN_SET = frozenset(_TOKEN_CHARS)
+# A program that runs code written in its arguments, with or without its version in the name
+# (perl5.36.0, ruby3.1, python3.12). Between two strings of its script a quoted "value" can be
+# code ('+exit!+', '.unlink"f".'); for any other program (mysql --password='a-1', export
+# TOKEN="ab+c=") it is one word of the command.
+_INTERPRETER_RE = re.compile(
+    r"(?<![\w.-])(?:ruby|irb|jruby|truffleruby|perl|raku|rakudo|python|pypy|node|nodejs|deno"
+    r"|bun|php|lua|luajit|tclsh|wish|[gm]?awk|osascript|pwsh|julia|Rscript)[\d.]*(?![\w-])"
+)
+# The image's own programs. The agent's root is read-only, so a program anywhere else (its
+# workspace, /tmp, /dev/shm, a relative path) is one the agent put there: a link to perl, say.
+_IMAGE_DIRS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/opt/")
 
 
-def _note_literal(literal: str, notes: set[str]) -> None:
-    """Note a strike of the last pass that may be code (see strike_structured)."""
-    if _WORD_RE.fullmatch(literal) is None:
+def _runs_code(binary: str | None, text: str) -> bool:
+    """Whether an interpreter may run ``text``: ``binary`` is one, or the agent's own program
+    (outside the image), or the text names one (sh -c "ruby -e …")."""
+    binary = binary or ""
+    if not binary.startswith(_IMAGE_DIRS):
+        return True
+    name = binary.rsplit("/", 1)[-1]
+    return _INTERPRETER_RE.fullmatch(name) is not None or _INTERPRETER_RE.search(text) is not None
+
+
+def _note_code(value: str, notes: set[str], code: bool) -> None:
+    """Note a quoted strike that may be code between two strings of a script: any value with a
+    character no token has ('+exit!+'), whatever the program; one of token characters only
+    ('.exit.') when an interpreter may run the text (``code``). An image program with an
+    interpreter's power under a name not in _INTERPRETER_RE, with token characters alone (no
+    space, quote, bracket or "!"), is the accepted rest."""
+    if _WORD_RE.fullmatch(value) is not None:
+        return
+    if code or not set(value) <= _TOKEN_SET:
         notes.add("long")
 
 
-def _note(match: re.Match[str], notes: set[str]) -> None:
+def _note(match: re.Match[str], notes: set[str], code: bool = False) -> None:
     """Note a strike that may hide part of a command (see _LONG_STRIKE)."""
     secret = match.group("secret")
     if secret == REDACTED or not secret:
         return
     spaced = any(char.isspace() for char in secret)
     reaches_end = match.end("secret") == len(match.string)
-    start = match.start("secret")
-    # A quoted value can be the code between two strings of a Ruby or Perl script, as in
-    # print('x_token='.unlink"/w/f".''): noted as in _note_literal (T27-9a review).
-    quoted = start > 0 and match.string[start - 1] in "'\"" and _WORD_RE.fullmatch(secret) is None
     if (
         not _SCRIPT_CHARS.isdisjoint(secret)
         or _CROSSED_RE.search(secret) is not None
         or (spaced and len(secret) > _LONG_STRIKE)
         or (spaced and reaches_end)
-        or quoted
     ):
         notes.add("long")
+        return
+    # A quoted value can be the code between two strings of a Ruby or Perl script, as in
+    # print('x_token='.unlink"/w/f".'') (T27-9a review).
+    start = match.start("secret")
+    if start > 0 and match.string[start - 1] in "'\"":
+        _note_code(secret, notes, code)
 
 
 def every_pattern() -> list[re.Pattern[str]]:

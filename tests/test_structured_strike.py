@@ -58,10 +58,8 @@ def without_the_pass(monkeypatch: pytest.MonkeyPatch) -> Callable[[str, str], di
 
     def outputs(text: str, binary: str) -> dict[str, str]:
         with monkeypatch.context() as m:
-            m.setattr(
-                redact_mod, "strike_structured", lambda text, words=None, on_strike=None: text
-            )
-            m.setattr(procs, "strike_structured", lambda text, words=None, on_strike=None: text)
+            m.setattr(redact_mod, "strike_structured", lambda text, *args, **kwargs: text)
+            m.setattr(procs, "strike_structured", lambda text, *args, **kwargs: text)
             return _all(text, binary)
 
     return outputs
@@ -395,6 +393,88 @@ def test_code_between_two_strings_is_seen_or_noted(binary: str, text: str) -> No
         # A call: never struck by the pass, in any barrier.
         for words in (SENSITIVE_WORDS, FLAG_WORDS):
             assert strike_structured(text, words) == text
+
+
+# The review of PR 1: a literal cut before its closing quote (Tetragon's truncArgs, the head
+# window) closes at the cut, as in procs' other rules.
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"-c d['token']='{_S}",
+        f"-c auth=('u', '{_S}",
+        f"-c x = cfg['api_key'] = '{_S}",
+        f'-c $ENV{{API_KEY}}="{_S}',
+    ],
+)
+def test_a_literal_cut_before_its_quote_is_struck_at_the_cut(text: str) -> None:
+    assert _S not in safe_text(text, tool=PY, cut=True)
+    assert _S not in strike_structured(text, FLAG_WORDS, open_end=True)
+    assert strike_structured(text, FLAG_WORDS) == text  # not cut: property 7
+
+
+def test_a_literal_cut_at_the_head_window_is_struck() -> None:
+    text = (
+        "-c " + "a" * (procs._WINDOW + procs._MARGIN - 20) + f" d['token']='{_S}{_S}" + " x" * 3000
+    )
+    assert _S[:8] not in safe_text(text, tool=PY)
+
+
+# Only an interpreter runs code between two strings: another program's quoted value with a
+# symbol is one word of its command, not noted (the review of PR 1).
+@pytest.mark.parametrize(
+    ("binary", "text"),
+    [
+        ("/usr/bin/mysql", "mysql --password='abc-123' shop"),
+        ("/bin/sh", 'export TOKEN="ab+cd/ef=="'),
+        ("/usr/bin/env", "PGPASSWORD='p-ss.w0rd' psql shop"),
+        ("/usr/bin/curl", "-u alice:'p.w-1' https://h.invalid"),
+        ("/bin/sh", "-c d['token']='ab.cd-ef'"),
+    ],
+)
+def test_a_quoted_value_outside_an_interpreter_is_not_noted(binary: str, text: str) -> None:
+    notes: set[str] = set()
+    safe_text(text, tool=binary, notes=notes)
+    assert notes == set()
+
+
+def test_a_renamed_interpreter_is_noted_for_a_symbol() -> None:
+    """An interpreter copied under another name: a value with a character no token has is
+    noted whatever the program."""
+    notes: set[str] = set()
+    safe_text("-e \"puts('x_token='+exit!+'')\"", tool="/w/bin/r", notes=notes)
+    assert notes == {"long"}
+
+
+# The review of the PR 1 fixes: an interpreter with its version in its name, or a link the
+# agent put outside the image (its root is read-only), is an interpreter.
+@pytest.mark.parametrize(
+    ("binary", "text"),
+    [
+        ("/usr/bin/perl5.36.0", "-e \"print 'x_token='.qx./tmp/x..''\""),
+        ("/usr/bin/ruby3.1", "-e \"puts('x_token='+exit+'')\""),
+        ("/workspace/r", "-e \"print('x_token='.unlink+q./w/f..'')\""),
+        ("/tmp/r", "-e \"print('x_token='.exit.'')\""),  # noqa: S108 - a path the agent sees
+        ("r", "-e \"print('x_token='.exit.'')\""),
+    ],
+)
+def test_token_character_code_is_noted_for_any_interpreter(binary: str, text: str) -> None:
+    notes: set[str] = set()
+    safe_text(text, tool=binary, notes=notes)
+    assert notes == {"long"}
+
+
+def test_an_unknown_image_program_with_token_character_code_is_the_residue() -> None:
+    """docs/23, section 5: an image program with an interpreter's power under a name not in
+    _INTERPRETER_RE. If this starts noting, update the document."""
+    notes: set[str] = set()
+    safe_text("-e \"print('x_token='.exit.'')\"", tool="/usr/bin/xyz", notes=notes)
+    assert notes == set()
+
+
+def test_an_interpreter_named_in_a_script_is_seen() -> None:
+    notes: set[str] = set()
+    safe_text("-c \"ruby -e \\\"puts('d[token]='+exit!+'')\\\"\"", tool="/bin/sh", notes=notes)
+    assert notes == {"long"}
 
 
 def test_a_strike_of_word_characters_only_is_not_noted() -> None:

@@ -249,6 +249,9 @@ _MAX_ELEMENTS = 8
 _CLEAN = r"[^\s'\"\\;&|`$<>()\[\]{},]"
 # The quotes may come escaped (\"x\" in a script that nests double quotes, or in JSON).
 _LITERAL_RE = re.compile(rf"(\\?['\"])({_CLEAN}{{0,{_MAX_LITERAL}}})\1")
+# At an artificial cut (the process sensor's windows, Tetragon's truncArgs) a literal may be
+# cut before its closing quote: then it closes at the end, as in the sensor's other rules.
+_OPEN_LITERAL_RE = re.compile(rf"\\?['\"]({_CLEAN}{{1,{_MAX_LITERAL}}})\Z")
 _ATOM_RE = re.compile(r"[\w.]{1,64}(?:\([\w., ]{0,64}\))?")
 _SPACES_RE = re.compile(r"[ \t]*")
 
@@ -272,14 +275,19 @@ def _structured_anchors(words: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
 
 
 def strike_structured(
-    text: str, words: str = SENSITIVE_WORDS, on_strike: Callable[[str], object] | None = None
+    text: str,
+    words: str = SENSITIVE_WORDS,
+    on_strike: Callable[[str], object] | None = None,
+    *,
+    open_end: bool = False,
 ) -> str:
     """The last pass: strike the clean literals that are the value of a secret subscript or
     name, or the elements of its tuple (see above). ``words``: the secret words the anchors end
     with (redact's; the process sensor passes its flag words). ``on_strike`` sees each struck
-    literal (the sensor notes one that may be code)."""
+    literal (the sensor notes one that may be code). ``open_end``: the text ends at an
+    artificial cut, so a literal left open there runs to the end."""
     out, last = [], 0
-    for start, end in _structured_spans(text, words):
+    for start, end in _structured_spans(text, words, open_end):
         if on_strike is not None:
             on_strike(text[start:end])
         out += [text[last:start], REDACTED]
@@ -287,7 +295,7 @@ def strike_structured(
     return "".join(out) + text[last:] if out else text
 
 
-def _structured_spans(text: str, words: str) -> list[tuple[int, int]]:
+def _structured_spans(text: str, words: str, open_end: bool = False) -> list[tuple[int, int]]:
     """The sorted, disjoint spans strike_structured replaces."""
     subscript, named = _structured_anchors(words)
     spans: list[tuple[int, int]] = []
@@ -303,10 +311,10 @@ def _structured_spans(text: str, words: str) -> list[tuple[int, int]]:
             break
         match = min(candidates, key=lambda candidate: candidate.start())
         if match.re is subscript:
-            value = _structured_value(text, match.end())
+            value = _structured_value(text, match.end(), open_end)
         elif match.group("literal") is not None:
-            literal = _LITERAL_RE.match(text, match.end())
-            value = [literal.span(2)] if literal is not None else None
+            literal = _literal_at(text, match.end(), open_end)
+            value = [literal[0]] if literal is not None else None
         else:
             # After an earlier strike, "(" and "get_token(" look the same: as for a call, one
             # argument is left alone and from two on, all but the first are struck.
@@ -315,9 +323,10 @@ def _structured_spans(text: str, words: str) -> list[tuple[int, int]]:
                 match.end(),
                 struck_first=match.group("struck") is not None,
                 call=match.group("call") is not None or match.group("struck") is not None,
+                open_end=open_end,
             )
         if value:
-            spans += [(s, e) for s, e in value if e > s and text[s:e] != REDACTED]
+            spans += [(s, e) for s, e in value if e > s]
             pos = max(e for _, e in value)
         else:
             pos = match.end()
@@ -328,18 +337,27 @@ def _structured_spans(text: str, words: str) -> list[tuple[int, int]]:
     return disjoint
 
 
-def _structured_value(text: str, i: int) -> list[tuple[int, int]] | None:
-    """The spans to strike in a subscript's value at ``i``: a clean literal or a flat tuple."""
+def _literal_at(text: str, i: int, open_end: bool) -> tuple[tuple[int, int], int] | None:
+    """The clean literal at ``i``: the span of its content and where it ends, or None."""
     literal = _LITERAL_RE.match(text, i)
+    if literal is None and open_end:
+        literal = _OPEN_LITERAL_RE.match(text, i)
+        return None if literal is None else (literal.span(1), literal.end())
+    return None if literal is None else (literal.span(2), literal.end())
+
+
+def _structured_value(text: str, i: int, open_end: bool) -> list[tuple[int, int]] | None:
+    """The spans to strike in a subscript's value at ``i``: a clean literal or a flat tuple."""
+    literal = _literal_at(text, i, open_end)
     if literal is not None:
-        return [literal.span(2)]
+        return [literal[0]]
     if text.startswith("(", i):
-        return _structured_tuple(text, i + 1, struck_first=False, call=False)
+        return _structured_tuple(text, i + 1, struck_first=False, call=False, open_end=open_end)
     return None
 
 
 def _structured_tuple(
-    text: str, i: int, *, struck_first: bool, call: bool
+    text: str, i: int, *, struck_first: bool, call: bool, open_end: bool = False
 ) -> list[tuple[int, int]] | None:
     """The spans to strike in a flat tuple or argument list that starts at ``i`` (just after the
     opening bracket) and closes, or None. A literal alone is struck (token = ('…')); in a call
@@ -360,14 +378,14 @@ def _structured_tuple(
     count = 0
     while True:
         i = _SPACES_RE.match(text, i).end()  # type: ignore[union-attr]
-        if text.startswith(")", i):
-            break
+        if text.startswith(")", i) or (open_end and i == len(text)):
+            break  # closed, or cut: what was read stands
         if count >= _MAX_ELEMENTS:
             return None
-        literal = _LITERAL_RE.match(text, i)
+        literal = _literal_at(text, i, open_end)
         if literal is not None:
-            literals.append((index, *literal.span(2)))
-            i = literal.end()
+            literals.append((index, *literal[0]))
+            i = literal[1]
         else:
             atom = _ATOM_RE.match(text, i)
             if atom is None:
@@ -378,7 +396,7 @@ def _structured_tuple(
         i = _SPACES_RE.match(text, i).end()  # type: ignore[union-attr]
         if text.startswith(",", i):
             i += 1
-        elif text.startswith(")", i):
+        elif text.startswith(")", i) or (open_end and i == len(text)):
             break
         else:
             return None
