@@ -13,6 +13,7 @@ description = "Fake secrets used as test inputs for the redaction"
 paths = [
   '''^tests/test_blackbox_redact\.py$''',
   '''^tests/test_secret_words_parity\.py$''',
+  '''^tests/fixtures/structured_hostile\.json$''',
   '''^tests/test_sensors_procs\.py$''',
   '''^tests/test_jail_sensor\.py$''',
   '''^tests/test_jail_agent\.py$''',
