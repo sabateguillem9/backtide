@@ -4,6 +4,7 @@ This is the second barrier (invariant 5); the first one is the proxy (T06). Reda
 errs on the side of striking too much: a lost word is better than a stored key.
 """
 
+import functools
 import html
 import json
 import re
@@ -201,10 +202,16 @@ def _redact_text(text: str) -> str:
     return _truncate(strike_text(text))
 
 
-def strike_text(text: str, on_strike: Callable[[re.Match[str]], object] | None = None) -> str:
+def strike_text(
+    text: str,
+    on_strike: Callable[[re.Match[str]], object] | None = None,
+    *,
+    structured: bool = True,
+) -> str:
     """The secret patterns of redact() struck out of ``text``, without cutting it: for callers
     that cut texts themselves (the process sensor keeps the head and the tail of a command).
-    ``on_strike`` sees each match before it is struck (the sensor notes long strikes)."""
+    ``on_strike`` sees each match before it is struck (the sensor notes long strikes).
+    ``structured``: end with strike_structured (the process sensor runs it itself, last)."""
     text = _to_valid_utf8(text)
     strike = _strike_secret
     if on_strike is not None:
@@ -219,7 +226,165 @@ def strike_text(text: str, on_strike: Callable[[re.Match[str]], object] | None =
     def strike_card(match: re.Match[str]) -> str:
         return strike(match) if _is_card_number(match.group("secret")) else match.group(0)
 
-    return _CARD_NUMBER_RE.sub(strike_card, text)
+    text = _CARD_NUMBER_RE.sub(strike_card, text)
+    return strike_structured(text) if structured else text
+
+
+# The last pass (T27-9, docs/46): the value of a subscript assignment (os.environ['X_TOKEN']='…',
+# $ENV{API_KEY}="…", cfg[:api_key] = '…') and the elements of a tuple or call after a secret
+# name (auth=('u', '…')). An anchor finds the name and stops after the "=" or the bracket;
+# nothing it matches is ever struck. From there a local reader takes only a clean literal (one
+# word between equal quotes: no quote, backslash, whitespace or shell character inside) or a
+# flat tuple of them that closes. Anything else is left: a bare word is an expression in these
+# languages (d['api_key'] = d['other']), and a literal with a space may span two argv elements,
+# the second one a command (env "d['token']='a" rm -rf "/w'"). It runs after every other rule
+# and only replaces such literals, so it adds strikes and takes nobody's anchor.
+_MAX_LITERAL = 4096
+_MAX_ELEMENTS = 8
+# The two quotes of a "literal" may instead close one string and open the next, with code
+# between them, in one argv element of python3 -c or node -e: print('d[token]=')or(exec(…))or('').
+# Brackets and commas are left out, so no call, subscript or tuple fits: Python and JavaScript
+# cannot call without "(". Ruby and Perl can ('+exit!+', '.exit.'): the process sensor notes a
+# strike of anything but word characters (argv_struck_long), and free text has that residue.
+_CLEAN = r"[^\s'\"\\;&|`$<>()\[\]{},]"
+# The quotes may come escaped (\"x\" in a script that nests double quotes, or in JSON).
+_LITERAL_RE = re.compile(rf"(\\?['\"])({_CLEAN}{{0,{_MAX_LITERAL}}})\1")
+_ATOM_RE = re.compile(r"[\w.]{1,64}(?:\([\w., ]{0,64}\))?")
+_SPACES_RE = re.compile(r"[ \t]*")
+
+
+@functools.cache
+def _structured_anchors(words: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """A subscript whose key ends with a secret word, then =, ||=, ??= or += (not ==, =~ or
+    =>); and NAME=( , NAME=Call( , NAME='…' , or NAME=[REDACTED] where an earlier rule struck
+    the "(" (or the "(" and a first element) as a plain value."""
+    subscript = re.compile(
+        rf"""(?i)[\[{{]:?(?P<quote>(?:\\?['"])?)[\w.-]{{0,64}}?{words}(?P=quote)[\]}}]"""
+        r"[ \t]*(?:\|\||\?\?|\+)?=(?![=~>])[ \t]*"
+    )
+    named = re.compile(
+        rf"(?i)(?<![\w.-])[\w.-]{{0,64}}?{words}[ \t]*=(?![=~>])[ \t]*"
+        r"(?:(?P<call>[A-Za-z_][\w.]{0,64})?\("
+        r"|(?P<struck>\[REDACTED\]|\*\*\*\*\*)(?=[ \t]*[,'\"\\])"
+        r"|(?P<literal>(?=\\?['\"])))"
+    )
+    return subscript, named
+
+
+def strike_structured(
+    text: str, words: str = SENSITIVE_WORDS, on_strike: Callable[[str], object] | None = None
+) -> str:
+    """The last pass: strike the clean literals that are the value of a secret subscript or
+    name, or the elements of its tuple (see above). ``words``: the secret words the anchors end
+    with (redact's; the process sensor passes its flag words). ``on_strike`` sees each struck
+    literal (the sensor notes one that may be code)."""
+    out, last = [], 0
+    for start, end in _structured_spans(text, words):
+        if on_strike is not None:
+            on_strike(text[start:end])
+        out += [text[last:start], REDACTED]
+        last = end
+    return "".join(out) + text[last:] if out else text
+
+
+def _structured_spans(text: str, words: str) -> list[tuple[int, int]]:
+    """The sorted, disjoint spans strike_structured replaces."""
+    subscript, named = _structured_anchors(words)
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    # Each anchor is searched again only once the pass has moved past its last match: linear.
+    found = {subscript: subscript.search(text), named: named.search(text)}
+    while True:
+        for anchor, match in found.items():
+            if match is not None and match.start() < pos:
+                found[anchor] = anchor.search(text, pos)
+        candidates = [match for match in found.values() if match is not None]
+        if not candidates:
+            break
+        match = min(candidates, key=lambda candidate: candidate.start())
+        if match.re is subscript:
+            value = _structured_value(text, match.end())
+        elif match.group("literal") is not None:
+            literal = _LITERAL_RE.match(text, match.end())
+            value = [literal.span(2)] if literal is not None else None
+        else:
+            # After an earlier strike, "(" and "get_token(" look the same: as for a call, one
+            # argument is left alone and from two on, all but the first are struck.
+            value = _structured_tuple(
+                text,
+                match.end(),
+                struck_first=match.group("struck") is not None,
+                call=match.group("call") is not None or match.group("struck") is not None,
+            )
+        if value:
+            spans += [(s, e) for s, e in value if e > s and text[s:e] != REDACTED]
+            pos = max(e for _, e in value)
+        else:
+            pos = match.end()
+    disjoint: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not disjoint or start >= disjoint[-1][1]:
+            disjoint.append((start, end))
+    return disjoint
+
+
+def _structured_value(text: str, i: int) -> list[tuple[int, int]] | None:
+    """The spans to strike in a subscript's value at ``i``: a clean literal or a flat tuple."""
+    literal = _LITERAL_RE.match(text, i)
+    if literal is not None:
+        return [literal.span(2)]
+    if text.startswith("(", i):
+        return _structured_tuple(text, i + 1, struck_first=False, call=False)
+    return None
+
+
+def _structured_tuple(
+    text: str, i: int, *, struck_first: bool, call: bool
+) -> list[tuple[int, int]] | None:
+    """The spans to strike in a flat tuple or argument list that starts at ``i`` (just after the
+    opening bracket) and closes, or None. A literal alone is struck (token = ('…')); in a call
+    one argument is left (get_token('name')); from two on, all but the first (the user)."""
+    literals: list[tuple[int, int, int]] = []  # (position in the tuple, start, end)
+    index = 0
+    if struck_first:
+        # The earlier strike took "(" alone (an element follows at once: it stopped at the quote),
+        # "(" and a first element (a comma follows), or a word up to a space (Tetragon's env rule
+        # takes "('u'," whole). In the last two the first element is gone.
+        spaced = text[i : i + 1] in (" ", "\t")
+        i = _SPACES_RE.match(text, i).end()  # type: ignore[union-attr]
+        if text.startswith(",", i):
+            i += 1
+            index = 1
+        elif spaced:
+            index = 1
+    count = 0
+    while True:
+        i = _SPACES_RE.match(text, i).end()  # type: ignore[union-attr]
+        if text.startswith(")", i):
+            break
+        if count >= _MAX_ELEMENTS:
+            return None
+        literal = _LITERAL_RE.match(text, i)
+        if literal is not None:
+            literals.append((index, *literal.span(2)))
+            i = literal.end()
+        else:
+            atom = _ATOM_RE.match(text, i)
+            if atom is None:
+                return None
+            i = atom.end()
+        count += 1
+        index += 1
+        i = _SPACES_RE.match(text, i).end()  # type: ignore[union-attr]
+        if text.startswith(",", i):
+            i += 1
+        elif text.startswith(")", i):
+            break
+        else:
+            return None
+    if index == 1 and not call:
+        return [(start, end) for _, start, end in literals]
+    return [(start, end) for n, start, end in literals if n >= 1]
 
 
 def _is_card_number(text: str) -> bool:

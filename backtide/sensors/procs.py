@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from backtide.blackbox.model import Source
-from backtide.blackbox.redact import REDACTED, strike_text
+from backtide.blackbox.redact import REDACTED, strike_structured, strike_text
 from backtide.blackbox.secret_words import (
     CONFIG_BASE,
     CONFIG_WORDS,
@@ -842,11 +842,18 @@ def _strike_patterns(
     text = _strike_scripts(text, strike)
     for pattern in _ARGV_PATTERNS[open_end]:
         text = pattern.sub(strike, text)
-    text = strike_text(text, on_strike=None if notes is None else lambda m: _note(m, notes))
+    text = strike_text(
+        text, on_strike=None if notes is None else lambda m: _note(m, notes), structured=False
+    )
     late = _LATE_PATTERNS[open_end] + (_ENV_LATE[open_end] if tool is _ENV_TOOL else ())
     for pattern in late:
         text = pattern.sub(strike, text)
-    return text
+    # Last (T27-9, docs/46): a clean literal holds no whitespace, shell character or bracket,
+    # but between two strings of a Ruby or Perl script ('+exit!+') it can still be code: a strike
+    # of anything but word characters is noted.
+    return strike_structured(
+        text, FLAG_WORDS, on_strike=None if notes is None else lambda s: _note_literal(s, notes)
+    )
 
 
 def _tool_of(binary: str | None) -> _Tool | None:
@@ -897,6 +904,15 @@ def _striker(notes: set[str] | None) -> Callable[[re.Match[str]], str]:
     return strike
 
 
+_WORD_RE = re.compile(r"\w*", re.ASCII)
+
+
+def _note_literal(literal: str, notes: set[str]) -> None:
+    """Note a strike of the last pass that may be code (see strike_structured)."""
+    if _WORD_RE.fullmatch(literal) is None:
+        notes.add("long")
+
+
 def _note(match: re.Match[str], notes: set[str]) -> None:
     """Note a strike that may hide part of a command (see _LONG_STRIKE)."""
     secret = match.group("secret")
@@ -904,11 +920,16 @@ def _note(match: re.Match[str], notes: set[str]) -> None:
         return
     spaced = any(char.isspace() for char in secret)
     reaches_end = match.end("secret") == len(match.string)
+    start = match.start("secret")
+    # A quoted value can be the code between two strings of a Ruby or Perl script, as in
+    # print('x_token='.unlink"/w/f".''): noted as in _note_literal (T27-9a review).
+    quoted = start > 0 and match.string[start - 1] in "'\"" and _WORD_RE.fullmatch(secret) is None
     if (
         not _SCRIPT_CHARS.isdisjoint(secret)
         or _CROSSED_RE.search(secret) is not None
         or (spaced and len(secret) > _LONG_STRIKE)
         or (spaced and reaches_end)
+        or quoted
     ):
         notes.add("long")
 

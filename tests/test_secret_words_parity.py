@@ -45,6 +45,7 @@ What is deliberately not the same is said by the table's columns:
 """
 
 import re
+import time
 
 import pytest
 
@@ -58,6 +59,17 @@ _S = "Qx7vR2mK9pLt4ZwB"  # noqa: S105 - a fake
 _T = "Vb6Yc1Df5Gh0JqR2"  # noqa: S105 - a fake
 
 
+# One rule's flag runs, "(?:--?[A-Za-z0-9_-]*WORD…)*", can split "--pass" two ways ("-" and "-pass",
+# or "--" and "pass"), so Python's backtracking takes 2**n steps on a run of n flags (43 of them
+# never end); RE2, Tetragon's engine, is linear. "-[A-Za-z0-9_-]*" matches the same strings
+# (the class holds "-") with one way to split them: the simulation runs that.
+_ONE_SPLIT = ("--?[A-Za-z0-9_-]*", "-[A-Za-z0-9_-]*")
+
+
+def _simulated(rule: str) -> str:
+    return rule.replace(*_ONE_SPLIT)
+
+
 def _tetragon(text: str, binary: str = "/bin/true") -> str:
     """What Tetragon does with its filters, in order: ReplaceAllStringFunc with each rule, and
     in each match, the rule found again (FindStringSubmatchIndex on the matched text alone)
@@ -67,7 +79,7 @@ def _tetragon(text: str, binary: str = "/bin/true") -> str:
         if regex is not None and not re.search(regex, binary, re.ASCII):
             continue
         for rule in rules:
-            pattern = re.compile(rule, re.ASCII)
+            pattern = re.compile(_simulated(rule), re.ASCII)
 
             def strike(match: re.Match[str], pattern: re.Pattern[str] = pattern) -> str:
                 whole = match.group(0)
@@ -157,6 +169,15 @@ SECRETS = [
     (f'"--signing-key={_S} {_T}" x', _T, ARGV),
     (f'"--master-key {_S} {_T}" x', _T, ARGV),
     (f'"--private-key={_S} {_T}" x', _T, ARGV),
+    # Subscripts and tuples (T27-9, docs/46): the last pass of redact and procs; Tetragon's
+    # rules are unchanged (decision 2), so they are the second barrier's on Tetragon's line.
+    (f"os.environ['X_TOKEN']='{_S}'", _S, TEXT),
+    (f'cfg["api_key"] = "{_S}"', _S, TEXT),
+    (f'$ENV{{API_KEY}}="{_S}"', _S, TEXT),
+    (f"cfg[:api_key] = '{_S}'", _S, TEXT),
+    (f"process.env.X_TOKEN='{_S}'", _S, TEXT),
+    (f"d['password'] = ('u', '{_S}')", _S, TEXT),
+    (f"requests.get(url, auth=('u', '{_S}'))", _S, SECOND),
     # The second barrier's.
     (f'--encryption-key "{_S} {_T}" out.bin', _S, SECOND),
     (f'--private-key "{_S} {_T}" out.bin', _S, SECOND),
@@ -369,6 +390,31 @@ def test_redact_and_procs_stay_linear_on_runs_of_secret_flags(unit: str, tail: s
     large = unit * (size // len(unit)) + tail
     assert_linear(strike_text, small, large, 8, floor=0.01, cap=2.0, label=f"redact {unit!r}")
     assert_linear(safe_text, small, large, 8, floor=0.01, cap=2.0, label=f"procs {unit!r}")
+
+
+def test_the_simulation_is_the_rules() -> None:
+    """The one-split form matches what the rule matches: the same spans, on every text of this
+    module and on runs short enough for the rule as written."""
+    texts = [row[0] for row in SECRETS] + [row[1] for row in ANCHORS + KNOWN_LEAKS] + LOOK_ALIKES
+    texts += ["--pass " * n + tail for n in range(1, 9) for tail in ("x", "", '"', "Bearer x")]
+    changed = [rule for _, rules in REDACTION_FILTERS for rule in rules if _simulated(rule) != rule]
+    assert changed
+    for rule in changed:
+        written, simulated = re.compile(rule, re.ASCII), re.compile(_simulated(rule), re.ASCII)
+        for text in texts:
+            assert [m.span() for m in written.finditer(text)] == [
+                m.span() for m in simulated.finditer(text)
+            ], (rule, text)
+
+
+@pytest.mark.parametrize("unit", ["--pass ", "--pass --password ", "-pass=", "--token=--pass "])
+def test_the_simulation_ends_on_runs_of_secret_flags(unit: str) -> None:
+    """Bounded, not linear: each start still scans the run once (quadratic, like any
+    backtracking engine on a rule that fails at its end), but 43 flags took forever."""
+    for count in (43, 512):
+        started = time.perf_counter()
+        _tetragon(unit * count + '"')
+        assert time.perf_counter() - started < 2.0, (unit, count)
 
 
 def test_an_unquoted_netrc_password_is_an_accepted_residual() -> None:

@@ -1,0 +1,1278 @@
+[
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a&PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a) PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a)PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a)]PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a)}PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a;PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"aPW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password = \"a|PW\"\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a PW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a&PW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a) PW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a)PW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a)]PW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a)}PW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a;PW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'aPW'\""
+],
+[
+"/bin/sh",
+"-c \"x d['token']=(password: 'a|PW'\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a&PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a) PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a)PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a)]PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a)}PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a;PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"aPW\""
+],
+[
+"/bin/sh",
+"d['token']=(password = \"a|PW\""
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a PW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a&PW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a) PW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a)PW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a)]PW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a)}PW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a;PW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'aPW'"
+],
+[
+"/bin/sh",
+"d['token']=(password: 'a|PW'"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a&PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a) PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a)PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a)]PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a)}PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a;PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"aPW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password = \"a|PW\"\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a PW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a&PW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a) PW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a)PW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a)]PW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a)}PW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a;PW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'aPW'\"}"
+],
+[
+"/bin/sh",
+"{\"cmd\": \"d['token']=(password: 'a|PW'\"}"
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a&PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a) PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a)PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a)]PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a)}PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a;PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"aPW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password = \"a|PW\"\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a PW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a&PW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a) PW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a)PW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a)]PW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a)}PW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a;PW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'aPW'\""
+],
+[
+"/bin/true",
+"-c \"x d['token']=(password: 'a|PW'\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a PW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a&PW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a) PW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a)PW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a)]PW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a)}PW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a;PW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"aPW\""
+],
+[
+"/bin/true",
+"d['token']=(password = \"a|PW\""
+],
+[
+"/bin/true",
+"d['token']=(password: 'a PW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'a&PW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'a) PW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'a)PW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'a)]PW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'a)}PW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'a;PW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'aPW'"
+],
+[
+"/bin/true",
+"d['token']=(password: 'a|PW'"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a&PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a) PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a)PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a)]PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a)}PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a;PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"aPW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password = \"a|PW\"\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a PW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a&PW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a) PW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a)PW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a)]PW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a)}PW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a;PW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'aPW'\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(password: 'a|PW'\"}"
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a&PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a) PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a)PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a)]PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a)}PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a;PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"aPW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password = \"a|PW\"\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a PW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a&PW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a) PW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a)PW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a)]PW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a)}PW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a;PW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'aPW'\""
+],
+[
+"/usr/bin/env",
+"-c \"x d['token']=(password: 'a|PW'\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a&PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a) PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a)PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a)]PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a)}PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a;PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"aPW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password = \"a|PW\""
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a PW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a&PW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a) PW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a)PW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a)]PW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a)}PW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a;PW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'aPW'"
+],
+[
+"/usr/bin/env",
+"d['token']=(password: 'a|PW'"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a&PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a) PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a)PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a)]PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a)}PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a;PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"aPW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password = \"a|PW\"\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a PW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a&PW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a) PW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a)PW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a)]PW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a)}PW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a;PW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'aPW'\"}"
+],
+[
+"/usr/bin/env",
+"{\"cmd\": \"d['token']=(password: 'a|PW'\"}"
+],
+[
+"/bin/true",
+"token=(a|PW)"
+],
+[
+"/bin/true",
+"TOKEN=(a|PW) run"
+],
+[
+"/usr/bin/env",
+"TOKEN=(a|PW) run"
+],
+[
+"/bin/sh",
+"-c \"x token=(a|PW) y\""
+],
+[
+"/bin/true",
+"token=(a&PW)"
+],
+[
+"/bin/true",
+"token=(a;PW)"
+],
+[
+"/bin/true",
+"cookie=(a|PW)"
+],
+[
+"/bin/true",
+"token=(x)|PW"
+],
+[
+"/bin/true",
+"token=()PW"
+],
+[
+"/bin/true",
+"token=(x)'PW'"
+],
+[
+"/bin/true",
+"token=(x)\"PW\""
+],
+[
+"/bin/true",
+"token=('a')'PW'"
+],
+[
+"/bin/true",
+"token=(a)=PW"
+],
+[
+"/bin/true",
+"token=(a))PW"
+],
+[
+"/bin/true",
+"token=(a)]PW"
+],
+[
+"/bin/true",
+"token=(a)}PW"
+],
+[
+"/bin/true",
+"token=(a),PW"
+],
+[
+"/bin/true",
+"token=(a)#PW"
+],
+[
+"/bin/true",
+"password=(PW"
+],
+[
+"/bin/true",
+"password=(((a))PW"
+],
+[
+"/bin/true",
+"password=((a)PW"
+],
+[
+"/bin/true",
+"password=('a)PW"
+],
+[
+"/bin/true",
+"password=(\")PW"
+],
+[
+"/bin/true",
+"MYSQL_PWD=(a|PW) mysql"
+],
+[
+"/bin/true",
+"MYSQL_PWD=(PW) mysql"
+],
+[
+"/bin/sh",
+"-c \"MYSQL_PWD=(a|PW) mysql\""
+],
+[
+"/bin/true",
+"--token=(PW)"
+],
+[
+"/bin/true",
+"--password=('u','PW')"
+],
+[
+"/bin/true",
+"d['token']=(a|PW)"
+],
+[
+"/bin/true",
+"d['token']='PW'x"
+],
+[
+"/bin/true",
+"d['token']='a'PW"
+],
+[
+"/bin/true",
+"d['token']=PW"
+],
+[
+"/bin/true",
+"d[token]=PW"
+],
+[
+"/bin/true",
+"d['token']=='PW'"
+],
+[
+"/bin/true",
+"$ENV{TOKEN}=(PW)"
+],
+[
+"/bin/true",
+"d['token']=\"a\"+\"PW\""
+],
+[
+"/bin/true",
+"d['token']='a'+'PW'"
+],
+[
+"/bin/sh",
+"-c \"python3 -c \"os.environ['TOKEN']='a'+'PW'\"\""
+],
+[
+"/bin/true",
+"os.environ['TOKEN']=os.getenv('X','PW')"
+],
+[
+"/bin/true",
+"token=getenv('X','PW')"
+],
+[
+"/bin/true",
+"token=f('PW')"
+],
+[
+"/bin/true",
+"token=(-u alice:PW)"
+],
+[
+"/usr/bin/curl",
+"token=( -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"token=(a) -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"cookie=(a -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"cookie=(a) -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"d['token']= -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"d['token']=( -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"-b token=( -u alice:PW"
+],
+[
+"/usr/bin/env",
+"TOKEN=( -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"authorization=(x --user alice:PW"
+],
+[
+"/bin/true",
+"d['token']=( --password PW"
+],
+[
+"/bin/true",
+"d['token']=(x) --password PW"
+],
+[
+"/bin/true",
+"token=(x --password PW"
+],
+[
+"/bin/true",
+"token=(x) --password PW"
+],
+[
+"/bin/true",
+"token=(x) password 'PW'"
+],
+[
+"/bin/true",
+"token=(x identified by 'PW'"
+],
+[
+"/bin/true",
+"token=( MYSQL_PWD=PW"
+],
+[
+"/bin/true",
+"token=(x) MYSQL_PWD=PW"
+],
+[
+"/bin/true",
+"d['token']= MYSQL_PWD=PW"
+],
+[
+"/usr/bin/openssl",
+"enc d['passphrase']=(x) -pass pass:PW"
+],
+[
+"/bin/true",
+"passphrase: -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"--passphrase -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"passphrase=-u alice:PW"
+],
+[
+"/bin/true",
+"passphrase=Bearer PW"
+],
+[
+"/bin/true",
+"BORG_PASSPHRASE=--password PW"
+],
+[
+"/usr/bin/curl",
+"BORG_PASSPHRASE= -u alice:PW"
+],
+[
+"/bin/true",
+"--passphrase --password PW"
+],
+[
+"/bin/true",
+"--passphrase \"--password PW\""
+],
+[
+"/usr/bin/x",
+"--passphrase -bsid=PW"
+],
+[
+"/usr/bin/openssl",
+"enc --passphrase -pass pass:PW"
+],
+[
+"/usr/bin/redis-cli",
+"--passphrase -a PW ping"
+],
+[
+"/usr/bin/mysql",
+"--passphrase -pPW"
+],
+[
+"/usr/bin/mysql",
+"--passphrase -p PW"
+],
+[
+"/usr/bin/sshpass",
+"--passphrase -p PW ssh"
+],
+[
+"/bin/sh",
+"-c \"PASSPHRASE= sshpass -p PW ssh h\""
+],
+[
+"/bin/sh",
+"-c \"x passphrase: curl -u alice:PW h\""
+],
+[
+"/bin/sh",
+"-c \"d['token']= curl -u alice:PW h\""
+],
+[
+"/bin/sh",
+"-c \"token=( curl -u alice:PW h\""
+],
+[
+"/bin/sh",
+"-c \"echo d['token']=x; curl -u alice:PW h\""
+],
+[
+"/bin/true",
+"token']= \"PW\""
+],
+[
+"/bin/true",
+"d[\"token\"]=\"a\" \"PW\""
+],
+[
+"/bin/true",
+"-c \"d['token']=\"PW x\" y\""
+],
+[
+"/bin/true",
+"-c \"d['token']='PW x' y\""
+],
+[
+"/bin/true",
+"-c \"d['token']='PW x\""
+],
+[
+"/bin/sh",
+"-c \"env TOKEN=('a', 'PW') run\""
+],
+[
+"/bin/sh",
+"-c \"TOKEN=('a' 'PW') run\""
+],
+[
+"/bin/true",
+"export TOKEN=(a PW)"
+],
+[
+"/bin/true",
+"token=( 'a' , 'PW' )"
+],
+[
+"/bin/true",
+"password = ('u', 'PW')"
+],
+[
+"/bin/true",
+"password= ( 'u', 'PW')"
+],
+[
+"/bin/true",
+"auth = ('u', 'PW')"
+],
+[
+"/bin/true",
+"token=('a' | 'PW')"
+],
+[
+"/bin/true",
+"{\"cmd\": \"token=(\", \"password\": \"ab;PW\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"token=(\", \"password\": \"ab|PW\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"token=(\", \"password\": \"ab)PW\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"token=(\", \"password\": \"ab) PW\"}"
+],
+[
+"/bin/true",
+"{'cmd': 'token=(', 'password': 'ab;PW'}"
+],
+[
+"/bin/true",
+"{'cmd': 'token=(', 'password': 'ab&PW'}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"d['token']=(\", \"api_key\": \"ab;PW\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"f(token=(\", \"secret\": \"a&PW\"}"
+],
+[
+"/bin/true",
+"token=(\" -H \"Authorization: Bearer a;PW\""
+],
+[
+"/usr/bin/curl",
+"token=(\" -H \"Authorization: Bearer a;PW\""
+],
+[
+"/bin/true",
+"token=(' --password 'a;PW'"
+],
+[
+"/bin/true",
+"token=(\" --password \"a;PW\""
+],
+[
+"/bin/true",
+"token=(\" password = \"a;PW\""
+],
+[
+"/bin/sh",
+"-c \"x token=(' ; mysql --password='a;PW'\""
+],
+[
+"/bin/true",
+"token=(\" MYSQL_PWD=\"a;PW\""
+],
+[
+"/bin/true",
+"token=(\" -H \"X-Api-Key: a;PW\""
+],
+[
+"/bin/true",
+"token=(' password: 'a;PW'"
+],
+[
+"/bin/true",
+"token=(\" identified by 'a;PW'"
+],
+[
+"/bin/true",
+"token=(' identified by 'a;PW'"
+],
+[
+"/bin/true",
+"token=(\" --password \"a)PW\""
+],
+[
+"/bin/true",
+"token=(' {\"password\": \"a;PW\"}"
+],
+[
+"/bin/sh",
+"-c \"token=(; rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo \"token=('\" ; rm -rf /w ; echo \"'\"\""
+],
+[
+"/bin/sh",
+"-c \"echo 'token=(\"' ; rm -rf /w ; echo '\"'\""
+],
+[
+"/bin/sh",
+"-c \"echo \"password='\" ; rm -rf /w ; echo \"'\"\""
+],
+[
+"/bin/sh",
+"-c \"echo \"d['token']='\" ; rm -rf /w ; echo \"'\"\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(' ; rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(\" ; rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a,; rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a, ; rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a|rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a&&rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a)&&rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a)|rm -rf /w\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a)$(rm -rf /w)\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a)`rm -rf /w`\""
+],
+[
+"/bin/sh",
+"-c \"echo token=(a`rm -rf /w`\""
+],
+[
+"/bin/true",
+"token=(a PW)"
+],
+[
+"/bin/true",
+"token=(a, PW)"
+],
+[
+"/bin/true",
+"token=(a,PW)"
+],
+[
+"/bin/true",
+"token=('a',PW)"
+],
+[
+"/bin/true",
+"token=(a)(b)PW"
+],
+[
+"/bin/true",
+"token=(a)) PW"
+],
+[
+"/bin/true",
+"token=((PW"
+],
+[
+"/bin/true",
+"token=('' PW"
+],
+[
+"/bin/true",
+"d['token']=(PW"
+],
+[
+"/bin/true",
+"d['token']=(a b PW)"
+],
+[
+"/bin/true",
+"{\"cmd\": \"token=(a\", \"password\": \"ab;PW\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"token=(a,\", \"password\": \"ab;PW\"}"
+],
+[
+"/bin/true",
+"{\"cmd\": \"token=('\", \"password\": \"ab;PW\", \"x\": \"')\"}"
+],
+[
+"/bin/true",
+"{\"a\": \"token=(\", \"b\": \")\", \"password\": \"a;PW\"}"
+],
+[
+"/bin/true",
+"token=(', ' --password 'a;PW'"
+],
+[
+"/bin/true",
+"token=('', ' --password 'a;PW')"
+],
+[
+"/bin/true",
+"token=(', ' password: 'a;PW')"
+],
+[
+"/bin/true",
+"token=(\", \" password = \"a;PW\")"
+],
+[
+"/usr/bin/curl",
+"token=(', ' -u alice:PW)"
+],
+[
+"/usr/bin/curl",
+"token=(x, -u, alice:PW)"
+],
+[
+"/usr/bin/curl",
+"token=(x) -u alice:PW"
+],
+[
+"/usr/bin/curl",
+"cookie=(', ' -u alice:PW)"
+],
+[
+"/usr/bin/curl",
+"cookie=(-u alice:PW)"
+],
+[
+"/usr/bin/env",
+"TOKEN=(', ' --password PW)"
+],
+[
+"/bin/true",
+"password=(PW)"
+],
+[
+"/bin/true",
+"password=(\"a b PW\")"
+],
+[
+"/bin/true",
+"password=('a;PW')"
+]
+]
