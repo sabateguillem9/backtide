@@ -145,6 +145,8 @@ RESIDUE = [
     (PY, f"-c \"HTTPBasicAuth('u', '{_S}')\""),  # a call with no secret name
     (PY, f"-c \"s.login('u', '{_S}')\""),
     (PY, f"-c f(token=('{_S}'))"),  # today's name=value rule takes the "("
+    (PY, f"-c f(cookie=('{_S}'))"),  # the same, with another word
+    (PY, f"-c f(password=('a;{_S}'))"),  # and a shell character inside
 ]
 
 
@@ -443,6 +445,18 @@ def test_a_renamed_interpreter_is_noted_for_a_symbol() -> None:
     notes: set[str] = set()
     safe_text("-e \"puts('x_token='+exit!+'')\"", tool="/w/bin/r", notes=notes)
     assert notes == {"long"}
+
+
+# The review of T27-9b: the same in a program of the image that names no interpreter (so the
+# symbol alone, not the program, notes it), after an older rule's name= and after a subscript.
+@pytest.mark.parametrize(
+    "text", ["-e \"puts('x_token='+exit!+'')\"", "-e \"puts('d[token]='+exit!+'')\""]
+)
+def test_a_symbol_is_noted_outside_an_interpreter(text: str) -> None:
+    for chained in (text, _tetragon(text, "/usr/bin/xyz")):
+        notes: set[str] = set()
+        safe_text(chained, tool="/usr/bin/xyz", notes=notes)
+        assert notes == {"long"}, chained
 
 
 # The review of the PR 1 fixes: an interpreter with its version in its name, or a link the

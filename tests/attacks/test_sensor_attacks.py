@@ -162,6 +162,81 @@ def test_a_passphrase_on_the_command_line(attack: Attack, agent, battery_sensor)
     )
 
 
+@scenario("secretos-en-subindices")
+def test_secrets_in_subscripts_and_brackets(attack: Attack, agent, battery_sensor) -> None:
+    # The review of 2026-10-29 (J2, J3) and of PR 1 (code between two strings). The secrets are
+    # made inside the container (the script prints them).
+    marker = f"fsub-{secrets_module.token_hex(4)}"
+    workdir = f"{CONTAINER_WORK}/secretos-en-subindices"
+    attack.watch(battery_sensor, agent.jail)
+    outcome = attack.run_script(agent, "secretos_en_subindices", marker, workdir)
+    forms, hidden = outcome["forms"], outcome["hidden"]
+    # The sentinel: every command is in by now.
+    assert attack.recorded_exec(argv=f"{marker}-fin"), "the script's sentinel never arrived"
+
+    # Recorded: each command with a secret, by its own binary (or the /bin/true stand-in), with
+    # its value struck to [REDACTED] (the residue: only recorded); each with code between
+    # strings showing the code or noted.
+    missing = []
+    for form in forms:
+        seen = attack.recorded_exec(argv=form["tag"], binary=form["binary"], timeout=10.0)
+        argvs = [str(e.details.get("argv", "")) for e in seen]
+        if not any(
+            form["residue"] or ("[REDACTED]" in argv and form["value"] not in argv)
+            for argv in argvs
+        ):
+            missing.append((form["form"], argvs))
+    unseen = []
+    for form in hidden:
+        seen = attack.recorded_exec(argv=form["tag"], timeout=10.0)
+        if not any(
+            form["word"] in str(e.details.get("argv", ""))
+            or (e.details.get("argv_struck_long") and e.risk >= 1)
+            for e in seen
+        ):
+            unseen.append((form["form"], [(e.target, e.details.get("argv")) for e in seen]))
+    stand_ins = sorted({form["form"].split()[1] for form in forms if form["stand_in"]})
+    attack.check(
+        "recorded",
+        missing == [] and unseen == [],
+        f"el sensor grabó los {len(forms)} comandos con un secreto en un subíndice o entre "
+        f"paréntesis (python3; sin la herramienta en la imagen, /bin/true con el mismo texto: "
+        f"{stand_ins or 'ninguna'}), cada uno con su binario y, salvo los "
+        f"{sum(f['residue'] for f in forms)} del residuo, con su valor cambiado por [REDACTED] "
+        f"(sin grabar o sin tachar: {missing or 'ninguno'}); y los {len(hidden)} con código "
+        f"entre dos textos (python3, perl5.36.0, un python copiado en la carpeta del agente y "
+        f"/bin/true con un !) enseñan el código o llevan argv_struck_long con riesgo 1 (sin "
+        f"ninguna de las dos: {unseen or 'ninguno'})",
+    )
+
+    # Stopped: no value, no 8-character piece of one in the box, but for the accepted residue
+    # (docs/46, section 6), and none of the thirteen in the sensor's logs. Tetragon's own file
+    # keeps J2 and J3 (docs/46, decision 2): it is root's alone, 0600 (docs/23, section 5), so
+    # it is not checked here.
+    events = [repr((e.target, e.details)) for e in battery_sensor.box.events()]
+    residue = [(f["form"], any(f["value"] in e for e in events)) for f in forms if f["residue"]]
+    for f in forms:
+        if f["residue"]:  # its run prefix is every secret's: not a piece of another one
+            events = [e.replace(f["value"], "<residue>") for e in events]
+    struck = [f for f in forms if not f["residue"]]
+    leaks = [
+        (f["form"], [e[:160] for e in events if piece in e][:2])
+        for f in struck
+        for piece in {f["value"][i : i + 8] for i in range(len(f["value"]) - 7)}
+        if any(piece in e for e in events)
+    ]
+    logs = battery_sensor.sensor_logs()
+    in_logs = [f["form"] for f in forms if f["value"] in logs]
+    attack.check(
+        "stopped",
+        leaks == [] and in_logs == [],
+        f"ninguno de los {len(struck)} secretos inventados que tacha el último paso llega a la "
+        f"caja negra, ni un trozo de 8 caracteres (se colaron: {leaks or 'ninguno'}); ninguno de "
+        f"los {len(forms)} está en los logs del sensor ({in_logs or 'ninguno'}); el residuo "
+        f"aceptado de docs/46 (sección 6), en la caja (sí o no): {residue}",
+    )
+
+
 @scenario("esconder-comandos")
 def test_hiding_commands(attack: Attack, agent, battery_sensor) -> None:
     marker = _marker()
