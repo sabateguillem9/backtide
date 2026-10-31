@@ -509,6 +509,13 @@ WEB_ACCESS_ALERTS = {
         "Alguien ha usado `sudo backtide contraseña`, y se han cerrado todas las sesiones. Si no "
         "has sido tú, cámbiala otra vez.",
     ),
+    "web_passkey_added": (
+        "Se ha añadido una llave a la web",
+        "Una passkey nueva queda registrada en la web. Si no has sido tú: primero cambia la "
+        "contraseña (`sudo backtide contraseña`, que cierra todas las sesiones), después quita "
+        "las llaves (`sudo rm /var/lib/backtide/web-auth/passkeys.json`) y vuelve a registrar "
+        "las tuyas.",
+    ),
     "web_password_locked": (
         "Demasiadas contraseñas equivocadas en la web",
         "La entrada con contraseña queda cerrada 15 minutos, también para ti. Para entrar ya, "
@@ -4200,12 +4207,17 @@ class Guardian:
         title, body = WEB_ACCESS_ALERTS[action]
         if action == "web_session_opened" and details.get("via") == "password":
             body = WEB_SIGN_IN_BODY
+        if action == "web_passkey_added":
+            # Which key: its name (the owner's own words, struck and cut by the alert) and the
+            # end of its id. Not saved if the box did not take it: then it says so instead.
+            label = f"«{str(details.get('name', ''))[:48]}» …{str(details.get('tail', ''))[:4]}"
+            body = f"Llave {label}. {body}"
         if event is None:
-            body += (
-                " No ha quedado en la caja negra, así que la entrada se ha rechazado."
-                if action == "web_session_opened"
-                else " No ha quedado en la caja negra."
-            )
+            body += {
+                "web_session_opened": " No ha quedado en la caja negra, así que la entrada se ha "
+                "rechazado.",
+                "web_passkey_added": " No ha quedado en la caja negra, así que no se ha guardado.",
+            }.get(action, " No ha quedado en la caja negra.")
         self._alert(AlertLevel.ERROR, title, body, event)
         return event is not None
 

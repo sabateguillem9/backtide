@@ -52,17 +52,30 @@ CONTROL_SOCKET = layout.STATE_DIR / STATE_SOCKET
 # the service's reply (outcome and ok only) or the errno of connecting. Plain sockets: nothing of
 # backtide runs as the probe. A session a reply opens (T26-3a) is kept, never printed, and put
 # where a later request says "<session>"; one opened by a request with "_as": NAME is kept under
-# that name too, for "<session:NAME>". {"_sleep": S} waits S seconds (T26-3a-2: expiry).
+# that name too, for "<session:NAME>". {"_sleep": S} waits S seconds (T26-3a-2: expiry). A
+# request with "_attestation", "_credential" and "_origin" gets, as its "answer", a browser's
+# answer to the last options a reply carried (T26-3b-2): only its clientDataJSON depends on the
+# challenge, and that needs nothing but the standard library.
 PROBE = """
-import errno, json, socket, sys, time
-path, out, session, named = sys.argv[1], [], None, {}
+import base64, errno, json, socket, sys, time
+path, out, session, named, options = sys.argv[1], [], None, {}, None
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 for line in sys.argv[2:]:
     request = json.loads(line)
     if "_sleep" in request:
         time.sleep(request["_sleep"])
         out.append({"slept": request["_sleep"]})
         continue
+    if "_attestation" in request and options is not None:
+        client = json.dumps({"type": "webauthn.create", "challenge": options["challenge"],
+                             "origin": request.pop("_origin"), "crossOrigin": False}).encode()
+        credential = request.pop("_credential")
+        request["answer"] = json.dumps({"id": credential, "rawId": credential, "type": "public-key",
+            "response": {"clientDataJSON": b64url(client),
+                         "attestationObject": request.pop("_attestation")}})
     name = request.pop("_as", None)
+    why = request.pop("_why", False)
     line = json.dumps(request)
     for key, value in named.items():
         line = line.replace(json.dumps("<session:" + key + ">"), json.dumps(value))
@@ -78,12 +91,17 @@ for line in sys.argv[2:]:
             while chunk := sock.recv(65536):
                 raw += chunk
         reply = json.loads(raw)
+        if isinstance(reply.get("options"), str):
+            options = json.loads(reply["options"])
         if isinstance(reply.get("session"), str):
             session = reply["session"]
             if name is not None:
                 named[name] = session
-        out.append({"outcome": reply.get("outcome"), "ok": reply.get("ok"),
-                    "n": len(reply.get("snapshots") or [])})
+        said = {"outcome": reply.get("outcome"), "ok": reply.get("ok"),
+                "n": len(reply.get("snapshots") or [])}
+        if why:
+            said["why"] = str(reply.get("message") or "")[:80]
+        out.append(said)
     except OSError as e:
         out.append({"errno": errno.errorcode.get(e.errno, str(e.errno))})
 print(json.dumps(out))
@@ -618,4 +636,118 @@ def test_guessing_the_webs_password_is_slow_and_leaves_a_trace(
         recorded() and len(opened) >= 1 and not leaked,
         f"las contraseñas equivocadas, en la caja negra ({recorded()}); la entrada con contraseña, "
         f"su evento ({len(opened)}); la contraseña en ningún evento ({leaked or 'ninguno'})",
+    )
+
+
+def soft_key(rp_id: str = "backtide.localhost") -> dict[str, str]:
+    """A passkey made here, as the probe needs it: its id and its attestation object (the part
+    of a browser's answer that does not depend on the challenge), for ``rp_id``."""
+    from tests.passkey_kit import SoftAuthenticator
+
+    options = json.dumps({"challenge": "AAAA", "rp": {"id": rp_id}})
+    answer = json.loads(SoftAuthenticator().create(options, "http://backtide.localhost:8765"))
+    return {"_credential": answer["id"], "_attestation": answer["response"]["attestationObject"]}
+
+
+@scenario("registro-sin-sesion")
+def test_a_passkey_is_only_registered_from_a_live_session(
+    attack: Attack, installed: Installed
+) -> None:
+    """T26-3b-2: as the web's user, register a passkey without a session, with a made-up one,
+    without a challenge, across sessions, from another site and for another relying party, and
+    then as the owner would; replay it; read the keys' file. Each refusal is checked for its
+    reason, not only for being one (review of T26-3b-2)."""
+    from backtide.service import passkeys as pk
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    right = LAB_PASSWORD.read_text().strip()
+    kept = pk.path_of(layout.STATE_DIR)
+    origin = pk.origin_for(pk.WEB_PORT)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    key, other, elsewhere = soft_key(), soft_key(), soft_key("evil.example")
+    time.sleep(13)  # the password's bucket, if another scenario just used it
+    steps = [
+        ("sin sesión", {"cmd": "passkey_begin", "session": None}, "refused", "sesión viva"),
+        ("sesión inventada", {"cmd": "passkey_begin", "session": "s" * 43}, "refused",
+         "sesión viva"),
+        ("entra (p)", {"cmd": "session_password", "password": right, "_as": "p"}, "opened", ""),
+        # The second session from a link root gives: the password's bucket may be spent by now.
+        ("entra (q)", {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_as": "q"},
+         "opened", ""),
+        ("terminar sin empezar", {"cmd": "passkey_finish", "session": "<session:p>",
+         "name": "x", "answer": "{}"}, "refused", "no hay un registro pedido"),
+        ("empieza p", {"cmd": "passkey_begin", "session": "<session:p>"}, "options", ""),
+        ("termina q", {"cmd": "passkey_finish", "session": "<session:q>", "name": "ajena",
+         "_origin": origin, **other}, "refused", "no hay un registro pedido"),
+        ("empieza p", {"cmd": "passkey_begin", "session": "<session:p>"}, "options", ""),
+        ("de otro sitio", {"cmd": "passkey_finish", "session": "<session:p>", "name": "x",
+         "_origin": "http://evil.example:8765", **other}, "refused", "no ha dado una llave"),
+        ("empieza p", {"cmd": "passkey_begin", "session": "<session:p>"}, "options", ""),
+        ("para otro dominio", {"cmd": "passkey_finish", "session": "<session:p>", "name": "x",
+         "_origin": origin, **elsewhere}, "refused", "no ha dado una llave"),
+        ("empieza p", {"cmd": "passkey_begin", "session": "<session:p>"}, "options", ""),
+        ("la del dueño", {"cmd": "passkey_finish", "session": "<session:p>", "name": "portátil",
+         "_origin": origin, **key}, "added", ""),
+        ("otra vez la misma", {"cmd": "passkey_finish", "session": "<session:p>",
+         "name": "portátil", "_origin": origin, **key}, "refused", "no hay un registro pedido"),
+        ("lista", {"cmd": "passkey_list", "session": "<session:p>"}, "listed", ""),
+        ("sale p", {"cmd": "session_end", "session": "<session:p>"}, "ended", ""),
+        ("sale q", {"cmd": "session_end", "session": "<session:q>"}, "ended", ""),
+    ]  # fmt: skip
+    try:
+        requests: list[dict] = []
+        for number, (_, request, _, _) in enumerate(steps):
+            requests.append({**request, "_why": True})
+            if number == 6:  # the keys' bucket gives 10 at once, then one every 3 s
+                requests.append({"_sleep": 12})
+        said = [
+            reply
+            for reply in probe_as(web.pw_uid, web.pw_gid, "", path, *requests)
+            if "slept" not in reply
+        ]
+        info, folder = os.stat(kept), os.stat(kept.parent)
+        as_file = (info.st_uid, oct(stat.S_IMODE(info.st_mode)), oct(stat.S_IMODE(folder.st_mode)))
+        text = kept.read_text()
+        read_as_web = sh(
+            "setpriv", "--reuid", str(web.pw_uid), "--regid", str(web.pw_gid), "--clear-groups",
+            "--", "cat", str(kept), check=False,
+        )  # fmt: skip
+        events = installed.box.events(since_seq=since)
+    finally:
+        kept.unlink(missing_ok=True)  # the installation as install.sh left it: no key
+    wrong = [
+        (label, reply.get("outcome"), reply.get("why"))
+        for (label, _, outcome, reason), reply in zip(steps, said, strict=False)
+        if reply.get("outcome") != outcome or reason not in str(reply.get("why", ""))
+    ]
+    ok = (
+        len(said) == len(steps)
+        and not wrong
+        and as_file == (0, "0o600", "0o700")
+        and "PRIVATE" not in text
+        and key["_credential"] in text
+        and other["_credential"] not in text
+        and elsewhere["_credential"] not in text
+        and read_as_web.returncode != 0
+    )
+    attack.check(
+        "stopped",
+        ok,
+        f"como backtide-web, {len(steps)} pasos (sin sesión, inventada, terminar sin empezar, un "
+        f"reto de otra sesión, otro sitio, otro dominio, la del dueño y repetirla): fuera de lo "
+        f"esperado {wrong or 'ninguno'}; el archivo (uid, modo, carpeta): {as_file}, solo "
+        f"claves públicas ({'PRIVATE' not in text}), ni la de otro sitio ni la de otro dominio "
+        f"({other['_credential'] not in text and elsewhere['_credential'] not in text}), y "
+        f"backtide-web no lo lee ({read_as_web.returncode != 0})",
+    )
+    added = [e for e in events if e.source == "system" and e.action == "web_passkey_added"]
+    attack.check(
+        "recorded",
+        len(added) == 1
+        and added[0].details.get("name") == "portátil"
+        and set(added[0].details) <= {"pid", "name", "tail"},
+        f"la llave nueva, en la caja negra con su nombre y el final de su id ({len(added)}), y "
+        f"ninguna de las rechazadas",
     )

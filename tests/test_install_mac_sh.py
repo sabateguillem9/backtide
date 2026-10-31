@@ -1368,3 +1368,14 @@ def test_the_web_password_is_not_taken_from_a_mac_path(mac: Mac, flag: list[str]
     done = mac.run("--desde", str(mac.archive), "--sha256", mac.sha, "--si", *flag)
     assert done.returncode == 1 and "backtide contraseña" in done.stdout + done.stderr
     _nothing_made(mac)
+
+
+def test_the_link_is_refused_when_another_program_holds_the_port_on_ipv6(
+    mac: Mac, wrapper: Path
+) -> None:
+    """T26-3b-2: backtide.localhost goes to [::1] first; Lima holds only 127.0.0.1, so any other
+    listener on the port (here, besides the hostagent 4242) would get the link."""
+    (mac.root / "listener").write_text("4242\n999\n")
+    done = mac.run("enlace", script=wrapper)
+    assert done.returncode == 1 and "otro programa (pid 999)" in done.stdout + done.stderr
+    (mac.root / "listener").write_text("4242\n")

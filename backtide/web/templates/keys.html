@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "icons.html" import ic %}
+{% block head %}<script src="{{ base }}/static/passkey.js" defer></script>{% endblock %}
+{% block title %}{{ t('keys.title') }}{% endblock %}
+{% block main %}
+<main class="watch gate-page ic-host">
+  {{ ic('key', 'ic--l') }}
+  <h1>{{ t('keys.title') }}</h1>
+  {% if not installed %}
+  <p class="lede">{{ t.code('keys.local') }}</p>
+  {% else %}
+  <p class="lede">{{ t('keys.first') if first else t('keys.body') }}</p>
+  {% if keys %}
+  <ul class="settings-list keys-list">
+    {% for key in keys %}<li class="setting"><div class="setting-info"><span class="setting-name">{{ key.name }}</span><span class="setting-state"><span>{{ t('settings.tail', tail=key.tail) }}</span><span aria-hidden="true">·</span><time datetime="{{ key.added }}">{{ key.added[:10] }}</time></span></div></li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if not here %}
+  <p class="note">{{ t.code('keys.elsewhere', origin=origin) }}</p>
+  {% else %}
+  <form class="settings-form keys-form" id="passkey-form" data-begin="{{ begin }}" data-finish="{{ finish }}" data-csrf="{{ csrf }}" data-done="{{ t('keys.done') }}" data-failed="{{ t('keys.failed') }}" data-unsupported="{{ t('keys.unsupported') }}" data-cancelled="{{ t('keys.cancelled') }}">
+    <div class="setting-field">
+      <label class="setting-label" for="passkey-name">{{ t('keys.name') }}</label>
+      <input id="passkey-name" class="setting-input" type="text" name="name" maxlength="48" required autocomplete="off" placeholder="{{ t('keys.name.example') }}" aria-describedby="passkey-status">
+      <p class="setting-hint" id="passkey-status" role="status" aria-live="polite"></p>
+    </div>
+    <div class="settings-actions">
+      <button class="settings-yes" type="submit"><span>{{ t('keys.add') }}</span>{% include "arrow.html" %}</button>
+      {% if first %}<a class="settings-cancel" href="{{ base }}/">{{ t('keys.later') }}</a>{% endif %}
+    </div>
+  </form>
+  {% endif %}
+  {% endif %}
+</main>
+{% endblock %}

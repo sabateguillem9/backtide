@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from backtide.service.control import ControlError
+from backtide.service.passkeys import Passkeys, origin_for
 from backtide.service.sessions import Sessions
 from backtide.service.web_control import WebControlServer, ask_snapshots
 from backtide.snapshots import SnapshotError
@@ -332,6 +333,7 @@ def signing_in(folder: Path, guardian: FakeGuardian, tmp_path: Path) -> Iterator
         sessions=sessions,
         on_entry=lambda action, details: True,
         password=password.Checker(state),
+        passkeys=Passkeys(state, origins=[origin_for(8765)]),
     )
     server.start()
     new_box(tmp_path)
@@ -428,3 +430,63 @@ def test_every_password_that_can_be_set_can_be_typed(
     web, sessions = signing_in
     entered = web.post("/entrar", data={"password": accepted}, headers=POST_HEADERS)
     assert entered.status_code == 200 and len(sessions) == 1
+
+
+# -- T26-3b-2: registering a passkey, through the service ---------------------------------------
+
+
+def _signed_in_to_keys(web: Any) -> tuple[Any, str]:
+    import re
+
+    from tests.test_web_rewind import POST_HEADERS
+
+    entered = web.post("/entrar", data={"password": WEB_PASSWORD}, headers=POST_HEADERS)
+    assert "/llaves?nueva=1" in entered.text  # the first entry asks for a passkey (D40)
+    elsewhere = web.get("/llaves?nueva=1")  # 127.0.0.1: where a passkey cannot be made
+    assert 'id="passkey-form"' not in elsewhere.text and "backtide.localhost" in elsewhere.text
+    page = web.get("/llaves?nueva=1", headers={"host": "backtide.localhost:8765"})
+    assert page.status_code == 200 and 'id="passkey-form"' in page.text
+    csrf = re.search(r'data-csrf="([^"]+)"', page.text)
+    assert csrf is not None
+    return page, csrf.group(1)
+
+
+def test_a_passkey_is_registered_from_the_web(signing_in: Any) -> None:
+    import json
+
+    from tests.passkey_kit import SoftAuthenticator
+    from tests.test_web_rewind import POST_HEADERS
+
+    web, _ = signing_in
+    _, csrf = _signed_in_to_keys(web)
+    begun = web.post("/llaves/empezar", data={"csrf": csrf}, headers=POST_HEADERS).json()
+    assert begun["ok"] is True
+    answer = SoftAuthenticator().create(begun["options"], "http://backtide.localhost:8765")
+    finished = web.post(
+        "/llaves/registrar",
+        data={"csrf": csrf, "name": "portátil", "answer": answer},
+        headers=POST_HEADERS,
+    ).json()
+    assert finished["ok"] is True and finished["key"]["name"] == "portátil"
+    assert "portátil" in web.get("/llaves").text
+    assert json.dumps(finished).count("public") == 0  # never a key's bytes back to the page
+
+
+def test_a_passkey_cannot_be_registered_without_this_sessions_csrf(signing_in: Any) -> None:
+    from tests.test_web_rewind import POST_HEADERS
+
+    web, _ = signing_in
+    _signed_in_to_keys(web)
+    refused = web.post("/llaves/empezar", data={"csrf": "x" * 43}, headers=POST_HEADERS)
+    assert refused.status_code == 403 and refused.json()["ok"] is False
+    web.cookies.clear()
+    assert (
+        web.post("/llaves/empezar", data={"csrf": "x" * 43}, headers=POST_HEADERS).status_code
+        == 401
+    )
+
+
+def test_the_web_answers_on_backtide_localhost(signing_in: Any) -> None:
+    web, _ = signing_in
+    page = web.get("/ahora", headers={"host": "backtide.localhost:8765"})
+    assert page.status_code == 401 and 'type="password"' in page.text

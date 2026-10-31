@@ -5,8 +5,12 @@ program on this machine that listens on a port of its own (cookies ignore ports)
 
 - ``Guard`` (an ASGI middleware, OUTSIDE everything, so even a 500 carries the headers):
   * the ``Host`` header must be exactly ``127.0.0.1:<port>`` (not ``localhost``: that name can
-    also resolve to ``::1``, where another program may be listening): a page on ``evil.example``
-    that re-points its name at 127.0.0.1 (DNS rebinding) arrives with ITS name in ``Host``;
+    also resolve to ``::1``, where another program may be listening), or ``backtide.localhost:
+    <port>`` (T26-3b-2: a passkey cannot belong to an address; Chrome, Edge and Firefox keep
+    ``*.localhost`` on this machine, but try ``[::1]`` first, so the web holds ``[::1]:<port>``
+    too, ``backtide.web.server.bind_both``): a page on ``evil.example`` that re-points its name
+    at 127.0.0.1 (DNS rebinding) arrives with ITS name in ``Host``. Each name's pages send their
+    own ``Origin``, and only that one is taken with it;
   * only GET, except the paths that change something: ``POST /instantaneas/rebobinar`` (T12b);
     only when `backtide web --ajustes` turned the Settings page on, ``POST /ajustes/guardar``
     (T12e: a key set or removed); and only with `backtide web --aprobar`, ``POST
@@ -65,6 +69,7 @@ from typing import Any, Protocol
 from backtide.service.control import ControlError, PeerCredentials, peer_credentials
 from backtide.service.sessions import Session, Sessions
 from backtide.service.web_control import (
+    ask_passkey,
     ask_session_check,
     ask_session_end,
     ask_session_open,
@@ -107,6 +112,9 @@ SETTINGS_POST_PATH = "/ajustes/guardar"
 HOLDS_PATH = "/peticiones"
 DECIDE_PATH = "/peticiones/decidir"
 # Signing out and closing every session (T26-3a-2): always there, each with the session's CSRF.
+KEYS_PATH = "/llaves"  # the passkeys (T26-3b-2): the page, then its two POSTs
+KEYS_BEGIN_PATH = "/llaves/empezar"
+KEYS_FINISH_PATH = "/llaves/registrar"  # the one path that takes a large form (the answer)
 SIGN_IN_PATH = "/entrar"  # the web's password (T26-3b-1): no session yet, our own Origin
 SIGN_OUT_PATH = "/salir"
 CLOSE_SESSIONS_PATH = "/ajustes/cerrar-sesiones"
@@ -207,6 +215,9 @@ class LocalAccess:
     def sign_in(self, password: str) -> tuple[Session | None, str]:
         return None, "unset"  # a web of its own has no password: only its link
 
+    def passkey(self, command: str, session_id: str, **fields: str) -> dict[str, Any]:
+        return {"ok": False, "outcome": "refused", "message": "Solo en la web instalada."}
+
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
         for value in cookie_values(cookie_header):
             session = self.sessions.check(value, use=use)
@@ -253,6 +264,19 @@ class ServiceAccess:
             logger.error("the service could not open a session: %s", error)
             return None
 
+    def passkey(self, command: str, session_id: str, **fields: str) -> dict[str, Any]:
+        """A passkey command for this session (T26-3b-2): the service's reply, or a refusal of
+        our own if it cannot be asked."""
+        try:
+            return ask_passkey(self._path, command, session_id, **fields, **self._ask())
+        except ControlError as error:
+            logger.error("the service could not be asked about the passkeys: %s", error)
+            return {
+                "ok": False,
+                "outcome": "refused",
+                "message": "Ahora no se puede: prueba otra vez.",
+            }
+
     def sign_in(self, password: str) -> tuple[Session | None, str]:
         try:
             return ask_session_password(self._path, password, **self._ask())
@@ -280,12 +304,12 @@ class ServiceAccess:
         return {"ended": True, "expired": False}.get(outcome)
 
 
+PASSKEY_HOST = "backtide.localhost"  # the passkeys' relying party (backtide.service.passkeys)
+MAX_LARGE_FORM_BYTES = 8192  # a passkey's answer, on its own path only
+
+
 def allowed_hosts(port: int) -> frozenset[str]:
-    return frozenset({f"127.0.0.1:{port}"})
-
-
-def allowed_origins(port: int) -> frozenset[str]:
-    return frozenset({f"http://127.0.0.1:{port}"})
+    return frozenset({f"127.0.0.1:{port}", f"{PASSKEY_HOST}:{port}"})
 
 
 class Guard:
@@ -296,13 +320,20 @@ class Guard:
     when it is on."""
 
     def __init__(
-        self, app: App, *, port: int, prefix: str, post_paths: tuple[str, ...] = (POST_PATH,)
+        self,
+        app: App,
+        *,
+        port: int,
+        prefix: str,
+        post_paths: tuple[str, ...] = (POST_PATH,),
+        large_post_paths: tuple[str, ...] = (),
     ) -> None:
         self.inner = app
         self.base = f"/s/{prefix}"
-        self._post_paths = tuple(self.base + path for path in post_paths)
+        self._post_paths = tuple(self.base + path for path in (*post_paths, *large_post_paths))
+        # A passkey's answer is bigger than any other form: only its path takes up to 8 KiB.
+        self._large_paths = tuple(self.base + path for path in large_post_paths)
         self._hosts = allowed_hosts(port)
-        self._origins = allowed_origins(port)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -338,16 +369,21 @@ class Guard:
         hosts = [v for k, v in headers if k == b"host"]
         if len(hosts) != 1 or hosts[0].decode("latin-1").lower() not in self._hosts:
             return 400, "Host not allowed", []
+        # The one Origin a page of ours sends is the name it was opened by: 127.0.0.1's or
+        # backtide.localhost's, never the other one (review of T26-3b-2).
+        own = "http://" + hosts[0].decode("latin-1").lower()
         if scope["method"] == "POST" and any(
             token_matches(scope["path"], path) for path in self._post_paths
         ):
-            refusal = self._post_refusal(headers)
+            large = any(token_matches(scope["path"], path) for path in self._large_paths)
+            limit = MAX_LARGE_FORM_BYTES if large else MAX_FORM_BYTES
+            refusal = self._post_refusal(headers, own, limit)
             if refusal is not None:
                 return refusal
         elif scope["method"] not in ALLOWED_METHODS:
             return 405, "Read-only", [(b"allow", b"GET")]
         origins = [v for k, v in headers if k == b"origin"]
-        if origins and (len(origins) != 1 or origins[0].decode("latin-1") not in self._origins):
+        if origins and (len(origins) != 1 or origins[0].decode("latin-1") != own):
             return 403, "Origin not allowed", []
         site = next((v for k, v in headers if k == b"sec-fetch-site"), b"").decode("latin-1")
         mode = next((v for k, v in headers if k == b"sec-fetch-mode"), b"").decode("latin-1")
@@ -358,7 +394,7 @@ class Guard:
         return None
 
     def _post_refusal(
-        self, headers: list[tuple[bytes, bytes]]
+        self, headers: list[tuple[bytes, bytes]], own: str, limit: int = MAX_FORM_BYTES
     ) -> tuple[int, str, list[tuple[bytes, bytes]]] | None:
         """A POST that changes something: from our own page, a small plain form, or nothing."""
 
@@ -366,7 +402,7 @@ class Guard:
             return [v.decode("latin-1") for k, v in headers if k == name]
 
         origins = values(b"origin")
-        if len(origins) != 1 or origins[0] not in self._origins:
+        if len(origins) != 1 or origins[0] != own:
             return 403, "A change needs our own Origin", []
         sites = values(b"sec-fetch-site")
         if len(sites) > 1 or (sites and sites[0].lower() != "same-origin"):
@@ -379,7 +415,7 @@ class Guard:
         lengths = values(b"content-length")
         if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
             return 411, "Length required", []
-        if len(lengths[0]) > 6 or int(lengths[0]) > MAX_FORM_BYTES:
+        if len(lengths[0]) > 6 or int(lengths[0]) > limit:
             return 413, "Too large", []
         return None
 

@@ -550,6 +550,11 @@ h1 {
 .signin-error { margin: 0; display: flex; align-items: center; gap: var(--space-2); font: var(--type-label-weight) var(--type-label-size)/1.3 var(--font-sans); color: var(--danger); }
 .signin-error .ic .ic-fill { fill: var(--danger); }
 .signin-error code { color: inherit; }
+#passkey-status.is-error { font: var(--type-label-weight) var(--type-label-size)/1.3 var(--font-sans); color: var(--danger); }
+#passkey-name[aria-invalid] { border-color: var(--danger); }
+/* the passkeys (T26-3b-2): Ajustes' rows, as wide as the form below them */
+.keys-list { max-width: 32rem; margin-top: var(--space-8); }
+.keys-list .setting-name { overflow-wrap: anywhere; }  /* a name is the person's, up to 48 letters in one word */
 .settings-outcome { display: flex; align-items: center; gap: var(--space-3); }
 .settings-outcome .setting-dot { width: 0.75rem; height: 0.75rem; }
 .settings-outcome.is-ok .setting-dot { background: var(--ok); border-color: var(--ok); }

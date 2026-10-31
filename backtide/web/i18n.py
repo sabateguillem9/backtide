@@ -471,6 +471,25 @@ ES: dict[str, str] = {
     "auth.bad": "Ese enlace ya se usó o ya no vale. Para otro navegador, para `backtide web` y "
     "vuelve a lanzarlo.",
     "auth.title.installed": "Entra en backtide",
+    "keys.title": "Llaves",
+    "keys.body": "Una passkey entra en backtide con tu huella, tu cara o el PIN del dispositivo, "
+    "y no se puede adivinar ni robar de aquí. Registra una por cada dispositivo.",
+    "keys.first": "Ya has entrado con la contraseña. Ahora registra una passkey en este "
+    "dispositivo: es la forma segura de entrar (y la que hará falta por tu dominio).",
+    "keys.local": "Las llaves son de la web instalada (`sudo backtide enlace`). Esta web solo "
+    "usa su enlace.",
+    "keys.name": "Nombre de la llave",
+    "keys.name.example": "por ejemplo, portátil",
+    "keys.add": "Registrar esta llave",
+    "keys.later": "Más tarde",
+    "keys.done": "Llave registrada.",
+    "keys.failed": "No se ha registrado.",
+    "keys.cancelled": "Se canceló o se acabó el tiempo: prueba otra vez.",
+    "keys.elsewhere": "Las passkeys son de un nombre, no de una dirección: abre la web en {origin} "
+    "(el enlace que da `sudo backtide enlace`) para registrar una.",
+    "settings.keys": "Llaves (passkeys) para entrar",
+    "keys.unsupported": "Este navegador no puede crear passkeys aquí. Abre la web en "
+    "http://backtide.localhost:8765 con Chrome, Edge o Firefox.",
     "auth.body.installed": "Entra con tu contraseña, o con un enlace de un solo uso: `sudo "
     "backtide enlace` en el servidor.",
     "auth.password": "Contraseña",
@@ -1217,6 +1236,25 @@ EN: dict[str, str] = {
     "auth.bad": "That link was already used or no longer works. For another browser, stop "
     "`backtide web` and start it again.",
     "auth.title.installed": "Sign in to backtide",
+    "keys.title": "Keys",
+    "keys.body": "A passkey signs in to backtide with your fingerprint, your face or the "
+    "device's PIN, and cannot be guessed or stolen from here. Register one on each device.",
+    "keys.first": "You are in with the password. Now register a passkey on this device: it is "
+    "the safe way in (and the one your domain will need).",
+    "keys.local": "Keys belong to the installed web (`sudo backtide enlace`). This web only uses "
+    "its link.",
+    "keys.name": "Name of the key",
+    "keys.name.example": "for example, laptop",
+    "keys.add": "Register this key",
+    "keys.later": "Later",
+    "keys.done": "Key registered.",
+    "keys.failed": "It was not registered.",
+    "keys.cancelled": "It was cancelled or the time ran out: try again.",
+    "keys.elsewhere": "Passkeys belong to a name, not an address: open the web at {origin} (the "
+    "link `sudo backtide enlace` gives) to register one.",
+    "settings.keys": "Keys (passkeys) to sign in",
+    "keys.unsupported": "This browser cannot create passkeys here. Open the web at "
+    "http://backtide.localhost:8765 with Chrome, Edge or Firefox.",
     "auth.body.installed": "Sign in with your password, or with a one-time link: `sudo backtide "
     "enlace` on the server.",
     "auth.password": "Password",

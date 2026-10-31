@@ -869,3 +869,39 @@ def test_a_web_of_its_own_has_no_password_form(tmp_path: Path) -> None:
     assert page.status_code == 401 and 'type="password"' not in page.text
     refused = web.post("/entrar", data={"password": "x" * 20}, headers=POST_HEADERS)
     assert refused.status_code == 404
+
+
+# -- T26-3b-2: backtide.localhost, each name with its own Origin, and the one large form ----------
+
+
+@pytest.mark.parametrize(
+    ("host", "origin", "status"),
+    [
+        (f"127.0.0.1:{PORT}", f"http://backtide.localhost:{PORT}", 403),  # the other name
+        (f"backtide.localhost:{PORT}", f"http://127.0.0.1:{PORT}", 403),
+        (f"backtide.localhost:{PORT}", f"http://backtide.localhost:{PORT}", 303),
+        (f"BACKTIDE.localhost:{PORT}", f"http://backtide.localhost:{PORT}", 303),
+    ],
+)
+def test_a_post_carries_the_origin_of_the_name_it_was_opened_by(
+    tmp_path: Path, host: str, origin: str, status: int
+) -> None:
+    web, (sessions, session) = signed_in_web(tmp_path)
+    response = web.post(
+        "/salir",
+        data={"csrf": session.csrf},
+        headers={"host": host, "origin": origin, "sec-fetch-site": "same-origin"},
+        follow_redirects=False,
+    )
+    assert response.status_code == status
+    assert (sessions.check(SESSION) is None) is (status == 303)
+
+
+@pytest.mark.parametrize(("path", "size"), [("/entrar", 5000), ("/llaves/registrar", 8193)])
+def test_only_the_passkey_answer_may_be_a_large_form(tmp_path: Path, path: str, size: int) -> None:
+    from tests.test_web_rewind import POST_HEADERS
+
+    web, _ = signed_in_web(tmp_path)
+    form = {**POST_HEADERS, "content-type": "application/x-www-form-urlencoded"}
+    response = web.post(path, content=b"a=" + b"x" * (size - 2), headers=form)
+    assert response.status_code == 413

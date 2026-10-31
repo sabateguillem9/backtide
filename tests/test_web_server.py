@@ -39,3 +39,49 @@ def test_without_it_the_stop_still_works_and_says_so(
         made.handle_exit(signal.SIGTERM, None)
     assert made.should_exit
     assert "uvicorn changed" in caplog.text
+
+
+# -- T26-3b-2: the web holds [::1] too, on the same port ------------------------------------------
+
+
+def test_the_web_holds_both_loopbacks_on_one_port() -> None:
+    import socket
+
+    from backtide.web.server import bind_both
+
+    socks = bind_both(0)
+    try:
+        assert [s.family for s in socks][0] == socket.AF_INET
+        if len(socks) == 2:  # a machine with IPv6
+            assert socks[1].family == socket.AF_INET6
+            assert socks[1].getsockname()[0] == "::1"
+            assert socks[0].getsockname()[1] == socks[1].getsockname()[1]
+    finally:
+        for sock in socks:
+            sock.close()
+
+
+def test_a_foreign_program_on_the_ipv6_loopback_stops_the_web() -> None:
+    """Review of T26-3b-2: whoever held [::1]:port would get backtide.localhost's requests."""
+    import socket
+
+    from backtide.web.server import bind, bind_both
+
+    probe = bind(0)
+    port = probe.getsockname()[1]
+    probe.close()
+    try:
+        squatter = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        squatter.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        squatter.bind(("::1", port))
+        squatter.listen(1)
+    except OSError:
+        pytest.skip("no IPv6 loopback here")
+    try:
+        with pytest.raises(OSError):
+            bind_both(port)
+        # ...and IPv4 is left free again: nothing half-open stays behind.
+        again = bind(port)
+        again.close()
+    finally:
+        squatter.close()

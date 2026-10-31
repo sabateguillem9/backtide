@@ -55,8 +55,7 @@ while [ "$left" -gt 0 ]; do
       esac ;;
     --telegram) TELEGRAM=1 ;;
     --telegram-token-stdin) die "en el Mac, el token va con --telegram-token-archivo RUTA, o se pide sin eco" ;;
-    --contrasena-archivo | --contrasena-archivo=* | --contrasena-stdin)
-      die "en el Mac, la contraseña de la web se pide sin eco al instalar, o se pone después con \`backtide contraseña\`" ;;
+    --contrasena-archivo | --contrasena-archivo=* | --contrasena-stdin) die "en el Mac, la contraseña de la web se pide sin eco al instalar, o luego con \`backtide contraseña\`" ;;
     --clave-archivo=*) KEY_FILE=${arg#--clave-archivo=} ;;
     --clave-stdin) KEY_MODE=stdin ;;
     --sin-clave) KEY_MODE=none ;;
@@ -194,8 +193,12 @@ web_port_is_ours() {
     n=$((n + 1)); [ "$n" -lt 15 ] || die "el puerto $PORT del Mac no está reenviado a la VM: \`backtide vm parar\` y otra vez"
     sleep 1
   done
-  [ "$who" = "$(cat "$LIMA_HOME/$VM/ha.pid" 2>/dev/null)" ] \
-    || die "el puerto $PORT del Mac lo tiene otro programa (pid $who), no la VM: el enlace llegaría a él"
+  # Every listener, IPv4 and IPv6: backtide.localhost tries [::1] first (T26-3b-2).
+  ha=$(cat "$LIMA_HOME/$VM/ha.pid" 2>/dev/null || true)
+  for who in $(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u); do
+    [ "$who" = "$ha" ] \
+      || die "el puerto $PORT del Mac lo tiene otro programa (pid $who), no la VM: el enlace llegaría a él"
+  done
 }
 if [ "${1:-}" = vm ]; then
   case "${2:-}" in
@@ -459,7 +462,7 @@ case ":$PATH:" in *":$BIN:"*) ;; *) say "añade $BIN a tu PATH para usar \`backt
 cat <<EOF
 
 backtide está instalado en la VM $VM de este Mac y vigila al agente.
-  - La web, solo en este Mac: \`backtide enlace\` da su enlace de un uso (http://127.0.0.1:$WEB_PORT/...).
+  - La web, solo en este Mac: \`backtide enlace\` da su enlace de un uso (http://backtide.localhost:$WEB_PORT/...).
   - El estado: \`backtide comprobar --despues-de-instalar\`; la VM: \`backtide vm estado\`.
   - Quitarlo: \`backtide desinstalar\` (conserva tus datos en la VM, parada; --borrar-datos lo borra todo).
   - Telegram: $([ "$TELEGRAM" = 1 ] && echo 'puesto, los avisos te llegan al bot.' || echo 'opcional; `backtide enlace` abre la web y se pone en Ajustes > Avisos.')

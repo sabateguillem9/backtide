@@ -1982,6 +1982,29 @@ risk = "n/a"
 recoverable = "n/a"
 held = "n/a"
 
+[[scenario]]
+id = "registro-sin-sesion"
+name = "Una passkey solo se registra desde una sesión viva y para nuestra web"
+story = """T26-3b-2 (D40): tras entrar con la contraseña, la web pide registrar una passkey, y la \
+comprueba el servicio, no la web. Como `backtide-web` (la web tomada), el escenario pide un \
+registro sin sesión y con una inventada; con la contraseña abre dos sesiones y termina un registro \
+que no empezó, responde con una sesión al reto de la otra, con una llave hecha para otro sitio \
+(`evil.example`) y con una hecha para otro dominio con el origen bueno: cada rechazo se comprueba \
+por su motivo, y cada reto rechazado queda gastado. La del dueño, para `http://backtide.localhost:8765`, queda: en \
+`/var/lib/backtide/web-auth/passkeys.json` (de root, 0600, en una carpeta 0700) solo su clave \
+pública, `backtide-web` no puede leerlo, y la caja negra apunta la llave nueva con su nombre y el \
+final de su id; repetir la misma respuesta ya no vale. Al terminar, el escenario quita la llave."""
+inspired_by = "Registrar la llave del atacante para volver a entrar siempre"
+invariants = [2, 5, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
 # Desinstalar (T13-4, la revisión): destructivos, solo con BACKTIDE_LAB_DESTRUCTIVO=1 en una VM
 # del laboratorio; cada uno acaba con backtide desinstalado y sus datos conservados.
 

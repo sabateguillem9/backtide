@@ -304,8 +304,11 @@ def test_nothing_outside_the_list_is_served(
 
 
 def test_the_list_is_closed() -> None:
-    assert COMMANDS == READS | CHANGES | SESSION_COMMANDS
+    from backtide.service.web_control import PASSKEY_COMMANDS
+
+    assert COMMANDS == READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS
     assert not READS & CHANGES and not (READS | CHANGES) & SESSION_COMMANDS
+    assert not (READS | CHANGES | SESSION_COMMANDS) & PASSKEY_COMMANDS
     assert "web_link" not in COMMANDS  # only root mints a way in
     assert {"resume", "shell", "import", "export"}.isdisjoint(COMMANDS)
 
@@ -1098,3 +1101,98 @@ def test_a_password_file_that_changed_hands_lets_nobody_in(
         r.levelno == logging.ERROR and "password file cannot be used" in r.getMessage()
         for r in caplog.records
     )
+
+
+# -- T26-3b-2: passkeys over the narrow socket ------------------------------------------------
+
+
+@pytest.fixture
+def passkeys(tmp_path: Path) -> Any:
+    from backtide.service.passkeys import Passkeys, origin_for
+
+    state = tmp_path / "keys-state"
+    state.mkdir(mode=0o700)
+    return Passkeys(state, origins=[origin_for(8765)])
+
+
+@pytest.mark.parametrize("session", [None, "x" * 43])
+def test_no_passkey_without_a_live_session(
+    make_server: Callable[..., WebControlServer], passkeys: Any, session: str | None
+) -> None:
+    server = make_server(passkeys=passkeys)
+    for request in (
+        {"cmd": "passkey_begin", "session": session},
+        {"cmd": "passkey_list", "session": session},
+        {"cmd": "passkey_finish", "session": session, "answer": "{}", "name": "x"},
+    ):
+        assert talk(server, request)["outcome"] == "refused"
+    assert passkeys.keys() == []
+
+
+def test_a_passkey_through_the_socket_is_recorded(
+    make_server: Callable[..., WebControlServer], passkeys: Any
+) -> None:
+    from backtide.service.passkeys import origin_for
+    from backtide.service.web_control import ask_passkey
+    from tests.passkey_kit import SoftAuthenticator
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    server = make_server(passkeys=passkeys,
+                         on_entry=lambda a, d: entries.append((a, d)) is None)  # fmt: skip
+    ask = {"server_uid": ME, "peer": the_web}
+    begun = ask_passkey(server.path, "passkey_begin", SESSION, **ask)
+    answer = SoftAuthenticator().create(begun["options"], origin_for(8765))
+    done = ask_passkey(server.path, "passkey_finish", SESSION, answer=answer, name="móvil", **ask)
+    assert done["outcome"] == "added" and done["key"]["name"] == "móvil"
+    listed = ask_passkey(server.path, "passkey_list", SESSION, **ask)
+    assert [k["name"] for k in listed["keys"]] == ["móvil"]
+    [(action, details)] = entries
+    assert action == "web_passkey_added" and details["name"] == "móvil"
+    assert set(details) == {"pid", "name", "tail"}
+
+
+def test_a_passkey_the_box_does_not_take_is_taken_out(
+    make_server: Callable[..., WebControlServer], passkeys: Any
+) -> None:
+    from backtide.service.passkeys import origin_for
+    from backtide.service.web_control import ask_passkey
+    from tests.passkey_kit import SoftAuthenticator
+
+    server = make_server(passkeys=passkeys, on_entry=lambda a, d: False)
+    ask = {"server_uid": ME, "peer": the_web}
+    begun = ask_passkey(server.path, "passkey_begin", SESSION, **ask)
+    answer = SoftAuthenticator().create(begun["options"], origin_for(8765))
+    done = ask_passkey(server.path, "passkey_finish", SESSION, answer=answer, name="móvil", **ask)
+    assert done["outcome"] == "refused" and passkeys.keys() == []
+
+
+def test_a_passkey_command_of_another_shape_is_refused(
+    make_server: Callable[..., WebControlServer], passkeys: Any
+) -> None:
+    server = make_server(passkeys=passkeys)
+    for request in (
+        {"cmd": "passkey_begin", "session": SESSION, "rp_id": "evil.example"},
+        {"cmd": "passkey_finish", "session": SESSION, "answer": "{}"},
+        {"cmd": "passkey_list"},
+    ):
+        assert talk(server, request)["outcome"] == "refused"
+
+
+def test_a_recorded_passkey_that_cannot_be_written_is_refused(
+    make_server: Callable[..., WebControlServer], passkeys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backtide.service.passkeys import PasskeyError, origin_for
+    from backtide.service.web_control import ask_passkey
+    from tests.passkey_kit import SoftAuthenticator
+
+    def full(key: object) -> None:
+        raise PasskeyError("no se puede guardar: disco lleno")
+
+    monkeypatch.setattr(passkeys, "keep", full)
+    entries: list[str] = []
+    server = make_server(passkeys=passkeys, on_entry=lambda a, d: entries.append(a) is None)
+    ask = {"server_uid": ME, "peer": the_web}
+    begun = ask_passkey(server.path, "passkey_begin", SESSION, **ask)
+    answer = SoftAuthenticator().create(begun["options"], origin_for(8765))
+    done = ask_passkey(server.path, "passkey_finish", SESSION, answer=answer, name="x", **ask)
+    assert done["outcome"] == "refused" and entries == ["web_passkey_added"]

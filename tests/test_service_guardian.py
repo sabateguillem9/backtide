@@ -3395,3 +3395,23 @@ def test_an_entry_with_the_password_says_to_change_it(world: World) -> None:
     with_password, with_link = world.alerts.titled("ha entrado en la web")
     assert "contraseña" in with_password.body and "backtide contraseña" in with_password.body
     assert "enlace" in with_link.body
+
+
+def test_a_new_passkey_is_recorded_and_alerted(world: World) -> None:
+    assert world.guardian.web_access(
+        "web_passkey_added", {"pid": 8, "name": "móvil", "tail": "ab12"}
+    )
+    assert world.only("web_passkey_added").details == {"pid": 8, "name": "móvil", "tail": "ab12"}
+    (alert,) = world.alerts.titled("llave")
+    assert alert.level is AlertLevel.ERROR
+    assert "«móvil» …ab12" in alert.body and "passkeys.json" in alert.body
+
+
+def test_a_passkey_the_box_does_not_take_is_said_not_saved(world: World) -> None:
+    world.box.append_error = BlackBoxError("disk full")
+    assert (
+        world.guardian.web_access("web_passkey_added", {"pid": 8, "name": "x", "tail": "ab12"})
+        is False
+    )
+    (alert,) = world.alerts.titled("llave")
+    assert "no se ha guardado" in alert.body

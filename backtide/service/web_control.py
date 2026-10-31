@@ -73,6 +73,7 @@ from backtide.service.control import (
     _reply_of,
     peer_credentials,
 )
+from backtide.service.passkeys import PasskeyError, Passkeys, describe
 from backtide.service.password import Checker, PasswordError, Verdict
 from backtide.service.rewind import RewindOutcome, RewindStatus
 from backtide.service.sessions import Session, Sessions
@@ -94,7 +95,9 @@ CHANGES = frozenset(
 SESSION_COMMANDS = frozenset(
     {"session_open", "session_password", "session_check", "session_end", "session_end_all"}
 )
-COMMANDS = READS | CHANGES | SESSION_COMMANDS
+# The passkeys (T26-3b-2): each from a live session, which they carry.
+PASSKEY_COMMANDS = frozenset({"passkey_begin", "passkey_finish", "passkey_list"})
+COMMANDS = READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS
 # Every request: a burst of 120, then 20 a second (the panel's stream asks about once a second
 # per open tab). The changes: a burst of 10, then one every 3 s (a person clicks).
 REQUESTS_BURST, REQUESTS_PER_SECOND = 120, 20.0
@@ -108,6 +111,13 @@ ENDS_BURST, ENDS_PER_SECOND = 5, 1 / 6
 # Passwords: a bucket of their own (the Checker's own, slower one comes after), so a stream of
 # them never empties the pages' checks nor the link's way in (review of T26-3b-1).
 PASSWORDS_BURST, PASSWORDS_PER_SECOND = 10, 1.0
+# The passkeys: a person registers one now and then (T26-3b-2).
+KEYS_BURST, KEYS_PER_SECOND = 10, 1 / 3
+PASSKEY_KEYS = {
+    "passkey_begin": {"cmd", "session"},
+    "passkey_list": {"cmd", "session"},
+    "passkey_finish": {"cmd", "session", "answer", "name"},
+}
 PASSWORD_MESSAGES = {
     Verdict.WRONG: "Esa no es la contraseña.",
     Verdict.SLOW_DOWN: "Demasiados intentos seguidos: espera unos segundos.",
@@ -174,6 +184,8 @@ class WebControlServer(ControlServer):
         opens: Bucket | None = None,
         ends: Bucket | None = None,
         passwords: Bucket | None = None,
+        keys: Bucket | None = None,
+        passkeys: Passkeys | None = None,
         on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
         password: Checker | None = None,
     ) -> None:
@@ -206,6 +218,8 @@ class WebControlServer(ControlServer):
         self._opens = opens or Bucket(OPENS_BURST, OPENS_PER_SECOND)
         self._ends = ends or Bucket(ENDS_BURST, ENDS_PER_SECOND)
         self._passwords = passwords or Bucket(PASSWORDS_BURST, PASSWORDS_PER_SECOND)
+        self._keys = keys or Bucket(KEYS_BURST, KEYS_PER_SECOND)
+        self._passkeys = passkeys
 
     def refusal_for(self, pid: int, uid: int, gid: int) -> str | None:
         wrong_user = self._user is not None and uid not in (self._user, 0)
@@ -239,6 +253,8 @@ class WebControlServer(ControlServer):
             raise _BadRequest("Esa orden no se acepta por el socket de la web.")
         if command in SESSION_COMMANDS:
             return self._session_command(command, request, pid)
+        if command in PASSKEY_COMMANDS:
+            return self._passkey_command(command, request, pid)
         if not self._requests.take():
             logger.warning("web socket: too many requests, one from pid %d was refused", pid)
             raise _BadRequest("Demasiadas peticiones seguidas: espera un poco.")
@@ -330,6 +346,55 @@ class WebControlServer(ControlServer):
         if self._on_entry is not None:
             self._on_entry("web_sessions_closed", {"pid": pid, "ended": ended})
         return {"ok": True, "outcome": "ended", "message": "", "ended": ended}
+
+    def _passkey_command(self, command: str, request: dict[str, Any], pid: int) -> dict[str, Any]:
+        """Register a passkey and list them (T26-3b-2): from a live session only; the service
+        checks the browser's answer, the web only carries it. A key the black box does not take
+        is taken out again (it fails closed)."""
+        if set(request) != PASSKEY_KEYS[command]:
+            raise _BadRequest("Esa orden de llaves no tiene la forma esperada.")
+        if not self._keys.take():
+            logger.warning("web socket: too many %s, one from pid %d was refused", command, pid)
+            raise _BadRequest("Demasiadas peticiones seguidas: espera un poco.")
+        if self._passkeys is None or self._sessions is None:
+            raise _BadRequest("Este servicio no lleva llaves de la web.")
+        session = self._sessions.check(request["session"])
+        if session is None:
+            logger.warning("web socket: refused a %s without a live session (pid %d)", command, pid)
+            raise _BadRequest(NO_SESSION)
+        try:
+            if command == "passkey_list":
+                keys = [describe(key) for key in self._passkeys.keys()]
+                return {"ok": True, "outcome": "listed", "message": "", "keys": keys}
+            if command == "passkey_begin":
+                options = self._passkeys.begin(session.id)
+                return {"ok": True, "outcome": "options", "message": "", "options": options}
+            key = self._passkeys.verify(session.id, request["answer"], request["name"])
+        except PasskeyError as error:
+            logger.warning("web socket: a passkey was refused (pid %d): %s", pid, error)
+            return {"ok": False, "outcome": "refused", "message": str(error)}
+        # Recorded first, written after: a key never lives without its event (an event
+        # without a key, if the write then fails, is the safe way to fail).
+        if self._on_entry is None or not self._on_entry(
+            "web_passkey_added", {"pid": pid, "name": key.name, "tail": key.tail}
+        ):
+            logger.error("web socket: a passkey could not be recorded and was not kept")
+            return {"ok": False, "outcome": "refused",
+                    "message": "No se ha podido apuntar la llave: no se ha guardado."}  # fmt: skip
+        try:
+            self._passkeys.keep(key)
+        except PasskeyError as error:
+            # The event says "added": the ERROR (recorded and alerted by the log bridge) says
+            # which key was not kept after all.
+            logger.error(
+                "web socket: the passkey «%s» …%s was recorded but could not be kept: %s",
+                key.name,
+                key.tail,
+                error,
+            )
+            return {"ok": False, "outcome": "refused", "message": str(error)}
+        logger.info("web socket: a new passkey for the web (pid %d)", pid)
+        return {"ok": True, "outcome": "added", "message": "", "key": describe(key)}
 
     def _password(self, given: object, pid: int) -> dict[str, Any]:
         """The web's password (T26-3b-1): the service checks it (a scrypt hash, a bucket for the
@@ -578,6 +643,27 @@ def ask_session_end(
     return "refused"
 
 
+def ask_passkey(
+    path: Path,
+    command: str,
+    session_id: str,
+    *,
+    server_uid: int = 0,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    **fields: str,
+) -> dict[str, Any]:
+    """One of the passkeys' commands (T26-3b-2) for this session: the service's reply, checked
+    to be a dict with ``ok``. ValueError for a command that is not one (nothing sent)."""
+    if command not in PASSKEY_COMMANDS:
+        raise ValueError("not a passkey command")
+    request: dict[str, Any] = {"cmd": command, "session": session_id, **fields}
+    return _ask_session(path, request, server_uid=server_uid, wait=wait, peer=peer,
+                        sleep=sleep, monotonic=monotonic)  # fmt: skip
+
+
 def web_group_problem(gid: int) -> str | None:
     """Why ``gid`` cannot be the web's group, or None (for `backtide vigilar --grupo-web`)."""
     if gid in _FORBIDDEN_GIDS:
@@ -589,9 +675,11 @@ __all__ = [
     "CHANGES",
     "COMMANDS",
     "READS",
+    "PASSKEY_COMMANDS",
     "SESSION_COMMANDS",
     "Bucket",
     "WebControlServer",
+    "ask_passkey",
     "ask_session_check",
     "ask_session_end",
     "ask_session_open",

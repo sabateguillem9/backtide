@@ -218,7 +218,11 @@ def test_no_route_takes_anything_but_get_except_the_rewind(tmp_path: Path) -> No
     routes = [r for r in app.inner.routes if hasattr(r, "methods")]
     # Rewinding; signing in with the password (T26-3b-1); signing out and closing every
     # session (T26-3a-2), which only end sessions.
-    takes_post = {POST_PATH, "/entrar", "/salir", "/ajustes/cerrar-sesiones"}
+    # Registering a passkey (T26-3b-2), from a live session and our own page.
+    takes_post = {
+        POST_PATH, "/entrar", "/salir", "/ajustes/cerrar-sesiones", "/llaves/empezar",
+        "/llaves/registrar",
+    }  # fmt: skip
     for route in routes:
         if route.path in takes_post and "POST" in route.methods:
             continue

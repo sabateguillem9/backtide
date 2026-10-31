@@ -47,6 +47,7 @@ is no setting that could make it listen on a network interface, and with ``--por
 the real port before the app is built (its ``Host`` check needs it).
 """
 
+import errno
 import logging
 import re
 import socket
@@ -90,6 +91,42 @@ def bind(port: int) -> socket.socket:
         sock.close()
         raise
     return sock
+
+
+LOOPBACK6 = "::1"
+# IPv6 is not there at all (a kernel or a VM without it): then nothing can listen on ::1 either.
+_NO_IPV6 = {errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, errno.EPROTONOSUPPORT}
+
+
+def bind_both(port: int) -> list[socket.socket]:
+    """127.0.0.1:``port`` and [::1] on the same port (T26-3b-2). A browser opens
+    backtide.localhost at ::1 first when something answers there: another program that held
+    [::1]:port would get the link, the password and the cookie. So the web holds it too, or does
+    not start (OSError, as for a taken port); without IPv6 at all, IPv4 alone is enough."""
+    first = bind(port)
+    real = first.getsockname()[1]
+    try:
+        second = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    except OSError as error:
+        if error.errno in _NO_IPV6:
+            logger.info("no IPv6 here: the web listens on 127.0.0.1 only")
+            return [first]
+        first.close()
+        raise
+    try:
+        second.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        second.bind((LOOPBACK6, real))
+        second.listen(64)
+        second.set_inheritable(True)
+    except OSError as error:
+        second.close()
+        if error.errno in _NO_IPV6:
+            logger.info("no IPv6 loopback here: the web listens on 127.0.0.1 only")
+            return [first]
+        first.close()
+        raise
+    return [first, second]
 
 
 class _Server(uvicorn.Server):
@@ -195,8 +232,8 @@ def run_web(
     asked instead of the control socket for everything, the snapshot list included, and the
     sign-in (T26-3a): then the service keeps the sessions, and ``announce`` gets the address
     without a token (``web_base``), which `sudo backtide enlace` completes."""
-    sock = bind(port)
-    real_port = sock.getsockname()[1]
+    socks = bind_both(port)
+    real_port = socks[0].getsockname()[1]
     token, prefix, run_name = make_token(), make_prefix(), make_run_name()
     reader = BoxReader(paths.blackbox_db)
 
@@ -235,9 +272,10 @@ def run_web(
     link = web_url(real_port, prefix, token) if access is None else web_base(real_port, prefix)
     announce(link, run_name)
     try:
-        server.run(sockets=[sock])
+        server.run(sockets=socks)
     finally:
         reader.close()
         for other in others:
             other.reader.close()
-        sock.close()
+        for sock in socks:
+            sock.close()

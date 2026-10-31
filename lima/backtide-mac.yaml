@@ -48,7 +48,9 @@ video:
 
 # First match wins: the web (backtide-web.service listens on the VM's 127.0.0.1:8765) to the
 # Mac's 127.0.0.1:8765, and nothing else, TCP or UDP, on any address of the VM. The web checks
-# that it is called as 127.0.0.1:8765, so the two ports must be the same.
+# that it is called as 127.0.0.1:8765 or backtide.localhost:8765, so the two ports must be the
+# same; the Mac's `backtide` refuses the link if any other program listens on that port, IPv4 or
+# IPv6 ([::1], where a browser tries backtide.localhost first).
 portForwards:
 - guestIP: "127.0.0.1"
   guestPort: 8765

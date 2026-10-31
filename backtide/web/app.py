@@ -35,7 +35,13 @@ from urllib.parse import parse_qsl, urlencode
 
 import jinja2
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from markupsafe import Markup
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -45,6 +51,7 @@ from backtide.gate.phrase import api_name
 from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
 from backtide.service.notice import rewind_notice
+from backtide.service.passkeys import MAX_ANSWER_CHARS
 from backtide.service.sessions import Sessions
 from backtide.snapshots import Snapshot, SnapshotError
 from backtide.web import format as fmt
@@ -98,8 +105,13 @@ from backtide.web.security import (
     COOKIE_NAME,
     DECIDE_PATH,
     HOLDS_PATH,
+    KEYS_BEGIN_PATH,
+    KEYS_FINISH_PATH,
+    KEYS_PATH,
     LANG_COOKIE,
     MAX_FORM_BYTES,
+    MAX_LARGE_FORM_BYTES,
+    PASSKEY_HOST,
     POST_PATH,
     SETTINGS_PATH,
     SETTINGS_POST_PATH,
@@ -412,7 +424,76 @@ def create_app(
             return _denied(request, t, status, why=why if why in SIGN_IN_ERRORS else "refused")
         if inside:  # as the link does: the session this browser had ends, the new one begins
             await asyncio.to_thread(access.end, request.state.session.id)
-        raise StartSession(session.id, target=base + "/")
+        # D40: after the first entry, the web asks for a passkey (T26-3b-2).
+        keys = await asyncio.to_thread(access.passkey, "passkey_list", session.id)
+        first = keys.get("ok") is True and not keys.get("keys")
+        raise StartSession(session.id, target=base + (KEYS_PATH + "?nueva=1" if first else "/"))
+
+    # -- the passkeys (T26-3b-2) -------------------------------------------------------------
+
+    @app.get(KEYS_PATH, dependencies=protected)
+    async def keys_page(request: Request) -> Response:
+        t = Translator(_language(request)[0])
+        session = request.state.session
+        listed: dict[str, Any] = {"ok": False, "keys": []}
+        if getattr(access, "passwords", False):  # only the installed web's service keeps keys
+            listed = await asyncio.to_thread(access.passkey, "passkey_list", session.id)
+        # A passkey belongs to backtide.localhost: on 127.0.0.1 the page says where to go instead
+        # of offering a form that cannot work there.
+        host = request.headers.get("host", "").lower()
+        return _page(
+            "keys.html",
+            request,
+            active="settings",
+            t=t,
+            installed=getattr(access, "passwords", False),
+            here=host.split(":")[0] == PASSKEY_HOST,
+            origin=f"http://{PASSKEY_HOST}:{port}",
+            keys=listed.get("keys") if listed.get("ok") is True else [],
+            first=request.query_params.get("nueva") == "1",
+            csrf=session.csrf,
+            begin=base + KEYS_BEGIN_PATH,
+            finish=base + KEYS_FINISH_PATH,
+        )
+
+    def _keys_reply(reply: dict[str, Any]) -> JSONResponse:
+        shown = {"ok": reply.get("ok") is True, "message": str(reply.get("message", ""))}
+        if isinstance(reply.get("options"), str):
+            shown["options"] = reply["options"]
+        if isinstance(reply.get("key"), dict):
+            shown["key"] = reply["key"]
+        return JSONResponse(shown, status_code=200 if shown["ok"] else 400)
+
+    @app.post(KEYS_BEGIN_PATH, dependencies=[Depends(require_session)])
+    async def keys_begin(request: Request) -> Response:
+        form = await _read_form(request, ("csrf",))
+        if form is None or not _csrf_is(request, form["csrf"]):
+            return JSONResponse({"ok": False, "message": "Formulario no válido."}, status_code=403)
+        if not getattr(access, "passwords", False):
+            return JSONResponse({"ok": False, "message": "Solo en la web instalada."}, 404)
+        reply = await asyncio.to_thread(access.passkey, "passkey_begin", request.state.session.id)
+        return _keys_reply(reply)
+
+    @app.post(KEYS_FINISH_PATH, dependencies=[Depends(require_session)])
+    async def keys_finish(request: Request) -> Response:
+        form = await _read_form(
+            request,
+            ("csrf", "name", "answer"),
+            limits={"name": 48, "answer": MAX_ANSWER_CHARS},
+            max_bytes=MAX_LARGE_FORM_BYTES,
+        )
+        if form is None or not _csrf_is(request, form["csrf"]):
+            return JSONResponse({"ok": False, "message": "Formulario no válido."}, status_code=403)
+        if not getattr(access, "passwords", False):
+            return JSONResponse({"ok": False, "message": "Solo en la web instalada."}, 404)
+        reply = await asyncio.to_thread(
+            access.passkey,
+            "passkey_finish",
+            request.state.session.id,
+            answer=form["answer"],
+            name=form["name"],
+        )
+        return _keys_reply(reply)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, error: StarletteHTTPException) -> Response:
@@ -1824,12 +1905,14 @@ def create_app(
                 yield b": keepalive\n\n"
             await asyncio.sleep(poll_interval)
 
-    post_paths = (POST_PATH, SIGN_IN_PATH, SIGN_OUT_PATH, CLOSE_SESSIONS_PATH)
+    post_paths = (POST_PATH, SIGN_IN_PATH, SIGN_OUT_PATH, CLOSE_SESSIONS_PATH, KEYS_BEGIN_PATH)
     if settings_on:
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:
         post_paths += (DECIDE_PATH,)
-    return Guard(app, port=port, prefix=prefix, post_paths=post_paths)
+    return Guard(
+        app, port=port, prefix=prefix, post_paths=post_paths, large_post_paths=(KEYS_FINISH_PATH,)
+    )
 
 
 # -- helpers ---------------------------------------------------------------------------------
@@ -1847,6 +1930,7 @@ async def _read_form(
     fields: Sequence[str] = FORM_FIELDS,
     optional: Sequence[str] = (),
     limits: dict[str, int] | None = None,
+    max_bytes: int = MAX_FORM_BYTES,
 ) -> dict[str, str] | None:
     """A form of ``fields`` (each once) and maybe some of ``optional`` (each once at most), every
     value short (``MAX_FIELD_CHARS``, or its own of ``limits``) and printable; None for anything
@@ -1854,7 +1938,7 @@ async def _read_form(
     body = b""
     async for chunk in request.stream():
         body += chunk
-        if len(body) > MAX_FORM_BYTES:
+        if len(body) > max_bytes:
             return None
     try:
         pairs = parse_qsl(

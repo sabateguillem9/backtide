@@ -180,8 +180,9 @@ def test_enlace_asks_the_service_for_a_new_link(
     config = tmp_path / "backtide.toml"
     code, out, _ = run(capsys, "enlace", "--archivo", link, "--config", config)
     assert code == 0
-    assert URL in out and "marea-faro-nube" in out
-    assert "ssh -L 8765:127.0.0.1:8765" in out and "15 minutos" in out
+    assert URL.replace("127.0.0.1", "backtide.localhost") in out and "marea-faro-nube" in out
+    assert "ExitOnForwardFailure=yes" in out and "-L '[::1]:8765:127.0.0.1:8765'" in out
+    assert "-L 127.0.0.1:8765:127.0.0.1:8765" in out and "15 minutos" in out
     assert service_link == [tmp_path / "state" / "control.sock"]
     assert link.read_text() == f"{BASE}\nmarea-faro-nube\n"  # the file never holds a token
 

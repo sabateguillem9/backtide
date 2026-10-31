@@ -1597,13 +1597,20 @@ def _link(args: argparse.Namespace) -> int:
         return EXIT_FAILED
     url, run_name = f"{lines[0]}?t={token}", _printable(lines[1])
     port = url.split(":")[2].split("/")[0]
+    # backtide.localhost (T26-3b-2): a passkey needs a name, not an address; the browser keeps
+    # every *.localhost on its own machine, so through the tunnel it is the same web.
+    url = url.replace("http://127.0.0.1:", "http://backtide.localhost:", 1)
     print(f"Puesto de vigilancia, solo en ese ordenador:\n\n  {url}\n")
     print(
         f"Nombre de esta ejecución: {run_name} (debe salir igual en la cabecera de la página).\n"
         "El enlace vale una sola vez y durante 15 minutos; para otro, `sudo backtide enlace` "
         "de nuevo (el anterior sin usar deja de valer).\n"
-        f"Si backtide corre en otro ordenador, llega sin abrir ningún puerto: `ssh -L "
-        f"{port}:127.0.0.1:{port} <usuario>@<servidor>` y abre el enlace en tu navegador."
+        "Si backtide corre en otro ordenador, llega sin abrir ningún puerto (los dos `-L` ocupan "
+        "también la dirección de IPv6 de tu ordenador, donde el navegador prueba "
+        "backtide.localhost primero, y ssh se para si no puede):\n\n"
+        f"  ssh -o ExitOnForwardFailure=yes -L 127.0.0.1:{port}:127.0.0.1:{port} "
+        f"-L '[::1]:{port}:127.0.0.1:{port}' <usuario>@<servidor>\n\n"
+        "y abre el enlace en tu navegador (Chrome, Edge o Firefox)."
     )
     return EXIT_OK
 
