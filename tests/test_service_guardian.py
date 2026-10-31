@@ -3380,3 +3380,10 @@ def test_only_the_known_ways_in_are_recorded(world: World) -> None:
     with pytest.raises(ValueError):
         world.guardian.web_access("anything", {})
     assert world.events("anything") == []
+
+
+def test_closing_every_session_is_recorded_and_alerted(world: World) -> None:
+    assert world.guardian.web_access("web_sessions_closed", {"uid": 0, "pid": 7, "ended": 3})
+    assert world.only("web_sessions_closed").details == {"uid": 0, "pid": 7, "ended": 3}
+    (alert,) = world.alerts.titled("cerrado todas las sesiones")
+    assert alert.level is AlertLevel.ERROR

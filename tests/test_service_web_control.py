@@ -706,9 +706,9 @@ def test_a_link_opens_a_session_that_then_changes(
     assert ask_session_check(server.path, session.id, **ask) == session
     reply = ask_rewind(server.path, LISTED.id, via="web", session=session.id, **ask)
     assert reply["outcome"] == "done"
-    assert ask_session_end(server.path, session.id, **ask) is True
+    assert ask_session_end(server.path, session.id, **ask) == "ended"
     assert ask_session_check(server.path, session.id, **ask) is None
-    assert ask_session_end(server.path, session.id, **ask) is False
+    assert ask_session_end(server.path, session.id, **ask) == "expired"
     said = [r.getMessage() for r in caplog.records if r.name == "backtide.service.web_control"]
     assert any("wrong, spent or old" in m for m in said)
     assert not any(token in m or session.id in m for m in said)  # never a secret in the log
@@ -719,15 +719,15 @@ def test_closing_every_session_needs_a_live_one(
 ) -> None:
     from backtide.service.web_control import ask_session_end
 
-    caplog.set_level(logging.WARNING, logger="backtide.service.web_control")
+    caplog.set_level(logging.INFO, logger="backtide.service.web_control")
     sessions = signed_in()
     other = sessions.open(sessions.new_link())
     assert other is not None
     server = make_server(sessions=sessions)
     ask = {"server_uid": ME, "peer": the_web}
-    assert ask_session_end(server.path, "x" * 43, every=True, **ask) is False
+    assert ask_session_end(server.path, "x" * 43, every=True, **ask) == "refused"
     assert len(sessions) == 2
-    assert ask_session_end(server.path, SESSION, every=True, **ask) is True
+    assert ask_session_end(server.path, SESSION, every=True, **ask) == "ended"
     assert len(sessions) == 0
     assert any("closed every session (2)" in r.getMessage() for r in caplog.records)
 
@@ -890,3 +890,42 @@ def test_an_entry_that_cannot_be_recorded_is_refused(
     assert ask_session_open(server.path, token, server_uid=ME, peer=the_web) is None
     assert len(sessions) == 0
     assert any("could not be recorded" in r.getMessage() for r in caplog.records)
+
+
+def test_root_closes_every_session_on_its_own_socket(folder: Path) -> None:
+    """`sudo backtide enlace --cerrar-todas` (T26-3a-2): for when the web is not to be trusted."""
+    from backtide.service.control import ask_web_end_all
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    sessions = signed_in()
+    sessions.open(sessions.new_link())
+    unspent = sessions.new_link()
+    me = lambda sock: (4242, ME, os.getegid())  # noqa: E731
+    server = ControlServer(
+        FakeGuardian(),
+        folder / "control.sock",
+        peer=me,
+        sessions=sessions,
+        on_entry=lambda action, details: entries.append((action, details)) is None,
+    )
+    server.start()
+    try:
+        assert ask_web_end_all(server.path, peer=me) == 2
+        assert talk(server, {"cmd": "web_end_all", "x": 1})["outcome"] == "refused"
+    finally:
+        server.close()
+    assert len(sessions) == 0 and sessions.open(unspent) is None
+    assert entries == [("web_sessions_closed", {"uid": ME, "pid": 4242, "ended": 2})]
+
+
+def test_the_webs_close_all_is_recorded_too(make_server: Callable[..., WebControlServer]) -> None:
+    entries: list[tuple[str, dict[str, Any]]] = []
+    server = make_server(on_entry=lambda action, details: entries.append((action, details)) is None)
+    assert talk(server, {"cmd": "session_end_all", "session": SESSION})["outcome"] == "ended"
+    assert entries == [("web_sessions_closed", {"pid": 4242, "ended": 1})]
+
+
+def test_web_end_all_is_not_on_the_narrow_socket(
+    make_server: Callable[..., WebControlServer],
+) -> None:
+    assert talk(make_server(), {"cmd": "web_end_all"})["outcome"] == "refused"

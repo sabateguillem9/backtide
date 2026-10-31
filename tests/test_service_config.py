@@ -904,3 +904,45 @@ read_budget_total_kib = 8192
 def test_a_bad_gate_section_is_refused(layout: Path, extra: str) -> None:
     with pytest.raises(ConfigError):
         ServiceConfig.from_file(write_toml(layout, extra))
+
+
+# -- [web]: the sessions' limits, only ever shorter (T26-3a-2) -----------------------------------
+
+
+def test_without_web_the_sessions_have_the_designs_limits(layout: Path) -> None:
+    from backtide.service.sessions import IDLE_SECONDS, LIFETIME_SECONDS
+
+    sessions = ServiceConfig.from_file(write_toml(layout)).web_sessions()
+    assert (sessions._idle, sessions._lifetime) == (IDLE_SECONDS, LIFETIME_SECONDS)  # noqa: SLF001
+
+
+def test_web_shortens_the_sessions_for_a_test(layout: Path) -> None:
+    config = ServiceConfig.from_file(
+        write_toml(layout, "[web]\nsession_idle_seconds = 60\nsession_lifetime_seconds = 120\n")
+    )
+    sessions = config.web_sessions()
+    assert (sessions._idle, sessions._lifetime) == (60, 120)  # noqa: SLF001
+    assert config.web_sessions() is not sessions  # a new one: the service makes it once
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "session_idle_seconds = 3601",  # longer than the design
+        "session_lifetime_seconds = 43201",
+        "session_idle_seconds = 59",  # under a minute
+        "session_idle_seconds = 600\nsession_lifetime_seconds = 300",  # life under idle
+        "session_idle_seconds = 60.5",
+        "session_idle_seconds = true",
+        'session_idle_seconds = "60"',
+        "link_seconds = 3600",  # not a setting of [web]
+    ],
+)
+def test_web_cannot_make_the_sessions_longer_or_odd(layout: Path, extra: str) -> None:
+    with pytest.raises(ConfigError, match=r"\[web\]"):
+        ServiceConfig.from_file(write_toml(layout, f"[web]\n{extra}\n"))
+
+
+def test_web_must_be_a_table(layout: Path) -> None:
+    with pytest.raises(ConfigError, match=r"\[web\] must be a table"):
+        ServiceConfig.from_file(write_toml(layout, "web = 1\n"))

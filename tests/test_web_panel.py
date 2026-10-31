@@ -216,8 +216,10 @@ def test_approve_and_reject_are_inert_without_aprobar(room: TestClient) -> None:
 def test_no_route_takes_anything_but_get_except_the_rewind(tmp_path: Path) -> None:
     app = new_app(tmp_path)
     routes = [r for r in app.inner.routes if hasattr(r, "methods")]
+    # Rewinding, and (T26-3a-2) signing out and closing every session: they only end sessions.
+    takes_post = {POST_PATH, "/salir", "/ajustes/cerrar-sesiones"}
     for route in routes:
-        if route.path == POST_PATH and "POST" in route.methods:
+        if route.path in takes_post and "POST" in route.methods:
             continue
         assert route.methods <= {"GET", "HEAD"}, (route.path, route.methods)
     assert any(r.path == "/panel" for r in routes)

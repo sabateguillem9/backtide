@@ -34,8 +34,9 @@ The socket:
   a cookie's session is live (and uses it); ``session_end`` ends one ("Salir") and
   ``session_end_all`` all of them, if asked from a live one. Every change carries the session
   of the person who asked (``session``) and is refused, with nothing called, without a live
-  one: a web taken over cannot change anything on its own. A WARNING on every refusal, every
-  new session and every "close them all".
+  one: a web taken over cannot change anything on its own. A WARNING on every refusal; every
+  new session and every "close them all" goes to the black box and is alerted, one by one
+  (``on_entry``: ``Guardian.web_access``).
 - How much: a request is one JSON line of at most 4 KiB within 5 s (the control socket's own
   reading), at most ``MAX_WEB_CONNECTIONS`` at once, and two token buckets: every request, and the
   changes on their own (``REQUESTS_*``, ``CHANGES_*``). Over either, a refusal without calling
@@ -301,7 +302,9 @@ class WebControlServer(ControlServer):
             logger.warning("web socket: refused to close every session without a live one")
             raise _BadRequest(NO_SESSION)
         ended = self._sessions.end_all()
-        logger.warning("web socket: the web closed every session (%d) (pid %d)", ended, pid)
+        logger.info("web socket: the web closed every session (%d) (pid %d)", ended, pid)
+        if self._on_entry is not None:
+            self._on_entry("web_sessions_closed", {"pid": pid, "ended": ended})
         return {"ok": True, "outcome": "ended", "message": "", "ended": ended}
 
     @staticmethod
@@ -480,13 +483,17 @@ def ask_session_end(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
-) -> bool:
+) -> str:
     """End this session ("Salir"), or, with ``every``, every session ("Cerrar todas", asked
-    from this live one). True if the service did. ControlError as above."""
+    from this live one). The service's word: "ended", "expired" (it was not a live one) or
+    "refused" (it did not do it, or would not say). ControlError if it cannot be asked."""
     command = "session_end_all" if every else "session_end"
     reply = _ask_session(path, {"cmd": command, "session": session_id}, server_uid=server_uid,
                          wait=wait, peer=peer, sleep=sleep, monotonic=monotonic)  # fmt: skip
-    return reply["ok"] is True and reply.get("outcome") == "ended"
+    outcome = reply.get("outcome")
+    if reply["ok"] is True and outcome in ("ended", "expired"):
+        return str(outcome)
+    return "refused"
 
 
 def web_group_problem(gid: int) -> str | None:

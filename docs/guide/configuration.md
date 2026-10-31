@@ -384,6 +384,18 @@ The web view is read-only unless you switch things on. Each switch is a flag of 
 
 All details of the command are in the [command-line reference](cli-reference.md#backtide-web). The web only listens on `127.0.0.1`; it is never exposed to the network. As root it refuses to start unless a flag is given.
 
+### `[web]`: shorter sessions, for a test
+
+A session of the installed web ends after an hour unused or 12 hours in all. `[web]` in `backtide.toml` can only make those shorter, never longer, and never under a minute: it is for testing that sessions expire.
+
+```toml
+[web]
+session_idle_seconds = 60       # at most 3600
+session_lifetime_seconds = 120  # at most 43200, and not under the idle time
+```
+
+The service reads it when it starts (`sudo systemctl restart backtide`); a restart also signs everyone out.
+
 ### The Settings page
 
 Open it from the web's navigation ("Settings", or "Ajustes" in Spanish; the page language follows your browser, or add `?lang=en`). Start the web with `--ajustes` to change anything. It has one row for each of these:

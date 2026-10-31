@@ -500,6 +500,10 @@ WEB_ACCESS_ALERTS = {
         "Se ha usado un enlace de un solo uso y hay una sesión nueva. Si no has sido tú, cierra "
         "todas las sesiones en Ajustes.",
     ),
+    "web_sessions_closed": (
+        "Se han cerrado todas las sesiones de la web",
+        "Para volver a entrar, `sudo backtide enlace`.",
+    ),
 }
 WEB_ACCESS_ACTIONS = frozenset(WEB_ACCESS_ALERTS)
 
@@ -4167,12 +4171,14 @@ class Guardian:
 
     def web_access(self, action: str, details: dict[str, Any]) -> bool:
         """A way into the web (T26-3a): ``web_link_given`` (`sudo backtide enlace`) or
-        ``web_session_opened`` (a link was used). Each one goes to the black box and is alerted,
-        one by one and never throttled: whoever has a link is signed in, so the owner hears of
-        every one ("if it was not you"). ``details`` holds who asked (uid, pid), never a token
-        or a session id. The alert is an ERROR, so a full queue of other alerts (an agent can
-        cause many) makes room for it instead of dropping it. False if the black box did not
-        take it: then the caller refuses the session (it fails closed), and the alert says so."""
+        ``web_session_opened`` (a link was used); or all of them shut, ``web_sessions_closed``
+        ("Cerrar todas" or `sudo backtide enlace --cerrar-todas`). Each one goes to the black
+        box and is alerted, one by one and never throttled: whoever has a link is signed in, so
+        the owner hears of every one ("if it was not you"). ``details`` holds who asked (uid,
+        pid) and how many sessions ended, never a token or a session id. The alert is an ERROR,
+        so a full queue of other alerts (an agent can cause many) makes room for it instead of
+        dropping it. False if the black box did not take it: then the caller refuses the
+        session (it fails closed), and the alert says so."""
         if action not in WEB_ACCESS_ACTIONS:
             raise ValueError(f"not a web access: {action}")
         event = self._record("system", action, "web", details=dict(details), risk=1)

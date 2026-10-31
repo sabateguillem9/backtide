@@ -673,3 +673,189 @@ def test_the_stream_does_not_keep_a_session_alive(tmp_path: Path) -> None:
         assert web.get(path).status_code == 200  # the stream itself still opens
     clock.now += 61
     assert web.get("/ahora").status_code == 401  # but it did not count as a use
+
+
+# -- T26-3a-2: signing out, closing every session, and a stream that stops ------------------------
+
+
+def signed_in_web(tmp_path: Path) -> tuple[TestClient, object]:
+    from backtide.service.sessions import Sessions
+    from backtide.web.security import LocalAccess
+
+    sessions = Sessions()
+    session = sessions.preset(SESSION)
+    new_box(tmp_path).append("file", "create", "notas.md")
+    return new_client(tmp_path, access=LocalAccess(sessions)), (sessions, session)
+
+
+def form_post(web: TestClient, path: str, fields: dict[str, str]) -> object:
+    from tests.test_web_rewind import POST_HEADERS
+
+    return web.post(path, data=fields, headers=POST_HEADERS, follow_redirects=False)
+
+
+def test_signing_out_ends_the_session_in_the_service(tmp_path: Path) -> None:
+    web, (sessions, session) = signed_in_web(tmp_path)
+    response = form_post(web, "/salir", {"csrf": session.csrf})
+    assert response.status_code == 303 and response.headers["location"] == f"{PREFIX_PATH}/"
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith('backtide_web="";') or "Max-Age=0" in cookie
+    assert f"Path={PREFIX_PATH}" in cookie
+    assert sessions.check(SESSION) is None
+    web.cookies.set("backtide_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
+    assert web.get("/ahora").status_code == 401  # the old cookie is worth nothing now
+
+
+@pytest.mark.parametrize("fields", [{}, {"csrf": "x" * 43}, {"csrf": "", "otro": "1"}])
+def test_signing_out_wants_this_sessions_csrf(tmp_path: Path, fields: dict[str, str]) -> None:
+    web, (sessions, _) = signed_in_web(tmp_path)
+    assert form_post(web, "/salir", fields).status_code in (400, 403, 415)  # 415: no body
+    assert sessions.check(SESSION) is not None
+
+
+def test_signing_out_without_a_session_or_from_another_site_does_nothing(
+    tmp_path: Path,
+) -> None:
+    web, (sessions, session) = signed_in_web(tmp_path)
+    web.cookies.clear()
+    assert form_post(web, "/salir", {"csrf": session.csrf}).status_code == 401
+    web.cookies.set("backtide_web", SESSION, domain="127.0.0.1", path=PREFIX_PATH)
+    foreign = web.post(
+        "/salir",
+        data={"csrf": session.csrf},
+        headers={
+            "origin": "http://evil.example",
+            "content-type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert foreign.status_code == 403
+    assert sessions.check(SESSION) is not None
+
+
+def test_closing_every_session_wants_the_word(tmp_path: Path) -> None:
+    from backtide.web.security import CLOSE_SESSIONS_WORD
+
+    web, (sessions, session) = signed_in_web(tmp_path)
+    phone = sessions.open(sessions.new_link())
+    unspent = sessions.new_link()
+    assert phone is not None
+    for word in ("", "si", "CERRAR-TODAS"):
+        reply = form_post(web, "/ajustes/cerrar-sesiones", {"csrf": session.csrf, "confirmo": word})
+        assert reply.status_code == 400
+    assert len(sessions) == 2
+    reply = form_post(
+        web, "/ajustes/cerrar-sesiones", {"csrf": session.csrf, "confirmo": CLOSE_SESSIONS_WORD}
+    )
+    assert reply.status_code == 303
+    assert len(sessions) == 0 and sessions.open(unspent) is None
+
+
+def test_closing_every_session_wants_this_sessions_csrf(tmp_path: Path) -> None:
+    web, (sessions, _) = signed_in_web(tmp_path)
+    reply = form_post(
+        web, "/ajustes/cerrar-sesiones", {"csrf": "x" * 43, "confirmo": "cerrar-todas"}
+    )
+    assert reply.status_code == 403 and len(sessions) == 1
+
+
+class DyingAccess:
+    """Signed in when the stream opens, and gone the next time it asks (a "Cerrar todas")."""
+
+    def __init__(self) -> None:
+        from backtide.service.sessions import Session
+
+        self.session = Session(SESSION, "c" * 43)
+        self.asked: list[bool] = []
+
+    def open(self, token: str) -> object:
+        return None
+
+    def session_of(self, cookie_header: str | None, *, use: bool = True) -> object:
+        self.asked.append(use)
+        return self.session if len(self.asked) == 1 else None
+
+    def end(self, session_id: str, *, every: bool = False) -> bool:
+        return False
+
+
+@pytest.mark.parametrize("path", ["/ahora/stream", "/panel/stream"])
+def test_an_open_stream_stops_when_its_session_dies(tmp_path: Path, path: str) -> None:
+    import time
+
+    access = DyingAccess()
+    new_box(tmp_path).append("file", "create", "notas.md")
+    web = new_client(
+        tmp_path, access=access, stream_seconds=30, poll_interval=0.02, session_recheck=0.05
+    )
+    started = time.monotonic()
+    response = web.get(path)
+    assert time.monotonic() - started < 10  # it did not run for its 30 s
+    assert "event: session\ndata: expired" in response.text
+    assert access.asked[0] is False and all(use is False for use in access.asked)
+
+
+class StuckAccess:
+    """A service that cannot end the session right now (restarting, or its bucket is full)."""
+
+    def __init__(self, *, ended: bool | None) -> None:
+        from backtide.service.sessions import Session
+
+        self.session = Session(SESSION, "c" * 43)
+        self.ended = ended
+
+    def open(self, token: str) -> object:
+        return None
+
+    def session_of(self, cookie_header: str | None, *, use: bool = True) -> object:
+        return self.session
+
+    def end(self, session_id: str, *, every: bool = False) -> bool | None:
+        return self.ended
+
+
+def test_signing_out_keeps_the_cookie_when_the_service_cannot_say(tmp_path: Path) -> None:
+    """Review of T26-3a-2: the owner must not think they left while the session lives on."""
+    new_box(tmp_path)
+    access = StuckAccess(ended=None)
+    web = new_client(tmp_path, access=access)
+    response = form_post(web, "/salir", {"csrf": access.session.csrf})
+    assert response.status_code == 503 and "set-cookie" not in response.headers
+    assert "--cerrar-todas" in response.text
+
+
+def test_signing_out_of_a_session_already_gone_just_leaves(tmp_path: Path) -> None:
+    new_box(tmp_path)
+    access = StuckAccess(ended=False)
+    web = new_client(tmp_path, access=access)
+    response = form_post(web, "/salir", {"csrf": access.session.csrf})
+    assert response.status_code == 303 and "set-cookie" in response.headers
+
+
+@pytest.mark.parametrize("path", ["/salir", "/ajustes/cerrar-sesiones"])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"origin": f"http://127.0.0.1:{PORT + 1}"},  # another program on this machine
+        {"origin": f"http://127.0.0.1:{PORT}", "sec-fetch-site": "same-site"},
+        {"origin": f"http://127.0.0.1:{PORT}", "sec-fetch-site": "cross-site"},
+        {"origin": f"http://127.0.0.1:{PORT}", "sec-fetch-site": "none"},
+        {"origin": "null"},
+        {},  # no Origin at all
+        {"origin": f"http://localhost:{PORT}"},
+    ],
+)
+def test_ending_sessions_only_from_our_own_page(
+    tmp_path: Path, path: str, headers: dict[str, str]
+) -> None:
+    web, (sessions, session) = signed_in_web(tmp_path)
+    fields = {"csrf": session.csrf, "confirmo": "cerrar-todas"}
+    if path == "/salir":
+        del fields["confirmo"]
+    response = web.post(
+        path,
+        data=fields,
+        headers={"content-type": "application/x-www-form-urlencoded", **headers},
+        follow_redirects=False,
+    )
+    assert response.status_code == 403, response.text
+    assert sessions.check(SESSION) is not None

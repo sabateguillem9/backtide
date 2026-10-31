@@ -289,3 +289,26 @@ def test_solo_comprobar_only_checks_and_says_why_it_would_stop(
     monkeypatch.setattr(install.Installer, "check_options", lambda self: calls.append("ok"))
     code, _, _ = run(capsys, "instalar", "--solo-comprobar")
     assert code == 0 and calls == ["check", "ok"]
+
+
+def test_enlace_closes_every_session_through_the_service(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_link: list[Path]
+) -> None:
+    asked: list[Path] = []
+
+    def close(path: Path) -> int:
+        asked.append(path)
+        return 3
+
+    monkeypatch.setattr(cli, "ask_web_end_all", close)
+    code, out, _ = run(capsys, "enlace", "--cerrar-todas", "--config", tmp_path / "backtide.toml")
+    assert code == 0 and "(3)" in out and "sudo backtide enlace" in out
+    assert asked == [tmp_path / "state" / "control.sock"] and service_link == []
+
+
+def test_enlace_closes_all_without_reading_a_link_file(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "ask_web_end_all", lambda path: pytest.fail("asked"))
+    code, _, err = run(capsys, "enlace", "--cerrar-todas", "--archivo", tmp_path / "x")
+    assert code == 2 and "--archivo" in err

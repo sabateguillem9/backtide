@@ -26,7 +26,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
@@ -93,6 +93,8 @@ from backtide.web.reader import BoxReader, BoxUnavailable
 from backtide.web.rewind import Availability, Redeemed, Rewinder, Tickets
 from backtide.web.security import (
     ACTING_SESSION,
+    CLOSE_SESSIONS_PATH,
+    CLOSE_SESSIONS_WORD,
     COOKIE_NAME,
     DECIDE_PATH,
     HOLDS_PATH,
@@ -101,6 +103,7 @@ from backtide.web.security import (
     POST_PATH,
     SETTINGS_PATH,
     SETTINGS_POST_PATH,
+    SIGN_OUT_PATH,
     Access,
     Guard,
     LocalAccess,
@@ -159,6 +162,7 @@ SUMMARY_TTL = 3.0  # an agent's card is read again at most this often...
 SUMMARY_MAX = 20.0  # ...and at least this often, even when its box has not moved
 PANEL_FEED = 40  # lines in the control room's feed when it loads
 REQUESTS_EVERY = 5.0  # how often the stream looks at the requests
+SESSION_RECHECK = 60.0  # how often an open stream asks whether its session still lives
 
 
 class Unauthorized(Exception):  # noqa: N818 - an HTTP outcome, not an error
@@ -192,6 +196,7 @@ def create_app(
     spend: SpendClient | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
+    session_recheck: float = SESSION_RECHECK,
     keepalive: float = KEEPALIVE,
     tz: tzinfo | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -303,6 +308,47 @@ def create_app(
 
     def _csrf_is(request: Request, given: str | None) -> bool:
         return token_matches(given, request.state.session.csrf)
+
+    # -- signing out (T26-3a-2) -----------------------------------------------------------
+
+    def _signed_out() -> Response:
+        """Back to the start, without the cookie: the next page asks for a link."""
+        response = Response(status_code=303, headers={"location": base + "/"})
+        response.delete_cookie(COOKIE_NAME, path=base, httponly=True, samesite="strict")
+        return response
+
+    @app.post(SIGN_OUT_PATH, dependencies=[Depends(require_session)])
+    async def sign_out(request: Request) -> Response:
+        """ "Salir": this session ends in the service, whatever the browser does next."""
+        form = await _read_form(request, ("csrf",))
+        if form is None:
+            return Response("Formulario no válido", status_code=400)
+        if not _csrf_is(request, form["csrf"]):
+            return Response("Formulario de otra sesión", status_code=403)
+        if await asyncio.to_thread(access.end, request.state.session.id) is None:
+            # The service could not say it ended: the cookie stays, or the owner would think
+            # they left while the session lives on (review of T26-3a-2).
+            return Response(
+                "No se ha podido cerrar la sesión: prueba otra vez, o `sudo backtide enlace "
+                "--cerrar-todas`.",
+                status_code=503,
+            )
+        return _signed_out()
+
+    @app.post(CLOSE_SESSIONS_PATH, dependencies=[Depends(require_session)])
+    async def close_sessions(request: Request) -> Response:
+        """ "Cerrar todas": every session and the unspent link, asked from a live one, with the
+        word typed as the confirmation. The service records it and alerts."""
+        form = await _read_form(request, ("csrf", "confirmo"))
+        if form is None:
+            return Response("Formulario no válido", status_code=400)
+        if not _csrf_is(request, form["csrf"]):
+            return Response("Formulario de otra sesión", status_code=403)
+        if not token_matches(form["confirmo"], CLOSE_SESSIONS_WORD):
+            return Response(f"Escribe {CLOSE_SESSIONS_WORD} para confirmar", status_code=400)
+        if await asyncio.to_thread(access.end, request.state.session.id, every=True) is not True:
+            return Response("El servicio no ha cerrado las sesiones", status_code=503)
+        return _signed_out()
 
     tickets = Tickets(clock)
     rewinding = threading.Lock()  # one rewind in flight at a time, whoever asks
@@ -432,12 +478,22 @@ def create_app(
             rest = [(k, v) for k, v in request.query_params.multi_items() if k not in {"lang", "t"}]
             return f"{_here(request)}?{urlencode([*rest, ('lang', code)])}"
 
+        session = getattr(request.state, "session", None)
         context = {
             **_helpers(t, now, agent),
             "active": active,
             "lang": t.language,
             "switch": switch,
             "languages": LANGUAGES,
+            # For the "Salir" and "Cerrar todas" forms (T26-3a-2): None outside a session.
+            "signed_in": None
+            if session is None
+            else {
+                "csrf": session.csrf,
+                "sign_out": base + SIGN_OUT_PATH,
+                "close_all": base + CLOSE_SESSIONS_PATH,
+                "close_word": CLOSE_SESSIONS_WORD,
+            },
             **values,
         }
         response = HTMLResponse(env.get_template(template).render(**context), status_code=status)
@@ -1522,10 +1578,26 @@ def create_app(
 
     # -- the stream ------------------------------------------------------------------------
 
+    def _session_watch(request: Request) -> Callable[[float], Awaitable[bool]]:
+        """For an open stream: does its session still live? Asked of the service at most every
+        ``session_recheck`` seconds, without counting as a use, so "Salir", "Cerrar todas" or
+        the end of the session stop a tab that is open (T26-3a-2)."""
+        last = [asyncio.get_running_loop().time()]
+
+        async def alive(now: float) -> bool:
+            if now - last[0] < session_recheck:
+                return True
+            last[0] = now
+            cookie = request.headers.get("cookie")
+            return await asyncio.to_thread(access.session_of, cookie, use=False) is not None
+
+        return alive
+
     async def _stream(
         request: Request, t: Translator, start: int, agent: Agent
     ) -> AsyncIterator[bytes]:
         loop = asyncio.get_running_loop()
+        signed_in = _session_watch(request)
         deadline = loop.time() + stream_seconds
         narrator = Narrator()
         seen: set[int] = set()
@@ -1549,6 +1621,9 @@ def create_app(
         yield b"retry: 2000\n\n"
         while loop.time() < deadline:
             if await request.is_disconnected():
+                return
+            if not await signed_in(loop.time()):
+                yield _sse("session", "expired", None)
                 return
             try:
                 if unanchored:
@@ -1629,6 +1704,7 @@ def create_app(
     ) -> AsyncIterator[bytes]:
         """Every agent's new lines (one feed), its card when it changes, and the requests."""
         loop = asyncio.get_running_loop()
+        signed_in = _session_watch(request)
         deadline = loop.time() + stream_seconds
         agents = list(roster)
         if len(starts) != len(agents):
@@ -1658,6 +1734,9 @@ def create_app(
         yield b"retry: 2000\n\n"
         while loop.time() < deadline:
             if await request.is_disconnected():
+                return
+            if not await signed_in(loop.time()):
+                yield _sse("session", "expired", None)
                 return
             now_t = loop.time()
             changed: list[tuple[Agent, Line, bool]] = []
@@ -1706,7 +1785,7 @@ def create_app(
                 yield b": keepalive\n\n"
             await asyncio.sleep(poll_interval)
 
-    post_paths = (POST_PATH,)
+    post_paths = (POST_PATH, SIGN_OUT_PATH, CLOSE_SESSIONS_PATH)
     if settings_on:
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:

@@ -24,6 +24,7 @@ from backtide.service.control import (
     ControlOutcomeUnknown,
     ControlUnavailable,
     ask_rewind,
+    ask_web_end_all,
     ask_web_link,
 )
 from backtide.service.gasto import caps as spending_caps
@@ -1247,6 +1248,13 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
     )
     _add_config(link)
     link.add_argument(
+        "--cerrar-todas",
+        dest="end_all",
+        action="store_true",
+        help="cierra todas las sesiones de la web y el enlace sin usar, sin dar otro (por el "
+        "socket de root: sirve aunque la web no responda o no sea de fiar)",
+    )
+    link.add_argument(
         "--archivo",
         dest="link_file",
         type=Path,
@@ -1433,12 +1441,39 @@ def _remove_link(path: Path) -> None:
 LINK_MAX_BYTES = 4096
 
 
+def _end_all_sessions(args: argparse.Namespace) -> int:
+    """`backtide enlace --cerrar-todas`: every web session and the unspent link, closed through
+    root's control socket (T26-3a-2), not through the web."""
+    from backtide.web.paths import WebPaths
+
+    try:
+        control = WebPaths.from_file(args.config).control_socket
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    try:
+        ended = ask_web_end_all(control)
+    except ControlError as error:
+        _error(f"el servicio no ha cerrado las sesiones: {error}")
+        return EXIT_FAILED
+    print(
+        f"Cerradas todas las sesiones de la web ({ended}) y el enlace sin usar, si había. Para "
+        "volver a entrar, `sudo backtide enlace`."
+    )
+    return EXIT_OK
+
+
 def _link(args: argparse.Namespace) -> int:
     """`backtide enlace`: the installed web's address, read from its file, with a new one-time
     token the service gives (T26-3a)."""
     from backtide.web.paths import WebPaths
     from backtide.web.server import web_url_problem
 
+    if args.end_all:
+        if args.link_file != layout.WEB_LINK_FILE:
+            _error("--cerrar-todas no lee el archivo del enlace: quita --archivo")
+            return EXIT_ERROR
+        return _end_all_sessions(args)
     path = args.link_file
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)

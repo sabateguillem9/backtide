@@ -272,3 +272,39 @@ def test_the_web_never_trusts_a_narrow_socket_that_is_not_the_services(
         ControlRewinder(narrow.path, enabled=True, wait=0, peer=the_web, server_uid=ME + 1).rewind(
             rewind.TARGET.id
         )
+
+
+def test_signing_out_when_the_service_cannot_end_it_keeps_the_cookie(
+    folder: Path, guardian: FakeGuardian, budget: FakeBudget, tmp_path: Path
+) -> None:
+    """The real path (review of T26-3a-2): the service checks the session for the page, then
+    cannot end it (its bucket is empty): "Salir" answers 503 and keeps the cookie, and the
+    session is still alive in the service."""
+    from backtide.service.web_control import Bucket
+    from tests.test_web_rewind import POST_HEADERS
+
+    sessions = signed_in()
+    csrf = sessions.check(SESSION).csrf  # type: ignore[union-attr]
+    server = WebControlServer(
+        guardian,
+        folder / "web2.sock",
+        group=GROUP,
+        snapshots=list,
+        peer=the_web,
+        sessions=sessions,
+        on_entry=lambda action, details: True,
+        checks=Bucket(1, 1e-6),  # one check (the page's), then nothing
+    )
+    server.start()
+    try:
+        new_box(tmp_path)
+        web = new_client(
+            tmp_path, access=ServiceAccess(server.path, server_uid=ME, wait=0, peer=the_web)
+        )
+        response = web.post(
+            "/salir", data={"csrf": csrf}, headers=POST_HEADERS, follow_redirects=False
+        )
+    finally:
+        server.close()
+    assert response.status_code == 503 and "set-cookie" not in response.headers
+    assert sessions.check(SESSION) is not None

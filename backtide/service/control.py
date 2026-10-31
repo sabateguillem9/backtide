@@ -498,6 +498,8 @@ class ControlServer:
             return self._export(request, pid, uid)
         if command == "web_link":
             return self._web_link(request, pid, uid)
+        if command == "web_end_all":
+            return self._web_end_all(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
 
     def _web_link(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
@@ -515,6 +517,19 @@ class ControlServer:
             # session it opens is refused anyway (``session_open``).
             self._on_entry("web_link_given", {"uid": uid, "pid": pid})
         return {"ok": True, "outcome": "link", "message": "", "token": token}
+
+    def _web_end_all(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """Close every web session and the unspent link (`sudo backtide enlace --cerrar-todas`):
+        on root's socket, for when the web itself cannot be trusted or does not answer."""
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una petición de cerrar las sesiones lleva `cmd` y nada más.")
+        if self._sessions is None:
+            raise _BadRequest("Este servicio no tiene web instalada: no hay sesiones.")
+        ended = self._sessions.end_all()
+        logger.info("%s: every web session was closed (%d) by uid %d", self.label, ended, uid)
+        if self._on_entry is not None:
+            self._on_entry("web_sessions_closed", {"uid": uid, "pid": pid, "ended": ended})
+        return {"ok": True, "outcome": "ended", "message": "", "ended": ended}
 
     def _shell(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         details: dict[str, Any] | None = None
@@ -1515,6 +1530,38 @@ def ask_web_link(
         message = reply.get("message")
         raise ControlError(message if isinstance(message, str) else "No se ha podido dar.")
     return token
+
+
+def ask_web_end_all(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> int:
+    """Close every web session (`sudo backtide enlace --cerrar-todas`); how many were open.
+    ControlError if the service has no web or its reply makes no sense."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "web_end_all"},
+        what="el cierre de las sesiones",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT,
+        peer=peer,
+        server_uid=server_uid,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    ended = reply.get("ended")
+    if reply.get("ok") is not True or isinstance(ended, bool) or not isinstance(ended, int):
+        message = reply.get("message")
+        raise ControlError(message if isinstance(message, str) else "No se han podido cerrar.")
+    return ended
 
 
 def ask_secrets(

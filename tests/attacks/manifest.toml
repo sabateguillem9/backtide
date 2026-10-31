@@ -1936,6 +1936,29 @@ risk = "n/a"
 recoverable = "n/a"
 held = "n/a"
 
+[[scenario]]
+id = "sesion-caducada"
+name = "Una sesión de la web muere a su hora, y root las cierra todas"
+story = """T26-3a-2: una sesión de la web caduca tras una hora sin uso y a las 12 en total, aunque se \
+use (docs/47, sección 5.2). Para no esperar horas, el escenario acorta los plazos a 60 y 120 \
+segundos con `[web]` en la configuración del servicio (solo se pueden acortar) y lo reinicia. Una \
+sesión que nadie usa muere al minuto, y un cambio con ella se rechaza; otra, usada cada 30 \
+segundos, sigue viva pasado el minuto y muere a los dos igualmente. Con una sesión viva, \
+`sudo backtide enlace --cerrar-todas` por el socket de root la cierra al momento; «Cerrar \
+todas» desde la web, por su socket estrecho, también. Los dos cierres quedan en la caja negra con \
+cuántas sesiones cerraron, y ningún evento de entrada o salida lleva un token ni un id. Al final la configuración vuelve a estar como estaba. La otra \
+mitad (una acción de la tabla 5.3 con la llave tocada hace más de 5 minutos) llega con T26-3c."""
+inspired_by = "Una cookie robada o una pestaña olvidada en un ordenador sin bloquear"
+invariants = [6, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
 # Desinstalar (T13-4, la revisión): destructivos, solo con BACKTIDE_LAB_DESTRUCTIVO=1 en una VM
 # del laboratorio; cada uno acaba con backtide desinstalado y sus datos conservados.
 

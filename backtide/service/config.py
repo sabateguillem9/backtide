@@ -121,6 +121,7 @@ from backtide.service.prices import (
     to_decimal,
 )
 from backtide.service.read_budget import DEFAULT_HOST_BYTES, DEFAULT_TOTAL_BYTES
+from backtide.service.sessions import IDLE_SECONDS, LIFETIME_SECONDS, MIN_SECONDS, Sessions
 from backtide.service.spend import (
     DEFAULT_DAILY_USD,
     DEFAULT_MAX_INFLIGHT,
@@ -165,9 +166,10 @@ MAX_OWNER_PRICES = 64
 _TOP_LEVEL_KEYS = frozenset(
     {
         "state_dir", "volume", "workspace_limit", "cycle_interval", "prune_interval", "agent",
-        "volume_image", "max_volume_bytes", "proxy", "sensor", "gate", "budget",
+        "volume_image", "max_volume_bytes", "proxy", "sensor", "gate", "budget", "web",
     }
 )  # fmt: skip
+_WEB_KEYS = frozenset({"session_idle_seconds", "session_lifetime_seconds"})
 _BUDGET_KEYS = frozenset(
     {"daily_usd", "monthly_usd", "timezone", "max_inflight", "max_inflight_local", "auto_prices",
      "prices_url", "prices"}
@@ -374,6 +376,8 @@ class ServiceConfig:
     sensor: Mapping[str, Any] = field(default_factory=dict)
     gate: Mapping[str, Any] = field(default_factory=dict)
     budget: Mapping[str, Any] = field(default_factory=dict)
+    # The web's sessions (T26-3a-2): only shorter than the design's, for a test of expiry.
+    web: Mapping[str, Any] = field(default_factory=dict)
     # One per provider of [proxy] (from_file reads them from keys/): the real and fake keys.
     provider_keys: Mapping[str, ProviderKey] = field(default_factory=dict, repr=False)
 
@@ -422,6 +426,7 @@ class ServiceConfig:
         self.jail_config()  # the result is rebuilt on demand
         self.gate_settings()  # validates [gate]
         self.budget_settings()  # validates [budget]
+        self.web_sessions()  # validates [web]
         self._check_cloud_prices()
 
     def _check_cloud_prices(self) -> None:
@@ -988,6 +993,31 @@ class ServiceConfig:
             read_budget_total=budgets["read_budget_total_kib"],
         )
 
+    def web_sessions(self) -> Sessions:
+        """The web's sessions (T26-3a), with the limits of [web] if any: only ever shorter than
+        the design's (an hour unused, twelve in all), and never under a minute. ConfigError
+        otherwise. A new, empty ``Sessions`` each call: the service makes it once."""
+        web = dict(self.web)
+        unknown = sorted(set(web) - _WEB_KEYS)
+        if unknown:
+            raise ConfigError(f"unknown [web] settings: {', '.join(map(repr, unknown))}")
+        limits: dict[str, float] = {}
+        for key, option in (("session_idle_seconds", "idle"),
+                            ("session_lifetime_seconds", "lifetime")):  # fmt: skip
+            if key in web:
+                value = web[key]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ConfigError(f"[web] {key} must be a whole number of seconds")
+                limits[option] = value
+        try:
+            return Sessions(**limits)
+        except ValueError as error:
+            raise ConfigError(
+                f"[web] can only shorten the sessions (at least {MIN_SECONDS} s, an idle time "
+                f"of at most {IDLE_SECONDS} s and a lifetime of at most {LIFETIME_SECONDS} s, "
+                f"never shorter than the idle time): {error}"
+            ) from None
+
     def budget_settings(self) -> BudgetSettings:
         """``[budget]``, checked (ConfigError): the spending caps and the prices (T11)."""
         if not isinstance(self.budget, Mapping):
@@ -1113,6 +1143,10 @@ class ServiceConfig:
             if not isinstance(data["budget"], dict):
                 raise ConfigError("[budget] must be a table")
             optional["budget"] = dict(data["budget"])
+        if "web" in data:
+            if not isinstance(data["web"], dict):
+                raise ConfigError("[web] must be a table")
+            optional["web"] = dict(data["web"])
         names = _provider_names(optional.get("proxy", {}))
         if names:
             optional["provider_keys"] = read_provider_keys(state_dir / STATE_KEYS, names)

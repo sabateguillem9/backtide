@@ -22,16 +22,25 @@ import pwd
 import secrets
 import shutil
 import stat
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from attack_kit import Attack, scenario
-from test_install_attacks import Installed, agent_running, open_installed, sh, wait
+from test_install_attacks import (
+    AGENT_WAIT,
+    Installed,
+    agent_running,
+    open_installed,
+    sh,
+    wait,
+)
 
 from backtide.jail.config import AGENT_GID, AGENT_UID
 from backtide.service.config import STATE_SOCKET, STATE_WEB_SOCKET
-from backtide.service.control import ask_web_link
+from backtide.service.control import ask_web_end_all, ask_web_link
 from backtide.setup import layout
 from backtide.snapshots import Snapshot
 
@@ -42,11 +51,21 @@ CONTROL_SOCKET = layout.STATE_DIR / STATE_SOCKET
 # One JSON request per line in argv[2:], each on its own connection; what comes back is either
 # the service's reply (outcome and ok only) or the errno of connecting. Plain sockets: nothing of
 # backtide runs as the probe. A session a reply opens (T26-3a) is kept, never printed, and put
-# where a later request says "<session>".
+# where a later request says "<session>"; one opened by a request with "_as": NAME is kept under
+# that name too, for "<session:NAME>". {"_sleep": S} waits S seconds (T26-3a-2: expiry).
 PROBE = """
-import errno, json, socket, sys
-path, out, session = sys.argv[1], [], None
+import errno, json, socket, sys, time
+path, out, session, named = sys.argv[1], [], None, {}
 for line in sys.argv[2:]:
+    request = json.loads(line)
+    if "_sleep" in request:
+        time.sleep(request["_sleep"])
+        out.append({"slept": request["_sleep"]})
+        continue
+    name = request.pop("_as", None)
+    line = json.dumps(request)
+    for key, value in named.items():
+        line = line.replace(json.dumps("<session:" + key + ">"), json.dumps(value))
     if session is not None:
         line = line.replace('"<session>"', json.dumps(session))
     try:
@@ -61,6 +80,8 @@ for line in sys.argv[2:]:
         reply = json.loads(raw)
         if isinstance(reply.get("session"), str):
             session = reply["session"]
+            if name is not None:
+                named[name] = session
         out.append({"outcome": reply.get("outcome"), "ok": reply.get("ok"),
                     "n": len(reply.get("snapshots") or [])})
     except OSError as e:
@@ -74,13 +95,15 @@ def installed() -> object:
     yield from open_installed()
 
 
-def probe_as(uid: int, gid: int, groups: str, path: str, *requests: dict) -> list[dict]:
+def probe_as(
+    uid: int, gid: int, groups: str, path: str, *requests: dict, timeout: float = 180
+) -> list[dict]:
     """The probe as ``uid``:``gid`` with exactly ``groups`` as supplementary groups."""
     group_args = ["--clear-groups"] if not groups else ["--groups", groups]
     ran = sh(
         "setpriv", "--reuid", str(uid), "--regid", str(gid), *group_args, "--",
         "python3", "-I", "-c", PROBE, path, *(json.dumps(r) for r in requests),
-        check=False, timeout=180,
+        check=False, timeout=timeout,
     )  # fmt: skip
     lines = ran.stdout.strip().splitlines()
     return json.loads(lines[-1]) if lines else [{"error": ran.stderr.strip()[-300:]}]
@@ -382,4 +405,136 @@ def test_a_web_taken_over_changes_nothing_without_a_session(
         f"({len(rewinds)}), ningún cambio de claves ni de topes ({len(settings)}) y ninguna "
         f"aprobación ni confianza ({len(approved)}); cada enlace dado ({len(links)}, al menos 2) "
         f"y cada entrada ({len(entries)}, al menos 2) con su evento, sin token ni id ({clean})",
+    )
+
+
+def restart_service(installed: Installed) -> None:
+    """The service again, with the agent answering and the web's socket back."""
+    sh("systemctl", "restart", layout.SERVICE_UNIT, timeout=300)
+    assert wait(lambda: WEB_SOCKET.exists() and agent_running(installed), AGENT_WAIT), (
+        "the service did not come back"
+    )
+
+
+@scenario("sesion-caducada")
+def test_a_session_dies_unused_after_its_time_and_when_root_closes_them(
+    attack: Attack, installed: Installed
+) -> None:
+    """T26-3a-2: the limits shortened to 60 s unused and 120 s in all ([web] in the service's
+    config, which can only shorten them), then restored."""
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    original = layout.CONFIG_FILE.read_bytes()
+    assert b"[web]" not in original, "the installation already has a [web] table"
+    forged_hold = "h-" + secrets.token_hex(6)
+    results: dict[str, list[dict]] = {}
+
+    def probe(name: str, *requests: dict) -> None:
+        results[name] = probe_as(web.pw_uid, web.pw_gid, "", path, *requests, timeout=400)
+
+    def opened(since: int, count: int) -> None:
+        """Wait until the probes have spent ``count`` links: only one link lives at a time, so
+        the next is given (or all are closed) once the last was used (review of T26-3a-2)."""
+
+        def spent() -> bool:
+            events = installed.box.events(since_seq=since)
+            return sum(e.action == "web_session_opened" for e in events) >= count
+
+        assert wait(spent, 60, interval=0.5), f"the probes did not open {count} sessions"
+
+    try:
+        layout.CONFIG_FILE.write_bytes(
+            original + b"\n[web]\nsession_idle_seconds = 60\nsession_lifetime_seconds = 120\n"
+        )
+        restart_service(installed)
+        head = installed.box.head()
+        since = head[0] if head is not None else 0
+        # 1. Left alone: dead after its minute unused, and then a change with it is refused.
+        quiet = threading.Thread(target=probe, args=("quiet",
+            {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_as": "q"},
+            {"cmd": "session_check", "session": "<session:q>"},
+            {"_sleep": 65},
+            {"cmd": "session_check", "session": "<session:q>"},
+            {"cmd": "decide", "hold_id": forged_hold, "verdict": "approve",
+             "session": "<session:q>"},
+        ))  # fmt: skip
+        quiet.start()
+        opened(since, 1)
+        # 2. Used every 30 s: alive past the minute, dead at its two minutes all the same.
+        busy = threading.Thread(target=probe, args=("busy",
+            {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_as": "b"},
+            *[r for _ in range(3) for r in ({"_sleep": 30},
+                                            {"cmd": "session_check", "session": "<session:b>"})],
+            {"_sleep": 32},
+            {"cmd": "session_check", "session": "<session:b>"},
+        ))  # fmt: skip
+        busy.start()
+        quiet.join(400)
+        busy.join(400)
+        # 3. Root closes them all on its own socket, while a session is live.
+        closing = threading.Thread(target=probe, args=("closed",
+            {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_as": "c"},
+            {"cmd": "session_check", "session": "<session:c>"},
+            {"_sleep": 10},
+            {"cmd": "session_check", "session": "<session:c>"},
+        ))  # fmt: skip
+        closing.start()
+        opened(since, 3)
+        # The event is written before the probe has its answer: give it its first check
+        # (it then sleeps 10 s) before root closes everything.
+        time.sleep(2)
+        ended = ask_web_end_all(CONTROL_SOCKET)
+        closing.join(60)
+        # 4. "Cerrar todas" from the web (what a web taken over could do): over the narrow
+        # socket, from a live session, and recorded by the service like root's.
+        probe(
+            "web",
+            {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_as": "w"},
+            {"cmd": "session_end_all", "session": "<session:w>"},
+            {"cmd": "session_check", "session": "<session:w>"},
+        )
+        events = installed.box.events(since_seq=since)
+    finally:
+        layout.CONFIG_FILE.write_bytes(original)
+        restart_service(installed)
+
+    def said(name: str) -> list[str | None]:
+        return [r.get("outcome") for r in results.get(name, []) if "slept" not in r]
+
+    closed = [e for e in events if e.source == "system" and e.action == "web_sessions_closed"]
+    by_root = [e for e in closed if "uid" in e.details]
+    by_web = [e for e in closed if "uid" not in e.details]
+    ways_in = [
+        e
+        for e in events
+        if e.source == "system"
+        and e.action in ("web_link_given", "web_session_opened", "web_sessions_closed")
+    ]
+    # Invariant 5: who asked and how many, never a token or a session id.
+    clean = all(set(e.details) <= {"uid", "pid", "ended"} for e in ways_in)
+    ok = (
+        said("quiet") == ["opened", "live", "expired", "refused"]
+        and said("busy") == ["opened", "live", "live", "live", "expired"]
+        and said("closed") == ["opened", "live", "expired"]
+        and said("web") == ["opened", "ended", "expired"]
+        and ended >= 1
+    )
+    attack.check(
+        "stopped",
+        ok,
+        f"con 60 s sin uso y 120 en total: una sesión quieta {said('quiet')} (viva, muerta "
+        f"al minuto, y un cambio con ella rechazado); otra usada cada 30 s {said('busy')} "
+        f"(viva pasado el minuto y muerta a los dos); `--cerrar-todas` por el socket de root "
+        f"con una viva {said('closed')} ({ended} cerradas); «Cerrar todas» desde la web "
+        f"{said('web')}; la configuración, como estaba",
+    )
+    attack.check(
+        "recorded",
+        len(by_root) >= 1
+        and len(by_web) >= 1
+        and all(e.details.get("ended", 0) >= 1 for e in closed)
+        and clean,
+        f"el cierre de todas las sesiones está en la caja negra, por root ({len(by_root)}) y "
+        f"desde la web ({len(by_web)}), con cuántas; ningún token ni id en los "
+        f"{len(ways_in)} eventos de entrada y salida ({clean})",
     )

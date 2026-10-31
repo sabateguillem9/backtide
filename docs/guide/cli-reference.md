@@ -590,7 +590,15 @@ How it keeps to "only what is ours":
 sudo backtide enlace
 ```
 
-Prints the one-time link of the installed web (`backtide-web.service`), its run name, and the `ssh -L 8765:127.0.0.1:8765 <user>@<server>` line to reach it from another computer without opening a port. Each run asks the running service for a new link: it works once and for 15 minutes, and the one before stops working if it was not used. The web cannot make a link itself: it leaves only its address in a file only its user and root can read (`/run/backtide-web/enlace`), never in the journal, and the token comes from the service through root's control socket. Whoever opens the link is signed in, so the service writes it in the black box and sends an alert each time a link is given and each time one is used. A session ends after an hour unused or 12 hours in all (time with the machine awake), and when the service restarts. A page left open does not count as use. Exit codes: `0` printed; `1` no running web or service, or a file that is not the web's address; `2` a configuration that cannot be read.
+Prints the one-time link of the installed web (`backtide-web.service`), its run name, and the `ssh -L 8765:127.0.0.1:8765 <user>@<server>` line to reach it from another computer without opening a port. Each run asks the running service for a new link: it works once and for 15 minutes, and the one before stops working if it was not used. The web cannot make a link itself: it leaves only its address in a file only its user and root can read (`/run/backtide-web/enlace`), never in the journal, and the token comes from the service through root's control socket. Whoever opens the link is signed in, so the service writes it in the black box and sends an alert each time a link is given and each time one is used. A session ends after an hour unused or 12 hours in all (time with the machine awake), and when the service restarts. A page left open does not count as use, and an open page stops within a minute once its session has ended. In the web, "Sign out" ends your session and "Close all" (in Settings, typing `cerrar-todas` to confirm) ends every one; both are written in the black box.
+
+```sh
+sudo backtide enlace --cerrar-todas
+```
+
+Closes every web session and the unused link, without giving a new one, through root's control socket: it works even when the web does not answer or cannot be trusted. It is written in the black box and alerted. Exit codes: `0` closed; `1` no running service, or one without the installed web; `2` a configuration that cannot be read, or `--archivo` given with it.
+
+The exit codes of `sudo backtide enlace` itself: `0` printed; `1` no running web or service, or a file that is not the web's address; `2` a configuration that cannot be read.
 
 ### `backtide imagenes`
 

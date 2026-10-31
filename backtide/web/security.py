@@ -11,8 +11,10 @@ program on this machine that listens on a port of its own (cookies ignore ports)
     only when `backtide web --ajustes` turned the Settings page on, ``POST /ajustes/guardar``
     (T12e: a key set or removed); and only with `backtide web --aprobar`, ``POST
     /peticiones/decidir`` (T10-5: approve, reject, "aprobar y confiar", revoke a batch, take a
-    trusted recipient out). A POST anywhere else, and any other method, is a 405, so without
-    ``--ajustes`` or ``--aprobar`` there is not even a door to knock on;
+    trusted recipient out); and always ``POST /salir`` and ``POST /ajustes/cerrar-sesiones``
+    (T26-3a-2: sign out, close every session), which only end sessions. A POST anywhere else,
+    and any other method, is a 405, so without ``--ajustes`` or ``--aprobar`` there is no door
+    that changes anything;
   * every such POST must come from our own page: exactly one ``Origin``, ours (every browser
     sends it on a POST), ``Sec-Fetch-Site: same-origin`` when the browser sends it (anything
     else, even ``none``, is refused), a plain form body (``application/x-www-form-urlencoded``: no
@@ -99,6 +101,10 @@ SETTINGS_POST_PATH = "/ajustes/guardar"
 # The held requests (T10-5): their page, and the POST that decides, only with --aprobar.
 HOLDS_PATH = "/peticiones"
 DECIDE_PATH = "/peticiones/decidir"
+# Signing out and closing every session (T26-3a-2): always there, each with the session's CSRF.
+SIGN_OUT_PATH = "/salir"
+CLOSE_SESSIONS_PATH = "/ajustes/cerrar-sesiones"
+CLOSE_SESSIONS_WORD = "cerrar-todas"  # typed in the form: the confirmation
 MAX_FORM_BYTES = 2048
 FORM_TYPE = "application/x-www-form-urlencoded"
 
@@ -171,8 +177,10 @@ class Access(Protocol):
         """The live session among this header's cookies, or None; with ``use`` it counts as
         used (a page's own stream checks without it)."""
 
-    def end(self, session_id: str, *, every: bool = False) -> bool:
-        """End this session, or every one (asked from this live one)."""
+    def end(self, session_id: str, *, every: bool = False) -> bool | None:
+        """End this session, or every one (asked from this live one): True if ended, False if
+        it was not a live one, None if the service could not be asked or would not say (then
+        nobody may assume it ended)."""
 
 
 class LocalAccess:
@@ -239,12 +247,13 @@ class ServiceAccess:
                 return session
         return None
 
-    def end(self, session_id: str, *, every: bool = False) -> bool:
+    def end(self, session_id: str, *, every: bool = False) -> bool | None:
         try:
-            return ask_session_end(self._path, session_id, every=every, **self._ask())
+            outcome = ask_session_end(self._path, session_id, every=every, **self._ask())
         except ControlError as error:
             logger.error("the service could not end a session: %s", error)
-            return False
+            return None
+        return {"ended": True, "expired": False}.get(outcome)
 
 
 def allowed_hosts(port: int) -> frozenset[str]:
