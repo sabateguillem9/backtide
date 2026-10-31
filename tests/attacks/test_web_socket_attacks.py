@@ -31,6 +31,7 @@ from test_install_attacks import Installed, agent_running, open_installed, sh, w
 
 from backtide.jail.config import AGENT_GID, AGENT_UID
 from backtide.service.config import STATE_SOCKET, STATE_WEB_SOCKET
+from backtide.service.control import ask_web_link
 from backtide.setup import layout
 from backtide.snapshots import Snapshot
 
@@ -40,11 +41,14 @@ CONTROL_SOCKET = layout.STATE_DIR / STATE_SOCKET
 
 # One JSON request per line in argv[2:], each on its own connection; what comes back is either
 # the service's reply (outcome and ok only) or the errno of connecting. Plain sockets: nothing of
-# backtide runs as the probe.
+# backtide runs as the probe. A session a reply opens (T26-3a) is kept, never printed, and put
+# where a later request says "<session>".
 PROBE = """
 import errno, json, socket, sys
-path, out = sys.argv[1], []
+path, out, session = sys.argv[1], [], None
 for line in sys.argv[2:]:
+    if session is not None:
+        line = line.replace('"<session>"', json.dumps(session))
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(20)
@@ -55,6 +59,8 @@ for line in sys.argv[2:]:
             while chunk := sock.recv(65536):
                 raw += chunk
         reply = json.loads(raw)
+        if isinstance(reply.get("session"), str):
+            session = reply["session"]
         out.append({"outcome": reply.get("outcome"), "ok": reply.get("ok"),
                     "n": len(reply.get("snapshots") or [])})
     except OSError as e:
@@ -149,21 +155,29 @@ def test_only_the_web_uses_its_socket_and_only_for_its_list(
         {"cmd": "rewind", "snapshot_id": forged_id, "via": "cli"},
         {"cmd": "rewind", "snapshot_id": "../../etc"},
     ]
+    # The forged ids go with a live session (T26-3a), from a link root asked for: what refuses
+    # them is the service's check of the id, not the missing session.
     forged = [
-        {"cmd": "rewind", "snapshot_id": forged_id},
-        {"cmd": "decide", "hold_id": forged_hold, "verdict": "approve"},
+        {"cmd": "rewind", "snapshot_id": forged_id, "session": "<session>"},
+        {"cmd": "decide", "hold_id": forged_hold, "verdict": "approve", "session": "<session>"},
     ]
     control = [{"cmd": "snapshots"}, {"cmd": "holds"}]
+    signed = [{"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)}]
     try:
-        as_web = probe_as(web.pw_uid, web.pw_gid, "", path, *outside, *forged, *control)
+        as_web = probe_as(
+            web.pw_uid, web.pw_gid, "", path, *outside, *signed, *forged, *control,
+            {"cmd": "session_end", "session": "<session>"},
+        )  # fmt: skip
     finally:
         exported = nowhere.exists()
         shutil.rmtree(nowhere, ignore_errors=True)
     root_socket = probe_as(web.pw_uid, web.pw_gid, "", str(CONTROL_SOCKET), {"cmd": "holds"})
     still_running = agent_running(installed)
 
-    said_outside, said_forged = as_web[: len(outside)], as_web[len(outside) : -len(control)]
-    said_control = as_web[-len(control) :]
+    said_outside = as_web[: len(outside)]
+    said_signed = as_web[len(outside)]
+    said_forged = as_web[len(outside) + 1 : len(outside) + 1 + len(forged)]
+    said_control = as_web[-len(control) - 1 : -1]
     refused = [{"outcome": "refused", "ok": False, "n": 0}]
     ok = (
         socket_file == (True, 0, True, "0o660")
@@ -176,6 +190,7 @@ def test_only_the_web_uses_its_socket_and_only_for_its_list(
         and all(r.get("outcome") == "refused" and r.get("ok") is False for r in said_outside[:-1])
         and said_outside[-1].get("outcome") in ("refused", "invalid")
         and said_outside[-1].get("ok") is False
+        and said_signed.get("outcome") == "opened"
         and said_forged[0].get("outcome") == "invalid"
         and said_forged[1].get("outcome") == "unknown"
         and said_control[0].get("outcome") == "listed"
@@ -241,4 +256,130 @@ def test_only_the_web_uses_its_socket_and_only_for_its_list(
         f"rechazos del socket de la web en la caja negra: {sorted(seen)}; ningún rebobinado "
         f"pedido ({len(rewinds)}), ninguna shell, exportación ni reanudación ({len(shells)}) y "
         f"ninguna aprobación ({len(approved)})",
+    )
+
+
+@scenario("web-tomada-sin-dueno")
+def test_a_web_taken_over_changes_nothing_without_a_session(
+    attack: Attack, installed: Installed
+) -> None:
+    """T26-3a: whoever runs code as `backtide-web` (the web taken over) has the narrow socket,
+    but not a session: only root mints the one-time link (on its own socket), and every change
+    wants a live session."""
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    listed = [s.id for s in installed.store.snapshots()]
+    assert listed, "the installed volume has no snapshot to aim at"
+    forged_hold = "h-" + secrets.token_hex(6)
+    budget_before = probe_as(web.pw_uid, web.pw_gid, "", path, {"cmd": "budget"})
+    # Each would change something real if it got through: a listed snapshot, a made-up key.
+    changes = [
+        {"cmd": "rewind", "snapshot_id": listed[-1]},
+        {"cmd": "set_secret", "kind": "openai", "value": "sk-proj-" + "x" * 40},
+        {"cmd": "clear_secret", "kind": "anthropic"},
+        {"cmd": "set_budget", "daily_usd": "1"},
+        {"cmd": "decide", "hold_id": forged_hold, "verdict": "approve"},
+        {"cmd": "trust", "hold_id": forged_hold},
+        {"cmd": "untrust", "trust_id": "t-0a1b2c3d"},
+        {"cmd": "end_batch", "rule_id": "b-01234567"},
+        {"cmd": "accept_prices", "digest": "0123456789abcdef"},
+    ]
+    # 1. No session at all; 2. a made-up one; 3. ways to make one without root.
+    bare = probe_as(web.pw_uid, web.pw_gid, "", path, *changes)
+    made_up = probe_as(
+        web.pw_uid, web.pw_gid, "", path, *({**c, "session": "s" * 43} for c in changes)
+    )
+    no_link = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        {"cmd": "session_open", "token": "t" * 43},
+        {"cmd": "web_link"},
+        {"cmd": "session_end_all", "session": "s" * 43},
+    )  # fmt: skip
+    root_socket = probe_as(web.pw_uid, web.pw_gid, "", str(CONTROL_SOCKET), {"cmd": "web_link"})
+    # 4. A session that ended: refused like none. 5. The control: a live session gets as far
+    # as the service's own check of the id (a forged hold is "unknown"), so the refusals above
+    # are the session's doing.
+    ended = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
+        {"cmd": "session_end", "session": "<session>"},
+        {**changes[0], "session": "<session>"},
+    )  # fmt: skip
+    live = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
+        {**changes[4], "session": "<session>"},
+        {"cmd": "session_end", "session": "<session>"},
+    )  # fmt: skip
+    budget_after = probe_as(web.pw_uid, web.pw_gid, "", path, {"cmd": "budget"})
+    still_running = agent_running(installed)
+
+    refused = {"outcome": "refused", "ok": False, "n": 0}
+    ok = (
+        bare == [refused] * len(changes)
+        and made_up == [refused] * len(changes)
+        and [r.get("outcome") for r in no_link] == ["refused"] * 3
+        and root_socket == [{"errno": "EACCES"}]
+        and [r.get("outcome") for r in ended] == ["opened", "ended", "refused"]
+        and [r.get("outcome") for r in live] == ["opened", "unknown", "ended"]
+        and budget_before == budget_after
+        and still_running
+    )
+    attack.check(
+        "stopped",
+        ok,
+        f"como backtide-web, los {len(changes)} cambios (rebobinar a una instantánea de la "
+        f"lista, poner y quitar claves, el tope, aprobar, confiar, quitar confianzas y lotes, "
+        f"precios) sin sesión: {[r.get('outcome') for r in bare]}; con una inventada: "
+        f"{[r.get('outcome') for r in made_up]}; abrir una sin enlace, pedir un enlace por su "
+        f"socket y cerrar todas sin sesión: {[r.get('outcome') for r in no_link]}; el socket de "
+        f"control de root: {root_socket}; con una sesión ya cerrada: "
+        f"{[r.get('outcome') for r in ended]}; control, con una sesión viva una petición "
+        f"inventada llega a la comprobación del id: {[r.get('outcome') for r in live]}; el tope "
+        f"no cambia ({budget_before == budget_after}) y el agente sigue ({still_running})",
+    )
+
+    # The refusals reach the black box through the log bridge (once a minute per kind): while
+    # it is not there since the probes began, cause it again.
+    kind = "refused a %s without a live session"
+
+    def recorded() -> bool:
+        seen = any(
+            kind in str(e.details.get("template", ""))
+            for e in installed.box.events(source="system", since_seq=since)
+            if e.action == "log" and e.target == "backtide.service.web_control"
+        )
+        if not seen:
+            probe_as(web.pw_uid, web.pw_gid, "", path, changes[0])
+        return seen
+
+    wait(recorded, 150, interval=5)
+    events = installed.box.events(since_seq=since)
+    rewinds = [e for e in events if e.source == "snapshot" and e.action == "rewind_requested"]
+    settings = [e for e in events if e.action in ("secret_set", "secret_cleared", "budget_set")]
+    approved = [e for e in events if e.source == "gate" and e.action in ("approved", "trusted")]
+    # Every way in, one by one (review of T26-3a): the two links root gave and the two sessions
+    # they opened, with who asked and never a token or a session id.
+    links = [e for e in events if e.source == "system" and e.action == "web_link_given"]
+    entries = [e for e in events if e.source == "system" and e.action == "web_session_opened"]
+    clean = all(
+        not {"token", "session"} & set(e.details)
+        and not any(isinstance(v, str) and len(v) >= 43 for v in e.details.values())
+        for e in links + entries
+    )
+    attack.check(
+        "recorded",
+        recorded()
+        and not rewinds
+        and not settings
+        and not approved
+        and len(links) >= 2
+        and len(entries) >= 2
+        and clean,
+        f"el rechazo sin sesión está en la caja negra ({recorded()}); ningún rebobinado "
+        f"({len(rewinds)}), ningún cambio de claves ni de topes ({len(settings)}) y ninguna "
+        f"aprobación ni confianza ({len(approved)}); cada enlace dado ({len(links)}, al menos 2) "
+        f"y cada entrada ({len(entries)}, al menos 2) con su evento, sin token ni id ({clean})",
     )

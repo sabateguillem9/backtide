@@ -31,12 +31,14 @@ from backtide.service.control import (
     ask_set_budget,
     ask_trust,
 )
+from backtide.service.sessions import Sessions
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
 from backtide.service.spend import CapOutcome
 from backtide.service.web_control import (
     CHANGES,
     COMMANDS,
     READS,
+    SESSION_COMMANDS,
     Bucket,
     WebControlServer,
     ask_snapshots,
@@ -52,6 +54,7 @@ GROUP = os.getegid() if os.getegid() not in (0, AGENT_GID, PROXY_GID) else 4321
 LISTED = Snapshot(datetime(2026, 10, 28, 9, 0, tzinfo=UTC), "periodic")
 NEWER = Snapshot(datetime(2026, 10, 28, 9, 5, tzinfo=UTC), "periodic")
 UNLISTED = Snapshot(datetime(2026, 10, 28, 9, 2, tzinfo=UTC), "periodic")
+SESSION = "s" * 43  # the cookie of the person at the web (a test value)
 
 
 def the_web(sock: socket.socket) -> tuple[int, int, int]:
@@ -134,6 +137,8 @@ def make_server(
         options.setdefault("snapshots", lambda: [LISTED, NEWER])
         options.setdefault("settings", settings)
         options.setdefault("budget", budget)
+        options.setdefault("sessions", signed_in())
+        options.setdefault("on_entry", lambda action, details: True)
         server = WebControlServer(guardian, folder / "web.sock", **options)
         server.start()
         servers.append(server)
@@ -142,6 +147,18 @@ def make_server(
     yield make
     for server in servers:
         server.close()
+
+
+def signed_in() -> Sessions:
+    """The service's sessions with one already open: the cookie of the person at the web."""
+    sessions = Sessions()
+    sessions.preset(SESSION)
+    return sessions
+
+
+def signed(request: dict[str, Any]) -> dict[str, Any]:
+    """A change as the web sends it: with the session of the person who asked (T26-3a)."""
+    return {**request, "session": SESSION}
 
 
 def talk(server: ControlServer, request: object) -> dict[str, Any]:
@@ -239,7 +256,7 @@ def test_unreadable_credentials_are_refused(
         raise ControlError("no SO_PEERCRED here")
 
     server = make_server(peer=unreadable)
-    assert talk(server, {"cmd": "rewind", "snapshot_id": LISTED.id})["outcome"] == "refused"
+    assert talk(server, signed({"cmd": "rewind", "snapshot_id": LISTED.id}))["outcome"] == "refused"
     assert guardian.calls == []
 
 
@@ -287,7 +304,9 @@ def test_nothing_outside_the_list_is_served(
 
 
 def test_the_list_is_closed() -> None:
-    assert COMMANDS == READS | CHANGES and not READS & CHANGES
+    assert COMMANDS == READS | CHANGES | SESSION_COMMANDS
+    assert not READS & CHANGES and not (READS | CHANGES) & SESSION_COMMANDS
+    assert "web_link" not in COMMANDS  # only root mints a way in
     assert {"resume", "shell", "import", "export"}.isdisjoint(COMMANDS)
 
 
@@ -342,10 +361,12 @@ def test_a_rewind_to_a_listed_snapshot_is_recorded_as_the_web(
     make_server: Callable[..., WebControlServer], guardian: FakeGuardian
 ) -> None:
     server = make_server()
-    reply = ask_rewind(server.path, LISTED.id, via="web", peer=the_web, server_uid=ME)
+    reply = ask_rewind(
+        server.path, LISTED.id, via="web", peer=the_web, server_uid=ME, session=SESSION
+    )
     assert reply["outcome"] == "done"
     # Without `via` too: the narrow socket says it is the web whatever the client sends.
-    assert talk(server, {"cmd": "rewind", "snapshot_id": NEWER.id})["outcome"] == "done"
+    assert talk(server, signed({"cmd": "rewind", "snapshot_id": NEWER.id}))["outcome"] == "done"
     assert guardian.calls == [
         (LISTED.id, f"web (uid {ME}, pid 4242)"),
         (NEWER.id, f"web (uid {ME}, pid 4242)"),
@@ -357,9 +378,11 @@ def test_a_forged_snapshot_id_is_refused_without_the_guardian(
 ) -> None:
     server = make_server()
     for snapshot_id in (UNLISTED.id, "../../etc", "20261028T090000Z-periodic/..", 7):
-        reply = talk(server, {"cmd": "rewind", "snapshot_id": snapshot_id})
+        reply = talk(server, signed({"cmd": "rewind", "snapshot_id": snapshot_id}))
         assert reply["ok"] is False and reply["outcome"] in ("invalid", "refused")
-    assert talk(server, {"cmd": "rewind", "snapshot_id": UNLISTED.id})["outcome"] == "invalid"
+    assert (
+        talk(server, signed({"cmd": "rewind", "snapshot_id": UNLISTED.id}))["outcome"] == "invalid"
+    )
     assert guardian.calls == []
 
 
@@ -370,7 +393,7 @@ def test_an_unreadable_list_rewinds_nothing(
         raise OSError("the volume is gone")
 
     server = make_server(snapshots=broken)
-    assert talk(server, {"cmd": "rewind", "snapshot_id": LISTED.id})["outcome"] == "invalid"
+    assert talk(server, signed({"cmd": "rewind", "snapshot_id": LISTED.id}))["outcome"] == "invalid"
     assert talk(server, {"cmd": "snapshots"})["ok"] is False
     assert guardian.calls == []
 
@@ -379,9 +402,13 @@ def test_approving_and_rejecting_go_to_the_guardian_as_the_web(
     make_server: Callable[..., WebControlServer], guardian: FakeGuardian
 ) -> None:
     server = make_server()
-    assert ask_decide(server.path, HOLD, "approve", via="web", peer=the_web, server_uid=ME)["ok"]
-    assert ask_decide(server.path, HOLD, "reject", peer=the_web, server_uid=ME)["ok"]
-    trusted = ask_trust(server.path, HOLD, peer=the_web, server_uid=ME)
+    assert ask_decide(
+        server.path, HOLD, "approve", via="web", peer=the_web, server_uid=ME, session=SESSION
+    )["ok"]
+    assert ask_decide(server.path, HOLD, "reject", peer=the_web, server_uid=ME, session=SESSION)[
+        "ok"
+    ]
+    trusted = ask_trust(server.path, HOLD, peer=the_web, server_uid=ME, session=SESSION)
     assert trusted["outcome"] == "trusted"
     who = f"web (uid {ME}, pid 4242)"
     assert guardian.decisions == [
@@ -400,7 +427,7 @@ def test_a_forged_hold_id_is_refused_without_the_guardian(
         {"cmd": "decide", "hold_id": hold_id, "verdict": "approve"},
         {"cmd": "trust", "hold_id": hold_id},
     ):
-        assert talk(server, request)["outcome"] == "refused"
+        assert talk(server, signed(request))["outcome"] == "refused"
     assert guardian.decisions == []
 
 
@@ -410,7 +437,7 @@ def test_an_unknown_hold_is_the_guardians_word(
     from backtide.service.holds import HoldStatus
 
     guardian.hold_status = HoldStatus.UNKNOWN
-    reply = talk(make_server(), {"cmd": "decide", "hold_id": HOLD, "verdict": "approve"})
+    reply = talk(make_server(), signed({"cmd": "decide", "hold_id": HOLD, "verdict": "approve"}))
     assert (reply["ok"], reply["outcome"]) == (False, "unknown")
 
 
@@ -419,17 +446,23 @@ def test_settings_and_caps_go_to_the_service_as_the_web(
 ) -> None:
     server = make_server()
     key = "sk-ant-api03-" + "k" * 80
-    reply = talk(server, {"cmd": "set_secret", "kind": "anthropic", "value": key})
+    reply = talk(server, signed({"cmd": "set_secret", "kind": "anthropic", "value": key}))
     assert reply["outcome"] == "saved" and key not in json.dumps(reply)
-    assert talk(server, {"cmd": "clear_secret", "kind": "openai"})["outcome"] == "cleared"
+    assert talk(server, signed({"cmd": "clear_secret", "kind": "openai"}))["outcome"] == "cleared"
     secrets = talk(server, {"cmd": "secrets"})
     assert secrets["secrets"] == {"anthropic": {"set": True, "tail": "WXYZ"}}
     capped = ask_set_budget(
-        server.path, daily_usd="2,5", monthly_usd=None, via="web", peer=the_web, server_uid=ME
+        server.path,
+        daily_usd="2,5",
+        monthly_usd=None,
+        via="web",
+        peer=the_web,
+        server_uid=ME,
+        session=SESSION,
     )
     assert capped["outcome"] == "saved"
-    assert talk(server, {"cmd": "set_budget", "daily_usd": "-1"})["outcome"] == "invalid"
-    assert talk(server, {"cmd": "accept_prices", "digest": "0123456789abcdef"})["ok"]
+    assert talk(server, signed({"cmd": "set_budget", "daily_usd": "-1"}))["outcome"] == "invalid"
+    assert talk(server, signed({"cmd": "accept_prices", "digest": "0123456789abcdef"}))["ok"]
     who = f"web (uid {ME}, pid 4242)"
     assert settings.calls == [("set", "anthropic", who), ("clear", "openai", who)]
     assert budget.caps == [(Decimal("2.5"), None, who)]
@@ -487,7 +520,7 @@ def test_too_many_requests_or_changes_are_refused_without_the_guardian(
     server = make_server(
         requests=Bucket(5, 0.001, clock=clock), changes=Bucket(2, 0.001, clock=clock)
     )
-    rewind = {"cmd": "rewind", "snapshot_id": LISTED.id}
+    rewind = signed({"cmd": "rewind", "snapshot_id": LISTED.id})
     assert [talk(server, rewind)["outcome"] for _ in range(3)] == ["done", "done", "refused"]
     assert len(guardian.calls) == 2
     assert [talk(server, {"cmd": "holds"})["outcome"] for _ in range(3)] == [
@@ -577,7 +610,7 @@ def test_changes_that_outlast_the_web_are_a_warning(
     """Review of T12c (M1): a new Telegram or a trusted recipient outlasts whoever held the web,
     so the owner hears of it over today's alert channel (the log bridge alerts a WARNING)."""
     caplog.set_level(logging.WARNING, logger="backtide.service.web_control")
-    talk(make_server(), request_)
+    talk(make_server(), signed(request_))
     said = [r.getMessage() for r in caplog.records if r.name == "backtide.service.web_control"]
     assert any("if it was not you" in m for m in said) is warned
     assert not any("a" * 30 in m for m in said)  # never the value
@@ -588,3 +621,272 @@ def test_the_log_says_which_socket_was_full(
 ) -> None:
     server = make_server()
     assert server.label == "web socket" and ControlServer.label == "control socket"
+
+
+# -- T26-3a: the service keeps the web's sessions --------------------------------------------------
+
+CHANGE_REQUESTS = [
+    {"cmd": "rewind", "snapshot_id": LISTED.id},
+    {"cmd": "decide", "hold_id": HOLD, "verdict": "approve"},
+    {"cmd": "trust", "hold_id": HOLD},
+    {"cmd": "untrust", "trust_id": "t-0a1b2c3d"},
+    {"cmd": "end_batch", "rule_id": "b-01234567"},
+    {"cmd": "set_secret", "kind": "anthropic", "value": "sk-ant-api03-" + "k" * 80},
+    {"cmd": "clear_secret", "kind": "openai"},
+    {"cmd": "set_budget", "daily_usd": "2"},
+    {"cmd": "accept_prices", "digest": "0123456789abcdef"},
+]
+
+
+def test_every_change_is_in_the_list_of_those_that_need_a_session() -> None:
+    assert {request["cmd"] for request in CHANGE_REQUESTS} == CHANGES
+
+
+@pytest.mark.parametrize("request_", CHANGE_REQUESTS, ids=lambda r: r["cmd"])
+@pytest.mark.parametrize("session", [None, "", "x" * 43, 7, ["s" * 43]])
+def test_a_change_without_a_live_session_calls_nothing(
+    make_server: Callable[..., WebControlServer],
+    guardian: FakeGuardian,
+    settings: FakeSettings,
+    budget: FakeBudget,
+    caplog: pytest.LogCaptureFixture,
+    request_: dict[str, Any],
+    session: object,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="backtide.service.web_control")
+    request = dict(request_) if session is None else {**request_, "session": session}
+    reply = talk(make_server(), request)
+    assert (reply["ok"], reply["outcome"]) == (False, "refused")
+    assert "sesión" in reply["message"]
+    assert nothing_asked(guardian, settings, budget)
+    assert any("without a live session" in r.getMessage() for r in caplog.records)
+
+
+def test_a_change_with_a_session_that_ended_calls_nothing(
+    make_server: Callable[..., WebControlServer], guardian: FakeGuardian
+) -> None:
+    sessions = signed_in()
+    server = make_server(sessions=sessions)
+    assert talk(server, signed(CHANGE_REQUESTS[0]))["outcome"] == "done"
+    sessions.end(SESSION)
+    assert talk(server, signed(CHANGE_REQUESTS[0]))["outcome"] == "refused"
+    assert len(guardian.calls) == 1
+
+
+def test_without_sessions_no_change_goes_through(
+    make_server: Callable[..., WebControlServer], guardian: FakeGuardian
+) -> None:
+    """A service built without the web's sessions fails closed."""
+    server = make_server(sessions=None)
+    assert talk(server, signed(CHANGE_REQUESTS[0]))["outcome"] == "refused"
+    assert talk(server, {"cmd": "session_check", "session": SESSION})["outcome"] == "refused"
+    assert guardian.calls == []
+
+
+def test_a_link_opens_a_session_that_then_changes(
+    make_server: Callable[..., WebControlServer],
+    guardian: FakeGuardian,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from backtide.service.web_control import (
+        ask_session_check,
+        ask_session_end,
+        ask_session_open,
+    )
+
+    caplog.set_level(logging.WARNING, logger="backtide.service.web_control")
+    sessions = Sessions()
+    server = make_server(sessions=sessions)
+    ask = {"server_uid": ME, "peer": the_web}
+    token = sessions.new_link()
+    assert ask_session_open(server.path, "y" * 43, **ask) is None  # a guess spends nothing
+    session = ask_session_open(server.path, token, **ask)
+    assert session is not None and session.id != token
+    assert ask_session_open(server.path, token, **ask) is None  # one use
+    assert ask_session_check(server.path, session.id, **ask) == session
+    reply = ask_rewind(server.path, LISTED.id, via="web", session=session.id, **ask)
+    assert reply["outcome"] == "done"
+    assert ask_session_end(server.path, session.id, **ask) is True
+    assert ask_session_check(server.path, session.id, **ask) is None
+    assert ask_session_end(server.path, session.id, **ask) is False
+    said = [r.getMessage() for r in caplog.records if r.name == "backtide.service.web_control"]
+    assert any("wrong, spent or old" in m for m in said)
+    assert not any(token in m or session.id in m for m in said)  # never a secret in the log
+
+
+def test_closing_every_session_needs_a_live_one(
+    make_server: Callable[..., WebControlServer], caplog: pytest.LogCaptureFixture
+) -> None:
+    from backtide.service.web_control import ask_session_end
+
+    caplog.set_level(logging.WARNING, logger="backtide.service.web_control")
+    sessions = signed_in()
+    other = sessions.open(sessions.new_link())
+    assert other is not None
+    server = make_server(sessions=sessions)
+    ask = {"server_uid": ME, "peer": the_web}
+    assert ask_session_end(server.path, "x" * 43, every=True, **ask) is False
+    assert len(sessions) == 2
+    assert ask_session_end(server.path, SESSION, every=True, **ask) is True
+    assert len(sessions) == 0
+    assert any("closed every session (2)" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        {"cmd": "session_open"},
+        {"cmd": "session_open", "token": "t" * 43, "session": SESSION},
+        {"cmd": "session_check", "token": "t" * 43},
+        {"cmd": "session_end", "session": SESSION, "via": "web"},
+        {"cmd": "web_link"},  # root's alone
+    ],
+)
+def test_a_session_command_of_another_shape_is_refused(
+    make_server: Callable[..., WebControlServer], request_: dict[str, Any]
+) -> None:
+    sessions = signed_in()
+    reply = talk(make_server(sessions=sessions), request_)
+    assert (reply["ok"], reply["outcome"]) == (False, "refused")
+    assert len(sessions) == 1
+
+
+def test_opening_sessions_has_a_bucket_of_its_own(
+    make_server: Callable[..., WebControlServer],
+) -> None:
+    clock = Clock()
+    server = make_server(opens=Bucket(2, 0.001, clock=clock), checks=Bucket(3, 0.001, clock=clock))
+    opens = [talk(server, {"cmd": "session_open", "token": "t" * 43}) for _ in range(3)]
+    assert [r["outcome"] for r in opens] == ["refused"] * 3
+    assert "Demasiadas" in opens[2]["message"]
+    checks = [talk(server, {"cmd": "session_check", "session": SESSION}) for _ in range(4)]
+    assert [r["outcome"] for r in checks] == ["live", "live", "live", "refused"]
+    assert talk(server, {"cmd": "holds"})["outcome"] == "listed"  # the reads' bucket is apart
+
+
+def test_root_mints_the_link_on_the_control_socket(
+    folder: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from backtide.service.control import ask_web_link
+
+    caplog.set_level(logging.INFO, logger="backtide.service.control")
+    sessions = Sessions()
+    me = lambda sock: (4242, ME, os.getegid())  # noqa: E731
+    server = ControlServer(
+        FakeGuardian(),
+        folder / "control.sock",
+        peer=me,
+        sessions=sessions,
+        on_entry=lambda action, details: True,
+    )
+    server.start()
+    try:
+        first = ask_web_link(server.path, peer=me)
+        second = ask_web_link(server.path, peer=me)
+        assert sessions.open(first) is None  # the new one killed the unspent one
+        assert sessions.open(second) is not None
+        assert talk(server, {"cmd": "web_link", "x": 1})["outcome"] == "refused"
+        said = [r.getMessage() for r in caplog.records]
+        assert any("a new one-time link for the web" in m for m in said)
+        assert not any(first in m or second in m for m in said)
+    finally:
+        server.close()
+
+
+def test_a_service_without_a_web_gives_no_link(folder: Path) -> None:
+    from backtide.service.control import ask_web_link
+
+    me = lambda sock: (4242, ME, os.getegid())  # noqa: E731
+    server = ControlServer(FakeGuardian(), folder / "control.sock", peer=me)
+    server.start()
+    try:
+        with pytest.raises(ControlError, match="no tiene web"):
+            ask_web_link(server.path, peer=me)
+    finally:
+        server.close()
+
+
+def test_a_check_may_say_it_is_not_a_use_and_nothing_else(
+    make_server: Callable[..., WebControlServer],
+) -> None:
+    server = make_server()
+    assert talk(server, {"cmd": "session_check", "session": SESSION, "use": False})["ok"]
+    for use in (True, 1, "false", None):
+        reply = talk(server, {"cmd": "session_check", "session": SESSION, "use": use})
+        assert reply["outcome"] == "refused", use
+
+
+def test_closing_every_session_has_a_bucket_of_its_own(
+    make_server: Callable[..., WebControlServer],
+) -> None:
+    """Made-up links that empty the opening bucket never block "close them all"."""
+    clock = Clock()
+    server = make_server(opens=Bucket(1, 0.001, clock=clock), ends=Bucket(1, 0.001, clock=clock))
+    for _ in range(3):
+        talk(server, {"cmd": "session_open", "token": "t" * 43})
+    assert talk(server, {"cmd": "session_end_all", "session": SESSION})["outcome"] == "ended"
+
+
+def test_every_link_and_every_entry_reaches_the_hook(folder: Path) -> None:
+    """One by one (review of T26-3a): the log bridge would let only one a minute by."""
+    from backtide.service.control import ask_web_link
+    from backtide.service.web_control import ask_session_open
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    sessions = Sessions()
+    me = lambda sock: (4242, ME, os.getegid())  # noqa: E731
+    control = ControlServer(
+        FakeGuardian(),
+        folder / "control.sock",
+        peer=me,
+        sessions=sessions,
+        on_entry=lambda action, details: entries.append((action, details)) is None,
+    )
+    narrow = WebControlServer(
+        FakeGuardian(),
+        folder / "web.sock",
+        group=GROUP,
+        snapshots=list,
+        peer=the_web,
+        sessions=sessions,
+        on_entry=lambda action, details: entries.append((action, details)) is None,
+    )
+    control.start()
+    narrow.start()
+    try:
+        ask_web_link(control.path, peer=me)
+        token = ask_web_link(control.path, peer=me)
+        assert ask_session_open(narrow.path, "x" * 43, server_uid=ME, peer=the_web) is None
+        assert ask_session_open(narrow.path, token, server_uid=ME, peer=the_web) is not None
+    finally:
+        control.close()
+        narrow.close()
+    assert entries == [
+        ("web_link_given", {"uid": ME, "pid": 4242}),
+        ("web_link_given", {"uid": ME, "pid": 4242}),
+        ("web_session_opened", {"pid": 4242}),
+    ]
+    assert token not in repr(entries)
+
+
+def test_sessions_without_a_place_to_record_entries_are_refused(folder: Path) -> None:
+    with pytest.raises(ControlError, match="apuntar"):
+        ControlServer(FakeGuardian(), folder / "control.sock", sessions=Sessions())
+    with pytest.raises(ControlError, match="apuntar"):
+        WebControlServer(
+            FakeGuardian(), folder / "web.sock", group=GROUP, snapshots=list, sessions=Sessions()
+        )
+
+
+def test_an_entry_that_cannot_be_recorded_is_refused(
+    make_server: Callable[..., WebControlServer], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fails closed (review of T26-3a): no record, no session; the cookie never leaves."""
+    from backtide.service.web_control import ask_session_open
+
+    sessions = Sessions()
+    server = make_server(sessions=sessions, on_entry=lambda action, details: False)
+    token = sessions.new_link()
+    assert ask_session_open(server.path, token, server_uid=ME, peer=the_web) is None
+    assert len(sessions) == 0
+    assert any("could not be recorded" in r.getMessage() for r in caplog.records)

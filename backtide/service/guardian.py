@@ -488,6 +488,22 @@ class _Assessment:
     changed: bool
 
 
+# The ways into the web (T26-3a): recorded and alerted every time (``Guardian.web_access``).
+WEB_ACCESS_ALERTS = {
+    "web_link_given": (
+        "Se ha dado un enlace para entrar en la web",
+        "Alguien ha pedido `sudo backtide enlace`. Si no has sido tú, cierra todas las sesiones "
+        "en Ajustes.",
+    ),
+    "web_session_opened": (
+        "Alguien ha entrado en la web",
+        "Se ha usado un enlace de un solo uso y hay una sesión nueva. Si no has sido tú, cierra "
+        "todas las sesiones en Ajustes.",
+    ),
+}
+WEB_ACCESS_ACTIONS = frozenset(WEB_ACCESS_ALERTS)
+
+
 class Guardian:
     def __init__(
         self,
@@ -4148,6 +4164,27 @@ class Guardian:
             self._bb_streak = 0
             self._bb_failing_since = None
         return event
+
+    def web_access(self, action: str, details: dict[str, Any]) -> bool:
+        """A way into the web (T26-3a): ``web_link_given`` (`sudo backtide enlace`) or
+        ``web_session_opened`` (a link was used). Each one goes to the black box and is alerted,
+        one by one and never throttled: whoever has a link is signed in, so the owner hears of
+        every one ("if it was not you"). ``details`` holds who asked (uid, pid), never a token
+        or a session id. The alert is an ERROR, so a full queue of other alerts (an agent can
+        cause many) makes room for it instead of dropping it. False if the black box did not
+        take it: then the caller refuses the session (it fails closed), and the alert says so."""
+        if action not in WEB_ACCESS_ACTIONS:
+            raise ValueError(f"not a web access: {action}")
+        event = self._record("system", action, "web", details=dict(details), risk=1)
+        title, body = WEB_ACCESS_ALERTS[action]
+        if event is None:
+            body += (
+                " No ha quedado en la caja negra, así que la entrada se ha rechazado."
+                if action == "web_session_opened"
+                else " No ha quedado en la caja negra."
+            )
+        self._alert(AlertLevel.ERROR, title, body, event)
+        return event is not None
 
     def _alert(self, level: AlertLevel, title: str, body: str, event: Event | None = None) -> None:
         """The one door alerts go through: title and body are redacted here, whatever put the

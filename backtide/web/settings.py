@@ -53,7 +53,7 @@ from backtide.web.rewind import (
     Redeemed,
     availability_of,
 )
-from backtide.web.security import TOKEN_BYTES, token_matches
+from backtide.web.security import TOKEN_BYTES, acting_session, token_matches
 
 ACTIONS = ("set", "clear")
 _TAIL_RE = re.compile(r"[A-Za-z0-9_-]{4}", re.ASCII)
@@ -120,26 +120,28 @@ class ControlSettings:
             raise ControlError("esta web no se lanzó con --ajustes")
         return {"wait": self._wait, "peer": self._peer, "server_uid": self._server_uid}
 
+    def _change(self) -> dict[str, Any]:
+        """``_require`` plus, on the narrow socket, the session of who asked (T26-3a)."""
+        return {**self._require(), "session": acting_session(self._server_uid)}
+
     def status(self) -> dict[str, dict[str, Any]]:
         return ask_secrets(self._path, **self._require())
 
     def set_secret(self, kind: str, value: str, chat_id: str | None) -> dict[str, Any]:
-        return ask_set_secret(
-            self._path, kind, value, chat_id=chat_id, via="web", **self._require()
-        )
+        return ask_set_secret(self._path, kind, value, chat_id=chat_id, via="web", **self._change())
 
     def clear_secret(self, kind: str) -> dict[str, Any]:
-        return ask_clear_secret(self._path, kind, via="web", **self._require())
+        return ask_clear_secret(self._path, kind, via="web", **self._change())
 
     def set_budget(self, daily: str | None, monthly: str | None) -> dict[str, Any]:
         """New spending caps (T11), as typed: the service checks them and records the change."""
         return ask_set_budget(
-            self._path, daily_usd=daily, monthly_usd=monthly, via="web", **self._require()
+            self._path, daily_usd=daily, monthly_usd=monthly, via="web", **self._change()
         )
 
     def accept_prices(self, digest: str) -> dict[str, Any]:
         """Accept the new prices waiting that the page showed (``digest``, T11 B3)."""
-        return ask_accept_prices(self._path, digest=digest, via="web", **self._require())
+        return ask_accept_prices(self._path, digest=digest, via="web", **self._change())
 
 
 class SpendClient(Protocol):

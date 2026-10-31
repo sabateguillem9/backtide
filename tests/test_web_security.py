@@ -143,8 +143,11 @@ def test_the_link_answers_a_page_with_the_cookie_and_a_refresh_under_the_prefix(
     assert "location" not in first.headers
     assert TOKEN not in first.text and SESSION not in first.text
     cookie = first.headers["set-cookie"]
-    # the value is a session secret, not the link's token, and the cookie hangs from the prefix
-    assert cookie.startswith(f"backtide_web={SESSION}") and TOKEN not in cookie
+    # the value is a NEW session id (never one that existed before: session fixation), not the
+    # link's token, and the cookie hangs from the prefix
+    value = cookie.split(";")[0].removeprefix("backtide_web=")
+    assert len(value) >= 43 and value not in (SESSION, TOKEN)
+    assert value not in first.text
     assert "HttpOnly" in cookie and "SameSite=strict" in cookie
     assert f"Path={PREFIX_PATH}" in cookie and "Path=/;" not in cookie
     assert "Max-Age" not in cookie and "expires" not in cookie.lower()  # a session cookie
@@ -185,15 +188,18 @@ def test_the_link_works_once(tmp_path: Path) -> None:
 def test_two_requests_with_the_link_at_once_only_one_wins() -> None:
     import threading
 
-    from backtide.web.security import Access
+    from backtide.service.sessions import Sessions
+    from backtide.web.security import LocalAccess
 
-    access = Access(TOKEN)
-    results: list[str | None] = []
+    sessions = Sessions()
+    sessions.new_link(TOKEN)
+    access = LocalAccess(sessions)
+    results: list[object] = []
     barrier = threading.Barrier(8)
 
     def use() -> None:
         barrier.wait()
-        results.append(access.use_link(TOKEN))
+        results.append(access.open(TOKEN))
 
     threads = [threading.Thread(target=use) for _ in range(8)]
     for thread in threads:
@@ -203,8 +209,10 @@ def test_two_requests_with_the_link_at_once_only_one_wins() -> None:
     assert sum(r is not None for r in results) == 1
 
 
-def test_a_used_link_in_a_browser_that_is_already_in_just_works(client: TestClient) -> None:
-    response = client.get(f"/ahora?t={TOKEN}", follow_redirects=False)
+def test_a_used_link_in_a_browser_that_is_already_in_just_works(tmp_path: Path) -> None:
+    web = anonymous(tmp_path)
+    web.get(f"/ahora?t={TOKEN}")  # used: this browser is in now
+    response = web.get(f"/ahora?t={TOKEN}", follow_redirects=False)
     assert response.status_code == 200 and "notas.md" in response.text
 
 
@@ -441,7 +449,7 @@ def test_the_cookie_is_scoped_to_the_prefix_so_another_port_never_gets_it(
     web.get(f"/ahora?t={TOKEN}")
     jar = web.cookies.jar
     (cookie,) = [c for c in jar if c.name == "backtide_web"]
-    assert cookie.path == PREFIX_PATH and cookie.value == SESSION
+    assert cookie.path == PREFIX_PATH and cookie.value not in (SESSION, TOKEN)
     # a request to the same host, another path (another service of 127.0.0.1): not sent
     elsewhere = urllib.request.Request(f"http://127.0.0.1:{PORT + 1}/")  # noqa: S310
     jar.add_cookie_header(elsewhere)
@@ -558,3 +566,110 @@ def test_a_stale_cookie_of_the_same_name_does_not_lock_us_out(tmp_path: Path) ->
         f"backtide_web2={SESSION}",
     ):
         assert web.get("/ahora", headers={"cookie": header}).status_code == 401, header
+
+
+# -- T26-3a: sessions that die, one CSRF token each, and a service that keeps them ---------------
+
+
+class MonotonicClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_a_session_unused_for_an_hour_is_out(tmp_path: Path) -> None:
+    from backtide.service.sessions import IDLE_SECONDS, Sessions
+    from backtide.web.security import LocalAccess
+
+    clock = MonotonicClock()
+    sessions = Sessions(clock=clock)
+    sessions.preset(SESSION)
+    new_box(tmp_path).append("file", "create", "notas.md")
+    web = new_client(tmp_path, access=LocalAccess(sessions))
+    assert web.get("/ahora").status_code == 200
+    clock.now += IDLE_SECONDS - 1
+    assert web.get("/ahora").status_code == 200  # a use: the hour starts again
+    clock.now += IDLE_SECONDS
+    response = web.get("/ahora")
+    assert response.status_code == 401 and "notas.md" not in response.text
+
+
+def test_each_session_has_its_own_csrf_token(tmp_path: Path) -> None:
+    from backtide.service.sessions import Sessions
+    from backtide.web.security import LocalAccess
+    from tests import test_web_rewind as rewind
+
+    sessions = Sessions()
+    sessions.preset(SESSION)
+    other = sessions.preset("o" * 43)
+    rewinder = rewind.FakeRewinder()
+    new_box(tmp_path).append("file", "delete", "work/notas.md", risk=1)
+    web = new_client(
+        tmp_path,
+        access=LocalAccess(sessions),
+        snapshots=lambda: list(rewind.SNAPS),
+        rewinder=rewinder,
+        clock=lambda: rewind.NOW,
+    )
+    fields = rewind.form_of(rewind.confirm(web))
+    assert fields["csrf"] != other.csrf
+    # The other session's token with our cookie: refused, nothing asked.
+    assert rewind.post(web, {**fields, "csrf": other.csrf}).status_code == 403
+    assert rewinder.calls == []
+    assert 'data-outcome="done"' in rewind.post(web, fields).text
+
+
+def test_a_service_that_cannot_be_asked_lets_nobody_in(tmp_path: Path) -> None:
+    from backtide.web.security import ServiceAccess
+
+    new_box(tmp_path).append("file", "create", "notas.md")
+    gone = ServiceAccess(tmp_path / "no.sock", server_uid=0, wait=0)
+    web = new_client(tmp_path, access=gone)
+    assert web.get("/ahora").status_code == 401
+    assert web.get(f"/ahora?t={TOKEN}").status_code == 401
+
+
+def test_a_request_carries_few_of_our_cookies() -> None:
+    from backtide.web.security import MAX_COOKIES, cookie_values
+
+    header = "; ".join(f"backtide_web=v{i}" for i in range(50))
+    assert cookie_values(header) == [f"v{i}" for i in range(MAX_COOKIES)]
+    assert cookie_values('a=b; backtide_web=""; backtide_web="x"') == ["x"]
+
+
+def test_a_link_opened_in_a_browser_already_in_is_spent_there(tmp_path: Path) -> None:
+    """Review of T26-3a: a link meant for the phone, opened where a session lives, is spent
+    there and starts a new session; it does not stay alive in this browser's history."""
+    web = new_client(tmp_path)  # signed in with SESSION
+    new_box(tmp_path).append("file", "create", "notas.md")
+    response = web.get(f"/ahora?t={TOKEN}", follow_redirects=False)
+    assert response.status_code == 200 and "set-cookie" in response.headers
+    fresh = response.headers["set-cookie"].split(";")[0].removeprefix("backtide_web=")
+    assert fresh not in (SESSION, TOKEN)
+    web.cookies.clear()
+    assert web.get(f"/ahora?t={TOKEN}").status_code == 401  # spent
+    # The old session was ended when the new one began.
+    assert web.get("/ahora", headers={"cookie": f"backtide_web={SESSION}"}).status_code == 401
+
+
+def test_an_old_link_pasted_while_in_is_simply_ignored(client: TestClient) -> None:
+    response = client.get("/ahora?t=" + "x" * 43, follow_redirects=False)
+    assert response.status_code == 200 and "set-cookie" not in response.headers
+
+
+def test_the_stream_does_not_keep_a_session_alive(tmp_path: Path) -> None:
+    from backtide.service.sessions import IDLE_SECONDS, Sessions
+    from backtide.web.security import LocalAccess
+
+    clock = MonotonicClock()
+    sessions = Sessions(clock=clock)
+    sessions.preset(SESSION)
+    new_box(tmp_path).append("file", "create", "notas.md")
+    web = new_client(tmp_path, access=LocalAccess(sessions), stream_seconds=0.2, poll_interval=0.02)
+    clock.now += IDLE_SECONDS - 60
+    for path in ("/ahora/stream", "/panel/stream"):
+        assert web.get(path).status_code == 200  # the stream itself still opens
+    clock.now += 61
+    assert web.get("/ahora").status_code == 401  # but it did not count as a use

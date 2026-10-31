@@ -94,7 +94,7 @@ If you skipped the key, put it in the web (next step): "Ajustes" ("Settings") > 
 sudo backtide enlace        # Mac: backtide enlace
 ```
 
-It prints a link and a name of three words. Open the link in your browser. The name must be the same as the one in the page header. The link works once; after that the page uses a cookie, and `sudo systemctl restart backtide-web` gives a new link.
+It prints a link and a name of three words. Open the link in your browser. The name must be the same as the one in the page header. The link works once and for 15 minutes; after that the page uses a cookie. Run `sudo backtide enlace` again for a new link, without restarting anything (the old one, if unused, stops working). You stay signed in until you leave the page unused for an hour, and at most 12 hours.
 
 On a server you reach over ssh, `backtide enlace` also prints the `ssh -L` line you need to open the page from your own computer.
 

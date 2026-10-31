@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from backtide.service.control import ControlError, PeerCredentials, ask_rewind, peer_credentials
-from backtide.web.security import TOKEN_BYTES, token_matches
+from backtide.web.security import TOKEN_BYTES, acting_session, token_matches
 
 CONFIRM_SECONDS = 600  # how long a confirmation stays valid
 MAX_TICKETS = 16  # confirmations open at once; the oldest is dropped first
@@ -113,6 +113,7 @@ class ControlRewinder:
             wait=self._wait,
             peer=self._peer,
             server_uid=self._server_uid,
+            session=acting_session(self._server_uid),
         )
 
 

@@ -17,18 +17,20 @@ from typing import Any
 import pytest
 
 from backtide.service.control import ControlError
+from backtide.service.sessions import Sessions
 from backtide.service.web_control import WebControlServer, ask_snapshots
 from backtide.snapshots import SnapshotError
 from backtide.web import server as server_module
 from backtide.web.approve import ControlApprover
 from backtide.web.paths import WebPaths
 from backtide.web.rewind import Availability, ControlRewinder, narrow_availability
+from backtide.web.security import ServiceAccess
 from backtide.web.settings import ControlSettings, ControlSpend
 from tests import test_web_decide as decide
 from tests import test_web_rewind as rewind
 from tests.test_service_control import FakeGuardian
 from tests.test_service_web_control import GROUP, FakeBudget, FakeSettings
-from tests.webkit import new_box, new_client
+from tests.webkit import SESSION, new_box, new_client
 
 ME = os.geteuid()
 
@@ -67,10 +69,24 @@ def narrow(folder: Path, guardian: FakeGuardian, budget: FakeBudget) -> Iterator
         peer=the_web,
         settings=FakeSettings(),
         budget=budget,
+        sessions=signed_in(),
+        on_entry=lambda action, details: True,
     )
     server.start()
     yield server
     server.close()
+
+
+def signed_in() -> Sessions:
+    """The service's sessions, with the one of the test client's cookie open (T26-3a)."""
+    sessions = Sessions()
+    sessions.preset(SESSION)
+    return sessions
+
+
+def the_service(narrow: WebControlServer) -> ServiceAccess:
+    """Who is signed in, asked of the service as the installed web asks it."""
+    return ServiceAccess(narrow.path, server_uid=ME, wait=0, peer=the_web)
 
 
 def ours(**more: Any) -> dict[str, Any]:
@@ -140,6 +156,7 @@ def test_the_web_rewinds_through_the_narrow_socket_as_web(
         snapshots=lambda: ask_snapshots(narrow.path, server_uid=ME, peer=the_web),
         rewinder=rewinder,
         clock=lambda: rewind.NOW,
+        access=the_service(narrow),
     )
     page = web.get("/instantaneas").text
     assert "rewind-go" in page
@@ -159,7 +176,9 @@ def test_the_web_approves_and_rejects_through_the_narrow_socket(
 ) -> None:
     approver = ControlApprover(narrow.path, enabled=True, wait=0, **ours())
     new_box(tmp_path).append("file", "create", "work/notas.md")
-    web = new_client(tmp_path, approver=approver, clock=lambda: decide.NOW)
+    web = new_client(
+        tmp_path, approver=approver, clock=lambda: decide.NOW, access=the_service(narrow)
+    )
     assert "556" in decide.text_of(web.get("/panel").text)
     assert decide.post(web, decide.confirm(web, "aprobar")).status_code == 200
     assert decide.post(web, decide.confirm(web, "rechazar")).status_code == 200
@@ -178,7 +197,12 @@ def test_the_settings_page_sets_a_cap_through_the_narrow_socket(
     budget.status = lambda: dict(STATUS)  # type: ignore[method-assign]
     settings = ControlSettings(narrow.path, enabled=True, wait=0, **ours())
     new_box(tmp_path)
-    web = new_client(tmp_path, settings=settings, spend=ControlSpend(narrow.path, **ours()))
+    web = new_client(
+        tmp_path,
+        settings=settings,
+        spend=ControlSpend(narrow.path, **ours()),
+        access=the_service(narrow),
+    )
     fields = budget_confirm(web)
     saved = web.post(
         "/ajustes/guardar",

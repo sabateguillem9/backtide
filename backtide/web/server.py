@@ -65,7 +65,7 @@ from backtide.web.approve import Approver, ControlApprover
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import WAIT_FOR_SERVICE, ControlRewinder
-from backtide.web.security import make_prefix, make_run_name, make_token
+from backtide.web.security import ServiceAccess, make_prefix, make_run_name, make_token
 from backtide.web.settings import ControlSettings, ControlSpend, SettingsClient
 
 # The installed service runs as root: the narrow socket and the process behind it must be root's.
@@ -127,25 +127,35 @@ def make_server(app: Callable) -> uvicorn.Server:  # type: ignore[type-arg]
         lifespan="off",
         timeout_graceful_shutdown=GRACEFUL_SECONDS,
         limit_concurrency=64,
+        # Each request starts with a clean context: a session set for one never rides into the
+        # next on the same connection (review of T26-3a).
+        reset_contextvars=True,
     )
     return _Server(config)
 
 
+def web_base(port: int, prefix: str) -> str:
+    """The web's address without a way in: what the installed web leaves in its link file, for
+    `sudo backtide enlace` to add a one-time token the service gives (T26-3a)."""
+    return f"http://{LOOPBACK}:{port}/s/{prefix}/"
+
+
 def web_url(port: int, prefix: str, token: str) -> str:
-    return f"http://{LOOPBACK}:{port}/s/{prefix}/?t={token}"
+    return f"{web_base(port, prefix)}?t={token}"
 
 
+_WEB_BASE = rf"http://{re.escape(LOOPBACK)}:(?P<port>[0-9]{{1,5}})/s/[A-Za-z0-9_-]{{8,64}}/"
 _WEB_URL = re.compile(
-    rf"http://{re.escape(LOOPBACK)}:(?P<port>[0-9]{{1,5}})/s/[A-Za-z0-9_-]{{8,64}}/\?t=[A-Za-z0-9_-]{{16,128}}",
+    rf"{_WEB_BASE}(?P<token>\?t=[A-Za-z0-9_-]{{16,128}})?",
     re.ASCII,
 )
 
 
-def web_url_problem(text: str) -> str | None:
-    """None if ``text`` is a link exactly as ``web_url`` makes it (`backtide enlace` prints
-    nothing else), else why not."""
+def web_url_problem(text: str, *, base: bool = False) -> str | None:
+    """None if ``text`` is a link exactly as ``web_url`` makes it, or with ``base`` as
+    ``web_base`` makes it (`backtide enlace` prints nothing else), else why not."""
     match = _WEB_URL.fullmatch(text)
-    if match is None:
+    if match is None or (match["token"] is None) is not base:
         return "it is not a link of this web"
     if not 0 < int(match["port"]) <= 65535:
         return "its port is out of range"
@@ -182,7 +192,9 @@ def run_web(
     ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
     requests) are only given by the demo today: T17 and T10 will fill them for real.
     ``web_socket`` is `--socket-web` (T12c): the service's narrow socket for the web's group,
-    asked instead of the control socket for everything, the snapshot list included."""
+    asked instead of the control socket for everything, the snapshot list included, and the
+    sign-in (T26-3a): then the service keeps the sessions, and ``announce`` gets the address
+    without a token (``web_base``), which `sudo backtide enlace` completes."""
     sock = bind(port)
     real_port = sock.getsockname()[1]
     token, prefix, run_name = make_token(), make_prefix(), make_run_name()
@@ -201,10 +213,12 @@ def run_web(
         except ControlError as error:  # the pages say the list cannot be read
             raise SnapshotError(str(error)) from None
 
+    access = None if web_socket is None else ServiceAccess(web_socket, server_uid=SERVICE_UID)
     app = create_app(
         reader=reader,
         port=real_port,
         token=token,
+        access=access,
         prefix=prefix,
         run_name=run_name,
         snapshots=snapshots or (from_volume if web_socket is None else from_service),
@@ -218,7 +232,8 @@ def run_web(
         agent_lines=paths.agent_lines,
     )
     server = make_server(app)
-    announce(web_url(real_port, prefix, token), run_name)
+    link = web_url(real_port, prefix, token) if access is None else web_base(real_port, prefix)
+    announce(link, run_name)
     try:
         server.run(sockets=[sock])
     finally:

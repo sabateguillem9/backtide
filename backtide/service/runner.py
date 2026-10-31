@@ -79,6 +79,7 @@ from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.price_update import PriceUpdater
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
 from backtide.service.proxy_channel import KEY_NOT_APPLIED, Policy, known_secrets
+from backtide.service.sessions import Sessions
 from backtide.service.settings import Applied, ReloadFailedClosed, Settings
 from backtide.service.spend import Budget
 from backtide.service.telegram_config import load_telegram
@@ -899,12 +900,18 @@ def serve(
         )
         # The spending cap (T11): `backtide web` reads it and changes it through the socket too,
         # and, next to it, which providers wait for their key (the panel).
+        # The web's sign-in (T26-3a): only with an installed web; root's socket gives the
+        # one-time link (`sudo backtide enlace`) and the web's narrow socket opens and checks
+        # the sessions, in this process's memory alone.
+        web_sessions = Sessions() if web_group is not None else None
         control: ControlHook = ControlServer(
             guardian,
             config.control_socket,
             settings=settings_service,
             budget=egress.budget,
             waiting=egress.waiting,
+            sessions=web_sessions,
+            on_entry=guardian.web_access,
         )
         if web_group is not None:
             listing = store if store is not None else SnapshotStore(config.volume)
@@ -919,6 +926,8 @@ def serve(
                     settings=settings_service,
                     budget=egress.budget,
                     waiting=egress.waiting,
+                    sessions=web_sessions,
+                    on_entry=guardian.web_access,
                 ),
             )
         if telegram is not None:

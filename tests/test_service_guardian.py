@@ -3349,3 +3349,34 @@ def test_a_rewind_rejects_the_held_requests(world: World, clock: Callable[[], da
     target = snapshot.id if snapshot is not None else "20261020T120000Z-manual"
     world.guardian.rewind(target, requested_by="test")
     assert "egress.reject_holds(rewind)" in world.log
+
+
+# -- T26-3a: every way into the web is recorded and alerted, one by one --------------------------
+
+
+def test_each_link_and_each_entry_is_recorded_and_alerted(world: World) -> None:
+    for _ in range(2):
+        world.guardian.web_access("web_link_given", {"uid": 0, "pid": 7})
+    world.guardian.web_access("web_session_opened", {"pid": 8})
+    given = world.events("web_link_given")
+    assert len(given) == 2 and all(e.risk == 1 and e.details == {"uid": 0, "pid": 7} for e in given)
+    assert len(world.events("web_session_opened")) == 1
+    assert len(world.alerts.titled("enlace para entrar")) == 2  # never throttled
+    assert len(world.alerts.titled("ha entrado en la web")) == 1
+    # ERROR: a full queue of other alerts makes room for these instead of dropping them.
+    assert {a.level for a in world.alerts.sent if "web" in a.title} == {AlertLevel.ERROR}
+
+
+def test_an_entry_the_box_does_not_take_is_said_and_refused(world: World) -> None:
+    world.box.append_error = BlackBoxError("disk full")
+    assert world.guardian.web_access("web_session_opened", {"pid": 8}) is False
+    (alert,) = world.alerts.titled("ha entrado en la web")
+    assert "no ha quedado en la caja negra" in alert.body.lower() and "rechazado" in alert.body
+    world.box.append_error = None
+    assert world.guardian.web_access("web_link_given", {"uid": 0, "pid": 7}) is True
+
+
+def test_only_the_known_ways_in_are_recorded(world: World) -> None:
+    with pytest.raises(ValueError):
+        world.guardian.web_access("anything", {})
+    assert world.events("anything") == []

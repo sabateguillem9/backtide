@@ -89,6 +89,7 @@ from backtide.service.holds import (
 )
 from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
+from backtide.service.sessions import Sessions
 from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
@@ -311,8 +312,20 @@ class ControlServer:
         settings: SettingsService | None = None,
         budget: BudgetService | None = None,
         waiting: Callable[[], Mapping[str, str]] | None = None,
+        sessions: Sessions | None = None,
+        on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
     ) -> None:
+        if sessions is not None and on_entry is None:
+            # Never a way into the web that leaves no trace (review of T26-3a).
+            raise ControlError("las sesiones de la web necesitan dónde apuntar cada entrada")
         self._guardian = guardian
+        # The web's sign-in (T26-3a): root asks here for a one-time link (`sudo backtide
+        # enlace`); the web's narrow socket opens and checks the sessions it gives. Every link
+        # given and every session opened goes to ``on_entry`` (``Guardian.web_access``: the black
+        # box and an alert, one by one), never through the log bridge alone, which lets one
+        # message of a kind by per minute.
+        self._sessions = sessions
+        self._on_entry = on_entry
         self._settings = settings
         self._budget = budget
         # The providers that wait for their key (``Egress.waiting``): the panel says so, next
@@ -483,7 +496,25 @@ class ControlServer:
             return self._shell(request, pid, uid)
         if command == "export":
             return self._export(request, pid, uid)
+        if command == "web_link":
+            return self._web_link(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
+
+    def _web_link(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """A new one-time link for the installed web (`sudo backtide enlace`): the unspent one,
+        if any, dies. Only here, on root's socket: the web cannot mint its own way in."""
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una petición de enlace lleva `cmd` y nada más.")
+        if self._sessions is None:
+            raise _BadRequest("Este servicio no tiene web instalada: no hay enlace que dar.")
+        token = self._sessions.new_link()
+        logger.info("%s: a new one-time link for the web was given to uid %d (pid %d)",
+                    self.label, uid, pid)  # fmt: skip
+        if self._on_entry is not None:
+            # The token reaches only root; if the box missed it, the alert says so and the
+            # session it opens is refused anyway (``session_open``).
+            self._on_entry("web_link_given", {"uid": uid, "pid": pid})
+        return {"ok": True, "outcome": "link", "message": "", "token": token}
 
     def _shell(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         details: dict[str, Any] | None = None
@@ -1101,6 +1132,7 @@ def ask_rewind(
     monotonic: Callable[[], float] = time.monotonic,
     via: str = "cli",
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to rewind to ``snapshot_id`` and return its reply, checked:
     a dict whose ``outcome`` is known, ``ok`` a bool, ``message`` a str and ``undo`` a str or
@@ -1126,6 +1158,7 @@ def ask_rewind(
         reply_timeout=reply_timeout,
         peer=peer,
         server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1189,6 +1222,7 @@ def ask_decide(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to approve or reject the held request ``hold_id`` (`backtide
     aprobar` / `rechazar`; ``via="telegram"`` from the bot inside the service, T10-4). Returns
@@ -1209,6 +1243,7 @@ def ask_decide(
         reply_timeout=reply_timeout,
         peer=peer,
         server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1275,6 +1310,7 @@ def ask_trust(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """ "Aprobar y confiar en este destinatario" from the web (T10-5): the reply, checked:
     ``ok``, ``outcome`` (a ``TrustStatus`` or "refused"), ``message`` and ``hold`` (what
@@ -1287,6 +1323,7 @@ def ask_trust(
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
         server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1320,6 +1357,7 @@ def _ask_change(
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     raw = _ask(
         Path(path),
@@ -1329,6 +1367,7 @@ def _ask_change(
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
         server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1356,6 +1395,7 @@ def ask_untrust(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Stop trusting the recipient ``trust_id`` (T10-5). ValueError for a ``via`` that cannot
     ask (nothing sent)."""
@@ -1370,6 +1410,7 @@ def ask_untrust(
         sleep=sleep,
         monotonic=monotonic,
         server_uid=server_uid,
+        session=session,
     )
 
 
@@ -1383,6 +1424,7 @@ def ask_end_batch(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Revoke the batch ``rule_id`` (T10-5, the web; T10-4's bot does it in its process)."""
     if via not in UNTRUST_REQUESTERS:
@@ -1396,6 +1438,7 @@ def ask_end_batch(
         sleep=sleep,
         monotonic=monotonic,
         server_uid=server_uid,
+        session=session,
     )
 
 
@@ -1440,6 +1483,38 @@ def ask_list(
         and isinstance(item.get(key), str)
         and pattern.fullmatch(item[key])
     ]
+
+
+def ask_web_link(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> str:
+    """A new one-time link token for the installed web (`sudo backtide enlace`, T26-3a); the
+    unspent one dies. ControlError if the service has no web or its reply makes no sense."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "web_link"},
+        what="el enlace",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT,
+        peer=peer,
+        server_uid=server_uid,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    token = reply.get("token")
+    if reply.get("ok") is not True or not isinstance(token, str) or not token:
+        message = reply.get("message")
+        raise ControlError(message if isinstance(message, str) else "No se ha podido dar.")
+    return token
 
 
 def ask_secrets(
@@ -1490,6 +1565,7 @@ def ask_set_secret(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to put ``value`` as the key of ``kind`` (and, for Telegram,
     ``chat_id``). Returns its reply, checked: ``ok``, ``outcome``, ``message``, ``applied``.
@@ -1512,6 +1588,7 @@ def ask_set_secret(
             reply_timeout=REPLY_TIMEOUT * 6,
             peer=peer,
             server_uid=server_uid,
+            session=session,
             sleep=sleep,
             monotonic=monotonic,
         )
@@ -1530,6 +1607,7 @@ def ask_clear_secret(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to remove the key of ``kind``. Checked like
     ``ask_set_secret``'s reply."""
@@ -1546,6 +1624,7 @@ def ask_clear_secret(
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
         server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1595,6 +1674,7 @@ def ask_set_budget(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service for new spending caps (texts as a person typed them). Its reply, checked:
     ``ok``, ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
@@ -1615,6 +1695,7 @@ def ask_set_budget(
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
         server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1642,6 +1723,7 @@ def ask_accept_prices(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Accept the new prices waiting whose digest is ``digest`` (B3). The reply, checked: ``ok``,
     ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
@@ -1658,6 +1740,7 @@ def ask_accept_prices(
         reply_timeout=REPLY_TIMEOUT * 6,
         peer=peer,
         server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
     )
@@ -1715,10 +1798,14 @@ def _ask(
     monotonic: Callable[[], float],
     max_reply: int = MAX_REPLY_BYTES,
     server_uid: int | None = None,
+    session: str | None = None,
 ) -> bytes:
     """One conversation: connect (retrying while nobody answers), send ``request``, read the
     whole reply (``max_reply`` bytes at most). ``what`` names the request in the messages ("el
-    rebobinado")."""
+    rebobinado"). ``session`` is the web's (T26-3a): the narrow socket takes no change without
+    a live one; it rides in the request, never in a log."""
+    if session is not None:
+        request["session"] = session
     deadline = monotonic() + wait
     while True:
         try:

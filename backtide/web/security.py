@@ -28,13 +28,18 @@ program on this machine that listens on a port of its own (cookies ignore ports)
   * the whole app lives under a random per-run prefix, ``/s/<random>/``: anything else is a
     bare 404, so a squatter or a page that guesses ``/ahora`` finds nothing;
   * every response, errors included, carries the headers below.
-- ``Access``: the link carries a one-time token. The first request that uses it gets a session
-  secret (a different random value) in an HttpOnly, SameSite=Strict cookie whose Path is the
-  prefix, and the token stops working. A copy of the link in the shell history or the terminal
-  scrollback is then worth nothing. The session also has a CSRF token (another random value),
-  which only our pages carry, in the rewind's confirmation form. Since T12b a web that runs as
-  the service's user can rewind, so a stolen, unspent link is worth a rewind too, not only a
-  look: it is printed once, and nothing else may read the terminal it is printed in.
+- ``Access``: the link carries a one-time token. The first request that uses it gets a NEW
+  session id (another random value, never one that existed before) in an HttpOnly,
+  SameSite=Strict cookie whose Path is the prefix, and the token stops working. A copy of the
+  link in the shell history or the terminal scrollback is then worth nothing. Each session has
+  its own CSRF token (another random value), which only our pages carry, in the forms. A
+  session dies after an hour unused or twelve in all (``backtide.service.sessions``, T26-3a).
+  Who keeps them: the installed web asks the service (``ServiceAccess``, over its narrow
+  socket), which also wants the session on every change (``ACTING_SESSION``), so a web taken
+  over can change nothing on its own; ``backtide web`` without that socket and the Mac's demo
+  keep their own (``LocalAccess``), with the same rules. A stolen, unspent link is worth a
+  rewind, not only a look: it is printed once (or given by `sudo backtide enlace`), and
+  nothing else may read where it is printed.
 - What this does NOT stop: another program on this machine can set cookies for 127.0.0.1 (cookies
   ignore ports) with ``Path=/``, enough of them to make every request too big to be served.
   That is a denial of service of the web, not a way in: the session check reads every
@@ -48,10 +53,18 @@ program on this machine that listens on a port of its own (cookies ignore ports)
 """
 
 import hmac
+import logging
 import secrets
-import threading
 from collections.abc import Awaitable, Callable, MutableMapping
-from typing import Any
+from contextvars import ContextVar
+from pathlib import Path
+from typing import Any, Protocol
+
+from backtide.service.control import ControlError, PeerCredentials, peer_credentials
+from backtide.service.sessions import Session, Sessions
+from backtide.service.web_control import ask_session_check, ask_session_end, ask_session_open
+
+logger = logging.getLogger(__name__)
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
@@ -122,42 +135,116 @@ def token_matches(given: str | None, expected: str) -> bool:
     return hmac.compare_digest(given.encode(), expected.encode())
 
 
-class Access:
-    """The link token (single use) and the session secret it is exchanged for. The secret
-    exists from the start but nobody knows it until the link is used: it is only ever sent as
-    the ``Set-Cookie`` of the response to the one request that presented the token."""
+MAX_COOKIES = 4  # how many of our cookies a request may carry that are looked at
 
-    def __init__(self, token: str, session: str | None = None) -> None:
-        self._token: str | None = token
-        self._session = session or secrets.token_urlsafe(TOKEN_BYTES)
-        # The form token of the session (T12b): in the pages, never in a cookie or a link.
-        self.csrf = secrets.token_urlsafe(TOKEN_BYTES)
-        self._lock = threading.Lock()
+# The session of the person whose request is being served, for the change it asks (T26-3a): the
+# app sets it from the cookie before it calls a client, and the clients of the narrow socket send
+# it. Unset, nothing is sent and the service refuses the change: it fails closed.
+ACTING_SESSION: ContextVar[str | None] = ContextVar("backtide_acting_session", default=None)
 
-    def use_link(self, given: str) -> str | None:
-        """The session secret if ``given`` is the link token and it was not used yet; the link
-        is then dead, whoever asks next (two requests with it at once: only one wins)."""
-        with self._lock:
-            if self._token is None or not token_matches(given, self._token):
+
+def acting_session(server_uid: int | None) -> str | None:
+    """The session to send with a change: only to the narrow socket (``server_uid`` set), whose
+    every change wants it; the control socket takes no such field."""
+    return ACTING_SESSION.get() if server_uid is not None else None
+
+
+def cookie_values(cookie_header: str | None) -> list[str]:
+    """Our cookie's values in this ``Cookie`` header, at most ``MAX_COOKIES``. Cookies ignore
+    ports, so a stale ``backtide_web`` of another run (or version) on 127.0.0.1 can travel with
+    ours, and a parser that keeps only one of two equal names would pick the wrong one."""
+    found = []
+    for part in (cookie_header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == COOKIE_NAME and value.strip('"'):
+            found.append(value.strip('"'))
+    return found[:MAX_COOKIES]
+
+
+class Access(Protocol):
+    """Who is signed in: the link traded for a session, and the session of a cookie."""
+
+    def open(self, token: str) -> Session | None:
+        """A new session for the link's token, or None (wrong, spent or too old)."""
+
+    def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
+        """The live session among this header's cookies, or None; with ``use`` it counts as
+        used (a page's own stream checks without it)."""
+
+    def end(self, session_id: str, *, every: bool = False) -> bool:
+        """End this session, or every one (asked from this live one)."""
+
+
+class LocalAccess:
+    """The sessions in this process: ``backtide web`` without the narrow socket, and the demo."""
+
+    def __init__(self, sessions: Sessions) -> None:
+        self.sessions = sessions
+
+    def open(self, token: str) -> Session | None:
+        return self.sessions.open(token)
+
+    def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
+        for value in cookie_values(cookie_header):
+            session = self.sessions.check(value, use=use)
+            if session is not None:
+                return session
+        return None
+
+    def end(self, session_id: str, *, every: bool = False) -> bool:
+        if every:
+            if self.sessions.check(session_id) is None:
+                return False
+            self.sessions.end_all()
+            return True
+        return self.sessions.end(session_id)
+
+
+class ServiceAccess:
+    """The sessions the service keeps (the installed web, T26-3a): asked over the narrow socket
+    at ``path``, whose server must be ``server_uid``. If the service cannot be asked, nobody is
+    signed in: it fails closed, and says so in the log."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        server_uid: int,
+        wait: float = 2.0,
+        peer: PeerCredentials = peer_credentials,
+    ) -> None:
+        self._path = Path(path)
+        self._server_uid = server_uid
+        self._wait = wait
+        self._peer = peer
+
+    def _ask(self) -> dict[str, Any]:
+        return {"server_uid": self._server_uid, "wait": self._wait, "peer": self._peer}
+
+    def open(self, token: str) -> Session | None:
+        try:
+            return ask_session_open(self._path, token, **self._ask())
+        except ControlError as error:
+            logger.error("the service could not open a session: %s", error)
+            return None
+
+    def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
+        for value in cookie_values(cookie_header):
+            try:
+                session = ask_session_check(self._path, value, use=use, **self._ask())
+            except ControlError as error:
+                logger.error("the service could not check a session: %s", error)
                 return None
-            self._token = None
-            return self._session
+            if session is not None:
+                return session
+        return None
 
-    def session_is(self, given: str | None) -> bool:
-        return token_matches(given, self._session)
-
-    def csrf_is(self, given: str | None) -> bool:
-        return token_matches(given, self.csrf)
-
-    def session_in(self, cookie_header: str | None) -> bool:
-        """Is our session among the cookies of this ``Cookie`` header? Cookies ignore ports, so
-        a stale ``backtide_web`` of another run (or version) on 127.0.0.1 can travel with ours,
-        and a parser that keeps only one of two equal names would pick the wrong one."""
-        for part in (cookie_header or "").split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME and self.session_is(value.strip('"')):
-                return True
-        return False
+    def end(self, session_id: str, *, every: bool = False) -> bool:
+        try:
+            return ask_session_end(self._path, session_id, every=every, **self._ask())
+        except ControlError as error:
+            logger.error("the service could not end a session: %s", error)
+            return False
 
 
 def allowed_hosts(port: int) -> frozenset[str]:

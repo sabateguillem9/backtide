@@ -45,6 +45,7 @@ from backtide.gate.phrase import api_name
 from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
 from backtide.service.notice import rewind_notice
+from backtide.service.sessions import Sessions
 from backtide.snapshots import Snapshot, SnapshotError
 from backtide.web import format as fmt
 from backtide.web.agents import (
@@ -91,6 +92,7 @@ from backtide.web.narrate import Line, Name, Narrator, line_for, safe_sentence, 
 from backtide.web.reader import BoxReader, BoxUnavailable
 from backtide.web.rewind import Availability, Redeemed, Rewinder, Tickets
 from backtide.web.security import (
+    ACTING_SESSION,
     COOKIE_NAME,
     DECIDE_PATH,
     HOLDS_PATH,
@@ -101,9 +103,11 @@ from backtide.web.security import (
     SETTINGS_POST_PATH,
     Access,
     Guard,
+    LocalAccess,
     make_prefix,
     make_run_name,
     make_token,
+    token_matches,
 )
 from backtide.web.settings import (
     ACTIONS,
@@ -175,6 +179,7 @@ def create_app(
     port: int,
     token: str | None = None,
     session: str | None = None,
+    access: Access | None = None,
     prefix: str | None = None,
     run_name: str | None = None,
     snapshots: Callable[[], Sequence[Snapshot]] | None = None,
@@ -211,7 +216,12 @@ def create_app(
     POST that decides exists only when it is enabled. ``spend`` reads the spending (T11) for the
     panel and Settings; changing the caps goes through ``settings`` (`--ajustes`).
     ``agent_lines`` are the agent profile's lines of the rewind notice (T17a-3)."""
-    access = Access(token or make_token(), session)
+    if access is None:
+        sessions = Sessions()
+        sessions.new_link(token or make_token())
+        if session is not None:
+            sessions.preset(session)  # the demo and the tests set the cookie themselves
+        access = LocalAccess(sessions)
     prefix = prefix or make_prefix()
     base = f"/s/{prefix}"
     roster = Roster(AgentSource(MAIN_SLUG, agent_name, reader, snapshots), others, base)
@@ -244,23 +254,55 @@ def create_app(
 
     # -- access ----------------------------------------------------------------------------
 
+    async def _signed_in(request: Request, *, use: bool = True) -> bool:
+        """Is the cookie's session live? Then it is this request's (``request.state.session``)
+        and the one every change it asks is sent with (``ACTING_SESSION``). Async on purpose: a
+        context variable set here reaches the handler and the threads it starts. Cleared first,
+        so nothing of an earlier request on the same connection is ever sent."""
+        ACTING_SESSION.set(None)
+        cookie = request.headers.get("cookie")
+        session = await asyncio.to_thread(access.session_of, cookie, use=use)
+        if session is None:
+            return False
+        request.state.session = session
+        ACTING_SESSION.set(session.id)
+        return True
+
     async def require_access(request: Request) -> None:
-        if access.session_in(request.headers.get("cookie")):
-            return  # already in: an old link in the address is simply ignored
+        inside = await _signed_in(request)
         given = request.query_params.get("t")
         if given is not None:
-            minted = access.use_link(given)  # one use: the link dies here
-            if minted is not None:
-                raise StartSession(minted)
-            raise Unauthorized(bad_link=True)
-        raise Unauthorized
+            # One use, even in a browser that is already in (review of T26-3a): a link meant for
+            # the phone, opened here, is spent here and does not stay alive in the history.
+            opened = await asyncio.to_thread(access.open, given)
+            if opened is not None:
+                if inside:
+                    await asyncio.to_thread(access.end, request.state.session.id)
+                raise StartSession(opened.id)
+            if not inside:
+                raise Unauthorized(bad_link=True)
+        if not inside:
+            raise Unauthorized
+
+    async def require_watching(request: Request) -> None:
+        """A page's own stream: the cookie, checked without counting as a use, because the
+        browser reconnects it by itself (a tab left open must not keep a session alive)."""
+        if not await _signed_in(request, use=False):
+            raise Unauthorized
 
     protected = [Depends(require_access)]
+    watching = [Depends(require_watching)]
 
-    def require_session(request: Request) -> None:
+    async def require_session(request: Request) -> None:
         """The cookie and nothing else: a change never starts from the link's token."""
-        if not access.session_in(request.headers.get("cookie")):
+        if not await _signed_in(request):
             raise Unauthorized
+
+    def _csrf(request: Request) -> str:
+        return request.state.session.csrf
+
+    def _csrf_is(request: Request, given: str | None) -> bool:
+        return token_matches(given, request.state.session.csrf)
 
     tickets = Tickets(clock)
     rewinding = threading.Lock()  # one rewind in flight at a time, whoever asks
@@ -609,7 +651,7 @@ def create_app(
             spend=_spend(),
         )
 
-    @app.get("/panel/stream", dependencies=protected)
+    @app.get("/panel/stream", dependencies=watching)
     def panel_stream(request: Request, after: str = "") -> Response:
         resume = request.headers.get("last-event-id", "")
         starts = _heads(resume) or _heads(after)
@@ -682,11 +724,11 @@ def create_app(
             unreadable=unreadable,
         )
 
-    @app.get("/ahora/stream", dependencies=protected)
+    @app.get("/ahora/stream", dependencies=watching)
     def stream(request: Request, after: str = "0") -> Response:
         return _open_stream(request, roster.main, after)
 
-    @app.get("/agentes/{slug}/ahora/stream", dependencies=protected)
+    @app.get("/agentes/{slug}/ahora/stream", dependencies=watching)
     def agent_stream(request: Request, slug: str, after: str = "0") -> Response:
         return _open_stream(request, _agent(slug), after)
 
@@ -886,7 +928,7 @@ def create_app(
             "confirm",
             snap=target,
             notice=rewind_notice(target.taken_at, now=clock(), tz=zone, agent_lines=agent_lines),
-            csrf=access.csrf,
+            csrf=_csrf(request),
             ticket=tickets.issue(target.id),
         )
 
@@ -897,7 +939,7 @@ def create_app(
         form = await _read_form(request)
         if form is None:
             return _not_now(request, t, 400, "rewind.err.form")
-        if not access.csrf_is(form["csrf"]):
+        if not _csrf_is(request, form["csrf"]):
             logger.warning("a rewind from the web was refused: wrong form token")
             return _not_now(request, t, 403, "rewind.err.form")
         redeemed = tickets.redeem(form["ticket"], form["id"])
@@ -1052,7 +1094,7 @@ def create_app(
             f"confirm_{action}",
             row=row,
             replacing=replacing,
-            csrf=access.csrf,
+            csrf=_csrf(request),
             ticket=setting_tickets.issue(action, kind, replacing=replacing),
         )
 
@@ -1070,7 +1112,7 @@ def create_app(
             200,
             "confirm_budget",
             spend=shown,
-            csrf=access.csrf,
+            csrf=_csrf(request),
             ticket=setting_tickets.issue("set", BUDGET),
         )
 
@@ -1089,7 +1131,7 @@ def create_app(
             200,
             "confirm_prices",
             spend=shown,
-            csrf=access.csrf,
+            csrf=_csrf(request),
             ticket=setting_tickets.issue("set", PRICES),
         )
 
@@ -1187,7 +1229,7 @@ def create_app(
             if form["accion"] != "set" or set(form) != {*SETTINGS_FIELDS, "diario", "mensual"}:
                 form.clear()
                 return _settings_refused(request, t, 400, "settings.err.form")
-            if not access.csrf_is(form["csrf"]):
+            if not _csrf_is(request, form["csrf"]):
                 form.clear()
                 logger.warning("a change of the spending caps was refused: wrong form token")
                 return _settings_refused(request, t, 403, "settings.err.form")
@@ -1205,7 +1247,7 @@ def create_app(
             if form["accion"] != "set" or not shape or not digest_ok(digest):
                 form.clear()
                 return _settings_refused(request, t, 400, "settings.err.form")
-            if not access.csrf_is(form["csrf"]):
+            if not _csrf_is(request, form["csrf"]):
                 form.clear()
                 logger.warning("accepting the new prices was refused: wrong form token")
                 return _settings_refused(request, t, 403, "settings.err.form")
@@ -1226,7 +1268,7 @@ def create_app(
         ):
             form.clear()
             return _settings_refused(request, t, 400, "settings.err.form")
-        if not access.csrf_is(form["csrf"]):
+        if not _csrf_is(request, form["csrf"]):
             form.clear()
             logger.warning("a change of the settings from the web was refused: wrong form token")
             return _settings_refused(request, t, 403, "settings.err.form")
@@ -1384,7 +1426,7 @@ def create_app(
         state = _approvals()
         if state is not Availability.READY:
             return _hold_refused(request, t, 200, f"hold.off.{state}")
-        values: dict[str, Any] = {"verb": verb, "csrf": access.csrf}
+        values: dict[str, Any] = {"verb": verb, "csrf": _csrf(request)}
         if verb in (APPROVE, REJECT, TRUST):
             listed, _now, failed = _requests()
             found = [] if failed or not listed else listed
@@ -1420,7 +1462,7 @@ def create_app(
         if form is None or not id_fits(form["v"], form["id"]):
             return _hold_refused(request, t, 400, "hold.err.form")
         verb, subject = form["v"], form["id"]
-        if not access.csrf_is(form["csrf"]):
+        if not _csrf_is(request, form["csrf"]):
             logger.warning("a decision from the web was refused: wrong form token")
             return _hold_refused(request, t, 403, "hold.err.form")
         redeemed = decision_tickets.redeem(form["ticket"], verb, subject)

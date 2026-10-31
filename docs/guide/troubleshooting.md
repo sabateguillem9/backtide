@@ -113,7 +113,7 @@ The web view listens only on `127.0.0.1`, so only your computer can open it.
 
 **"No hay demo en marcha: lanza antes make demo (terminal 1)".** `make demo-web` needs the demo to be running. For `make probar-web` the message says "No hay prueba en marcha: lanza antes make probar (terminal 1)".
 
-**The link works once.** When you open the link (`http://127.0.0.1:<port>/s/<random>/?t=<key>`), the page stores a cookie in that browser and the link stops working. A copy of the link in your terminal history is useless. To open the page in another browser, press `Ctrl-C` and start the web again: you get a new link.
+**The link works once.** When you open the link (`http://127.0.0.1:<port>/s/<random>/?t=<key>`), the page stores a cookie in that browser and the link stops working. A copy of the link in your terminal history is useless. It also stops working after 15 minutes unused, and the cookie after an hour unused or 12 hours in all. With the installed web, `sudo backtide enlace` gives a new link at any time. With `backtide web` started by hand, press `Ctrl-C` and start it again: you get a new link.
 
 **The page stops letting you in** (for example, another site on your `127.0.0.1` filled your browser with cookies). Same fix: `Ctrl-C` and start the web again.
 

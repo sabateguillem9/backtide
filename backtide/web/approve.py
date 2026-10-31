@@ -61,7 +61,7 @@ from backtide.web.rewind import (
     Redeemed,
     availability_of,
 )
-from backtide.web.security import TOKEN_BYTES, token_matches
+from backtide.web.security import TOKEN_BYTES, acting_session, token_matches
 
 # The verbs of the form, each with the shape of the id it acts on.
 APPROVE, REJECT, TRUST, REVOKE, FORGET = "aprobar", "rechazar", "confiar", "revocar", "olvidar"
@@ -143,26 +143,30 @@ class ControlApprover:
             raise ControlError("esta web no se lanzó con --aprobar")
         return {"wait": self._wait, "peer": self._peer, "server_uid": self._server_uid}
 
+    def _change(self) -> dict[str, Any]:
+        """``_require`` plus, on the narrow socket, the session of who asked (T26-3a)."""
+        return {**self._require(), "session": acting_session(self._server_uid)}
+
     def holds(self) -> list[dict[str, Any]]:
         return ask_holds(self._path, **self._require())
 
     def decide(self, hold_id: str, verdict: str) -> dict[str, Any]:
-        return ask_decide(self._path, hold_id, verdict, via="web", **self._require())
+        return ask_decide(self._path, hold_id, verdict, via="web", **self._change())
 
     def trust(self, hold_id: str) -> dict[str, Any]:
-        return ask_trust(self._path, hold_id, **self._require())
+        return ask_trust(self._path, hold_id, **self._change())
 
     def trusted(self) -> list[dict[str, Any]]:
         return ask_list(self._path, "trusted", **self._require())
 
     def untrust(self, trust_id: str) -> dict[str, Any]:
-        return ask_untrust(self._path, trust_id, via="web", **self._require())
+        return ask_untrust(self._path, trust_id, via="web", **self._change())
 
     def batches(self) -> list[dict[str, Any]]:
         return ask_list(self._path, "batches", **self._require())
 
     def end_batch(self, rule_id: str) -> dict[str, Any]:
-        return ask_end_batch(self._path, rule_id, via="web", **self._require())
+        return ask_end_batch(self._path, rule_id, via="web", **self._change())
 
 
 # -- what the page shows of a hold -----------------------------------------------------------

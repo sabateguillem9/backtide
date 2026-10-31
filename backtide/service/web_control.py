@@ -28,6 +28,14 @@ The socket:
   of any kind), no config. Each change is handled by the very code of the control socket, with
   ``via`` forced to ``web``, so the black box records it as the control socket does:
   ``requested_by: "web (uid …, pid …)"`` with the kernel's uid and pid.
+- Who is signed in (T26-3a, docs/47 section 5.2): the service keeps the web's sessions
+  (``backtide.service.sessions``). ``session_open`` trades the one-time link that root got
+  (`sudo backtide enlace`, on the control socket) for a session; ``session_check`` says whether
+  a cookie's session is live (and uses it); ``session_end`` ends one ("Salir") and
+  ``session_end_all`` all of them, if asked from a live one. Every change carries the session
+  of the person who asked (``session``) and is refused, with nothing called, without a live
+  one: a web taken over cannot change anything on its own. A WARNING on every refusal, every
+  new session and every "close them all".
 - How much: a request is one JSON line of at most 4 KiB within 5 s (the control socket's own
   reading), at most ``MAX_WEB_CONNECTIONS`` at once, and two token buckets: every request, and the
   changes on their own (``REQUESTS_*``, ``CHANGES_*``). Over either, a refusal without calling
@@ -65,6 +73,7 @@ from backtide.service.control import (
     peer_credentials,
 )
 from backtide.service.rewind import RewindOutcome, RewindStatus
+from backtide.service.sessions import Session, Sessions
 from backtide.snapshots import Snapshot
 
 logger = logging.getLogger(__name__)
@@ -79,11 +88,20 @@ CHANGES = frozenset(
         "set_budget", "accept_prices",
     }
 )  # fmt: skip
-COMMANDS = READS | CHANGES
+# The sign-in (T26-3a): opening, checking and ending the web's sessions.
+SESSION_COMMANDS = frozenset({"session_open", "session_check", "session_end", "session_end_all"})
+COMMANDS = READS | CHANGES | SESSION_COMMANDS
 # Every request: a burst of 120, then 20 a second (the panel's stream asks about once a second
 # per open tab). The changes: a burst of 10, then one every 3 s (a person clicks).
 REQUESTS_BURST, REQUESTS_PER_SECOND = 120, 20.0
 CHANGES_BURST, CHANGES_PER_SECOND = 10, 1 / 3
+# Every page and fragment checks its session: a bucket of their own, so the stream of an open
+# tab never starves a click. Opening a session: a person, with a link, now and then.
+CHECKS_BURST, CHECKS_PER_SECOND = 240, 40.0
+OPENS_BURST, OPENS_PER_SECOND = 5, 1 / 6
+# "Close them all": a bucket of its own, so a stream of made-up links cannot block it.
+ENDS_BURST, ENDS_PER_SECOND = 5, 1 / 6
+NO_SESSION = "Sin una sesión viva no se cambia nada: vuelve a entrar con `sudo backtide enlace`."
 MAX_LISTED_SNAPSHOTS = 5000
 _FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID})
 _FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID})
@@ -136,6 +154,11 @@ class WebControlServer(ControlServer):
         max_connections: int = MAX_WEB_CONNECTIONS,
         requests: Bucket | None = None,
         changes: Bucket | None = None,
+        sessions: Sessions | None = None,
+        checks: Bucket | None = None,
+        opens: Bucket | None = None,
+        ends: Bucket | None = None,
+        on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
     ) -> None:
         if isinstance(group, bool) or not isinstance(group, int) or group in _FORBIDDEN_GIDS:
             raise ControlError(
@@ -150,6 +173,8 @@ class WebControlServer(ControlServer):
             settings=settings,
             budget=budget,
             waiting=waiting,
+            sessions=sessions,
+            on_entry=on_entry,
         )
         self.socket_group = group
         # The web's own uid, when it is an account (the installed ``backtide-web``): then the
@@ -159,6 +184,9 @@ class WebControlServer(ControlServer):
         self._list_snapshots = snapshots
         self._requests = requests or Bucket(REQUESTS_BURST, REQUESTS_PER_SECOND)
         self._changes = changes or Bucket(CHANGES_BURST, CHANGES_PER_SECOND)
+        self._checks = checks or Bucket(CHECKS_BURST, CHECKS_PER_SECOND)
+        self._opens = opens or Bucket(OPENS_BURST, OPENS_PER_SECOND)
+        self._ends = ends or Bucket(ENDS_BURST, ENDS_PER_SECOND)
 
     def refusal_for(self, pid: int, uid: int, gid: int) -> str | None:
         wrong_user = self._user is not None and uid not in (self._user, 0)
@@ -190,6 +218,8 @@ class WebControlServer(ControlServer):
                 shown[:32],
             )
             raise _BadRequest("Esa orden no se acepta por el socket de la web.")
+        if command in SESSION_COMMANDS:
+            return self._session_command(command, request, pid)
         if not self._requests.take():
             logger.warning("web socket: too many requests, one from pid %d was refused", pid)
             raise _BadRequest("Demasiadas peticiones seguidas: espera un poco.")
@@ -204,6 +234,7 @@ class WebControlServer(ControlServer):
                     pid,
                 )
                 raise _BadRequest("Por aquí solo pide la web.")
+            self._signed_in(command, request, pid)
             if not self._changes.take():
                 logger.warning("web socket: too many changes, one from pid %d was refused", pid)
                 raise _BadRequest("Demasiados cambios seguidos: espera un poco.")
@@ -216,6 +247,62 @@ class WebControlServer(ControlServer):
             if refused is not None:
                 return refused
         return super()._handle(request, pid, uid)
+
+    def _signed_in(self, command: str, request: dict[str, Any], pid: int) -> Session:
+        """The live session a change carries, taken out of the request (the control socket's
+        own checks want exactly their keys); else a refusal, with nothing called."""
+        given = request.pop("session", None)
+        session = self._sessions.check(given) if self._sessions is not None else None
+        if session is None:
+            logger.warning("web socket: refused a %s without a live session (pid %d)", command, pid)
+            raise _BadRequest(NO_SESSION)
+        return session
+
+    def _session_command(self, command: str, request: dict[str, Any], pid: int) -> dict[str, Any]:
+        key = "token" if command == "session_open" else "session"
+        allowed = {"cmd", key, "use"} if command == "session_check" else {"cmd", key}
+        if not {"cmd", key} <= set(request) <= allowed or request.get("use", False) is not False:
+            raise _BadRequest(f"Esa orden lleva `cmd` y `{key}`, y nada más.")
+        buckets = {"session_open": self._opens, "session_end_all": self._ends}
+        bucket = buckets.get(command, self._checks)
+        if not bucket.take():
+            logger.warning("web socket: too many %s, one from pid %d was refused", command, pid)
+            raise _BadRequest("Demasiadas peticiones seguidas: espera un poco.")
+        if self._sessions is None:
+            raise _BadRequest("Este servicio no lleva sesiones de la web.")
+        given = request[key]
+        if command == "session_open":
+            session = self._sessions.open(given)
+            if session is None:
+                logger.warning(
+                    "web socket: refused a link that is wrong, spent or old (pid %d)", pid
+                )
+                return {"ok": False, "outcome": "refused", "message": "Ese enlace ya no vale."}
+            if self._on_entry is None or not self._on_entry("web_session_opened", {"pid": pid}):
+                # An entry that cannot be recorded is not granted: the cookie never leaves.
+                self._sessions.end(session.id)
+                logger.error("web socket: a web session could not be recorded and was refused")
+                return {"ok": False, "outcome": "refused",
+                        "message": "No se ha podido apuntar la entrada: no se entra."}  # fmt: skip
+            logger.info(
+                "web socket: a one-time link was used, a new web session started (pid %d)", pid
+            )
+            return {"ok": True, "outcome": "opened", "message": "",
+                    "session": session.id, "csrf": session.csrf}  # fmt: skip
+        if command == "session_check":
+            session = self._sessions.check(given, use="use" not in request)
+            if session is None:
+                return {"ok": False, "outcome": "expired", "message": ""}
+            return {"ok": True, "outcome": "live", "message": "", "csrf": session.csrf}
+        if command == "session_end":
+            ended = self._sessions.end(given)
+            return {"ok": True, "outcome": "ended" if ended else "expired", "message": ""}
+        if self._sessions.check(given) is None:  # session_end_all, from a live one only
+            logger.warning("web socket: refused to close every session without a live one")
+            raise _BadRequest(NO_SESSION)
+        ended = self._sessions.end_all()
+        logger.warning("web socket: the web closed every session (%d) (pid %d)", ended, pid)
+        return {"ok": True, "outcome": "ended", "message": "", "ended": ended}
 
     @staticmethod
     def _warn_lasting(command: str, request: dict[str, Any], pid: int) -> None:
@@ -309,6 +396,99 @@ def ask_snapshots(
     return found
 
 
+def _ask_session(
+    path: Path,
+    request: dict[str, Any],
+    *,
+    server_uid: int,
+    wait: float,
+    peer: PeerCredentials,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> dict[str, Any]:
+    raw = _ask(
+        Path(path),
+        request,
+        what="la sesión",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+        server_uid=server_uid,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict) or not isinstance(reply.get("ok"), bool):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    return reply
+
+
+def _session_of(reply: dict[str, Any], session_id: str | None) -> Session | None:
+    session_id = reply.get("session", session_id)
+    csrf = reply.get("csrf")
+    if reply["ok"] is not True or not isinstance(session_id, str) or not isinstance(csrf, str):
+        return None
+    return Session(session_id, csrf)
+
+
+def ask_session_open(
+    path: Path,
+    token: str,
+    *,
+    server_uid: int = 0,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Session | None:
+    """A new session for the link's ``token`` (T26-3a), or None if the service refused it.
+    ControlError if the service cannot be asked or its reply makes no sense."""
+    reply = _ask_session(path, {"cmd": "session_open", "token": token}, server_uid=server_uid,
+                         wait=wait, peer=peer, sleep=sleep, monotonic=monotonic)  # fmt: skip
+    return _session_of(reply, None)
+
+
+def ask_session_check(
+    path: Path,
+    session_id: str,
+    *,
+    use: bool = True,
+    server_uid: int = 0,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Session | None:
+    """The live session with this id, or None; with ``use`` it counts as used (a page's own
+    stream asks without it). ControlError as above."""
+    request: dict[str, Any] = {"cmd": "session_check", "session": session_id}
+    if not use:
+        request["use"] = False
+    reply = _ask_session(path, request,
+                         server_uid=server_uid, wait=wait, peer=peer, sleep=sleep,
+                         monotonic=monotonic)  # fmt: skip
+    return _session_of(reply, session_id)
+
+
+def ask_session_end(
+    path: Path,
+    session_id: str,
+    *,
+    every: bool = False,
+    server_uid: int = 0,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> bool:
+    """End this session ("Salir"), or, with ``every``, every session ("Cerrar todas", asked
+    from this live one). True if the service did. ControlError as above."""
+    command = "session_end_all" if every else "session_end"
+    reply = _ask_session(path, {"cmd": command, "session": session_id}, server_uid=server_uid,
+                         wait=wait, peer=peer, sleep=sleep, monotonic=monotonic)  # fmt: skip
+    return reply["ok"] is True and reply.get("outcome") == "ended"
+
+
 def web_group_problem(gid: int) -> str | None:
     """Why ``gid`` cannot be the web's group, or None (for `backtide vigilar --grupo-web`)."""
     if gid in _FORBIDDEN_GIDS:
@@ -320,8 +500,12 @@ __all__ = [
     "CHANGES",
     "COMMANDS",
     "READS",
+    "SESSION_COMMANDS",
     "Bucket",
     "WebControlServer",
+    "ask_session_check",
+    "ask_session_end",
+    "ask_session_open",
     "ask_snapshots",
     "web_group_problem",
 ]

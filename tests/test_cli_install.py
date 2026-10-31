@@ -13,7 +13,9 @@ import backtide.web.server as server_module
 from backtide.cli import main
 from backtide.setup import images, install
 
-URL = "http://127.0.0.1:8765/s/AbCdEfGhIjKlMnOpQrStUv/?t=" + "T" * 43
+BASE = "http://127.0.0.1:8765/s/AbCdEfGhIjKlMnOpQrStUv/"
+TOKEN = "T" * 43
+URL = f"{BASE}?t={TOKEN}"
 
 
 def run(capsys, *args):
@@ -114,17 +116,28 @@ def test_the_web_writes_its_link_to_its_file_and_not_to_stdout(
     seen = {}
 
     def fake(paths, port, announce, **options) -> None:
-        announce(URL, "marea-faro-nube")
+        seen["socket"] = options.get("web_socket")
+        announce(BASE, "marea-faro-nube")  # the installed web has no token of its own (T26-3a)
         seen["mode"] = stat.S_IMODE(os.stat(link).st_mode)
         seen["text"] = link.read_text()
 
     monkeypatch.setattr(server_module, "run_web", fake)
-    code, out, err = run(capsys, "web", "--config", config, "--enlace-en", link)
+    sock = tmp_path / "web.sock"
+    code, out, err = run(
+        capsys, "web", "--config", config, "--enlace-en", link, "--socket-web", sock
+    )
     assert code == 0
-    assert URL not in out and URL not in err and "?t=" not in out
+    assert BASE not in out and BASE not in err and "?t=" not in out
     assert "sudo backtide enlace" in out and "marea-faro-nube" in out
-    assert seen == {"mode": 0o600, "text": f"{URL}\nmarea-faro-nube\n"}
+    assert seen == {"socket": sock, "mode": 0o600, "text": f"{BASE}\nmarea-faro-nube\n"}
     assert not link.exists()  # a dead link is not left behind
+
+
+def test_a_link_file_needs_the_narrow_socket(capsys, tmp_path: Path) -> None:
+    config = tmp_path / "web.toml"
+    config.write_text(f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n')
+    code, _, err = run(capsys, "web", "--config", config, "--enlace-en", tmp_path / "enlace")
+    assert code == 2 and "--socket-web" in err
 
 
 def test_a_link_file_that_cannot_be_written_stops_the_web(
@@ -133,20 +146,59 @@ def test_a_link_file_that_cannot_be_written_stops_the_web(
     config = tmp_path / "web.toml"
     config.write_text(f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n')
     monkeypatch.setattr(
-        server_module, "run_web", lambda paths, port, announce, **o: announce(URL, "a-b-c")
+        server_module, "run_web", lambda paths, port, announce, **o: announce(BASE, "a-b-c")
     )
-    code, out, err = run(capsys, "web", "--config", config, "--enlace-en", tmp_path / "no/enlace")
+    code, out, err = run(capsys, "web", "--config", config, "--enlace-en", tmp_path / "no/enlace",
+                         "--socket-web", tmp_path / "web.sock")  # fmt: skip
     assert code == 1 and "no se puede escribir el enlace" in err
-    assert URL not in out + err
+    assert BASE not in out + err
 
 
-def test_enlace_prints_the_link_and_how_to_reach_it(capsys, tmp_path: Path) -> None:
+@pytest.fixture
+def service_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """`backtide enlace` asks the service for a new token (T26-3a): played here."""
+    asked: list[Path] = []
+    config = tmp_path / "backtide.toml"
+    config.write_text(f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n')
+    (tmp_path / "state").mkdir(mode=0o700)
+    (tmp_path / "vol").mkdir()
+
+    def give(path: Path) -> str:
+        asked.append(path)
+        return TOKEN
+
+    monkeypatch.setattr(cli, "ask_web_link", give)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG", config)
+    return asked
+
+
+def test_enlace_asks_the_service_for_a_new_link(
+    capsys, tmp_path: Path, service_link: list[Path]
+) -> None:
     link = tmp_path / "enlace"
-    cli._write_link(link, URL, "marea-faro-nube")  # noqa: SLF001
-    code, out, _ = run(capsys, "enlace", "--archivo", link)
+    cli._write_link(link, BASE, "marea-faro-nube")  # noqa: SLF001
+    config = tmp_path / "backtide.toml"
+    code, out, _ = run(capsys, "enlace", "--archivo", link, "--config", config)
     assert code == 0
     assert URL in out and "marea-faro-nube" in out
-    assert "ssh -L 8765:127.0.0.1:8765" in out and "restart backtide-web.service" in out
+    assert "ssh -L 8765:127.0.0.1:8765" in out and "15 minutos" in out
+    assert service_link == [tmp_path / "state" / "control.sock"]
+    assert link.read_text() == f"{BASE}\nmarea-faro-nube\n"  # the file never holds a token
+
+
+def test_enlace_says_why_when_the_service_gives_none(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_link: list[Path]
+) -> None:
+    def refuse(path: Path) -> str:
+        raise cli.ControlError("Este servicio no tiene web instalada")
+
+    monkeypatch.setattr(cli, "ask_web_link", refuse)
+    link = tmp_path / "enlace"
+    cli._write_link(link, BASE, "a-b-c")  # noqa: SLF001
+    code, out, err = run(
+        capsys, "enlace", "--archivo", link, "--config", tmp_path / "backtide.toml"
+    )
+    assert code == 1 and "no tiene web" in err and BASE not in out
 
 
 def test_enlace_without_a_running_web_says_how_to_start_it(capsys, tmp_path: Path) -> None:
@@ -157,27 +209,29 @@ def test_enlace_without_a_running_web_says_how_to_start_it(capsys, tmp_path: Pat
 @pytest.mark.parametrize(
     ("content", "file_mode"),
     [
-        (f"{URL}\n", 0o600),  # no run name
-        ("http://evil.example/?t=x\nname\n", 0o600),  # not a link of this web
-        (f"{URL}\nname\n", 0o644),  # open to others: not the web's file
+        (f"{BASE}\n", 0o600),  # no run name
+        ("http://evil.example/\nname\n", 0o600),  # not a link of this web
+        (f"{BASE}\nname\n", 0o644),  # open to others: not the web's file
+        (f"{URL}\nname\n", 0o600),  # a token in the file: not what the web writes now
     ],
 )
 def test_enlace_prints_only_a_real_link_file(
-    capsys, tmp_path: Path, content: str, file_mode: int
+    capsys, tmp_path: Path, content: str, file_mode: int, service_link: list[Path]
 ) -> None:
     link = tmp_path / "enlace"
     link.write_text(content)
     link.chmod(file_mode)
     code, out, err = run(capsys, "enlace", "--archivo", link)
     assert code == 1 and "no se enseña" in err and "evil" not in out
+    assert service_link == []  # nothing asked of the service for a file that is not the web's
 
 
 def test_enlace_never_follows_a_link(capsys, tmp_path: Path) -> None:
     target = tmp_path / "real"
-    cli._write_link(target, URL, "a-b-c")  # noqa: SLF001
+    cli._write_link(target, BASE, "a-b-c")  # noqa: SLF001
     (tmp_path / "enlace").symlink_to(target)
     code, out, _ = run(capsys, "enlace", "--archivo", tmp_path / "enlace")
-    assert code == 1 and URL not in out
+    assert code == 1 and BASE not in out
 
 
 def test_instalar_passes_the_agent_and_telegram(

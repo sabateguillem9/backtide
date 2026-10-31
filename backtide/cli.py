@@ -24,6 +24,7 @@ from backtide.service.control import (
     ControlOutcomeUnknown,
     ControlUnavailable,
     ask_rewind,
+    ask_web_link,
 )
 from backtide.service.gasto import caps as spending_caps
 from backtide.service.gasto import spending
@@ -1228,9 +1229,9 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         dest="link_file",
         type=Path,
         metavar="ARCHIVO",
-        help="escribe el enlace de un solo uso en ARCHIVO (0600) en vez de imprimirlo: lo usa "
-        "backtide-web.service para que el enlace no quede en el registro (`sudo backtide "
-        "enlace` lo enseña)",
+        help="con --socket-web: escribe en ARCHIVO (0600) la dirección de la web, sin el token; "
+        "lo usa backtide-web.service, y `sudo backtide enlace` le pide al servicio un enlace de "
+        "un solo uso para esa dirección",
     )
     web.set_defaults(handler=_web)
 
@@ -1240,9 +1241,11 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         description="Enseña el enlace de un solo uso de la web que corre como servicio "
         "(backtide-web.service), con el nombre de su ejecución y cómo llegar desde otro "
         "ordenador sin abrir puertos (`ssh -L`). Hace falta `sudo`: el enlace es un archivo de "
-        "la web que nadie más puede leer, nunca una línea del registro. Para uno nuevo, "
-        "`sudo systemctl restart backtide-web`. Sale con 0 si lo enseña y 1 si no hay.",
+        "la web que nadie más puede leer, nunca una línea del registro. Cada vez da uno nuevo, "
+        "que el servicio deja usar una vez y durante 15 minutos (el anterior sin usar deja de "
+        "valer), sin reiniciar la web. Sale con 0 si lo enseña y 1 si no hay.",
     )
+    _add_config(link)
     link.add_argument(
         "--archivo",
         dest="link_file",
@@ -1326,6 +1329,10 @@ def _web(args: argparse.Namespace) -> int:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
     web_socket = getattr(args, "web_socket", None)
+    if args.link_file is not None and web_socket is None:
+        # The file holds the address without a way in; the service gives the token (T26-3a).
+        _error("--enlace-en va con --socket-web: el enlace lo da el servicio")
+        return EXIT_ERROR
     control, server_uid = paths.control_socket, None
     if web_socket is not None:
         control, server_uid = web_socket, SERVICE_UID
@@ -1337,9 +1344,15 @@ def _web(args: argparse.Namespace) -> int:
             except OSError as error:
                 raise LinkFileError(args.link_file, error) from None
             print(
-                f"Puesto de vigilancia listo, solo en este ordenador. Ejecución: {run_name}. El "
-                f"enlace de un solo uso está en {args.link_file}: `sudo backtide enlace` lo "
-                "enseña.",
+                f"Puesto de vigilancia listo, solo en este ordenador. Ejecución: {run_name}. "
+                "Para entrar, `sudo backtide enlace` da un enlace de un solo uso.",
+                flush=True,
+            )
+        elif web_socket is not None:
+            print(
+                f"Puesto de vigilancia listo, solo en este ordenador: {url}\n"
+                f"Nombre de esta ejecución: {run_name}\n"
+                "Para entrar, `sudo backtide enlace` da un enlace de un solo uso.",
                 flush=True,
             )
         else:
@@ -1421,7 +1434,9 @@ LINK_MAX_BYTES = 4096
 
 
 def _link(args: argparse.Namespace) -> int:
-    """`backtide enlace`: the installed web's one-time link, read from its file."""
+    """`backtide enlace`: the installed web's address, read from its file, with a new one-time
+    token the service gives (T26-3a)."""
+    from backtide.web.paths import WebPaths
     from backtide.web.server import web_url_problem
 
     path = args.link_file
@@ -1449,17 +1464,29 @@ def _link(args: argparse.Namespace) -> int:
         len(data) > LINK_MAX_BYTES
         or len(lines) != 2
         or stat.S_IMODE(info.st_mode) & 0o077
-        or web_url_problem(lines[0]) is not None
+        or web_url_problem(lines[0], base=True) is not None
     ):
         _error(f"{path} no es el archivo del enlace de la web: no se enseña.")
         return EXIT_FAILED
-    url, run_name = lines[0], _printable(lines[1])
+    try:
+        # Only where the control socket is: no key or token of the service is read for this.
+        control = WebPaths.from_file(args.config).control_socket
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    try:
+        # A new one-time link from the service (T26-3a): the web cannot make its own.
+        token = ask_web_link(control)
+    except ControlError as error:
+        _error(f"el servicio no ha dado el enlace: {error}")
+        return EXIT_FAILED
+    url, run_name = f"{lines[0]}?t={token}", _printable(lines[1])
     port = url.split(":")[2].split("/")[0]
     print(f"Puesto de vigilancia, solo en ese ordenador:\n\n  {url}\n")
     print(
         f"Nombre de esta ejecución: {run_name} (debe salir igual en la cabecera de la página).\n"
-        "El enlace vale una sola vez; para uno nuevo, `sudo systemctl restart "
-        f"{layout.WEB_UNIT}` y otra vez `sudo backtide enlace`.\n"
+        "El enlace vale una sola vez y durante 15 minutos; para otro, `sudo backtide enlace` "
+        "de nuevo (el anterior sin usar deja de valer).\n"
         f"Si backtide corre en otro ordenador, llega sin abrir ningún puerto: `ssh -L "
         f"{port}:127.0.0.1:{port} <usuario>@<servidor>` y abre el enlace en tu navegador."
     )
