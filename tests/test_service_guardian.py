@@ -3387,3 +3387,11 @@ def test_closing_every_session_is_recorded_and_alerted(world: World) -> None:
     assert world.only("web_sessions_closed").details == {"uid": 0, "pid": 7, "ended": 3}
     (alert,) = world.alerts.titled("cerrado todas las sesiones")
     assert alert.level is AlertLevel.ERROR
+
+
+def test_an_entry_with_the_password_says_to_change_it(world: World) -> None:
+    world.guardian.web_access("web_session_opened", {"pid": 8, "via": "password"})
+    world.guardian.web_access("web_session_opened", {"pid": 9})
+    with_password, with_link = world.alerts.titled("ha entrado en la web")
+    assert "contraseña" in with_password.body and "backtide contraseña" in with_password.body
+    assert "enlace" in with_link.body

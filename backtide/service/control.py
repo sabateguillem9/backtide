@@ -87,6 +87,7 @@ from backtide.service.holds import (
     TrustOutcome,
     TrustStatus,
 )
+from backtide.service.password import Checker, PasswordError
 from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from backtide.service.sessions import Sessions
@@ -314,6 +315,7 @@ class ControlServer:
         waiting: Callable[[], Mapping[str, str]] | None = None,
         sessions: Sessions | None = None,
         on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
+        password: Checker | None = None,
     ) -> None:
         if sessions is not None and on_entry is None:
             # Never a way into the web that leaves no trace (review of T26-3a).
@@ -326,6 +328,8 @@ class ControlServer:
         # message of a kind by per minute.
         self._sessions = sessions
         self._on_entry = on_entry
+        # The web's password (T26-3b-1): checked on the narrow socket, set here by root.
+        self._password_checker = password
         self._settings = settings
         self._budget = budget
         # The providers that wait for their key (``Egress.waiting``): the panel says so, next
@@ -500,6 +504,8 @@ class ControlServer:
             return self._web_link(request, pid, uid)
         if command == "web_end_all":
             return self._web_end_all(request, pid, uid)
+        if command == "set_password":
+            return self._set_password(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
 
     def _web_link(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
@@ -517,6 +523,26 @@ class ControlServer:
             # session it opens is refused anyway (``session_open``).
             self._on_entry("web_link_given", {"uid": uid, "pid": pid})
         return {"ok": True, "outcome": "link", "message": "", "token": token}
+
+    def _set_password(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """A new password for the web (`sudo backtide contraseña`, T26-3b-1): only its hash is
+        kept. Recorded and alerted; never logged, never in a reply."""
+        if set(request) != {"cmd", "password"}:
+            raise _BadRequest("Una petición de contraseña lleva `cmd` y `password`, y nada más.")
+        if self._password_checker is None:
+            raise _BadRequest("Este servicio no tiene web instalada: no hay contraseña que poner.")
+        try:
+            self._password_checker.set(request.pop("password"))
+        except PasswordError as error:
+            return {"ok": False, "outcome": "invalid", "message": str(error)}
+        # A password is changed when the old one may be known: every session ends with it,
+        # the owner signs in again with the new one (review of T26-3b-1).
+        ended = self._sessions.end_all() if self._sessions is not None else 0
+        logger.info("%s: the web's password was changed by uid %d", self.label, uid)
+        if self._on_entry is not None:
+            self._on_entry("web_password_set", {"uid": uid, "pid": pid, "ended": ended})
+        return {"ok": True, "outcome": "saved", "ended": ended,
+                "message": "Contraseña guardada."}  # fmt: skip
 
     def _web_end_all(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         """Close every web session and the unspent link (`sudo backtide enlace --cerrar-todas`):
@@ -1562,6 +1588,46 @@ def ask_web_end_all(
         message = reply.get("message")
         raise ControlError(message if isinstance(message, str) else "No se han podido cerrar.")
     return ended
+
+
+def ask_set_password(
+    path: Path,
+    password: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> dict[str, Any]:
+    """A new password for the web (`sudo backtide contraseña`): the reply's ``ok``, ``outcome``
+    ("saved" or "invalid") and ``message``. ControlError if the service has no web or its reply
+    makes no sense. The password is in the request only, never in an error."""
+    request: dict[str, Any] = {"cmd": "set_password", "password": password}
+    try:
+        raw = _ask(
+            Path(path),
+            request,
+            what="la contraseña",
+            wait=wait,
+            reply_timeout=REPLY_TIMEOUT * 6,
+            peer=peer,
+            server_uid=server_uid,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+    finally:
+        request.clear()
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    if reply.get("outcome") not in ("saved", "invalid"):
+        raise ControlError(reply["message"] or "No se ha podido guardar.")
+    return {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
 
 
 def ask_secrets(

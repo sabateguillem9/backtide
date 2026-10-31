@@ -120,6 +120,12 @@ class Sessions:
             self._link = None
             return self._start(secrets.token_urlsafe(SECRET_BYTES), now)
 
+    def start(self) -> Session:
+        """A new session for an entry the service checked itself (the password; later the
+        passkey): a new random id, as for a link."""
+        with self._lock:
+            return self._start(secrets.token_urlsafe(SECRET_BYTES), self._clock())
+
     def preset(self, session_id: str) -> Session:
         """A session that is already open with this id: for the Mac's demo and the tests, which
         set the cookie themselves. The service never calls it."""

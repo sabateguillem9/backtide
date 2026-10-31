@@ -351,8 +351,12 @@ class Prompter:
         key: str = "",
         token: str = "",
         chat: str = "",
+        password: str = "made-up web password",  # noqa: S107 - a test value
+        again: str | None = None,
     ) -> None:
         self.interactive = interactive
+        self.password = password  # what is typed at the web password's prompt
+        self.again = password if again is None else again  # and at "Otra vez"
         self.answers = answers
         self.key = key
         self.token = token  # what is typed at the Telegram token's prompt
@@ -369,6 +373,10 @@ class Prompter:
 
     def secret(self, prompt: str) -> str:
         self.asked.append(prompt)
+        if prompt.startswith("Contraseña"):
+            return self.password
+        if prompt.startswith("Otra vez"):
+            return self.again
         return self.token if "Telegram" in prompt else self.key
 
     def answer(self, question: str) -> str:
@@ -1374,3 +1382,72 @@ def test_a_bad_chat_stops_the_check_before_any_command(machine: Machine) -> None
         with pytest.raises(InstallError, match="chat privado"):
             run.check_options()
     assert machine.calls == []
+
+
+# -- the web's password (T26-3b-1, D40) ---------------------------------------------------------
+
+WEB_PASSWORD = "correct horse battery staple"  # noqa: S105 - a test value
+
+
+def password_file(machine: Machine) -> Path:
+    return machine.paths.state_dir / "web-auth" / "password"
+
+
+def test_the_web_password_asked_twice_without_echo_keeps_only_its_hash(machine: Machine) -> None:
+    from backtide.service import password
+
+    prompter = Prompter(interactive=True, password=WEB_PASSWORD)
+    installer(machine, prompter, no_key=True).install()
+    path = password_file(machine)
+    assert mode(path) == 0o600 and mode(path.parent) == 0o700
+    text = path.read_text()
+    assert WEB_PASSWORD not in text and password.matches(WEB_PASSWORD, text)
+    assert sum(q.startswith("Contraseña para entrar en la web") for q in prompter.asked) == 1
+    assert any(q.startswith("Otra vez") for q in prompter.asked)
+    assert not any(WEB_PASSWORD in line for line in prompter.said)
+    assert WEB_PASSWORD not in manifest.load(machine.paths.manifest).to_json()
+    assert str(path) in manifest.load(machine.paths.manifest).created["files"]
+
+
+def test_two_different_web_passwords_are_asked_again_then_refused(machine: Machine) -> None:
+    prompter = Prompter(interactive=True, password=WEB_PASSWORD, again="something else entirely")
+    with pytest.raises(InstallError, match="tres intentos"):
+        installer(machine, prompter, no_key=True).install()
+    assert not password_file(machine).exists()
+    assert sum("No son iguales" in line for line in prompter.said) == 3
+
+
+def test_a_short_web_password_is_refused_unquoted(machine: Machine, tmp_path: Path) -> None:
+    short = tmp_path / "short"
+    short.write_text("tooshort\n")
+    with pytest.raises(InstallError) as caught:
+        installer(machine, no_key=True, password_file=short).install()
+    assert "tooshort" not in str(caught.value) and "entre 12 y 256" in str(caught.value)
+
+
+def test_the_web_password_from_a_file(machine: Machine, tmp_path: Path) -> None:
+    from backtide.service import password
+
+    given = tmp_path / "pw"
+    given.write_text(WEB_PASSWORD + "\n")
+    installer(machine, no_key=True, password_file=given).install()
+    assert password.matches(WEB_PASSWORD, password_file(machine).read_text())
+
+
+def test_without_a_terminal_the_web_password_is_left_for_later(machine: Machine) -> None:
+    prompter = Prompter()
+    installer(machine, prompter, no_key=True).install()
+    assert not password_file(machine).exists()
+    assert any("Sin contraseña de la web" in line and "backtide contraseña" in line
+               for line in prompter.said)  # fmt: skip
+
+
+def test_a_web_password_already_there_is_kept(machine: Machine, tmp_path: Path) -> None:
+    given = tmp_path / "pw"
+    given.write_text(WEB_PASSWORD + "\n")
+    installer(machine, no_key=True, password_file=given).install()
+    before = password_file(machine).read_text()
+    prompter = Prompter(interactive=True, password="another one entirely")  # noqa: S106
+    installer(machine, prompter, no_key=True).install()
+    assert password_file(machine).read_text() == before
+    assert not any(q.startswith("Contraseña") for q in prompter.asked)

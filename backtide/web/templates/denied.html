@@ -1,10 +1,24 @@
 {% extends "base.html" %}
 {% from "icons.html" import ic %}
-{% block title %}{{ t('auth.title') }}{% endblock %}
+{% block title %}{{ t('auth.title.installed') if sign_in else t('auth.title') }}{% endblock %}
 {% block main %}
 <main class="watch gate-page ic-host">
   {{ ic('key', 'ic--l') }}
-  <h1>{{ t('auth.title') }}</h1>
-  <p class="lede">{{ t('auth.bad') if bad_link else t('auth.body') }}</p>
+  <h1>{{ t('auth.title.installed') if sign_in else t('auth.title') }}</h1>
+  {% if sign_in %}
+  <p class="lede">{{ t.code('auth.bad') if bad_link else t.code('auth.body.installed') }}</p>
+  <form class="settings-form signin-form" method="post" action="{{ sign_in }}">
+    <div class="setting-field">
+      <label class="setting-label" for="signin-password">{{ t('auth.password') }}</label>
+      <input id="signin-password" class="setting-input" type="password" name="password" minlength="12" maxlength="256" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus{% if sign_in_error %} aria-invalid="true" aria-describedby="signin-error"{% endif %}>
+      {% if sign_in_error %}<p class="signin-error" id="signin-error" role="alert">{{ ic('warning') }}<span>{{ t.code('auth.err.' ~ sign_in_error) }}</span></p>{% endif %}
+    </div>
+    <div class="settings-actions">
+      <button class="settings-yes" type="submit"><span>{{ t('auth.enter') }}</span>{% include "arrow.html" %}</button>
+    </div>
+  </form>
+  {% else %}
+  <p class="lede">{{ t.code('auth.bad') if bad_link else t.code('auth.body') }}</p>
+  {% endif %}
 </main>
 {% endblock %}

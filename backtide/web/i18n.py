@@ -470,6 +470,19 @@ ES: dict[str, str] = {
     "auth.body": "Abre el enlace que imprime `backtide web` al arrancar. Vale una sola vez.",
     "auth.bad": "Ese enlace ya se usó o ya no vale. Para otro navegador, para `backtide web` y "
     "vuelve a lanzarlo.",
+    "auth.title.installed": "Entra en backtide",
+    "auth.body.installed": "Entra con tu contraseña, o con un enlace de un solo uso: `sudo "
+    "backtide enlace` en el servidor.",
+    "auth.password": "Contraseña",
+    "auth.enter": "Entrar",
+    "auth.err.wrong": "Esa no es la contraseña.",
+    "auth.err.slow_down": "Demasiados intentos seguidos: espera unos segundos.",
+    "auth.err.locked": "Demasiadas contraseñas equivocadas: la entrada con contraseña está "
+    "cerrada un rato. Para entrar ya, `sudo backtide enlace` en el servidor.",
+    "auth.err.unset": "Aún no hay contraseña: ponla con `sudo backtide contraseña`, o entra con "
+    "`sudo backtide enlace`.",
+    "auth.err.refused": "Ahora no se puede comprobar: prueba otra vez en un momento.",
+    "auth.err.form": "Eso no se ha podido leer: escribe la contraseña otra vez.",
     "notfound.title": "Aquí no hay nada",
     "notfound.body": "Esa página no existe.",
     # ages
@@ -1203,6 +1216,19 @@ EN: dict[str, str] = {
     "auth.body": "Open the link `backtide web` prints when it starts. It works only once.",
     "auth.bad": "That link was already used or no longer works. For another browser, stop "
     "`backtide web` and start it again.",
+    "auth.title.installed": "Sign in to backtide",
+    "auth.body.installed": "Sign in with your password, or with a one-time link: `sudo backtide "
+    "enlace` on the server.",
+    "auth.password": "Password",
+    "auth.enter": "Sign in",
+    "auth.err.wrong": "That is not the password.",
+    "auth.err.slow_down": "Too many tries in a row: wait a few seconds.",
+    "auth.err.locked": "Too many wrong passwords: signing in with a password is closed for a "
+    "while. To get in now, `sudo backtide enlace` on the server.",
+    "auth.err.unset": "There is no password yet: set it with `sudo backtide contraseña`, or get "
+    "in with `sudo backtide enlace`.",
+    "auth.err.refused": "It cannot be checked right now: try again in a moment.",
+    "auth.err.form": "That could not be read: type the password again.",
     "notfound.title": "Nothing here",
     "notfound.body": "That page does not exist.",
     "day.today": "Today, {time}",

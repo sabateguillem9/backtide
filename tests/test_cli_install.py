@@ -312,3 +312,56 @@ def test_enlace_closes_all_without_reading_a_link_file(
     monkeypatch.setattr(cli, "ask_web_end_all", lambda path: pytest.fail("asked"))
     code, _, err = run(capsys, "enlace", "--cerrar-todas", "--archivo", tmp_path / "x")
     assert code == 2 and "--archivo" in err
+
+
+@pytest.fixture
+def password_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    given: list[str] = []
+    (tmp_path / "state").mkdir(mode=0o700, exist_ok=True)
+    (tmp_path / "vol").mkdir(exist_ok=True)
+    (tmp_path / "backtide.toml").write_text(
+        f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n'
+    )
+
+    def keep(path: Path, value: str) -> dict:
+        given.append(value)
+        return {"ok": True, "outcome": "saved", "message": "Contraseña guardada."}
+
+    monkeypatch.setattr(cli, "ask_set_password", keep)
+    return given
+
+
+def test_contrasena_asks_twice_and_gives_it_to_the_service(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, password_service: list[str]
+) -> None:
+    from backtide.setup import secrets
+
+    typed = iter(["correct horse battery staple", "correct horse battery staple"])
+    monkeypatch.setattr(secrets, "ask", lambda prompt, **kw: next(typed))
+    code, out, _ = run(capsys, "contraseña", "--config", tmp_path / "backtide.toml")
+    assert code == 0 and "guardada" in out and "horse" not in out
+    assert password_service == ["correct horse battery staple"]
+
+
+@pytest.mark.parametrize(
+    ("typed", "said"),
+    [
+        (["correct horse battery staple", "something else entirely"], "no son iguales"),
+        (["short", "short"], "entre 12 y 256"),
+    ],
+)
+def test_contrasena_refuses_before_asking_the_service(
+    capsys,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    password_service: list[str],
+    typed: list[str],
+    said: str,
+) -> None:
+    from backtide.setup import secrets
+
+    answers = iter(typed)
+    monkeypatch.setattr(secrets, "ask", lambda prompt, **kw: next(answers))
+    code, out, err = run(capsys, "contraseña", "--config", tmp_path / "backtide.toml")
+    assert code == 2 and said in err and password_service == []
+    assert "short" not in err and "horse" not in out + err

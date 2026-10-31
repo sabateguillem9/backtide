@@ -1959,6 +1959,29 @@ risk = "n/a"
 recoverable = "n/a"
 held = "n/a"
 
+[[scenario]]
+id = "contrasena-a-la-fuerza"
+name = "Adivinar la contraseña de la web es lento y deja rastro"
+story = """T26-3b-1 (D40): la web tiene contraseña, que `install.sh` pide y que el servicio guarda \
+como una huella scrypt en `/var/lib/backtide/web-auth/password` (de root, 0600, en una carpeta \
+0700). Como `backtide-web` (la web tomada), el escenario intenta leer ese archivo (no puede), y \
+prueba contraseñas por el socket estrecho: cinco se comprueban y son «wrong», y a partir de ahí el \
+servicio dice que espere sin comprobar nada, ni siquiera la buena. A los 12 segundos la buena abre \
+una sesión. Las equivocadas quedan en la caja negra, la entrada tiene su evento \
+(`web_session_opened`, `via: password`) y la contraseña no aparece en ningún evento. El bloqueo \
+de 15 minutos tras 20 fallos seguidos lo prueban los tests del Mac con un reloj falso (aquí \
+serían 4 minutos de intentos)."""
+inspired_by = "Un diccionario de contraseñas contra una web que da paso a todo"
+invariants = [5, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
 # Desinstalar (T13-4, la revisión): destructivos, solo con BACKTIDE_LAB_DESTRUCTIVO=1 en una VM
 # del laboratorio; cada uno acaba con backtide desinstalado y sus datos conservados.
 

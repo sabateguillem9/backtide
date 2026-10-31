@@ -504,8 +504,23 @@ WEB_ACCESS_ALERTS = {
         "Se han cerrado todas las sesiones de la web",
         "Para volver a entrar, `sudo backtide enlace`.",
     ),
+    "web_password_set": (
+        "Se ha cambiado la contraseña de la web",
+        "Alguien ha usado `sudo backtide contraseña`, y se han cerrado todas las sesiones. Si no "
+        "has sido tú, cámbiala otra vez.",
+    ),
+    "web_password_locked": (
+        "Demasiadas contraseñas equivocadas en la web",
+        "La entrada con contraseña queda cerrada 15 minutos, también para ti. Para entrar ya, "
+        "`sudo backtide enlace`.",
+    ),
 }
 WEB_ACCESS_ACTIONS = frozenset(WEB_ACCESS_ALERTS)
+# An entry with the password: closing the sessions is not enough if it was not you.
+WEB_SIGN_IN_BODY = (
+    "Se ha entrado con la contraseña de la web. Si no has sido tú, cámbiala (`sudo backtide "
+    "contraseña`, que cierra todas las sesiones)."
+)
 
 
 class Guardian:
@@ -4183,6 +4198,8 @@ class Guardian:
             raise ValueError(f"not a web access: {action}")
         event = self._record("system", action, "web", details=dict(details), risk=1)
         title, body = WEB_ACCESS_ALERTS[action]
+        if action == "web_session_opened" and details.get("via") == "password":
+            body = WEB_SIGN_IN_BODY
         if event is None:
             body += (
                 " No ha quedado en la caja negra, así que la entrada se ha rechazado."

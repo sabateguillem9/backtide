@@ -1357,3 +1357,14 @@ def test_a_typed_token_goes_through_stdin_without_echo_and_the_chat_is_asked(mac
     call = _install_call(mac)
     assert call["stdin"] == f"{KEY}\n{TOKEN}\n"
     assert call["argv"][call["argv"].index("--telegram-chat") + 1] == "424242"
+
+
+@pytest.mark.parametrize(
+    "flag", [["--contrasena-archivo", "/Users/x/pw"], ["--contrasena-archivo=/Users/x/pw"],
+             ["--contrasena-stdin"]],
+)  # fmt: skip
+def test_the_web_password_is_not_taken_from_a_mac_path(mac: Mac, flag: list[str]) -> None:
+    """T26-3b-1: a Mac path means nothing inside the VM; the password is asked there instead."""
+    done = mac.run("--desde", str(mac.archive), "--sha256", mac.sha, "--si", *flag)
+    assert done.returncode == 1 and "backtide contraseña" in done.stdout + done.stderr
+    _nothing_made(mac)

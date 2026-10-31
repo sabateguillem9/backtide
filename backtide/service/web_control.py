@@ -73,6 +73,7 @@ from backtide.service.control import (
     _reply_of,
     peer_credentials,
 )
+from backtide.service.password import Checker, PasswordError, Verdict
 from backtide.service.rewind import RewindOutcome, RewindStatus
 from backtide.service.sessions import Session, Sessions
 from backtide.snapshots import Snapshot
@@ -90,7 +91,9 @@ CHANGES = frozenset(
     }
 )  # fmt: skip
 # The sign-in (T26-3a): opening, checking and ending the web's sessions.
-SESSION_COMMANDS = frozenset({"session_open", "session_check", "session_end", "session_end_all"})
+SESSION_COMMANDS = frozenset(
+    {"session_open", "session_password", "session_check", "session_end", "session_end_all"}
+)
 COMMANDS = READS | CHANGES | SESSION_COMMANDS
 # Every request: a burst of 120, then 20 a second (the panel's stream asks about once a second
 # per open tab). The changes: a burst of 10, then one every 3 s (a person clicks).
@@ -102,6 +105,17 @@ CHECKS_BURST, CHECKS_PER_SECOND = 240, 40.0
 OPENS_BURST, OPENS_PER_SECOND = 5, 1 / 6
 # "Close them all": a bucket of its own, so a stream of made-up links cannot block it.
 ENDS_BURST, ENDS_PER_SECOND = 5, 1 / 6
+# Passwords: a bucket of their own (the Checker's own, slower one comes after), so a stream of
+# them never empties the pages' checks nor the link's way in (review of T26-3b-1).
+PASSWORDS_BURST, PASSWORDS_PER_SECOND = 10, 1.0
+PASSWORD_MESSAGES = {
+    Verdict.WRONG: "Esa no es la contraseña.",
+    Verdict.SLOW_DOWN: "Demasiados intentos seguidos: espera unos segundos.",
+    Verdict.LOCKED: "Demasiadas contraseñas equivocadas: la entrada con contraseña está cerrada "
+    "un rato. Para entrar ya, `sudo backtide enlace`.",
+    Verdict.UNSET: "Aún no hay contraseña: ponla con `sudo backtide contraseña`, o entra con "
+    "`sudo backtide enlace`.",
+}
 NO_SESSION = "Sin una sesión viva no se cambia nada: vuelve a entrar con `sudo backtide enlace`."
 MAX_LISTED_SNAPSHOTS = 5000
 _FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID})
@@ -159,7 +173,9 @@ class WebControlServer(ControlServer):
         checks: Bucket | None = None,
         opens: Bucket | None = None,
         ends: Bucket | None = None,
+        passwords: Bucket | None = None,
         on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
+        password: Checker | None = None,
     ) -> None:
         if isinstance(group, bool) or not isinstance(group, int) or group in _FORBIDDEN_GIDS:
             raise ControlError(
@@ -176,6 +192,7 @@ class WebControlServer(ControlServer):
             waiting=waiting,
             sessions=sessions,
             on_entry=on_entry,
+            password=password,
         )
         self.socket_group = group
         # The web's own uid, when it is an account (the installed ``backtide-web``): then the
@@ -188,6 +205,7 @@ class WebControlServer(ControlServer):
         self._checks = checks or Bucket(CHECKS_BURST, CHECKS_PER_SECOND)
         self._opens = opens or Bucket(OPENS_BURST, OPENS_PER_SECOND)
         self._ends = ends or Bucket(ENDS_BURST, ENDS_PER_SECOND)
+        self._passwords = passwords or Bucket(PASSWORDS_BURST, PASSWORDS_PER_SECOND)
 
     def refusal_for(self, pid: int, uid: int, gid: int) -> str | None:
         wrong_user = self._user is not None and uid not in (self._user, 0)
@@ -260,11 +278,15 @@ class WebControlServer(ControlServer):
         return session
 
     def _session_command(self, command: str, request: dict[str, Any], pid: int) -> dict[str, Any]:
-        key = "token" if command == "session_open" else "session"
+        key = {"session_open": "token", "session_password": "password"}.get(command, "session")
         allowed = {"cmd", key, "use"} if command == "session_check" else {"cmd", key}
         if not {"cmd", key} <= set(request) <= allowed or request.get("use", False) is not False:
             raise _BadRequest(f"Esa orden lleva `cmd` y `{key}`, y nada más.")
-        buckets = {"session_open": self._opens, "session_end_all": self._ends}
+        buckets = {
+            "session_open": self._opens,
+            "session_end_all": self._ends,
+            "session_password": self._passwords,
+        }
         bucket = buckets.get(command, self._checks)
         if not bucket.take():
             logger.warning("web socket: too many %s, one from pid %d was refused", command, pid)
@@ -272,6 +294,8 @@ class WebControlServer(ControlServer):
         if self._sessions is None:
             raise _BadRequest("Este servicio no lleva sesiones de la web.")
         given = request[key]
+        if command == "session_password":
+            return self._password(given, pid)
         if command == "session_open":
             session = self._sessions.open(given)
             if session is None:
@@ -306,6 +330,41 @@ class WebControlServer(ControlServer):
         if self._on_entry is not None:
             self._on_entry("web_sessions_closed", {"pid": pid, "ended": ended})
         return {"ok": True, "outcome": "ended", "message": "", "ended": ended}
+
+    def _password(self, given: object, pid: int) -> dict[str, Any]:
+        """The web's password (T26-3b-1): the service checks it (a scrypt hash, a bucket for the
+        whole web, a lock after many failures) and, if right, gives a new session. Never logged,
+        never in a reply."""
+        if self._password_checker is None or self._sessions is None:
+            raise _BadRequest("Este servicio no lleva contraseña de la web.")
+        try:
+            verdict = self._password_checker.check(given)
+        except PasswordError as error:
+            # The file changed hands (an owner, a mode, a link): nobody gets in by it, and the
+            # owner hears of it (an ERROR: the log bridge records it and alerts).
+            logger.error("web socket: the web's password file cannot be used: %s", error)
+            return {"ok": False, "outcome": "refused",
+                    "message": "La contraseña no se puede comprobar ahora."}  # fmt: skip
+        finally:
+            del given
+        if verdict is Verdict.RIGHT:
+            session = self._sessions.start()
+            if self._on_entry is None or not self._on_entry(
+                "web_session_opened", {"pid": pid, "via": "password"}
+            ):
+                self._sessions.end(session.id)
+                logger.error("web socket: a web session could not be recorded and was refused")
+                return {"ok": False, "outcome": "refused",
+                        "message": "No se ha podido apuntar la entrada: no se entra."}  # fmt: skip
+            logger.info("web socket: the right password, a new web session (pid %d)", pid)
+            return {"ok": True, "outcome": "opened", "message": "",
+                    "session": session.id, "csrf": session.csrf}  # fmt: skip
+        if verdict is Verdict.LOCKING and self._on_entry is not None:
+            self._on_entry("web_password_locked", {"pid": pid})
+        if verdict in (Verdict.WRONG, Verdict.LOCKING):
+            logger.warning("web socket: a wrong password for the web (pid %d)", pid)
+        outcome = Verdict.LOCKED if verdict is Verdict.LOCKING else verdict
+        return {"ok": False, "outcome": str(outcome), "message": PASSWORD_MESSAGES[outcome]}
 
     @staticmethod
     def _warn_lasting(command: str, request: dict[str, Any], pid: int) -> None:
@@ -451,6 +510,29 @@ def ask_session_open(
     return _session_of(reply, None)
 
 
+def ask_session_password(
+    path: Path,
+    password: str,
+    *,
+    server_uid: int = 0,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[Session | None, str]:
+    """A new session for the web's password (T26-3b-1), and the service's word: "opened",
+    "wrong", "slow_down", "locked", "unset" or "refused". ControlError if it cannot be asked.
+    The password is in the request only, never in an error."""
+    request: dict[str, Any] = {"cmd": "session_password", "password": password}
+    try:
+        reply = _ask_session(path, request, server_uid=server_uid, wait=wait, peer=peer,
+                             sleep=sleep, monotonic=monotonic)  # fmt: skip
+    finally:
+        request.clear()
+    outcome = reply.get("outcome")
+    return _session_of(reply, None), outcome if isinstance(outcome, str) else "refused"
+
+
 def ask_session_check(
     path: Path,
     session_id: str,
@@ -513,6 +595,7 @@ __all__ = [
     "ask_session_check",
     "ask_session_end",
     "ask_session_open",
+    "ask_session_password",
     "ask_snapshots",
     "web_group_problem",
 ]

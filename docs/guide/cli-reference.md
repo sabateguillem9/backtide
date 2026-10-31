@@ -31,6 +31,7 @@ Other guides: [getting started](getting-started.md), [configuration](configurati
 | `backtide instalar` | Install backtide as a system service ("install"; `install.sh` calls it) |
 | `backtide imagenes` | List the container images this version uses, pinned by digest ("images") |
 | `backtide enlace` | Print the installed web's one-time link ("link") |
+| `backtide contraseña` | Set or change the installed web's password ("password") |
 
 `backtide --version` prints the version (`backtide 0.1.0` today). `backtide` on its own, or `backtide --help`, prints the list of commands. Each command also answers to `--help`.
 
@@ -502,6 +503,8 @@ sudo backtide instalar [--si] [--dry-run] [--perfil openclaw|claude-code]
 | `--telegram-token-archivo FILE` | none | Read the bot's token from `FILE` (one line). Implies `--telegram`. Delete the file afterwards |
 | `--telegram-token-stdin` | off | Read the bot's token from standard input. Implies `--telegram`. With `--clave-stdin` too, the key is the first line and the token the second |
 | `--telegram-chat N` | asked | Your private chat with the bot (a positive number; it is not a secret). Implies `--telegram` |
+| `--contrasena-archivo FILE` | asked | The web's password, from this file (one line). Without it the installer asks for it twice, without echo; without a terminal it is left for `sudo backtide contraseña`. Not on the Mac: there it is asked in the VM |
+| `--contrasena-stdin` | off | The web's password from standard input (after the key and the token, one per line, if they come that way too) |
 | `--tope-diario`, `--tope-mensual` | `5`, `50` | The spending caps in dollars, written to the first `backtide.toml` |
 | `--zona-horaria` | the machine's | The time zone of "a day" for the cap |
 | `--subredes A,B` | chosen | The subnets of the agent's network (A) and the egress one (B). By default two free `/24` from `172.29.0.0/16`, from the top, that no route, address or Docker network uses |
@@ -583,6 +586,14 @@ How it keeps to "only what is ours":
 
 - **By default it keeps the VM, stopped, with your data in it.** It runs the Linux uninstall above inside the VM (keeping the data), stops the VM and removes `~/.local/bin/backtide`. Nothing of backtide runs any more; the VM's files and the Lima it needs stay on your Mac, and it prints how much disk the VM takes. To install again over the data, run the same `sh install-mac.sh --desde …`: it uses that VM. To look at the data, `limactl start backtide` and `limactl shell backtide` (it prints the full path of `limactl`). Why not copy the data to a Mac folder instead: the agent's volume is a 20 GiB sparse Btrfs image whose snapshots only make sense inside Linux, and installing again would then need an import step. Keeping the VM is the simplest way that loses nothing.
 - **`--borrar-datos` deletes the VM**, and with it the black box, the agent's work and its snapshots, for good, after you type the VM's name (or `--si`). If it downloaded Lima into `~/.backtide/lima` and no other VM is left in your Lima folder, that Lima goes too, with its download of the VM's image in `~/Library/Caches/lima` and the Lima folder the install made. **It never touches your own Lima, other VMs, `~/.lima` if it was there before, or Homebrew.**
+
+### `backtide contraseña`
+
+```sh
+sudo backtide contraseña
+```
+
+Sets or changes the password to sign in to the installed web. It asks twice without echo (or reads it with `--archivo FILE` or `--stdin`): 12 to 256 characters. The service keeps only its scrypt hash, root's and `0600` in `/var/lib/backtide/web-auth/`, writes the change in the black box and sends an alert. Every open session ends with it (it is changed when the old one may be known): sign in again with the new one. It must be typeable as it is (no spaces at the ends) and not trivial. Signing in with the password is slowed for the whole web (5 tries at once, then one every 12 seconds) and closed for 15 minutes after 20 wrong ones in a row, even for the right one: then `sudo backtide enlace` gets you in. Exit codes: `0` saved; `1` the service did not take it; `2` not a valid password, or the two did not match.
 
 ### `backtide enlace`
 

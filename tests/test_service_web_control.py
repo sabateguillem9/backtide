@@ -929,3 +929,172 @@ def test_web_end_all_is_not_on_the_narrow_socket(
     make_server: Callable[..., WebControlServer],
 ) -> None:
     assert talk(make_server(), {"cmd": "web_end_all"})["outcome"] == "refused"
+
+
+# -- T26-3b-1: the web's password --------------------------------------------------------------
+
+WEB_PASSWORD = "correct horse battery staple"  # noqa: S105 - a test value
+
+
+@pytest.fixture
+def checker(tmp_path: Path) -> Any:
+    from backtide.service import password
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    password.write(state, WEB_PASSWORD)
+    return password.Checker(state)
+
+
+def test_the_right_password_opens_a_recorded_session(
+    make_server: Callable[..., WebControlServer], checker: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    from backtide.service.web_control import ask_session_check, ask_session_password
+
+    caplog.set_level(logging.DEBUG)
+    entries: list[tuple[str, dict[str, Any]]] = []
+    sessions = Sessions()
+    server = make_server(
+        sessions=sessions,
+        password=checker,
+        on_entry=lambda action, details: entries.append((action, details)) is None,
+    )
+    ask = {"server_uid": ME, "peer": the_web}
+    session, why = ask_session_password(server.path, WEB_PASSWORD, **ask)
+    assert why == "opened" and session is not None
+    assert ask_session_check(server.path, session.id, **ask) == session
+    assert entries == [("web_session_opened", {"pid": 4242, "via": "password"})]
+    wrong, why = ask_session_password(server.path, WEB_PASSWORD + "!", **ask)
+    assert wrong is None and why == "wrong"
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "wrong password" in logged and "horse" not in logged and session.id not in logged
+
+
+def test_the_password_bucket_and_lock_are_said(
+    make_server: Callable[..., WebControlServer], checker: Any
+) -> None:
+    from backtide.service.password import LOCK_AFTER
+    from backtide.service.web_control import ask_session_password
+
+    entries: list[str] = []
+    from backtide.service.password import Checker
+
+    clock = Clock()
+    checker = Checker(checker._state_dir, clock=clock)  # noqa: SLF001 - its time, driven
+    server = make_server(
+        password=checker,
+        on_entry=lambda a, d: entries.append(a) is None,
+        passwords=Bucket(1000, 1000),  # the socket's own bucket out of the way: the Checker's
+    )
+    ask = {"server_uid": ME, "peer": the_web}
+    whys = [ask_session_password(server.path, f"wrong one number {i}", **ask)[1] for i in range(6)]
+    assert whys == ["wrong"] * 5 + ["slow_down"]
+    for i in range(LOCK_AFTER):
+        clock.now += 12
+        ask_session_password(server.path, f"wrong one number {i}", **ask)
+    clock.now += 12
+    assert ask_session_password(server.path, WEB_PASSWORD, **ask) == (None, "locked")
+    assert entries.count("web_password_locked") == 1
+
+
+def test_without_a_password_checker_or_a_password_nothing_opens(
+    make_server: Callable[..., WebControlServer], tmp_path: Path
+) -> None:
+    from backtide.service import password
+    from backtide.service.web_control import ask_session_password
+
+    ask = {"server_uid": ME, "peer": the_web}
+    server = make_server()
+    assert ask_session_password(server.path, WEB_PASSWORD, **ask) == (None, "refused")
+    server.close()
+    empty = tmp_path / "empty"
+    empty.mkdir(mode=0o700)
+    server = make_server(password=password.Checker(empty))
+    assert ask_session_password(server.path, WEB_PASSWORD, **ask) == (None, "unset")
+
+
+def test_root_sets_the_password_recorded_and_unquoted(
+    folder: Path, checker: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    from backtide.service import password
+    from backtide.service.control import ask_set_password
+
+    caplog.set_level(logging.DEBUG)
+    entries: list[tuple[str, dict[str, Any]]] = []
+    me = lambda sock: (4242, ME, os.getegid())  # noqa: E731
+    server = ControlServer(
+        FakeGuardian(),
+        folder / "control.sock",
+        peer=me,
+        sessions=Sessions(),
+        on_entry=lambda action, details: entries.append((action, details)) is None,
+        password=checker,
+    )
+    server.start()
+    try:
+        assert ask_set_password(server.path, "short", peer=me)["outcome"] == "invalid"
+        assert ask_set_password(server.path, "a brand new password", peer=me)["ok"] is True
+        assert talk(server, {"cmd": "set_password"})["outcome"] == "refused"
+    finally:
+        server.close()
+    line = password.read(checker._state_dir)  # noqa: SLF001
+    assert line is not None and password.matches("a brand new password", line)
+    assert entries == [("web_password_set", {"uid": ME, "pid": 4242, "ended": 0})]
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "brand new" not in logged and "short" not in logged
+
+
+def test_the_password_is_not_on_the_narrow_socket_to_set(
+    make_server: Callable[..., WebControlServer], checker: Any
+) -> None:
+    reply = talk(make_server(password=checker), {"cmd": "set_password", "password": "x" * 20})
+    assert reply["outcome"] == "refused"
+
+
+def test_a_new_password_ends_every_session(folder: Path, checker: Any) -> None:
+    from backtide.service.control import ask_set_password
+
+    sessions = Sessions()
+    sessions.preset(SESSION)
+    sessions.open(sessions.new_link())
+    me = lambda sock: (4242, ME, os.getegid())  # noqa: E731
+    server = ControlServer(FakeGuardian(), folder / "control.sock", peer=me, sessions=sessions,
+                           on_entry=lambda a, d: True, password=checker)  # fmt: skip
+    server.start()
+    try:
+        assert ask_set_password(server.path, "a brand new password", peer=me)["ok"] is True
+    finally:
+        server.close()
+    assert len(sessions) == 0
+
+
+def test_passwords_have_a_bucket_of_their_own(
+    make_server: Callable[..., WebControlServer], checker: Any
+) -> None:
+    """A stream of passwords never empties the pages' checks (review of T26-3b-1)."""
+    clock = Clock()
+    server = make_server(password=checker, passwords=Bucket(2, 0.001, clock=clock),
+                         checks=Bucket(5, 0.001, clock=clock))  # fmt: skip
+    outcomes = [
+        talk(server, {"cmd": "session_password", "password": f"not it number {i}"})["outcome"]
+        for i in range(3)
+    ]
+    assert outcomes == ["wrong", "wrong", "refused"]
+    assert talk(server, {"cmd": "session_check", "session": SESSION})["outcome"] == "live"
+
+
+def test_a_password_file_that_changed_hands_lets_nobody_in(
+    make_server: Callable[..., WebControlServer], checker: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    from backtide.service import password
+
+    path = password.path_of(checker._state_dir)  # noqa: SLF001
+    path.chmod(0o644)
+    reply = talk(
+        make_server(password=checker), {"cmd": "session_password", "password": WEB_PASSWORD}
+    )
+    assert (reply["ok"], reply["outcome"]) == (False, "refused")
+    assert any(
+        r.levelno == logging.ERROR and "password file cannot be used" in r.getMessage()
+        for r in caplog.records
+    )

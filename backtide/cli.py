@@ -1,6 +1,7 @@
 """Command-line entry point: `backtide`. Messages for the user are in Spanish."""
 
 import argparse
+import hmac
 import logging
 import os
 import signal
@@ -24,6 +25,7 @@ from backtide.service.control import (
     ControlOutcomeUnknown,
     ControlUnavailable,
     ask_rewind,
+    ask_set_password,
     ask_web_end_all,
     ask_web_link,
 )
@@ -468,6 +470,21 @@ def _add_check(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         metavar="NUMERO",
         help="con --telegram, el número de tu chat privado con el bot (si no, se pregunta)",
     )
+    passwords = install.add_mutually_exclusive_group()
+    passwords.add_argument(
+        "--contrasena-archivo",
+        dest="password_file",
+        type=Path,
+        metavar="RUTA",
+        help="lee la contraseña de la web de este archivo (una línea; si no, se pregunta sin eco)",
+    )
+    passwords.add_argument(
+        "--contrasena-stdin",
+        dest="password_stdin",
+        action="store_true",
+        help="lee la contraseña de la web de la entrada estándar (tras la clave y el token, si "
+        "también van por ahí)",
+    )
     install.add_argument("--tope-diario", metavar="DOLARES", help="tope de gasto diario (5)")
     install.add_argument("--tope-mensual", metavar="DOLARES", help="tope de gasto mensual (50)")
     install.add_argument(
@@ -593,6 +610,8 @@ def _install(args: argparse.Namespace) -> int:
         telegram_token_file=args.telegram_token_archivo,
         telegram_token_stdin=args.telegram_token_stdin,
         telegram_chat=args.telegram_chat,
+        password_file=args.password_file,
+        password_stdin=args.password_stdin,
     )
     host = SystemHost()
     installer = install.Installer(
@@ -1236,6 +1255,22 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
     )
     web.set_defaults(handler=_web)
 
+    secret = commands.add_parser(
+        "contraseña",
+        help="pone o cambia la contraseña de la web instalada",
+        description="Pone o cambia la contraseña para entrar en la web instalada (T26-3b-1). "
+        "La pide dos veces sin eco (o la lee de --archivo o --stdin) y se la da al servicio, que "
+        "guarda solo su huella (scrypt) y lo apunta en la caja negra con un aviso. Las sesiones "
+        "abiertas se cierran todas, porque se cambia cuando la anterior puede ser conocida. Sale "
+        "con 0 si la guarda, 1 si el servicio no la acepta y 2 si no vale.",
+    )
+    _add_config(secret)
+    sources = secret.add_mutually_exclusive_group()
+    sources.add_argument("--archivo", dest="password_file", type=Path, metavar="RUTA",
+                         help="lee la contraseña de este archivo (una línea)")  # fmt: skip
+    sources.add_argument("--stdin", dest="password_stdin", action="store_true",
+                         help="lee la contraseña de la entrada estándar")  # fmt: skip
+    secret.set_defaults(handler=_set_password)
     link = commands.add_parser(
         "enlace",
         help="enseña el enlace de la web instalada (backtide-web.service)",
@@ -1439,6 +1474,51 @@ def _remove_link(path: Path) -> None:
 
 
 LINK_MAX_BYTES = 4096
+
+
+def _set_password(args: argparse.Namespace) -> int:
+    """`backtide contraseña`: the web's password, given to the service (T26-3b-1)."""
+    from backtide.service import password
+    from backtide.setup import secrets
+    from backtide.web.paths import WebPaths
+
+    try:
+        control = WebPaths.from_file(args.config).control_socket
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    try:
+        if args.password_file is not None:
+            value = secrets.from_file(args.password_file)
+        elif args.password_stdin:
+            value = secrets.from_stream(sys.stdin.buffer)
+        else:
+            value = secrets.ask("Contraseña nueva de la web (no se ve al escribirla): ")
+            if not hmac.compare_digest(
+                value.encode(), secrets.ask("Otra vez, para comprobarla: ").encode()
+            ):
+                _error("no son iguales: no se ha cambiado nada")
+                return EXIT_ERROR
+    except secrets.SecretError as error:
+        _error(f"la contraseña: {error}")
+        return EXIT_ERROR
+    why = password.problem(value)
+    if why is not None:
+        _error(f"{why}: no se ha cambiado nada")
+        return EXIT_ERROR
+    try:
+        reply = ask_set_password(control, value)
+    except ControlError as error:
+        _error(f"el servicio no ha guardado la contraseña: {error}")
+        return EXIT_FAILED
+    finally:
+        del value
+    if not reply["ok"]:
+        _error(reply["message"])
+        return EXIT_ERROR
+    print("Contraseña de la web guardada (solo su huella). Se han cerrado todas las sesiones: "
+          "entra otra vez con la nueva.")  # fmt: skip
+    return EXIT_OK
 
 
 def _end_all_sessions(args: argparse.Namespace) -> int:

@@ -49,6 +49,7 @@ install starts that agent on it; ``_choose_profile``).
 """
 
 import errno
+import hmac
 import json
 import os
 import stat
@@ -67,6 +68,7 @@ from backtide.jail.docker import sanitize
 from backtide.jail.profiles import NAMED
 from backtide.jail.proxy_config import network_create_argv as egress_network_argv
 from backtide.notify.telegram_api import DEFAULT_API_BASE
+from backtide.service import password
 from backtide.service.config import (
     STATE_CHECKPOINT,
     STATE_KEY,
@@ -243,6 +245,9 @@ class Options:
     telegram_token_file: Path | None = None
     telegram_token_stdin: bool = False
     telegram_chat: str | None = None  # --telegram-chat: a chat id, not a secret
+    # The web's password (T26-3b-1, D40): asked without echo, or from a file or stdin.
+    password_file: Path | None = None
+    password_stdin: bool = False
 
 
 @dataclass(frozen=True)
@@ -567,6 +572,7 @@ class Installer:
             self.manifest.add("files", self.paths.gateway_token)
         self._model_key()
         self._telegram()
+        self._web_password()
         self._blackbox_for_the_web(gid)
         try:
             ServiceConfig.from_file(self.paths.config_file)
@@ -1011,6 +1017,56 @@ class Installer:
         self.prompter.say(f"Telegram (el token y el chat {int(chat)}): {written.value}.")
         self.manifest.add("files", path)
 
+    def _web_password(self) -> None:
+        """The web's password (T26-3b-1, D40), the first way in: only its scrypt hash, in
+        ``web-auth/password`` (root's, 0600). One already there stays unless a new one is given;
+        without a terminal and without one given, it is left for `sudo backtide contraseña`."""
+        options, path = self.options, password.path_of(self.paths.state_dir)
+        given = options.password_file is not None or options.password_stdin
+        if os.path.lexists(path) and not given:
+            self.prompter.say("La contraseña de la web ya está puesta: se conserva "
+                              "(`sudo backtide contraseña` la cambia).")  # fmt: skip
+            return
+        try:
+            if options.password_file is not None:
+                value = secrets.from_file(options.password_file)
+            elif options.password_stdin:
+                value = self._from_stdin("password")
+            elif self.prompter.interactive:
+                value = self._ask_password()
+            else:
+                self.prompter.say(f"Sin contraseña de la web por ahora: ponla con `sudo backtide "
+                                  f"contraseña`, o entra con {OPEN_WEB}.")  # fmt: skip
+                return
+        except secrets.SecretError as error:
+            raise InstallError(f"la contraseña de la web: {error}") from None
+        try:
+            password.write(self.paths.state_dir, value)
+        except password.PasswordError as error:
+            raise InstallError(f"la contraseña de la web: {error}") from None
+        finally:
+            del value
+        self.prompter.say("Contraseña de la web: guardada (solo su huella, nunca ella).")
+        self.manifest.add("files", path)
+
+    def _ask_password(self) -> str:
+        """Twice, without echo, until both match and it can be one (three chances)."""
+        for _ in range(3):
+            first = secrets.ask(
+                f"Contraseña para entrar en la web (de {password.MIN_CHARS} a "
+                f"{password.MAX_CHARS} caracteres; no se ve al escribirla): ",
+                reader=self.prompter.secret,
+            )
+            why = password.problem(first)
+            if why is not None:
+                self.prompter.say(f"No vale: {why}.")
+                continue
+            again = secrets.ask("Otra vez, para comprobarla: ", reader=self.prompter.secret)
+            if hmac.compare_digest(first.encode(), again.encode()):
+                return first
+            self.prompter.say("No son iguales: otra vez.")
+        raise InstallError("la contraseña de la web: tres intentos sin una que valga")
+
     def _telegram_chat(self) -> str:
         chat = self.options.telegram_chat
         if chat is None:
@@ -1032,12 +1088,16 @@ class Installer:
         return current.api_base if current is not None else DEFAULT_API_BASE
 
     def _from_stdin(self, which: str) -> str:
-        """The model's key (``key``) or the bot's token (``telegram``) from standard input. With
-        both on it, the key is the first line and the token the second; read once, each value
-        handed out once."""
+        """The model's key (``key``), the bot's token (``telegram``) or the web's password
+        (``password``) from standard input. With several on it, one a line in that order; read
+        once, each value handed out once."""
         if self._stdin_values is None:
             options = self.options
-            sources = (("key", options.key_stdin), ("telegram", options.telegram_token_stdin))
+            sources = (
+                ("key", options.key_stdin),
+                ("telegram", options.telegram_token_stdin),
+                ("password", options.password_stdin),
+            )
             wanted = [name for name, on in sources if on]
             stream = self.stdin or sys.stdin.buffer
             if len(wanted) == 1:

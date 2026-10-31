@@ -75,6 +75,7 @@ from backtide.service.local_models import (
     ollama_version,
     resolve_all,
 )
+from backtide.service.password import Checker
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.price_update import PriceUpdater
 from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
@@ -903,6 +904,8 @@ def serve(
         # one-time link (`sudo backtide enlace`) and the web's narrow socket opens and checks
         # the sessions, in this process's memory alone.
         web_sessions = config.web_sessions() if web_group is not None else None
+        # The web's password (T26-3b-1): checked by the narrow socket, set by root's.
+        web_password = Checker(config.state_dir) if web_group is not None else None
         control: ControlHook = ControlServer(
             guardian,
             config.control_socket,
@@ -911,6 +914,7 @@ def serve(
             waiting=egress.waiting,
             sessions=web_sessions,
             on_entry=guardian.web_access,
+            password=web_password,
         )
         if web_group is not None:
             listing = store if store is not None else SnapshotStore(config.volume)
@@ -927,6 +931,7 @@ def serve(
                     waiting=egress.waiting,
                     sessions=web_sessions,
                     on_entry=guardian.web_access,
+                    password=web_password,
                 ),
             )
         if telegram is not None:

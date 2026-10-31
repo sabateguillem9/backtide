@@ -64,7 +64,12 @@ from typing import Any, Protocol
 
 from backtide.service.control import ControlError, PeerCredentials, peer_credentials
 from backtide.service.sessions import Session, Sessions
-from backtide.service.web_control import ask_session_check, ask_session_end, ask_session_open
+from backtide.service.web_control import (
+    ask_session_check,
+    ask_session_end,
+    ask_session_open,
+    ask_session_password,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +107,7 @@ SETTINGS_POST_PATH = "/ajustes/guardar"
 HOLDS_PATH = "/peticiones"
 DECIDE_PATH = "/peticiones/decidir"
 # Signing out and closing every session (T26-3a-2): always there, each with the session's CSRF.
+SIGN_IN_PATH = "/entrar"  # the web's password (T26-3b-1): no session yet, our own Origin
 SIGN_OUT_PATH = "/salir"
 CLOSE_SESSIONS_PATH = "/ajustes/cerrar-sesiones"
 CLOSE_SESSIONS_WORD = "cerrar-todas"  # typed in the form: the confirmation
@@ -173,6 +179,10 @@ class Access(Protocol):
     def open(self, token: str) -> Session | None:
         """A new session for the link's token, or None (wrong, spent or too old)."""
 
+    def sign_in(self, password: str) -> tuple[Session | None, str]:
+        """A new session for the web's password (T26-3b-1), and why not: "opened", "wrong",
+        "slow_down", "locked", "unset" or "refused"."""
+
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
         """The live session among this header's cookies, or None; with ``use`` it counts as
         used (a page's own stream checks without it)."""
@@ -186,11 +196,16 @@ class Access(Protocol):
 class LocalAccess:
     """The sessions in this process: ``backtide web`` without the narrow socket, and the demo."""
 
+    passwords = False  # only its link
+
     def __init__(self, sessions: Sessions) -> None:
         self.sessions = sessions
 
     def open(self, token: str) -> Session | None:
         return self.sessions.open(token)
+
+    def sign_in(self, password: str) -> tuple[Session | None, str]:
+        return None, "unset"  # a web of its own has no password: only its link
 
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
         for value in cookie_values(cookie_header):
@@ -212,6 +227,8 @@ class ServiceAccess:
     """The sessions the service keeps (the installed web, T26-3a): asked over the narrow socket
     at ``path``, whose server must be ``server_uid``. If the service cannot be asked, nobody is
     signed in: it fails closed, and says so in the log."""
+
+    passwords = True  # the web's password (T26-3b-1), checked by the service
 
     def __init__(
         self,
@@ -235,6 +252,13 @@ class ServiceAccess:
         except ControlError as error:
             logger.error("the service could not open a session: %s", error)
             return None
+
+    def sign_in(self, password: str) -> tuple[Session | None, str]:
+        try:
+            return ask_session_password(self._path, password, **self._ask())
+        except ControlError as error:
+            logger.error("the service could not check the password: %s", error)
+            return None, "refused"
 
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
         for value in cookie_values(cookie_header):

@@ -511,7 +511,7 @@ def test_a_session_dies_unused_after_its_time_and_when_root_closes_them(
         and e.action in ("web_link_given", "web_session_opened", "web_sessions_closed")
     ]
     # Invariant 5: who asked and how many, never a token or a session id.
-    clean = all(set(e.details) <= {"uid", "pid", "ended"} for e in ways_in)
+    clean = all(set(e.details) <= {"uid", "pid", "ended", "via"} for e in ways_in)
     ok = (
         said("quiet") == ["opened", "live", "expired", "refused"]
         and said("busy") == ["opened", "live", "live", "live", "expired"]
@@ -537,4 +537,85 @@ def test_a_session_dies_unused_after_its_time_and_when_root_closes_them(
         f"el cierre de todas las sesiones está en la caja negra, por root ({len(by_root)}) y "
         f"desde la web ({len(by_web)}), con cuántas; ningún token ni id en los "
         f"{len(ways_in)} eventos de entrada y salida ({clean})",
+    )
+
+
+LAB_PASSWORD = Path("/var/lib/backtide-lab/made-up.password")  # instalar_lab.sh's (T26-3b-1)
+
+
+@scenario("contrasena-a-la-fuerza")
+def test_guessing_the_webs_password_is_slow_and_leaves_a_trace(
+    attack: Attack, installed: Installed
+) -> None:
+    """T26-3b-1: as the web's user, guess the password; read its file; then the right one."""
+    from backtide.service import password
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    right = LAB_PASSWORD.read_text().strip()
+    kept = password.path_of(layout.STATE_DIR)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    # 1. The file: root's, 0600 in a 0700 folder, only a hash; the web's user cannot read it.
+    info, folder = os.stat(kept), os.stat(kept.parent)
+    as_file = (info.st_uid, oct(stat.S_IMODE(info.st_mode)), oct(stat.S_IMODE(folder.st_mode)))
+    hash_only = right not in kept.read_text() and password.matches(right, kept.read_text())
+    read_as_web = sh(
+        "setpriv", "--reuid", str(web.pw_uid), "--regid", str(web.pw_gid), "--clear-groups",
+        "--", "cat", str(kept), check=False,
+    )  # fmt: skip
+    # 2. Guessing: five wrong ones are checked, then the bucket says wait, the right one too.
+    guesses = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        *({"cmd": "session_password", "password": f"guess-number-{i:04d}-x"} for i in range(6)),
+        {"cmd": "session_password", "password": right},
+    )  # fmt: skip
+    # 3. After the bucket's 12 s, the right one opens a session (then ended).
+    time.sleep(13)
+    entered = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        {"cmd": "session_password", "password": right},
+        {"cmd": "session_end", "session": "<session>"},
+    )  # fmt: skip
+    said = [r.get("outcome") for r in guesses]
+    ok = (
+        as_file == (0, "0o600", "0o700")
+        and hash_only
+        and read_as_web.returncode != 0
+        and said == ["wrong"] * 5 + ["slow_down", "slow_down"]
+        and [r.get("outcome") for r in entered] == ["opened", "ended"]
+    )
+    attack.check(
+        "stopped",
+        ok,
+        f"el archivo de la contraseña (uid, modo, carpeta): {as_file}, solo su huella "
+        f"({hash_only}), y backtide-web no lo lee ({read_as_web.returncode != 0}); adivinando: "
+        f"{said} (cinco comprobadas, luego espera, también la buena); a los 12 s la buena: "
+        f"{[r.get('outcome') for r in entered]}",
+    )
+
+    # The wrong ones reach the black box through the log bridge (once a minute per kind); the
+    # entry is its own event.
+    def recorded() -> bool:
+        seen = any(
+            "a wrong password for the web" in str(e.details.get("template", ""))
+            for e in installed.box.events(source="system", since_seq=since)
+            if e.action == "log"
+        )
+        if not seen:
+            probe_as(web.pw_uid, web.pw_gid, "", path,
+                     {"cmd": "session_password", "password": "one more wrong one"})  # fmt: skip
+        return seen
+
+    wait(recorded, 150, interval=5)
+    events = installed.box.events(since_seq=since)
+    opened = [
+        e for e in events if e.action == "web_session_opened" and e.details.get("via") == "password"
+    ]
+    leaked = [e.seq for e in events if right in repr(e.details)]
+    attack.check(
+        "recorded",
+        recorded() and len(opened) >= 1 and not leaked,
+        f"las contraseñas equivocadas, en la caja negra ({recorded()}); la entrada con contraseña, "
+        f"su evento ({len(opened)}); la contraseña en ningún evento ({leaked or 'ninguno'})",
     )

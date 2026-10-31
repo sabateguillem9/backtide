@@ -103,6 +103,7 @@ from backtide.web.security import (
     POST_PATH,
     SETTINGS_PATH,
     SETTINGS_POST_PATH,
+    SIGN_IN_PATH,
     SIGN_OUT_PATH,
     Access,
     Guard,
@@ -162,6 +163,8 @@ SUMMARY_TTL = 3.0  # an agent's card is read again at most this often...
 SUMMARY_MAX = 20.0  # ...and at least this often, even when its box has not moved
 PANEL_FEED = 40  # lines in the control room's feed when it loads
 REQUESTS_EVERY = 5.0  # how often the stream looks at the requests
+MAX_PASSWORD_CHARS = 256
+SIGN_IN_ERRORS = frozenset({"wrong", "slow_down", "locked", "unset", "refused", "form"})
 SESSION_RECHECK = 60.0  # how often an open stream asks whether its session still lives
 
 
@@ -173,8 +176,9 @@ class Unauthorized(Exception):  # noqa: N818 - an HTTP outcome, not an error
 class StartSession(Exception):  # noqa: N818 - an HTTP outcome, not an error
     """The link carried the right token: set the cookie and go to the same page without it."""
 
-    def __init__(self, session: str) -> None:
+    def __init__(self, session: str, target: str | None = None) -> None:
         self.session = session
+        self.target = target  # where to go; None: the same page, without the link
 
 
 def create_app(
@@ -357,7 +361,7 @@ def create_app(
     async def _start_session(request: Request, started: StartSession) -> Response:
         rest = [(k, v) for k, v in request.query_params.multi_items() if k != "t"]
         # The path hangs from our own prefix: "//host/x" can never become a link to another site.
-        target = _here(request) + (f"?{urlencode(rest)}" if rest else "")
+        target = started.target or _here(request) + (f"?{urlencode(rest)}" if rest else "")
         # A 200 page, not a 303: when the link is opened from another site (a chat, a mail, the
         # browser pane of another app) the browser keeps that origin for the whole redirect
         # chain, and SameSite=Strict then withholds the cookie that this very response sets. Our
@@ -373,7 +377,42 @@ def create_app(
     @app.exception_handler(Unauthorized)
     async def _unauthorized(request: Request, error: Unauthorized) -> Response:
         t = Translator(_language(request)[0])
-        return _page("denied.html", request, status=401, active="", t=t, bad_link=error.bad_link)
+        return _denied(request, t, 401, bad_link=error.bad_link)
+
+    def _denied(
+        request: Request, t: Translator, status: int, *, bad_link: bool = False, why: str = ""
+    ) -> HTMLResponse:
+        """The way in: the link, and on the installed web the password form (T26-3b-1)."""
+        return _page(
+            "denied.html",
+            request,
+            status=status,
+            active="",
+            t=t,
+            bad_link=bad_link,
+            sign_in=base + SIGN_IN_PATH if getattr(access, "passwords", False) else None,
+            sign_in_error=why,
+        )
+
+    @app.post(SIGN_IN_PATH)
+    async def sign_in(request: Request) -> Response:
+        """The web's password: the service checks it and gives a new session. Never logged,
+        never kept here; only our own page may send it (the Guard's Origin checks)."""
+        t = Translator(_language(request)[0])
+        if not getattr(access, "passwords", False):
+            return _denied(request, t, 404, why="unset")
+        form = await _read_form(request, ("password",), limits={"password": MAX_PASSWORD_CHARS})
+        if form is None:
+            return _denied(request, t, 400, why="form")
+        inside = await _signed_in(request)
+        session, why = await asyncio.to_thread(access.sign_in, form.pop("password"))
+        del form
+        if session is None:
+            status = 429 if why in ("slow_down", "locked") else 401
+            return _denied(request, t, status, why=why if why in SIGN_IN_ERRORS else "refused")
+        if inside:  # as the link does: the session this browser had ends, the new one begins
+            await asyncio.to_thread(access.end, request.state.session.id)
+        raise StartSession(session.id, target=base + "/")
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, error: StarletteHTTPException) -> Response:
@@ -1785,7 +1824,7 @@ def create_app(
                 yield b": keepalive\n\n"
             await asyncio.sleep(poll_interval)
 
-    post_paths = (POST_PATH, SIGN_OUT_PATH, CLOSE_SESSIONS_PATH)
+    post_paths = (POST_PATH, SIGN_IN_PATH, SIGN_OUT_PATH, CLOSE_SESSIONS_PATH)
     if settings_on:
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:

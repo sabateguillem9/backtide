@@ -27,6 +27,7 @@ set -euo pipefail
 LAB=/var/lib/backtide-lab
 KEY_FILE=$LAB/made-up.key
 TOKEN_FILE=$LAB/made-up.token  # a Telegram bot token's shape, nobody's (D27)
+PASSWORD_FILE=$LAB/made-up.password  # the web's password (T26-3b-1), made up here
 PS_LOG=$LAB/ps.log
 
 require_clean_vm_root() {
@@ -95,12 +96,17 @@ instalar() {
     printf 'sk-ant-api03-%s\n' "$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 80)" > "$KEY_FILE"
     chmod 0600 "$KEY_FILE"
   fi
+  if [ ! -s "$PASSWORD_FILE" ]; then
+    printf '%s\n' "$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)" > "$PASSWORD_FILE"
+    chmod 0600 "$PASSWORD_FILE"
+  fi
   sha=$(sha256sum "$src" | cut -d' ' -f1)
   tar -xOf "$src" install.sh > "$LAB/install.sh"
   ( while :; do ps -eww -o pid=,args= >> "$PS_LOG"; sleep 0.2; done ) &
   local watcher=$!
   local start=$SECONDS code=0
-  sh "$LAB/install.sh" --desde "$src" --sha256 "$sha" --si --clave-archivo "$KEY_FILE" "$@" \
+  sh "$LAB/install.sh" --desde "$src" --sha256 "$sha" --si --clave-archivo "$KEY_FILE" \
+    --contrasena-archivo "$PASSWORD_FILE" "$@" \
     > >(tee -a "$LAB/install.log") 2>&1 || code=$?
   kill "$watcher" 2>/dev/null || true
   result install_exit "$code"
@@ -124,6 +130,21 @@ fugas() {
   result ps_samples "$(grep -c . "$PS_LOG")"
   result key_leaks "[${found# }]"
   result key_file "$(stat -c '%U:%G %a' /var/lib/backtide/keys/anthropic.key)"
+  if [ -s "$PASSWORD_FILE" ]; then
+    # The web's password (T26-3b-1): nowhere at all, not even in its own file (only its hash),
+    # nor in the black box or its WAL (under /var/lib/backtide).
+    found="" match=(grep -qF -f "$PASSWORD_FILE")
+    "${match[@]}" "$PS_LOG" && found="$found ps"
+    journalctl -b --no-pager -o cat 2>/dev/null | "${match[@]}" && found="$found journal"
+    grep -rqF -f "$PASSWORD_FILE" /var/log 2>/dev/null && found="$found /var/log"
+    [ ! -e "$LAB/install.log" ] || ! "${match[@]}" "$LAB/install.log" || found="$found install.log"
+    for c in $(docker ps -aq); do docker logs "$c" 2>&1 | "${match[@]}" && found="$found docker-logs:$c"; done
+    while IFS= read -r file; do
+      [ "$file" = "$PASSWORD_FILE" ] || found="$found $file"
+    done < <(grep -rlF -f "$PASSWORD_FILE" /etc /var/lib/backtide /opt/backtide /run /tmp /root 2>/dev/null || true)
+    result password_leaks "[${found# }]"
+    result password_file "$(stat -c '%U:%G %a' /var/lib/backtide/web-auth/password 2>/dev/null || echo missing)"
+  fi
   [ -s "$TOKEN_FILE" ] || return 0
   # The same for the Telegram token (D27): only in telegram.toml.
   found="" match=(grep -qF -f "$TOKEN_FILE")

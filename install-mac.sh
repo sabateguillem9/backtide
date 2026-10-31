@@ -55,6 +55,8 @@ while [ "$left" -gt 0 ]; do
       esac ;;
     --telegram) TELEGRAM=1 ;;
     --telegram-token-stdin) die "en el Mac, el token va con --telegram-token-archivo RUTA, o se pide sin eco" ;;
+    --contrasena-archivo | --contrasena-archivo=* | --contrasena-stdin)
+      die "en el Mac, la contraseña de la web se pide sin eco al instalar, o se pone después con \`backtide contraseña\`" ;;
     --clave-archivo=*) KEY_FILE=${arg#--clave-archivo=} ;;
     --clave-stdin) KEY_MODE=stdin ;;
     --sin-clave) KEY_MODE=none ;;

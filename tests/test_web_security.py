@@ -859,3 +859,13 @@ def test_ending_sessions_only_from_our_own_page(
     )
     assert response.status_code == 403, response.text
     assert sessions.check(SESSION) is not None
+
+
+def test_a_web_of_its_own_has_no_password_form(tmp_path: Path) -> None:
+    from tests.test_web_rewind import POST_HEADERS
+
+    web = anonymous(tmp_path)
+    page = web.get("/ahora")
+    assert page.status_code == 401 and 'type="password"' not in page.text
+    refused = web.post("/entrar", data={"password": "x" * 20}, headers=POST_HEADERS)
+    assert refused.status_code == 404

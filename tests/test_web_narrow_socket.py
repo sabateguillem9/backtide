@@ -308,3 +308,123 @@ def test_signing_out_when_the_service_cannot_end_it_keeps_the_cookie(
         server.close()
     assert response.status_code == 503 and "set-cookie" not in response.headers
     assert sessions.check(SESSION) is not None
+
+
+# -- T26-3b-1: signing in with the web's password, through the service -----------------------
+
+WEB_PASSWORD = "correct horse battery staple"  # noqa: S105 - a test value
+
+
+@pytest.fixture
+def signing_in(folder: Path, guardian: FakeGuardian, tmp_path: Path) -> Iterator[Any]:
+    from backtide.service import password
+
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    password.write(state, WEB_PASSWORD)
+    sessions = Sessions()
+    server = WebControlServer(
+        guardian,
+        folder / "web3.sock",
+        group=GROUP,
+        snapshots=list,
+        peer=the_web,
+        sessions=sessions,
+        on_entry=lambda action, details: True,
+        password=password.Checker(state),
+    )
+    server.start()
+    new_box(tmp_path)
+    web = new_client(
+        tmp_path,
+        logged_in=False,
+        access=ServiceAccess(server.path, server_uid=ME, wait=0, peer=the_web),
+    )
+    yield web, sessions
+    server.close()
+
+
+def test_the_way_in_shows_the_password_form(signing_in: Any) -> None:
+    web, _ = signing_in
+    page = web.get("/ahora")
+    assert page.status_code == 401
+    assert 'action="/s/' in page.text and '/entrar"' in page.text
+    assert 'type="password"' in page.text and 'autocomplete="current-password"' in page.text
+
+
+def test_the_right_password_signs_in_and_the_cookie_works(signing_in: Any) -> None:
+    from tests.test_web_rewind import POST_HEADERS
+
+    web, sessions = signing_in
+    entered = web.post("/entrar", data={"password": WEB_PASSWORD}, headers=POST_HEADERS)
+    assert entered.status_code == 200 and "set-cookie" in entered.headers
+    assert WEB_PASSWORD not in entered.text
+    assert len(sessions) == 1
+    assert web.get("/ahora").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("data", "status", "said"),
+    [
+        ({"password": WEB_PASSWORD + "x"}, 401, "Esa no es la contraseña"),
+        ({"password": "x" * 300}, 400, "no se ha podido leer"),
+        ({"pw": WEB_PASSWORD}, 400, "no se ha podido leer"),
+    ],
+)
+def test_a_wrong_password_signs_nobody_in(
+    signing_in: Any, data: dict[str, str], status: int, said: str
+) -> None:
+    from tests.test_web_rewind import POST_HEADERS
+
+    web, sessions = signing_in
+    refused = web.post("/entrar", data=data, headers=POST_HEADERS)
+    assert refused.status_code == status and said in refused.text
+    assert "set-cookie" not in refused.headers and len(sessions) == 0
+    assert WEB_PASSWORD not in refused.text
+
+
+def test_a_password_from_another_site_is_refused_unread(signing_in: Any) -> None:
+    web, sessions = signing_in
+    refused = web.post(
+        "/entrar",
+        data={"password": WEB_PASSWORD},
+        headers={
+            "origin": "http://evil.example",
+            "content-type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert refused.status_code == 403 and len(sessions) == 0
+
+
+def test_signing_in_where_a_session_lives_ends_it(signing_in: Any) -> None:
+    from tests.test_web_rewind import POST_HEADERS
+
+    web, sessions = signing_in
+    web.post("/entrar", data={"password": WEB_PASSWORD}, headers=POST_HEADERS)
+    assert len(sessions) == 1
+    web.post("/entrar", data={"password": WEB_PASSWORD}, headers=POST_HEADERS)
+    assert len(sessions) == 1  # the first ended when the second began
+
+
+@pytest.mark.parametrize(
+    "accepted",
+    [
+        "contraseña de montaña 9",
+        "ünïcödé pässwörd ✓",
+        "🌊" * 12 + "marea",
+        "Ab1!xQ9#mZ2&",
+        "".join(chr(0x4E00 + i) for i in range(226)),  # 678 bytes: right at the form's edge
+    ],
+)
+def test_every_password_that_can_be_set_can_be_typed(
+    signing_in: Any, tmp_path: Path, accepted: str
+) -> None:
+    """Review of T26-3b-1: what ``problem`` accepts goes through the web's form as it is."""
+    from backtide.service import password
+    from tests.test_web_rewind import POST_HEADERS
+
+    assert password.problem(accepted) is None
+    password.write(tmp_path / "state", accepted)
+    web, sessions = signing_in
+    entered = web.post("/entrar", data={"password": accepted}, headers=POST_HEADERS)
+    assert entered.status_code == 200 and len(sessions) == 1
