@@ -62,6 +62,12 @@ Design: docs/19-diseno-t04.md, section "Disposición".
   (``required``, false by default: decision 7), the sensor container's limits and the reader's
   rate limits. Never the image (pinned in backtide/jail/sensor.py) nor its folder, which is
   ``<state_dir>/sensor`` and never overlaps anything mounted into the agent.
+- Several agents (T26-2a, docs/47 sections 6.2 and 6.8): this class describes ONE agent, the main
+  one by default. ``slug`` and ``number`` (backtide/jail/identity.py) say which; the main agent's
+  paths, names and ids are the ones it always had, and any other's come from them, in
+  ``<state_dir>/agents/<slug>``. ``state_dir`` stays the machine's: the sockets, the lock, the
+  real keys, the sensor and the rules are one. ``backtide.service.agents`` reads the other agents'
+  files. The installation's own black box lives in ``<state_dir>/installation``.
 """
 
 import dataclasses
@@ -99,6 +105,7 @@ from backtide.gate.providers import Provider as GateProvider
 from backtide.gate.providers import Secret as GateSecret
 from backtide.gate.translate.base import Trusted, normalize_trusted
 from backtide.gate.translate.read_post import check_read_endpoint
+from backtide.jail import identity
 from backtide.jail.ca import CaPaths
 from backtide.jail.config import AGENT_DIR, MAX_READY_TIMEOUT, AgentJailConfig, Protected
 from backtide.jail.model import MODEL_ID, ModelProvider
@@ -160,6 +167,8 @@ STATE_AGENT_CA = "agent-ca"  # the CA's certificate alone: the agent's /etc/back
 STATE_PROXY_CHANNEL = "proxy-channel"  # the proxy's folder for the channel's socket
 STATE_KEYS = "keys"  # the real keys of the model providers (T06-4): never mounted anywhere
 STATE_SENSOR = "sensor"  # Tetragon's events, settings and the reader's cursor (T07)
+STATE_INSTALLATION = "installation"  # the installation's own black box (T26-2a)
+AGENTS_FOLDER = "agents"  # the other agents': <state_dir>/agents/<slug>/, <etc>/agents/<slug>.toml
 MAX_RULES_BYTES = 64 * 1024
 MAX_OWNER_PRICES = 64
 
@@ -199,6 +208,9 @@ _JAIL_KEYS = frozenset(
     }
 )  # fmt: skip
 _PORTS = frozenset({"ports", "publish", "expose", "publish_all"})
+# What an agent other than the main one gets from its slug and number (T26-2a), never a setting.
+_DECIDED_AGENT_KEYS = frozenset({"name", "network", "hostname", "uid", "gid", "config_dir"})
+_DECIDED_PROXY_KEYS = frozenset({"name", "network", "uid", "gid"})
 # [proxy]: the container options a file may change (``internal_egress`` and ``allow_shared_ids``
 # are test-only concessions, so not here), and what the proxy lets out. Never a key.
 _PROXY_CONTAINER_KEYS = frozenset(
@@ -380,12 +392,18 @@ class ServiceConfig:
     web: Mapping[str, Any] = field(default_factory=dict)
     # One per provider of [proxy] (from_file reads them from keys/): the real and fake keys.
     provider_keys: Mapping[str, ProviderKey] = field(default_factory=dict, repr=False)
+    # Which agent of the installation this is (T26-2a). The main one, unless the file of another
+    # says so (backtide.service.agents): everything it has always been stays as it was.
+    slug: str = identity.MAIN_SLUG
+    number: int = 0
+    display_name: str | None = None  # what the founder calls it: never a path nor a Docker name
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("volume", self.volume)):
             if not isinstance(path, Path) or not path.is_absolute() or "\0" in str(path):
                 raise ConfigError(f"{label} must be an absolute path, got {str(path)!r}")
             _require_no_dotdot(label, path)
+        self._check_identity()  # before any path below is built with the slug
         if _overlap(self.state_dir, self.volume):
             raise ConfigError(
                 f"state_dir {self.state_dir} and volume {self.volume} must not contain each "
@@ -429,6 +447,32 @@ class ServiceConfig:
         self.web_sessions()  # validates [web]
         self._check_cloud_prices()
 
+    def _check_identity(self) -> None:
+        """The main agent is number 0. Any other has a good slug and number, and nothing that
+        those two decide (its names, its ids, its config folder) comes from anywhere else."""
+        if self.slug == identity.MAIN_SLUG:
+            if self.number != 0:
+                raise ConfigError(f"the agent {self.slug} has no number, got {self.number!r}")
+            return
+        try:
+            identity.check_slug(self.slug)
+        except identity.SlugError as error:
+            raise ConfigError(str(error)) from None
+        if not _positive_int(self.number) or self.number > identity.MAX_NUMBER:
+            raise ConfigError(
+                f"an agent's number must be a whole number, 1-{identity.MAX_NUMBER}, "
+                f"got {self.number!r}"
+            )
+        for label, table, decided in (
+            ("[agent]", self.agent, _DECIDED_AGENT_KEYS),
+            ("[proxy]", self.proxy, _DECIDED_PROXY_KEYS),
+        ):
+            found = sorted(set(table) & decided) if isinstance(table, Mapping) else []
+            if found:
+                raise ConfigError(
+                    f"{label} {', '.join(map(repr, found))}: an agent's slug and number decide them"
+                )
+
     def _check_cloud_prices(self) -> None:
         """Ollama's cloud API bills by plan, not by token (T20): the owner prices each of its
         models (``[budget.prices]``), or the spending cap could not count it."""
@@ -452,12 +496,16 @@ class ServiceConfig:
         unknown = sorted(set(self.proxy) - _PROXY_KEYS)
         if unknown:
             raise ConfigError(f"unknown [proxy] settings: {', '.join(map(repr, unknown))}")
-        for label, folder in (
+        folders = [
             ("the proxy's CA folder", self.proxy_ca_dir),
             ("the agent's CA folder", self.agent_ca_dir),
             ("the proxy's channel folder", self.proxy_channel_dir),
             ("the keys folder", self.keys_dir),
-        ):
+            ("the installation's black box", self.installation_dir),
+        ]
+        if self.is_main:  # another agent's config folder is in there, by design
+            folders.append(("the other agents' folder", self.agents_dir))
+        for label, folder in folders:
             if _overlap(config_dir, folder):
                 raise ConfigError(
                     f"the agent's config_dir {config_dir} must not be or contain {label} "
@@ -540,31 +588,65 @@ class ServiceConfig:
                 f"max_volume_bytes must be a positive number of bytes, got {ceiling!r}"
             )
 
-    # Where things live (docs/19, "Disposición")
+    # Where things live (docs/19, "Disposición"; docs/47, section 6.8)
+
+    @property
+    def is_main(self) -> bool:
+        """The installation's first agent, the one of every installation made before T26-2."""
+        return self.slug == identity.MAIN_SLUG
+
+    @property
+    def agents_dir(self) -> Path:
+        """The folders of the agents other than the main one."""
+        return self.state_dir / AGENTS_FOLDER
+
+    @property
+    def agent_dir(self) -> Path:
+        """What is this agent's alone: ``state_dir`` itself for the main one (nothing of an
+        installation of before moves), ``<state_dir>/agents/<slug>`` for any other."""
+        return self.state_dir if self.is_main else self.agents_dir / self.slug
 
     @property
     def blackbox_db(self) -> Path:
-        return self.state_dir / STATE_DB
+        return self.agent_dir / STATE_DB
 
     @property
     def blackbox_key(self) -> Path:
-        return self.state_dir / STATE_KEY
+        return self.agent_dir / STATE_KEY
 
     @property
     def blackbox_checkpoint(self) -> Path:
-        return self.state_dir / STATE_CHECKPOINT
+        return self.agent_dir / STATE_CHECKPOINT
+
+    @property
+    def installation_dir(self) -> Path:
+        """The installation's own black box (docs/47, section 6.2): one, for every agent. What
+        is nobody's in particular goes there, in a chain of its own."""
+        return self.state_dir / STATE_INSTALLATION
+
+    @property
+    def installation_db(self) -> Path:
+        return self.installation_dir / STATE_DB
+
+    @property
+    def installation_key(self) -> Path:
+        return self.installation_dir / STATE_KEY
+
+    @property
+    def installation_checkpoint(self) -> Path:
+        return self.installation_dir / STATE_CHECKPOINT
 
     @property
     def gateway_token_file(self) -> Path:
-        return self.state_dir / STATE_TOKEN
+        return self.agent_dir / STATE_TOKEN
 
     @property
     def agent_config_dir(self) -> Path:
-        """``[agent] config_dir``, or ``<state_dir>/<profile>`` (OpenClaw's: ``openclaw``)."""
+        """``[agent] config_dir``, or ``<its folder>/<profile>`` (OpenClaw's: ``openclaw``)."""
         configured = self.agent.get("config_dir")
         if configured is not None:
             return Path(configured)
-        return self.state_dir / self.agent_profile.name
+        return self.agent_dir / self.agent_profile.name
 
     @property
     def lock_file(self) -> Path:
@@ -572,7 +654,7 @@ class ServiceConfig:
 
     @property
     def pending_file(self) -> Path:
-        return self.state_dir / STATE_PENDING
+        return self.agent_dir / STATE_PENDING
 
     @property
     def control_socket(self) -> Path:
@@ -591,15 +673,15 @@ class ServiceConfig:
 
     @property
     def proxy_ca_dir(self) -> Path:
-        return self.state_dir / STATE_PROXY_CA
+        return self.agent_dir / STATE_PROXY_CA
 
     @property
     def agent_ca_dir(self) -> Path:
-        return self.state_dir / STATE_AGENT_CA
+        return self.agent_dir / STATE_AGENT_CA
 
     @property
     def proxy_channel_dir(self) -> Path:
-        return self.state_dir / STATE_PROXY_CHANNEL
+        return self.agent_dir / STATE_PROXY_CHANNEL
 
     @property
     def keys_dir(self) -> Path:
@@ -655,6 +737,14 @@ class ServiceConfig:
         ready = self.agent.get("ready")
         if isinstance(ready, Mapping) and "timeout" in ready:
             options["ready_timeout"] = ready["timeout"]  # agent_profile_of checked it
+        if not self.is_main:
+            ids = identity.agent_id(self.number)
+            options |= {
+                "name": identity.agent_container(self.slug),
+                "network": identity.agent_network(self.slug),
+                "uid": ids,
+                "gid": ids,
+            }
         token = self.gateway_token if profile.token_env is not None else None
         try:
             providers = tuple(
@@ -701,6 +791,12 @@ class ServiceConfig:
             Protected("the black box", self.blackbox_db),
             Protected("the black box's key", self.blackbox_key),
             Protected("the black box's checkpoint", self.blackbox_checkpoint),
+            Protected("the installation's black box", self.installation_dir),
+            Protected(
+                "the agents' folders",
+                self.agents_dir,
+                allowed_inside=tuple(f for f in in_state if f.is_relative_to(self.agents_dir)),
+            ),
             Protected("the gateway token", self.gateway_token_file),
             Protected("the control socket", self.control_socket),
             Protected("the web's socket", self.web_socket),
@@ -833,6 +929,14 @@ class ServiceConfig:
         ids. No secret in it."""
         agent = self.jail_config()
         options = {key: value for key, value in self.proxy.items() if key in _PROXY_CONTAINER_KEYS}
+        if not self.is_main:
+            ids = identity.proxy_id(self.number)
+            options |= {
+                "name": identity.proxy_container(self.slug),
+                "network": identity.egress_network(self.slug),
+                "uid": ids,
+                "gid": ids,
+            }
         try:
             return ProxyJailConfig(
                 ca_dir=self.proxy_ca_dir,
@@ -1281,11 +1385,14 @@ def _provider_names(proxy: Mapping[str, Any]) -> list[str]:
     return names
 
 
-def read_provider_keys(folder: Path, names: list[str]) -> dict[str, ProviderKey]:
+def read_provider_keys(
+    folder: Path, names: list[str], *, fakes: Path | None = None
+) -> dict[str, ProviderKey]:
     """The keys of each provider in ``names``: ``<name>.key``, the real one, which the person
     puts there (the Settings page, or by hand); and ``<name>.fake``, made here the first time
     (0600, never replaced). The folder is made (0700) if there is none yet; it must be ours and
-    0700, and nothing in it a symlink.
+    0700, and nothing in it a symlink. ``fakes``: where the fake keys live, if not there (each
+    agent other than the main one has its own, docs/47 section 6.5, and the real key is one).
 
     A provider whose ``<name>.key`` is missing, or cannot be used, waits for its key
     (``real`` None, ``read_real_key``): backtide starts and the proxy refuses its calls. A
@@ -1302,7 +1409,7 @@ def read_provider_keys(folder: Path, names: list[str]) -> dict[str, ProviderKey]
     _require_private_dir(folder, "the keys folder")
     keys = {}
     for name in names:
-        fake = _fake_key(folder / f"{name}.fake", name)
+        fake = _fake_key((fakes or folder) / f"{name}.fake", name)
         real, problem, why = read_real_key(folder, name)
         strike = read_strike_only(folder, name) if problem == KEY_UNUSABLE else None
         keys[name] = ProviderKey(real=real, fake=fake, problem=problem, why=why, strike=strike)
@@ -1499,6 +1606,35 @@ def _fake_key(path: Path, name: str) -> str:
             "backtide makes a new one"
         )
     return value
+
+
+def ensure_state_folder(path: Path, what: str) -> None:
+    """A folder of backtide's state, made (0700) if there is none yet. Like the state itself, only
+    we may write in it; no link, whatever it points at. ConfigError otherwise."""
+    try:
+        os.mkdir(path, 0o700)  # the umask can only take bits away
+    except FileExistsError:
+        pass  # whatever is there (a link, a folder open to others) the check refuses
+    except OSError as error:
+        raise ConfigError(f"cannot make {what} {path}: {os.strerror(error.errno or 0)}") from None
+    require_own_folder(path, what)
+
+
+def require_own_folder(path: Path, what: str) -> None:
+    """``path`` is a real folder of ours that only we can write. ConfigError otherwise."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise ConfigError(f"cannot read {what} {path}: {os.strerror(error.errno or 0)}") from None
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        raise ConfigError(f"{what} {path} is a symlink: refusing it")
+    if not stat.S_ISDIR(info.st_mode):
+        raise ConfigError(f"{what} {path} is not a directory")
+    if info.st_uid != os.geteuid():
+        raise ConfigError(f"{what} {path} is owned by uid {info.st_uid}, not {os.geteuid()}")
+    if mode & 0o022:
+        raise ConfigError(f"{what} {path} is writable by group or others (mode {mode:04o})")
 
 
 def _require_private_dir(path: Path, what: str) -> None:

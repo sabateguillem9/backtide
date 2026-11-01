@@ -22,6 +22,7 @@ from enum import StrEnum
 
 from backtide.jail.config import AgentJailConfig
 from backtide.jail.docker import sanitize
+from backtide.jail.identity import AGENT_ID_RANGE
 from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import TETRAGON_VERSION
 from backtide.setup import layout, networks
@@ -146,6 +147,7 @@ def run_checks(host: Host, *, installing: bool) -> list[Check]:
         _btf(host),
         _space(host, installing=installing),
         _ids(host),
+        _agent_ids(host),
         _tool(
             host,
             "btrfs-progs",
@@ -374,6 +376,28 @@ def _ids(host: Host) -> Check:
         f"Ya existe {' y '.join(taken)}",
         "El agente y el proxy corren con esos ids, que no deben ser de nadie: así nada de la "
         "máquina les da permisos. Cambia el id de esa cuenta o de ese grupo.",
+    )
+
+
+def _agent_ids(host: Host) -> Check:
+    """The ids of the agents besides the first one (docs/47, section 6.8). A warning, not a stop
+    like the two above: an installation with one agent never uses them, so one already taken must
+    not stop an update that works today. An agent whose ids are taken is refused when its file is
+    read (backtide.service.agents)."""
+    taken = [i for i in AGENT_ID_RANGE if host.uid_taken(i) or host.gid_taken(i)]
+    if not taken:
+        return Check(
+            "ids-agentes",
+            Status.OK,
+            f"Los ids {AGENT_ID_RANGE[0]}-{AGENT_ID_RANGE[-1]}, para más agentes, están libres",
+        )
+    return Check(
+        "ids-agentes",
+        Status.WARN,
+        f"Ya están en uso {len(taken)} ids de los que usarían más agentes (el {taken[0]}...)",
+        "Con un solo agente no pasa nada, salvo que uno sea de la cuenta backtide-web: la web no "
+        "puede usar esos ids. Para tener más agentes, cambia el id de esas cuentas o grupos: el "
+        "agente y su proxy corren con ids que no deben ser de nadie.",
     )
 
 

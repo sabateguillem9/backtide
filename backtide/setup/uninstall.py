@@ -50,6 +50,7 @@ from backtide.jail.docker import sanitize
 from backtide.service.config import (
     STATE_CHECKPOINT,
     STATE_DB,
+    STATE_INSTALLATION,
     STATE_KEY,
     STATE_KEYS,
     ConfigError,
@@ -643,6 +644,7 @@ class Uninstaller:
             return
         say(f"  - Se conservan los datos, en {state} (solo root):")
         say(f"      la caja negra: {STATE_DB}, su clave {STATE_KEY} y {STATE_CHECKPOINT};")
+        say(f"      la caja de la instalación: {STATE_INSTALLATION}/;")
         image = self.paths.volume_image
         used = self._used(image)
         size = f", ocupa {used}" if used else ""

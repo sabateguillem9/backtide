@@ -431,7 +431,7 @@ Checks whether this Linux machine has what backtide needs, and says how to fix w
 sudo backtide comprobar
 ```
 
-- What it looks at: root, the architecture (x86_64 or aarch64), the kernel (6.7 or later), Btrfs, loop devices, cgroup v2, systemd, time sync, the kernel's BTF (the process sensor needs it), free space in `/var/lib`, that the ids 61000 and 61001 belong to nobody, `btrfs-progs`, `openssl`, Docker Engine (not Docker Desktop, Podman or rootless Docker) and SELinux or AppArmor.
+- What it looks at: root, the architecture (x86_64 or aarch64), the kernel (6.7 or later), Btrfs, loop devices, cgroup v2, systemd, time sync, the kernel's BTF (the process sensor needs it), free space in `/var/lib`, that the ids 61000 and 61001 belong to nobody (and a warning if an account already uses part of 61100-61299, the ids set aside for more agents), `btrfs-progs`, `openssl`, Docker Engine (not Docker Desktop, Podman or rootless Docker) and SELinux or AppArmor.
 - Each line is `[ok]`, `[aviso]` (a warning: something works less, or the installer will do it with your permission) or `[falla]` (a failure: backtide cannot run safely here). Under each warning or failure, how to fix it.
 - Without `sudo` it still runs, with a warning: some checks (Docker, SELinux) may come out short.
 - **Fedora 43 and 44 with kernel 7.1 or later:** the process sensor (Tetragon v1.7.1) cannot read their BTF yet, so the agent runs but its commands are not recorded. `comprobar` warns about it. Ubuntu 24.04 and 26.04 are fine. It goes away with Tetragon 1.8.

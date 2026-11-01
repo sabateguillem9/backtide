@@ -226,6 +226,9 @@ def test_the_control_socket_is_still_0600(folder: Path) -> None:
         (AGENT_UID, AGENT_GID),  # the agent
         (AGENT_UID, GROUP),  # the agent, claiming the web's group
         (PROXY_UID, GROUP),  # the proxy, the same
+        (61101, GROUP),  # another agent (T26-2a), claiming it too
+        (61299, GROUP),  # another agent's proxy
+        (ME, 61150),  # a group of that range
         (ME + 1, 0),  # root's group
     ],
 )

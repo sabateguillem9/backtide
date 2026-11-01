@@ -1,0 +1,302 @@
+"""The agents of an installation (T26-2a): the main one and the files of the others.
+
+Design: docs/47-diseno-t26-web-agentes.md, sections 6.2, 6.3 and 6.8.
+
+An installation of before T26-2 has one agent, ``principal``: ``backtide.toml`` describes it and
+nothing of it moves. Each other agent is a file, ``agents/<slug>.toml`` next to ``backtide.toml``,
+and a ``ServiceConfig`` of its own made from the machine's with what that file says. The file name
+is the slug (backtide/jail/identity.py), so an agent has no way to name a folder outside its own.
+
+What a file holds, and all it may hold (written by the service, T26-6a, or by hand with ``sudo``):
+
+    number = 1                 # 1-99: its ids (61100 + n, 61200 + n). Never reused
+    name = "Revisor"           # optional: what to call it in the web
+    volume = "/var/lib/backtide-agents/revisor"
+    volume_image = "..."       # with max_volume_bytes, as in backtide.toml
+    max_volume_bytes = 0
+    workspace_limit = 0
+
+    [agent]                    # as in backtide.toml, but its names, ids and folder: those are not
+    profile = "claude-code"    # settings (ServiceConfig refuses them and every setting of the jail)
+    memory = "1g"
+
+    [proxy]                    # lower or higher limits than the machine's [proxy]
+    memory = "256m"
+
+Everything else is the machine's, in ``backtide.toml`` (``[sensor]``, ``[gate]``, ``[budget]``,
+``[web]``, what ``[proxy]`` lets out, its limits by default) and comes along. Reading makes the
+agent's folder and its fake keys, as ``from_file`` makes the main one's, and starts nothing. A file
+that cannot be used is a ConfigError, never skipped: an agent that was asked for and does not run
+is not something to find out later.
+
+Together, agents share nothing that would let one reach another: no container or network name, no
+uid or gid, no folder (a volume, the image behind one, a config folder) that holds another's, links
+resolved, and no secret (a fake key, a Gateway token, a black box's key: a copied folder would
+share them). And an agent's ids belong to no account of the machine.
+"""
+
+import dataclasses
+import grp
+import os
+import pwd
+import tomllib
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from backtide.jail import identity
+from backtide.jail.identity import MAX_AGENTS as MAX_AGENTS
+from backtide.service.config import (
+    _DECIDED_PROXY_KEYS,
+    AGENTS_FOLDER,
+    MAX_CONFIG_BYTES,
+    MAX_TOKEN_BYTES,
+    STATE_TOKEN,
+    ConfigError,
+    Secret,
+    ServiceConfig,
+    _as_path,
+    _decode,
+    _overlap,
+    _provider_names,
+    _read_file,
+    agent_profile_of,
+    ensure_state_folder,
+    read_provider_keys,
+    read_token_to_strike,
+    require_own_folder,
+)
+
+_FILE_SUFFIX = ".toml"
+_KEYS = frozenset(
+    {"number", "name", "volume", "volume_image", "max_volume_bytes", "workspace_limit", "agent",
+     "proxy"}
+)  # fmt: skip
+_PROXY_LIMITS = frozenset({"memory", "cpus", "pids_limit"})
+_IMAGE = "volume.img"  # the file behind an agent's volume, when it is in its folder (docs/47, 6.3)
+_MAX_KEY_FILE = 1024
+
+
+@dataclass(frozen=True)
+class Installation:
+    """The agents of this machine: the main one and the others, by number."""
+
+    main: ServiceConfig
+    others: tuple[ServiceConfig, ...] = ()
+
+    @property
+    def agents(self) -> tuple[ServiceConfig, ...]:
+        return (self.main, *self.others)
+
+
+def load_installation(path: Path) -> Installation:
+    """``backtide.toml`` at ``path`` and the files of ``agents/`` beside it. Without that folder,
+    exactly ``ServiceConfig.from_file(path)``: nothing else is read or made. Raises ConfigError."""
+    main = ServiceConfig.from_file(path)
+    folder = Path(path).parent / AGENTS_FOLDER
+    if not os.path.lexists(folder):
+        return Installation(main)
+    require_own_folder(folder, "the agents' files folder")
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError as error:
+        raise ConfigError(f"cannot read {folder}: {os.strerror(error.errno or 0)}") from None
+    slugs = [name.removesuffix(_FILE_SUFFIX) for name in names if name.endswith(_FILE_SUFFIX)]
+    for slug in slugs:  # all of them first: a bad name makes no folder for the good ones
+        _check_slug(slug)
+    if 1 + len(slugs) > MAX_AGENTS:
+        raise ConfigError(f"at most {MAX_AGENTS} agents, the main one included")
+    others = [_read_agent(main, folder / f"{slug}{_FILE_SUFFIX}", slug) for slug in slugs]
+    others.sort(key=lambda config: config.number)
+    installation = Installation(main, tuple(others))
+    _check_apart(installation.agents)
+    for config in others:
+        _check_ids_free(config)
+    return installation
+
+
+def _check_slug(slug: str) -> None:
+    try:
+        identity.check_slug(slug)
+    except identity.SlugError as error:
+        raise ConfigError(f"agents/: a file for no agent: {error}") from None
+
+
+def _read_agent(main: ServiceConfig, path: Path, slug: str) -> ServiceConfig:
+    """The ServiceConfig of the agent of ``path``: the machine's, with what its file says."""
+    data = _read_toml(path)
+    unknown = sorted(set(data) - _KEYS)
+    if unknown:
+        raise ConfigError(f"{path}: unknown settings: {', '.join(map(repr, unknown))}")
+    agent = _table(path, data, "agent")
+    proxy = _table(path, data, "proxy")
+    unknown = sorted(set(proxy) - _PROXY_LIMITS)
+    if unknown:
+        raise ConfigError(
+            f"{path}: unknown [proxy] settings: {', '.join(map(repr, unknown))}: an agent's file "
+            "only sets its proxy's limits, and what it lets out is the machine's"
+        )
+    if "number" not in data:
+        raise ConfigError(f"{path}: the setting 'number' is required")
+    if "volume" not in data:
+        raise ConfigError(f"{path}: the setting 'volume' is required")
+    image = data.get("volume_image")
+    image = None if image is None else _as_path("volume_image", image)
+    home = main.agents_dir / slug
+    if image is not None and image.is_relative_to(main.state_dir) and image != home / _IMAGE:
+        raise ConfigError(
+            f"{path}: volume_image {image} is in the state, and the only one allowed there is "
+            f"{home / _IMAGE}: the rest of it is black boxes and keys"
+        )
+    ensure_state_folder(main.agents_dir, "the agents' folder")
+    ensure_state_folder(home, "the agent's folder")  # checked before anything is read from it
+    token, struck = None, None
+    if agent_profile_of(agent).token_env is None:
+        struck = read_token_to_strike(home / STATE_TOKEN)
+    else:
+        token = _read_token(home / STATE_TOKEN)
+    machine_proxy = {k: v for k, v in main.proxy.items() if k not in _DECIDED_PROXY_KEYS}
+    names = _provider_names(machine_proxy)
+    keys = read_provider_keys(main.keys_dir, names, fakes=home) if names else {}
+    return dataclasses.replace(
+        main,
+        slug=slug,
+        number=data["number"],
+        display_name=_display_name(path, data.get("name")),
+        volume=_as_path("volume", data["volume"]),
+        volume_image=image,
+        max_volume_bytes=data.get("max_volume_bytes"),
+        workspace_limit=data.get("workspace_limit"),
+        agent=agent,
+        proxy={**machine_proxy, **proxy},
+        gateway_token=token,
+        struck_token=struck,
+        provider_keys=keys,
+    )
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    text = _decode(_read_file(path, "agent file", MAX_CONFIG_BYTES, private=False))
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:  # a line and a column, never what the file holds
+        raise ConfigError(f"{path} is not valid TOML: {error}") from error
+
+
+def _table(path: Path, data: dict[str, Any], key: str) -> dict[str, Any]:
+    table = data.get(key, {})
+    if not isinstance(table, dict):
+        raise ConfigError(f"{path}: [{key}] must be a table")
+    return dict(table)
+
+
+def _read_token(path: Path) -> Secret:
+    return Secret(
+        _decode(_read_file(path, "gateway token file", MAX_TOKEN_BYTES, private=True)).strip()
+    )
+
+
+def _display_name(path: Path, name: object) -> str | None:
+    """What to call the agent in the web: short, and nothing that moves a terminal or a page
+    around (no control or format character, which covers the direction marks)."""
+    if name is None:
+        return None
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or len(name) > identity.MAX_NAME
+        or any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in name)
+    ):
+        raise ConfigError(
+            f"{path}: the setting 'name' must be 1 to {identity.MAX_NAME} characters, none of them "
+            "a control character"
+        )
+    return name
+
+
+def _check_apart(agents: tuple[ServiceConfig, ...]) -> None:
+    """No two agents share a Docker name, an id, or a folder that holds the other's."""
+    names: dict[str, str] = {}
+    ids: dict[int, str] = {}
+    for config in agents:
+        jail, proxy = config.jail_config(), config.proxy_jail_config()
+        for name in sorted(
+            {jail.name, proxy.name, jail.network, proxy.network, proxy.agent_network}
+        ):
+            _only_once(names, name, config.slug, "the Docker name")
+        for number in sorted({jail.uid, jail.gid, proxy.uid, proxy.gid}):
+            _only_once(ids, number, config.slug, "the id")
+    for index, config in enumerate(agents):
+        for other in agents[index + 1 :]:
+            for mine in _held(config):
+                for theirs in _held(other):
+                    if _overlap(Path(os.path.realpath(mine)), Path(os.path.realpath(theirs))):
+                        raise ConfigError(
+                            f"the agents {config.slug} and {other.slug} share a folder: {mine} "
+                            f"and {theirs} (a volume, its image or a config folder holds only one "
+                            "agent)"
+                        )
+    _check_no_shared_secret(agents)
+
+
+def _check_no_shared_secret(agents: tuple[ServiceConfig, ...]) -> None:
+    """Each agent's secrets are its own. They are made apart: this is for a folder copied by hand
+    (``cp -a``), which would give two agents one chain and spending counted to the wrong one.
+    The message never holds a secret."""
+    seen: dict[bytes, str] = {}
+    for config in agents:
+        for secret in _secrets_of(config):
+            if seen.setdefault(secret, config.slug) != config.slug:
+                raise ConfigError(
+                    f"the agents {seen[secret]} and {config.slug} share a secret (a fake key, a "
+                    "Gateway token or a black box's key): each has its own. Was a folder copied?"
+                )
+
+
+def _secrets_of(config: ServiceConfig) -> set[bytes]:
+    secrets = {key.fake.encode() for key in config.provider_keys.values()}
+    if config.gateway_token is not None:
+        secrets.add(config.gateway_token.reveal().encode())
+    if os.path.lexists(config.blackbox_key):
+        secrets.add(_read_file(config.blackbox_key, "black box key", _MAX_KEY_FILE, private=True))
+    return secrets
+
+
+def _check_ids_free(config: ServiceConfig) -> None:
+    """An agent's ids are nobody's: running as an account's uid would hand it that account's
+    files if it got out, and share the kernel's limits per uid (docs/47, section 6.8). The main
+    agent's are checked when installing, as they always were."""
+    for number in (identity.agent_id(config.number), identity.proxy_id(config.number)):
+        if _id_taken(number):
+            raise ConfigError(
+                f"the agent {config.slug} would run as id {number}, which is an account or a group "
+                "of this machine: give it another number, or change that account's id"
+            )
+
+
+def _id_taken(number: int) -> bool:
+    try:
+        pwd.getpwuid(number)
+    except KeyError:
+        pass
+    else:
+        return True
+    try:
+        grp.getgrgid(number)
+    except KeyError:
+        return False
+    return True
+
+
+def _only_once[T](seen: dict[T, str], value: T, slug: str, what: str) -> None:
+    if seen.setdefault(value, slug) != slug:
+        raise ConfigError(f"the agents {seen[value]} and {slug} both use {what} {value}")
+
+
+def _held(config: ServiceConfig) -> list[Path]:
+    """What is this agent's alone, wherever the configuration put it."""
+    held = [config.volume, config.agent_config_dir]
+    if config.volume_image is not None:
+        held.append(config.volume_image)
+    return held

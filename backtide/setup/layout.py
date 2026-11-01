@@ -7,7 +7,13 @@ from pathlib import Path
 
 from backtide.jail.config import AGENT_GID, AGENT_UID
 from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
-from backtide.service.config import STATE_DB, STATE_KEYS, STATE_PROXY_CHANNEL, STATE_TOKEN
+from backtide.service.config import (
+    AGENTS_FOLDER,
+    STATE_DB,
+    STATE_KEYS,
+    STATE_PROXY_CHANNEL,
+    STATE_TOKEN,
+)
 
 NAME = "backtide"
 GIB = 1024**3
@@ -21,6 +27,7 @@ BIN_LINK = Path("/usr/local/bin") / NAME  # `backtide` on the PATH, pointing at 
 CONFIG_DIR = Path("/etc") / NAME
 CONFIG_FILE = CONFIG_DIR / f"{NAME}.toml"
 WEB_CONFIG_FILE = CONFIG_DIR / "web.toml"  # the web's own, readable by WEB_USER (D25)
+AGENT_CONFIGS = CONFIG_DIR / AGENTS_FOLDER  # agents/<slug>.toml, the other agents' (T26-2a)
 
 STATE_DIR = Path("/var/lib") / NAME
 VOLUME_IMAGE = STATE_DIR / "volume.img"
@@ -32,6 +39,9 @@ MANIFEST = STATE_DIR / "install-manifest.json"  # what the installer made (docs/
 # The volume's mount point is NOT inside STATE_DIR: the agent writes the volume, and the state
 # must never be in it (ServiceConfig refuses one inside the other).
 VOLUME_MOUNT = Path("/var/lib") / f"{NAME}-agent"
+# Those of the other agents, `<here>/<slug>`: beside the main agent's, never in it (docs/47 section
+# 6.3). In it, they would be mount points on the main agent's own filesystem.
+AGENT_VOLUMES = Path("/var/lib") / f"{NAME}-agents"
 # Where `backtide exportar` writes the owner's copies: the only folder besides the state and the
 # volume that the service's unit lets it write (code review of 2026-10-29, S1). Root's alone.
 EXPORT_DIR = Path("/var/lib") / f"{NAME}-export"

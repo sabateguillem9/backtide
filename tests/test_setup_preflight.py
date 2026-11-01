@@ -114,6 +114,7 @@ def test_a_good_machine_has_no_failures_and_no_warnings_but_the_kernel() -> None
         "btf",
         "space",
         "ids",
+        "ids-agentes",
         "btrfs-progs",
         "openssl",
         "docker",
@@ -314,6 +315,30 @@ def test_the_agent_and_proxy_ids_must_be_nobodys(uids: set[int], gids: set[int])
     check = checks(FakeHost(taken_uids=uids, taken_gids=gids))["ids"]
     assert check.status is Status.FAIL
     assert str(next(iter(uids | gids))) in check.summary
+
+
+def test_the_other_agents_ids_are_free_on_a_clean_machine() -> None:
+    check = checks(FakeHost())["ids-agentes"]
+    assert check.status is Status.OK
+    assert "61100-61299" in check.summary
+
+
+@pytest.mark.parametrize(
+    ("uids", "gids"),
+    [({61100}, set()), (set(), {61150}), ({61299}, set()), ({61101, 61102}, {61201})],
+)
+def test_a_taken_id_of_the_other_agents_warns_and_never_stops_an_update(
+    uids: set[int], gids: set[int]
+) -> None:
+    """An installation of one agent never uses them: what works today keeps installing."""
+    check = checks(FakeHost(taken_uids=uids, taken_gids=gids))["ids-agentes"]
+    assert check.status is Status.WARN
+    assert str(min(uids | gids)) in check.summary
+    assert check.fix
+
+
+def test_ids_beside_the_range_are_not_the_other_agents() -> None:
+    assert checks(FakeHost(taken_uids={61099, 61300}))["ids-agentes"].status is Status.OK
 
 
 @pytest.mark.parametrize(

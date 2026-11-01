@@ -65,6 +65,7 @@ from typing import BinaryIO, Protocol
 from backtide.blackbox import BlackBoxError, create_key
 from backtide.jail.config import network_create_argv as agent_network_argv
 from backtide.jail.docker import sanitize
+from backtide.jail.identity import AGENT_ID_RANGE
 from backtide.jail.profiles import NAMED
 from backtide.jail.proxy_config import network_create_argv as egress_network_argv
 from backtide.notify.telegram_api import DEFAULT_API_BASE
@@ -418,7 +419,7 @@ class Installer:
         gid = self.accounts.group_id(layout.WEB_USER)
         if uid is None or gid is None:
             raise InstallError(f"el usuario o el grupo {layout.WEB_USER} no existen tras crearlos")
-        reserved = {0} | {i for pair in layout.RESERVED_IDS.values() for i in pair}
+        reserved = {0, *AGENT_ID_RANGE} | {i for pair in layout.RESERVED_IDS.values() for i in pair}
         if uid in reserved or gid in reserved:
             raise InstallError(
                 f"{layout.WEB_USER} tiene el id {uid}:{gid}, que es de root, del agente o del "

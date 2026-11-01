@@ -29,6 +29,7 @@ Other guides: [command-line reference](cli-reference.md), [getting started](gett
 | Spending count and caps set from the web or terminal | `<state_dir>/budget.json` | the service |
 | Price table read from the provider's page | `<state_dir>/prices.json` | the service |
 | Black box, its key and its checkpoint | `<state_dir>/blackbox.db`, `blackbox.key`, `blackbox.checkpoint` | the service. The key is made on the first start and never replaced |
+| The installation's own black box | `<state_dir>/installation/blackbox.db`, with its own key and checkpoint | the service. For what belongs to no agent in particular; for now, each start of the service. `backtide verificar` checks it like any other |
 
 Also in the state folder: `backtide.lock`, `control.sock` (the [control socket](cli-reference.md#four-ideas-used-on-this-page)), `rewind.pending`, `proxy-ca/`, `agent-ca/`, `proxy-channel/`, `sensor/` and the agent's config folder (`<state_dir>/<profile name>`). They are backtide's own; do not edit them.
 

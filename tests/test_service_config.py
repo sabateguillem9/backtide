@@ -686,6 +686,8 @@ def test_the_agent_is_told_what_it_must_never_see(layout: Path) -> None:
         state / "blackbox.db": (),
         state / "blackbox.key": (),
         state / "blackbox.checkpoint": (),
+        state / "installation": (),  # T26-2a: the installation's own black box
+        state / "agents": (),  # T26-2a: the other agents' folders, whole
         state / "gateway.token": (),
         state / "control.sock": (),
         state / "web.sock": (),  # T12c: the web's narrow socket

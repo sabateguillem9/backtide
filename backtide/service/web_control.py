@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from backtide.jail.config import AGENT_GID, AGENT_UID
+from backtide.jail.identity import AGENT_ID_RANGE
 from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
 from backtide.service.control import (
     MAX_CONNECTIONS,
@@ -149,8 +150,8 @@ NO_SESSION = "Sin una sesión viva no se cambia nada: vuelve a entrar con `sudo 
 NEEDS_TOUCH = "Esto pide volver a tocar tu llave: tócala en la web y prueba otra vez."
 FIRST_KEY_TOO_LATE = "La primera llave se registra nada más entrar: vuelve a entrar y regístrala."
 MAX_LISTED_SNAPSHOTS = 5000
-_FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID})
-_FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID})
+_FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID, *AGENT_ID_RANGE})
+_FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID, *AGENT_ID_RANGE})
 
 
 class Bucket:

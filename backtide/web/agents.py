@@ -25,6 +25,8 @@ from typing import Any, NamedTuple
 
 from backtide.blackbox import Event, Source
 from backtide.gate.phrase import api_name
+from backtide.jail.identity import MAIN_SLUG as MAIN_SLUG
+from backtide.jail.identity import MAX_NAME, SLUG
 from backtide.snapshots import Snapshot
 from backtide.web import format as fmt
 from backtide.web.narrate import Line, Name, Narrator
@@ -32,9 +34,6 @@ from backtide.web.reader import BoxReader
 from backtide.web.state import FROZEN, STATE_ACTIONS, STOPPED, UNKNOWN, WATCHED, status_from
 from backtide.web.tide import Tide, build_tide
 
-MAIN_SLUG = "principal"
-SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?")
-MAX_NAME = 48
 COLOURS = 6  # identity colours of the app palette (brand tokens.json, "app")
 WORKING_FOR = timedelta(seconds=60)  # an agent that moved this recently is "working"
 REWIND_FOR = timedelta(minutes=10)  # a rewind asked and not answered for this long is stale

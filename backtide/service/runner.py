@@ -49,7 +49,7 @@ from backtide.gate.translate.base import MAIL_TRANSLATORS
 from backtide.jail import AgentJail, JailError, ca
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
-from backtide.notify import AlertQueue, FanOut, LogNotifier, Notifier
+from backtide.notify import Alert, AlertLevel, AlertQueue, AlertSink, FanOut, LogNotifier, Notifier
 from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
@@ -59,6 +59,7 @@ from backtide.service.config import (
     ConfigError,
     ProviderKey,
     ServiceConfig,
+    ensure_state_folder,
     holds_fake,
     read_real_keys,
     read_strike_only,
@@ -208,14 +209,49 @@ def open_black_box(config: ServiceConfig) -> BlackBox:
     ``service_start``). Creates the key on the very first start; raises BlackBoxError if any
     part of a black box (database, checkpoint, -wal, -shm) exists without it, or the key file
     is not private. Nothing is created in those cases."""
-    key_path = config.blackbox_key
+    return _box_at(config.blackbox_db, config.blackbox_key, config.blackbox_checkpoint)
+
+
+def open_installation_box(config: ServiceConfig) -> BlackBox:
+    """The installation's own black box (T26-2a, docs/47 section 6.2), not yet opened, with the
+    same rules as an agent's: its key is made once and a box without it is refused. Its folder
+    is made here. Raises BlackBoxError or ConfigError."""
+    ensure_state_folder(config.installation_dir, "the installation's black box folder")
+    return _box_at(config.installation_db, config.installation_key, config.installation_checkpoint)
+
+
+def record_installation_start(config: ServiceConfig, alerts: AlertSink) -> None:
+    """Write in the installation's box that the service starts, and with which agents. Opened
+    and closed each time: what goes there is rare, and it holds nothing open.
+
+    A box that cannot be used never stops the service: it records no agent, whose own black box
+    is untouched and is what the service depends on. It is told out loud instead, and a chain
+    that does not verify is not extended."""
+    try:
+        with open_installation_box(config) as box:
+            problems = box.verify().problems
+            if problems:
+                raise BlackBoxError(f"its chain does not verify ({len(problems)} problems)")
+            box.append("system", "service_start", "", details={"agents": [config.slug]})
+    except (BlackBoxError, ConfigError, OSError) as error:
+        logger.error("the installation's black box cannot be used: %s", error)
+        alerts.submit(
+            Alert(
+                AlertLevel.ERROR,
+                "La caja de la instalación no se puede usar",
+                "Cada agente sigue grabándose en su propia caja negra. Mira "
+                f"{config.installation_dir}: {error}",
+            )
+        )
+
+
+def _box_at(db: Path, key_path: Path, checkpoint: Path) -> BlackBox:
     if os.path.lexists(key_path):
         key = load_key(key_path)
     else:
-        db = config.blackbox_db
         parts = [
             db,
-            config.blackbox_checkpoint,
+            checkpoint,
             db.with_name(db.name + "-wal"),
             db.with_name(db.name + "-shm"),
         ]
@@ -226,7 +262,7 @@ def open_black_box(config: ServiceConfig) -> BlackBox:
                 f"clave {key_path}: no se crea una clave nueva para una cadena que ya existe."
             )
         key = create_key(key_path)
-    return BlackBox(config.blackbox_db, key, checkpoint_path=config.blackbox_checkpoint)
+    return BlackBox(db, key, checkpoint_path=checkpoint)
 
 
 def load_rules(config: ServiceConfig) -> RuleSet:
@@ -949,6 +985,7 @@ def serve(
                 guardian, box, snapshots, budget=egress.budget, waiting=egress.waiting
             )
             control = Hooks(control, telegram.bot)
+        record_installation_start(config, alerts)
         run_guardian(
             guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control
         )
