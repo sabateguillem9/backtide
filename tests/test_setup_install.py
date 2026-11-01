@@ -567,6 +567,24 @@ def test_the_second_run_finds_the_same_manifest(machine: Machine, key_file: Path
     assert machine.paths.manifest.read_text() == first
 
 
+@pytest.mark.parametrize("uid", [61100, 61150, 61299])
+def test_a_web_account_with_an_id_of_the_agents_range_stops_the_install(
+    machine: Machine, key_file: Path, uid: int
+) -> None:
+    """Such an account could not use its socket, and an agent with that number would be it."""
+    machine.users[layout.WEB_USER] = uid
+    with pytest.raises(InstallError, match="tiene el id"):
+        installer(machine, key_file=key_file).install()
+
+
+@pytest.mark.parametrize("uid", [61099, 61300])
+def test_a_web_account_just_outside_the_agents_range_installs(
+    machine: Machine, key_file: Path, uid: int
+) -> None:
+    machine.users[layout.WEB_USER] = uid
+    installer(machine, key_file=key_file).install()
+
+
 @pytest.mark.parametrize(
     "broken",
     [

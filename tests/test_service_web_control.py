@@ -199,12 +199,24 @@ def test_the_socket_is_0660_with_the_webs_group(
     assert not os.path.lexists(server.path)
 
 
-@pytest.mark.parametrize("group", [0, AGENT_GID, PROXY_GID, True])
+@pytest.mark.parametrize("group", [0, AGENT_GID, PROXY_GID, True, 61101, 61150, 61201])
 def test_the_group_of_root_the_agent_or_the_proxy_is_refused(folder: Path, group: int) -> None:
     with pytest.raises(ControlError):
         WebControlServer(FakeGuardian(), folder / "web.sock", group=group, snapshots=list)
     assert web_group_problem(0) and web_group_problem(AGENT_GID) and web_group_problem(PROXY_GID)
     assert web_group_problem(GROUP) is None
+
+
+@pytest.mark.parametrize("group", [61100, 61101, 61150, 61200, 61201, 61299])
+def test_no_gid_of_the_other_agents_can_be_the_webs_group(group: int) -> None:
+    """The only thing that holds this range for a group: `refusal_for` compares with the socket's
+    own group, so a socket opened for 61150 would let the agent number 50 in."""
+    assert web_group_problem(group) is not None
+
+
+@pytest.mark.parametrize("group", [61099, 61300])
+def test_the_ids_around_the_agents_range_are_free(group: int) -> None:
+    assert web_group_problem(group) is None
 
 
 def test_the_control_socket_is_still_0600(folder: Path) -> None:
