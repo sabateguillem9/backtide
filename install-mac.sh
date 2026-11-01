@@ -184,16 +184,16 @@ EOF
   exit 0
 fi
 [ -n "$status" ] || die "no existe la VM $VM: vuelve a ejecutar install-mac.sh"
-# The web's port on this Mac must be Lima's forward to the VM, and nobody else's.
+# The web's port on this Mac: Lima's forward to the VM on 127.0.0.1 and on [::1] (where
+# backtide.localhost goes first, T26-3b-3), and no other listener on any address (T26-3b-2).
 web_port_is_ours() {
   n=0
   while :; do
-    who=$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
-    [ -z "$who" ] || break
+    [ -z "$(lsof -nP -t -i4TCP@127.0.0.1:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ] \
+      || [ -z "$(lsof -nP -t -i6TCP@"[::1]:$PORT" -sTCP:LISTEN 2>/dev/null || true)" ] || break
     n=$((n + 1)); [ "$n" -lt 15 ] || die "el puerto $PORT del Mac no está reenviado a la VM: \`backtide vm parar\` y otra vez"
     sleep 1
   done
-  # Every listener, IPv4 and IPv6: backtide.localhost tries [::1] first (T26-3b-2).
   ha=$(cat "$LIMA_HOME/$VM/ha.pid" 2>/dev/null || true)
   for who in $(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u); do
     [ "$who" = "$ha" ] \
@@ -203,7 +203,7 @@ web_port_is_ours() {
 if [ "${1:-}" = vm ]; then
   case "${2:-}" in
     estado) exec "$LIMACTL" list "$VM" ;;
-    arrancar) exec "$LIMACTL" start --tty=false "$VM" ;;
+    arrancar) "$LIMACTL" start --tty=false "$VM" || exit; web_port_is_ours; exit 0 ;;
     parar) exec "$LIMACTL" stop "$VM" ;;
     shell) exec "$LIMACTL" shell --workdir / "$VM" ;;
     *) echo "uso: backtide vm estado|arrancar|parar|shell" >&2; exit 2 ;;
@@ -376,16 +376,16 @@ if [ -z "$status" ]; then
   [ "${#sock}" -lt 104 ] || die "la ruta de Lima ($LIMA_HOME) es demasiado larga para sus sockets: usa un LIMA_HOME más corto"
   say "creando la VM $VM (la primera vez descarga Fedora 44: unos minutos)"
   lima create --tty=false --name "$VM" \
-    --set ".portForwards[0].hostPort = $HOST_PORT" "$WORK/backtide-mac.yaml" < /dev/null || die "Lima no pudo crear la VM"
+    --set ".portForwards[0].hostPort = $HOST_PORT | .portForwards[1].hostPort = $HOST_PORT" "$WORK/backtide-mac.yaml" < /dev/null || die "Lima no pudo crear la VM"
   status=Stopped
 fi
 head -n 1 "$LIMA_HOME/$VM/lima.yaml" 2>/dev/null | grep -q '^# backtide-mac:' \
   || die "ya hay una VM $VM que no es la de backtide: no se toca"
 # What Lima will really apply (its lima.yaml, filled with defaults and any _config file): no
-# mount, and the template's three port rules. Checked on every run, before the VM starts.
+# mount, and the template's four port rules. Checked on every run, before the VM starts.
 mounts=$(lima list --format '{{len .Config.Mounts}}' "$VM" 2>/dev/null) || die "Lima no puede leer la VM $VM"
 [ "$mounts" = 0 ] || die "la VM $VM tiene $(clean "$mounts") carpetas del Mac montadas: no se toca (bórrala con limactl delete $VM)"
-FORWARDS_WANT="127.0.0.1 [8765 8765] 127.0.0.1 [$HOST_PORT $HOST_PORT] tcp false;0.0.0.0 [1 65535] 127.0.0.1 [1 65535] any true;:: [1 65535] 127.0.0.1 [1 65535] any true;"
+FORWARDS_WANT="::1 [8765 8765] ::1 [$HOST_PORT $HOST_PORT] tcp false;127.0.0.1 [8765 8765] 127.0.0.1 [$HOST_PORT $HOST_PORT] tcp false;0.0.0.0 [1 65535] 127.0.0.1 [1 65535] any true;:: [1 65535] 127.0.0.1 [1 65535] any true;"
 forwards=$(lima list --format '{{range .Config.PortForwards}}{{.GuestIP}} {{.GuestPortRange}} {{.HostIP}} {{.HostPortRange}} {{.Proto}} {{.Ignore}};{{end}}' "$VM") \
   || die "Lima no puede leer la VM $VM"
 [ "$forwards" = "$FORWARDS_WANT" ] || die "los puertos de la VM $VM no son los de la plantilla ($(clean "$forwards")): no se toca"

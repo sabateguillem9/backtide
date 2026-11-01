@@ -2051,7 +2051,7 @@ held = "n/a"
 [[scenario]]
 id = "la-vm-no-reenvia-al-mac"
 name = "Ningún puerto de la VM llega al Mac salvo la web"
-story = """Un programa de la VM (el proxy del agente, un servidor de depuración, Docker) abre puertos TCP y UDP en 127.0.0.1, 0.0.0.0 y [::], y Lima los abriría también en el `127.0.0.1` del Mac. Tras dar tiempo al agente de Lima, ninguno está en el Mac: desde la VM, el Mac (192.168.5.2, que es su 127.0.0.1) rechaza esos puertos TCP y no devuelve ningún datagrama UDP. Control: el puerto de la web en el Mac sí llega a la web de la VM."""
+story = """Un programa de la VM (el proxy del agente, un servidor de depuración, Docker) abre puertos TCP y UDP en 127.0.0.1, 0.0.0.0 y [::], y Lima los abriría también en el `127.0.0.1` del Mac. Tras dar tiempo al agente de Lima, ninguno está en el Mac: desde la VM, el Mac (192.168.5.2, que es su 127.0.0.1) rechaza esos puertos TCP y no devuelve ningún datagrama UDP. Control: el puerto de la web en el Mac sí llega a la web de la VM. Lo que no se ve desde la VM es el `[::1]` del Mac, donde Lima también reenvía la web (T26-3b-3): eso lo prueba `tests/install/instalar_mac_lab.sh alcance` desde el Mac (solo la web en 127.0.0.1 y [::1], y ningún otro programa puede escuchar en ese [::1])."""
 inspired_by = "El reenvío automático de puertos de Lima, que por defecto abre en el Mac todo lo que escucha la VM"
 invariants = [1, 3, 7]
 status = "ready"

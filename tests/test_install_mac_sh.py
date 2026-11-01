@@ -67,7 +67,8 @@ elif args[0] == "list":
     form = args[args.index("--format") + 1] if "--format" in args else ""
     if "PortForwards" in form:
         p = ports.get(name, 8765)
-        print(state.get("forwards", f"127.0.0.1 [8765 8765] 127.0.0.1 [{p} {p}] tcp false;"
+        print(state.get("forwards", f"::1 [8765 8765] ::1 [{p} {p}] tcp false;"
+              f"127.0.0.1 [8765 8765] 127.0.0.1 [{p} {p}] tcp false;"
               "0.0.0.0 [1 65535] 127.0.0.1 [1 65535] any true;"
               ":: [1 65535] 127.0.0.1 [1 65535] any true;"))
     elif "Mounts" in form:
@@ -267,7 +268,14 @@ def mac(tmp_path: Path, short_dir: Path) -> Mac:
     )
     _write_sh(fake / "sw_vers", 'echo "${FAKE_MACOS:-27.0.1}"')
     _write_sh(fake / "sysctl", 'echo "${FAKE_MEMORY:-25769803776}"')
-    _write_sh(fake / "lsof", 'cat "$FAKE_LISTENER_FILE" 2>/dev/null || true')
+    # The port's listeners: `listener` on 127.0.0.1, and on [::1] too unless there is a
+    # `listener.6` (T26-3b-3); asked for no address, all of them.
+    _write_sh(
+        fake / "lsof",
+        'f=$FAKE_LISTENER_FILE; case "$*" in *"4TCP@127.0.0.1:"*) exec cat "$f" 2>/dev/null ;;\n'
+        '*"6TCP@[::1]:"*) [ -e "$f.6" ] || f6=$f; exec cat "${f6:-$f.6}" 2>/dev/null ;; esac\n'
+        'cat "$f" "$f.6" 2>/dev/null || true',
+    )
     _write_sh(
         fake / "df",
         'echo "Filesystem 1K-blocks Used Available"; echo "x 1 1 ${FAKE_FREE_K:-209715200}"',
@@ -374,10 +382,14 @@ def test_the_template_mounts_nothing_and_forwards_only_the_web() -> None:
     assert image, "the Fedora image is pinned by digest"
     assert re.search(r"(?m)^cpus: 4$", t) and 'memory: "6GiB"' in t and 'disk: "40GiB"' in t
     forwards = t.split("portForwards:\n", 1)[1]
-    first, *ignored = forwards.split("\n- ")[0:3]
-    assert (
-        "guestPort: 8765" in first and 'hostIP: "127.0.0.1"' in first and "hostPort: 8765" in first
-    )
+    rules = forwards.split("\n- ")
+    assert len(rules) == 4, rules  # the file ends with them: nothing else is forwarded
+    ipv6, ipv4, *ignored = rules
+    # T26-3b-3: the web's [::1] to the Mac's [::1], where a browser tries backtide.localhost
+    # first. Before the 127.0.0.1 rule, which also takes a guest's ::1 (first match wins).
+    for rule, ip in ((ipv6, "::1"), (ipv4, "127.0.0.1")):
+        assert f'guestIP: "{ip}"' in rule and f'hostIP: "{ip}"' in rule, rule
+        assert "guestPort: 8765" in rule and "hostPort: 8765" in rule and "proto: tcp" in rule
     assert all("ignore: true" in rule and "proto: any" in rule for rule in ignored)
     assert {'guestIP: "0.0.0.0"', 'guestIP: "::"'} <= {
         line.strip().lstrip("- ") for rule in ignored for line in rule.splitlines()
@@ -526,7 +538,7 @@ def test_the_first_run_makes_the_vm_and_installs_inside(mac: Mac, shell: str) ->
     assert verbs[:2] == ["create", "start"]
     create = next(a for a in argvs if a[0] == "create")
     assert create[:4] == ["create", "--tty=false", "--name", "backtide"]
-    assert ".portForwards[0].hostPort = 8765" in create
+    assert ".portForwards[0].hostPort = 8765 | .portForwards[1].hostPort = 8765" in create
     made = (mac.lima_home / "backtide" / "lima.yaml").read_text()
     assert made == TEMPLATE_TEXT  # the archive's template, nothing added
     copy = next(a for a in argvs if a[0] == "copy")
@@ -588,7 +600,7 @@ def test_the_lab_yaml_goes_only_into_a_test_vm(mac: Mac) -> None:
     )
     assert "provision" not in (mac.lima_home / "backtide" / "lima.yaml").read_text()
     create = next(a for a in mac.lima_calls() if a[0] == "create")
-    assert ".portForwards[0].hostPort = 8765" in create
+    assert ".portForwards[0].hostPort = 8765 | .portForwards[1].hostPort = 8765" in create
     (mac.root / "listener").unlink()  # the fake has one port: the first VM's is on 8765
     done = mac.install(
         "--sin-clave",
@@ -604,7 +616,7 @@ def test_the_lab_yaml_goes_only_into_a_test_vm(mac: Mac) -> None:
         .endswith("provision: []\n")
     )
     create = [a for a in mac.lima_calls() if a[0] == "create"][-1]
-    assert ".portForwards[0].hostPort = 18765" in create
+    assert ".portForwards[0].hostPort = 18765 | .portForwards[1].hostPort = 18765" in create
 
 
 @pytest.mark.parametrize("name", ["Backtide", "-x", "a b", "a;b", "a/b", ""])
@@ -999,6 +1011,14 @@ def test_the_wrapper_will_not_give_the_link_when_another_program_has_the_port(
             {"forwards": "127.0.0.1 [1 65535] 127.0.0.1 [1 65535] any false;"},
             "no son los de la plantilla",
         ),
+        (  # made before T26-3b-3: nothing on the Mac's [::1]
+            {
+                "forwards": "127.0.0.1 [8765 8765] 127.0.0.1 [8765 8765] tcp false;"
+                "0.0.0.0 [1 65535] 127.0.0.1 [1 65535] any true;"
+                ":: [1 65535] 127.0.0.1 [1 65535] any true;"
+            },
+            "no son los de la plantilla",
+        ),
     ],
 )
 def test_a_vm_whose_config_drifted_from_the_template_is_not_touched(
@@ -1370,12 +1390,40 @@ def test_the_web_password_is_not_taken_from_a_mac_path(mac: Mac, flag: list[str]
     _nothing_made(mac)
 
 
-def test_the_link_is_refused_when_another_program_holds_the_port_on_ipv6(
+def test_the_link_is_refused_when_another_program_also_holds_the_port(
     mac: Mac, wrapper: Path
 ) -> None:
-    """T26-3b-2: backtide.localhost goes to [::1] first; Lima holds only 127.0.0.1, so any other
-    listener on the port (here, besides the hostagent 4242) would get the link."""
+    """T26-3b-2: any other listener on the port (here, besides the hostagent 4242), on any
+    address, would get the link."""
     (mac.root / "listener").write_text("4242\n999\n")
     done = mac.run("enlace", script=wrapper)
     assert done.returncode == 1 and "otro programa (pid 999)" in done.stdout + done.stderr
     (mac.root / "listener").write_text("4242\n")
+
+
+def test_the_link_needs_lima_on_the_macs_ipv6_loopback_too(mac: Mac, wrapper: Path) -> None:
+    """T26-3b-3: the hostagent holds [::1] as well as 127.0.0.1, so no other program can take
+    [::1] while the VM runs; without it (a VM still starting, or Lima's rule gone) no link."""
+    _write_sh(mac.bin / "sleep", "exit 0")  # its 15 seconds of waiting for Lima, at once
+    (mac.root / "listener.6").write_text("")
+    first = len(mac.calls())
+    done = mac.run("enlace", script=wrapper)
+    assert done.returncode == 1 and "no está reenviado a la VM" in done.stdout + done.stderr
+    assert [c for c in mac.calls()[first:] if c.get("argv", [""])[0] == "shell"] == []
+    (mac.root / "listener.6").write_text("999\n")  # someone else's, on [::1] alone
+    done = mac.run("enlace", script=wrapper)
+    assert done.returncode == 1 and "otro programa (pid 999)" in done.stdout + done.stderr
+    (mac.root / "listener.6").write_text("4242\n")
+    assert mac.run("enlace", script=wrapper).returncode == 0
+    (mac.root / "listener").write_text("")  # Lima on [::1] alone: 127.0.0.1 is not forwarded
+    done = mac.run("enlace", script=wrapper)
+    assert done.returncode == 1 and "no está reenviado a la VM" in done.stdout + done.stderr
+
+
+def test_starting_the_vm_checks_the_port_too(mac: Mac, wrapper: Path) -> None:
+    """After a restart of the Mac the VM is stopped and the port free, maybe for hours: whoever
+    took [::1] meanwhile is caught by `backtide vm arrancar` as well, not only by `enlace`."""
+    mac.set_state(vms={"backtide": "Stopped"})
+    (mac.root / "listener.6").write_text("999\n")  # someone else's, taken before Lima could
+    done = _wrap(mac, wrapper, "vm", "arrancar")
+    assert done.returncode == 1 and "otro programa (pid 999)" in done.stdout + done.stderr

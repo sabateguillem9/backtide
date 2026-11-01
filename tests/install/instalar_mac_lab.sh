@@ -120,13 +120,15 @@ bateria() {
 }
 
 alcance() {
-  # From the Mac's side: listeners in the VM (TCP and UDP, on 127.0.0.1, 0.0.0.0 and [::]) for a
-  # while, and what Lima's hostagent opens on the Mac meanwhile. Only the web's port may appear,
-  # besides Lima's own ssh and DNS; and that port answers (the control).
+  # From the Mac's side: listeners in the VM (TCP and UDP, on 127.0.0.1, 0.0.0.0, [::] and [::1])
+  # for a while, and what Lima's hostagent opens on the Mac meanwhile. Only the web's port may
+  # appear, on 127.0.0.1 and [::1] (T26-3b-3), besides Lima's own ssh and DNS; that port answers
+  # on both (the control), no other program of the Mac can listen on its [::1], and the Mac's
+  # `backtide enlace` (with the real lsof) gives the link.
   vm 'nohup python3 -c "
 import socket, time
 s = []
-for a, f in ((\"127.0.0.1\", socket.AF_INET), (\"0.0.0.0\", socket.AF_INET), (\"::\", socket.AF_INET6)):
+for a, f in ((\"127.0.0.1\", socket.AF_INET), (\"0.0.0.0\", socket.AF_INET), (\"::\", socket.AF_INET6), (\"::1\", socket.AF_INET6)):
     for k in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
         x = socket.socket(f, k); x.bind((a, 0)); k == socket.SOCK_STREAM and x.listen(); s.append(x)
 print(\" \".join(str(x.getsockname()[1]) for x in s), flush=True)
@@ -138,16 +140,44 @@ time.sleep(40)
   dns=$(sed -n 's/.*Start tcp DNS listening on: 127.0.0.1:\([0-9]*\).*/\1/p' "$LAB/l/$VM/ha.stderr.log" | tail -n 1)
   udp_dns=$(sed -n 's/.*Start udp DNS listening on: 127.0.0.1:\([0-9]*\).*/\1/p' "$LAB/l/$VM/ha.stderr.log" | tail -n 1)
   tcp=$(lsof -nP -a -p "$ha" -iTCP -sTCP:LISTEN | awk 'NR > 1 {print $9}' | sort | tr '\n' ' ')
-  udp=$(lsof -nP -a -p "$ha" -iUDP | awk 'NR > 1 && $9 ~ /^127\.0\.0\.1:/ {print $9}' | sort | tr '\n' ' ')
-  want_tcp=$(printf '127.0.0.1:%s\n' "$(cat "$LAB/port")" "$ssh_port" "$dns" | sort | tr '\n' ' ')
-  result vm_listeners "$(vm 'cat /tmp/alcance.ports')"
+  udp=$(lsof -nP -a -p "$ha" -iUDP | awk 'NR > 1 && $9 ~ /^(127\.0\.0\.1|\[::1\]):/ {print $9}' | sort | tr '\n' ' ')
+  want_tcp=$({ printf '127.0.0.1:%s\n' "$(cat "$LAB/port")" "$ssh_port" "$dns"; echo "[::1]:$(cat "$LAB/port")"; } | sort | tr '\n' ' ')
+  ports=$(vm 'cat /tmp/alcance.ports')
+  result vm_listeners "$ports"
   result mac_tcp "[$tcp]"
   result mac_udp "[$udp]"
   result want "tcp [$want_tcp] udp [127.0.0.1:$udp_dns ]"
   control=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: 127.0.0.1:8765' "http://127.0.0.1:$(cat "$LAB/port")/")
+  control6=$(curl -s -g -o /dev/null -w '%{http_code}' -H 'Host: 127.0.0.1:8765' "http://[::1]:$(cat "$LAB/port")/")
+  # Another program of the Mac, as a user would run it, trying the web's [::1], also with
+  # SO_REUSEADDR, SO_REUSEPORT and both. Only "address in use" counts as held; first, the
+  # control: this program may listen on [::1] at all (or it prints nothing).
+  taken=$(python3 -c '
+import errno, socket, sys
+socket.socket(socket.AF_INET6).bind(("::1", 0))
+out = []
+for opts in ((), (socket.SO_REUSEADDR,), (socket.SO_REUSEPORT,), (socket.SO_REUSEADDR, socket.SO_REUSEPORT)):
+    s = socket.socket(socket.AF_INET6)
+    for opt in opts:
+        s.setsockopt(socket.SOL_SOCKET, opt, 1)
+    try:
+        s.bind(("::1", int(sys.argv[1]))); s.listen(); out.append("free")
+    except OSError as e:
+        out.append("held" if e.errno == errno.EADDRINUSE else errno.errorcode.get(e.errno, "error"))
+    finally:
+        s.close()
+print(" ".join(out))' "$(cat "$LAB/port")" || true)
+  link=0; lab_env backtide enlace > /dev/null 2>&1 < /dev/null || link=$?
   result control "$control"
-  [ "$tcp" = "$want_tcp" ] && [ "$udp" = "127.0.0.1:$udp_dns " ] && [ "$control" != 000 ] \
-    || { echo "FALLO: el Mac tiene algo más que la web, el ssh y el DNS de Lima" >&2; return 1; }
+  result control6 "$control6"
+  result ipv6_taken "$taken"
+  result enlace_exit "$link"
+  # The eight listeners of the VM really were there (or nothing was tried).
+  case "$ports" in *[!0-9\ ]* | "") ports= ;; esac
+  [ "$(echo "$ports" | wc -w | tr -d ' ')" = 8 ] && [ "$tcp" = "$want_tcp" ] \
+    && [ "$udp" = "127.0.0.1:$udp_dns " ] && [ "$control" != 000 ] && [ "$control6" != 000 ] \
+    && [ "$taken" = "held held held held" ] && [ "$link" = 0 ] \
+    || { echo "FALLO: el Mac tiene algo más que la web, el ssh y el DNS de Lima, su [::1] está libre o no hay enlace" >&2; return 1; }
   result alcance OK
 }
 
