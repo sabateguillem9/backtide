@@ -18,6 +18,7 @@ from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, lo
 from backtide.jail import ExposedJail, JailError
 from backtide.jail.profile import ProfileError
 from backtide.jail.profiles import DEFAULT_PROFILE
+from backtide.service.agents import load_installation
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import (
     OUTCOME_EXIT_CODES,
@@ -270,9 +271,15 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     take.set_defaults(handler=_export)
 
 
+def _main_of(path: Path) -> ServiceConfig:
+    """The main agent's config: every order of the CLI is about it until T26-2c. A file of another
+    agent that cannot be used is an error here too: nothing of an installation is half read."""
+    return load_installation(path).main
+
+
 def _shell_config(args: argparse.Namespace) -> ServiceConfig | None:
     try:
-        return ServiceConfig.from_file(args.config)
+        return _main_of(args.config)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return None
@@ -782,7 +789,8 @@ def _web_group(name: str | None) -> int | str | None:
 
 def _watch(args: argparse.Namespace) -> int:
     try:
-        config = ServiceConfig.from_file(args.config)
+        installation = load_installation(args.config)
+        config = installation.main
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
@@ -798,7 +806,8 @@ def _watch(args: argparse.Namespace) -> int:
     print("backtide arrancando. Ctrl-C o SIGTERM lo paran, y con él al agente.", flush=True)
     try:
         web = {"web_group": web_group, "web_user": _web_user(args.web_group)}
-        serve(config, **({} if web_group is None else web))
+        others = {"others": installation.others} if installation.others else {}
+        serve(config, **({} if web_group is None else web), **others)
     except ProfileError as error:  # OpenClaw's: UnrewindableConfig
         _error(error.notice)  # the alert and the black box already hold the detail
         return EXIT_ERROR
@@ -850,7 +859,7 @@ def _watch(args: argparse.Namespace) -> int:
 
 def _list_snapshots(args: argparse.Namespace) -> int:
     try:
-        config = ServiceConfig.from_file(args.config)
+        config = _main_of(args.config)
         snapshots = SnapshotStore(config.volume).snapshots()
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
@@ -880,7 +889,7 @@ def _rewind(args: argparse.Namespace) -> int:
         )
         return EXIT_ERROR
     try:
-        config = ServiceConfig.from_file(args.config)
+        config = _main_of(args.config)
         known = SnapshotStore(config.volume).snapshots()
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
@@ -917,7 +926,7 @@ def _rewind(args: argparse.Namespace) -> int:
 def _resume(args: argparse.Namespace) -> int:
     """`backtide seguir`: everything but reading the config is in backtide/service/seguir.py."""
     try:
-        config = ServiceConfig.from_file(args.config)
+        config = _main_of(args.config)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
@@ -927,7 +936,7 @@ def _resume(args: argparse.Namespace) -> int:
 def _list_holds(args: argparse.Namespace) -> int:
     """`backtide retenidas`: everything but reading the config is in service/retenidas.py."""
     try:
-        config = ServiceConfig.from_file(args.config)
+        config = _main_of(args.config)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
@@ -937,7 +946,7 @@ def _list_holds(args: argparse.Namespace) -> int:
 def _decide_hold(args: argparse.Namespace) -> int:
     """`backtide aprobar` and `backtide rechazar`."""
     try:
-        config = ServiceConfig.from_file(args.config)
+        config = _main_of(args.config)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
@@ -958,7 +967,7 @@ def _caps(args: argparse.Namespace) -> int:
 
 def _load_config(args: argparse.Namespace) -> ServiceConfig | None:
     try:
-        return ServiceConfig.from_file(args.config)
+        return _main_of(args.config)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return None

@@ -33,6 +33,11 @@ Together, agents share nothing that would let one reach another: no container or
 uid or gid, no folder (a volume, the image behind one, a config folder) that holds another's, links
 resolved, and no secret (a fake key, a Gateway token, a black box's key: a copied folder would
 share them). And an agent's ids belong to no account of the machine.
+
+With other agents, each one's jail is told what is theirs (T26-2b, ``neighbours``): their volumes,
+their images and their config folders are protected paths like the black box, so a container that
+mounts one is refused or killed. With no other agent nothing is told: ``main`` stays what
+``from_file`` gave.
 """
 
 import dataclasses
@@ -46,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from backtide.jail import identity
+from backtide.jail.config import Protected
 from backtide.jail.identity import MAX_AGENTS as MAX_AGENTS
 from backtide.service.config import (
     _DECIDED_PROXY_KEYS,
@@ -109,11 +115,14 @@ def load_installation(path: Path) -> Installation:
         raise ConfigError(f"at most {MAX_AGENTS} agents, the main one included")
     others = [_read_agent(main, folder / f"{slug}{_FILE_SUFFIX}", slug) for slug in slugs]
     others.sort(key=lambda config: config.number)
-    installation = Installation(main, tuple(others))
-    _check_apart(installation.agents)
+    agents = (main, *others)
+    _check_apart(agents)
     for config in others:
         _check_ids_free(config)
-    return installation
+    if not others:
+        return Installation(main)  # an empty agents/: nothing changes
+    first, *rest = [_told_of_neighbours(config, agents) for config in agents]
+    return Installation(first, tuple(rest))
 
 
 def _check_slug(slug: str) -> None:
@@ -144,10 +153,21 @@ def _read_agent(main: ServiceConfig, path: Path, slug: str) -> ServiceConfig:
     image = data.get("volume_image")
     image = None if image is None else _as_path("volume_image", image)
     home = main.agents_dir / slug
-    if image is not None and image.is_relative_to(main.state_dir) and image != home / _IMAGE:
+    state = Path(os.path.realpath(main.state_dir))  # a link may lead there: what counts is where
+    if image is not None and (
+        image.is_relative_to(main.state_dir) or Path(os.path.realpath(image)).is_relative_to(state)
+    ):
+        allowed = home / _IMAGE
+        if os.path.realpath(image) != os.path.join(state, allowed.relative_to(main.state_dir)):
+            raise ConfigError(
+                f"{path}: volume_image {image} is in the state, and the only one allowed there is "
+                f"{allowed}: the rest of it is black boxes and keys"
+            )
+    volume = _as_path("volume", data["volume"])
+    if _overlap(state, Path(os.path.realpath(volume))):
         raise ConfigError(
-            f"{path}: volume_image {image} is in the state, and the only one allowed there is "
-            f"{home / _IMAGE}: the rest of it is black boxes and keys"
+            f"{path}: volume {volume} is in the state, or holds it: the agent writes its volume, "
+            "and the state is black boxes and keys"
         )
     ensure_state_folder(main.agents_dir, "the agents' folder")
     ensure_state_folder(home, "the agent's folder")  # checked before anything is read from it
@@ -164,7 +184,7 @@ def _read_agent(main: ServiceConfig, path: Path, slug: str) -> ServiceConfig:
         slug=slug,
         number=data["number"],
         display_name=_display_name(path, data.get("name")),
-        volume=_as_path("volume", data["volume"]),
+        volume=volume,
         volume_image=image,
         max_volume_bytes=data.get("max_volume_bytes"),
         workspace_limit=data.get("workspace_limit"),
@@ -287,6 +307,22 @@ def _id_taken(number: int) -> bool:
     except KeyError:
         return False
     return True
+
+
+def _told_of_neighbours(config: ServiceConfig, agents: tuple[ServiceConfig, ...]) -> ServiceConfig:
+    """``config``, its jail told what of the others it must never see. Made again, so what it may
+    mount is checked against them too (a ConfigError if it would show one)."""
+    neighbours: list[Protected] = []
+    for other in agents:
+        if other.slug == config.slug:
+            continue
+        neighbours.append(Protected(f"the volume of the agent {other.slug}", other.volume))
+        if other.volume_image is not None:
+            neighbours.append(Protected(f"the image of the agent {other.slug}", other.volume_image))
+        neighbours.append(
+            Protected(f"the config of the agent {other.slug}", other.agent_config_dir)
+        )
+    return dataclasses.replace(config, neighbours=tuple(neighbours))
 
 
 def _only_once[T](seen: dict[T, str], value: T, slug: str, what: str) -> None:

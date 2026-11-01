@@ -18,6 +18,12 @@ Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
   it half way, and a second signal while it stops is ignored: a stop of the agent takes up to
   ``stop_timeout`` s. The handler only writes a byte to a pipe: ``Event.set`` takes a lock, and
   a handler runs on the very thread that may be holding it.
+- ``serve`` with ``others`` (T26-2b; docs/47, section 6.1): one ``Guardian`` per agent in one
+  process. The main one runs on the main thread, as it always did: the sockets, the bot and the
+  lock are its and, if it ends, so does everything (fail closed, and systemd starts it again).
+  Every other one runs on a thread of its own (``_Neighbours``): one that cannot start or fails is
+  told, in the installation's black box and to the owner, and the others go on. With no others,
+  no thread and nothing of this.
 """
 
 import dataclasses
@@ -28,7 +34,8 @@ import os
 import signal
 import stat
 import threading
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import FrameType, TracebackType
 from typing import Protocol
@@ -42,17 +49,27 @@ from backtide.analyzer import (
     parse_rules,
 )
 from backtide.blackbox import BlackBox, BlackBoxError, create_key, load_key
-from backtide.blackbox.redact import MIN_KNOWN_SECRET
+from backtide.blackbox.redact import MIN_KNOWN_SECRET, redact
 from backtide.gate import protocol
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import MAIL_TRANSLATORS
 from backtide.jail import AgentJail, JailError, ca
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
-from backtide.notify import Alert, AlertLevel, AlertQueue, AlertSink, FanOut, LogNotifier, Notifier
+from backtide.notify import (
+    Alert,
+    AlertLevel,
+    AlertQueue,
+    AlertSink,
+    FanOut,
+    Labelled,
+    LogNotifier,
+    Notifier,
+)
 from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
+from backtide.service import scope
 from backtide.service.bot import Hooks, telegram_parts
 from backtide.service.config import (
     KEY_UNUSABLE,
@@ -80,7 +97,12 @@ from backtide.service.passkeys import WEB_PORT, Passkeys, origin_for
 from backtide.service.password import Checker
 from backtide.service.pause import Holder, make_space_gate, read_holders
 from backtide.service.price_update import PriceUpdater
-from backtide.service.process_sensor import ProcessSensor, SnapshotBefore, recorded_keys
+from backtide.service.process_sensor import (
+    ProcessSensor,
+    SensorShare,
+    SnapshotBefore,
+    recorded_keys,
+)
 from backtide.service.proxy_channel import KEY_NOT_APPLIED, Policy, known_secrets
 from backtide.service.settings import Applied, ReloadFailedClosed, Settings
 from backtide.service.spend import Budget
@@ -92,6 +114,12 @@ from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
 
 logger = logging.getLogger(__name__)
 
+SYSTEMD_RUN_MARK = "INVOCATION_ID"  # systemd sets it for every service it runs
+NEIGHBOURS_STOP = 110.0  # under the unit's TimeoutStopSec, which ends it all at 120
+_FAILED_AGENT_CHARS = 300
+_INSTALLATION_BOX = (
+    threading.Lock()
+)  # one writer: agents may fail at once, and its key is made once
 _STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 LOCK_ATTEMPTS = 5
 
@@ -220,19 +248,50 @@ def open_installation_box(config: ServiceConfig) -> BlackBox:
     return _box_at(config.installation_db, config.installation_key, config.installation_checkpoint)
 
 
-def record_installation_start(config: ServiceConfig, alerts: AlertSink) -> None:
+def record_installation_start(
+    config: ServiceConfig, alerts: AlertSink, others: Sequence[ServiceConfig] = ()
+) -> None:
     """Write in the installation's box that the service starts, and with which agents. Opened
     and closed each time: what goes there is rare, and it holds nothing open.
 
     A box that cannot be used never stops the service: it records no agent, whose own black box
     is untouched and is what the service depends on. It is told out loud instead, and a chain
     that does not verify is not extended."""
+    details = {"agents": [config.slug, *(other.slug for other in others)]}
+    _record_in_installation(config, alerts, "service_start", "", details)
+
+
+def record_agent_failed(
+    config: ServiceConfig, alerts: AlertSink, slug: str, error: BaseException
+) -> None:
+    """An agent other than the main one could not start or stopped being watched: it is told
+    in the installation's box, whose business it is, and to the owner. The others go on."""
+    text = str(redact(f"{type(error).__name__}: {error}"))[:_FAILED_AGENT_CHARS]
+    _record_in_installation(config, alerts, "agent_failed", slug, {"error": text}, risk=2)
+    alerts.submit(
+        Alert(
+            AlertLevel.ERROR,
+            f"El agente {slug} no se está vigilando",
+            f"No ha arrancado o ha dejado de vigilarse, y los demás siguen. Causa: {text}",
+        )
+    )
+
+
+def _record_in_installation(
+    config: ServiceConfig,
+    alerts: AlertSink,
+    action: str,
+    target: str,
+    details: dict[str, object],
+    *,
+    risk: int = 0,
+) -> None:
     try:
-        with open_installation_box(config) as box:
+        with _INSTALLATION_BOX, open_installation_box(config) as box:
             problems = box.verify().problems
             if problems:
                 raise BlackBoxError(f"its chain does not verify ({len(problems)} problems)")
-            box.append("system", "service_start", "", details={"agents": [config.slug]})
+            box.append("system", action, target, details=details, risk=risk)
     except (BlackBoxError, ConfigError, OSError) as error:
         logger.error("the installation's black box cannot be used: %s", error)
         alerts.submit(
@@ -296,6 +355,8 @@ def build_guardian(
     on_egress: Callable[[Egress], None] | None = None,
     scrub: LiveScrub | None = None,
     hold_watch: HoldWatch | None = None,
+    sensor_share: SensorShare | None = None,
+    log_filter: Callable[[logging.LogRecord], bool] | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -320,7 +381,9 @@ def build_guardian(
     ``on_egress`` is handed the egress once it is built (``serve``: the Settings page hands it
     the providers' new keys, T12e), and ``hold_watch`` is told about its held requests (the
     Telegram notice, T10-4). ``scrub`` is the process sensor's list of secrets to strike,
-    filled here and kept by ``serve`` to refresh it when a key changes."""
+    filled here and kept by ``serve`` to refresh it when a key changes. With several agents
+    (T26-2b), ``sensor_share`` is the one Tetragon they have in common and ``log_filter`` says
+    which log records are this one's."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
         rules = load_rules(config)  # a broken file is an error, not a guess
@@ -358,7 +421,9 @@ def build_guardian(
     if grow is None:
         grow = make_grower(config)
     process_sensor = (
-        build_sensor(config, jail, rated_box, store, jail_config=sensor_jail, scrub=scrub)
+        build_sensor(
+            config, jail, rated_box, store, jail_config=sensor_jail, scrub=scrub, share=sensor_share
+        )
         if sensor
         else None
     )
@@ -387,6 +452,7 @@ def build_guardian(
         prepare_egress=lambda: prepare_egress(config),
         sensor=process_sensor,
         egress=egress,
+        log_filter=log_filter,
     )
     responder.bind(snapshot=guardian.take_evidence, record=rated_box.append)
     return guardian, alerts, box
@@ -400,6 +466,7 @@ def build_sensor(
     *,
     jail_config: SensorJailConfig | None = None,
     scrub: LiveScrub | None = None,
+    share: SensorShare | None = None,
 ) -> ProcessSensor:
     """The process sensor of ``config`` (docs/23): Tetragon's container, and the reader that
     records the agent's commands and connections through the rules (``box``), each with the
@@ -429,6 +496,7 @@ def build_sensor(
         agent,
         required=config.sensor_required,
         novelty_streak=config.sensor_novelty_streak,
+        share=share,
     )
 
 
@@ -447,14 +515,15 @@ def build_egress(
     hands the proxy each provider's real and fake key (in memory only: the ``config`` message,
     T06-5), records through the rules (``box``) and strikes the Gateway token too. Constructed
     only: the Guardian starts it. ConfigError for an allowed host the gate cannot use."""
-    proxy = proxy if proxy is not None else ProxyJail(config.proxy_jail_config())
+    proxy = proxy if proxy is not None else _proxy_jail(config)
     providers, problems = config.model_providers_and_problems(local_upstreams(config))
     policy = egress_policy(config, providers, problems)
     if timings is None:
         timings = config.gate_settings().timings  # [gate] wait_s, hold_s, preapproval_s
-    # The recipients trusted from the web (T10-5, decision 9): <state_dir>/trusted.json, read
-    # once here; a file that cannot be used gives no trust (logged).
-    trust = TrustStore(config.state_dir)
+    # The recipients trusted from the web (T10-5, decision 9): trusted.json in the agent's folder
+    # (the main one's is <state_dir>), read once here; a file that cannot be used gives no trust
+    # (logged). What is trusted for one agent never lets out another's.
+    trust = TrustStore(config.agent_dir)
     trust.load()
     budget, prices = build_budget(config, box, alerts)
     # The gate (T10-2) reads the black box once, at the first start: the holds a backtide that
@@ -477,16 +546,33 @@ def build_egress(
     )
 
 
+def _proxy_jail(config: ServiceConfig) -> ProxyJail:
+    """The proxy's container. What a service under its systemd unit mounts stays in its own mount
+    namespace and Docker never sees it (docs/25, section 1), so another agent's channel has to be
+    mounted before the service starts, as the main one's is by its unit (docs/47, section 6.3)."""
+    if not config.is_main and SYSTEMD_RUN_MARK in os.environ:
+        return ProxyJail(config.proxy_jail_config(), mount=_channel_not_mounted)
+    return ProxyJail(config.proxy_jail_config())
+
+
+def _channel_not_mounted(argv: list[str]) -> None:
+    raise JailError(
+        f"the channel's tmpfs has to be mounted before the service starts: {' '.join(argv)}"
+    )
+
+
 def build_budget(
     config: ServiceConfig, box: AssessedBlackBox, alerts: AlertQueue | None
 ) -> tuple[Budget, PriceUpdater]:
     """The spending cap of ``[budget]`` (T11, docs/33) and, unless ``auto_prices = false``, the
     updater of its prices (Anthropic's page, from the service: never through the agent's proxy).
-    Constructed only: the Egress opens the budget and starts the updater at its first start."""
+    Constructed only: the Egress opens the budget and starts the updater at its first start.
+    What it keeps goes in the agent's folder: <state_dir> for the main one, and for another its
+    own, so two ledgers never write one file. The cap of the whole installation is T26-2c."""
     settings = config.budget_settings()
     budget = Budget(
         settings,
-        state_dir=config.state_dir,
+        state_dir=config.agent_dir,
         record=box.append,
         alert=None if alerts is None else alerts.submit,
         history=box.events,
@@ -494,7 +580,7 @@ def build_budget(
     # With auto_prices = false it only loads the last good table fetched before (no thread).
     prices = PriceUpdater(
         budget,
-        state_dir=config.state_dir,
+        state_dir=config.agent_dir,
         record=box.append,
         url=settings.prices_url,
         auto=settings.auto_prices,
@@ -792,6 +878,108 @@ def _stop_unrecorded_agent(
     error.add_note("Se ha parado al agente que estaba en marcha: sin grabar no hay vigilancia.")
 
 
+def reload_everyones_keys(
+    main: Callable[[], Applied], others: Callable[[], Sequence[Callable[[], Applied]]]
+) -> Callable[[], Applied]:
+    """What the Settings page calls with several agents: the keys are the machine's, so each
+    agent's proxy gets them. All are tried: one that fails closed never leaves another with a key
+    the owner took away. ``NOW`` only if every proxy has it; a failure, whichever, is told."""
+
+    def reload() -> Applied:
+        applied: list[Applied] = []
+        failed = False
+        for each in (main, *others()):
+            try:
+                applied.append(each())
+            except ReloadFailedClosed as error:
+                failed = True
+                applied.append(error.applied)
+            except Exception:  # key_reloader handles its own: this is a bug, and it is told
+                logger.exception("an agent's proxy could not be handed the keys")
+                failed = True
+                applied.append(Applied.WHEN_UP)
+        result = Applied.NOW if all(a is Applied.NOW for a in applied) else Applied.WHEN_UP
+        if failed:
+            raise ReloadFailedClosed(result)
+        return result
+
+    return reload
+
+
+class _Neighbours:
+    """The agents other than the main one, each with its Guardian on a thread of its own."""
+
+    def __init__(
+        self,
+        main: ServiceConfig,
+        others: Sequence[ServiceConfig],
+        *,
+        notifier_for: Callable[[str], Notifier],
+        stop: threading.Event,
+        share: SensorShare | None,
+        told: AlertSink,
+        build: Callable[..., tuple[Guardian, AlertQueue, BlackBox]] | None = None,
+        run: Callable[..., None] | None = None,
+    ) -> None:
+        self._main = main
+        self._others = others
+        self._notifier_for = notifier_for
+        self._stop = stop
+        self._share = share
+        self._told = told
+        self._build = build if build is not None else build_guardian
+        self._run_guardian = run if run is not None else run_guardian
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._reloads: list[Callable[[], Applied]] = []
+
+    def reloads(self) -> list[Callable[[], Applied]]:
+        """Who to hand new keys to: the proxies built so far."""
+        with self._lock:
+            return list(self._reloads)
+
+    def start(self) -> None:
+        for config in self._others:
+            thread = threading.Thread(
+                target=self._watch, args=(config,), name=f"backtide-agent-{config.slug}"
+            )
+            thread.start()
+            self._threads.append(thread)
+
+    def join(self, timeout: float = NEIGHBOURS_STOP) -> None:
+        """They were told to stop (``stop``): each stops its own agent, at once with the others."""
+        deadline = time.monotonic() + timeout
+        for thread in self._threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                logger.error("%s did not stop in %s s", thread.name, timeout)
+
+    def _watch(self, config: ServiceConfig) -> None:
+        """One agent's whole watch. What goes wrong in it stays in it."""
+        scope.enter(config.slug)
+        try:
+            self._serve_one(config)
+        except Exception as error:  # the Guardian already stopped its agent, or said it could not
+            logger.exception("the agent %s is not being watched", config.slug)
+            record_agent_failed(self._main, self._told, config.slug, error)
+
+    def _serve_one(self, config: ServiceConfig) -> None:
+        built: list[Egress] = []
+        secrets = LiveScrub()
+        guardian, alerts, box = self._build(
+            config,
+            notifier=self._notifier_for(config.slug),
+            on_egress=built.append,
+            scrub=secrets,
+            sensor=self._share is not None,
+            sensor_share=self._share,
+            log_filter=scope.belongs_to(config.slug),
+        )
+        with self._lock:
+            self._reloads.extend(key_reloader(config, egress, secrets) for egress in built)
+        self._run_guardian(guardian, alerts, box, stop=self._stop, handle_signals=False)
+
+
 class _Runnable(Protocol):
     def run(self, stop: threading.Event, **options: ControlHook) -> None: ...
 
@@ -888,6 +1076,7 @@ def serve(
     hold_timings: HoldTimings | None = None,
     web_group: int | None = None,
     web_user: int | None = None,
+    others: Sequence[ServiceConfig] = (),
 ) -> None:
     """What `backtide vigilar` does: take the lock, build the real service and run it until it is
     told to stop, with the control socket of ``backtide rebobinar`` and ``backtide seguir`` open
@@ -903,12 +1092,30 @@ def serve(
 
     With ``web_group`` (`--grupo-web`, T12c) the web's narrow socket (``config.web_socket``)
     opens too, right after the control socket, for that group only (and, with ``web_user``,
-    that user only)."""
+    that user only).
+
+    With ``others`` (T26-2b) those agents run too, each on its own thread, and this one remains
+    the one behind the sockets and the bot (``--agente``, T26-2c). Each one's alerts say whose."""
     settings = load_telegram(config.state_dir)
     with take_lock(config.lock_file):
         telegram = telegram_parts(config, settings) if settings is not None else None
         if telegram is not None:
             notifier = FanOut(notifier or LogNotifier(), telegram.notifier)
+        stop = stop if stop is not None else threading.Event()
+        share: SensorShare | None = None
+        log_filter = None
+        neighbours: _Neighbours | None = None
+        if others:
+            scope.hand_down()  # before any thread of an agent starts
+            log_filter = scope.belongs_to(None)
+            share = SensorShare() if sensor else None
+            machine_notifier = notifier if notifier is not None else LogNotifier()
+            one_at_a_time = threading.Lock()
+
+            def notifier_for(slug: str) -> Notifier:
+                return Labelled(machine_notifier, slug, one_at_a_time)
+
+            notifier = notifier_for(config.slug)
         built: list[Egress] = []
         sensor_secrets = LiveScrub()
         guardian, alerts, box = build_guardian(
@@ -925,13 +1132,21 @@ def serve(
             on_egress=built.append,
             scrub=sensor_secrets,
             hold_watch=None if telegram is None else telegram.desk,
+            sensor_share=share,
+            log_filter=log_filter,
         )
         # The Settings page (T12e): `backtide web --ajustes` asks through this same socket.
         (egress,) = built
+        reload_keys = key_reloader(config, egress, sensor_secrets)
+        if others:
+            neighbours = _Neighbours(
+                config, others, notifier_for=notifier_for, stop=stop, share=share, told=alerts
+            )
+            reload_keys = reload_everyones_keys(reload_keys, neighbours.reloads)
         settings_service = Settings(
             config.state_dir,
             record=box.append,
-            reload_keys=key_reloader(config, egress, sensor_secrets),
+            reload_keys=reload_keys,
             in_use=[p.name for p in config.proxy_settings().providers],
             waiting=egress.waiting,
         )
@@ -985,7 +1200,14 @@ def serve(
                 guardian, box, snapshots, budget=egress.budget, waiting=egress.waiting
             )
             control = Hooks(control, telegram.bot)
-        record_installation_start(config, alerts)
-        run_guardian(
-            guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control
-        )
+        record_installation_start(config, alerts, others)
+        if neighbours is not None:
+            neighbours.start()
+        try:
+            run_guardian(
+                guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control
+            )
+        finally:
+            if neighbours is not None:
+                stop.set()  # the main agent is gone, and with it the way to ask for anything
+                neighbours.join()

@@ -176,6 +176,7 @@ class Paths:
     blackbox_db: Path = layout.BLACKBOX_DB
     volume_image: Path = layout.VOLUME_IMAGE
     volume_mount: Path = layout.VOLUME_MOUNT
+    agent_volumes: Path = layout.AGENT_VOLUMES
     export_dir: Path = layout.EXPORT_DIR
     channel_dir: Path = layout.PROXY_CHANNEL_DIR
     manifest: Path = layout.MANIFEST

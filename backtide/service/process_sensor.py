@@ -49,6 +49,14 @@ calls it at a few points of its life; everything else happens here, on the senso
 - **Unseen command lines** (T07-5): a summary window where command lines of a binary that does
   have events of its own were folded unseen (a parallel build) is risk 2 and an alert once per
   streak of heartbeats, never a stop: only binaries lost whole are blind.
+- **Several agents, one Tetragon** (T26-2b; docs/47, section 6.6): each agent has its own
+  ``ProcessSensor`` and its own reader of the same file, which keeps only its container's lines,
+  with its own cursor, budgets and probes; ``SensorShare`` is what they have in common. What makes
+  or removes the container goes one at a time, and the last one to leave removes it. Tetragon is
+  everyone's, so one agent cannot take it away from the others: while another agent's sensor is up,
+  a heartbeat that failed is that agent's problem, it is reported and the container stays (a
+  hostile agent would otherwise blind its neighbour at will). Tetragon's losses are read by each,
+  so the warning goes to every agent. Without a share nothing of this applies.
 - Nothing raises out of here into the Guardian: the sensor is observation, not a barrier.
 """
 
@@ -57,6 +65,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
@@ -188,6 +197,32 @@ def kernel_lost_details(grew: dict[str, int], **more: Any) -> dict[str, Any]:
     return {"kind": "kernel_lost", "count": sum(grew.values()), "counters": dict(grew), **more}
 
 
+class SensorShare:
+    """What the sensors of a process with several agents have in common: the one container."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()  # whoever creates, removes or prepares the container
+        self._members: list[ProcessSensor] = []
+
+    def join(self, sensor: "ProcessSensor") -> None:
+        with self.lock:
+            if sensor not in self._members:
+                self._members.append(sensor)
+
+    def leave(self, sensor: "ProcessSensor") -> bool:
+        """``sensor`` is done with the container. True if nobody else uses it: then it goes."""
+        with self.lock:
+            if sensor in self._members:
+                self._members.remove(sensor)
+            return not self._members
+
+    def may_replace(self, sensor: "ProcessSensor") -> bool:
+        """Whether ``sensor`` may take the container down to restart it: only when nobody else
+        sees through it. A sensor that is up says Tetragon works."""
+        with self.lock:
+            return not any(m is not sensor and m.state is SensorState.UP for m in self._members)
+
+
 class ProcessSensor:
     """The sensor's container, its reader and its heartbeat, for the Guardian.
 
@@ -211,7 +246,10 @@ class ProcessSensor:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         thread: bool = True,
+        share: SensorShare | None = None,
     ) -> None:
+        self._share = share
+        self._container_lock = share.lock if share is not None else nullcontext()
         self._jail = jail
         self._reader = reader
         self._agent = agent
@@ -295,6 +333,8 @@ class ProcessSensor:
 
     def start(self, hooks: SensorHooks) -> bool:
         """Bring the sensor up and start watching it. True if it serves. Never raises."""
+        if self._share is not None:
+            self._share.join(self)
         with self._lock:
             self._hooks = hooks
             self._closing.clear()
@@ -372,18 +412,23 @@ class ProcessSensor:
         with self._lock:
             if self._state is SensorState.OFF:
                 return
-            try:
-                if self._jail.is_running():
-                    self._jail.stop()  # SIGTERM: Tetragon writes what it holds, unloads programs
-            except JailError as error:
-                self._failed("stop", error, alert=False)
+            last = self._share is None or self._share.leave(self)
+            if last:
+                try:
+                    with self._container_lock:
+                        if self._jail.is_running():
+                            self._jail.stop()  # SIGTERM: Tetragon writes what it holds
+                except JailError as error:
+                    self._failed("stop", error, alert=False)
             if self._reading:
                 self._reading = False
                 self._reader.stop()  # reads to the end, the last summary and the cursor
-            try:
-                self._jail.remove()
-            except JailError as error:
-                self._failed("remove", error)
+            if last:
+                try:
+                    with self._container_lock:
+                        self._jail.remove()
+                except JailError as error:
+                    self._failed("remove", error)
             self._state = SensorState.OFF
             self._record("system", "sensor_stop", self.name, details={"reason": reason})
 
@@ -897,11 +942,12 @@ class ProcessSensor:
         self._record(
             "system", "sensor_restart", self.name, details={"attempt": len(self._restarts)}, risk=1
         )
-        try:
-            self._halt_container()
-        except JailError as error:
-            self._failed("restart", error)
-            return
+        if self._share is None or self._share.may_replace(self):
+            try:
+                self._halt_container()
+            except JailError as error:
+                self._failed("restart", error)
+                return
         if self._bring_up(restart=True) and self._required and self._hooks is not None:
             after.append(self._hooks.back)
 
@@ -911,7 +957,8 @@ class ProcessSensor:
         stage = "prepare"
         started = self._clock()
         try:
-            self._jail.prepare()
+            with self._container_lock:
+                self._jail.prepare()
             if not self._reading:
                 # Before the first read: what Tetragon wrote while backtide was down (a kill -9
                 # leaves the agent's container, with its id) is the agent's.
@@ -961,19 +1008,21 @@ class ProcessSensor:
             self._record_losses(lost, while_down=True)
 
     def _start_container(self) -> bool:
-        """Start the sensor; True if it reused one already running (a killed service's)."""
-        if self._jail.is_running():
-            try:
-                self._jail.start()  # checks it is exactly our sensor; a no-op otherwise
-                return True
-            except JailError as error:
-                logger.info("replacing the running sensor, which is not this one: %s", error)
-                self._halt_container()
-        elif self._jail.exists():
-            self._jail.remove()  # a stopped leftover: made again from this code
-        self._jail.create()
-        self._jail.start()
-        return False
+        """Start the sensor; True if it reused one already running (a killed service's, or the
+        one another agent's sensor started)."""
+        with self._container_lock:
+            if self._jail.is_running():
+                try:
+                    self._jail.start()  # checks it is exactly our sensor; a no-op otherwise
+                    return True
+                except JailError as error:
+                    logger.info("replacing the running sensor, which is not this one: %s", error)
+                    self._halt_container()
+            elif self._jail.exists():
+                self._jail.remove()  # a stopped leftover: made again from this code
+            self._jail.create()
+            self._jail.start()
+            return False
 
     def _wait_serving(self) -> None:
         deadline = self._clock() + self._ready_timeout
@@ -986,12 +1035,13 @@ class ProcessSensor:
 
     def _halt_container(self) -> None:
         """SIGTERM, then remove. Raises JailError only if it cannot be removed."""
-        try:
-            if self._jail.is_running():
-                self._jail.stop()
-        except JailError as error:
-            logger.info("the sensor did not stop, removing it: %s", error)
-        self._jail.remove()
+        with self._container_lock:
+            try:
+                if self._jail.is_running():
+                    self._jail.stop()
+            except JailError as error:
+                logger.info("the sensor did not stop, removing it: %s", error)
+            self._jail.remove()
 
     def _halt_quietly(self) -> None:
         try:

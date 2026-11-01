@@ -278,6 +278,9 @@ class Machine:
                     for container, role in SERVICE_CONTAINERS.items():
                         self.containers.setdefault(container, {"backtide.role": role})
                 return ok
+            case ("umount", point):
+                self.extra_mounts = [m for m in self.extra_mounts if str(m) != point]
+                return ok
             case ("systemctl", "restart", "docker.service"):
                 return ok
             case ("systemctl", "reload", "docker.service"):

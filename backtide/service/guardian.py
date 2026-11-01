@@ -570,6 +570,7 @@ class Guardian:
         prepare_egress: Callable[[], None] | None = None,
         sensor: Sensor | None = None,
         egress: EgressProxy | None = None,
+        log_filter: Callable[[logging.LogRecord], bool] | None = None,
     ) -> None:
         """Every collaborator is injected, so the tests use fakes. ``alerts`` is where alerts
         go (an ``AlertQueue`` in production); the caller starts and closes it. ``sample``
@@ -586,8 +587,10 @@ class Guardian:
         ``sensor`` (T07-3) is the process sensor; without it nothing watches the agent's
         commands and connections. ``egress`` (T06-4) is the proxy, the agent's only way out;
         without it the Guardian neither starts nor watches one (the unit tests that do not
-        test it)."""
+        test it). ``log_filter`` says which log records are this agent's, when a process runs
+        several (T26-2b, ``service.scope``); without it, all of them."""
         self._config = config
+        self._log_filter = log_filter
         self._sensor = sensor
         self._sensor_closing = threading.Event()  # set by the stop: the hooks stop waiting
         self._sensor_held = False  # the sensor (required) stopped the agent or kept it stopped
@@ -644,7 +647,7 @@ class Guardian:
         self._late_pause_seq: int | None = None
         self._late_since: float | None = None  # when that freeze was made (LATE_STUCK_AFTER)
 
-        self._bridge = LogBridge(self._on_log)
+        self._bridge = LogBridge(self._on_log, accepts=self._log_filter)
         self._stopped = False  # the agent really stopped
         self._wound_down = False  # watcher closed, service_stop recorded, bridge removed
         self._serving = False  # booted (black box open, service_start recorded), not wound down
@@ -718,7 +721,7 @@ class Guardian:
             self._serving = True
             with self.freeze_lock:
                 self._serving_since = self._mono()
-            self._bridge = LogBridge(self._on_log)
+            self._bridge = LogBridge(self._on_log, accepts=self._log_filter)
             self._bridge.start()
             logging.getLogger(_BRIDGED_LOGGERS).addHandler(self._bridge)
             try:
@@ -2567,7 +2570,7 @@ class Guardian:
                 logger.error("cannot use the black box, so nothing is rewound: %s", error)
                 raise
             self._serving = True
-            self._bridge = LogBridge(self._on_log)
+            self._bridge = LogBridge(self._on_log, accepts=self._log_filter)
             self._bridge.start()
             logging.getLogger(_BRIDGED_LOGGERS).addHandler(self._bridge)
 

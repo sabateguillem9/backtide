@@ -24,7 +24,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
@@ -82,6 +82,21 @@ class LogNotifier:
         }[alert.level]
         cited = f" (evento {alert.event_seq})" if alert.event_seq is not None else ""
         self._logger.log(level, "%s: %s%s", _printable(alert.title), _printable(alert.body), cited)
+
+
+class Labelled:
+    """Says which agent an alert is about, when a machine has several (T26-2b), and hands one
+    agent's alert at a time: each agent's queue calls this from its own thread, and ``notifier``
+    is the same for all of them. ``lock`` is theirs to share."""
+
+    def __init__(self, notifier: Notifier, label: str, lock: threading.Lock) -> None:
+        self._notifier = notifier
+        self._label = label
+        self._lock = lock
+
+    def send(self, alert: Alert) -> None:
+        with self._lock:
+            self._notifier.send(replace(alert, title=f"{self._label}: {alert.title}"))
 
 
 class FanOut:
@@ -239,9 +254,11 @@ class LogBridge(logging.Handler):
         interval: float = BRIDGE_INTERVAL,
         clock: Callable[[], float] = time.monotonic,
         maxsize: int = BRIDGE_QUEUE_SIZE,
+        accepts: Callable[[logging.LogRecord], bool] | None = None,
     ) -> None:
         super().__init__(level=logging.WARNING)
         self._sink = sink
+        self._accepts = accepts  # with several agents, what is this agent's (service.scope)
         self._interval = interval
         self._clock = clock
         self._seen: dict[tuple[str, int, str], tuple[float, int]] = {}
@@ -298,6 +315,8 @@ class LogBridge(logging.Handler):
             return
         if getattr(self._busy, "active", False):
             return  # the sink itself logged: never answer a log with a log
+        if self._accepts is not None and not self._accepts(record):
+            return  # another agent's
         try:
             template = str(record.msg)[:MAX_TEMPLATE_CHARS]
             suppressed = self._admit((record.name, record.levelno, template))

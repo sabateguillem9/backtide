@@ -288,7 +288,58 @@ def _egress(jail: AgentJail, run: Runner) -> Check:
     return egress(done.stdout.strip() or done.stderr.strip())
 
 
+def _verify_installation(config: ServiceConfig) -> Check:
+    """The installation's own black box (T26-2a): the service writes in it at every start, so a
+    service that started has one. What holds it up is apart from the agent's: the service goes on
+    without it, and here it is a failure so the owner hears of it."""
+    if not config.installation_db.exists():
+        return Check(
+            "installation-box",
+            Status.WARN,
+            "La caja de la instalación aún no existe",
+            f"La escribe el servicio al arrancar, en {config.installation_dir}.",
+        )
+    try:
+        box = BlackBox(
+            config.installation_db,
+            load_key(config.installation_key),
+            checkpoint_path=config.installation_checkpoint,
+            readonly=True,
+        )
+    except (BlackBoxError, OSError) as error:
+        return Check(
+            "installation-box",
+            Status.FAIL,
+            "No se puede abrir la caja de la instalación con su clave",
+            f"Mira {config.installation_dir}: {error}",
+        )
+    try:
+        report = box.verify()
+    except BlackBoxError as error:
+        return Check(
+            "installation-box", Status.FAIL, f"La caja de la instalación no se puede leer: {error}"
+        )
+    finally:
+        box.close()
+    if not report.ok:
+        return Check(
+            "installation-box",
+            Status.FAIL,
+            "La caja de la instalación NO está íntegra",
+            f"Mira {config.installation_dir}: los agentes siguen en sus cajas.",
+        )
+    return Check(
+        "installation-box",
+        Status.OK,
+        f"La caja de la instalación está íntegra ({report.checked} eventos)",
+    )
+
+
 def _verify(config: ServiceConfig) -> list[Check]:
+    return [*_verify_agent_box(config), _verify_installation(config)]
+
+
+def _verify_agent_box(config: ServiceConfig) -> list[Check]:
     box = _box(config)
     if box is None:
         return [
