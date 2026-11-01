@@ -177,6 +177,13 @@ estado() {
   result config "$(stat -c '%U:%G %a' /etc/backtide/backtide.toml)"
   result volume_root "$(stat -c '%U:%G %a' /var/lib/backtide-agent)"
   result web_link "$(stat -c '%U:%G %a' /run/backtide-web/enlace 2>/dev/null || echo missing)"
+  # The clock check runs ten minutes in: try it now under the service's own filter (incident of
+  # 2026-11-01), and say how many times the service has restarted.
+  result clock_under_filter "$(systemd-run --wait --pipe --quiet \
+    -p "SystemCallFilter=@system-service adjtimex clock_adjtime" \
+    -p "CapabilityBoundingSet=$(systemctl show -p CapabilityBoundingSet --value backtide.service)" \
+    /opt/backtide/current/.venv/bin/python -I -c 'from backtide.service.clock import clock_synced; print("read", clock_synced())' 2>&1 | tail -1)"
+  result service_restarts "$(systemctl show -p NRestarts --value backtide.service)"
   for unit in backtide.service backtide-web.service; do
     result "security:$unit" "$(systemd-analyze security --no-pager "$unit" 2>/dev/null | tail -1)"
   done

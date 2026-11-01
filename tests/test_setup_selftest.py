@@ -128,9 +128,9 @@ def test_the_host_address_is_never_loopback_or_dockers() -> None:
 
 
 def test_the_thresholds_are_the_measured_levels_plus_a_little() -> None:
-    """docs/25, "Resultados de T13-3": 3.1 and 1.2 on systemd 255 and 259. Losing a directive
-    moves the level up by more than the margin."""
-    assert selftest.SECURITY_THRESHOLDS == {layout.SERVICE_UNIT: 3.2, layout.WEB_UNIT: 1.3}
+    """docs/25, "Resultados de T13-3": 3.4 (3.1 before the service could read the clock) and 1.2
+    on systemd 259. Losing a directive moves the level up by more than the margin."""
+    assert selftest.SECURITY_THRESHOLDS == {layout.SERVICE_UNIT: 3.5, layout.WEB_UNIT: 1.3}
 
 
 def test_a_link_in_the_webs_journal_is_seen() -> None:

@@ -31,10 +31,9 @@ PrivateTmp=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-# Measured in clean VMs in T13-3: these five coexist with snapshots, rewinds, the watcher and
-# Docker (exposure 3.5 -> 3.1 on systemd 259).
+# Measured in clean VMs in T13-3: these coexist with snapshots, rewinds, the watcher and Docker
+# (exposure 3.4 on systemd 259, 3.1 before the service could read the clock).
 ProtectHostname=yes
-ProtectClock=yes
 ProtectKernelLogs=yes
 RestrictRealtime=yes
 RemoveIPC=yes
@@ -42,7 +41,9 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-SystemCallFilter=@system-service
+# adjtimex only to read whether the clock is synchronised, before pruning snapshots by age. Setting
+# the time needs CAP_SYS_TIME, which this unit does not have; ProtectClock would refuse the read too.
+SystemCallFilter=@system-service adjtimex clock_adjtime
 SystemCallArchitectures=native
 
 [Install]

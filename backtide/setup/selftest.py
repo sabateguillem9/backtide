@@ -47,9 +47,10 @@ SENSOR_WAIT = 60.0
 WEB_PORT = 8765
 TEST_NET = "192.0.2.1"  # RFC 5737 TEST-NET-1: documentation only, never routed
 # `systemd-analyze security` of each unit, measured in clean VMs (docs/25, "Resultados de
-# T13-3"): 3.1 and 1.2 with systemd 255 (Ubuntu 24.04) and 259 (Fedora 44), plus 0.1 of margin.
-# A higher number means a directive was lost.
-SECURITY_THRESHOLDS = {layout.SERVICE_UNIT: 3.2, layout.WEB_UNIT: 1.3}
+# T13-3"), plus 0.1 of margin: the service 3.4 with systemd 259 (Fedora 44; it reads the clock,
+# incident of 2026-11-01), the web 1.2 with 255 (Ubuntu 24.04) and 259. A higher number means a
+# directive was lost; the exact list is in tests/test_setup_units.py.
+SECURITY_THRESHOLDS = {layout.SERVICE_UNIT: 3.5, layout.WEB_UNIT: 1.3}
 _EXPOSURE = re.compile(r"Overall exposure level for \S+: ([0-9]+(?:\.[0-9]+)?)")
 _CONNECT_PROBE = (
     "import errno, socket, sys\n"

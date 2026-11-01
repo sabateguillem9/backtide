@@ -83,7 +83,6 @@ SERVICE = {
     "ProtectControlGroups": ["yes"],
     # T13-3, measured in clean VMs
     "ProtectHostname": ["yes"],
-    "ProtectClock": ["yes"],
     "ProtectKernelLogs": ["yes"],
     "RestrictRealtime": ["yes"],
     "RemoveIPC": ["yes"],
@@ -91,7 +90,7 @@ SERVICE = {
     "RestrictNamespaces": ["yes"],
     "LockPersonality": ["yes"],
     "MemoryDenyWriteExecute": ["yes"],
-    "SystemCallFilter": ["@system-service"],
+    "SystemCallFilter": ["@system-service adjtimex clock_adjtime"],
     "SystemCallArchitectures": ["native"],
 }
 WEB = {
@@ -235,3 +234,18 @@ def test_render_refuses_a_missing_or_odd_value() -> None:
         with pytest.raises(ValueError):
             units.render("X=@V@\n", {"V": bad})
     assert units.render("X=@V@\n", {"V": "/opt/backtide"}) == "X=/opt/backtide\n"
+
+
+def test_the_service_may_read_the_clock_and_never_set_it() -> None:
+    """Incident of 2026-11-01: the check before pruning by age is adjtimex, outside @system-service:
+    the filter killed the service every ten minutes. It may read; setting the time needs
+    CAP_SYS_TIME, and neither unit has it."""
+    assert "CAP_SYS_TIME" not in layout.SERVICE_CAPABILITIES
+    rendered = units.render_units()
+    service = rendered[layout.SERVICE_UNIT]
+    assert "adjtimex" in service and "ProtectClock=" not in service
+    assert (
+        "settimeofday" not in service and "clock_settime" not in service and "@clock" not in service
+    )
+    assert "ProtectClock=yes" in rendered[layout.WEB_UNIT]
+    assert "adjtimex" not in rendered[layout.WEB_UNIT]
