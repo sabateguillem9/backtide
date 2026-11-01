@@ -8,7 +8,8 @@ in, and the tests never ran under the unit. So the service here is the real one:
   the same code the installer uses, only with the lab's paths. Its filters and its mount namespace
   are the ones an installation has. The clock check, every 20 s.
 - Each agent's volume is a real btrfs with simple quotas in a file, and each channel a real tmpfs,
-  mounted before the service starts by this kit, as the units of an installation would.
+  mounted before the service starts by this kit: what the units of an installation do for the main
+  agent. For another agent nothing does it yet (T26-6a creates them).
 - ``--grupo-web`` with a group that has no account: the case where the narrow socket has only the
   group and its forbidden ids to go by.
 
@@ -58,9 +59,10 @@ WEB_GROUP = "backtide-lab-dos-web"
 NFT_TABLE = "backtide_lab_dos"
 GIB = 1024**3
 MIB = 1024**2
-# P1 is 341 MiB on 1 GiB, and a new volume has about 494: the caps are what a test can reach.
+# P1 is 341 MiB on 1 GiB, and a new volume has about 494: the caps are what a test can reach,
+# and each its own, so one that took the other's would show.
 VOLUME_SIZE = GIB
-MAIN_CAP = 64 * MIB
+MAIN_CAP = 48 * MIB
 OTHER_CAP = 64 * MIB
 SLUG = "revisor"
 NUMBER = 1
@@ -187,7 +189,7 @@ class Lab:
         return "\n".join(lines[-20:])
 
     def wait_up(self, timeout: float = START_TIMEOUT) -> None:
-        """Both agents recorded as started by this start of the service."""
+        """The unit active and both agents running."""
 
         def up() -> bool:
             if int(self.show("NRestarts") or 0) > MAX_RESTARTS:
@@ -334,6 +336,9 @@ name = "anthropic"
 kind = "anthropic"
 [budget]
 auto_prices = false
+[gate]
+wait_s = 3
+hold_s = 30
 """
 
 OTHER_FILE = f"""\

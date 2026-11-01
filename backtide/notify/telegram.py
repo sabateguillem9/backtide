@@ -177,6 +177,17 @@ class TelegramNotifier:
         self._actions = actions
 
     def send(self, alert: Alert) -> None:
+        if alert.elsewhere:
+            # "Pausar" and "Rebobinar" act on the main agent: never offered about another one, and
+            # its event's number means nothing in the main agent's box (T26-2e gives them back).
+            self._call_with_retry(
+                {
+                    "chat_id": self._chat_id,
+                    "text": alert_text(alert),
+                    "link_preview_options": {"is_disabled": True},
+                }
+            )
+            return
         tokens = [self._book.issue(Action.PAUSE)]
         row = [("Pausar", tokens[0])]
         target = self._target(alert)

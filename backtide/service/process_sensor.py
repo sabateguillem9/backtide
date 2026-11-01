@@ -942,7 +942,7 @@ class ProcessSensor:
         self._record(
             "system", "sensor_restart", self.name, details={"attempt": len(self._restarts)}, risk=1
         )
-        if self._share is None or self._share.may_replace(self):
+        if self._may_take_it_down():
             try:
                 self._halt_container()
             except JailError as error:
@@ -972,7 +972,7 @@ class ProcessSensor:
         except Exception as error:  # recorded and alerted: the agent may run without it
             self._failed(stage, error, starting=True)
             self._state = SensorState.DOWN
-            if stage == "ready":
+            if stage == "ready" and self._may_take_it_down():
                 self._halt_quietly()  # never leave a privileged container that does not serve
             return False
         self._state = SensorState.UP
@@ -993,6 +993,11 @@ class ProcessSensor:
             },
         )
         return True
+
+    def _may_take_it_down(self) -> bool:
+        """Whether the container may go: always when it is only this agent's. Shared, only when
+        no other agent's sensor is up."""
+        return self._share is None or self._share.may_replace(self)
 
     def _baseline_losses(self, reused: bool) -> None:
         """Read Tetragon's loss counters right after it serves. A Tetragon a killed service
@@ -1016,6 +1021,8 @@ class ProcessSensor:
                     self._jail.start()  # checks it is exactly our sensor; a no-op otherwise
                     return True
                 except JailError as error:
+                    if not self._may_take_it_down():
+                        raise  # someone else sees through it: down, and it tries again
                     logger.info("replacing the running sensor, which is not this one: %s", error)
                     self._halt_container()
             elif self._jail.exists():

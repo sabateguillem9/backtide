@@ -1279,6 +1279,61 @@ def test_one_agents_failed_heartbeats_never_take_tetragon_from_the_other(tmp_pat
     assert one.jail.running and two.sensor.state is SensorState.UP
 
 
+def test_a_tetragon_that_hangs_is_replaced_once_nobody_sees_through_it(tmp_path: Path) -> None:
+    """It runs and answers, and exports nothing: with both down it is everyone's, and it goes."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    created, stops = one.log.count("sensor.create"), one.log.count("sensor.stop")
+    one.sensor._state = two.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.sensor.tick()
+    assert one.log.count("sensor.stop") == stops + 1
+    assert one.log.count("sensor.create") == created + 1
+    assert one.sensor.state is SensorState.UP
+
+
+def test_a_tetragon_slow_to_serve_is_not_taken_from_the_other_agent(tmp_path: Path) -> None:
+    """A flood can keep `tetra status` from answering in time: that one agent gives up, not the
+    container the other one sees through."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    removes = one.log.count("sensor.remove")
+    one.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.jail.serves = False
+    one.sensor.tick()
+    assert one.log.count("sensor.remove") == removes
+    assert one.jail.running and one.sensor.state is SensorState.DOWN
+    assert two.sensor.state is SensorState.UP
+    assert one.box.of("sensor_failed")[-1].details["stage"] == "ready"
+
+
+def test_a_slow_tetragon_with_nobody_else_on_it_still_goes(tmp_path: Path) -> None:
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    two.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.jail.serves = False
+    one.sensor.tick()
+    assert "sensor.remove" in one.log
+
+
+def test_a_running_sensor_that_looks_wrong_is_not_replaced_under_the_other_agent(
+    tmp_path: Path,
+) -> None:
+    """A passing error of Docker in the check would otherwise take it from a neighbour that sees."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    removes = one.log.count("sensor.remove")
+    one.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.jail.start_error = JailError("docker did not answer")
+    one.sensor.tick()
+    assert one.log.count("sensor.remove") == removes
+    assert one.sensor.state is SensorState.DOWN and two.sensor.state is SensorState.UP
+
+
 def test_tetragon_is_replaced_when_nobody_sees_through_it(tmp_path: Path) -> None:
     one, two = two_on_one_container(tmp_path)
     one.start()

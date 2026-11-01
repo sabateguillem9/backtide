@@ -7,10 +7,10 @@ proxy, and the configuration that an agent cannot reach through a link. A machin
 stays out of all of it (the last section).
 """
 
+import dataclasses
 import logging
 import os
 import threading
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,9 @@ import pytest
 from backtide import cli
 from backtide.blackbox import BlackBoxError
 from backtide.jail import AgentJail, JailError
+from backtide.jail.config import Protected
 from backtide.notify import Alert, AlertLevel, Labelled, LogBridge, LoggedProblem
+from backtide.notify.telegram import ButtonBook, TelegramNotifier
 from backtide.service import runner, scope
 from backtide.service.agents import load_installation
 from backtide.service.config import ConfigError, ServiceConfig, ensure_state_folder
@@ -37,7 +39,6 @@ from backtide.setup.preflight import Status
 from tests.test_service_agents import (
     Sink,
     add_agent,
-    claude_code,
     main_config,
     write_main,
 )
@@ -86,7 +87,6 @@ def test_each_jail_is_told_the_volumes_and_folders_of_the_others(home: Path) -> 
 
 
 def test_a_config_that_mounts_a_neighbours_volume_is_refused(home: Path) -> None:  # noqa: F811
-    """Without the neighbours this file reads: its folder is nobody's until it runs."""
     add_agent(home, "revisor", number=1)
     other = home / "agent-volumes" / "revisor" / "workspace" / "agente"
     write_main(home, f'[agent]\nconfig_dir = "{other}"\n')
@@ -157,6 +157,22 @@ def test_two_volumes_that_are_one_through_a_link_are_refused(home: Path) -> None
     add_agent(home, "b", f'number = 2\nvolume = "{link}"\n[agent]\nprofile = "claude-code"\n')
     with pytest.raises(ConfigError, match="share a folder"):
         load_installation(main_config(home))
+
+
+def test_the_neighbours_list_is_what_refuses_a_mount_of_another_agent(
+    home: Path,  # noqa: F811
+) -> None:
+    """What _check_apart cannot see: a path of the neighbour given by hand to a jail, as a planned
+    mount would be. The plain state and volume checks say nothing about it."""
+    add_agent(home, "revisor", number=1)
+    (other,) = load_installation(main_config(home)).others
+    outside = other.volume / "workspace" / "agente"
+    with pytest.raises(ConfigError, match="the volume of the agent revisor"):
+        dataclasses.replace(
+            ServiceConfig.from_file(main_config(home)),
+            neighbours=(Protected("the volume of the agent revisor", other.volume),),
+            agent={"config_dir": str(outside)},
+        )
 
 
 # --- whose thread is whose --------------------------------------------------------------------
@@ -260,7 +276,44 @@ def test_every_alert_says_whose_and_one_goes_at_a_time() -> None:
     assert len(sent) == 10
 
 
+class FakeApi:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def call(self, method: str, params: dict[str, Any], **_: Any) -> dict[str, Any]:
+        self.sent.append(params)
+        return {"message_id": len(self.sent)}
+
+
+class FakeActions:
+    def __init__(self) -> None:
+        self.asked: list[int] = []
+
+    def target_for(self, seq: int) -> str | None:
+        self.asked.append(seq)
+        return None
+
+
 # --- the keys are the machine's ---------------------------------------------------------------
+
+
+def test_every_alert_of_a_neighbour_offers_no_button_that_acts_on_the_main_agent() -> None:
+    """Its event is in another box: "Pausar" would freeze the wrong agent, and "Rebobinar" would
+    offer a snapshot of the main one for a number that means nothing there."""
+    api = FakeApi()
+    actions = FakeActions()
+    notifier = TelegramNotifier(api, 42, ButtonBook(), actions)  # type: ignore[arg-type]
+    lock = threading.Lock()
+    Labelled(notifier, "revisor", lock, elsewhere=True).send(
+        Alert(AlertLevel.ERROR, "Algo", "cuerpo", event_seq=7)
+    )
+    (sent,) = api.sent
+    assert "reply_markup" not in sent and "revisor: Algo" in sent["text"]
+    assert actions.asked == []
+    Labelled(notifier, "principal", lock).send(
+        Alert(AlertLevel.ERROR, "Algo", "cuerpo", event_seq=7)
+    )
+    assert "reply_markup" in api.sent[1] and actions.asked == [7]
 
 
 def test_a_new_key_reaches_every_proxy() -> None:
@@ -317,6 +370,80 @@ def two_configs(home: Path) -> tuple[ServiceConfig, tuple[ServiceConfig, ...]]: 
     add_agent(home, "malo", number=2)
     found = load_installation(main_config(home))
     return found.main, found.others
+
+
+def test_serve_hands_new_keys_to_every_proxy_and_each_agent_its_own_thread_scope(
+    home: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring: a neighbour left out of the reload would keep a key the owner took away."""
+    main, others = two_configs(home)
+    reloaded: list[str] = []
+    captured: dict[str, Any] = {}
+    scopes: dict[str, str | None] = {}
+    registered = threading.Barrier(3)
+    real_build = runner.build_guardian
+    real_settings = runner.Settings
+
+    def build(config: ServiceConfig, **kwargs: Any) -> Any:
+        return real_build(config, **{**kwargs, "jail": AgentJail(config.jail_config())})
+
+    def key_reloader(config: ServiceConfig, egress: Any, secrets: Any) -> Any:
+        def reload() -> Applied:
+            reloaded.append(config.slug)
+            return Applied.NOW
+
+        return reload
+
+    def settings(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_settings(*args, **kwargs)
+
+    def run(guardian: Any, alerts: Any, box: Any, *, stop: threading.Event, **_: Any) -> None:
+        scopes[guardian._config.slug] = scope.current()  # noqa: SLF001
+        registered.wait(30)
+        if threading.current_thread() is threading.main_thread():
+            # The barrier: each neighbour registered its proxy before it ran.
+            captured["applied"] = captured["reload_keys"]()
+            stop.set()
+        else:
+            stop.wait(30)
+
+    monkeypatch.setattr(runner, "build_guardian", build)
+    monkeypatch.setattr(runner, "run_guardian", run)
+    monkeypatch.setattr(runner, "key_reloader", key_reloader)
+    monkeypatch.setattr(runner, "Settings", settings)
+    serve(main, others=others, handle_signals=False)
+    assert sorted(reloaded) == ["bueno", "malo", "principal"]
+    assert captured["applied"] is Applied.NOW
+    assert scopes == {"principal": None, "bueno": "bueno", "malo": "malo"}
+
+
+def test_what_is_trusted_for_one_agent_is_its_own(
+    home: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate: trust given for one agent must never let out what another sends."""
+    add_agent(home, "revisor", number=1)
+    found = load_installation(main_config(home))
+    (other,) = found.others
+    folders: list[Path] = []
+    real = runner.TrustStore
+
+    def store(folder: Path) -> Any:
+        folders.append(folder)
+        return real(folder)
+
+    class Box:
+        def append(self, *_: Any, **__: Any) -> None: ...
+        def events(self, **_: Any) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(runner, "TrustStore", store)
+    for config in found.agents:
+        runner.build_egress(config, AgentJail(config.jail_config()), Box())  # type: ignore[arg-type]
+    assert folders == [found.main.state_dir, other.agent_dir]
+    assert other.agent_dir != found.main.state_dir
 
 
 def test_a_neighbour_that_cannot_start_is_told_and_the_others_go_on(home: Path) -> None:  # noqa: F811
@@ -563,15 +690,6 @@ def test_ensure_state_folder_is_what_refuses_a_link(tmp_path: Path) -> None:
     link.symlink_to(target)
     with pytest.raises(ConfigError):
         ensure_state_folder(link, "a folder")
-
-
-def test_a_replaced_config_still_validates_its_neighbours(home: Path) -> None:  # noqa: F811
-    add_agent(home, "revisor", number=1)
-    found = load_installation(main_config(home))
-    (other,) = found.others
-    rebuilt = replace(other, neighbours=other.neighbours)
-    assert rebuilt.agent_protected() == other.agent_protected()
-    assert claude_code(home, "revisor", 1).startswith("number = 1")
 
 
 # --- the CLI ----------------------------------------------------------------------------------

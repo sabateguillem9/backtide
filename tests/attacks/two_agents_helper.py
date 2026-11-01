@@ -13,6 +13,7 @@ program. It runs only what is written here, on the lab's own paths.
     python -m two_agents_helper selftest <config>
     python -m two_agents_helper tamper <db>
     python -m two_agents_helper count <db>
+    python -m two_agents_helper decide <control socket> <hold id>
 """
 
 import json
@@ -26,6 +27,7 @@ from backtide.jail import docker
 from backtide.jail.config import create_env, docker_create_argv
 from backtide.service.agents import load_installation
 from backtide.service.config import STATE_CHECKPOINT, STATE_DB, STATE_KEY, ConfigError
+from backtide.service.control import ask_decide
 from backtide.setup import selftest
 from backtide.snapshots import SnapshotStore, btrfs
 
@@ -128,6 +130,11 @@ def count(db: str) -> dict[str, int]:
         connection.close()
 
 
+def decide(control: str, hold_id: str) -> dict[str, Any]:
+    """The owner says yes through the control socket, as `backtide aprobar` does."""
+    return ask_decide(Path(control), hold_id, "approve", via="cli")
+
+
 ORDERS = {
     "events": events,
     "verify": verify,
@@ -138,6 +145,7 @@ ORDERS = {
     "selftest": self_test,
     "tamper": tamper,
     "count": count,
+    "decide": decide,
 }
 
 if __name__ == "__main__":

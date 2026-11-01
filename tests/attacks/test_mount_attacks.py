@@ -135,6 +135,7 @@ def test_mounting_what_the_agent_must_not_see(
         for label, folder in (
             ("holds the installation's black box", service.config.installation_dir),
             ("holds the agents' folders", service.config.agents_dir),
+            ("is inside the agents' folders", service.config.agents_dir / "revisor"),
         )
     }
     # 5. The same container, altered: Docker would start it again on its own.

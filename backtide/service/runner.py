@@ -1113,7 +1113,9 @@ def serve(
             one_at_a_time = threading.Lock()
 
             def notifier_for(slug: str) -> Notifier:
-                return Labelled(machine_notifier, slug, one_at_a_time)
+                return Labelled(
+                    machine_notifier, slug, one_at_a_time, elsewhere=slug != config.slug
+                )
 
             notifier = notifier_for(config.slug)
         built: list[Egress] = []

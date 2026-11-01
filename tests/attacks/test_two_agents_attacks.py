@@ -41,12 +41,19 @@ from two_agents_kit import (
 
 from backtide.jail.config import AGENT_GID, AGENT_UID, PROXY_PORT
 from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
-from backtide.service.config import STATE_DB, STATE_INSTALLATION, STATE_KEY, STATE_WEB_SOCKET
+from backtide.service.config import (
+    STATE_DB,
+    STATE_INSTALLATION,
+    STATE_KEY,
+    STATE_SOCKET,
+    STATE_WEB_SOCKET,
+)
 from backtide.snapshots.space import MIB
 
 SEEN_TIMEOUT = 60.0  # the reader reads every half second; a heartbeat may hold it a few
 CLOCK_CHECKS = 50.0  # prune_interval is 20: two clock checks under the unit's filter
 KILL_TIMEOUT = 60.0
+HOLD_LIFE = 30.0  # [gate] hold_s in the lab's config
 SCRIPT = "pausar_por_espacio"
 BATCH = 1000  # files per fill (~3 MiB): stops short of the cap, never at it
 NEIGHBOUR_CAP = 64 * MIB
@@ -257,14 +264,79 @@ def test_an_agent_reaches_nothing_of_its_neighbour(attack: Attack, lab: Lab) -> 
         OTHER.network: members(OTHER.network),
         MAIN.network: members(MAIN.network),
     }
+    internal = {
+        name: sh("docker", "network", "inspect", "--format", "{{.Internal}}", name).stdout.strip()
+        for name in alone
+    }
     attack.check(
         "stopped",
         own == 0
         and all(code != 0 for code in blocked.values())
         and alone[OTHER.network] == {OTHER.container, OTHER.proxy}
-        and alone[MAIN.network] == {MAIN.container, MAIN.proxy},
+        and alone[MAIN.network] == {MAIN.container, MAIN.proxy}
+        and set(internal.values()) == {"true"},
         f"llega a su proxy (control, código {own}) y a nada del vecino ({blocked}); en cada red "
-        f"solo están su agente y su proxy ({alone})",
+        f"solo están su agente y su proxy ({alone}), y las dos son internas: sin salida directa "
+        f"({internal})",
+    )
+
+
+# --- its gate ---------------------------------------------------------------------------------
+
+
+@scenario("puerta-del-vecino")
+def test_what_the_neighbour_sends_waits_at_its_own_gate(attack: Attack, lab: Lab) -> None:
+    """The heart of backtide, for the agent that is not the main one: a DELETE stays at its proxy's
+    gate, in its box, and with nobody to say yes it is refused (invariant 6). And what the owner
+    approves for the main agent releases nothing of the other. The control is that the same request
+    from the main agent is held too, in the main agent's box."""
+    tag = f"puerta-{secrets.token_hex(6)}"
+    host = "cubos.ejemplo.test"
+    script = "peticion_delete_retenida"
+
+    def held(agent: Agent, mark: str) -> list[dict[str, Any]]:
+        return said_in(lab.events(agent, "held"), mark)
+
+    def ask(agent: Agent, mark: str) -> None:
+        attack.run_script(InContainer(lab, agent), script, "delete", host, f"/{mark}/v1", "5")
+
+    other_mark, main_mark = f"{tag}-vecino", f"{tag}-principal"
+    ask(OTHER, other_mark)
+    ask(MAIN, main_mark)
+    wait(
+        lambda: held(OTHER, other_mark) and held(MAIN, main_mark),
+        SEEN_TIMEOUT,
+        "each request held at its own gate",
+        lab.diagnosis,
+    )
+    (own,), crossed = held(OTHER, other_mark), said_in(lab.events(MAIN), other_mark)
+    theirs = said_in(lab.events(OTHER), main_mark)
+    hold_id = own["details"]["hold_id"]
+    # What the main agent's control socket can do about it: nothing, it is not its hold.
+    told = lab.helper("decide", str(STATE / STATE_SOCKET), hold_id)
+    wait(
+        lambda: said_in(lab.events(OTHER, "expired"), hold_id),
+        HOLD_LIFE + SEEN_TIMEOUT,
+        "the neighbour's hold to end with nobody saying yes",
+        lab.diagnosis,
+    )
+    released = said_in(lab.events(OTHER, "approved"), hold_id)
+    attack.check(
+        "stopped",
+        told.get("ok") is not True and not released,
+        f"el sí por el socket de control del principal no suelta lo del vecino ({told}), y nada "
+        "sale aprobado",
+    )
+    attack.check(
+        "recorded",
+        crossed == [] and theirs == [],
+        "gate/held en la caja de quien lo pidió y nunca en la del otro, en las dos direcciones",
+    )
+    attack.check(
+        "held",
+        bool(said_in(lab.events(OTHER, "expired"), hold_id)),
+        f"la petición del vecino quedó retenida ({hold_id}) y, sin respuesta, terminó rechazada "
+        "(gate/expired)",
     )
 
 
@@ -628,6 +700,7 @@ def test_an_agent_out_of_space_stops_nobody_else(attack: Attack, lab: Lab) -> No
         and state == "false"
         and wrote
         and main_usage["limit"] == main_limit == MAIN_CAP
+        and lab.usage(OTHER)["limit"] == NEIGHBOUR_CAP
         and main_pauses == [],
         f"el vecino, pasado de su tope, queda congelado ({pause['details']['conditions']}); el "
         f"otro sigue en marcha, escribe y hace instantáneas, y su tope no cambia ({main_limit} y "

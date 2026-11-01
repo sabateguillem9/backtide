@@ -24,6 +24,7 @@ from backtide.blackbox import BlackBox, BlackBoxError, Event, create_key
 from backtide.jail import ExposedJail, JailError
 from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
 from backtide.notify import Alert, AlertLevel
+from backtide.service import scope
 from backtide.service.config import Secret, ServiceConfig
 from backtide.service.guardian import AgentState, CycleResult, FileWatcher, Guardian
 from backtide.service.holds import HoldOutcome, HoldStatus
@@ -3440,3 +3441,38 @@ def test_a_touched_passkey_is_recorded_and_alerted(world: World) -> None:
     assert world.only("web_passkey_touched").details == details
     (alert,) = world.alerts.titled("tocado")
     assert alert.level is AlertLevel.ERROR and "«móvil» …ab12" in alert.body
+
+
+# --- several agents in one process (T26-2b) -----------------------------------------------------
+
+
+def test_a_guardian_records_only_the_log_of_its_own_agent(world: World) -> None:
+    """One logger tree and one bridge per agent: without its filter every box would hear everyone.
+    The filter has to reach the bridge the start makes, not only the one made at construction."""
+    scope.hand_down()
+    world.guardian._log_filter = scope.belongs_to("revisor")  # noqa: SLF001
+    world.guardian.start()
+    world.log.clear()
+    logger = logging.getLogger("backtide.snapshots.store")
+
+    def from_the_agents_thread() -> None:
+        scope.enter("revisor")
+        logger.warning("%s", "mine")
+
+    thread = threading.Thread(target=from_the_agents_thread)
+    thread.start()
+    thread.join()
+    logger.warning("%s", "from the main agent's")
+    assert world.guardian.flush_logs()
+    (event,) = world.box.events(action="log")
+    assert event.details["message"] == "mine"
+    world.guardian.stop()
+
+
+def test_the_bridge_of_a_rewind_without_a_service_has_the_filter_too(world: World) -> None:
+    world.guardian._log_filter = scope.belongs_to("revisor")  # noqa: SLF001
+    world.guardian.open_for_rewind()
+    logging.getLogger("backtide.snapshots.store").warning("%s", "from nobody's thread")
+    assert world.guardian.flush_logs()
+    assert world.box.events(action="log") == []
+    world.guardian.close_after_rewind()
