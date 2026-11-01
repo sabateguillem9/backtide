@@ -745,7 +745,13 @@ def create_app(
             request, t, 200, "removed",
             key={"name": str(reply.get("name", "")), "tail": str(reply.get("tail", ""))},
         )  # fmt: skip
-        response.delete_cookie(COOKIE_NAME, path=base, httponly=True, samesite="strict")
+        response.delete_cookie(
+            cookie_name,
+            path=cookie_path,
+            httponly=True,
+            samesite="strict",
+            secure=origin is not None,
+        )
         return response
 
     @app.post(KEY_RENAME_PATH, dependencies=[Depends(require_session)])
