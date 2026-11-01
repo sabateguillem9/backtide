@@ -24,6 +24,7 @@ from backtide.service.control import (
     ControlError,
     ControlOutcomeUnknown,
     ControlUnavailable,
+    ask_passkey_rename,
     ask_passkeys,
     ask_rewind,
     ask_set_password,
@@ -1278,12 +1279,19 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         description="Lista las passkeys de la web instalada, con su nombre, el final de su "
         "identificador y la fecha, o quita una con --quitar. Es la salida si pierdes un "
         "dispositivo: quitar una llave cierra todas las sesiones, y queda en la caja negra con un "
-        "aviso. Sale con 0 si va bien, 1 si el servicio no puede y 2 si esa llave no existe.",
+        "aviso. También puede con la última, cosa que la web no hace. --renombrar y --nombre le "
+        "cambian el nombre a una. Sale con 0 si va bien, 1 si el servicio no puede y 2 si esa "
+        "llave no existe o el nombre no vale.",
     )
     _add_config(keys)
     keys.add_argument("--quitar", dest="remove", metavar="ID",
                       help="quita la llave con este identificador o que acabe en él "
-                      "(al menos 4 caracteres, como en la lista)")  # fmt: skip
+                      "(al menos 4 caracteres, como en la lista); si empieza por «-», "
+                      "--quitar=ID")  # fmt: skip
+    keys.add_argument("--renombrar", dest="rename", metavar="ID",
+                      help="cambia el nombre de esta llave, con --nombre")  # fmt: skip
+    keys.add_argument("--nombre", dest="new_name", metavar="NOMBRE",
+                      help="el nombre nuevo (letras, cifras, espacios, - y _)")  # fmt: skip
     keys.set_defaults(handler=_passkeys)
     link = commands.add_parser(
         "enlace",
@@ -1491,27 +1499,43 @@ LINK_MAX_BYTES = 4096
 
 
 def _passkeys(args: argparse.Namespace) -> int:
-    """`backtide llaves`: the web's passkeys, listed or one taken out, by the service (T26-3c)."""
+    """`backtide llaves`: the web's passkeys, listed, one taken out or one with a new name, by
+    the service (T26-3c, T26-3d)."""
     from backtide.web.paths import WebPaths
 
+    if (args.rename is None) != (args.new_name is None) or (
+        args.remove is not None and args.rename is not None
+    ):
+        _error("o --quitar ID, o --renombrar ID con --nombre NOMBRE")
+        return EXIT_ERROR
     try:
         control = WebPaths.from_file(args.config).control_socket
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
     try:
-        reply = ask_passkeys(control, args.remove)
+        if args.rename is not None:
+            reply = ask_passkey_rename(control, args.rename, args.new_name)
+        else:
+            reply = ask_passkeys(control, args.remove)
     except ControlError as error:
         _error(f"el servicio no ha contestado sobre las llaves: {error}")
         return EXIT_FAILED
     if not reply["ok"]:
         _error(reply["message"])
         return EXIT_ERROR if reply.get("outcome") == "invalid" else EXIT_FAILED
+    if args.rename is not None:
+        print(f"La llave …{reply.get('tail', '')} se llama ahora "
+              f"«{_printable(str(reply.get('name', '')))}».")  # fmt: skip
+        return EXIT_OK
     if args.remove is not None:
         print(
             f"Llave «{_printable(str(reply.get('name', '')))}» …{reply.get('tail', '')} quitada. "
             f"Se han cerrado todas las sesiones ({reply.get('ended', 0)})."
         )
+        if reply.get("left") == 0:
+            print("No queda ninguna llave: se entra con la contraseña o con `sudo backtide "
+                  "enlace`, y registra otra nada más entrar.")  # fmt: skip
         return EXIT_OK
     listed = reply.get("keys") or []
     if not listed:

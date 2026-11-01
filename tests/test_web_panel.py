@@ -239,11 +239,12 @@ def test_no_route_takes_anything_but_get_except_the_rewind(tmp_path: Path) -> No
     # Rewinding; signing in with the password (T26-3b-1); signing out and closing every
     # session (T26-3a-2), which only end sessions.
     # Registering a passkey (T26-3b-2), from a live session and our own page; signing in with it
-    # and touching it again (T26-3c), the service checks the signature.
+    # and touching it again (T26-3c), the service checks the signature; taking a key out and
+    # naming it (T26-3d), the service decides.
     takes_post = {
         POST_PATH, "/entrar", "/salir", "/ajustes/cerrar-sesiones", "/llaves/empezar",
         "/llaves/registrar", "/entrar/llave/empezar", "/entrar/llave/responder",
-        "/tocar/empezar", "/tocar/responder",
+        "/tocar/empezar", "/tocar/responder", "/llaves/quitar", "/llaves/nombre",
     }  # fmt: skip
     for route in routes:
         if route.path in takes_post and "POST" in route.methods:

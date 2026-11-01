@@ -546,7 +546,7 @@ h1 {
 .settings-step > .settings-actions { margin-top: var(--space-8); }
 /* the installed web's way in (T26-3b-1): the Field's error, crimson with its drawing */
 .gate-page code { font-weight: var(--type-label-weight); color: var(--ink); white-space: nowrap; user-select: all; }
-.signin-form .setting-input[aria-invalid="true"] { border-color: var(--danger); }
+:is(.signin-form, .settings-form) .setting-input[aria-invalid="true"] { border-color: var(--danger); }
 .signin-error { margin: 0; display: flex; align-items: center; gap: var(--space-2); font: var(--type-label-weight) var(--type-label-size)/1.3 var(--font-sans); color: var(--danger); }
 .signin-error .ic .ic-fill { fill: var(--danger); }
 .signin-error code { color: inherit; }
@@ -568,11 +568,12 @@ h1 {
 /* the passkeys (T26-3b-2): Ajustes' rows, as wide as the form below them */
 .keys-list { max-width: 32rem; margin-top: var(--space-8); }
 .keys-list + .note { margin-top: var(--space-6); }
+.keys-list + .settings-actions { margin-top: var(--space-8); }  /* the way on, as far from the rows as the form is */
 .keys-list .setting-name { overflow-wrap: anywhere; }  /* a name is the person's, up to 48 letters in one word */
 .settings-outcome { display: flex; align-items: center; gap: var(--space-3); }
 .settings-outcome .setting-dot { width: 0.75rem; height: 0.75rem; }
 .settings-outcome.is-ok .setting-dot { background: var(--ok); border-color: var(--ok); }
-.settings-what { font-weight: var(--type-label-weight); }
+.settings-what { font-weight: var(--type-label-weight); overflow-wrap: anywhere; }  /* a key's name may be one word of 48 letters */
 .settings-said { color: var(--ink-soft); overflow-wrap: anywhere; }
 .settings-prices { margin: var(--space-4) 0 0; padding-left: 1.1em; color: var(--ink-soft); }
 @media (max-width: 480px) {

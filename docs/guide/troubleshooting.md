@@ -164,6 +164,8 @@ The key must never go in a file you create, in a chat, or in a command. It goes 
 - **"--telegram necesita el token del bot y aquí no hay terminal para pedirlo".** Without a terminal (a script, `--si` in a pipe), give the token with `--telegram-token-archivo FILE` or `--telegram-token-stdin` and the chat with `--telegram-chat N`. Or leave Telegram out and set it later in the web: `sudo backtide enlace` gives the link, then "Ajustes" ("Settings") > "Avisos" ("Alerts").
 - **"eso no parece un token de bot de Telegram"** or **"el chat de Telegram tiene que ser…".** The token is `<digits>:<letters>`, as BotFather gives it; the chat is your private chat's number (positive). Nothing of Telegram was saved.
 - **"Falta la clave del modelo".** Open the web (`sudo backtide enlace`) and put it in "Ajustes" > "Modelos", or run the installer again with `--clave-archivo FILE`.
+- **You lost a passkey.** Sign in with another key and remove it in "Ajustes" ("Settings") > "Llaves" ("Keys"). If it was your only one or you have lost them all: `sudo backtide llaves --quitar ID` on the server for each, then sign in with the password or `sudo backtide enlace` and register a new one. The steps are in [the CLI reference](cli-reference.md#passkeys-the-webs-keys-page).
+- **"Es la última llave: desde la web no se quita".** It is on purpose: with no key, the password alone would be enough for everything the key protects. Register another first, or remove it with `sudo backtide llaves --quitar ID`.
 - **"… se admite pero aún no se ha probado".** Your distribution or architecture is accepted but nobody has tried backtide on it yet (only Fedora 44 and Ubuntu 24.04 on arm64 have been). It should work; if something fails, tell us.
 
 ## Still stuck?

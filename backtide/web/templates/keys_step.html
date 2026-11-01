@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% from "icons.html" import ic %}
+{# One step of changing a key (T26-3d): its confirmation (a form with a one-time ticket), the key
+   gone, or why not. Plain forms, no scripts: the POST is a normal navigation, which carries
+   our Origin. The service decides each one; this only asks and says. #}
+{% block title %}{{ t('keys.title') }}{% endblock %}
+{% block main %}
+<main class="watch gate-page ic-host">
+  {{ ic('key', 'ic--l') }}
+  {% if view == 'confirm_remove' %}
+  <h1>{{ t('keys.remove.title') }}</h1>
+  <p class="lede"><span class="settings-what">{{ key.name }}</span>, {{ t('settings.tail', tail=key.tail) }}.</p>
+  <p class="note">{{ t('keys.remove.note') }}</p>
+  <form class="settings-form" method="post" action="{{ action }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="ticket" value="{{ ticket }}">
+    <input type="hidden" name="llave" value="{{ key.id }}">
+    <div class="settings-actions">
+      <button class="settings-yes is-remove" type="submit"><span>{{ t('keys.remove.yes') }}</span></button>
+      <a class="settings-cancel" href="{{ back }}">{{ t('keys.back') }}</a>
+    </div>
+  </form>
+  {% elif view == 'confirm_rename' %}
+  <h1>{{ t('keys.name.title') }}</h1>
+  <p class="lede"><span class="settings-what">{{ key.name }}</span>, {{ t('settings.tail', tail=key.tail) }}.</p>
+  <form class="settings-form" method="post" action="{{ action }}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="ticket" value="{{ ticket }}">
+    <input type="hidden" name="llave" value="{{ key.id }}">
+    <div class="setting-field">
+      <label class="setting-label" for="key-name">{{ t('keys.name') }}</label>
+      <input id="key-name" class="setting-input" type="text" name="nombre" value="{{ typed or '' }}" maxlength="48" required autocomplete="off" {% if error %}aria-describedby="key-name-error" aria-invalid="true"{% else %}aria-describedby="key-name-hint"{% endif %}>
+      {% if error %}<p class="signin-error" id="key-name-error" role="alert">{{ ic('warning') }}<span>{{ t(error) }}</span></p>{% else %}<p class="setting-hint" id="key-name-hint">{{ t('keys.name.hint') }}</p>{% endif %}
+    </div>
+    <div class="settings-actions">
+      <button class="settings-yes" type="submit"><span>{{ t('keys.name.save') }}</span>{% include "arrow.html" %}</button>
+      <a class="settings-cancel" href="{{ back }}">{{ t('keys.back') }}</a>
+    </div>
+  </form>
+  {% elif view == 'removed' %}
+  <h1>{{ t('keys.removed.title') }}</h1>
+  <p class="lede"><span class="settings-what">{{ key.name }}</span>, {{ t('settings.tail', tail=key.tail) }}.</p>
+  <p class="note">{{ t('keys.removed.body') }}</p>
+  <div class="settings-actions">
+    <a class="settings-yes" href="{{ base }}/"><span>{{ t('keys.removed.enter') }}</span>{% include "arrow.html" %}</a>
+  </div>
+  {% else %}
+  <h1>{{ t('keys.title') }}</h1>
+  <p class="lede">{{ t.code(reason) }}</p>
+  <div class="settings-actions">
+    <a class="settings-cancel" href="{{ back }}">{{ t('keys.back') }}</a>
+  </div>
+  {% endif %}
+</main>
+{% endblock %}

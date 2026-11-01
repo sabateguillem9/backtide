@@ -930,7 +930,9 @@ def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> No
         if method == "POST":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             # Exactly the fields its form asks for: any other says 403 too, even with a session.
-            more = {"/llaves/registrar": "&answer=x&name=x", "/tocar/responder": "&answer=x"}
+            more = {"/llaves/registrar": "&answer=x&name=x", "/tocar/responder": "&answer=x",
+                    "/llaves/quitar": "&ticket=x&llave=x",
+                    "/llaves/nombre": "&ticket=x&llave=x&nombre=x"}  # fmt: skip
             body = f"csrf={csrf}{more.get(where, '')}"
         conn.request(method, base + where, body=body, headers=headers)
         status = conn.getresponse().status
@@ -939,7 +941,10 @@ def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> No
 
     pages = ["/", "/ahora", "/instantaneas", "/peticiones", "/ajustes", "/llaves", "/tocar"]
     orders = ["/llaves/empezar", "/llaves/registrar", "/tocar/empezar", "/tocar/responder",
-              "/ajustes/cerrar-sesiones", "/salir"]  # fmt: skip
+              "/llaves/quitar", "/llaves/nombre", "/ajustes/cerrar-sesiones", "/salir"]  # fmt: skip
+    # Asked without a key, these say 404 with a session too: not in the control below, whose
+    # POSTs of them get in (a ticket that is no good, 400).
+    key_pages = ["/llaves/quitar", "/llaves/nombre"]
     # The control: the same requests with a live session do get in. "/salir" is left out: it
     # ends the session the rest of this needs, and then the same cookie and CSRF must not.
     request = {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_see": True}
@@ -948,15 +953,15 @@ def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> No
     inside = {where: fetch("GET", where, live) for where in pages}
     inside |= {where: fetch("POST", where, live, csrf) for where in orders if where != "/salir"}
     probe_as(web.pw_uid, web.pw_gid, "", path, {"cmd": "session_end", "session": live})
-    shut_out = {where: fetch("GET", where, live) for where in pages}
-    shut_out |= {where: fetch("POST", where, live, csrf) for where in orders}
+    shut_out = {f"GET {where}": fetch("GET", where, live) for where in (*pages, *key_pages)}
+    shut_out |= {f"POST {where}": fetch("POST", where, live, csrf) for where in orders}
     results = {"cerrada, con su CSRF": shut_out}
     for name, cookie in (("sin cookie", None), ("inventada", "s" * 43)):
-        results[name] = {where: fetch("GET", where, cookie) for where in pages} | {
-            where: fetch("POST", where, cookie) for where in orders
-        }
+        results[name] = {
+            f"GET {where}": fetch("GET", where, cookie) for where in (*pages, *key_pages)
+        } | {f"POST {where}": fetch("POST", where, cookie) for where in orders}
     # Keys through the socket without a session: nothing to touch, nothing to add. After the
-    # keys' bucket fills again: the control above spent some of it.
+    # keys' bucket has had time to give back what the control above spent.
     time.sleep(CHANGES_WAIT)
     commands = probe_as(
         web.pw_uid, web.pw_gid, "", path,
@@ -980,7 +985,8 @@ def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> No
         )
         and no_keys[0].get("outcome") == "refused"
         and not pk.path_of(layout.STATE_DIR).exists(),
-        f"{len(pages)} páginas y {len(orders)} órdenes sin cookie, con una inventada y con una "
+        f"{len(pages) + len(key_pages)} páginas y {len(orders)} órdenes sin cookie, con una "
+        "inventada y con una "
         f"cerrada: las que no dicen 401: {let_in or 'ninguna'}; con una sesión viva, las que no "
         f"llegan: {not_inside or 'ninguna'}; las órdenes de llaves por "
         f"el socket: {[r.get('why') for r in commands]}; sin llaves no hay reto "
@@ -997,7 +1003,8 @@ def web_prefix() -> str:
 def test_a_lost_key_goes_with_its_sessions(attack: Attack, installed: Installed) -> None:
     """T26-3c: two keys; with the real `backtide llaves --quitar`, one goes. Its signature no longer
     signs in and every session ends; the other key still signs in. The web's user cannot ask for
-    any of it, by its socket or by root's."""
+    root's commands, by its socket or by root's; its own way, `key_remove`, has its own scenario
+    (`quitar-llave-desde-la-web`)."""
     from backtide.service import passkeys as pk
     from tests.passkey_kit import SoftAuthenticator
 
@@ -1030,7 +1037,7 @@ def test_a_lost_key_goes_with_its_sessions(attack: Attack, installed: Installed)
                         "name": "móvil", "_why": True})  # fmt: skip
         keys = pk.Passkeys(layout.STATE_DIR, origins=[origin])
         tail = next(k.tail for k in keys.keys() if k.name == "portátil")
-        # What the web's user may not do: take it out, list ids, reach root's socket.
+        # What the web's user may not do: root's commands, by its socket or by reaching root's.
         refused = ask({"cmd": "passkey_remove", "key": tail, "_why": True},
                       {"cmd": "passkeys", "_why": True})  # fmt: skip
         root_socket = probe_as(web.pw_uid, web.pw_gid, "", str(CONTROL_SOCKET),
@@ -1077,6 +1084,144 @@ def test_a_lost_key_goes_with_its_sessions(attack: Attack, installed: Installed)
         and events[0].details.get("tail") == tail
         and events[0].details.get("uid") == 0,
         f"`web_passkey_removed`, en la caja negra con la llave y quién: {len(events)}",
+    )
+
+
+KEYS_WAIT = 61  # the narrow socket's passkey commands: 20 at once, then one every 3 s
+
+
+@scenario("quitar-llave-desde-la-web")
+def test_from_the_web_a_key_goes_only_by_another_key_and_never_the_last(
+    attack: Attack, installed: Installed
+) -> None:
+    """T26-3d: as the web's user, every way to take a key out or name it without a live session,
+    without a key touched, with the end of an id or with a bad name: refused, each for its reason.
+    The last key does not go, not even touched. Then what must work does: a key gets a new name;
+    with the second key, the lost one goes and every session with it; it signs in no more, the
+    other does. Root's way still takes the last one."""
+    from backtide.service import passkeys as pk
+    from tests.passkey_kit import SoftAuthenticator
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    origin = pk.origin_for(pk.WEB_PORT)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    time.sleep(KEYS_WAIT)  # the keys' bucket and the answers', whatever came before
+
+    def ask(*requests: dict) -> list[dict]:
+        return probe_as(web.pw_uid, web.pw_gid, "", path, *requests)
+
+    def sign_in(signer: Any) -> dict:
+        [begun] = ask({"cmd": "auth_begin", "_see": True})
+        answer = signer.get(begun["options"], origin)
+        [said] = ask({"cmd": "auth_finish", "answer": answer, "_why": True, "_see": True})
+        return said
+
+    keys = pk.Passkeys(layout.STATE_DIR, origins=[origin])
+    try:
+        lost, first_session = key_for_the_owner(web, path)
+        [only] = keys.keys()
+        remove = {"cmd": "key_remove", "key": only.id, "_why": True}
+        rename = {"cmd": "key_rename", "key": only.id, "name": "otro", "_why": True}
+        no_session = ask({**remove, "session": "x" * 43}, {**rename, "session": "x" * 43})
+        untouched = ask({**remove, "session": first_session}, {**rename, "session": first_session})
+        names_untouched = [k.name for k in keys.keys()]
+        [begun] = ask({"cmd": "touch_begin", "session": first_session, "_see": True})
+        answer = lost.get(begun["options"], origin)
+        [touch] = ask({"cmd": "touch_finish", "session": first_session, "answer": answer})
+        the_last, by_tail, bad_name = ask(
+            {**remove, "session": first_session},
+            {**remove, "key": only.tail, "session": first_session},
+            {**rename, "name": "t.me/x", "session": first_session},
+        )
+        root_remove = {"cmd": "passkey_remove", "key": only.id, "_why": True}
+        root_rename = {"cmd": "passkey_rename", "key": only.id, "name": "x", "_why": True}
+        roots_own = ask(root_remove, root_rename)
+        names_refused = [k.name for k in keys.keys()]
+        # What must work: a new name, a second key.
+        [renamed] = ask({**rename, "name": "portatil viejo", "session": first_session})
+        names_renamed = [k.name for k in keys.keys()]
+        kept = SoftAuthenticator()
+        [begun] = ask({"cmd": "passkey_begin", "session": first_session, "_see": True})
+        answer = kept.create(begun["options"], origin)
+        [second] = ask({"cmd": "passkey_finish", "session": first_session, "answer": answer,
+                        "name": "móvil", "_why": True})  # fmt: skip
+        # The laptop is lost: the other key signs in and takes it out.
+        entered = sign_in(kept)
+        [removed] = ask({**remove, "session": entered.get("session")})
+        ended = ask({"cmd": "session_check", "session": first_session},
+                    {"cmd": "session_check", "session": entered.get("session")})  # fmt: skip
+        names_removed = [k.name for k in keys.keys()]
+        with_lost, with_kept = sign_in(lost), sign_in(kept)
+        # The last one does not go from there, with a key just touched. Root's does.
+        [kept_key] = keys.keys()
+        [last_again] = ask({**remove, "key": kept_key.id, "session": with_kept.get("session")})
+        names_last = [k.name for k in keys.keys()]
+        by_root_name = sh(str(layout.BIN_LINK), "llaves", f"--renombrar={kept_key.tail}",
+                          "--nombre", "movil viejo", check=False)  # fmt: skip
+        names_root = [k.name for k in keys.keys()]
+        by_root = sh(str(layout.BIN_LINK), "llaves", f"--quitar={kept_key.tail}", check=False)
+        names_end = [k.name for k in keys.keys()]
+
+        def actions() -> list[Any]:
+            kinds = ("web_passkey_removed", "web_passkey_renamed")
+            return [e for e in installed.box.events(since_seq=since) if e.action in kinds]
+
+        wait(lambda: len(actions()) >= 4, 30, interval=1)
+        events = actions()
+    finally:
+        pk.path_of(layout.STATE_DIR).unlink(missing_ok=True)
+    attack.check(
+        "stopped",
+        all("sesión viva" in r.get("why", "") for r in no_session)
+        and all(
+            r.get("outcome") == "touch" and "tocar tu llave" in r.get("why", "") for r in untouched
+        )
+        and names_untouched == ["portátil"]
+        and touch.get("outcome") == "touched"
+        and the_last.get("outcome") == "last"
+        and "última" in the_last.get("why", "")
+        and by_tail.get("outcome") == "missing"
+        and bad_name.get("outcome") == "name"
+        and all("no se acepta" in r.get("why", "") for r in roots_own)
+        and names_refused == ["portátil"]
+        and renamed.get("outcome") == "renamed"
+        and names_renamed == ["portatil viejo"]
+        and second.get("outcome") == "added"
+        and entered.get("outcome") == "opened"
+        and removed.get("outcome") == "removed"
+        and all(r.get("outcome") == "expired" for r in ended)
+        and names_removed == ["móvil"]
+        and "no está registrada" in with_lost.get("why", "")
+        and with_kept.get("outcome") == "opened"
+        and last_again.get("outcome") == "last"
+        and names_last == ["móvil"]
+        and by_root_name.returncode == 0
+        and names_root == ["movil viejo"]
+        and by_root.returncode == 0
+        and names_end == [],
+        f"sin sesión: {[r.get('why') for r in no_session]}; sin tocar: "
+        f"{[r.get('outcome') for r in untouched]}; la última: {the_last.get('outcome')}; por el "
+        f"final del id: {by_tail.get('outcome')}; mal nombre: {bad_name.get('outcome')}; las de "
+        f"root: {[r.get('why') for r in roots_own]}; nombre nuevo: {renamed.get('outcome')}; "
+        f"segunda llave: {second.get('outcome')}; entrar con ella: {entered.get('outcome')}; "
+        f"quitar la perdida: {removed.get('outcome')}; las sesiones: "
+        f"{[r.get('outcome') for r in ended]}; la perdida: {with_lost.get('why')}; la otra: "
+        f"{with_kept.get('outcome')}; otra vez la última: {last_again.get('outcome')}; root: "
+        f"{by_root_name.returncode} y {by_root.returncode}; quedan: {names_end}",
+    )
+    # One of each, from each side: a refusal is not recorded as if it had been done.
+    seen = sorted((e.action, e.details.get("via", "root"), e.details.get("tail")) for e in events)
+    expected = sorted(
+        [("web_passkey_renamed", "web", only.tail), ("web_passkey_removed", "web", only.tail),
+         ("web_passkey_renamed", "root", kept_key.tail),
+         ("web_passkey_removed", "root", kept_key.tail)]
+    )  # fmt: skip
+    attack.check(
+        "recorded",
+        seen == expected,
+        f"en la caja negra, con la llave y desde dónde: {seen}",
     )
 
 
@@ -1183,7 +1328,7 @@ def test_a_passkey_is_only_registered_from_a_live_session(
         requests: list[dict] = []
         for number, (_, request, _, _) in enumerate(steps):
             requests.append({**request, "_why": True})
-            if number == 6:  # the keys' bucket gives 10 at once, then one every 3 s
+            if number == 6:  # the keys' bucket gives one every 3 s after what it holds at once
                 requests.append({"_sleep": 12})
         said = [
             reply

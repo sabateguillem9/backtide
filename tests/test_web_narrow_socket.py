@@ -20,7 +20,7 @@ import pytest
 from backtide.service.control import ControlError
 from backtide.service.passkeys import Passkeys, origin_for
 from backtide.service.sessions import Sessions
-from backtide.service.web_control import WebControlServer, ask_snapshots
+from backtide.service.web_control import Bucket, WebControlServer, ask_snapshots
 from backtide.snapshots import SnapshotError
 from backtide.web import server as server_module
 from backtide.web.approve import ControlApprover
@@ -335,6 +335,7 @@ def signing_in(folder: Path, guardian: FakeGuardian, tmp_path: Path) -> Iterator
         on_entry=lambda action, details: True,
         password=password.Checker(state),
         passkeys=Passkeys(state, origins=[origin_for(8765)]),
+        keys=Bucket(1000, 1000),  # the flows here are longer than a person's in one breath
     )
     server.start()
     new_box(tmp_path)
@@ -645,3 +646,270 @@ def test_with_a_key_the_keys_page_asks_to_touch_one_before_adding(signing_in: An
     registered(web)
     page = web.get("/llaves", headers=KEY_HOST)
     assert 'id="passkey-form"' not in page.text and "/tocar?volver=llaves" in page.text
+
+
+# -- T26-3d: managing the keys from the web, with the service answering -------------------------
+
+
+def touch_with(web: Any, signer: Any, csrf: str) -> None:
+    begun = web.post("/tocar/empezar", data={"csrf": csrf}, headers=key_headers()).json()
+    done = web.post(
+        "/tocar/responder",
+        data={"csrf": csrf, "answer": signer.get(begun["options"], KEY_ORIGIN)},
+        headers=key_headers(),
+    ).json()
+    assert done["ok"] is True, done
+
+
+def add_key(web: Any, csrf: str, name: str) -> Any:
+    from tests.passkey_kit import SoftAuthenticator
+
+    signer = SoftAuthenticator()
+    begun = web.post("/llaves/empezar", data={"csrf": csrf}, headers=key_headers()).json()
+    assert begun["ok"] is True, begun
+    done = web.post(
+        "/llaves/registrar",
+        data={"csrf": csrf, "name": name, "answer": signer.create(begun["options"], KEY_ORIGIN)},
+        headers=key_headers(),
+    ).json()
+    assert done["ok"] is True, done
+    return signer
+
+
+def sign_in_with(web: Any, signer: Any) -> Any:
+    begun = web.post("/entrar/llave/empezar", headers=key_headers()).json()
+    return web.post(
+        "/entrar/llave/responder",
+        data={"answer": signer.get(begun["options"], KEY_ORIGIN)},
+        headers=key_headers(),
+    )
+
+
+def field(html: str, name: str) -> str:
+    found = re.search(rf'name="{name}" value="([^"]*)"', html)
+    assert found is not None, f"no {name} in the page"
+    return found.group(1)
+
+
+def key_ids(tmp_path: Path) -> dict[str, str]:
+    keys = Passkeys(tmp_path / "state", origins=[origin_for(8765)])
+    return {key.name: key.id for key in keys.keys()}
+
+
+def test_a_lost_key_is_taken_out_from_the_web_with_the_other_one(
+    signing_in: Any, tmp_path: Path
+) -> None:
+    """T26-3d's "terminada cuando": a key is lost (gone from the test's authenticator), the other
+    signs in and takes it out, every session ends, and the lost one no longer signs in."""
+    web, sessions = signing_in
+    lost, csrf = registered(web)
+    touch_with(web, lost, csrf)
+    kept = add_key(web, csrf, "móvil")
+    thief_session = sessions.start().id  # `lost` is now only the thief's: the owner has no copy
+    web.cookies.clear()
+
+    entered = sign_in_with(web, kept)
+    assert entered.status_code == 200 and entered.json()["ok"] is True
+    cookie = entered.headers["set-cookie"].split(";")[0]
+    ids = key_ids(tmp_path)
+    assert sorted(ids) == ["móvil", "portátil"]
+    page = web.get("/llaves", headers=KEY_HOST)
+    assert f"/llaves/quitar?llave={ids['portátil']}" in page.text
+    confirm = web.get(f"/llaves/quitar?llave={ids['portátil']}", headers=KEY_HOST)
+    assert confirm.status_code == 200 and "portátil" in confirm.text
+    done = web.post(
+        "/llaves/quitar",
+        data={"csrf": field(confirm.text, "csrf"), "ticket": field(confirm.text, "ticket"),
+              "llave": ids["portátil"]},
+        headers=key_headers(),
+    )  # fmt: skip
+    assert done.status_code == 200 and "portátil" in done.text
+    assert 'class="settings-yes"' in done.text
+    gone = done.headers["set-cookie"].lower()  # the browser is told to forget it
+    assert gone.startswith(cookie.split("=")[0].lower() + '=""') and "max-age=0" in gone
+    assert list(key_ids(tmp_path)) == ["móvil"]
+    assert len(sessions) == 0 and sessions.check(thief_session) is None
+    web.cookies.clear()
+    # The same cookie, kept by whoever had it: the service has ended its session.
+    after = web.get("/llaves", headers={**KEY_HOST, "cookie": cookie})
+    assert after.status_code == 401
+
+    refused = sign_in_with(web, lost)
+    assert refused.status_code == 400 and "no está registrada" in refused.json()["message"]
+    assert sign_in_with(web, kept).json()["ok"] is True
+
+
+def test_managing_a_key_sends_you_to_touch_one_first(signing_in: Any, tmp_path: Path) -> None:
+    web, _ = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    add_key(web, csrf, "móvil")
+    web.cookies.clear()
+    web.post("/entrar", data={"password": WEB_PASSWORD}, headers=key_headers())
+    assert web.get("/ahora", headers=KEY_HOST).status_code == 200  # a password's session: no touch
+    the_id = key_ids(tmp_path)["portátil"]
+    for path in ("quitar", "nombre"):
+        page = web.get(f"/llaves/{path}?llave={the_id}", headers=KEY_HOST, follow_redirects=False)
+        assert page.status_code == 303 and "/tocar?volver=llaves" in page.headers["location"]
+
+
+def test_the_service_says_no_even_if_the_page_was_open_from_before(
+    signing_in: Any, tmp_path: Path
+) -> None:
+    """A form left open, whose touch ran out: the POST goes to touch, and nothing changes."""
+    web, _ = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    add_key(web, csrf, "móvil")
+    ids = key_ids(tmp_path)
+    confirm = web.get(f"/llaves/quitar?llave={ids['portátil']}", headers=KEY_HOST)
+    form = {"csrf": field(confirm.text, "csrf"), "ticket": field(confirm.text, "ticket"),
+            "llave": ids["portátil"]}  # fmt: skip
+    web.cookies.clear()
+    web.post("/entrar", data={"password": WEB_PASSWORD}, headers=key_headers())
+    session_csrf = re.search(r'data-csrf="([^"]+)"', web.get("/tocar", headers=KEY_HOST).text)
+    assert session_csrf is not None
+    done = web.post(
+        "/llaves/quitar",
+        data={**form, "csrf": session_csrf.group(1)},
+        headers=key_headers(),
+        follow_redirects=False,
+    )
+    assert done.status_code == 303 and "/tocar?volver=llaves" in done.headers["location"]
+    assert sorted(key_ids(tmp_path)) == ["móvil", "portátil"]
+
+
+def test_removing_needs_this_sessions_csrf_and_a_ticket_for_this_key(
+    signing_in: Any, tmp_path: Path
+) -> None:
+    web, _ = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    add_key(web, csrf, "móvil")
+    ids = key_ids(tmp_path)
+    confirm = web.get(f"/llaves/quitar?llave={ids['portátil']}", headers=KEY_HOST)
+    ticket = field(confirm.text, "ticket")
+    good = {"csrf": csrf, "ticket": ticket, "llave": ids["portátil"]}
+    wrong_csrf = web.post("/llaves/quitar", data={**good, "csrf": "x" * 43}, headers=key_headers())
+    assert wrong_csrf.status_code == 403
+    other_key = web.post(
+        "/llaves/quitar", data={**good, "llave": ids["móvil"]}, headers=key_headers()
+    )  # the ticket was for the other key: spent, and nothing changes
+    assert other_key.status_code == 400
+    spent = web.post("/llaves/quitar", data=good, headers=key_headers())
+    assert spent.status_code == 400
+    assert sorted(key_ids(tmp_path)) == ["móvil", "portátil"]
+    without = web.post(
+        "/llaves/quitar", data={"csrf": csrf, "llave": ids["móvil"]}, headers=key_headers()
+    )
+    assert without.status_code == 400
+    assert sorted(key_ids(tmp_path)) == ["móvil", "portátil"]
+
+
+def test_removing_from_another_site_is_stopped_by_the_guard(
+    signing_in: Any, tmp_path: Path
+) -> None:
+    web, _ = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    add_key(web, csrf, "móvil")
+    ids = key_ids(tmp_path)
+    confirm = web.get(f"/llaves/quitar?llave={ids['portátil']}", headers=KEY_HOST)
+    form = {"csrf": csrf, "ticket": field(confirm.text, "ticket"), "llave": ids["portátil"]}
+    foreign = {**key_headers(), "origin": "https://evil.example"}
+    assert web.post("/llaves/quitar", data=form, headers=foreign).status_code == 403
+    assert sorted(key_ids(tmp_path)) == ["móvil", "portátil"]
+
+
+def test_the_last_key_offers_no_removal_and_the_service_refuses_it(
+    signing_in: Any, tmp_path: Path
+) -> None:
+    web, sessions = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    the_id = key_ids(tmp_path)["portátil"]
+    page = web.get("/llaves", headers=KEY_HOST)
+    assert "/llaves/quitar" not in page.text and "sudo backtide llaves --quitar" in page.text
+    confirm = web.get(f"/llaves/quitar?llave={the_id}", headers=KEY_HOST)
+    assert 'name="ticket"' not in confirm.text and "sudo backtide llaves --quitar" in confirm.text
+    # Whatever the page offers: the service decides. A ticket from when there were two.
+    other = add_key(web, csrf, "móvil")
+    ids = key_ids(tmp_path)
+    confirm = web.get(f"/llaves/quitar?llave={ids['portátil']}", headers=KEY_HOST)
+    form = {"csrf": csrf, "ticket": field(confirm.text, "ticket"), "llave": ids["portátil"]}
+    Passkeys(tmp_path / "state", origins=[origin_for(8765)]).remove(ids["móvil"])
+    done = web.post("/llaves/quitar", data=form, headers=key_headers())
+    assert done.status_code == 400 and "sudo backtide llaves --quitar" in done.text
+    assert list(key_ids(tmp_path)) == ["portátil"] and len(sessions) == 1
+    assert other is not None
+
+
+def test_a_key_gets_a_new_name_from_the_web(signing_in: Any, tmp_path: Path) -> None:
+    web, sessions = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    the_id = key_ids(tmp_path)["portátil"]
+    assert f"/llaves/nombre?llave={the_id}" in web.get("/llaves", headers=KEY_HOST).text
+    confirm = web.get(f"/llaves/nombre?llave={the_id}", headers=KEY_HOST)
+    assert confirm.status_code == 200 and 'value="portátil"' in confirm.text
+    done = web.post(
+        "/llaves/nombre",
+        data={"csrf": csrf, "ticket": field(confirm.text, "ticket"), "llave": the_id,
+              "nombre": "portátil viejo"},
+        headers=key_headers(),
+        follow_redirects=False,
+    )  # fmt: skip
+    assert done.status_code == 303 and done.headers["location"].endswith("/llaves")
+    assert key_ids(tmp_path) == {"portátil viejo": the_id}
+    assert len(sessions) == 1
+
+
+def test_a_bad_name_comes_back_with_its_reason_and_a_new_ticket(
+    signing_in: Any, tmp_path: Path
+) -> None:
+    web, _ = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    the_id = key_ids(tmp_path)["portátil"]
+    confirm = web.get(f"/llaves/nombre?llave={the_id}", headers=KEY_HOST)
+    ticket = field(confirm.text, "ticket")
+    done = web.post(
+        "/llaves/nombre",
+        data={"csrf": csrf, "ticket": ticket, "llave": the_id, "nombre": "t.me/x"},
+        headers=key_headers(),
+    )
+    assert done.status_code == 400 and 'aria-invalid="true"' in done.text
+    assert field(done.text, "ticket") != ticket and 'id="key-name-error"' in done.text
+    assert key_ids(tmp_path) == {"portátil": the_id}
+    again = web.post(
+        "/llaves/nombre",
+        data={"csrf": csrf, "ticket": field(done.text, "ticket"), "llave": the_id,
+              "nombre": " móvil "},
+        headers=key_headers(),
+        follow_redirects=False,
+    )  # fmt: skip
+    assert again.status_code == 303 and key_ids(tmp_path) == {"móvil": the_id}
+
+
+def test_a_key_that_is_not_there_says_so(signing_in: Any) -> None:
+    web, _ = signing_in
+    owner, csrf = registered(web)
+    touch_with(web, owner, csrf)
+    for path in ("quitar", "nombre"):
+        page = web.get(f"/llaves/{path}?llave=nada", headers=KEY_HOST)
+        assert page.status_code == 404 and 'name="ticket"' not in page.text
+
+
+def test_after_the_first_key_the_page_asks_for_a_second(signing_in: Any, tmp_path: Path) -> None:
+    web, _ = signing_in
+    owner, csrf = registered(web)
+    page = web.get("/llaves?nueva=1", headers=KEY_HOST)
+    assert "segunda llave" in page.text and "/tocar?volver=llaves-alta" in page.text
+    touch = web.get("/tocar?volver=llaves-alta", headers=KEY_HOST)
+    assert re.search(r'data-target="/s/[a-z0-9]+/llaves\?nueva=1"', touch.text)
+    touch_with(web, owner, csrf)
+    form = web.get("/llaves?nueva=1", headers=KEY_HOST)
+    assert 'id="passkey-form"' in form.text and "Más tarde" in form.text
+    add_key(web, csrf, "móvil")
+    done = web.get("/llaves?nueva=1", headers=KEY_HOST)
+    assert "segunda llave" not in done.text and 'id="passkey-form"' not in done.text

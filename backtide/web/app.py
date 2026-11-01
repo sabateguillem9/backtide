@@ -105,6 +105,8 @@ from backtide.web.security import (
     COOKIE_NAME,
     DECIDE_PATH,
     HOLDS_PATH,
+    KEY_REMOVE_PATH,
+    KEY_RENAME_PATH,
     KEYS_BEGIN_PATH,
     KEYS_FINISH_PATH,
     KEYS_PATH,
@@ -182,7 +184,14 @@ PANEL_FEED = 40  # lines in the control room's feed when it loads
 REQUESTS_EVERY = 5.0  # how often the stream looks at the requests
 MAX_PASSWORD_CHARS = 256
 # Where the touch page goes back to: a word, never a path from the query.
-TOUCH_BACK = {"ajustes": SETTINGS_PATH, "peticiones": HOLDS_PATH, "llaves": KEYS_PATH}
+TOUCH_BACK = {
+    "ajustes": SETTINGS_PATH,
+    "peticiones": HOLDS_PATH,
+    "llaves": KEYS_PATH,
+    "llaves-alta": f"{KEYS_PATH}?nueva=1",
+}
+MAX_KEY_ID_CHARS = 1400  # 1023 bytes, the most a credential id can be, in base64url
+KEY_REMOVE_ACTION, KEY_RENAME_ACTION = "remove", "rename"  # what a confirmation's ticket is for
 SIGN_IN_ERRORS = frozenset({"wrong", "slow_down", "locked", "unset", "refused", "form"})
 SESSION_RECHECK = 60.0  # how often an open stream asks whether its session still lives
 
@@ -552,6 +561,7 @@ def create_app(
         # A passkey belongs to backtide.localhost: on 127.0.0.1 the page says where to go instead
         # of offering a form that cannot work there.
         host = request.headers.get("host", "").lower()
+        first = request.query_params.get("nueva") == "1"
         return _page(
             "keys.html",
             request,
@@ -561,13 +571,151 @@ def create_app(
             here=host.split(":")[0] == PASSKEY_HOST,
             origin=f"http://{PASSKEY_HOST}:{port}",
             keys=listed.get("keys") if listed.get("ok") is True else [],
-            first=request.query_params.get("nueva") == "1",
+            first=first,
             add=add,
-            touch=f"{base}{TOUCH_PATH}?volver=llaves",
+            touch=f"{base}{TOUCH_PATH}?volver={'llaves-alta' if first else 'llaves'}",
+            remove=base + KEY_REMOVE_PATH,
+            rename=base + KEY_RENAME_PATH,
             csrf=session.csrf,
             begin=base + KEYS_BEGIN_PATH,
             finish=base + KEYS_FINISH_PATH,
         )
+
+    # -- taking a key out and naming it (T26-3d): the service decides ---------------------------
+
+    key_tickets = SettingTickets(clock)
+
+    def _key_step(
+        request: Request, t: Translator, status: int, view: str, **values: Any
+    ) -> HTMLResponse:
+        for name in ("key", "error", "reason", "ticket", "action", "typed"):
+            values.setdefault(name, None)
+        return _page(
+            "keys_step.html",
+            request,
+            status=status,
+            active="settings",
+            t=t,
+            view=view,
+            back=base + KEYS_PATH,
+            **values,
+        )
+
+    async def _listed_keys(request: Request) -> list[dict[str, Any]] | None:
+        """The keys the service lists now, or None if it cannot say."""
+        reply = await asyncio.to_thread(access.passkey, "passkey_list", request.state.session.id)
+        keys = reply.get("keys")
+        return keys if reply.get("ok") is True and isinstance(keys, list) else None
+
+    async def _key_confirm(request: Request, action: str) -> Response:
+        """The confirmation of a change to a key: a one-time ticket for this action on this key.
+        After a touch, or the page sends you to touch one and back to the list."""
+        t = Translator(_language(request)[0])
+        if not getattr(access, "passwords", False):
+            return _key_step(request, t, 404, "refused", reason="keys.local")
+        if await _touch_needed(request):
+            return _go_touch("llaves")
+        given = request.query_params.get("llave", "")
+        keys = await _listed_keys(request)
+        if keys is None:
+            return _key_step(request, t, 503, "refused", reason="keys.err.refused")
+        key = next((k for k in keys if k.get("id") == given), None)
+        if key is None:
+            return _key_step(request, t, 404, "refused", reason="keys.err.missing")
+        if action == KEY_REMOVE_ACTION and len(keys) == 1:
+            return _key_step(request, t, 200, "refused", reason="keys.err.last")
+        view = "confirm_remove" if action == KEY_REMOVE_ACTION else "confirm_rename"
+        return _key_step(
+            request, t, 200, view, key=key, typed=key.get("name"),
+            ticket=key_tickets.issue(action, given), csrf=request.state.session.csrf,
+            action=base + (KEY_REMOVE_PATH if action == KEY_REMOVE_ACTION else KEY_RENAME_PATH),
+        )  # fmt: skip
+
+    @app.get(KEY_REMOVE_PATH, dependencies=protected)
+    async def key_remove_page(request: Request) -> Response:
+        return await _key_confirm(request, KEY_REMOVE_ACTION)
+
+    @app.get(KEY_RENAME_PATH, dependencies=protected)
+    async def key_rename_page(request: Request) -> Response:
+        return await _key_confirm(request, KEY_RENAME_ACTION)
+
+    async def _key_form(
+        request: Request, t: Translator, action: str, fields: tuple[str, ...]
+    ) -> dict[str, str] | Response:
+        """The form of a change to a key, its CSRF and its ticket: the form, or the refusal."""
+        form = await _read_form(
+            request,
+            fields,
+            limits={"llave": MAX_KEY_ID_CHARS, "nombre": 48},
+            max_bytes=MAX_LARGE_FORM_BYTES,
+        )
+        if form is None:
+            return _key_step(request, t, 400, "refused", reason="keys.err.form")
+        if not _csrf_is(request, form["csrf"]):
+            return Response("Formulario de otra sesión", status_code=403)
+        if not getattr(access, "passwords", False):
+            return _key_step(request, t, 404, "refused", reason="keys.local")
+        redeemed, _ = key_tickets.redeem(form["ticket"], action, form["llave"])
+        if redeemed is not Redeemed.OK:
+            return _key_step(request, t, 400, "refused", reason="keys.err.ticket")
+        return form
+
+    def _key_refused(request: Request, t: Translator, reply: dict[str, Any]) -> Response:
+        """The service said no: to touch a key first, or why not, in the page's language."""
+        outcome = reply.get("outcome")
+        if outcome == "touch":
+            return _go_touch("llaves")
+        if outcome == "missing":
+            return _key_step(request, t, 404, "refused", reason="keys.err.missing")
+        if outcome == "last":
+            return _key_step(request, t, 400, "refused", reason="keys.err.last")
+        return _key_step(request, t, 400, "refused", reason="keys.err.refused")
+
+    @app.post(KEY_REMOVE_PATH, dependencies=[Depends(require_session)])
+    async def key_remove(request: Request) -> Response:
+        """Take a key out. The service records it first, and ends every session, this one too."""
+        t = Translator(_language(request)[0])
+        form = await _key_form(request, t, KEY_REMOVE_ACTION, ("csrf", "ticket", "llave"))
+        if isinstance(form, Response):
+            return form
+        reply = await asyncio.to_thread(
+            access.passkey, "key_remove", request.state.session.id, key=form["llave"]
+        )
+        if reply.get("ok") is not True:
+            return _key_refused(request, t, reply)
+        request.state.session = None  # it has just ended: the page offers no "Salir"
+        response = _key_step(
+            request, t, 200, "removed",
+            key={"name": str(reply.get("name", "")), "tail": str(reply.get("tail", ""))},
+        )  # fmt: skip
+        response.delete_cookie(COOKIE_NAME, path=base, httponly=True, samesite="strict")
+        return response
+
+    @app.post(KEY_RENAME_PATH, dependencies=[Depends(require_session)])
+    async def key_rename(request: Request) -> Response:
+        """A key's new name. A bad one comes back to its form, with its reason and a new ticket."""
+        t = Translator(_language(request)[0])
+        form = await _key_form(request, t, KEY_RENAME_ACTION, ("csrf", "ticket", "llave", "nombre"))
+        if isinstance(form, Response):
+            return form
+        session = request.state.session
+        name = form["nombre"].strip()
+        reply = await asyncio.to_thread(
+            access.passkey, "key_rename", session.id, key=form["llave"], name=name
+        )
+        if reply.get("ok") is True:
+            return RedirectResponse(base + KEYS_PATH, status_code=303)
+        if reply.get("outcome") != "name":
+            return _key_refused(request, t, reply)
+        keys = await _listed_keys(request)
+        key = next((k for k in keys or [] if k.get("id") == form["llave"]), None)
+        if key is None:
+            return _key_step(request, t, 404, "refused", reason="keys.err.missing")
+        return _key_step(
+            request, t, 400, "confirm_rename", key=key, typed=name, error="keys.err.name",
+            ticket=key_tickets.issue(KEY_RENAME_ACTION, form["llave"]), csrf=session.csrf,
+            action=base + KEY_RENAME_PATH,
+        )  # fmt: skip
 
     def _keys_reply(reply: dict[str, Any]) -> JSONResponse:
         shown = {"ok": reply.get("ok") is True, "message": str(reply.get("message", ""))}
@@ -2032,7 +2180,13 @@ def create_app(
         KEYS_BEGIN_PATH,
         TOUCH_BEGIN_PATH,
     )
-    large_post_paths = (KEYS_FINISH_PATH, SIGN_IN_KEY_FINISH_PATH, TOUCH_FINISH_PATH)
+    large_post_paths = (
+        KEYS_FINISH_PATH,
+        SIGN_IN_KEY_FINISH_PATH,
+        TOUCH_FINISH_PATH,
+        KEY_REMOVE_PATH,
+        KEY_RENAME_PATH,
+    )
     if settings_on:
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:

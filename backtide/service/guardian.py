@@ -525,6 +525,11 @@ WEB_ACCESS_ALERTS = {
         "Alguien ha usado `sudo backtide llaves --quitar`, y se han cerrado todas las sesiones. "
         "Si no has sido tú, alguien tiene root en esta máquina.",
     ),
+    "web_passkey_renamed": (
+        "Se ha cambiado el nombre de una llave de la web",
+        "Una llave se llama ahora de otra forma: comprueba cuál con `sudo backtide llaves`. Si no "
+        "has sido tú, quita la que no reconozcas (`--quitar`).",
+    ),
     "web_password_locked": (
         "Demasiadas contraseñas equivocadas en la web",
         "La entrada con contraseña queda cerrada 15 minutos, también para ti. Para entrar ya, "
@@ -536,6 +541,13 @@ WEB_ACCESS_ACTIONS = frozenset(WEB_ACCESS_ALERTS)
 WEB_PASSKEY_SIGN_IN_BODY = (
     "Se ha entrado con ella. Si no has sido tú, quítala (`sudo backtide llaves --quitar`, que "
     "cierra todas las sesiones)."
+)
+# A key taken out from the web (T26-3d), not by root: whoever did it touched a key, so the keys
+# that are left are the question.
+WEB_PASSKEY_REMOVED_BODY = (
+    "Se ha quitado desde la web, tocando una llave, y se han cerrado todas las sesiones. Si no has "
+    "sido tú, mira las que quedan con `sudo backtide llaves` y quita las que no reconozcas "
+    "(`--quitar`, también la última)."
 )
 # An entry with the password: closing the sessions is not enough if it was not you.
 WEB_SIGN_IN_BODY = (
@@ -4223,19 +4235,31 @@ class Guardian:
             body = WEB_SIGN_IN_BODY
         if action == "web_session_opened" and details.get("via") == "passkey":
             body = WEB_PASSKEY_SIGN_IN_BODY
-        if action in ("web_passkey_added", "web_passkey_touched") or (
-            action == "web_session_opened" and details.get("via") == "passkey"
-        ):
+        from_the_web = details.get("via") == "web"
+        if action == "web_passkey_removed" and from_the_web:
+            body = WEB_PASSKEY_REMOVED_BODY
+        if action == "web_passkey_renamed":
+            body = f"Antes se llamaba «{str(details.get('was', ''))[:48]}». {body}"
+        if action in (
+            "web_passkey_added", "web_passkey_touched", "web_passkey_removed", "web_passkey_renamed"
+        ) or (action == "web_session_opened" and details.get("via") == "passkey"):  # fmt: skip
             # Which key: its name (the owner's own words, struck and cut by the alert) and the
             # end of its id. Not saved if the box did not take it: then it says so instead.
             label = f"«{str(details.get('name', ''))[:48]}» …{str(details.get('tail', ''))[:4]}"
             body = f"Llave {label}. {body}"
         if event is None:
-            body += {
+            not_recorded = {
                 "web_session_opened": " No ha quedado en la caja negra, así que la entrada se ha "
                 "rechazado.",
                 "web_passkey_added": " No ha quedado en la caja negra, así que no se ha guardado.",
-            }.get(action, " No ha quedado en la caja negra.")
+                "web_passkey_renamed": " No ha quedado en la caja negra, así que no se ha "
+                "cambiado.",
+            }
+            if from_the_web:  # root's goes anyway: a lost key must be able to go
+                not_recorded["web_passkey_removed"] = (
+                    " No ha quedado en la caja negra, así que no se ha quitado."
+                )
+            body += not_recorded.get(action, " No ha quedado en la caja negra.")
         self._alert(AlertLevel.ERROR, title, body, event)
         return event is not None
 

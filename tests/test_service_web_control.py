@@ -1501,3 +1501,275 @@ def test_a_touch_the_box_does_not_take_does_not_count(
     answer = keyed.owner.get(begun["options"], keyed.origin)
     reply = talk(server, {"cmd": "touch_finish", "session": keyed.session, "answer": answer})
     assert reply["outcome"] == "refused" and not keyed.sessions.recently_touched(keyed.session)
+
+
+# -- T26-3d: taking a key out and naming it from the web ---------------------------------------
+
+
+@pytest.fixture
+def two_keyed(passkeys: Any) -> tuple[Keyed, Any]:
+    """The service with two keys kept: ``owner``'s (portátil) and the one given back (móvil)."""
+    from tests.passkey_kit import SoftAuthenticator
+
+    keyed = Keyed(passkeys)
+    other = SoftAuthenticator()
+    keyed.keys.finish("alta2", other.create(keyed.keys.begin("alta2"), keyed.origin), "móvil")
+    return keyed, other
+
+
+def key_requests(key_id: str) -> list[dict[str, Any]]:
+    return [{"cmd": "key_remove", "key": key_id},
+            {"cmd": "key_rename", "key": key_id, "name": "otro"}]  # fmt: skip
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["remove", "rename"])
+def test_managing_a_key_without_a_live_session_changes_nothing(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any], which: int
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    before = keyed.keys.keys()
+    request_ = key_requests(before[0].id)[which]
+    for session in ("x" * 43, None, 7):
+        reply = talk(server, {**request_, "session": session})
+        assert reply["ok"] is False and "vuelve a entrar" in reply["message"]
+    assert keyed.keys.keys() == before and keyed.entries == []
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["remove", "rename"])
+def test_managing_a_key_asks_for_a_key_touched_a_moment_ago(
+    make_server: Callable[..., WebControlServer], passkeys: Any, which: int
+) -> None:
+    from tests.passkey_kit import SoftAuthenticator
+
+    ticks = Ticks()
+    keyed = Keyed(passkeys, clock=ticks)
+    keyed.keys.finish("b", SoftAuthenticator().create(keyed.keys.begin("b"), keyed.origin), "móvil")
+    server = keyed_server(make_server, keyed)
+    before = keyed.keys.keys()
+    request_ = {**key_requests(before[0].id)[which], "session": keyed.session}
+    reply = talk(server, dict(request_))
+    assert (reply["ok"], reply["outcome"]) == (False, "touch")
+    assert "tocar tu llave" in reply["message"]
+    assert keyed.keys.keys() == before and keyed.entries == []
+    touched(server, keyed)
+    keyed.entries.clear()
+    ticks.now += 5 * 60 + 1  # the session lives on, the touch does not
+    assert keyed.sessions.check(keyed.session) is not None
+    assert talk(server, dict(request_))["outcome"] == "touch"
+    assert keyed.keys.keys() == before and keyed.entries == []
+
+
+def test_a_key_goes_from_the_web_recorded_first_and_every_session_with_it(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any]
+) -> None:
+    keyed, _ = two_keyed
+    other_session = keyed.sessions.start().id
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    keyed.entries.clear()
+    going, staying = keyed.keys.keys()
+    seen_when_recorded: list[int] = []
+
+    def record(action: str, details: dict[str, Any]) -> bool:
+        seen_when_recorded.append(len(keyed.keys.keys()))
+        return keyed.record(action, details)
+
+    server._on_entry = record
+    reply = talk(server, {"cmd": "key_remove", "session": keyed.session, "key": going.id})
+    assert (reply["ok"], reply["outcome"]) == (True, "removed")
+    assert reply["ended"] == 2 and reply["name"] == going.name and reply["tail"] == going.tail
+    assert keyed.keys.keys() == [staying]
+    assert seen_when_recorded == [2]  # the black box heard before the file changed
+    [(action, details)] = keyed.entries
+    assert action == "web_passkey_removed"
+    assert details == {"pid": 4242, "via": "web", "name": going.name, "tail": going.tail}
+    assert keyed.sessions.check(keyed.session) is None
+    assert keyed.sessions.check(other_session) is None
+
+
+def test_a_removal_the_box_does_not_take_is_not_done(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any]
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    server._on_entry = lambda action, details: False
+    before = keyed.keys.keys()
+    reply = talk(server, {"cmd": "key_remove", "session": keyed.session, "key": before[0].id})
+    assert (reply["ok"], reply["outcome"]) == (False, "refused")
+    assert "apuntar" in reply["message"]
+    assert keyed.keys.keys() == before
+    assert keyed.sessions.check(keyed.session) is not None
+
+
+def test_the_last_key_does_not_go_from_the_web(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    keyed.entries.clear()
+    [only] = keyed.keys.keys()
+    reply = talk(server, {"cmd": "key_remove", "session": keyed.session, "key": only.id})
+    assert (reply["ok"], reply["outcome"]) == (False, "last")
+    assert "sudo backtide llaves --quitar" in reply["message"]
+    assert keyed.keys.keys() == [only] and keyed.entries == []
+    assert keyed.sessions.check(keyed.session) is not None
+
+
+def test_two_removals_at_once_leave_a_key(
+    make_server: Callable[..., WebControlServer],
+    two_keyed: tuple[Keyed, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both saw two keys and were recorded: the second write is refused under the lock, and the
+    ERROR says the event was not followed by the change."""
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    first, second = keyed.keys.keys()
+
+    def the_other_goes_meanwhile(action: str, details: dict[str, Any]) -> bool:
+        keyed.keys.remove(first.id)
+        return True
+
+    server._on_entry = the_other_goes_meanwhile
+    reply = talk(server, {"cmd": "key_remove", "session": keyed.session, "key": second.id})
+    assert (reply["ok"], reply["outcome"]) == (False, "last")
+    assert keyed.keys.keys() == [second]
+    assert keyed.sessions.check(keyed.session) is not None
+    assert any(
+        r.levelno == logging.ERROR and "recorded but" in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize("given", ["nada", "", 7, None, ["x"]])
+def test_a_key_is_named_by_its_whole_id(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any], given: object
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    keyed.entries.clear()
+    before = keyed.keys.keys()
+    for request_ in key_requests("x"):
+        reply = talk(server, {**request_, "session": keyed.session, "key": given})
+        assert (reply["ok"], reply["outcome"]) == (False, "missing")
+    assert keyed.keys.keys() == before and keyed.entries == []
+
+
+def test_the_end_of_an_id_is_roots_way_not_the_webs(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any]
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    before = keyed.keys.keys()
+    reply = talk(server, {"cmd": "key_remove", "session": keyed.session, "key": before[0].tail})
+    assert reply["outcome"] == "missing" and keyed.keys.keys() == before
+    # And root's own commands are still not on the web's list.
+    for request_ in ({"cmd": "passkey_remove", "key": before[0].id}, {"cmd": "passkeys"},
+                     {"cmd": "passkey_rename", "key": before[0].id, "name": "x"}):  # fmt: skip
+        assert "no se acepta" in talk(server, request_)["message"]
+    assert keyed.keys.keys() == before
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"name": "x"}, {"via": "sudo"}, {"uid": 0}],
+    ids=["no-key", "a-name-too", "via", "uid"],
+)
+def test_a_removal_of_another_shape_is_refused(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any], extra: dict
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    before = keyed.keys.keys()
+    with_key = {} if not extra else {"key": before[0].id}
+    reply = talk(server, {"cmd": "key_remove", "session": keyed.session, **with_key, **extra})
+    assert "forma esperada" in reply["message"] and keyed.keys.keys() == before
+
+
+def test_a_key_is_named_from_the_web_recorded_first(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any]
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    keyed.entries.clear()
+    target, other = keyed.keys.keys()
+    names_when_recorded: list[str] = []
+
+    def record(action: str, details: dict[str, Any]) -> bool:
+        names_when_recorded.append(keyed.keys.keys()[0].name)
+        return keyed.record(action, details)
+
+    server._on_entry = record
+    reply = talk(server, {"cmd": "key_rename", "session": keyed.session, "key": target.id,
+                          "name": "viejo"})  # fmt: skip
+    assert (reply["ok"], reply["outcome"]) == (True, "renamed")
+    assert [k.name for k in keyed.keys.keys()] == ["viejo", other.name]
+    assert names_when_recorded == [target.name]
+    [(action, details)] = keyed.entries
+    assert action == "web_passkey_renamed"
+    assert details == {"pid": 4242, "via": "web", "name": "viejo", "was": target.name,
+                       "tail": target.tail}  # fmt: skip
+    assert keyed.sessions.check(keyed.session) is not None  # a name closes nothing
+
+
+def test_a_name_the_box_does_not_take_is_not_changed(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any]
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    server._on_entry = lambda action, details: False
+    before = keyed.keys.keys()
+    reply = talk(server, {"cmd": "key_rename", "session": keyed.session, "key": before[0].id,
+                          "name": "viejo"})  # fmt: skip
+    assert (reply["ok"], reply["outcome"]) == (False, "refused")
+    assert keyed.keys.keys() == before
+
+
+@pytest.mark.parametrize("name", ["t.me/x", "@alguien", "", " x", "a" * 49, 7, None])
+def test_a_bad_name_is_refused_and_not_recorded(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any], name: object
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    keyed.entries.clear()
+    before = keyed.keys.keys()
+    reply = talk(server, {"cmd": "key_rename", "session": keyed.session, "key": before[0].id,
+                          "name": name})  # fmt: skip
+    assert (reply["ok"], reply["outcome"]) == (False, "name")
+    assert keyed.keys.keys() == before and keyed.entries == []
+
+
+def test_keys_that_cannot_be_read_are_not_touched(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any]
+) -> None:
+    from backtide.service.passkeys import path_of
+
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    keyed.entries.clear()
+    before = keyed.keys.keys()
+    path = path_of(keyed.keys._state_dir)
+    path.chmod(0o644)  # not ours any more, as far as the service can tell
+    reply = talk(server, {"cmd": "key_remove", "session": keyed.session, "key": before[0].id})
+    assert reply["ok"] is False and keyed.entries == []
+    path.chmod(0o600)
+    assert keyed.keys.keys() == before
+
+
+def test_the_web_sees_each_keys_whole_id_to_ask_by_it(
+    make_server: Callable[..., WebControlServer], two_keyed: tuple[Keyed, Any]
+) -> None:
+    keyed, _ = two_keyed
+    server = keyed_server(make_server, keyed)
+    listed = talk(server, {"cmd": "passkey_list", "session": keyed.session})["keys"]
+    assert [k["id"] for k in listed] == [k.id for k in keyed.keys.keys()]
+    assert all(set(k) == {"id", "name", "tail", "added"} for k in listed)  # never a public key

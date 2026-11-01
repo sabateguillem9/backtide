@@ -443,6 +443,78 @@ def test_llaves_quitar_says_why_not(
     assert code == exit_code and "Ninguna llave" in err
 
 
+def test_llaves_says_when_no_key_is_left(
+    capsys, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key_service: list[Any]
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "ask_passkeys",
+        lambda path, key=None: {
+            "ok": True, "message": "", "name": "móvil", "tail": "T-XQ", "ended": 0, "left": 0,
+        },
+    )  # fmt: skip
+    code, out, _ = run(capsys, "llaves", "--quitar", "T-XQ", "--config", tmp_path / "backtide.toml")
+    assert code == 0 and "No queda ninguna llave" in out
+
+
+def test_llaves_renombrar_gives_a_key_its_new_name(
+    capsys, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key_service: list[Any]
+) -> None:
+    def rename(path: Path, key: str, name: str) -> dict[str, Any]:
+        key_service.append((key, name))
+        return {"ok": True, "message": "", "name": name, "tail": "T-XQ"}
+
+    monkeypatch.setattr(cli, "ask_passkey_rename", rename)
+    code, out, _ = run(
+        capsys, "llaves", "--renombrar=-XQ1", "--nombre", "móvil viejo",
+        "--config", tmp_path / "backtide.toml",
+    )  # fmt: skip
+    assert code == 0 and key_service == [("-XQ1", "móvil viejo")] and "móvil viejo" in out
+
+
+@pytest.mark.parametrize(("outcome", "exit_code"), [("invalid", 2), ("failed", 1)])
+def test_llaves_renombrar_says_why_not(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    key_service: list[Any],
+    outcome: str,
+    exit_code: int,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "ask_passkey_rename",
+        lambda path, key, name: {"ok": False, "outcome": outcome, "message": "Así no."},
+    )
+    code, _, err = run(
+        capsys, "llaves", "--renombrar", "zzzz", "--nombre", "x",
+        "--config", tmp_path / "backtide.toml",
+    )  # fmt: skip
+    assert code == exit_code and "Así no." in err
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("--renombrar", "zzzz"), ("--nombre", "x"), ("--quitar", "zzzz", "--nombre", "x"),
+     ("--quitar", "zzzz", "--renombrar", "yyyy", "--nombre", "x")],
+    ids=["no-name", "no-key", "quitar-and-name", "both"],
+)  # fmt: skip
+def test_llaves_asks_for_one_thing_at_a_time(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    key_service: list[Any],
+    args: tuple[str, ...],
+) -> None:
+    def never(*_: Any, **__: Any) -> dict[str, Any]:
+        raise AssertionError("nothing should be asked")
+
+    monkeypatch.setattr(cli, "ask_passkeys", never)
+    monkeypatch.setattr(cli, "ask_passkey_rename", never)
+    code, _, err = run(capsys, "llaves", *args, "--config", tmp_path / "backtide.toml")
+    assert code == 2 and "--renombrar" in err
+
+
 def test_llaves_without_the_service_says_so(
     capsys, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key_service: list[Any]
 ) -> None:

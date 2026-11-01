@@ -2047,10 +2047,38 @@ id = "llave-perdida"
 name = "Una llave quitada no entra, y se lleva las sesiones"
 story = """T26-3c: con dos llaves registradas, `sudo backtide llaves --quitar` quita una: su firma ya \
 no entra, todas las sesiones se cierran y la otra llave sigue entrando. `backtide-web` no puede \
-pedir nada de eso: por su socket se rechaza por estar fuera de la lista y al de root no llega. En \
+pedir las órdenes de root (`passkey_remove`, `passkeys`): por su socket se rechazan por estar fuera \
+de la lista y al de root no llega; su propio camino, `key_remove`, tiene su escenario \
+(`quitar-llave-desde-la-web`). En \
 la caja negra queda `web_passkey_removed`, con la llave y quién lo pidió. Al terminar, quita las \
 llaves."""
 inspired_by = "Un móvil perdido con su passkey dentro"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "quitar-llave-desde-la-web"
+name = "Desde la web, una llave solo se quita con otra, y nunca la última"
+story = """T26-3d: como `backtide-web`, pide quitar una llave y cambiarle el nombre sin sesión viva \
+(se rechaza por eso), con una sesión de enlace sin haber tocado una llave (se rechaza por eso), con \
+el final del id en vez del id entero y con un nombre que un chat convertiría en enlace. Las órdenes \
+de root (`passkey_remove`, `passkey_rename`) siguen fuera de su lista. Tocando la llave, tampoco \
+quita la última: sin llaves la tabla 5.3 ya no pediría nada. Lo que debe funcionar, funciona: un \
+nombre nuevo, una segunda llave, y al perder la primera, entrar con la segunda y quitarla; se cierran \
+todas las sesiones, la perdida no vuelve a entrar y la otra sí. Con una sola llave otra vez, la web \
+sigue sin poder y `sudo backtide llaves --quitar` sí. En la caja negra queda cada cambio, desde dónde \
+y con qué llave, y ninguno de los rechazados. Tres cosas van en los tests del servicio y no aquí: \
+que la caja negra no los tome (no se hacen), porque a una instalación no se le puede romper la caja \
+negra; el plazo de 5 minutos del toque, porque aquí no hay reloj falso ni se puede acortar; y dos \
+peticiones a la vez, porque aquí no se puede forzar la carrera. Al terminar, quita las llaves."""
+inspired_by = "Un móvil perdido con su passkey dentro, y quien lo encuentra intenta quedarse solo"
 invariants = [2, 7]
 status = "ready"
 profiles = ["openclaw", "claude-code"]

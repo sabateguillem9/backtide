@@ -504,6 +504,35 @@ ES: dict[str, str] = {
     "settings.keys": "Llaves (passkeys) para entrar",
     "keys.unsupported": "Este navegador no puede crear passkeys aquí. Abre la web en "
     "http://backtide.localhost:8765 con Chrome, Edge o Firefox.",
+    "keys.second": "Tienes una sola llave. Registra una segunda llave en otro dispositivo, el "
+    "móvil o una llave USB: si pierdes esta, con la otra entras y la quitas.",
+    "keys.both": "Ya tienes dos llaves: si pierdes una, con la otra entras y la quitas.",
+    "keys.go_on": "Ir al panel",
+    "keys.last": "Es tu única llave, así que desde aquí no se quita: sin ninguna bastaría la "
+    "contraseña para todo. Si la has perdido, `sudo backtide llaves --quitar` en el servidor.",
+    "keys.rename": "Cambiar nombre",
+    "keys.remove": "Quitar",
+    "keys.remove.title": "¿Quitar esta llave?",
+    "keys.remove.note": "Ya no servirá para entrar. Se cerrarán todas las sesiones, también esta, "
+    "y volverás a entrar con otra llave.",
+    "keys.remove.yes": "Quitar la llave",
+    "keys.removed.title": "Llave quitada",
+    "keys.removed.body": "Ya no sirve para entrar, y se han cerrado todas las sesiones. Entra con "
+    "otra llave.",
+    "keys.removed.enter": "Volver a entrar",
+    "keys.name.title": "Cambiar el nombre",
+    "keys.name.hint": "Letras, cifras, espacios, - y _, hasta 48 caracteres.",
+    "keys.name.save": "Guardar el nombre",
+    "keys.back": "Volver a las llaves",
+    "keys.err.last": "Es la última llave, así que desde aquí no se quita: sin ninguna bastaría la "
+    "contraseña para todo. Registra otra, o quítala con `sudo backtide llaves --quitar`.",
+    "keys.err.missing": "Esa llave ya no está en la lista.",
+    "keys.err.refused": "No se ha hecho: el servicio no ha podido, o no ha podido apuntarlo en la "
+    "caja negra. Prueba otra vez; si sigue, `sudo backtide llaves` en el servidor.",
+    "keys.err.name": "Un nombre lleva solo letras, cifras, espacios, - y _, hasta 48 caracteres.",
+    "keys.err.ticket": "Esa confirmación ya se usó o caducó: no se ha hecho nada. Empieza otra "
+    "vez.",
+    "keys.err.form": "Ese formulario no vale: no se ha hecho nada. Empieza otra vez.",
     "auth.body.installed": "Entra con tu contraseña, o con un enlace de un solo uso: `sudo "
     "backtide enlace` en el servidor.",
     "auth.password": "Contraseña",
@@ -1282,6 +1311,37 @@ EN: dict[str, str] = {
     "keys.elsewhere": "Passkeys belong to a name, not an address: open the web at `{origin}` (the "
     "link `sudo backtide enlace` gives) to register one.",
     "settings.keys": "Keys (passkeys) to sign in",
+    "keys.second": "You have only one key. Register a second key on another device, your phone or "
+    "a USB key: if you lose this one, the other gets you in to take it out.",
+    "keys.both": "You have two keys now: if you lose one, the other gets you in to take it out.",
+    "keys.go_on": "Go to the overview",
+    "keys.last": "It is your only key, so it cannot be removed here: with none, the password "
+    "would be enough for everything. If you lost it, `sudo backtide llaves --quitar` on the "
+    "server.",
+    "keys.rename": "Rename",
+    "keys.remove": "Remove",
+    "keys.remove.title": "Remove this key?",
+    "keys.remove.note": "It will no longer sign in. Every session will close, this one too, and "
+    "you will sign in again with another key.",
+    "keys.remove.yes": "Remove the key",
+    "keys.removed.title": "Key removed",
+    "keys.removed.body": "It no longer signs in, and every session has closed. Sign in with "
+    "another key.",
+    "keys.removed.enter": "Sign in again",
+    "keys.name.title": "Change the name",
+    "keys.name.hint": "Letters, digits, spaces, - and _, up to 48 characters.",
+    "keys.name.save": "Save the name",
+    "keys.back": "Back to the keys",
+    "keys.err.last": "It is the last key, so it cannot be removed here: with none, the password "
+    "would be enough for everything. Register another, or remove it with `sudo backtide llaves "
+    "--quitar`.",
+    "keys.err.missing": "That key is no longer on the list.",
+    "keys.err.refused": "It was not done: the service could not, or could not write it in the "
+    "black box. Try again; if it goes on, `sudo backtide llaves` on the server.",
+    "keys.err.name": "A name has only letters, digits, spaces, - and _, up to 48 characters.",
+    "keys.err.ticket": "That confirmation was already used or has expired: nothing was done. "
+    "Start again.",
+    "keys.err.form": "That form is not valid: nothing was done. Start again.",
     "keys.unsupported": "This browser cannot create passkeys here. Open the web at "
     "http://backtide.localhost:8765 with Chrome, Edge or Firefox.",
     "auth.body.installed": "Sign in with your password, or with a one-time link: `sudo backtide "

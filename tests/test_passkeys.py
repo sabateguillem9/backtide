@@ -320,3 +320,128 @@ def test_a_key_is_found_by_the_end_of_its_id(keys: Passkeys, owner: SoftAuthenti
     key = keys.keys()[0]
     assert matching(keys.keys(), key.tail) == [key] == matching(keys.keys(), key.id)
     assert matching(keys.keys(), key.tail[1:]) == [] == matching(keys.keys(), "zzzz")
+
+
+# -- T26-3d: managing the keys ------------------------------------------------------------------
+
+
+def two_keys(keys: Passkeys) -> tuple[Passkeys, list]:
+    for name in ("portátil", "móvil"):
+        keys.finish(name, SoftAuthenticator().create(keys.begin(name), ORIGIN), name)
+    return keys, keys.keys()
+
+
+def test_keep_one_takes_a_key_out_while_another_stays(keys: Passkeys) -> None:
+    keys, (going, staying) = two_keys(keys)
+    assert keys.remove(going.id, keep_one=True) is True
+    assert keys.keys() == [staying]
+
+
+def test_keep_one_refuses_the_last_key_under_the_lock(keys: Passkeys) -> None:
+    keys, (going, staying) = two_keys(keys)
+    keys.remove(going.id, keep_one=True)
+    with pytest.raises(PasskeyError, match="última"):
+        keys.remove(staying.id, keep_one=True)
+    assert keys.keys() == [staying]
+
+
+def test_keep_one_says_false_for_a_key_that_is_not_there(keys: Passkeys) -> None:
+    keys, (going, staying) = two_keys(keys)
+    assert keys.remove("not-a-key", keep_one=True) is False
+    assert keys.keys() == [going, staying]
+
+
+def test_root_can_still_take_the_last_key_out(keys: Passkeys) -> None:
+    keys, (going, staying) = two_keys(keys)
+    assert keys.remove(going.id) is True and keys.remove(staying.id) is True
+    assert keys.keys() == []
+
+
+def test_a_key_is_renamed_and_nothing_else_of_it_changes(keys: Passkeys) -> None:
+    keys, (first, second) = two_keys(keys)
+    renamed = keys.rename(first.id, "portátil viejo")
+    assert renamed.name == "portátil viejo"
+    assert (renamed.id, renamed.public_key, renamed.sign_count, renamed.added) == (
+        first.id, first.public_key, first.sign_count, first.added,
+    )  # fmt: skip
+    assert keys.keys() == [renamed, second]
+
+
+@pytest.mark.parametrize("name", ["", " x", "x ", "t.me/x", "@someone", "a" * 49, None, 7])
+def test_a_new_name_follows_the_rules_of_a_first_name(keys: Passkeys, name: object) -> None:
+    keys, listed = two_keys(keys)
+    with pytest.raises(PasskeyError):
+        keys.rename(listed[0].id, name)
+    assert keys.keys() == listed
+
+
+def test_a_key_that_is_not_there_is_not_renamed(keys: Passkeys) -> None:
+    keys, listed = two_keys(keys)
+    with pytest.raises(PasskeyError, match="no está"):
+        keys.rename("not-a-key", "móvil")
+    assert keys.keys() == listed
+
+
+def test_a_signature_in_flight_does_not_bring_an_old_name_back(
+    keys: Passkeys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename while a signature is being checked: the count saved after it keeps the new name."""
+    import backtide.service.passkeys as module
+
+    owner = SoftAuthenticator()
+    keys.finish(SESSION, owner.create(keys.begin(SESSION), ORIGIN), "portátil")
+    real = module.verify_authentication_response
+
+    def renames_meanwhile(**kwargs: object) -> object:
+        keys.rename(keys.keys()[0].id, "móvil")
+        return real(**kwargs)
+
+    monkeypatch.setattr(module, "verify_authentication_response", renames_meanwhile)
+    owner.count = 5
+    signed = keys.sign_in(owner.get(keys.sign_in_begin(), ORIGIN))
+    assert signed.name == "móvil" and signed.sign_count == 5
+    [kept] = keys.keys()
+    assert kept.name == "móvil" and kept.sign_count == 5
+
+
+def test_a_whole_id_reaches_its_key_whatever_its_length_or_the_others(keys: Passkeys) -> None:
+    """Review of T26-3d: `--quitar` must reach every key, also one kept before ids were bounded
+    or whose whole id is the end of another's."""
+    from backtide.service.passkeys import Passkey
+
+    short = Passkey(id="abc", public_key="", sign_count=0, name="corta", added="2026-11-01")
+    longer = Passkey(id="xyzabc", public_key="", sign_count=0, name="larga", added="2026-11-01")
+    assert matching([short, longer], "abc") == [short]
+    assert matching([short, longer], "xyzabc") == [longer]
+    assert matching([short, longer], "yz") == []  # the end of an id still takes 4 at least
+
+
+@pytest.mark.parametrize("size", [1, 8, 15])
+def test_a_key_with_a_short_id_is_not_kept(keys: Passkeys, size: int) -> None:
+    authenticator = SoftAuthenticator()
+    authenticator.credential_id = os.urandom(size)
+    answer = authenticator.create(keys.begin(SESSION), ORIGIN)
+    with pytest.raises(PasskeyError, match="tamaño"):
+        keys.finish(SESSION, answer, "corta")
+    assert keys.keys() == []
+
+
+def test_a_key_with_a_long_id_is_not_kept(keys: Passkeys, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The true limit (1023) cannot be reached here: the answer's own 3500 characters come first."""
+    import backtide.service.passkeys as module
+
+    monkeypatch.setattr(module, "MAX_ID_BYTES", 32)
+    authenticator = SoftAuthenticator()
+    authenticator.credential_id = os.urandom(33)
+    answer = authenticator.create(keys.begin(SESSION), ORIGIN)
+    with pytest.raises(PasskeyError, match="tamaño"):
+        keys.finish(SESSION, answer, "larga")
+    assert keys.keys() == []
+
+
+@pytest.mark.parametrize("size", [16, 64])
+def test_a_key_with_a_normal_id_is_kept(keys: Passkeys, size: int) -> None:
+    authenticator = SoftAuthenticator()
+    authenticator.credential_id = os.urandom(size)
+    key = keys.finish(SESSION, authenticator.create(keys.begin(SESSION), ORIGIN), "normal")
+    assert keys.keys() == [key]

@@ -17,6 +17,8 @@ session (``touch_begin``, ``touch``, T26-3c). Through the domain (T26-4) it will
 - Only public keys are kept: ``<state_dir>/web-auth/passkeys.json``, root's and 0600, at most
   ``MAX_KEYS``. Whoever reads the file cannot sign in with it. Each key has a name the owner
   gives it (``NAME_CHARS`` at most, printable) and the date it was added.
+- Managing them (T26-3d): ``rename``, and ``remove``, which the web asks with ``keep_one``: from
+  there the last key does not go.
 """
 
 import base64
@@ -69,6 +71,11 @@ MAX_SIGN_INS = 16  # challenges waiting for an answer, with nobody signed in yet
 NAME_CHARS = 48
 MAX_FILE_BYTES = 64 * 1024
 MAX_ANSWER_CHARS = 3500  # the narrow socket's line is 4 KiB
+MIN_ID_BYTES, MAX_ID_BYTES = 16, 1023  # a credential id: what the WebAuthn standard allows
+LAST_KEY = (
+    "Es la última llave: desde la web no se quita, porque sin ninguna bastaría la contraseña para "
+    "todo. Registra otra, o quítala con `sudo backtide llaves --quitar`."
+)
 ALGORITHMS = [  # what a platform authenticator or a security key signs with
     COSEAlgorithmIdentifier.ECDSA_SHA_256,
     COSEAlgorithmIdentifier.EDDSA,
@@ -192,15 +199,33 @@ class Passkeys:
         except SettingsError as error:
             raise PasskeyError(f"no se puede guardar en {folder}: {error}") from None
 
-    def remove(self, key_id: str) -> bool:
-        """Take a key out (a registration the black box did not take; T26-3d's "quitar")."""
+    def remove(self, key_id: str, *, keep_one: bool = False) -> bool:
+        """Take a key out; False if it is not there. With ``keep_one`` (the web, T26-3d) never the
+        last one: PasskeyError, decided here under the lock, so that two removals at once cannot
+        leave none (docs/47 section 5.2). Root may take them all."""
         with self._lock:
             kept = self.keys()
             left = [k for k in kept if k.id != key_id]
             if len(left) == len(kept):
                 return False
+            if keep_one and not left:
+                raise PasskeyError(LAST_KEY)
             self._write(left)
             return True
+
+    def rename(self, key_id: str, name: object) -> Passkey:
+        """Give a key a new name, by the rules of a first one (T26-3d): the key as it is now."""
+        why = name_problem(name)
+        if why is not None:
+            raise PasskeyError(why)
+        with self._lock:
+            kept = self.keys()
+            key = next((k for k in kept if k.id == key_id), None)
+            if key is None:
+                raise PasskeyError("esa llave no está registrada")
+            renamed = replace(key, name=str(name))
+            self._write([renamed if k.id == key_id else k for k in kept])
+            return renamed
 
     # -- registering ---------------------------------------------------------------------------
 
@@ -273,6 +298,10 @@ class Passkeys:
             raise PasskeyError(
                 f"el navegador no ha dado una llave válida: {type(error).__name__}"
             ) from None
+        # A real authenticator's id has at least 16 random bytes; an id chosen short could not be
+        # told apart in a list, nor reached by the end of it (review of T26-3d).
+        if not MIN_ID_BYTES <= len(verified.credential_id) <= MAX_ID_BYTES:
+            raise PasskeyError("el identificador de esa llave no tiene un tamaño normal")
         key = Passkey(
             id=_b64url(verified.credential_id),
             public_key=base64.b64encode(verified.credential_public_key).decode(),
@@ -405,12 +434,14 @@ class Passkeys:
             raise PasskeyError(
                 f"el navegador no ha dado una firma válida: {type(error).__name__}"
             ) from None
-        if verified.new_sign_count == key.sign_count:
+        count = verified.new_sign_count
+        if count == key.sign_count:
             return key
-        updated = replace(key, sign_count=verified.new_sign_count)
+        # Read again under the lock: the key may have got a new name (or gone) meanwhile.
         with self._lock:
-            self._write([updated if k.id == key.id else k for k in self.keys()])
-        return updated
+            kept = [replace(k, sign_count=count) if k.id == key.id else k for k in self.keys()]
+            self._write(kept)
+        return next((k for k in kept if k.id == key.id), replace(key, sign_count=count))
 
 
 def describe(key: Passkey) -> dict[str, Any]:
@@ -419,14 +450,20 @@ def describe(key: Passkey) -> dict[str, Any]:
 
 
 def matching(keys: Sequence[Passkey], given: str) -> list[Passkey]:
-    """The keys whose id is ``given`` or ends in it (at least 4 characters, as a list shows it)."""
+    """The key whose id is ``given``, whatever its length: root's way out must reach any key
+    (review of T26-3d). Else the keys whose id ends in it (at least 4 characters, as a list shows
+    it)."""
+    exact = [k for k in keys if k.id == given]
+    if exact:
+        return exact
     if len(given) < 4:
         return []
-    return [k for k in keys if k.id == given or k.id.endswith(given)]
+    return [k for k in keys if k.id.endswith(given)]
 
 
 __all__ = [
     "CHALLENGE_SECONDS",
+    "LAST_KEY",
     "MAX_KEYS",
     "RP_ID",
     "Passkey",

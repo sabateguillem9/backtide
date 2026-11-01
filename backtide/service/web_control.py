@@ -37,6 +37,10 @@ The socket:
   one: a web taken over cannot change anything on its own. A WARNING on every refusal; every
   new session and every "close them all" goes to the black box and is alerted, one by one
   (``on_entry``: ``Guardian.web_access``).
+- The keys (T26-3b-2, T26-3c, T26-3d): registering, listing and touching them, signing in, and
+  ``key_remove`` and ``key_rename`` (``_manage_key``): by the whole id, with a key just touched,
+  recorded first, and from here never the last key. Root's own ``passkey_remove``, by the end of
+  an id and for any key, stays off this list.
 - How much: a request is one JSON line of at most 4 KiB within 5 s (the control socket's own
   reading), at most ``MAX_WEB_CONNECTIONS`` at once, and two token buckets: every request, and the
   changes on their own (``REQUESTS_*``, ``CHANGES_*``). Over either, a refusal without calling
@@ -74,7 +78,7 @@ from backtide.service.control import (
     _reply_of,
     peer_credentials,
 )
-from backtide.service.passkeys import PasskeyError, Passkeys, describe
+from backtide.service.passkeys import LAST_KEY, PasskeyError, Passkeys, describe, name_problem
 from backtide.service.password import Checker, PasswordError, Verdict
 from backtide.service.rewind import RewindOutcome, RewindStatus
 from backtide.service.sessions import Session, Sessions
@@ -101,14 +105,16 @@ PASSKEY_COMMANDS = frozenset(
     {
         "passkey_begin", "passkey_finish", "passkey_list",
         "touch_status", "touch_begin", "touch_finish",
+        "key_remove", "key_rename",
     }
 )  # fmt: skip
 # Signing in with a passkey (T26-3c): nobody is signed in yet, and the service checks the signature.
 SIGN_IN_COMMANDS = frozenset({"auth_begin", "auth_finish"})
 COMMANDS = READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS | SIGN_IN_COMMANDS
 # What asks for the passkey touched a moment ago (docs/47 section 5.3), once there is one: it
-# outlasts the session or decides who hears the alerts. Closing every session and adding a key
-# too, in their own commands; creating agents (T26-6) and the terminal (T26-5d) will join.
+# outlasts the session or decides who hears the alerts. Closing every session, and adding, taking
+# out or naming a key too, in their own commands; creating agents (T26-6) and the terminal
+# (T26-5d) will join.
 TOUCH_CHANGES = frozenset({"set_secret", "clear_secret", "trust"})
 # Every request: a burst of 120, then 20 a second (the panel's stream asks about once a second
 # per open tab). The changes: a burst of 10, then one every 3 s (a person clicks).
@@ -123,8 +129,9 @@ ENDS_BURST, ENDS_PER_SECOND = 5, 1 / 6
 # Passwords: a bucket of their own (the Checker's own, slower one comes after), so a stream of
 # them never empties the pages' checks nor the link's way in (review of T26-3b-1).
 PASSWORDS_BURST, PASSWORDS_PER_SECOND = 10, 1.0
-# The passkeys: a person registers one now and then (T26-3b-2).
-KEYS_BURST, KEYS_PER_SECOND = 10, 1 / 3
+# The passkeys: a person registers one now and then (T26-3b-2). Registering two in a row and
+# touching one in between, with their pages, takes about 15 at once (T26-3d).
+KEYS_BURST, KEYS_PER_SECOND = 20, 1 / 3
 # Signing in with one (docs/47 section 5.2): about 10 answers a minute for the whole web, whoever
 # sends them, and its challenges apart, so that a stream of them leaves the answers alone.
 AUTH_ANSWERS_BURST, AUTH_ANSWERS_PER_SECOND = 10, 1 / 6
@@ -136,6 +143,8 @@ PASSKEY_KEYS = {
     "touch_status": {"cmd", "session"},
     "touch_begin": {"cmd", "session"},
     "touch_finish": {"cmd", "session", "answer"},
+    "key_remove": {"cmd", "session", "key"},
+    "key_rename": {"cmd", "session", "key", "name"},
 }
 SIGN_IN_KEYS = {"auth_begin": {"cmd"}, "auth_finish": {"cmd", "answer"}}
 PASSWORD_MESSAGES = {
@@ -401,6 +410,8 @@ class WebControlServer(ControlServer):
         if session is None:
             logger.warning("web socket: refused a %s without a live session (pid %d)", command, pid)
             raise _BadRequest(NO_SESSION)
+        if command in ("key_remove", "key_rename"):
+            return self._manage_key(command, request, session.id, pid)
         if command in ("passkey_begin", "passkey_finish"):
             refusal = self._add_refusal(session.id)
             if refusal is not None:
@@ -408,7 +419,9 @@ class WebControlServer(ControlServer):
                 return {"ok": False, "outcome": "refused", "message": refusal}
         try:
             if command == "passkey_list":
-                keys = [describe(key) for key in self._passkeys.keys()]
+                # Their ids too: not secret (any `auth_begin` lists them), and how the page names
+                # the key it wants changed.
+                keys = [{**describe(key), "id": key.id} for key in self._passkeys.keys()]
                 return {"ok": True, "outcome": "listed", "message": "", "keys": keys}
             if command == "touch_status":
                 add = {None: "ok", NEEDS_TOUCH: "touch"}.get(self._add_refusal(session.id), "again")
@@ -459,6 +472,67 @@ class WebControlServer(ControlServer):
             return {"ok": False, "outcome": "refused", "message": str(error)}
         logger.info("web socket: a new passkey for the web (pid %d)", pid)
         return {"ok": True, "outcome": "added", "message": "", "key": describe(key)}
+
+    def _manage_key(
+        self, command: str, request: dict[str, Any], session_id: str, pid: int
+    ) -> dict[str, Any]:
+        """Take a key out or give it a new name (T26-3d, docs/47 sections 5.2 and 5.3): a key
+        touched a moment ago, the key by its whole id, recorded first and not done if the black
+        box does not take it. The last key does not go from here: without keys the table 5.3 asks
+        for nothing, so a web taken over would keep what it took (`sudo backtide llaves --quitar`
+        can). Taking one out ends every session, this one too: it may be in other hands, and so
+        may a session opened with it."""
+
+        def refused(outcome: str, message: str) -> dict[str, Any]:
+            logger.warning("web socket: refused a %s (pid %d): %s", command, pid, message)
+            return {"ok": False, "outcome": outcome, "message": message}
+
+        if self._needs_touch(session_id):
+            return refused("touch", NEEDS_TOUCH)
+        try:
+            kept = self._passkeys.keys()
+        except PasskeyError as error:
+            return refused("refused", str(error))
+        key = next((k for k in kept if k.id == request["key"]), None)
+        if key is None:
+            return refused("missing", "Esa llave no está en la lista.")
+        renaming = command == "key_rename"
+        details: dict[str, Any] = {"pid": pid, "via": "web", "name": key.name, "tail": key.tail}
+        if renaming:
+            why = name_problem(request["name"])
+            if why is not None:
+                return refused("name", why)
+            details |= {"name": request["name"], "was": key.name}
+        elif len(kept) == 1:
+            return refused("last", LAST_KEY)
+        action = "web_passkey_renamed" if renaming else "web_passkey_removed"
+        if self._on_entry is None or not self._on_entry(action, details):
+            logger.error("web socket: a %s could not be recorded and was not done", command)
+            return {"ok": False, "outcome": "refused",
+                    "message": "No se ha podido apuntar el cambio: no se ha hecho."}  # fmt: skip
+        try:
+            if renaming:
+                key = self._passkeys.rename(key.id, request["name"])
+            elif not self._passkeys.remove(key.id, keep_one=True):
+                raise PasskeyError("Esa llave no está en la lista.")
+        except PasskeyError as error:
+            # The event says it was done: the ERROR (recorded and alerted by the log bridge) says
+            # which key it was not done to after all.
+            logger.error(
+                "web socket: %s on the passkey …%s was recorded but not done: %s",
+                command,
+                key.tail,
+                error,
+            )
+            outcome = "last" if str(error) == LAST_KEY else "refused"
+            return {"ok": False, "outcome": outcome, "message": str(error)}
+        if renaming:
+            logger.info("web socket: the passkey …%s has a new name (pid %d)", key.tail, pid)
+            return {"ok": True, "outcome": "renamed", "message": "", "key": describe(key)}
+        ended = self._sessions.end_all()
+        logger.info("web socket: the passkey …%s was taken out (pid %d)", key.tail, pid)
+        return {"ok": True, "outcome": "removed", "message": "", "ended": ended,
+                "name": key.name, "tail": key.tail}  # fmt: skip
 
     def _needs_touch(self, session_id: object) -> bool:
         """Does this session have to touch a passkey first (docs/47 section 5.3)? Only once there

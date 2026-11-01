@@ -516,6 +516,8 @@ class ControlServer:
             return self._list_passkeys(request)
         if command == "passkey_remove":
             return self._remove_passkey(request, pid, uid)
+        if command == "passkey_rename":
+            return self._rename_passkey(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
 
     def _web_link(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
@@ -595,8 +597,44 @@ class ControlServer:
             return {"ok": False, "outcome": "failed", "ended": 0, "message": str(error)}
         ended = self._sessions.end_all() if self._sessions is not None else 0
         logger.info("%s: the passkey …%s was taken out by uid %d", self.label, key.tail, uid)
+        try:
+            left = len(self._passkeys.keys())
+        except PasskeyError:
+            left = None  # it went: what cannot be read now is for the next list to say
         return {"ok": True, "outcome": "removed", "ended": ended, "message": "",
-                "name": key.name, "tail": key.tail}  # fmt: skip
+                "name": key.name, "tail": key.tail, "left": left}  # fmt: skip
+
+    def _rename_passkey(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """A key's new name (`sudo backtide llaves --renombrar`, T26-3d): by its id or the end of
+        it. Unlike a lost key, a name can wait for the black box: not recorded, not done."""
+        from backtide.service.passkeys import PasskeyError, matching, name_problem
+
+        if set(request) != {"cmd", "key", "name"} or not isinstance(request["key"], str):
+            raise _BadRequest("Cambiar el nombre de una llave lleva `cmd`, `key` y `name`.")
+        if self._passkeys is None:
+            raise _BadRequest("Este servicio no tiene web instalada: no hay llaves.")
+        why = name_problem(request["name"])
+        if why is not None:
+            return {"ok": False, "outcome": "invalid", "message": why}
+        try:
+            found = matching(self._passkeys.keys(), request["key"])
+            if len(found) != 1:
+                why = "Ninguna llave acaba así." if not found else "Varias llaves acaban así."
+                return {"ok": False, "outcome": "invalid", "message": why}
+            key = found[0]
+            details = {"uid": uid, "pid": pid, "name": request["name"], "was": key.name,
+                       "tail": key.tail}  # fmt: skip
+            if self._on_entry is None or not self._on_entry("web_passkey_renamed", details):
+                logger.error("%s: a passkey's new name could not be recorded", self.label)
+                said = "No se ha podido apuntar el cambio: no se ha hecho."
+                return {"ok": False, "outcome": "failed", "message": said}
+            renamed = self._passkeys.rename(key.id, request["name"])
+        except PasskeyError as error:
+            logger.error("%s: a passkey could not get its new name: %s", self.label, error)
+            return {"ok": False, "outcome": "failed", "message": str(error)}
+        logger.info("%s: the passkey …%s has a new name, by uid %d", self.label, key.tail, uid)
+        return {"ok": True, "outcome": "renamed", "message": "",
+                "name": renamed.name, "tail": renamed.tail}  # fmt: skip
 
     def _web_end_all(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         """Close every web session and the unspent link (`sudo backtide enlace --cerrar-todas`):
@@ -1627,6 +1665,34 @@ def ask_passkeys(
     request: dict[str, Any] = {"cmd": "passkeys"}
     if key is not None:
         request = {"cmd": "passkey_remove", "key": key}
+    return _ask_keys(path, request, wait, peer, sleep, monotonic, server_uid)
+
+
+def ask_passkey_rename(
+    path: Path,
+    key: str,
+    name: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> dict[str, Any]:
+    """Give that key a new name (`sudo backtide llaves --renombrar`): the reply, as above."""
+    request = {"cmd": "passkey_rename", "key": key, "name": name}
+    return _ask_keys(path, request, wait, peer, sleep, monotonic, server_uid)
+
+
+def _ask_keys(
+    path: Path,
+    request: dict[str, Any],
+    wait: float,
+    peer: PeerCredentials,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    server_uid: int | None,
+) -> dict[str, Any]:
     raw = _ask(
         Path(path),
         request,

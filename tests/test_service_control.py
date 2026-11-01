@@ -1300,3 +1300,69 @@ def test_without_a_web_there_are_no_keys(make_server: Callable[..., ControlServe
 
     reply = ask_passkeys(make_server().path, peer=me)
     assert reply["ok"] is False and "no hay llaves" in reply["message"]
+
+
+# -- T26-3d: root names the web's passkeys, and hears how many are left ---------------------------
+
+
+def test_root_renames_a_key_and_it_is_recorded(
+    make_server: Callable[..., ControlServer], kept: Any
+) -> None:
+    from backtide.service.control import ask_passkey_rename
+    from backtide.service.sessions import Sessions
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    server = make_server(passkeys=kept, sessions=Sessions(),
+                         on_entry=lambda a, d: entries.append((a, d)) is None)  # fmt: skip
+    target, other = kept.keys()
+    reply = ask_passkey_rename(server.path, target.tail, "viejo", peer=me)
+    assert reply["ok"] is True and reply["name"] == "viejo" and reply["tail"] == target.tail
+    assert [k.name for k in kept.keys()] == ["viejo", other.name]
+    [(action, details)] = entries
+    assert action == "web_passkey_renamed" and details["uid"] == os.geteuid()
+    assert details["name"] == "viejo" and details["was"] == target.name
+    assert details["tail"] == target.tail
+
+
+def test_a_rename_the_box_does_not_take_is_not_done(
+    make_server: Callable[..., ControlServer], kept: Any
+) -> None:
+    """Nobody is locked out by an old name: unlike a lost key, it can wait for the black box."""
+    from backtide.service.control import ask_passkey_rename
+    from backtide.service.sessions import Sessions
+
+    before = kept.keys()
+    server = make_server(passkeys=kept, sessions=Sessions(), on_entry=lambda a, d: False)
+    reply = ask_passkey_rename(server.path, before[0].tail, "viejo", peer=me)
+    assert (reply["ok"], reply["outcome"]) == (False, "failed")
+    assert kept.keys() == before
+
+
+@pytest.mark.parametrize(("given", "name"), [("zzzz", "viejo"), ("", "viejo"), (None, "t.me/x")])
+def test_a_rename_without_one_key_or_a_good_name_is_refused(
+    make_server: Callable[..., ControlServer], kept: Any, given: str | None, name: str
+) -> None:
+    from backtide.service.control import ask_passkey_rename
+    from backtide.service.sessions import Sessions
+
+    before = kept.keys()
+    entries: list[str] = []
+    server = make_server(passkeys=kept, sessions=Sessions(),
+                         on_entry=lambda a, d: entries.append(a) is None)  # fmt: skip
+    reply = ask_passkey_rename(server.path, before[0].tail if given is None else given, name,
+                               peer=me)  # fmt: skip
+    assert (reply["ok"], reply["outcome"]) == (False, "invalid")
+    assert kept.keys() == before and entries == []
+
+
+def test_taking_a_key_out_says_how_many_are_left(
+    make_server: Callable[..., ControlServer], kept: Any
+) -> None:
+    from backtide.service.control import ask_passkeys
+    from backtide.service.sessions import Sessions
+
+    server = make_server(passkeys=kept, sessions=Sessions(), on_entry=lambda a, d: True)
+    first, second = kept.keys()
+    assert ask_passkeys(server.path, first.tail, peer=me)["left"] == 1
+    assert ask_passkeys(server.path, second.tail, peer=me)["left"] == 0  # root may take the last
+    assert kept.keys() == []

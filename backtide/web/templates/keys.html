@@ -9,17 +9,22 @@
   {% if not installed %}
   <p class="lede">{{ t.code('keys.local') }}</p>
   {% else %}
-  <p class="lede">{{ t('keys.first') if first else t('keys.body') }}</p>
+  {% set count = keys | length %}
+  {% set both = first and count >= 2 %}
+  <p class="lede">{% if count == 1 %}{{ t('keys.second') }}{% elif both %}{{ t('keys.both') }}{% elif first %}{{ t('keys.first') }}{% else %}{{ t('keys.body') }}{% endif %}</p>
   {% if keys %}
   <ul class="settings-list keys-list">
-    {% for key in keys %}<li class="setting"><div class="setting-info"><span class="setting-name">{{ key.name }}</span><span class="setting-state"><span>{{ t('settings.tail', tail=key.tail) }}</span><span aria-hidden="true">·</span><time datetime="{{ key.added }}">{{ key.added[:10] }}</time></span></div></li>{% endfor %}
+    {% for key in keys %}<li class="setting"><div class="setting-info"><span class="setting-name">{{ key.name }}</span><span class="setting-state"><span>{{ t('settings.tail', tail=key.tail) }}</span><span aria-hidden="true">·</span><time datetime="{{ key.added }}">{{ key.added[:10] }}</time></span></div><div class="setting-actions"><a class="setting-go" href="{{ rename }}?llave={{ key.id | urlencode }}">{{ t('keys.rename') }}<span class="visually-hidden"> {{ key.name }}</span></a>{% if count > 1 %}<a class="setting-remove" href="{{ remove }}?llave={{ key.id | urlencode }}">{{ t('keys.remove') }}<span class="visually-hidden"> {{ key.name }}</span></a>{% endif %}</div></li>{% endfor %}
   </ul>
+  {% if count == 1 %}<p class="note">{{ t.code('keys.last') }}</p>{% endif %}
   {% endif %}
-  {% if not here %}
+  {% if both %}
+  <div class="settings-actions"><a class="settings-yes" href="{{ base }}/"><span>{{ t('keys.go_on') }}</span>{% include "arrow.html" %}</a></div>
+  {% elif not here %}
   <p class="note">{{ t.code('keys.elsewhere', origin=origin) }}</p>
   {% elif add == "touch" %}
   <p class="note">{{ t('keys.touch') }}</p>
-  <div class="settings-actions"><a class="settings-yes" href="{{ touch }}"><span>{{ t('touch.go') }}</span>{% include "arrow.html" %}</a></div>
+  <div class="settings-actions"><a class="settings-yes" href="{{ touch }}"><span>{{ t('touch.go') }}</span>{% include "arrow.html" %}</a>{% if first %}<a class="settings-cancel" href="{{ base }}/">{{ t('keys.later') }}</a>{% endif %}</div>
   {% elif add == "again" %}
   <p class="note">{{ t('keys.again') }}</p>
   {% else %}

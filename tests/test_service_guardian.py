@@ -3440,3 +3440,50 @@ def test_a_touched_passkey_is_recorded_and_alerted(world: World) -> None:
     assert world.only("web_passkey_touched").details == details
     (alert,) = world.alerts.titled("tocado")
     assert alert.level is AlertLevel.ERROR and "«móvil» …ab12" in alert.body
+
+
+# -- T26-3d: a key taken out or named from the web ------------------------------------------------
+
+
+def test_taking_a_passkey_out_from_the_web_says_which_and_what_to_do(world: World) -> None:
+    details = {"pid": 8, "via": "web", "name": "móvil", "tail": "ab12"}
+    assert world.guardian.web_access("web_passkey_removed", details)
+    assert world.only("web_passkey_removed").details == details
+    (alert,) = world.alerts.titled("quitado")
+    assert alert.level is AlertLevel.ERROR and "«móvil» …ab12" in alert.body
+    assert "desde la web" in alert.body and "backtide llaves" in alert.body
+    assert "alguien tiene root" not in alert.body
+
+
+def test_a_web_removal_the_box_does_not_take_is_said_not_done(world: World) -> None:
+    world.box.append_error = BlackBoxError("disk full")
+    details = {"pid": 8, "via": "web", "name": "x", "tail": "ab12"}
+    assert world.guardian.web_access("web_passkey_removed", details) is False
+    (alert,) = world.alerts.titled("quitado")
+    assert "no se ha quitado" in alert.body
+
+
+def test_a_removal_by_root_the_box_does_not_take_goes_anyway_and_it_says_so(world: World) -> None:
+    world.box.append_error = BlackBoxError("disk full")
+    details = {"uid": 0, "pid": 8, "name": "x", "tail": "ab12"}
+    assert world.guardian.web_access("web_passkey_removed", details) is False
+    (alert,) = world.alerts.titled("quitado")
+    assert "No ha quedado en la caja negra." in alert.body
+    assert "no se ha quitado" not in alert.body
+
+
+def test_a_new_name_for_a_passkey_is_recorded_and_alerted(world: World) -> None:
+    details = {"pid": 8, "via": "web", "name": "móvil", "was": "viejo", "tail": "ab12"}
+    assert world.guardian.web_access("web_passkey_renamed", details)
+    assert world.only("web_passkey_renamed").details == details
+    (alert,) = world.alerts.titled("nombre")
+    assert alert.level is AlertLevel.ERROR
+    assert "«móvil» …ab12" in alert.body and "«viejo»" in alert.body
+
+
+def test_a_new_name_the_box_does_not_take_is_said_not_done(world: World) -> None:
+    world.box.append_error = BlackBoxError("disk full")
+    details = {"pid": 8, "via": "web", "name": "móvil", "was": "viejo", "tail": "ab12"}
+    assert world.guardian.web_access("web_passkey_renamed", details) is False
+    (alert,) = world.alerts.titled("nombre")
+    assert "no se ha cambiado" in alert.body

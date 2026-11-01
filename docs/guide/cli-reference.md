@@ -32,7 +32,7 @@ Other guides: [getting started](getting-started.md), [configuration](configurati
 | `backtide imagenes` | List the container images this version uses, pinned by digest ("images") |
 | `backtide enlace` | Print the installed web's one-time link ("link") |
 | `backtide contraseña` | Set or change the installed web's password ("password") |
-| `backtide llaves` | List the installed web's passkeys and take one out ("keys") |
+| `backtide llaves` | List the installed web's passkeys, rename one or take one out ("keys") |
 
 `backtide --version` prints the version (`backtide 0.1.0` today). `backtide` on its own, or `backtide --help`, prints the list of commands. Each command also answers to `--help`.
 
@@ -590,9 +590,21 @@ How it keeps to "only what is ours":
 
 ### Passkeys (the web's "Keys" page)
 
-After your first sign-in with the password, the web asks you to register a passkey on that device: a key that signs in with your fingerprint, face or the device's PIN, and that nothing on the server can be used to guess or steal. Give it a name ("laptop", "phone") and register one on each device you use. Only its public key is kept, root's and `0600` in `/var/lib/backtide/web-auth/passkeys.json`; each new key is written in the black box and alerted. A passkey belongs to a name, so open the web at `http://backtide.localhost:8765` (the link `sudo backtide enlace` prints), with Chrome, Edge or Firefox (Safari is not checked yet). Then the sign-in page offers "Sign in with your key" there.
+After your first sign-in with the password, the web asks you to register a passkey on that device: a key that signs in with your fingerprint, face or the device's PIN, and that nothing on the server can be used to guess or steal. Give it a name ("laptop", "phone") and register one on each device you use. Only its public key is kept, root's and `0600` in `/var/lib/backtide/web-auth/passkeys.json`; each new key is written in the black box and alerted. A passkey belongs to a name, so open the web at `http://backtide.localhost:8765` (the link `sudo backtide enlace` prints), with Chrome, Edge or Firefox (Safari is not checked yet). Then the sign-in page offers "Sign in with your key" there. After the first key the page asks for a second, on your phone or a USB key: it is how you recover if you lose one. You can leave it for later; while you have only one, the page keeps saying so.
 
-Once you have a key, what outlasts a session or cannot be undone asks you to touch it again, at most 5 minutes before: setting or removing a provider key or Telegram, "approve and trust", closing every session and adding another key. Signing in with the key counts; signing in with the password or a link does not. With no key registered, none of this asks for one. The first key must be registered within 5 minutes of signing in.
+Once you have a key, what outlasts a session or cannot be undone asks you to touch it again, at most 5 minutes before: setting or removing a provider key or Telegram, "approve and trust", closing every session, and adding, renaming or removing a key. Signing in with the key counts; signing in with the password or a link does not. With no key registered, none of this asks for one. The first key must be registered within 5 minutes of signing in.
+
+In "Settings" > "Keys" each key has "Rename" and "Remove". Each change is written in the black box and alerted, and is not done if the black box cannot take it. Removing one closes every session, yours too, because it may be in other hands; you sign in again with another key. **The last key cannot be removed from the web**, even after touching it: with no key, the password alone would be enough for everything above. `sudo backtide llaves --quitar` can.
+
+**If you lose a key:**
+
+1. Sign in with another key. Signing in counts as touching it.
+2. In "Settings" > "Keys", remove the one you lost. It no longer signs in, and every session opened with it has ended.
+3. Sign in again, and register a new key on another device.
+
+If it was your only key, or you have lost them all, use SSH: `sudo backtide llaves` lists them and `sudo backtide llaves --quitar ID` takes each one out. Then sign in with the password (or `sudo backtide enlace`) and register a new key within 5 minutes. There is no e-mail or secret question: whoever has root on the server is the owner.
+
+If you get an alert about a key and it was not you, run `sudo backtide llaves` on the server and take out the ones you do not recognize. Someone with a stolen key can sign in and remove your other keys, and so can a web taken over once you have touched a key for it, after registering one of its own. Nothing tells them from you: the alert names each key, and SSH is the way back, because `--quitar` reaches any key.
 
 ### `backtide contraseña`
 
@@ -607,9 +619,10 @@ Sets or changes the password to sign in to the installed web. It asks twice with
 ```sh
 sudo backtide llaves
 sudo backtide llaves --quitar DNMg
+sudo backtide llaves --renombrar DNMg --nombre "old laptop"
 ```
 
-Lists the installed web's passkeys: name, the end of its id, the date and the whole id. `--quitar ID` takes one out, by its id or the end of it (4 characters at least, and only if one key ends that way). It closes every session, is written in the black box and alerted, and goes through even if the black box cannot take it, so that a lost key can always go. Exits 0 if it worked, 1 if the service cannot do it and 2 if there is no such key.
+Lists the installed web's passkeys: name, the end of its id, the date and the whole id. `--quitar ID` takes one out, by its id or the end of it (4 characters at least, and only if one key ends that way). It closes every session, is written in the black box and alerted, and goes through even if the black box cannot take it, so that a lost key can always go. It can take the last key too, which the web cannot, and says so when none is left. `--renombrar ID --nombre NAME` gives a key a new name (letters, digits, spaces, `-` and `_`, up to 48 characters); it is written in the black box and alerted, and a name can wait: if the black box cannot take it, it is not done. If an id starts with `-`, write `--quitar=ID` or `--renombrar=ID`. Exits 0 if it worked, 1 if the service cannot do it and 2 if there is no such key or the name is not valid.
 
 ### `backtide enlace`
 
