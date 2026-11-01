@@ -922,6 +922,7 @@ def serve(
             sessions=web_sessions,
             on_entry=guardian.web_access,
             password=web_password,
+            passkeys=web_passkeys,
         )
         if web_group is not None:
             listing = store if store is not None else SnapshotStore(config.volume)

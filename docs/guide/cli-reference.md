@@ -32,6 +32,7 @@ Other guides: [getting started](getting-started.md), [configuration](configurati
 | `backtide imagenes` | List the container images this version uses, pinned by digest ("images") |
 | `backtide enlace` | Print the installed web's one-time link ("link") |
 | `backtide contraseña` | Set or change the installed web's password ("password") |
+| `backtide llaves` | List the installed web's passkeys and take one out ("keys") |
 
 `backtide --version` prints the version (`backtide 0.1.0` today). `backtide` on its own, or `backtide --help`, prints the list of commands. Each command also answers to `--help`.
 
@@ -589,7 +590,9 @@ How it keeps to "only what is ours":
 
 ### Passkeys (the web's "Keys" page)
 
-After your first sign-in with the password, the web asks you to register a passkey on that device: a key that signs in with your fingerprint, face or the device's PIN, and that nothing on the server can be used to guess or steal. Give it a name ("laptop", "phone") and register one on each device you use. Only its public key is kept, root's and `0600` in `/var/lib/backtide/web-auth/passkeys.json`; each new key is written in the black box and alerted. A passkey belongs to a name, so open the web at `http://backtide.localhost:8765` (the link `sudo backtide enlace` prints), with Chrome, Edge or Firefox (Safari is not checked yet). Signing in with a passkey, and removing one, come next.
+After your first sign-in with the password, the web asks you to register a passkey on that device: a key that signs in with your fingerprint, face or the device's PIN, and that nothing on the server can be used to guess or steal. Give it a name ("laptop", "phone") and register one on each device you use. Only its public key is kept, root's and `0600` in `/var/lib/backtide/web-auth/passkeys.json`; each new key is written in the black box and alerted. A passkey belongs to a name, so open the web at `http://backtide.localhost:8765` (the link `sudo backtide enlace` prints), with Chrome, Edge or Firefox (Safari is not checked yet). Then the sign-in page offers "Sign in with your key" there.
+
+Once you have a key, what outlasts a session or cannot be undone asks you to touch it again, at most 5 minutes before: setting or removing a provider key or Telegram, "approve and trust", closing every session and adding another key. Signing in with the key counts; signing in with the password or a link does not. With no key registered, none of this asks for one. The first key must be registered within 5 minutes of signing in.
 
 ### `backtide contraseña`
 
@@ -598,6 +601,15 @@ sudo backtide contraseña
 ```
 
 Sets or changes the password to sign in to the installed web. It asks twice without echo (or reads it with `--archivo FILE` or `--stdin`): 12 to 256 characters. The service keeps only its scrypt hash, root's and `0600` in `/var/lib/backtide/web-auth/`, writes the change in the black box and sends an alert. Every open session ends with it (it is changed when the old one may be known): sign in again with the new one. It must be typeable as it is (no spaces at the ends) and not trivial. Signing in with the password is slowed for the whole web (5 tries at once, then one every 12 seconds) and closed for 15 minutes after 20 wrong ones in a row, even for the right one: then `sudo backtide enlace` gets you in. Exit codes: `0` saved; `1` the service did not take it; `2` not a valid password, or the two did not match.
+
+### `backtide llaves`
+
+```sh
+sudo backtide llaves
+sudo backtide llaves --quitar DNMg
+```
+
+Lists the installed web's passkeys: name, the end of its id, the date and the whole id. `--quitar ID` takes one out, by its id or the end of it (4 characters at least, and only if one key ends that way). It closes every session, is written in the black box and alerted, and goes through even if the black box cannot take it, so that a lost key can always go. Exits 0 if it worked, 1 if the service cannot do it and 2 if there is no such key.
 
 ### `backtide enlace`
 

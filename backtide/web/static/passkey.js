@@ -30,7 +30,11 @@
       credentials: "same-origin",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams(fields).toString()
-    }).then(function (response) { return response.json(); });
+    }).then(function (response) {
+      // A refusal that is not ours to word (an expired session's page, the Guard's bare status) is
+      // not JSON: it says "it did not work", never the parser's own sentence.
+      return response.json().catch(function () { return { ok: false, message: "" }; });
+    });
   }
 
   form.addEventListener("submit", function (event) {

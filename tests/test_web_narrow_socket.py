@@ -6,6 +6,7 @@ real ``WebControlServer`` answers over a real Unix socket in a short folder, to 
 with ``SO_PEERCRED`` played by a fake ``peer`` that says "the web's group"."""
 
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -490,3 +491,157 @@ def test_the_web_answers_on_backtide_localhost(signing_in: Any) -> None:
     web, _ = signing_in
     page = web.get("/ahora", headers={"host": "backtide.localhost:8765"})
     assert page.status_code == 401 and 'type="password"' in page.text
+
+
+# -- T26-3c: signing in with the key, and touching it again, through the service ---------------
+
+
+KEY_HOST = {"host": "backtide.localhost:8765"}
+KEY_ORIGIN = "http://backtide.localhost:8765"
+
+
+def key_headers() -> dict[str, str]:
+    from tests.test_web_rewind import POST_HEADERS
+
+    return {
+        **POST_HEADERS,
+        **KEY_HOST,
+        "origin": KEY_ORIGIN,
+        "content-type": "application/x-www-form-urlencoded",
+    }
+
+
+def registered(web: Any) -> tuple[Any, str]:
+    """An owner with a key registered, signed out by the end: the key, and the session's CSRF."""
+    from tests.passkey_kit import SoftAuthenticator
+    from tests.test_web_rewind import POST_HEADERS
+
+    _, csrf = _signed_in_to_keys(web)
+    begun = web.post("/llaves/empezar", data={"csrf": csrf}, headers=POST_HEADERS).json()
+    owner = SoftAuthenticator()
+    finished = web.post(
+        "/llaves/registrar",
+        data={
+            "csrf": csrf,
+            "name": "portátil",
+            "answer": owner.create(begun["options"], KEY_ORIGIN),
+        },
+        headers=POST_HEADERS,
+    ).json()
+    assert finished["ok"] is True
+    return owner, csrf
+
+
+def test_signing_in_with_the_key_from_the_web(signing_in: Any) -> None:
+    web, sessions = signing_in
+    owner, _ = registered(web)
+    web.cookies.clear()
+    page = web.get("/ahora", headers=KEY_HOST)
+    assert page.status_code == 401 and 'id="webauthn-go"' in page.text
+    assert "webauthn-get.js" in page.text
+    begun = web.post("/entrar/llave/empezar", headers=key_headers()).json()
+    assert begun["ok"] is True
+    finished = web.post(
+        "/entrar/llave/responder",
+        data={"answer": owner.get(begun["options"], KEY_ORIGIN)},
+        headers=key_headers(),
+    )
+    assert finished.status_code == 200 and finished.json()["ok"] is True
+    assert "HttpOnly" in finished.headers["set-cookie"]
+    assert "samesite=strict" in finished.headers["set-cookie"].lower()
+    assert web.get("/ahora", headers=KEY_HOST).status_code == 200
+
+
+def test_at_the_numeric_address_the_way_in_says_where_a_key_works(signing_in: Any) -> None:
+    web, _ = signing_in
+    page = web.get("/ahora")
+    assert 'id="webauthn-go"' not in page.text and "backtide.localhost:8765" in page.text
+
+
+def test_a_signature_for_another_site_gives_no_cookie(signing_in: Any) -> None:
+    web, _ = signing_in
+    owner, _ = registered(web)
+    web.cookies.clear()
+    begun = web.post("/entrar/llave/empezar", headers=key_headers()).json()
+    refused = web.post(
+        "/entrar/llave/responder",
+        data={"answer": owner.get(begun["options"], "https://evil.example")},
+        headers=key_headers(),
+    )
+    assert refused.status_code == 400 and refused.json()["ok"] is False
+    assert "set-cookie" not in refused.headers
+    assert web.get("/ahora", headers=KEY_HOST).status_code == 401
+
+
+def test_another_site_cannot_ask_for_a_challenge(signing_in: Any) -> None:
+    web, _ = signing_in
+    registered(web)
+    headers = {**key_headers(), "origin": "https://evil.example"}
+    assert web.post("/entrar/llave/empezar", headers=headers).status_code == 403
+    assert (
+        web.post("/entrar/llave/responder", data={"answer": "{}"}, headers=headers).status_code
+        == 403
+    )
+
+
+def test_closing_every_session_sends_you_to_touch_the_key_first(signing_in: Any) -> None:
+    from tests.test_web_rewind import POST_HEADERS
+
+    web, sessions = signing_in
+    owner, csrf = registered(web)
+    live = len(sessions)
+    sent = web.post(
+        "/ajustes/cerrar-sesiones",
+        data={"csrf": csrf, "confirmo": "cerrar-todas"},
+        headers=POST_HEADERS,
+        follow_redirects=False,
+    )
+    assert sent.status_code == 303 and "/tocar?volver=ajustes" in sent.headers["location"]
+    assert len(sessions) == live
+    page = web.get("/tocar?volver=ajustes", headers=KEY_HOST)
+    assert page.status_code == 200 and 'id="webauthn-go"' in page.text
+    assert 'data-target="' in page.text and "/ajustes" in page.text
+    begun = web.post("/tocar/empezar", data={"csrf": csrf}, headers=key_headers()).json()
+    touched = web.post(
+        "/tocar/responder",
+        data={"csrf": csrf, "answer": owner.get(begun["options"], KEY_ORIGIN)},
+        headers=key_headers(),
+    ).json()
+    assert touched["ok"] is True
+    closed = web.post(
+        "/ajustes/cerrar-sesiones",
+        data={"csrf": csrf, "confirmo": "cerrar-todas"},
+        headers=POST_HEADERS,
+        follow_redirects=False,
+    )
+    assert closed.status_code != 303 or "/tocar" not in closed.headers["location"]
+    assert len(sessions) == 0
+
+
+def test_touching_the_key_needs_this_sessions_csrf(signing_in: Any) -> None:
+    web, _ = signing_in
+    registered(web)
+    assert (
+        web.post("/tocar/empezar", data={"csrf": "x" * 43}, headers=key_headers()).status_code
+        == 403
+    )
+    web.cookies.clear()
+    assert (
+        web.post("/tocar/empezar", data={"csrf": "x" * 43}, headers=key_headers()).status_code
+        == 401
+    )
+
+
+def test_the_touch_page_goes_back_only_to_our_own_pages(signing_in: Any) -> None:
+    web, _ = signing_in
+    registered(web)
+    page = web.get("/tocar?volver=https://evil.example/", headers=KEY_HOST)
+    assert re.search(r'data-target="/s/[a-z0-9]+/"', page.text)
+    assert not re.search(r'(data-target|class="settings-cancel" href)="[^"]*evil', page.text)
+
+
+def test_with_a_key_the_keys_page_asks_to_touch_one_before_adding(signing_in: Any) -> None:
+    web, _ = signing_in
+    registered(web)
+    page = web.get("/llaves", headers=KEY_HOST)
+    assert 'id="passkey-form"' not in page.text and "/tocar?volver=llaves" in page.text

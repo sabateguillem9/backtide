@@ -24,8 +24,10 @@ import shutil
 import stat
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from attack_kit import Attack, scenario
@@ -55,7 +57,9 @@ CONTROL_SOCKET = layout.STATE_DIR / STATE_SOCKET
 # that name too, for "<session:NAME>". {"_sleep": S} waits S seconds (T26-3a-2: expiry). A
 # request with "_attestation", "_credential" and "_origin" gets, as its "answer", a browser's
 # answer to the last options a reply carried (T26-3b-2): only its clientDataJSON depends on the
-# challenge, and that needs nothing but the standard library.
+# challenge, and that needs nothing but the standard library. A request with "_see" shows the
+# options and the session of its reply: to sign a challenge out here, with the test's own key
+# (a signature needs more than the standard library), and go on with that session (T26-3c).
 PROBE = """
 import base64, errno, json, socket, sys, time
 path, out, session, named, options = sys.argv[1], [], None, {}, None
@@ -76,6 +80,7 @@ for line in sys.argv[2:]:
                          "attestationObject": request.pop("_attestation")}})
     name = request.pop("_as", None)
     why = request.pop("_why", False)
+    see = request.pop("_see", False)
     line = json.dumps(request)
     for key, value in named.items():
         line = line.replace(json.dumps("<session:" + key + ">"), json.dumps(value))
@@ -101,6 +106,9 @@ for line in sys.argv[2:]:
                 "n": len(reply.get("snapshots") or [])}
         if why:
             said["why"] = str(reply.get("message") or "")[:80]
+        if see:
+            said["options"], said["session"] = reply.get("options"), reply.get("session")
+            said["csrf"] = reply.get("csrf")
         out.append(said)
     except OSError as e:
         out.append({"errno": errno.errorcode.get(e.errno, str(e.errno))})
@@ -410,6 +418,46 @@ def test_a_web_taken_over_changes_nothing_without_a_session(
         and not any(isinstance(v, str) and len(v) >= 43 for v in e.details.values())
         for e in links + entries
     )
+    # The other half (T26-3c): with a key registered, a live session that has not touched it.
+    # The first key from a fresh session, as the owner would; then, without touching it, what
+    # lasts is refused for that reason, and the keys and the sessions stay as they were.
+    from backtide.service import passkeys as pk
+
+    try:
+        _, session = key_for_the_owner(web, path)
+        asked = [
+            {"cmd": "set_secret", "kind": "openai", "value": "sk-proj-" + "x" * 40},
+            {"cmd": "clear_secret", "kind": "anthropic"},
+            {"cmd": "trust", "hold_id": forged_hold},
+            {"cmd": "session_end_all"},
+            {"cmd": "passkey_begin"},
+        ]
+        time.sleep(CHANGES_WAIT)
+        untouched = probe_as(
+            web.pw_uid, web.pw_gid, "", path,
+            *({**r, "session": session, "_why": True} for r in asked),
+            {"cmd": "session_check", "session": session},
+        )  # fmt: skip
+        words = [r.get("why", "") for r in untouched[:-1]]
+        keys_after = [k.id for k in pk.Passkeys(
+            layout.STATE_DIR, origins=[pk.origin_for(pk.WEB_PORT)]).keys()]  # fmt: skip
+        untouched_recorded = recorded_in_time(
+            installed, since, "without the passkey touched",
+            lambda: probe_as(web.pw_uid, web.pw_gid, "", path, {**asked[2], "session": session}),
+        )  # fmt: skip
+    finally:
+        pk.path_of(layout.STATE_DIR).unlink(missing_ok=True)
+    attack.check(
+        "stopped",
+        all("tocar tu llave" in word for word in words)
+        and untouched[-1].get("outcome") == "live"
+        and len(keys_after) == 1
+        and untouched_recorded,
+        f"con una llave y una sesión viva sin tocarla, poner y quitar claves, confiar, cerrar "
+        f"todas y añadir otra llave: {words}; la sesión sigue ({untouched[-1].get('outcome')}), "
+        f"la llave sigue siendo una ({len(keys_after)}) y el rechazo está en la caja negra "
+        f"({untouched_recorded})",
+    )
     attack.check(
         "recorded",
         recorded()
@@ -649,6 +697,440 @@ def soft_key(rp_id: str = "backtide.localhost") -> dict[str, str]:
     return {"_credential": answer["id"], "_attestation": answer["response"]["attestationObject"]}
 
 
+CHANGES_WAIT = 31  # the narrow socket's changes: 10 at once, then one every 3 s
+
+
+def key_for_the_owner(web: Any, path: str) -> tuple[Any, str]:
+    """A session from a link root gives and, as the web's user, the first key registered with it:
+    the key (made here, it signs) and the session."""
+    from backtide.service import passkeys as pk
+    from tests.passkey_kit import SoftAuthenticator
+
+    owner = SoftAuthenticator()
+    token = ask_web_link(CONTROL_SOCKET)
+    opened, begun = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        {"cmd": "session_open", "token": token, "_see": True},
+        {"cmd": "passkey_begin", "session": "<session>", "_see": True},
+    )  # fmt: skip
+    assert begun.get("options"), f"no options to register a key: {begun}"
+    answer = owner.create(begun["options"], pk.origin_for(pk.WEB_PORT))
+    [added] = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        {"cmd": "passkey_finish", "session": opened["session"], "answer": answer,
+         "name": "portátil", "_why": True},
+    )  # fmt: skip
+    assert added.get("outcome") == "added", f"the owner's key was not registered: {added}"
+    return owner, opened["session"]
+
+
+def recorded_in_time(installed: Installed, since: int, kind: str, cause: Callable[[], Any]) -> bool:
+    """A refusal reaches the black box through the log bridge (once a minute per kind): while it
+    is not there since the probes began, cause it again."""
+
+    def seen() -> bool:
+        found = any(
+            kind in str(e.details.get("template", ""))
+            for e in installed.box.events(source="system", since_seq=since)
+            if e.action == "log"
+        )
+        if not found:
+            cause()
+        return found
+
+    wait(seen, 150, interval=5)
+    return seen()
+
+
+@scenario("firma-de-otro-sitio")
+def test_a_signature_for_another_site_opens_nothing(attack: Attack, installed: Installed) -> None:
+    """T26-3c: as the web's user (or a page that fooled a browser), sign in with a true key's
+    signature made for another site, another port or another relying party, without the user
+    verified, with a key that is not kept, and repeat a good one. Only the good one enters."""
+    from backtide.service import passkeys as pk
+    from tests.passkey_kit import SoftAuthenticator
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    origin = pk.origin_for(pk.WEB_PORT)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    time.sleep(CHANGES_WAIT)
+    stranger = SoftAuthenticator()
+
+    def attempt(signer: Any, at: str, **bend: Any) -> dict:
+        [begun] = probe_as(web.pw_uid, web.pw_gid, "", path, {"cmd": "auth_begin", "_see": True})
+        answer = signer.get(begun["options"], at, **bend)
+        finish = {"cmd": "auth_finish", "answer": answer, "_why": True, "_see": True}
+        [said] = probe_as(web.pw_uid, web.pw_gid, "", path, finish)
+        said["answer"] = answer
+        return said
+
+    try:
+        owner, session = key_for_the_owner(web, path)
+        bent = {
+            "otro sitio": attempt(owner, "https://evil.example"),
+            "otro puerto": attempt(owner, "http://backtide.localhost:9999"),
+            "otro dominio": attempt(owner, origin, rp_id="evil.example"),
+            "sin verificar": attempt(owner, origin, verified=False),
+            "otra llave": attempt(stranger, origin),
+        }
+        time.sleep(13)  # the answers' bucket: 10 at once, then one every 6 s
+        good = attempt(owner, origin)
+        repeat = {"cmd": "auth_finish", "answer": good["answer"], "_why": True, "_see": True}
+        [again] = probe_as(web.pw_uid, web.pw_gid, "", path, repeat)
+        # A touch from another site does not count either: what lasts stays refused.
+        [begun] = probe_as(web.pw_uid, web.pw_gid, "", path,
+                           {"cmd": "touch_begin", "session": session, "_see": True})  # fmt: skip
+        [touch] = probe_as(
+            web.pw_uid, web.pw_gid, "", path,
+            {"cmd": "touch_finish", "session": session, "_why": True,
+             "answer": owner.get(begun["options"], "https://evil.example")},
+        )  # fmt: skip
+        time.sleep(CHANGES_WAIT)
+        forged = {"cmd": "trust", "hold_id": "h-" + secrets.token_hex(6), "_why": True}
+        [still] = probe_as(web.pw_uid, web.pw_gid, "", path, {**forged, "session": session})
+        # The control: a good touch opens it (it reaches the check of the made-up id), and a
+        # session born of signing in with the key has it open without touching.
+        [begun] = probe_as(web.pw_uid, web.pw_gid, "", path,
+                           {"cmd": "touch_begin", "session": session, "_see": True})  # fmt: skip
+        [good_touch] = probe_as(
+            web.pw_uid, web.pw_gid, "", path,
+            {"cmd": "touch_finish", "session": session, "_why": True,
+             "answer": owner.get(begun["options"], origin)},
+        )  # fmt: skip
+        [opened_by_touch] = probe_as(
+            web.pw_uid, web.pw_gid, "", path, {**forged, "session": session}
+        )
+        [opened_by_entry] = probe_as(
+            web.pw_uid, web.pw_gid, "", path, {**forged, "session": good["session"]}
+        )
+        recorded = recorded_in_time(
+            installed, since, "a passkey did not sign in",
+            lambda: attempt(owner, "https://evil.example"),
+        )  # fmt: skip
+        events = installed.box.events(since_seq=since)
+    finally:
+        pk.path_of(layout.STATE_DIR).unlink(missing_ok=True)
+    reasons = {"otra llave": "no está registrada"}
+    wrong = {name: r.get("why") for name, r in bent.items()
+             if r.get("outcome") != "refused" or r.get("session")
+             or reasons.get(name, "firma válida") not in str(r.get("why"))}  # fmt: skip
+    ok = (
+        not wrong
+        and good.get("outcome") == "opened"
+        and good.get("session")
+        and again.get("outcome") == "refused"
+        and not again.get("session")
+        and "pendiente" in again.get("why", "")
+        and touch.get("outcome") == "refused"
+        and "firma válida" in touch.get("why", "")
+        and "tocar tu llave" in still.get("why", "")
+        and good_touch.get("outcome") == "touched"
+        and "tocar tu llave" not in opened_by_touch.get("why", "tocar tu llave")
+        and "tocar tu llave" not in opened_by_entry.get("why", "tocar tu llave")
+    )
+    attack.check(
+        "stopped",
+        bool(ok),
+        f"una firma de otro sitio, otro puerto, otro dominio, sin verificar y con otra llave: "
+        f"{ {n: r.get('outcome') for n, r in bent.items()} }, fuera de lo esperado "
+        f"{wrong or 'ninguna'}; la buena: {good.get('outcome')}; repetirla: "
+        f"{again.get('outcome')} ({again.get('why')}); un toque de otro sitio: "
+        f"{touch.get('outcome')}, y lo que dura sigue pidiendo la llave: {still.get('why')}; "
+        f"con un toque bueno ({good_touch.get('outcome')}) ya no: {opened_by_touch.get('why')}; y "
+        f"la sesión de entrar con la llave tampoco: {opened_by_entry.get('why')}",
+    )
+    entries = [e for e in events if e.action == "web_session_opened"
+               and e.details.get("via") == "passkey"]  # fmt: skip
+    touches = [e for e in events if e.action == "web_passkey_touched"]
+    attack.check(
+        "recorded",
+        recorded
+        and len(entries) == 1
+        and entries[0].details.get("name") == "portátil"
+        and set(entries[0].details) <= {"pid", "via", "name", "tail"}
+        and len(touches) == 1,
+        f"los rechazos, en la caja negra ({recorded}); la única entrada con llave, su evento "
+        f"con el nombre y el final de su id ({len(entries)}); el único toque bueno, el suyo "
+        f"({len(touches)})",
+    )
+
+
+@scenario("llaves-a-la-fuerza")
+def test_a_thousand_answers_are_not_even_looked_at(attack: Attack, installed: Installed) -> None:
+    """T26-3c: mil respuestas de entrada seguidas, como la web tomada: las del cubo se comprueban
+    y se rechazan, el resto ni se mira, y el dueño entra en cuanto el cubo se rellena."""
+    from backtide.service import passkeys as pk
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    time.sleep(CHANGES_WAIT)
+    try:
+        owner, _ = key_for_the_owner(web, path)
+        junk = {"cmd": "auth_finish", "answer": "{}", "_why": True}
+        started = time.monotonic()
+        said = probe_as(web.pw_uid, web.pw_gid, "", path, *([junk] * 1000), timeout=300)
+        took = time.monotonic() - started
+        looked = [r for r in said if "Demasiados" not in str(r.get("why", ""))]
+        opened_any = [r for r in said if r.get("outcome") == "opened"]
+        allowed = 10 + took / 6 + 1  # the bucket: 10 at once, then one every 6 s
+        time.sleep(13)
+        [begun] = probe_as(web.pw_uid, web.pw_gid, "", path, {"cmd": "auth_begin", "_see": True})
+        answer = owner.get(begun["options"], pk.origin_for(pk.WEB_PORT))
+        [entered] = probe_as(web.pw_uid, web.pw_gid, "", path,
+                             {"cmd": "auth_finish", "answer": answer})  # fmt: skip
+        recorded = recorded_in_time(
+            installed, since, "too many %s",
+            lambda: probe_as(web.pw_uid, web.pw_gid, "", path, *([junk] * 30)),
+        )  # fmt: skip
+    finally:
+        pk.path_of(layout.STATE_DIR).unlink(missing_ok=True)
+    attack.check(
+        "stopped",
+        len(said) == 1000
+        and len(looked) <= allowed
+        and not opened_any
+        and entered.get("outcome") == "opened",
+        f"{len(said)} respuestas en {took:.0f} s: {len(looked)} comprobadas (como mucho "
+        f"{allowed:.0f}), ninguna entra ({len(opened_any)}); el dueño, 13 s después: "
+        f"{entered.get('outcome')}",
+    )
+    attack.check(
+        "recorded", recorded, f"el aviso de tantos intentos, en la caja negra ({recorded})"
+    )
+
+
+@scenario("entrar-sin-llave")
+def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> None:
+    """T26-3c: the installed web by HTTP, at its own prefix: each page and each order without a
+    session, with a made-up cookie and with the cookie of a session that ended. As the web's
+    user, the key's commands too. Nothing opens, and no key appears."""
+    from http.client import HTTPConnection
+
+    from backtide.service import passkeys as pk
+    from backtide.web.security import COOKIE_NAME
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    prefix = web_prefix()
+    base = f"/s/{prefix}"
+    host = f"{pk.RP_ID}:{pk.WEB_PORT}"
+    origin = pk.origin_for(pk.WEB_PORT)
+    time.sleep(CHANGES_WAIT)
+
+    def fetch(method: str, where: str, cookie: str | None = None, csrf: str = "x" * 43) -> int:
+        conn = HTTPConnection("127.0.0.1", pk.WEB_PORT, timeout=20)
+        headers = {"Host": host, "Origin": origin}
+        if cookie is not None:
+            headers["Cookie"] = f"{COOKIE_NAME}={cookie}"
+        body = None
+        if method == "POST":
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            # Exactly the fields its form asks for: any other says 403 too, even with a session.
+            more = {"/llaves/registrar": "&answer=x&name=x", "/tocar/responder": "&answer=x"}
+            body = f"csrf={csrf}{more.get(where, '')}"
+        conn.request(method, base + where, body=body, headers=headers)
+        status = conn.getresponse().status
+        conn.close()
+        return status
+
+    pages = ["/", "/ahora", "/instantaneas", "/peticiones", "/ajustes", "/llaves", "/tocar"]
+    orders = ["/llaves/empezar", "/llaves/registrar", "/tocar/empezar", "/tocar/responder",
+              "/ajustes/cerrar-sesiones", "/salir"]  # fmt: skip
+    # The control: the same requests with a live session do get in. "/salir" is left out: it
+    # ends the session the rest of this needs, and then the same cookie and CSRF must not.
+    request = {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_see": True}
+    [opened] = probe_as(web.pw_uid, web.pw_gid, "", path, request)
+    live, csrf = opened["session"], opened["csrf"]
+    inside = {where: fetch("GET", where, live) for where in pages}
+    inside |= {where: fetch("POST", where, live, csrf) for where in orders if where != "/salir"}
+    probe_as(web.pw_uid, web.pw_gid, "", path, {"cmd": "session_end", "session": live})
+    shut_out = {where: fetch("GET", where, live) for where in pages}
+    shut_out |= {where: fetch("POST", where, live, csrf) for where in orders}
+    results = {"cerrada, con su CSRF": shut_out}
+    for name, cookie in (("sin cookie", None), ("inventada", "s" * 43)):
+        results[name] = {where: fetch("GET", where, cookie) for where in pages} | {
+            where: fetch("POST", where, cookie) for where in orders
+        }
+    # Keys through the socket without a session: nothing to touch, nothing to add. After the
+    # keys' bucket fills again: the control above spent some of it.
+    time.sleep(CHANGES_WAIT)
+    commands = probe_as(
+        web.pw_uid, web.pw_gid, "", path,
+        *({"cmd": c, "session": "s" * 43, "_why": True}
+          for c in ("passkey_begin", "passkey_list", "touch_begin", "touch_status")),
+        {"cmd": "touch_finish", "session": "s" * 43, "answer": "{}", "_why": True},
+        {"cmd": "passkey_finish", "session": "s" * 43, "answer": "{}", "name": "x", "_why": True},
+    )  # fmt: skip
+    # With no key at all, a signature has nothing to sign.
+    no_keys = probe_as(web.pw_uid, web.pw_gid, "", path, {"cmd": "auth_begin", "_why": True})
+    let_in = {name: {w: s for w, s in found.items() if s != 401}
+              for name, found in results.items()}  # fmt: skip
+    let_in = {name: found for name, found in let_in.items() if found}
+    not_inside = {w: s for w, s in inside.items() if s in (401, 403, 404, 405)}
+    attack.check(
+        "stopped",
+        not let_in
+        and not not_inside
+        and all(
+            r.get("outcome") == "refused" and "sesión viva" in r.get("why", "") for r in commands
+        )
+        and no_keys[0].get("outcome") == "refused"
+        and not pk.path_of(layout.STATE_DIR).exists(),
+        f"{len(pages)} páginas y {len(orders)} órdenes sin cookie, con una inventada y con una "
+        f"cerrada: las que no dicen 401: {let_in or 'ninguna'}; con una sesión viva, las que no "
+        f"llegan: {not_inside or 'ninguna'}; las órdenes de llaves por "
+        f"el socket: {[r.get('why') for r in commands]}; sin llaves no hay reto "
+        f"({no_keys[0].get('why')}), y no aparece ninguna llave",
+    )
+
+
+def web_prefix() -> str:
+    """The installed web's random prefix: from the link file root reads for `backtide enlace`."""
+    return layout.WEB_LINK_FILE.read_text().splitlines()[0].rstrip("/").rsplit("/", 1)[-1]
+
+
+@scenario("llave-perdida")
+def test_a_lost_key_goes_with_its_sessions(attack: Attack, installed: Installed) -> None:
+    """T26-3c: two keys; with the real `backtide llaves --quitar`, one goes. Its signature no longer
+    signs in and every session ends; the other key still signs in. The web's user cannot ask for
+    any of it, by its socket or by root's."""
+    from backtide.service import passkeys as pk
+    from tests.passkey_kit import SoftAuthenticator
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    origin = pk.origin_for(pk.WEB_PORT)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    time.sleep(CHANGES_WAIT)
+
+    def ask(*requests: dict) -> list[dict]:
+        return probe_as(web.pw_uid, web.pw_gid, "", path, *requests)
+
+    def sign_in(signer: Any) -> dict:
+        [begun] = ask({"cmd": "auth_begin", "_see": True})
+        answer = signer.get(begun["options"], origin)
+        [said] = ask({"cmd": "auth_finish", "answer": answer, "_why": True})
+        return said
+
+    try:
+        lost, session = key_for_the_owner(web, path)
+        # The second key, from a session that touched the first.
+        [begun] = ask({"cmd": "touch_begin", "session": session, "_see": True})
+        answer = lost.get(begun["options"], origin)
+        [touch] = ask({"cmd": "touch_finish", "session": session, "answer": answer})
+        kept = SoftAuthenticator()
+        [begun] = ask({"cmd": "passkey_begin", "session": session, "_see": True})
+        answer = kept.create(begun["options"], origin)
+        [second] = ask({"cmd": "passkey_finish", "session": session, "answer": answer,
+                        "name": "móvil", "_why": True})  # fmt: skip
+        keys = pk.Passkeys(layout.STATE_DIR, origins=[origin])
+        tail = next(k.tail for k in keys.keys() if k.name == "portátil")
+        # What the web's user may not do: take it out, list ids, reach root's socket.
+        refused = ask({"cmd": "passkey_remove", "key": tail, "_why": True},
+                      {"cmd": "passkeys", "_why": True})  # fmt: skip
+        root_socket = probe_as(web.pw_uid, web.pw_gid, "", str(CONTROL_SOCKET),
+                               {"cmd": "passkey_remove", "key": tail})  # fmt: skip
+        still_two = len(keys.keys())
+        listed = sh(str(layout.BIN_LINK), "llaves", check=False)
+        removed = sh(str(layout.BIN_LINK), "llaves", f"--quitar={tail}", check=False)
+        [ended] = ask({"cmd": "session_check", "session": session})
+        names = [k.name for k in keys.keys()]
+        time.sleep(13)  # the answers' bucket, whatever came before
+        with_lost, with_kept = sign_in(lost), sign_in(kept)
+        recorded = wait(
+            lambda: any(e.action == "web_passkey_removed"
+                        for e in installed.box.events(since_seq=since)),
+            30, interval=1,
+        )  # fmt: skip
+        events = [e for e in installed.box.events(since_seq=since)
+                  if e.action == "web_passkey_removed"]  # fmt: skip
+    finally:
+        pk.path_of(layout.STATE_DIR).unlink(missing_ok=True)
+    attack.check(
+        "stopped",
+        touch.get("outcome") == "touched"
+        and second.get("outcome") == "added"
+        and all("no se acepta" in r.get("why", "") for r in refused)
+        and root_socket[0].get("errno") == "EACCES"
+        and still_two == 2
+        and listed.returncode == 0
+        and f"…{tail}" in listed.stdout
+        and removed.returncode == 0
+        and ended.get("outcome") == "expired"
+        and names == ["móvil"]
+        and "no está registrada" in with_lost.get("why", "")
+        and with_kept.get("outcome") == "opened",
+        f"como backtide-web, quitarla y listarlas: {[r.get('why') for r in refused]}, y el "
+        f"socket de root: {root_socket[0]}; `backtide llaves --quitar`: {removed.returncode}; la "
+        f"sesión: {ended.get('outcome')}; quedan: {names}; la llave quitada: "
+        f"{with_lost.get('why')}; la otra: {with_kept.get('outcome')}",
+    )
+    attack.check(
+        "recorded",
+        bool(recorded)
+        and len(events) == 1
+        and events[0].details.get("tail") == tail
+        and events[0].details.get("uid") == 0,
+        f"`web_passkey_removed`, en la caja negra con la llave y quién: {len(events)}",
+    )
+
+
+@scenario("reloj-bajo-el-filtro")
+def test_the_service_lives_through_its_clock_check(attack: Attack, installed: Installed) -> None:
+    """Incident of 2026-11-01: the filter of the unit killed the service at its first clock check,
+    ten minutes in, and no test ran that long. Here the check comes every 20 s, with the real unit:
+    after two of them the service is the same process. The control: the same read under
+    @system-service alone dies by SIGSYS."""
+    unit = (layout.UNIT_DIR / layout.SERVICE_UNIT).read_text()
+    [real_filter] = [line for line in unit.splitlines() if line.startswith("SystemCallFilter=")]
+
+    def show(name: str) -> str:
+        return sh("systemctl", "show", "-p", name, "--value", layout.SERVICE_UNIT).stdout.strip()
+
+    def under(rule: str) -> Any:
+        read = "from backtide.service.clock import clock_synced; print(clock_synced())"
+        interpreter = "/opt/backtide/current/.venv/bin/python"
+        return sh("systemd-run", "--wait", "--pipe", "--quiet", "-p", rule,
+                  interpreter, "-I", "-c", read, check=False)  # fmt: skip
+
+    original = layout.CONFIG_FILE.read_bytes()
+    assert b"prune_interval" not in original, "the installation already sets prune_interval"
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    try:
+        layout.CONFIG_FILE.write_bytes(b"prune_interval = 20\n" + original)
+        restart_service(installed)
+        pid, restarts = show("MainPID"), show("NRestarts")
+        time.sleep(50)
+        pid_after, restarts_after = show("MainPID"), show("NRestarts")
+    finally:
+        layout.CONFIG_FILE.write_bytes(original)
+        restart_service(installed)
+    allowed, killed = under(real_filter), under("SystemCallFilter=@system-service")
+    bad_clock = [
+        e.seq for e in installed.box.events(source="system", since_seq=since)
+        if "cannot read the state of the clock" in str(e.details.get("template", ""))
+    ]  # fmt: skip
+    attack.check(
+        "stopped",
+        pid == pid_after
+        and pid != "0"
+        and restarts == restarts_after
+        and allowed.returncode == 0
+        and killed.returncode != 0
+        and not bad_clock,
+        f"con la comprobación del reloj cada 20 s, 50 s después el proceso es el mismo "
+        f"({pid} y {pid_after}) y los reinicios no cambian ({restarts} y {restarts_after}); bajo "
+        f"el filtro de la unidad la lectura termina con {allowed.returncode}, sin él con "
+        f"{killed.returncode}; avisos de no poder leer el reloj: {bad_clock or 'ninguno'}",
+    )
+
+
 @scenario("registro-sin-sesion")
 def test_a_passkey_is_only_registered_from_a_live_session(
     attack: Attack, installed: Installed
@@ -690,8 +1172,9 @@ def test_a_passkey_is_only_registered_from_a_live_session(
         ("empieza p", {"cmd": "passkey_begin", "session": "<session:p>"}, "options", ""),
         ("la del dueño", {"cmd": "passkey_finish", "session": "<session:p>", "name": "portátil",
          "_origin": origin, **key}, "added", ""),
+        # With a key kept, adding another asks to touch it first (T26-3c): the repeat stops there.
         ("otra vez la misma", {"cmd": "passkey_finish", "session": "<session:p>",
-         "name": "portátil", "_origin": origin, **key}, "refused", "no hay un registro pedido"),
+         "name": "portátil", "_origin": origin, **key}, "refused", "tocar tu llave"),
         ("lista", {"cmd": "passkey_list", "session": "<session:p>"}, "listed", ""),
         ("sale p", {"cmd": "session_end", "session": "<session:p>"}, "ended", ""),
         ("sale q", {"cmd": "session_end", "session": "<session:q>"}, "ended", ""),

@@ -511,10 +511,19 @@ WEB_ACCESS_ALERTS = {
     ),
     "web_passkey_added": (
         "Se ha añadido una llave a la web",
-        "Una passkey nueva queda registrada en la web. Si no has sido tú: primero cambia la "
-        "contraseña (`sudo backtide contraseña`, que cierra todas las sesiones), después quita "
-        "las llaves (`sudo rm /var/lib/backtide/web-auth/passkeys.json`) y vuelve a registrar "
-        "las tuyas.",
+        "Una passkey nueva queda registrada en la web. Si no has sido tú: quítala (`sudo backtide "
+        "llaves --quitar`, que cierra todas las sesiones) y cambia la contraseña (`sudo backtide "
+        "contraseña`).",
+    ),
+    "web_passkey_touched": (
+        "Se ha tocado una llave en la web",
+        "Durante 5 minutos, esa sesión puede cambiar claves, avisos y llaves. Si no has sido tú, "
+        "cierra todas las sesiones (`sudo backtide enlace --cerrar-todas`).",
+    ),
+    "web_passkey_removed": (
+        "Se ha quitado una llave de la web",
+        "Alguien ha usado `sudo backtide llaves --quitar`, y se han cerrado todas las sesiones. "
+        "Si no has sido tú, alguien tiene root en esta máquina.",
     ),
     "web_password_locked": (
         "Demasiadas contraseñas equivocadas en la web",
@@ -523,6 +532,11 @@ WEB_ACCESS_ALERTS = {
     ),
 }
 WEB_ACCESS_ACTIONS = frozenset(WEB_ACCESS_ALERTS)
+# An entry with a passkey: whoever has that device is inside, so that key is the one to take out.
+WEB_PASSKEY_SIGN_IN_BODY = (
+    "Se ha entrado con ella. Si no has sido tú, quítala (`sudo backtide llaves --quitar`, que "
+    "cierra todas las sesiones)."
+)
 # An entry with the password: closing the sessions is not enough if it was not you.
 WEB_SIGN_IN_BODY = (
     "Se ha entrado con la contraseña de la web. Si no has sido tú, cámbiala (`sudo backtide "
@@ -4207,7 +4221,11 @@ class Guardian:
         title, body = WEB_ACCESS_ALERTS[action]
         if action == "web_session_opened" and details.get("via") == "password":
             body = WEB_SIGN_IN_BODY
-        if action == "web_passkey_added":
+        if action == "web_session_opened" and details.get("via") == "passkey":
+            body = WEB_PASSKEY_SIGN_IN_BODY
+        if action in ("web_passkey_added", "web_passkey_touched") or (
+            action == "web_session_opened" and details.get("via") == "passkey"
+        ):
             # Which key: its name (the owner's own words, struck and cut by the alert) and the
             # end of its id. Not saved if the box did not take it: then it says so instead.
             label = f"«{str(details.get('name', ''))[:48]}» …{str(details.get('tail', ''))[:4]}"

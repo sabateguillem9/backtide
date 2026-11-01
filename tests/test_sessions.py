@@ -11,6 +11,7 @@ from backtide.service.sessions import (
     LINK_SECONDS,
     MAX_SESSIONS,
     MIN_SECONDS,
+    TOUCH_SECONDS,
     Sessions,
 )
 
@@ -218,3 +219,46 @@ def test_a_check_without_use_does_not_keep_a_session_alive(
 def test_a_given_link_token_must_look_like_one() -> None:
     with pytest.raises(ValueError):
         Sessions().new_link("é" * 10)
+
+
+# -- touching the key again (T26-3c) ----------------------------------------------------------
+
+
+def test_a_session_remembers_its_touch_for_a_while() -> None:
+    clock = Clock()
+    sessions = Sessions(clock=clock)
+    session = sessions.start()
+    assert not sessions.recently_touched(session.id)
+    assert sessions.touch(session.id)
+    clock.now += TOUCH_SECONDS - 1
+    assert sessions.recently_touched(session.id)
+    clock.now += 1
+    assert not sessions.recently_touched(session.id)
+
+
+def test_entering_with_a_key_counts_as_a_touch_and_the_others_do_not() -> None:
+    sessions = Sessions()
+    assert sessions.recently_touched(sessions.start(touched=True).id)
+    assert not sessions.recently_touched(sessions.start().id)
+    assert not sessions.recently_touched(sessions.open(sessions.new_link()).id)
+
+
+def test_a_touch_is_of_one_session_and_of_a_live_one() -> None:
+    clock = Clock()
+    sessions = Sessions(clock=clock)
+    one, other = sessions.start(), sessions.start()
+    sessions.touch(one.id)
+    assert not sessions.recently_touched(other.id)
+    assert not sessions.touch("x" * 43) and not sessions.recently_touched("x" * 43)
+    sessions.end(one.id)
+    assert not sessions.recently_touched(one.id) and not sessions.touch(one.id)
+
+
+def test_recently_opened_is_for_the_first_key() -> None:
+    clock = Clock()
+    sessions = Sessions(clock=clock)
+    session = sessions.start()
+    assert sessions.recently_opened(session.id)
+    clock.now += TOUCH_SECONDS
+    assert not sessions.recently_opened(session.id)
+    assert not sessions.recently_opened("x" * 43)

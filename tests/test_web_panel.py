@@ -34,6 +34,7 @@ from backtide.web.agents import (
 from backtide.web.app import _heads
 from backtide.web.security import CSP, POST_PATH
 from tests.conftest import FakeClock
+from tests.test_web_rewind import POST_HEADERS
 from tests.webkit import (
     KEY,
     PREFIX_PATH,
@@ -213,15 +214,36 @@ def test_approve_and_reject_are_inert_without_aprobar(room: TestClient) -> None:
     assert text_of(waiting).count("backtide web --aprobar") == 2
 
 
+def test_without_a_session_every_route_says_401(tmp_path: Path) -> None:
+    """T26-3c, so that a new route cannot be left outside: every route, from the app's own list,
+    apart from the way in and what closes a session that is not there."""
+    new_box(tmp_path)
+    client = new_client(tmp_path, logged_in=False)
+    open_ones = {"/entrar", "/entrar/llave/empezar", "/entrar/llave/responder", "/salir"}
+    routes = [r for r in client.app.inner.routes if hasattr(r, "methods")]
+    assert len(routes) > 20
+    for route in routes:
+        if route.path in open_ones:
+            continue
+        path = re.sub(r"\{[^}]+\}", "x", route.path)
+        for method in sorted(route.methods - {"HEAD"}):
+            form = {"content": "x=1", "headers": {**POST_HEADERS,
+                    "content-type": "application/x-www-form-urlencoded"}}  # fmt: skip
+            answer = client.request(method, path, **(form if method == "POST" else {}))
+            assert answer.status_code == 401, (method, route.path, answer.status_code)
+
+
 def test_no_route_takes_anything_but_get_except_the_rewind(tmp_path: Path) -> None:
     app = new_app(tmp_path)
     routes = [r for r in app.inner.routes if hasattr(r, "methods")]
     # Rewinding; signing in with the password (T26-3b-1); signing out and closing every
     # session (T26-3a-2), which only end sessions.
-    # Registering a passkey (T26-3b-2), from a live session and our own page.
+    # Registering a passkey (T26-3b-2), from a live session and our own page; signing in with it
+    # and touching it again (T26-3c), the service checks the signature.
     takes_post = {
         POST_PATH, "/entrar", "/salir", "/ajustes/cerrar-sesiones", "/llaves/empezar",
-        "/llaves/registrar",
+        "/llaves/registrar", "/entrar/llave/empezar", "/entrar/llave/responder",
+        "/tocar/empezar", "/tocar/responder",
     }  # fmt: skip
     for route in routes:
         if route.path in takes_post and "POST" in route.methods:

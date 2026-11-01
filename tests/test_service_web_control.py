@@ -304,9 +304,10 @@ def test_nothing_outside_the_list_is_served(
 
 
 def test_the_list_is_closed() -> None:
-    from backtide.service.web_control import PASSKEY_COMMANDS
+    from backtide.service.web_control import PASSKEY_COMMANDS, SIGN_IN_COMMANDS
 
-    assert COMMANDS == READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS
+    assert COMMANDS == READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS | SIGN_IN_COMMANDS
+    assert {"passkeys", "passkey_remove"}.isdisjoint(COMMANDS)  # only root takes a key out
     assert not READS & CHANGES and not (READS | CHANGES) & SESSION_COMMANDS
     assert not (READS | CHANGES | SESSION_COMMANDS) & PASSKEY_COMMANDS
     assert "web_link" not in COMMANDS  # only root mints a way in
@@ -1196,3 +1197,304 @@ def test_a_recorded_passkey_that_cannot_be_written_is_refused(
     answer = SoftAuthenticator().create(begun["options"], origin_for(8765))
     done = ask_passkey(server.path, "passkey_finish", SESSION, answer=answer, name="x", **ask)
     assert done["outcome"] == "refused" and entries == ["web_passkey_added"]
+
+
+# -- T26-3c: signing in with a passkey, and touching it again ----------------------------------
+
+
+class Keyed:
+    """A web's service with one key kept and one session open by the password."""
+
+    def __init__(self, passkeys: Any, clock: Any = None) -> None:
+        from backtide.service.passkeys import origin_for
+        from tests.passkey_kit import SoftAuthenticator
+
+        self.origin = origin_for(8765)
+        self.keys = passkeys
+        self.owner = SoftAuthenticator()
+        self.keys.finish(
+            "alta", self.owner.create(self.keys.begin("alta"), self.origin), "portátil"
+        )
+        self.sessions = Sessions(clock=clock) if clock is not None else Sessions()
+        self.session = self.sessions.start().id
+        self.entries: list[tuple[str, dict[str, Any]]] = []
+
+    def record(self, action: str, details: dict[str, Any]) -> bool:
+        self.entries.append((action, details))
+        return True
+
+
+class Ticks:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def keyed(passkeys: Any) -> Keyed:
+    return Keyed(passkeys)
+
+
+def keyed_server(
+    make: Callable[..., WebControlServer], keyed: Keyed, **more: Any
+) -> WebControlServer:
+    return make(passkeys=keyed.keys, sessions=keyed.sessions, on_entry=keyed.record, **more)
+
+
+def touched(server: WebControlServer, keyed: Keyed) -> None:
+    begun = talk(server, {"cmd": "touch_begin", "session": keyed.session})
+    answer = keyed.owner.get(begun["options"], keyed.origin)
+    reply = talk(server, {"cmd": "touch_finish", "session": keyed.session, "answer": answer})
+    assert reply["outcome"] == "touched"
+
+
+def test_a_passkey_signs_in_and_it_is_recorded_first(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = keyed_server(make_server, keyed)
+    begun = talk(server, {"cmd": "auth_begin"})
+    answer = keyed.owner.get(begun["options"], keyed.origin)
+    reply = talk(server, {"cmd": "auth_finish", "answer": answer})
+    assert reply["outcome"] == "opened" and keyed.sessions.check(reply["session"]) is not None
+    assert keyed.sessions.recently_touched(reply["session"])  # entering with it counts
+    [(action, details)] = keyed.entries
+    assert action == "web_session_opened" and details["via"] == "passkey"
+    assert details["name"] == "portátil" and len(details["tail"]) == 4
+    assert reply["session"] not in str(details)
+
+
+def test_a_passkey_entry_the_box_does_not_take_is_refused(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = make_server(passkeys=keyed.keys, sessions=keyed.sessions, on_entry=lambda a, d: False)
+    before = len(keyed.sessions)
+    answer = keyed.owner.get(talk(server, {"cmd": "auth_begin"})["options"], keyed.origin)
+    reply = talk(server, {"cmd": "auth_finish", "answer": answer})
+    assert reply["outcome"] == "refused" and "session" not in reply
+    assert len(keyed.sessions) == before
+
+
+def test_a_signature_for_another_site_opens_nothing_and_warns(
+    make_server: Callable[..., WebControlServer], keyed: Keyed, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = keyed_server(make_server, keyed)
+    before = len(keyed.sessions)
+    answer = keyed.owner.get(talk(server, {"cmd": "auth_begin"})["options"], "https://evil.example")
+    with caplog.at_level(logging.WARNING):
+        reply = talk(server, {"cmd": "auth_finish", "answer": answer})
+    assert reply["outcome"] == "refused" and "session" not in reply
+    assert len(keyed.sessions) == before and keyed.entries == []
+    assert "did not sign in" in caplog.text
+
+
+def test_many_answers_are_not_even_looked_at(
+    make_server: Callable[..., WebControlServer], keyed: Keyed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backtide.service.passkeys import PasskeyError
+
+    looked: list[object] = []
+
+    def refuse(answer: object) -> None:
+        looked.append(answer)
+        raise PasskeyError("no")
+
+    monkeypatch.setattr(keyed.keys, "sign_in", refuse)
+    server = keyed_server(make_server, keyed, auth_answers=Bucket(3, 0))
+    replies = [talk(server, {"cmd": "auth_finish", "answer": "x"})["message"] for _ in range(8)]
+    assert len(looked) == 3
+    assert sum("Demasiados" in message for message in replies) == 5
+
+
+def test_a_stream_of_challenges_leaves_the_answers_alone(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = keyed_server(make_server, keyed, auth_begins=Bucket(1, 0))
+    options = talk(server, {"cmd": "auth_begin"})["options"]
+    assert "Demasiados" in talk(server, {"cmd": "auth_begin"})["message"]
+    answer = keyed.owner.get(options, keyed.origin)
+    assert talk(server, {"cmd": "auth_finish", "answer": answer})["outcome"] == "opened"
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        {"cmd": "auth_begin", "rp_id": "evil.example"},
+        {"cmd": "auth_begin", "session": "x"},
+        {"cmd": "auth_finish"},
+        {"cmd": "auth_finish", "answer": "{}", "origin": "https://evil.example"},
+        {"cmd": "touch_begin"},
+        {"cmd": "touch_finish", "session": "x"},
+        {"cmd": "touch_status"},
+    ],
+)
+def test_a_sign_in_of_another_shape_is_refused(
+    make_server: Callable[..., WebControlServer], keyed: Keyed, request_: dict[str, Any]
+) -> None:
+    assert talk(keyed_server(make_server, keyed), request_)["outcome"] == "refused"
+
+
+LASTING = [
+    ({"cmd": "set_secret", "kind": "anthropic", "value": "sk-test", "via": "web"}, "settings"),
+    ({"cmd": "clear_secret", "kind": "anthropic", "via": "web"}, "settings"),
+    ({"cmd": "trust", "hold_id": "h-abc", "via": "web"}, "guardian"),
+]
+
+
+@pytest.mark.parametrize(("request_", "_who"), LASTING)
+def test_what_lasts_asks_for_the_key_touched(
+    make_server: Callable[..., WebControlServer],
+    keyed: Keyed,
+    settings: FakeSettings,
+    guardian: FakeGuardian,
+    budget: FakeBudget,
+    request_: dict[str, Any],
+    _who: str,
+) -> None:
+    server = keyed_server(make_server, keyed)
+    reply = talk(server, {**request_, "session": keyed.session})
+    assert reply["outcome"] == "refused" and "tocar tu llave" in reply["message"]
+    assert nothing_asked(guardian, settings, budget)
+    touched(server, keyed)
+    reply = talk(server, {**request_, "session": keyed.session})
+    assert "tocar tu llave" not in reply["message"]
+    assert _who != "settings" or settings.calls
+
+
+def test_a_touch_lasts_five_minutes(
+    make_server: Callable[..., WebControlServer], passkeys: Any
+) -> None:
+    clock = Ticks()
+    keyed = Keyed(passkeys, clock)
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    asked = {"cmd": "clear_secret", "kind": "anthropic", "via": "web", "session": keyed.session}
+    assert "tocar tu llave" not in talk(server, asked)["message"]
+    clock.now += 5 * 60
+    assert "tocar tu llave" in talk(server, dict(asked))["message"]
+
+
+def test_what_is_daily_does_not_ask_for_the_key(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = keyed_server(make_server, keyed)
+    for request_ in (
+        {"cmd": "decide", "hold_id": "h-abc", "verdict": "reject", "via": "web"},
+        {"cmd": "end_batch", "rule_id": "r-1", "via": "web"},
+        {"cmd": "set_budget", "daily_usd": "3", "via": "web"},
+    ):
+        reply = talk(server, {**request_, "session": keyed.session})
+        assert "tocar tu llave" not in reply["message"]
+
+
+def test_closing_every_session_asks_for_the_key_too(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = keyed_server(make_server, keyed)
+    request_ = {"cmd": "session_end_all", "session": keyed.session}
+    assert "tocar tu llave" in talk(server, dict(request_))["message"]
+    assert keyed.sessions.check(keyed.session) is not None
+    touched(server, keyed)
+    assert talk(server, dict(request_))["outcome"] == "ended"
+    assert keyed.sessions.check(keyed.session) is None
+
+
+def test_without_keys_the_password_is_enough(
+    make_server: Callable[..., WebControlServer],
+    passkeys: Any,
+    settings: FakeSettings,
+    guardian: FakeGuardian,
+    budget: FakeBudget,
+) -> None:
+    """D40: through the tunnel or a private network, nothing asks for a key nobody has."""
+    server = make_server(passkeys=passkeys)
+    asked = {"cmd": "clear_secret", "kind": "anthropic", "via": "web", "session": SESSION}
+    assert "tocar tu llave" not in talk(server, asked)["message"]
+    assert not nothing_asked(guardian, settings, budget)
+
+
+def test_keys_that_cannot_be_read_ask_for_a_touch_that_cannot_happen(
+    make_server: Callable[..., WebControlServer], keyed: Keyed, caplog: pytest.LogCaptureFixture
+) -> None:
+    from backtide.service.passkeys import path_of
+
+    server = keyed_server(make_server, keyed)
+    path_of(keyed.keys._state_dir).write_text("no es json")
+    asked = {"cmd": "clear_secret", "kind": "anthropic", "via": "web", "session": keyed.session}
+    with caplog.at_level(logging.ERROR):
+        assert "tocar tu llave" in talk(server, asked)["message"]
+    assert "cannot be read" in caplog.text
+
+
+def test_another_key_asks_to_touch_one_of_those_there_are(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    from tests.passkey_kit import SoftAuthenticator
+
+    server = keyed_server(make_server, keyed)
+    begin = {"cmd": "passkey_begin", "session": keyed.session}
+    assert "tocar tu llave" in talk(server, dict(begin))["message"]
+    touched(server, keyed)
+    answer = SoftAuthenticator().create(talk(server, dict(begin))["options"], keyed.origin)
+    done = talk(server, {"cmd": "passkey_finish", "session": keyed.session, "answer": answer,
+                         "name": "móvil"})  # fmt: skip
+    assert done["outcome"] == "added" and len(keyed.keys.keys()) == 2
+
+
+def test_the_first_key_is_only_right_after_entering(
+    make_server: Callable[..., WebControlServer], passkeys: Any
+) -> None:
+    clock = Ticks()
+    sessions = Sessions(clock=clock)
+    session = sessions.start().id
+    server = make_server(passkeys=passkeys, sessions=sessions)
+    assert talk(server, {"cmd": "passkey_begin", "session": session})["outcome"] == "options"
+    assert talk(server, {"cmd": "touch_status", "session": session})["add"] == "ok"
+    clock.now += 5 * 60
+    assert (
+        "nada más entrar" in talk(server, {"cmd": "passkey_begin", "session": session})["message"]
+    )
+    assert talk(server, {"cmd": "touch_status", "session": session})["add"] == "again"
+
+
+def test_two_sessions_racing_for_the_first_key_add_only_one(
+    make_server: Callable[..., WebControlServer], passkeys: Any
+) -> None:
+    from backtide.service.passkeys import origin_for
+    from tests.passkey_kit import SoftAuthenticator
+
+    sessions = Sessions()
+    one, other = sessions.start().id, sessions.start().id
+    server = make_server(passkeys=passkeys, sessions=sessions)
+    answers = {
+        who: SoftAuthenticator().create(
+            talk(server, {"cmd": "passkey_begin", "session": who})["options"], origin_for(8765)
+        )
+        for who in (one, other)
+    }
+    for who, outcome in ((one, "added"), (other, "refused")):
+        reply = talk(server, {"cmd": "passkey_finish", "session": who, "answer": answers[who],
+                              "name": "llave"})  # fmt: skip
+        assert reply["outcome"] == outcome
+    assert len(passkeys.keys()) == 1
+
+
+def test_a_touch_is_recorded_first_and_said(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = keyed_server(make_server, keyed)
+    touched(server, keyed)
+    [(action, details)] = keyed.entries
+    assert action == "web_passkey_touched" and details["name"] == "portátil"
+    assert set(details) == {"pid", "name", "tail"}
+
+
+def test_a_touch_the_box_does_not_take_does_not_count(
+    make_server: Callable[..., WebControlServer], keyed: Keyed
+) -> None:
+    server = make_server(passkeys=keyed.keys, sessions=keyed.sessions, on_entry=lambda a, d: False)
+    begun = talk(server, {"cmd": "touch_begin", "session": keyed.session})
+    answer = keyed.owner.get(begun["options"], keyed.origin)
+    reply = talk(server, {"cmd": "touch_finish", "session": keyed.session, "answer": answer})
+    assert reply["outcome"] == "refused" and not keyed.sessions.recently_touched(keyed.session)

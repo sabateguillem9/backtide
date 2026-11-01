@@ -76,7 +76,7 @@ import time
 from collections.abc import Callable, Mapping
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from backtide.blackbox import redact
 from backtide.service.holds import (
@@ -88,6 +88,9 @@ from backtide.service.holds import (
     TrustStatus,
 )
 from backtide.service.password import Checker, PasswordError
+
+if TYPE_CHECKING:
+    from backtide.service.passkeys import Passkeys  # webauthn: not for every `backtide` command
 from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
 from backtide.service.sessions import Sessions
@@ -316,6 +319,7 @@ class ControlServer:
         sessions: Sessions | None = None,
         on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
         password: Checker | None = None,
+        passkeys: "Passkeys | None" = None,
     ) -> None:
         if sessions is not None and on_entry is None:
             # Never a way into the web that leaves no trace (review of T26-3a).
@@ -330,6 +334,8 @@ class ControlServer:
         self._on_entry = on_entry
         # The web's password (T26-3b-1): checked on the narrow socket, set here by root.
         self._password_checker = password
+        # The web's passkeys (T26-3c): root lists and takes them out here (`sudo backtide llaves`).
+        self._passkeys = passkeys
         self._settings = settings
         self._budget = budget
         # The providers that wait for their key (``Egress.waiting``): the panel says so, next
@@ -506,6 +512,10 @@ class ControlServer:
             return self._web_end_all(request, pid, uid)
         if command == "set_password":
             return self._set_password(request, pid, uid)
+        if command == "passkeys":
+            return self._list_passkeys(request)
+        if command == "passkey_remove":
+            return self._remove_passkey(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
 
     def _web_link(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
@@ -543,6 +553,50 @@ class ControlServer:
             self._on_entry("web_password_set", {"uid": uid, "pid": pid, "ended": ended})
         return {"ok": True, "outcome": "saved", "ended": ended,
                 "message": "Contraseña guardada."}  # fmt: skip
+
+    def _list_passkeys(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The web's passkeys (`sudo backtide llaves`): their ids too, which are not secret and
+        are how `--quitar` tells two keys apart."""
+        from backtide.service.passkeys import PasskeyError, describe
+
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una lista de llaves lleva `cmd` y nada más.")
+        if self._passkeys is None:
+            raise _BadRequest("Este servicio no tiene web instalada: no hay llaves.")
+        try:
+            keys = [{**describe(key), "id": key.id} for key in self._passkeys.keys()]
+        except PasskeyError as error:
+            return {"ok": False, "outcome": "refused", "message": str(error), "keys": []}
+        return {"ok": True, "outcome": "listed", "message": "", "keys": keys}
+
+    def _remove_passkey(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """Take a passkey out (`sudo backtide llaves --quitar`): by its id or the end of it, one
+        key and no doubt. Every session ends too, as with a new password: it is taken out when
+        it may be in other hands. A lost key must be able to go: if the black box does not take
+        it, the alert says so and it goes anyway."""
+        from backtide.service.passkeys import PasskeyError, matching
+
+        if set(request) != {"cmd", "key"} or not isinstance(request["key"], str):
+            raise _BadRequest("Quitar una llave lleva `cmd` y `key`, y nada más.")
+        if self._passkeys is None:
+            raise _BadRequest("Este servicio no tiene web instalada: no hay llaves.")
+        try:
+            found = matching(self._passkeys.keys(), request["key"])
+            if len(found) != 1:
+                why = "Ninguna llave acaba así." if not found else "Varias llaves acaban así."
+                return {"ok": False, "outcome": "invalid", "ended": 0, "message": why}
+            key = found[0]
+            if self._on_entry is not None:
+                self._on_entry("web_passkey_removed", {"uid": uid, "pid": pid, "name": key.name,
+                                                       "tail": key.tail})  # fmt: skip
+            self._passkeys.remove(key.id)
+        except PasskeyError as error:
+            logger.error("%s: a passkey could not be taken out: %s", self.label, error)
+            return {"ok": False, "outcome": "failed", "ended": 0, "message": str(error)}
+        ended = self._sessions.end_all() if self._sessions is not None else 0
+        logger.info("%s: the passkey …%s was taken out by uid %d", self.label, key.tail, uid)
+        return {"ok": True, "outcome": "removed", "ended": ended, "message": "",
+                "name": key.name, "tail": key.tail}  # fmt: skip
 
     def _web_end_all(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         """Close every web session and the unspent link (`sudo backtide enlace --cerrar-todas`):
@@ -1556,6 +1610,42 @@ def ask_web_link(
         message = reply.get("message")
         raise ControlError(message if isinstance(message, str) else "No se ha podido dar.")
     return token
+
+
+def ask_passkeys(
+    path: Path,
+    key: str | None = None,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> dict[str, Any]:
+    """The web's passkeys (`sudo backtide llaves`), or, with ``key``, take that one out: the
+    reply, with its ``ok`` and ``message`` checked. ControlError if it makes no sense."""
+    request: dict[str, Any] = {"cmd": "passkeys"}
+    if key is not None:
+        request = {"cmd": "passkey_remove", "key": key}
+    raw = _ask(
+        Path(path),
+        request,
+        what="las llaves",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT,
+        peer=peer,
+        server_uid=server_uid,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    return reply
 
 
 def ask_web_end_all(

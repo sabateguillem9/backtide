@@ -24,6 +24,7 @@ from backtide.service.control import (
     ControlError,
     ControlOutcomeUnknown,
     ControlUnavailable,
+    ask_passkeys,
     ask_rewind,
     ask_set_password,
     ask_web_end_all,
@@ -1271,6 +1272,19 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
     sources.add_argument("--stdin", dest="password_stdin", action="store_true",
                          help="lee la contraseña de la entrada estándar")  # fmt: skip
     secret.set_defaults(handler=_set_password)
+    keys = commands.add_parser(
+        "llaves",
+        help="lista las passkeys de la web instalada y quita las que ya no sean tuyas",
+        description="Lista las passkeys de la web instalada, con su nombre, el final de su "
+        "identificador y la fecha, o quita una con --quitar. Es la salida si pierdes un "
+        "dispositivo: quitar una llave cierra todas las sesiones, y queda en la caja negra con un "
+        "aviso. Sale con 0 si va bien, 1 si el servicio no puede y 2 si esa llave no existe.",
+    )
+    _add_config(keys)
+    keys.add_argument("--quitar", dest="remove", metavar="ID",
+                      help="quita la llave con este identificador o que acabe en él "
+                      "(al menos 4 caracteres, como en la lista)")  # fmt: skip
+    keys.set_defaults(handler=_passkeys)
     link = commands.add_parser(
         "enlace",
         help="enseña el enlace de la web instalada (backtide-web.service)",
@@ -1474,6 +1488,38 @@ def _remove_link(path: Path) -> None:
 
 
 LINK_MAX_BYTES = 4096
+
+
+def _passkeys(args: argparse.Namespace) -> int:
+    """`backtide llaves`: the web's passkeys, listed or one taken out, by the service (T26-3c)."""
+    from backtide.web.paths import WebPaths
+
+    try:
+        control = WebPaths.from_file(args.config).control_socket
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    try:
+        reply = ask_passkeys(control, args.remove)
+    except ControlError as error:
+        _error(f"el servicio no ha contestado sobre las llaves: {error}")
+        return EXIT_FAILED
+    if not reply["ok"]:
+        _error(reply["message"])
+        return EXIT_ERROR if reply.get("outcome") == "invalid" else EXIT_FAILED
+    if args.remove is not None:
+        print(
+            f"Llave «{_printable(str(reply.get('name', '')))}» …{reply.get('tail', '')} quitada. "
+            f"Se han cerrado todas las sesiones ({reply.get('ended', 0)})."
+        )
+        return EXIT_OK
+    listed = reply.get("keys") or []
+    if not listed:
+        print("Aún no hay llaves: se registran en la web, nada más entrar con la contraseña.")
+    for key in listed:
+        print(f"{_printable(str(key.get('name', '')))}\t…{key.get('tail', '')}\t"
+              f"{str(key.get('added', ''))[:10]}\t{key.get('id', '')}")  # fmt: skip
+    return EXIT_OK
 
 
 def _set_password(args: argparse.Namespace) -> int:

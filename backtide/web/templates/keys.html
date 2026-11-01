@@ -17,6 +17,11 @@
   {% endif %}
   {% if not here %}
   <p class="note">{{ t.code('keys.elsewhere', origin=origin) }}</p>
+  {% elif add == "touch" %}
+  <p class="note">{{ t('keys.touch') }}</p>
+  <div class="settings-actions"><a class="settings-yes" href="{{ touch }}"><span>{{ t('touch.go') }}</span>{% include "arrow.html" %}</a></div>
+  {% elif add == "again" %}
+  <p class="note">{{ t('keys.again') }}</p>
   {% else %}
   <form class="settings-form keys-form" id="passkey-form" data-begin="{{ begin }}" data-finish="{{ finish }}" data-csrf="{{ csrf }}" data-done="{{ t('keys.done') }}" data-failed="{{ t('keys.failed') }}" data-unsupported="{{ t('keys.unsupported') }}" data-cancelled="{{ t('keys.cancelled') }}">
     <div class="setting-field">

@@ -339,7 +339,7 @@ h1 {
 /* primary */
 :is(.req-yes, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .dot-button) { background: var(--ink); color: var(--on-ink); }
 :is(.req-yes, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .dot-button)::before { background: var(--ink-hover); }
-:is(.req-yes, .settings-yes, .ask-send, .filters-apply):hover .arrow { transform: translateX(var(--nudge)); }
+:is(.req-yes, .settings-yes, .ask-send, .filters-apply, .signin-key .setting-go):hover .arrow { transform: translateX(var(--nudge)); }
 /* secondary */
 /* Its border is `edge` (3:1 on every ground it sits on, hold-wash included), not `line`. */
 :is(.req-no, .setting-go, .more) { border-color: var(--edge); }
@@ -349,10 +349,10 @@ h1 {
 :is(.setting-remove, .settings-yes.is-remove) { background: none; color: var(--danger); border-color: var(--edge); }
 :is(.setting-remove, .settings-yes.is-remove)::before { background: var(--danger-wash); }
 /* disabled: band ground, muted words, no hover; the reason is next to it (aria-describedby) */
-:is(.req-yes, .req-no, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .dot-button):disabled, .setting-go.is-off { cursor: not-allowed; }
-:is(.req-yes, .req-no, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .dot-button):disabled::before, .setting-go.is-off::before { display: none; }
+:is(.req-yes, .req-no, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .setting-go, .dot-button):disabled, .setting-go.is-off { cursor: not-allowed; }
+:is(.req-yes, .req-no, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .setting-go, .dot-button):disabled::before, .setting-go.is-off::before { display: none; }
 :is(.req-yes, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .dot-button):disabled { background: var(--band); color: var(--ink-muted); }
-.req-no:disabled, .setting-go.is-off { color: var(--ink-muted); border-color: var(--hair); }
+:is(.req-no, .setting-go):disabled, .setting-go.is-off { color: var(--ink-muted); border-color: var(--hair); }
 /* The arrow-only button of a snapshot row: the system's primary button, square. It points back. */
 .dot-button { width: var(--size-target); padding: 0; }
 .rewind .dot-button .arrow, .rewind-yes .arrow { transform: scaleX(-1); }
@@ -550,10 +550,24 @@ h1 {
 .signin-error { margin: 0; display: flex; align-items: center; gap: var(--space-2); font: var(--type-label-weight) var(--type-label-size)/1.3 var(--font-sans); color: var(--danger); }
 .signin-error .ic .ic-fill { fill: var(--danger); }
 .signin-error code { color: inherit; }
-#passkey-status.is-error { font: var(--type-label-weight) var(--type-label-size)/1.3 var(--font-sans); color: var(--danger); }
+:is(#passkey-status, #webauthn-status).is-error { font: var(--type-label-weight) var(--type-label-size)/1.3 var(--font-sans); color: var(--danger); }
 #passkey-name[aria-invalid] { border-color: var(--danger); }
+/* the other way in (T26-3c): the password is the view's one primary (it works from the first day,
+   on either name), the key its secondary, past a hairline as wide as the field */
+.signin-key { max-width: 32rem; margin-top: var(--space-6); padding-top: var(--space-6); border-top: var(--stroke-hair) solid var(--hair); }
+.signin-form + .note { margin-top: var(--space-6); }
+/* what the browser or the key said: the Field's error, crimson with its drawing; nothing until then */
+.webauthn-said { display: flex; align-items: center; gap: var(--space-2); max-width: 32rem; }
+.webauthn-said > .ic { display: none; }
+.webauthn-said:has(.is-error) { margin-top: var(--space-3); }
+.webauthn-said:has(.is-error) > .ic { display: block; }
+.webauthn-said .ic .ic-fill { fill: var(--danger); }
+/* the touch page and the keys page: a button alone under the words, one close under its reason */
+.gate-page > .lede + .settings-actions { margin-top: var(--space-8); }
+.gate-page > .note + .settings-actions { margin-top: var(--space-3); }
 /* the passkeys (T26-3b-2): Ajustes' rows, as wide as the form below them */
 .keys-list { max-width: 32rem; margin-top: var(--space-8); }
+.keys-list + .note { margin-top: var(--space-6); }
 .keys-list .setting-name { overflow-wrap: anywhere; }  /* a name is the person's, up to 48 letters in one word */
 .settings-outcome { display: flex; align-items: center; gap: var(--space-3); }
 .settings-outcome .setting-dot { width: 0.75rem; height: 0.75rem; }

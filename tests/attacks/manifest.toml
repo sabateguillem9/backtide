@@ -1923,8 +1923,9 @@ aceptar precios): sin sesión, con una inventada y con una que ya se cerró, el 
 sin llamar a nada. Tampoco puede abrir una sesión sin enlace, pedir un enlace por su socket, cerrar \
 todas sin sesión ni llegar al socket de control de root. Como control, con una sesión viva una \
 petición inventada llega hasta la comprobación del id. En la caja negra queda el rechazo y ningún \
-rebobinado, cambio de claves o topes, aprobación ni confianza. La otra mitad (crear y borrar \
-agentes con una sesión pero sin tocar la llave) llega con T26-3c."""
+rebobinado, cambio de claves o topes, aprobación ni confianza. Con una llave registrada y una \
+sesión viva que no la ha tocado (T26-3c), poner o quitar claves, confiar, cerrar todas y añadir \
+otra llave se rechazan por ese motivo, y la llave y la sesión siguen como estaban."""
 inspired_by = "Un fallo en la web (o en una dependencia suya) que da a un atacante su proceso"
 invariants = [2, 6, 7]
 status = "ready"
@@ -1947,7 +1948,8 @@ segundos, sigue viva pasado el minuto y muere a los dos igualmente. Con una sesi
 `sudo backtide enlace --cerrar-todas` por el socket de root la cierra al momento; «Cerrar \
 todas» desde la web, por su socket estrecho, también. Los dos cierres quedan en la caja negra con \
 cuántas sesiones cerraron, y ningún evento de entrada o salida lleva un token ni un id. Al final la configuración vuelve a estar como estaba. La otra \
-mitad (una acción de la tabla 5.3 con la llave tocada hace más de 5 minutos) llega con T26-3c."""
+mitad (una acción de la tabla 5.3 con la llave tocada hace más de 5 minutos) no está aquí: la \
+prueban los tests del Mac con un reloj falso, hasta que haya una opción que acorte ese plazo."""
 inspired_by = "Una cookie robada o una pestaña olvidada en un ordenador sin bloquear"
 invariants = [6, 7]
 status = "ready"
@@ -1978,6 +1980,103 @@ profiles = ["openclaw", "claude-code"]
 [scenario.expect]
 stopped = "yes"
 recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "firma-de-otro-sitio"
+name = "Una firma hecha para otro sitio no abre nada"
+story = """T26-3c: una passkey firma el origen que le da el navegador, y por eso no se puede \
+*phishear*. Como `backtide-web`, el escenario registra la llave del dueño y prueba a entrar con una \
+firma de verdad hecha para `https://evil.example`, para otro puerto de `backtide.localhost` y para \
+otro dominio, sin el usuario verificado y con una llave que no está registrada: ninguna da sesión. \
+La buena entra y repetirla ya no vale, porque cada reto sirve una vez. Un toque hecho para otro \
+sitio tampoco cuenta: lo que dura sigue pidiendo la llave. En la caja negra quedan los rechazos y \
+una sola entrada con llave, con su nombre y el final de su id. Al terminar, quita la llave."""
+inspired_by = "Una página parecida que pide tocar la llave y pasa la firma a la web de verdad"
+invariants = [2, 5, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "llaves-a-la-fuerza"
+name = "Mil respuestas de entrada: las del cubo se miran, el resto ni eso"
+story = """T26-3c: las respuestas de entrada llevan un cubo para toda la web, no por IP: 10 de golpe \
+y una cada 6 segundos. Como `backtide-web`, el escenario manda mil seguidas. Solo las del cubo se \
+comprueban y se rechazan, ninguna entra, y el resto se contesta sin mirarla. Trece segundos después, \
+el dueño entra con su llave. El aviso de tantos intentos llega a la caja negra. Al terminar, quita \
+la llave."""
+inspired_by = "Probar firmas sin parar, o agotar al servicio con su comprobación"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "entrar-sin-llave"
+name = "Sin una sesión, la web instalada no enseña ni cambia nada"
+story = """T26-3c: la web instalada por HTTP, con su prefijo y su `Host` buenos. Sus páginas y sus \
+órdenes, sin cookie, con una inventada y con la de una sesión que ya se cerró, contestan 401 o 403. \
+Como `backtide-web`, las órdenes de las llaves con una sesión inventada se rechazan por no tener \
+sesión viva, y sin llaves no hay reto que firmar. No aparece ninguna llave."""
+inspired_by = "Abrir la web sin haber entrado, o con una cookie vieja"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "llave-perdida"
+name = "Una llave quitada no entra, y se lleva las sesiones"
+story = """T26-3c: con dos llaves registradas, `sudo backtide llaves --quitar` quita una: su firma ya \
+no entra, todas las sesiones se cierran y la otra llave sigue entrando. `backtide-web` no puede \
+pedir nada de eso: por su socket se rechaza por estar fuera de la lista y al de root no llega. En \
+la caja negra queda `web_passkey_removed`, con la llave y quién lo pidió. Al terminar, quita las \
+llaves."""
+inspired_by = "Un móvil perdido con su passkey dentro"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "reloj-bajo-el-filtro"
+name = "El servicio instalado sobrevive a su comprobación del reloj"
+story = """Incidente del 2026-11-01: el filtro de llamadas de la unidad mataba al servicio cada 10 \
+minutos, en la comprobación del reloj antes de borrar instantáneas, y ninguna prueba duraba tanto. \
+El escenario pone esa comprobación cada 20 segundos con la unidad de verdad y, tras dos pasadas, \
+exige el mismo proceso y los mismos reinicios, sin avisos de no poder leer el reloj. Como control, \
+la misma lectura con `@system-service` a secas termina mal, y con el filtro de la unidad termina \
+bien. Al final la configuración vuelve a como estaba."""
+inspired_by = "Un fallo propio: la defensa mataba lo que defiende"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
 risk = "n/a"
 recoverable = "n/a"
 held = "n/a"

@@ -1198,3 +1198,105 @@ def test_a_batch_is_revoked_from_the_web_or_the_terminal(
     ]  # fmt: skip
     with pytest.raises(ValueError):
         ask_end_batch(server.path, "b-01234567", via="telegram", peer=me)
+
+
+# -- T26-3c: root lists the web's passkeys and takes them out ----------------------------------
+
+
+@pytest.fixture
+def kept(tmp_path: Path) -> Any:
+    from backtide.service.passkeys import Passkeys, origin_for
+    from tests.passkey_kit import SoftAuthenticator
+
+    state = tmp_path / "keys-state"
+    state.mkdir(mode=0o700)
+    keys = Passkeys(state, origins=[origin_for(8765)])
+    for name in ("portátil", "móvil"):
+        options = keys.begin(name)
+        keys.finish(name, SoftAuthenticator().create(options, origin_for(8765)), name)
+    return keys
+
+
+def test_root_lists_the_keys_with_their_ids(
+    make_server: Callable[..., ControlServer], kept: Any
+) -> None:
+    from backtide.service.control import ask_passkeys
+    from backtide.service.sessions import Sessions
+
+    server = make_server(passkeys=kept, sessions=Sessions(), on_entry=lambda a, d: True)
+    reply = ask_passkeys(server.path, peer=me)
+    assert [k["name"] for k in reply["keys"]] == ["portátil", "móvil"]
+    assert reply["keys"][0]["id"] == kept.keys()[0].id
+    assert "public" not in json.dumps(reply)
+
+
+def test_taking_a_key_out_records_it_and_closes_every_session(
+    make_server: Callable[..., ControlServer], kept: Any
+) -> None:
+    from backtide.service.control import ask_passkeys
+    from backtide.service.sessions import Sessions
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    sessions = Sessions()
+    session = sessions.start()
+    server = make_server(passkeys=kept, sessions=sessions,
+                         on_entry=lambda a, d: entries.append((a, d)) is None)  # fmt: skip
+    going, staying = kept.keys()
+    reply = ask_passkeys(server.path, going.tail, peer=me)
+    assert reply["ok"] is True and reply["name"] == going.name and reply["ended"] == 1
+    assert [k.id for k in kept.keys()] == [staying.id]
+    assert sessions.check(session.id) is None
+    [(action, details)] = entries
+    assert action == "web_passkey_removed" and details["tail"] == going.tail
+    assert details["uid"] == os.geteuid()
+
+
+def test_a_lost_key_goes_even_if_the_box_does_not_take_it(
+    make_server: Callable[..., ControlServer], kept: Any
+) -> None:
+    from backtide.service.control import ask_passkeys
+    from backtide.service.sessions import Sessions
+
+    server = make_server(passkeys=kept, sessions=Sessions(), on_entry=lambda a, d: False)
+    going = kept.keys()[0]
+    assert ask_passkeys(server.path, going.id, peer=me)["ok"] is True
+    assert going.id not in [k.id for k in kept.keys()]
+
+
+@pytest.mark.parametrize("given", ["zzzz", "abc", ""])
+def test_a_key_that_is_not_there_takes_nothing_out(
+    make_server: Callable[..., ControlServer], kept: Any, given: str
+) -> None:
+    from backtide.service.control import ask_passkeys
+    from backtide.service.sessions import Sessions
+
+    sessions = Sessions()
+    session = sessions.start()
+    server = make_server(passkeys=kept, sessions=sessions, on_entry=lambda a, d: True)
+    reply = ask_passkeys(server.path, given, peer=me)
+    assert reply["ok"] is False and reply["outcome"] == "invalid"
+    assert len(kept.keys()) == 2 and sessions.check(session.id) is not None
+
+
+def test_two_keys_ending_the_same_take_nothing_out(
+    make_server: Callable[..., ControlServer], kept: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from backtide.service.control import ask_passkeys
+    from backtide.service.sessions import Sessions
+
+    one, two = kept.keys()
+    monkeypatch.setattr(
+        kept, "keys", lambda: [replace(one, id="AAAAtail"), replace(two, id="BBBBtail")]
+    )
+    server = make_server(passkeys=kept, sessions=Sessions(), on_entry=lambda a, d: True)
+    reply = ask_passkeys(server.path, "tail", peer=me)
+    assert reply["ok"] is False and "Varias" in reply["message"]
+
+
+def test_without_a_web_there_are_no_keys(make_server: Callable[..., ControlServer]) -> None:
+    from backtide.service.control import ask_passkeys
+
+    reply = ask_passkeys(make_server().path, peer=me)
+    assert reply["ok"] is False and "no hay llaves" in reply["message"]

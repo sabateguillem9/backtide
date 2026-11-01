@@ -69,6 +69,7 @@ from typing import Any, Protocol
 from backtide.service.control import ControlError, PeerCredentials, peer_credentials
 from backtide.service.sessions import Session, Sessions
 from backtide.service.web_control import (
+    ask_auth,
     ask_passkey,
     ask_session_check,
     ask_session_end,
@@ -116,6 +117,11 @@ KEYS_PATH = "/llaves"  # the passkeys (T26-3b-2): the page, then its two POSTs
 KEYS_BEGIN_PATH = "/llaves/empezar"
 KEYS_FINISH_PATH = "/llaves/registrar"  # the one path that takes a large form (the answer)
 SIGN_IN_PATH = "/entrar"  # the web's password (T26-3b-1): no session yet, our own Origin
+SIGN_IN_KEY_BEGIN_PATH = "/entrar/llave/empezar"  # with a passkey (T26-3c): the same, two POSTs
+SIGN_IN_KEY_FINISH_PATH = "/entrar/llave/responder"
+TOUCH_PATH = "/tocar"  # touching the key again (T26-3c): the page, then its two POSTs
+TOUCH_BEGIN_PATH = "/tocar/empezar"
+TOUCH_FINISH_PATH = "/tocar/responder"
 SIGN_OUT_PATH = "/salir"
 CLOSE_SESSIONS_PATH = "/ajustes/cerrar-sesiones"
 CLOSE_SESSIONS_WORD = "cerrar-todas"  # typed in the form: the confirmation
@@ -191,6 +197,9 @@ class Access(Protocol):
         """A new session for the web's password (T26-3b-1), and why not: "opened", "wrong",
         "slow_down", "locked", "unset" or "refused"."""
 
+    def auth(self, command: str, **fields: str) -> dict[str, Any]:
+        """Signing in with a passkey (T26-3c): the service's reply."""
+
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
         """The live session among this header's cookies, or None; with ``use`` it counts as
         used (a page's own stream checks without it)."""
@@ -214,6 +223,9 @@ class LocalAccess:
 
     def sign_in(self, password: str) -> tuple[Session | None, str]:
         return None, "unset"  # a web of its own has no password: only its link
+
+    def auth(self, command: str, **fields: str) -> dict[str, Any]:
+        return {"ok": False, "outcome": "refused", "message": "Solo en la web instalada."}
 
     def passkey(self, command: str, session_id: str, **fields: str) -> dict[str, Any]:
         return {"ok": False, "outcome": "refused", "message": "Solo en la web instalada."}
@@ -271,6 +283,19 @@ class ServiceAccess:
             return ask_passkey(self._path, command, session_id, **fields, **self._ask())
         except ControlError as error:
             logger.error("the service could not be asked about the passkeys: %s", error)
+            return {
+                "ok": False,
+                "outcome": "refused",
+                "message": "Ahora no se puede: prueba otra vez.",
+            }
+
+    def auth(self, command: str, **fields: str) -> dict[str, Any]:
+        """Signing in with a passkey (T26-3c): the service's reply, or a refusal of our own if
+        it cannot be asked."""
+        try:
+            return ask_auth(self._path, command, **fields, **self._ask())
+        except ControlError as error:
+            logger.error("the service could not be asked about a sign-in: %s", error)
             return {
                 "ok": False,
                 "outcome": "refused",

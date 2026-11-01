@@ -3404,7 +3404,24 @@ def test_a_new_passkey_is_recorded_and_alerted(world: World) -> None:
     assert world.only("web_passkey_added").details == {"pid": 8, "name": "móvil", "tail": "ab12"}
     (alert,) = world.alerts.titled("llave")
     assert alert.level is AlertLevel.ERROR
-    assert "«móvil» …ab12" in alert.body and "passkeys.json" in alert.body
+    assert "«móvil» …ab12" in alert.body and "backtide llaves --quitar" in alert.body
+
+
+def test_an_entry_with_a_passkey_says_which_and_how_to_take_it_out(world: World) -> None:
+    details = {"pid": 8, "via": "passkey", "name": "móvil", "tail": "ab12"}
+    assert world.guardian.web_access("web_session_opened", details)
+    assert world.only("web_session_opened").details == details
+    (alert,) = world.alerts.titled("entrado")
+    assert alert.level is AlertLevel.ERROR
+    assert "«móvil» …ab12" in alert.body and "backtide llaves --quitar" in alert.body
+
+
+def test_taking_a_passkey_out_is_recorded_and_alerted(world: World) -> None:
+    details = {"uid": 0, "pid": 8, "name": "móvil", "tail": "ab12"}
+    assert world.guardian.web_access("web_passkey_removed", details)
+    assert world.only("web_passkey_removed").details == details
+    (alert,) = world.alerts.titled("quitado")
+    assert alert.level is AlertLevel.ERROR and "root" in alert.body
 
 
 def test_a_passkey_the_box_does_not_take_is_said_not_saved(world: World) -> None:
@@ -3415,3 +3432,11 @@ def test_a_passkey_the_box_does_not_take_is_said_not_saved(world: World) -> None
     )
     (alert,) = world.alerts.titled("llave")
     assert "no se ha guardado" in alert.body
+
+
+def test_a_touched_passkey_is_recorded_and_alerted(world: World) -> None:
+    details = {"pid": 8, "name": "móvil", "tail": "ab12"}
+    assert world.guardian.web_access("web_passkey_touched", details)
+    assert world.only("web_passkey_touched").details == details
+    (alert,) = world.alerts.titled("tocado")
+    assert alert.level is AlertLevel.ERROR and "«móvil» …ab12" in alert.body

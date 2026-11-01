@@ -12,6 +12,9 @@ one-time link that root asks for (`sudo backtide enlace`, on the control socket)
   Several at once (the laptop and the phone), at most ``MAX_SESSIONS``: past that, the least
   recently used goes. One can be ended ("Salir") or all ("Cerrar todas", which kills the
   unspent link too).
+- What lasts longer than a session or has no way back asks for the passkey touched in the last
+  ``TOUCH_SECONDS`` (T26-3c, docs/47 section 5.3): a session remembers when, and it only says so;
+  the narrow socket decides. Entering with a passkey counts; a link or a password does not.
 - Only a SHA-256 digest of each token and id is kept, in memory: a restart of the service signs
   everyone out, and nothing on disk or in a dump of these structures opens a session.
 - The limits can be shortened (a test of expiry), never made longer than the design's.
@@ -32,6 +35,7 @@ IDLE_SECONDS = 60 * 60
 LIFETIME_SECONDS = 12 * 60 * 60
 LINK_SECONDS = 15 * 60
 MAX_SESSIONS = 16
+TOUCH_SECONDS = 5 * 60
 MIN_SECONDS = 60  # the shortest a test may make a session's life
 SECRET_BYTES = 32
 MAX_SECRET_CHARS = 128  # anything longer is not one of ours: not even hashed
@@ -50,6 +54,7 @@ class _Entry:
     csrf: str
     opened: float
     used: float
+    touched: float | None = None  # when its passkey was last touched, if it ever was
 
 
 def _digest(secret: str) -> bytes:
@@ -120,11 +125,15 @@ class Sessions:
             self._link = None
             return self._start(secrets.token_urlsafe(SECRET_BYTES), now)
 
-    def start(self) -> Session:
-        """A new session for an entry the service checked itself (the password; later the
-        passkey): a new random id, as for a link."""
+    def start(self, *, touched: bool = False) -> Session:
+        """A new session for an entry the service checked itself (the password; with
+        ``touched``, a passkey): a new random id, as for a link."""
         with self._lock:
-            return self._start(secrets.token_urlsafe(SECRET_BYTES), self._clock())
+            now = self._clock()
+            session = self._start(secrets.token_urlsafe(SECRET_BYTES), now)
+            if touched:
+                self._sessions[_digest(session.id)].touched = now
+            return session
 
     def preset(self, session_id: str) -> Session:
         """A session that is already open with this id: for the Mac's demo and the tests, which
@@ -147,6 +156,35 @@ class Sessions:
             if use:
                 entry.used = max(entry.used, now)
             return Session(session_id, entry.csrf)
+
+    def touch(self, session_id: object) -> bool:
+        """This live session has just touched a passkey (T26-3c); False if it is not live."""
+        entry = self._live(session_id)
+        if entry is None:
+            return False
+        with self._lock:
+            entry.touched = self._clock()
+        return True
+
+    def recently_touched(self, session_id: object) -> bool:
+        """Did this live session touch a passkey in the last ``TOUCH_SECONDS``?"""
+        entry = self._live(session_id)
+        if entry is None or entry.touched is None:
+            return False
+        return self._clock() < entry.touched + TOUCH_SECONDS
+
+    def recently_opened(self, session_id: object) -> bool:
+        """Was this live session opened in the last ``TOUCH_SECONDS``? What the first passkey
+        asks for, when there is none to touch."""
+        entry = self._live(session_id)
+        return entry is not None and self._clock() < entry.opened + TOUCH_SECONDS
+
+    def _live(self, session_id: object) -> _Entry | None:
+        if not _usable(session_id):
+            return None
+        with self._lock:
+            self._forget_the_dead(self._clock())
+            return self._sessions.get(_digest(session_id))
 
     def end(self, session_id: object) -> bool:
         """End this session ("Salir"); False if it was not a live one."""
@@ -194,4 +232,5 @@ __all__ = [
     "MIN_SECONDS",
     "Session",
     "Sessions",
+    "TOUCH_SECONDS",
 ]

@@ -43,6 +43,8 @@ class InstalledWeb:
         return None
 
     def passkey(self, command: str, session_id: str, **fields: str) -> dict[str, Any]:
+        if command == "touch_status":
+            return {"ok": True, "needs": False, "add": "ok"}
         assert command == "passkey_list"
         return {"ok": True, "keys": self.keys}
 

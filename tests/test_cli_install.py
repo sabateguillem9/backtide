@@ -5,6 +5,7 @@ tests/test_setup_install.py."""
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -366,3 +367,90 @@ def test_contrasena_refuses_before_asking_the_service(
     code, out, err = run(capsys, "contraseña", "--config", tmp_path / "backtide.toml")
     assert code == 2 and said in err and password_service == []
     assert "short" not in err and "horse" not in out + err
+
+
+# -- T26-3c: `backtide llaves` ------------------------------------------------------------------
+
+
+@pytest.fixture
+def key_service(tmp_path: Path) -> list[Any]:
+    (tmp_path / "state").mkdir(mode=0o700, exist_ok=True)
+    (tmp_path / "vol").mkdir(exist_ok=True)
+    (tmp_path / "backtide.toml").write_text(
+        f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n'
+    )
+    return []
+
+
+def test_llaves_lists_them(
+    capsys, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key_service: list[Any]
+) -> None:
+    keys = [{"name": "portátil", "tail": "DNMg", "added": "2026-10-31T09:12:00Z", "id": "abcDNMg"}]
+    monkeypatch.setattr(
+        cli, "ask_passkeys", lambda path, key=None: {"ok": True, "message": "", "keys": keys}
+    )
+    code, out, _ = run(capsys, "llaves", "--config", tmp_path / "backtide.toml")
+    assert (
+        code == 0
+        and "portátil" in out
+        and "…DNMg" in out
+        and "2026-10-31" in out
+        and "abcDNMg" in out
+    )
+
+
+def test_llaves_says_when_there_are_none(
+    capsys, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key_service: list[Any]
+) -> None:
+    monkeypatch.setattr(
+        cli, "ask_passkeys", lambda path, key=None: {"ok": True, "message": "", "keys": []}
+    )
+    code, out, _ = run(capsys, "llaves", "--config", tmp_path / "backtide.toml")
+    assert code == 0 and "Aún no hay llaves" in out
+
+
+def test_llaves_quitar_takes_one_out(
+    capsys, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key_service: list[Any]
+) -> None:
+    def remove(path: Path, key: str | None = None) -> dict[str, Any]:
+        key_service.append(key)
+        return {"ok": True, "message": "", "name": "móvil", "tail": "T-XQ", "ended": 2}
+
+    monkeypatch.setattr(cli, "ask_passkeys", remove)
+    code, out, _ = run(capsys, "llaves", "--quitar", "T-XQ", "--config", tmp_path / "backtide.toml")
+    assert code == 0 and key_service == ["T-XQ"] and "móvil" in out and "cerrado todas" in out
+
+
+@pytest.mark.parametrize(("outcome", "exit_code"), [("invalid", 2), ("failed", 1)])
+def test_llaves_quitar_says_why_not(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    key_service: list[Any],
+    outcome: str,
+    exit_code: int,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "ask_passkeys",
+        lambda path, key=None: {
+            "ok": False,
+            "outcome": outcome,
+            "message": "Ninguna llave acaba así.",
+        },
+    )
+    code, _, err = run(capsys, "llaves", "--quitar", "zzzz", "--config", tmp_path / "backtide.toml")
+    assert code == exit_code and "Ninguna llave" in err
+
+
+def test_llaves_without_the_service_says_so(
+    capsys, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key_service: list[Any]
+) -> None:
+    from backtide.service.control import ControlError
+
+    def down(path: Path, key: str | None = None) -> dict[str, Any]:
+        raise ControlError("no responde")
+
+    monkeypatch.setattr(cli, "ask_passkeys", down)
+    code, _, err = run(capsys, "llaves", "--config", tmp_path / "backtide.toml")
+    assert code == 1 and "no responde" in err

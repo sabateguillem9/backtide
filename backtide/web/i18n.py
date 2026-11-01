@@ -471,6 +471,20 @@ ES: dict[str, str] = {
     "auth.bad": "Ese enlace ya se usó o ya no vale. Para otro navegador, para `backtide web` y "
     "vuelve a lanzarlo.",
     "auth.title.installed": "Entra en backtide",
+    "auth.key": "Entrar con tu llave",
+    "auth.key.elsewhere": "Para entrar con tu llave, abre `{origin}`.",
+    "touch.title": "Toca tu llave",
+    "touch.body": "Lo que vas a hacer dura más que la sesión o no tiene vuelta, así que backtide "
+    "pide tu llave otra vez. Después, envíalo de nuevo: tienes 5 minutos.",
+    "touch.go": "Tocar la llave",
+    "touch.cancel": "Volver",
+    "touch.lost": "Si ya no tienes la llave: `sudo backtide llaves`, y quita la perdida.",
+    "keys.touch": "Para añadir otra llave, toca antes una de las que ya tienes.",
+    "keys.again": "La primera llave se registra nada más entrar. Sal, vuelve a entrar y "
+    "regístrala.",
+    "webauthn.cancelled": "Se canceló o se acabó el tiempo: prueba otra vez.",
+    "webauthn.failed": "No ha funcionado.",
+    "webauthn.unsupported": "Este navegador no puede usar passkeys aquí.",
     "keys.title": "Llaves",
     "keys.body": "Una passkey entra en backtide con tu huella, tu cara o el PIN del dispositivo, "
     "y no se puede adivinar ni robar de aquí. Registra una por cada dispositivo.",
@@ -485,8 +499,8 @@ ES: dict[str, str] = {
     "keys.done": "Llave registrada.",
     "keys.failed": "No se ha registrado.",
     "keys.cancelled": "Se canceló o se acabó el tiempo: prueba otra vez.",
-    "keys.elsewhere": "Las passkeys son de un nombre, no de una dirección: abre la web en {origin} "
-    "(el enlace que da `sudo backtide enlace`) para registrar una.",
+    "keys.elsewhere": "Las passkeys son de un nombre, no de una dirección: abre la web en "
+    "`{origin}` (el enlace que da `sudo backtide enlace`) para registrar una.",
     "settings.keys": "Llaves (passkeys) para entrar",
     "keys.unsupported": "Este navegador no puede crear passkeys aquí. Abre la web en "
     "http://backtide.localhost:8765 con Chrome, Edge o Firefox.",
@@ -1236,6 +1250,21 @@ EN: dict[str, str] = {
     "auth.bad": "That link was already used or no longer works. For another browser, stop "
     "`backtide web` and start it again.",
     "auth.title.installed": "Sign in to backtide",
+    "auth.key": "Sign in with your key",
+    "auth.key.elsewhere": "To sign in with your key, open `{origin}`.",
+    "touch.title": "Touch your key",
+    "touch.body": "What you are about to do outlasts the session or has no way back, so backtide "
+    "asks for your key again. Then send it once more: you have 5 minutes.",
+    "touch.go": "Touch the key",
+    "touch.cancel": "Back",
+    "touch.lost": "If you no longer have the key: `sudo backtide llaves`, and take out the lost "
+    "one.",
+    "keys.touch": "To add another key, first touch one you already have.",
+    "keys.again": "The first key is registered right after signing in. Sign out, sign in again "
+    "and register it.",
+    "webauthn.cancelled": "It was cancelled or the time ran out: try again.",
+    "webauthn.failed": "It did not work.",
+    "webauthn.unsupported": "This browser cannot use passkeys here.",
     "keys.title": "Keys",
     "keys.body": "A passkey signs in to backtide with your fingerprint, your face or the "
     "device's PIN, and cannot be guessed or stolen from here. Register one on each device.",
@@ -1250,7 +1279,7 @@ EN: dict[str, str] = {
     "keys.done": "Key registered.",
     "keys.failed": "It was not registered.",
     "keys.cancelled": "It was cancelled or the time ran out: try again.",
-    "keys.elsewhere": "Passkeys belong to a name, not an address: open the web at {origin} (the "
+    "keys.elsewhere": "Passkeys belong to a name, not an address: open the web at `{origin}` (the "
     "link `sudo backtide enlace` gives) to register one.",
     "settings.keys": "Keys (passkeys) to sign in",
     "keys.unsupported": "This browser cannot create passkeys here. Open the web at "

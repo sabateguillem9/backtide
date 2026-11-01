@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% from "icons.html" import ic %}
+{% block head %}{% if here %}<script src="{{ base }}/static/webauthn-get.js" defer></script>{% endif %}{% endblock %}
+{% block title %}{{ t('touch.title') }}{% endblock %}
+{% block main %}
+<main class="watch gate-page ic-host">
+  {{ ic('key', 'ic--l') }}
+  <h1>{{ t('touch.title') }}</h1>
+  <p class="lede">{{ t('touch.body') }}</p>
+  {% if not here %}
+  <p class="note">{{ t.code('keys.elsewhere', origin=origin) }}</p>
+  {% else %}
+  <div class="settings-actions">
+    <button class="settings-yes" type="button" id="webauthn-go" data-begin="{{ begin }}" data-finish="{{ finish }}" data-csrf="{{ csrf }}" data-target="{{ target }}" data-cancelled="{{ t('webauthn.cancelled') }}" data-failed="{{ t('webauthn.failed') }}" data-unsupported="{{ t('webauthn.unsupported') }}"><span>{{ t('touch.go') }}</span>{% include "arrow.html" %}</button>
+    <a class="settings-cancel" href="{{ target }}">{{ t('touch.cancel') }}</a>
+  </div>
+  <div class="webauthn-said">{{ ic('warning') }}<p class="setting-hint" id="webauthn-status" role="status" aria-live="polite"></p></div>
+  <p class="note">{{ t.code('touch.lost') }}</p>
+  {% endif %}
+</main>
+{% endblock %}

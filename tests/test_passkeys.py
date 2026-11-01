@@ -11,9 +11,11 @@ import pytest
 from backtide.service.passkeys import (
     CHALLENGE_SECONDS,
     MAX_KEYS,
+    MAX_SIGN_INS,
     RP_ID,
     PasskeyError,
     Passkeys,
+    matching,
     origin_for,
     path_of,
 )
@@ -189,3 +191,132 @@ def test_verify_writes_nothing_until_kept(keys: Passkeys) -> None:
     assert keys.keys() == [key]
     with pytest.raises(PasskeyError, match="ya está registrada"):
         keys.keep(key)
+
+
+# -- signing in and touching it again (T26-3c) ------------------------------------------------
+
+
+@pytest.fixture
+def owner(keys: Passkeys) -> SoftAuthenticator:
+    authenticator = SoftAuthenticator()
+    keys.finish(SESSION, authenticator.create(keys.begin(SESSION), ORIGIN), "portátil")
+    return authenticator
+
+
+def test_signing_in_with_the_kept_key(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    options = json.loads(keys.sign_in_begin())
+    assert options["rpId"] == RP_ID and options["userVerification"] == "required"
+    assert [c["id"] for c in options["allowCredentials"]] == [keys.keys()[0].id]
+    assert keys.sign_in(owner.get(json.dumps(options), ORIGIN)).name == "portátil"
+
+
+def test_no_key_nothing_to_sign_in_with(keys: Passkeys) -> None:
+    with pytest.raises(PasskeyError, match="ninguna llave"):
+        keys.sign_in_begin()
+    with pytest.raises(PasskeyError, match="ninguna llave"):
+        keys.touch_begin(SESSION)
+
+
+@pytest.mark.parametrize(
+    "bend",
+    [
+        {"origin": "https://backtide.localhost.evil.example"},
+        {"origin": "http://backtide.localhost:9999"},
+        {"rp_id": "evil.example"},
+        {"verified": False},
+        {"kind": "webauthn.create"},
+        {"bad_signature": True},
+    ],
+)
+def test_a_signature_bent_any_way_does_not_sign_in(
+    keys: Passkeys, owner: SoftAuthenticator, bend: dict
+) -> None:
+    fields = {"origin": ORIGIN, **bend}
+    answer = owner.get(keys.sign_in_begin(), fields.pop("origin"), **fields)
+    with pytest.raises(PasskeyError):
+        keys.sign_in(answer)
+
+
+def test_a_signature_counts_once(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    answer = owner.get(keys.sign_in_begin(), ORIGIN)
+    keys.sign_in(answer)
+    with pytest.raises(PasskeyError, match="pendiente"):
+        keys.sign_in(answer)
+
+
+def test_a_failed_answer_spends_its_challenge(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    options = keys.sign_in_begin()
+    with pytest.raises(PasskeyError):
+        keys.sign_in(owner.get(options, "https://evil.example"))
+    with pytest.raises(PasskeyError, match="pendiente"):
+        keys.sign_in(owner.get(options, ORIGIN))
+
+
+def test_a_challenge_nobody_asked_for_or_too_old(
+    keys: Passkeys, owner: SoftAuthenticator, clock: Clock
+) -> None:
+    options = keys.sign_in_begin()
+    with pytest.raises(PasskeyError, match="pendiente"):
+        keys.sign_in(owner.get(options, ORIGIN, challenge="b3RybyByZXRv"))
+    clock.now += CHALLENGE_SECONDS
+    with pytest.raises(PasskeyError, match="pendiente"):
+        keys.sign_in(owner.get(options, ORIGIN))
+
+
+def test_a_key_that_is_not_kept_does_not_sign_in(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    with pytest.raises(PasskeyError, match="no está registrada"):
+        keys.sign_in(SoftAuthenticator().get(keys.sign_in_begin(), ORIGIN))
+
+
+def test_the_same_id_with_another_key_does_not_sign_in(
+    keys: Passkeys, owner: SoftAuthenticator
+) -> None:
+    thief = SoftAuthenticator()
+    thief.credential_id = owner.credential_id
+    with pytest.raises(PasskeyError, match="firma válida"):
+        keys.sign_in(thief.get(keys.sign_in_begin(), ORIGIN))
+
+
+def test_a_count_that_goes_back_is_a_copied_key(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    owner.count = 7
+    assert keys.sign_in(owner.get(keys.sign_in_begin(), ORIGIN)).sign_count == 7
+    assert keys.keys()[0].sign_count == 7
+    owner.count = 7
+    with pytest.raises(PasskeyError, match="firma válida"):
+        keys.sign_in(owner.get(keys.sign_in_begin(), ORIGIN))
+    assert keys.keys()[0].sign_count == 7
+
+
+def test_only_so_many_challenges_wait(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    first = keys.sign_in_begin()
+    for _ in range(MAX_SIGN_INS):
+        last = keys.sign_in_begin()
+    with pytest.raises(PasskeyError, match="pendiente"):
+        keys.sign_in(owner.get(first, ORIGIN))
+    assert keys.sign_in(owner.get(last, ORIGIN)).name == "portátil"
+
+
+def test_a_touch_belongs_to_its_session(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    options = keys.touch_begin(SESSION)
+    with pytest.raises(PasskeyError, match="toque"):
+        keys.touch("o" * 43, owner.get(options, ORIGIN))
+    options = keys.touch_begin(SESSION)
+    assert keys.touch(SESSION, owner.get(options, ORIGIN)).name == "portátil"
+    with pytest.raises(PasskeyError, match="toque"):
+        keys.touch(SESSION, owner.get(options, ORIGIN))
+
+
+def test_a_touchs_challenge_does_not_sign_in_nor_the_other_way(
+    keys: Passkeys, owner: SoftAuthenticator
+) -> None:
+    with pytest.raises(PasskeyError, match="pendiente"):
+        keys.sign_in(owner.get(keys.touch_begin(SESSION), ORIGIN))
+    keys.touch_begin(SESSION)
+    with pytest.raises(PasskeyError, match="firma válida"):
+        keys.touch(SESSION, owner.get(keys.sign_in_begin(), ORIGIN))
+
+
+def test_a_key_is_found_by_the_end_of_its_id(keys: Passkeys, owner: SoftAuthenticator) -> None:
+    key = keys.keys()[0]
+    assert matching(keys.keys(), key.tail) == [key] == matching(keys.keys(), key.id)
+    assert matching(keys.keys(), key.tail[1:]) == [] == matching(keys.keys(), "zzzz")

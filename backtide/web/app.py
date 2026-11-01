@@ -115,8 +115,13 @@ from backtide.web.security import (
     POST_PATH,
     SETTINGS_PATH,
     SETTINGS_POST_PATH,
+    SIGN_IN_KEY_BEGIN_PATH,
+    SIGN_IN_KEY_FINISH_PATH,
     SIGN_IN_PATH,
     SIGN_OUT_PATH,
+    TOUCH_BEGIN_PATH,
+    TOUCH_FINISH_PATH,
+    TOUCH_PATH,
     Access,
     Guard,
     LocalAccess,
@@ -176,6 +181,8 @@ SUMMARY_MAX = 20.0  # ...and at least this often, even when its box has not move
 PANEL_FEED = 40  # lines in the control room's feed when it loads
 REQUESTS_EVERY = 5.0  # how often the stream looks at the requests
 MAX_PASSWORD_CHARS = 256
+# Where the touch page goes back to: a word, never a path from the query.
+TOUCH_BACK = {"ajustes": SETTINGS_PATH, "peticiones": HOLDS_PATH, "llaves": KEYS_PATH}
 SIGN_IN_ERRORS = frozenset({"wrong", "slow_down", "locked", "unset", "refused", "form"})
 SESSION_RECHECK = 60.0  # how often an open stream asks whether its session still lives
 
@@ -362,6 +369,8 @@ def create_app(
             return Response("Formulario de otra sesión", status_code=403)
         if not token_matches(form["confirmo"], CLOSE_SESSIONS_WORD):
             return Response(f"Escribe {CLOSE_SESSIONS_WORD} para confirmar", status_code=400)
+        if await _touch_needed(request):
+            return _go_touch("ajustes")
         if await asyncio.to_thread(access.end, request.state.session.id, every=True) is not True:
             return Response("El servicio no ha cerrado las sesiones", status_code=503)
         return _signed_out()
@@ -404,6 +413,10 @@ def create_app(
             bad_link=bad_link,
             sign_in=base + SIGN_IN_PATH if getattr(access, "passwords", False) else None,
             sign_in_error=why,
+            here=request.headers.get("host", "").lower().split(":")[0] == PASSKEY_HOST,
+            origin=f"http://{PASSKEY_HOST}:{port}",
+            key_begin=base + SIGN_IN_KEY_BEGIN_PATH,
+            key_finish=base + SIGN_IN_KEY_FINISH_PATH,
         )
 
     @app.post(SIGN_IN_PATH)
@@ -429,6 +442,100 @@ def create_app(
         first = keys.get("ok") is True and not keys.get("keys")
         raise StartSession(session.id, target=base + (KEYS_PATH + "?nueva=1" if first else "/"))
 
+    # -- signing in with a passkey and touching it again (T26-3c) -----------------------------
+
+    @app.post(SIGN_IN_KEY_BEGIN_PATH)
+    async def sign_in_key_begin(request: Request) -> Response:
+        """The challenge to sign. No session yet: only our own page may ask (the Guard's Origin
+        checks), and the service has its own limits."""
+        if not getattr(access, "passwords", False):
+            return JSONResponse({"ok": False, "message": "Solo en la web instalada."}, 404)
+        if await _read_form(request, ()) is None:
+            return JSONResponse({"ok": False, "message": "Formulario no válido."}, status_code=400)
+        return _keys_reply(await asyncio.to_thread(access.auth, "auth_begin"))
+
+    @app.post(SIGN_IN_KEY_FINISH_PATH)
+    async def sign_in_key_finish(request: Request) -> Response:
+        """The signature: the service checks it and gives a new session, whose cookie goes out
+        with this answer (a fetch of our own page, so SameSite=Strict lets it in on the next
+        navigation)."""
+        if not getattr(access, "passwords", False):
+            return JSONResponse({"ok": False, "message": "Solo en la web instalada."}, 404)
+        form = await _read_form(
+            request,
+            ("answer",),
+            limits={"answer": MAX_ANSWER_CHARS},
+            max_bytes=MAX_LARGE_FORM_BYTES,
+        )
+        if form is None:
+            return JSONResponse({"ok": False, "message": "Formulario no válido."}, status_code=400)
+        inside = await _signed_in(request)
+        reply = await asyncio.to_thread(access.auth, "auth_finish", answer=form["answer"])
+        session = reply.get("session")
+        if reply.get("ok") is not True or not isinstance(session, str):
+            return JSONResponse({"ok": False, "message": str(reply.get("message", ""))}, 400)
+        if inside:  # as the link and the password do
+            await asyncio.to_thread(access.end, request.state.session.id)
+        response = JSONResponse({"ok": True, "target": base + "/"})
+        response.set_cookie(COOKIE_NAME, session, httponly=True, samesite="strict", path=base)
+        return response
+
+    async def _touch_needed(request: Request) -> bool:
+        """Does this session have to touch its key first? Only to send the person there before
+        they fill in a form: the service decides anyway, and says no if it was not done."""
+        if not getattr(access, "passwords", False):
+            return False
+        reply = await asyncio.to_thread(access.passkey, "touch_status", request.state.session.id)
+        return reply.get("needs") is True
+
+    def _go_touch(back: str) -> Response:
+        return RedirectResponse(f"{base}{TOUCH_PATH}?volver={back}", status_code=303)
+
+    @app.get(TOUCH_PATH, dependencies=protected)
+    async def touch_page(request: Request) -> Response:
+        t = Translator(_language(request)[0])
+        host = request.headers.get("host", "").lower()
+        back = TOUCH_BACK.get(request.query_params.get("volver", ""), "/")
+        return _page(
+            "touch.html",
+            request,
+            active="settings",
+            t=t,
+            here=host.split(":")[0] == PASSKEY_HOST,
+            origin=f"http://{PASSKEY_HOST}:{port}",
+            csrf=request.state.session.csrf,
+            begin=base + TOUCH_BEGIN_PATH,
+            finish=base + TOUCH_FINISH_PATH,
+            target=base + back,
+        )
+
+    @app.post(TOUCH_BEGIN_PATH, dependencies=[Depends(require_session)])
+    async def touch_begin(request: Request) -> Response:
+        form = await _read_form(request, ("csrf",))
+        if form is None or not _csrf_is(request, form["csrf"]):
+            return JSONResponse({"ok": False, "message": "Formulario no válido."}, status_code=403)
+        if not getattr(access, "passwords", False):
+            return JSONResponse({"ok": False, "message": "Solo en la web instalada."}, 404)
+        reply = await asyncio.to_thread(access.passkey, "touch_begin", request.state.session.id)
+        return _keys_reply(reply)
+
+    @app.post(TOUCH_FINISH_PATH, dependencies=[Depends(require_session)])
+    async def touch_finish(request: Request) -> Response:
+        form = await _read_form(
+            request,
+            ("csrf", "answer"),
+            limits={"answer": MAX_ANSWER_CHARS},
+            max_bytes=MAX_LARGE_FORM_BYTES,
+        )
+        if form is None or not _csrf_is(request, form["csrf"]):
+            return JSONResponse({"ok": False, "message": "Formulario no válido."}, status_code=403)
+        if not getattr(access, "passwords", False):
+            return JSONResponse({"ok": False, "message": "Solo en la web instalada."}, 404)
+        reply = await asyncio.to_thread(
+            access.passkey, "touch_finish", request.state.session.id, answer=form["answer"]
+        )
+        return _keys_reply(reply)
+
     # -- the passkeys (T26-3b-2) -------------------------------------------------------------
 
     @app.get(KEYS_PATH, dependencies=protected)
@@ -438,6 +545,10 @@ def create_app(
         listed: dict[str, Any] = {"ok": False, "keys": []}
         if getattr(access, "passwords", False):  # only the installed web's service keeps keys
             listed = await asyncio.to_thread(access.passkey, "passkey_list", session.id)
+        add = "ok"
+        if getattr(access, "passwords", False):
+            status = await asyncio.to_thread(access.passkey, "touch_status", session.id)
+            add = status["add"] if status.get("add") in ("ok", "touch", "again") else "ok"
         # A passkey belongs to backtide.localhost: on 127.0.0.1 the page says where to go instead
         # of offering a form that cannot work there.
         host = request.headers.get("host", "").lower()
@@ -451,6 +562,8 @@ def create_app(
             origin=f"http://{PASSKEY_HOST}:{port}",
             keys=listed.get("keys") if listed.get("ok") is True else [],
             first=request.query_params.get("nueva") == "1",
+            add=add,
+            touch=f"{base}{TOUCH_PATH}?volver=llaves",
             csrf=session.csrf,
             begin=base + KEYS_BEGIN_PATH,
             finish=base + KEYS_FINISH_PATH,
@@ -1460,6 +1573,9 @@ def create_app(
         if state is not Availability.READY or settings is None:
             form.clear()
             return _settings_refused(request, t, 503, f"settings.off.{state}")
+        if await _touch_needed(request):
+            form.clear()
+            return _go_touch("ajustes")
         client = settings
         value = form.pop("valor", "").strip()
         chat = form.pop("chat", None)
@@ -1653,6 +1769,8 @@ def create_app(
         state = await asyncio.to_thread(_approvals)
         if state is not Availability.READY or approver is None:
             return _hold_refused(request, t, 503, f"hold.off.{state}")
+        if verb == TRUST and await _touch_needed(request):
+            return _go_touch("peticiones")
         client = approver
 
         def run() -> tuple[str, dict[str, Any] | None]:
@@ -1905,13 +2023,22 @@ def create_app(
                 yield b": keepalive\n\n"
             await asyncio.sleep(poll_interval)
 
-    post_paths = (POST_PATH, SIGN_IN_PATH, SIGN_OUT_PATH, CLOSE_SESSIONS_PATH, KEYS_BEGIN_PATH)
+    post_paths = (
+        POST_PATH,
+        SIGN_IN_PATH,
+        SIGN_IN_KEY_BEGIN_PATH,
+        SIGN_OUT_PATH,
+        CLOSE_SESSIONS_PATH,
+        KEYS_BEGIN_PATH,
+        TOUCH_BEGIN_PATH,
+    )
+    large_post_paths = (KEYS_FINISH_PATH, SIGN_IN_KEY_FINISH_PATH, TOUCH_FINISH_PATH)
     if settings_on:
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:
         post_paths += (DECIDE_PATH,)
     return Guard(
-        app, port=port, prefix=prefix, post_paths=post_paths, large_post_paths=(KEYS_FINISH_PATH,)
+        app, port=port, prefix=prefix, post_paths=post_paths, large_post_paths=large_post_paths
     )
 
 

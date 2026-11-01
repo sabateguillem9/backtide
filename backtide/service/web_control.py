@@ -95,9 +95,20 @@ CHANGES = frozenset(
 SESSION_COMMANDS = frozenset(
     {"session_open", "session_password", "session_check", "session_end", "session_end_all"}
 )
-# The passkeys (T26-3b-2): each from a live session, which they carry.
-PASSKEY_COMMANDS = frozenset({"passkey_begin", "passkey_finish", "passkey_list"})
-COMMANDS = READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS
+# The passkeys (T26-3b-2, T26-3c): each from a live session, which they carry.
+PASSKEY_COMMANDS = frozenset(
+    {
+        "passkey_begin", "passkey_finish", "passkey_list",
+        "touch_status", "touch_begin", "touch_finish",
+    }
+)  # fmt: skip
+# Signing in with a passkey (T26-3c): nobody is signed in yet, and the service checks the signature.
+SIGN_IN_COMMANDS = frozenset({"auth_begin", "auth_finish"})
+COMMANDS = READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS | SIGN_IN_COMMANDS
+# What asks for the passkey touched a moment ago (docs/47 section 5.3), once there is one: it
+# outlasts the session or decides who hears the alerts. Closing every session and adding a key
+# too, in their own commands; creating agents (T26-6) and the terminal (T26-5d) will join.
+TOUCH_CHANGES = frozenset({"set_secret", "clear_secret", "trust"})
 # Every request: a burst of 120, then 20 a second (the panel's stream asks about once a second
 # per open tab). The changes: a burst of 10, then one every 3 s (a person clicks).
 REQUESTS_BURST, REQUESTS_PER_SECOND = 120, 20.0
@@ -113,11 +124,19 @@ ENDS_BURST, ENDS_PER_SECOND = 5, 1 / 6
 PASSWORDS_BURST, PASSWORDS_PER_SECOND = 10, 1.0
 # The passkeys: a person registers one now and then (T26-3b-2).
 KEYS_BURST, KEYS_PER_SECOND = 10, 1 / 3
+# Signing in with one (docs/47 section 5.2): about 10 answers a minute for the whole web, whoever
+# sends them, and its challenges apart, so that a stream of them leaves the answers alone.
+AUTH_ANSWERS_BURST, AUTH_ANSWERS_PER_SECOND = 10, 1 / 6
+AUTH_BEGINS_BURST, AUTH_BEGINS_PER_SECOND = 10, 1 / 3
 PASSKEY_KEYS = {
     "passkey_begin": {"cmd", "session"},
     "passkey_list": {"cmd", "session"},
     "passkey_finish": {"cmd", "session", "answer", "name"},
+    "touch_status": {"cmd", "session"},
+    "touch_begin": {"cmd", "session"},
+    "touch_finish": {"cmd", "session", "answer"},
 }
+SIGN_IN_KEYS = {"auth_begin": {"cmd"}, "auth_finish": {"cmd", "answer"}}
 PASSWORD_MESSAGES = {
     Verdict.WRONG: "Esa no es la contraseña.",
     Verdict.SLOW_DOWN: "Demasiados intentos seguidos: espera unos segundos.",
@@ -127,6 +146,8 @@ PASSWORD_MESSAGES = {
     "`sudo backtide enlace`.",
 }
 NO_SESSION = "Sin una sesión viva no se cambia nada: vuelve a entrar con `sudo backtide enlace`."
+NEEDS_TOUCH = "Esto pide volver a tocar tu llave: tócala en la web y prueba otra vez."
+FIRST_KEY_TOO_LATE = "La primera llave se registra nada más entrar: vuelve a entrar y regístrala."
 MAX_LISTED_SNAPSHOTS = 5000
 _FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID})
 _FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID})
@@ -185,6 +206,8 @@ class WebControlServer(ControlServer):
         ends: Bucket | None = None,
         passwords: Bucket | None = None,
         keys: Bucket | None = None,
+        auth_answers: Bucket | None = None,
+        auth_begins: Bucket | None = None,
         passkeys: Passkeys | None = None,
         on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
         password: Checker | None = None,
@@ -205,6 +228,7 @@ class WebControlServer(ControlServer):
             sessions=sessions,
             on_entry=on_entry,
             password=password,
+            passkeys=passkeys,
         )
         self.socket_group = group
         # The web's own uid, when it is an account (the installed ``backtide-web``): then the
@@ -219,7 +243,8 @@ class WebControlServer(ControlServer):
         self._ends = ends or Bucket(ENDS_BURST, ENDS_PER_SECOND)
         self._passwords = passwords or Bucket(PASSWORDS_BURST, PASSWORDS_PER_SECOND)
         self._keys = keys or Bucket(KEYS_BURST, KEYS_PER_SECOND)
-        self._passkeys = passkeys
+        self._auth_answers = auth_answers or Bucket(AUTH_ANSWERS_BURST, AUTH_ANSWERS_PER_SECOND)
+        self._auth_begins = auth_begins or Bucket(AUTH_BEGINS_BURST, AUTH_BEGINS_PER_SECOND)
 
     def refusal_for(self, pid: int, uid: int, gid: int) -> str | None:
         wrong_user = self._user is not None and uid not in (self._user, 0)
@@ -255,6 +280,8 @@ class WebControlServer(ControlServer):
             return self._session_command(command, request, pid)
         if command in PASSKEY_COMMANDS:
             return self._passkey_command(command, request, pid)
+        if command in SIGN_IN_COMMANDS:
+            return self._sign_in_command(command, request, pid)
         if not self._requests.take():
             logger.warning("web socket: too many requests, one from pid %d was refused", pid)
             raise _BadRequest("Demasiadas peticiones seguidas: espera un poco.")
@@ -269,7 +296,12 @@ class WebControlServer(ControlServer):
                     pid,
                 )
                 raise _BadRequest("Por aquí solo pide la web.")
-            self._signed_in(command, request, pid)
+            session = self._signed_in(command, request, pid)
+            if command in TOUCH_CHANGES and self._needs_touch(session.id):
+                logger.warning(
+                    "web socket: refused a %s without the passkey touched (pid %d)", command, pid
+                )
+                raise _BadRequest(NEEDS_TOUCH)
             if not self._changes.take():
                 logger.warning("web socket: too many changes, one from pid %d was refused", pid)
                 raise _BadRequest("Demasiados cambios seguidos: espera un poco.")
@@ -341,6 +373,12 @@ class WebControlServer(ControlServer):
         if self._sessions.check(given) is None:  # session_end_all, from a live one only
             logger.warning("web socket: refused to close every session without a live one")
             raise _BadRequest(NO_SESSION)
+        if self._needs_touch(given):
+            logger.warning(
+                "web socket: refused to close every session without the passkey touched (pid %d)",
+                pid,
+            )
+            raise _BadRequest(NEEDS_TOUCH)
         ended = self._sessions.end_all()
         logger.info("web socket: the web closed every session (%d) (pid %d)", ended, pid)
         if self._on_entry is not None:
@@ -362,10 +400,35 @@ class WebControlServer(ControlServer):
         if session is None:
             logger.warning("web socket: refused a %s without a live session (pid %d)", command, pid)
             raise _BadRequest(NO_SESSION)
+        if command in ("passkey_begin", "passkey_finish"):
+            refusal = self._add_refusal(session.id)
+            if refusal is not None:
+                logger.warning("web socket: refused a %s (pid %d): %s", command, pid, refusal)
+                return {"ok": False, "outcome": "refused", "message": refusal}
         try:
             if command == "passkey_list":
                 keys = [describe(key) for key in self._passkeys.keys()]
                 return {"ok": True, "outcome": "listed", "message": "", "keys": keys}
+            if command == "touch_status":
+                add = {None: "ok", NEEDS_TOUCH: "touch"}.get(self._add_refusal(session.id), "again")
+                return {"ok": True, "outcome": "status", "message": "", "add": add,
+                        "needs": self._needs_touch(session.id)}  # fmt: skip
+            if command == "touch_begin":
+                options = self._passkeys.touch_begin(session.id)
+                return {"ok": True, "outcome": "options", "message": "", "options": options}
+            if command == "touch_finish":
+                key = self._passkeys.touch(session.id, request["answer"])
+                # Recorded first: a touch opens five minutes of what lasts, and a web taken over
+                # can ask for it with the owner's own finger (docs/47 section 5.2).
+                if self._on_entry is None or not self._on_entry(
+                    "web_passkey_touched", {"pid": pid, "name": key.name, "tail": key.tail}
+                ):
+                    logger.error("web socket: a touch could not be recorded and does not count")
+                    return {"ok": False, "outcome": "refused",
+                            "message": "No se ha podido apuntar el toque: no cuenta."}  # fmt: skip
+                self._sessions.touch(session.id)
+                logger.info("web socket: a passkey was touched again (pid %d)", pid)
+                return {"ok": True, "outcome": "touched", "message": ""}
             if command == "passkey_begin":
                 options = self._passkeys.begin(session.id)
                 return {"ok": True, "outcome": "options", "message": "", "options": options}
@@ -395,6 +458,66 @@ class WebControlServer(ControlServer):
             return {"ok": False, "outcome": "refused", "message": str(error)}
         logger.info("web socket: a new passkey for the web (pid %d)", pid)
         return {"ok": True, "outcome": "added", "message": "", "key": describe(key)}
+
+    def _needs_touch(self, session_id: object) -> bool:
+        """Does this session have to touch a passkey first (docs/47 section 5.3)? Only once there
+        is one: through the tunnel the password is enough without any (D40). A file that cannot
+        be read may hold keys: yes, and the owner hears of it."""
+        if self._passkeys is None or self._sessions is None:
+            return False
+        try:
+            kept = self._passkeys.keys()
+        except PasskeyError as error:
+            logger.error("web socket: the passkeys cannot be read: %s", error)
+            return True
+        return bool(kept) and not self._sessions.recently_touched(session_id)
+
+    def _add_refusal(self, session_id: str) -> str | None:
+        """Why this session may not add a key, or None: with keys, it touches one; the first
+        one, right after entering (review of T26-3b-2: whoever adds a key stays inside, even
+        after "Cerrar todas" and a new password). Asked at both ends of a registration: two
+        sessions may have started before the first key was kept."""
+        if self._passkeys is None or self._sessions is None:
+            return "Este servicio no lleva llaves de la web."
+        try:
+            kept = self._passkeys.keys()
+        except PasskeyError as error:
+            return str(error)
+        if kept:
+            return None if self._sessions.recently_touched(session_id) else NEEDS_TOUCH
+        return None if self._sessions.recently_opened(session_id) else FIRST_KEY_TOO_LATE
+
+    def _sign_in_command(self, command: str, request: dict[str, Any], pid: int) -> dict[str, Any]:
+        """Signing in with a passkey (T26-3c): the service makes the challenge and checks the
+        signature, and a session only comes out of a right one, recorded first. Every refusal
+        is a WARNING: the log bridge records it and alerts."""
+        if set(request) != SIGN_IN_KEYS[command]:
+            raise _BadRequest("Esa orden de entrada no tiene la forma esperada.")
+        bucket = self._auth_begins if command == "auth_begin" else self._auth_answers
+        if not bucket.take():
+            logger.warning("web socket: too many %s, one from pid %d was refused", command, pid)
+            raise _BadRequest("Demasiados intentos seguidos: espera un poco.")
+        if self._passkeys is None or self._sessions is None:
+            raise _BadRequest("Este servicio no lleva llaves de la web.")
+        try:
+            if command == "auth_begin":
+                options = self._passkeys.sign_in_begin()
+                return {"ok": True, "outcome": "options", "message": "", "options": options}
+            key = self._passkeys.sign_in(request["answer"])
+        except PasskeyError as error:
+            logger.warning("web socket: a passkey did not sign in (pid %d): %s", pid, error)
+            return {"ok": False, "outcome": "refused", "message": str(error)}
+        session = self._sessions.start(touched=True)
+        if self._on_entry is None or not self._on_entry(
+            "web_session_opened", {"pid": pid, "via": "passkey", "name": key.name, "tail": key.tail}
+        ):
+            self._sessions.end(session.id)
+            logger.error("web socket: a web session could not be recorded and was refused")
+            return {"ok": False, "outcome": "refused",
+                    "message": "No se ha podido apuntar la entrada: no se entra."}  # fmt: skip
+        logger.info("web socket: a passkey signed in, a new web session (pid %d)", pid)
+        return {"ok": True, "outcome": "opened", "message": "",
+                "session": session.id, "csrf": session.csrf}  # fmt: skip
 
     def _password(self, given: object, pid: int) -> dict[str, Any]:
         """The web's password (T26-3b-1): the service checks it (a scrypt hash, a bucket for the
@@ -664,6 +787,25 @@ def ask_passkey(
                         sleep=sleep, monotonic=monotonic)  # fmt: skip
 
 
+def ask_auth(
+    path: Path,
+    command: str,
+    *,
+    server_uid: int = 0,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    **fields: str,
+) -> dict[str, Any]:
+    """Signing in with a passkey (T26-3c): the service's reply, checked to be a dict with ``ok``.
+    ValueError for a command that is not one (nothing sent)."""
+    if command not in SIGN_IN_COMMANDS:
+        raise ValueError("not a sign-in command")
+    return _ask_session(path, {"cmd": command, **fields}, server_uid=server_uid, wait=wait,
+                        peer=peer, sleep=sleep, monotonic=monotonic)  # fmt: skip
+
+
 def web_group_problem(gid: int) -> str | None:
     """Why ``gid`` cannot be the web's group, or None (for `backtide vigilar --grupo-web`)."""
     if gid in _FORBIDDEN_GIDS:
@@ -677,8 +819,11 @@ __all__ = [
     "READS",
     "PASSKEY_COMMANDS",
     "SESSION_COMMANDS",
+    "SIGN_IN_COMMANDS",
+    "TOUCH_CHANGES",
     "Bucket",
     "WebControlServer",
+    "ask_auth",
     "ask_passkey",
     "ask_session_check",
     "ask_session_end",
