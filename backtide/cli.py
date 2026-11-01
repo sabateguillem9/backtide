@@ -36,6 +36,7 @@ from backtide.service.gasto import spending
 from backtide.service.guardian import BOOT_STOP_FAILED_NOTE
 from backtide.service.notice import ago, rewind_notice
 from backtide.service.offline import rewind_without_service
+from backtide.service.origin import SCHEME
 from backtide.service.retenidas import decide as decide_hold
 from backtide.service.retenidas import listing as list_holds
 from backtide.service.runner import ServiceLocked, ServiceRunning, serve, take_lock
@@ -1398,9 +1399,15 @@ def _web(args: argparse.Namespace) -> int:
         # The file holds the address without a way in; the service gives the token (T26-3a).
         _error("--enlace-en va con --socket-web: el enlace lo da el servicio")
         return EXIT_ERROR
+    origin = paths.public_origin
+    if origin is not None and web_socket is None:
+        # Through a domain the way in is a passkey, and only the service keeps those (D40).
+        _error("[web] public_origin va con --socket-web: las llaves las guarda el servicio")
+        return EXIT_ERROR
     control, server_uid = paths.control_socket, None
     if web_socket is not None:
         control, server_uid = web_socket, SERVICE_UID
+    where = "solo en este ordenador" if origin is None else f"detrás de {origin.url}"
 
     def announce(url: str, run_name: str) -> None:
         if args.link_file is not None:
@@ -1409,13 +1416,13 @@ def _web(args: argparse.Namespace) -> int:
             except OSError as error:
                 raise LinkFileError(args.link_file, error) from None
             print(
-                f"Puesto de vigilancia listo, solo en este ordenador. Ejecución: {run_name}. "
+                f"Puesto de vigilancia listo, {where}. Ejecución: {run_name}. "
                 "Para entrar, `sudo backtide enlace` da un enlace de un solo uso.",
                 flush=True,
             )
         elif web_socket is not None:
             print(
-                f"Puesto de vigilancia listo, solo en este ordenador: {url}\n"
+                f"Puesto de vigilancia listo, {where}: {url}\n"
                 f"Nombre de esta ejecución: {run_name}\n"
                 "Para entrar, `sudo backtide enlace` da un enlace de un solo uso.",
                 flush=True,
@@ -1449,6 +1456,7 @@ def _web(args: argparse.Namespace) -> int:
             can_set=args.ajustes,
             can_approve=args.aprobar,
             **({} if web_socket is None else {"web_socket": web_socket}),
+            **({} if origin is None else {"public_origin": origin}),
         )
     except LinkFileError as error:
         _error(str(error))
@@ -1649,23 +1657,46 @@ def _link(args: argparse.Namespace) -> int:
         len(data) > LINK_MAX_BYTES
         or len(lines) != 2
         or stat.S_IMODE(info.st_mode) & 0o077
-        or web_url_problem(lines[0], base=True) is not None
+        or (web_url_problem(lines[0], base=True) is not None and not lines[0].startswith(SCHEME))
     ):
         _error(f"{path} no es el archivo del enlace de la web: no se enseña.")
         return EXIT_FAILED
     try:
-        # Only where the control socket is: no key or token of the service is read for this.
-        control = WebPaths.from_file(args.config).control_socket
+        # Only what is needed: no key or token of the service is read for this.
+        paths = WebPaths.from_file(args.config)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return EXIT_ERROR
+    # Behind a domain the address is root's own configuration, never the file's words: the file is
+    # the web's, and a web taken over must not choose where root's one-time link goes (T26-4a).
+    origin = paths.public_origin
+    if (origin.link_base if origin is not None else None) != (
+        lines[0] if lines[0].startswith(SCHEME) else None
+    ):
+        _error(
+            f"la web y `[web] public_origin` de {args.config} no dicen lo mismo: pon lo mismo en "
+            f"{layout.CONFIG_FILE} y {layout.WEB_CONFIG_FILE}, y reinicia {layout.SERVICE_UNIT} y "
+            f"{layout.WEB_UNIT}."
+        )
+        return EXIT_FAILED
     try:
         # A new one-time link from the service (T26-3a): the web cannot make its own.
-        token = ask_web_link(control)
+        token = ask_web_link(paths.control_socket)
     except ControlError as error:
         _error(f"el servicio no ha dado el enlace: {error}")
         return EXIT_FAILED
     url, run_name = f"{lines[0]}?t={token}", _printable(lines[1])
+    if origin is not None:
+        print(f"Puesto de vigilancia, en su dominio:\n\n  {origin.link_base}?t={token}\n")
+        print(
+            f"Nombre de esta ejecución: {run_name} (debe salir igual en la cabecera de la "
+            "página).\n"
+            "El enlace vale una sola vez y durante 15 minutos; para otro, `sudo backtide enlace` "
+            "de nuevo (el anterior sin usar deja de valer).\n"
+            "Es para registrar tu primera llave: en cuanto hay una, por el dominio se entra con "
+            "ella (D40) y el enlace deja de valer."
+        )
+        return EXIT_OK
     port = url.split(":")[2].split("/")[0]
     # backtide.localhost (T26-3b-2): a passkey needs a name, not an address; the browser keeps
     # every *.localhost on its own machine, so through the tunnel it is the same web.

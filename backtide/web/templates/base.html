@@ -63,7 +63,7 @@
 {% endif %}
 {% block main %}{% endblock %}
 <footer class="foot">
-  <span>{{ t('app.local') }}</span>
+  <span>{{ public_host or t('app.local') }}</span>
   <span class="prefs">
   <button class="theme-switch" type="button" hidden data-dark="{{ t('theme.dark') }}" data-light="{{ t('theme.light') }}">{{ t('theme.dark') }}</button>
   <span class="langs" role="group" aria-label="{{ t('lang.label') }}">

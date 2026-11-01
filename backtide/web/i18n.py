@@ -543,6 +543,14 @@ ES: dict[str, str] = {
     "cerrada un rato. Para entrar ya, `sudo backtide enlace` en el servidor.",
     "auth.err.unset": "Aún no hay contraseña: ponla con `sudo backtide contraseña`, o entra con "
     "`sudo backtide enlace`.",
+    "auth.body.domain": "Entra con tu llave. Si aún no tienes ninguna aquí: `sudo backtide "
+    "enlace` en el servidor. Si las has perdido: primero `sudo backtide llaves --quitar`.",
+    "auth.bad.domain": "Ese enlace ya se usó o ya no vale: con una llave registrada, por aquí se "
+    "entra con ella. Si no hay ninguna: `sudo backtide enlace` en el servidor.",
+    "auth.err.busy": "Ahora mismo no se puede comprobar tu sesión: hay demasiadas peticiones. "
+    "Vuelve a probar en unos segundos.",
+    "keys.unsupported.domain": "Este navegador no puede crear passkeys aquí. Prueba con Chrome, "
+    "Edge, Firefox o Safari.",
     "auth.err.refused": "Ahora no se puede comprobar: prueba otra vez en un momento.",
     "auth.err.form": "Eso no se ha podido leer: escribe la contraseña otra vez.",
     "notfound.title": "Aquí no hay nada",
@@ -1354,6 +1362,14 @@ EN: dict[str, str] = {
     "while. To get in now, `sudo backtide enlace` on the server.",
     "auth.err.unset": "There is no password yet: set it with `sudo backtide contraseña`, or get "
     "in with `sudo backtide enlace`.",
+    "auth.body.domain": "Sign in with your key. If you have none here yet: `sudo backtide enlace` "
+    "on the server. If you lost them: first `sudo backtide llaves --quitar`.",
+    "auth.bad.domain": "That link was already used or no longer works: with a key registered, you "
+    "sign in here with it. If there is none: `sudo backtide enlace` on the server.",
+    "auth.err.busy": "Your session cannot be checked right now: there are too many requests. Try "
+    "again in a few seconds.",
+    "keys.unsupported.domain": "This browser cannot create passkeys here. Try Chrome, Edge, "
+    "Firefox or Safari.",
     "auth.err.refused": "It cannot be checked right now: try again in a moment.",
     "auth.err.form": "That could not be read: type the password again.",
     "notfound.title": "Nothing here",

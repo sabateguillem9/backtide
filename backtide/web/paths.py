@@ -9,7 +9,8 @@ owner the web's own user or root: an installed web, as ``backtide-web``, reads r
 ``state_dir`` and ``volume`` and nothing else: no token, no key, no checkpoint. Everything else
 in the file is ignored, so the service's own configuration works as it is. The control socket is
 only ever connected to (``backtide.web.rewind``), never opened as a file. From ``[agent]`` it
-takes only the profile's lines of the rewind notice (T17a-3): no secret lives there.
+takes only the profile's lines of the rewind notice (T17a-3), and from ``[web]`` only the domain
+it is behind, ``public_origin`` (T26-4a): no secret lives there.
 """
 
 import tomllib
@@ -26,7 +27,9 @@ from backtide.service.config import (
     _decode,
     _read_file,
     agent_profile_of,
+    public_origin_of,
 )
+from backtide.service.origin import PublicOrigin
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,8 @@ class WebPaths:
     control_socket: Path
     # The agent profile's lines of the rewind notice (backtide/service/notice.py).
     agent_lines: tuple[str, ...] = DEFAULT_PROFILE.rewind_notice_lines
+    # The domain the web is behind, if any (T26-4a): `[web] public_origin`, the installer's copy.
+    public_origin: PublicOrigin | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> "WebPaths":
@@ -60,4 +65,5 @@ class WebPaths:
             volume=volume,
             control_socket=state_dir / STATE_SOCKET,
             agent_lines=profile.rewind_notice_lines,
+            public_origin=public_origin_of(data.get("web", {})),
         )

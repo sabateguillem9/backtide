@@ -397,6 +397,35 @@ session_lifetime_seconds = 120  # at most 43200, and not under the idle time
 
 The service reads it when it starts (`sudo systemctl restart backtide`); a restart also signs everyone out.
 
+### `[web] public_origin`: the web on a domain
+
+By default you reach the web through an SSH tunnel or a private network, and that is what we recommend. If you want it on a domain, put a reverse proxy of your own in front of it, with HTTPS, on a **subdomain of its own**. Under a path of another site it would share that site's origin, so a flaw there would reach your session: backtide refuses a path.
+
+The web still listens only on `127.0.0.1` and `[::1]`, and your proxy is what reaches it. Put the same line in both `/etc/backtide/backtide.toml` and `/etc/backtide/web.toml` (the web cannot read the first; installing again copies it to the second):
+
+```toml
+[web]
+public_origin = "https://backtide.example.org"   # https, a name and perhaps a port
+```
+
+Then `sudo systemctl restart backtide backtide-web`. Anything other than `https`, a name with a dot and perhaps a port (a path, credentials, an address, a `*.localhost`) and the service and the web refuse to start, and say why. With this set:
+
+- **Only that `Host` and that `Origin` are answered.** `127.0.0.1` and `backtide.localhost` are refused too, so **the SSH tunnel stops working** while it is set. To go back, remove the line from both files and restart.
+- **The way in is a passkey.** There is no password form, and the service checks no password. A passkey belongs to one name: those of `backtide.localhost` stay in their own file and work again if you remove the domain, and you register new ones for the domain. Each name's keys are in `/var/lib/backtide/web-auth/`; `sudo backtide llaves` shows the current name's.
+- **The first key comes from `sudo backtide enlace`**, which then prints a link on your domain. Once there is a key, the link stops working there, even one already given. If you lost your keys: over SSH, `sudo backtide llaves --quitar <id>`, then `sudo backtide enlace`.
+- **Until there is a key**, a session can register one and look, but not change what outlasts it (provider keys, Telegram, "approve and trust").
+- The web lives at the root of the domain, and its cookie is `__Host-backtide_web`.
+
+**What your proxy has to do:**
+
+- Pass `Host` as the browser sent it (Caddy does by default; in nginx, `proxy_set_header Host $host;`). Otherwise every request gets a 400.
+- Answer only for this name, and redirect port 80 to HTTPS with HSTS.
+- Cap requests per address on `/entrar/llave/`. backtide's own caps are for the whole web, because it does not believe `X-Forwarded-For`: anyone can empty them with a stream of requests, and for that while **you cannot sign in with your key from the internet** (SSH and Telegram still work).
+- Set timeouts and buffer request bodies, so that slow connections do not hold the web's 64 slots.
+- Not log the query string of `/`: the one-time link's token travels in it.
+
+An answer of 503 from the web means it could not check a session just then (too many requests); it does not mean you are signed out.
+
 ### The Settings page
 
 Open it from the web's navigation ("Settings", or "Ajustes" in Spanish; the page language follows your browser, or add `?lang=en`). Start the web with `--ajustes` to change anything. It has one row for each of these:

@@ -872,6 +872,15 @@ class _StopPipe:
         os.close(self._read)
 
 
+def web_passkeys_of(config: ServiceConfig) -> Passkeys:
+    """The web's passkeys: for its domain if it is behind one (T26-4a), else for the tunnel's
+    name, ``backtide.localhost``."""
+    origin = config.web_public_origin()
+    if origin is None:
+        return Passkeys(config.state_dir, origins=[origin_for(WEB_PORT)])
+    return Passkeys(config.state_dir, origins=[origin.url], rp_id=origin.name)
+
+
 def serve(
     config: ServiceConfig,
     *,
@@ -944,11 +953,10 @@ def serve(
         # The web's password (T26-3b-1): checked by the narrow socket, set by root's.
         web_password = Checker(config.state_dir) if web_group is not None else None
         # Its passkeys (T26-3b-2): registered from a session, for the web's own origin.
-        web_passkeys = (
-            Passkeys(config.state_dir, origins=[origin_for(WEB_PORT)])
-            if web_group is not None
-            else None
-        )
+        web_passkeys = web_passkeys_of(config) if web_group is not None else None
+        # Behind a domain the password stops at the service too (D40, T26-4a): the narrow socket
+        # does not check any, so a web taken over cannot try them. Root can still set it.
+        web_checks = None if config.web_public_origin() is not None else web_password
         control: ControlHook = ControlServer(
             guardian,
             config.control_socket,
@@ -975,7 +983,7 @@ def serve(
                     waiting=egress.waiting,
                     sessions=web_sessions,
                     on_entry=guardian.web_access,
-                    password=web_password,
+                    password=web_checks,
                     passkeys=web_passkeys,
                 ),
             )

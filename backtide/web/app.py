@@ -51,6 +51,7 @@ from backtide.gate.phrase import api_name
 from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
 from backtide.service.notice import rewind_notice
+from backtide.service.origin import PublicOrigin
 from backtide.service.passkeys import MAX_ANSWER_CHARS
 from backtide.service.sessions import Sessions
 from backtide.snapshots import Snapshot, SnapshotError
@@ -102,7 +103,6 @@ from backtide.web.security import (
     ACTING_SESSION,
     CLOSE_SESSIONS_PATH,
     CLOSE_SESSIONS_WORD,
-    COOKIE_NAME,
     DECIDE_PATH,
     HOLDS_PATH,
     KEY_REMOVE_PATH,
@@ -127,9 +127,11 @@ from backtide.web.security import (
     Access,
     Guard,
     LocalAccess,
+    SessionsBusy,
     make_prefix,
     make_run_name,
     make_token,
+    session_cookie_name,
     token_matches,
 )
 from backtide.web.settings import (
@@ -194,6 +196,7 @@ MAX_KEY_ID_CHARS = 1400  # 1023 bytes, the most a credential id can be, in base6
 KEY_REMOVE_ACTION, KEY_RENAME_ACTION = "remove", "rename"  # what a confirmation's ticket is for
 SIGN_IN_ERRORS = frozenset({"wrong", "slow_down", "locked", "unset", "refused", "form"})
 SESSION_RECHECK = 60.0  # how often an open stream asks whether its session still lives
+BUSY_RETRY_SECONDS = 5  # a 503 past the service's cap: its bucket comes back in moments
 
 
 class Unauthorized(Exception):  # noqa: N818 - an HTTP outcome, not an error
@@ -233,6 +236,7 @@ def create_app(
     tz: tzinfo | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     agent_lines: Sequence[str] = DEFAULT_PROFILE.rewind_notice_lines,
+    origin: PublicOrigin | None = None,
 ) -> Guard:
     """The ASGI app for one run, wrapped in its ``Guard``. ``token`` is the link's one-time
     token, ``session`` the secret of the cookie it is exchanged for, ``prefix`` the random path
@@ -252,15 +256,20 @@ def create_app(
     ones (from the service with `backtide web --aprobar`, else from the black box), and the
     POST that decides exists only when it is enabled. ``spend`` reads the spending (T11) for the
     panel and Settings; changing the caps goes through ``settings`` (`--ajustes`).
-    ``agent_lines`` are the agent profile's lines of the rewind notice (T17a-3)."""
+    ``agent_lines`` are the agent profile's lines of the rewind notice (T17a-3). ``origin`` is the
+    domain it is behind, if any (T26-4a, ``backtide.web.security``): the app lives at its root,
+    the cookie is the ``__Host-`` one, and there is no way in with the password (D40)."""
+    cookie_name = session_cookie_name(origin)
     if access is None:
         sessions = Sessions()
         sessions.new_link(token or make_token())
         if session is not None:
             sessions.preset(session)  # the demo and the tests set the cookie themselves
-        access = LocalAccess(sessions)
+        access = LocalAccess(sessions, cookie_name=cookie_name)
     prefix = prefix or make_prefix()
-    base = f"/s/{prefix}"
+    base = "" if origin is not None else f"/s/{prefix}"
+    cookie_path = base or "/"
+    passkey_origin = origin.url if origin is not None else f"http://{PASSKEY_HOST}:{port}"
     roster = Roster(AgentSource(MAIN_SLUG, agent_name, reader, snapshots), others, base)
     run_name = run_name or make_run_name()
     zone = tz if tz is not None else fmt.local_tz()
@@ -305,21 +314,41 @@ def create_app(
         ACTING_SESSION.set(session.id)
         return True
 
+    async def _signed_in_if_known(request: Request) -> bool:
+        """For a new way in: an old cookie the service would not look at right now (T26-4a) must
+        not stand in the way of the link, the password or the key. It dies at its own hour."""
+        try:
+            return await _signed_in(request)
+        except SessionsBusy:
+            return False
+
+    async def _first_key_page(session_id: str) -> str | None:
+        """Where to go after entering with no key yet: to register one (D40). None with keys."""
+        keys = await asyncio.to_thread(access.passkey, "passkey_list", session_id)
+        return (
+            f"{base}{KEYS_PATH}?nueva=1"
+            if keys.get("ok") is True and not keys.get("keys")
+            else None
+        )
+
     async def require_access(request: Request) -> None:
-        inside = await _signed_in(request)
         given = request.query_params.get("t")
-        if given is not None:
-            # One use, even in a browser that is already in (review of T26-3a): a link meant for
-            # the phone, opened here, is spent here and does not stay alive in the history.
-            opened = await asyncio.to_thread(access.open, given)
-            if opened is not None:
-                if inside:
-                    await asyncio.to_thread(access.end, request.state.session.id)
-                raise StartSession(opened.id)
-            if not inside:
-                raise Unauthorized(bad_link=True)
+        if given is None:
+            if not await _signed_in(request):
+                raise Unauthorized
+            return
+        inside = await _signed_in_if_known(request)
+        # One use, even in a browser that is already in (review of T26-3a): a link meant for
+        # the phone, opened here, is spent here and does not stay alive in the history.
+        opened = await asyncio.to_thread(access.open, given)
+        if opened is not None:
+            if inside:
+                await asyncio.to_thread(access.end, request.state.session.id)
+            # Behind a domain the link is there for the first key: straight to it.
+            first = None if origin is None else await _first_key_page(opened.id)
+            raise StartSession(opened.id, target=first)
         if not inside:
-            raise Unauthorized
+            raise Unauthorized(bad_link=True)
 
     async def require_watching(request: Request) -> None:
         """A page's own stream: the cookie, checked without counting as a use, because the
@@ -341,12 +370,29 @@ def create_app(
     def _csrf_is(request: Request, given: str | None) -> bool:
         return token_matches(given, request.state.session.csrf)
 
-    # -- signing out (T26-3a-2) -----------------------------------------------------------
+    # -- the cookie, and signing out (T26-3a-2) --------------------------------------------
+
+    def _with_cookie(response: Response, session_id: str) -> Response:
+        response.set_cookie(
+            cookie_name,
+            session_id,
+            httponly=True,
+            samesite="strict",
+            path=cookie_path,
+            secure=origin is not None,
+        )
+        return response
 
     def _signed_out() -> Response:
         """Back to the start, without the cookie: the next page asks for a link."""
         response = Response(status_code=303, headers={"location": base + "/"})
-        response.delete_cookie(COOKIE_NAME, path=base, httponly=True, samesite="strict")
+        response.delete_cookie(
+            cookie_name,
+            path=cookie_path,
+            httponly=True,
+            samesite="strict",
+            secure=origin is not None,
+        )
         return response
 
     @app.post(SIGN_OUT_PATH, dependencies=[Depends(require_session)])
@@ -399,15 +445,20 @@ def create_app(
         response = _page("enter.html", request, active="", t=None, target=target)
         # The cookie belongs to our prefix: other services on 127.0.0.1 (cookies ignore ports)
         # see it only if they are asked for a path under it, which they cannot guess.
-        response.set_cookie(
-            COOKIE_NAME, started.session, httponly=True, samesite="strict", path=base
-        )
-        return response
+        return _with_cookie(response, started.session)
 
     @app.exception_handler(Unauthorized)
     async def _unauthorized(request: Request, error: Unauthorized) -> Response:
         t = Translator(_language(request)[0])
         return _denied(request, t, 401, bad_link=error.bad_link)
+
+    @app.exception_handler(SessionsBusy)
+    async def _busy(request: Request, error: SessionsBusy) -> Response:
+        """Not "you are out": nobody knows yet (T26-4a). With the way in, for whoever holds an old
+        cookie while somebody floods the web with made-up ones."""
+        response = _denied(request, Translator(_language(request)[0]), 503, why="busy")
+        response.headers["retry-after"] = str(BUSY_RETRY_SECONDS)
+        return response
 
     def _denied(
         request: Request, t: Translator, status: int, *, bad_link: bool = False, why: str = ""
@@ -420,15 +471,23 @@ def create_app(
             active="",
             t=t,
             bad_link=bad_link,
-            sign_in=base + SIGN_IN_PATH if getattr(access, "passwords", False) else None,
+            key_only=origin is not None,
+            sign_in=base + SIGN_IN_PATH
+            if origin is None and getattr(access, "passwords", False)
+            else None,
             sign_in_error=why,
-            here=request.headers.get("host", "").lower().split(":")[0] == PASSKEY_HOST,
-            origin=f"http://{PASSKEY_HOST}:{port}",
+            here=_at_the_keys_name(request),
+            origin=passkey_origin,
             key_begin=base + SIGN_IN_KEY_BEGIN_PATH,
             key_finish=base + SIGN_IN_KEY_FINISH_PATH,
         )
 
-    @app.post(SIGN_IN_PATH)
+    def _at_the_keys_name(request: Request) -> bool:
+        """Was this page opened by the name its passkeys belong to? Behind a domain there is no
+        other (the Guard); through the tunnel, 127.0.0.1 is one too and cannot have them."""
+        host = request.headers.get("host", "").lower()
+        return origin is not None or host.split(":")[0] == PASSKEY_HOST
+
     async def sign_in(request: Request) -> Response:
         """The web's password: the service checks it and gives a new session. Never logged,
         never kept here; only our own page may send it (the Guard's Origin checks)."""
@@ -438,7 +497,7 @@ def create_app(
         form = await _read_form(request, ("password",), limits={"password": MAX_PASSWORD_CHARS})
         if form is None:
             return _denied(request, t, 400, why="form")
-        inside = await _signed_in(request)
+        inside = await _signed_in_if_known(request)
         session, why = await asyncio.to_thread(access.sign_in, form.pop("password"))
         del form
         if session is None:
@@ -447,9 +506,10 @@ def create_app(
         if inside:  # as the link does: the session this browser had ends, the new one begins
             await asyncio.to_thread(access.end, request.state.session.id)
         # D40: after the first entry, the web asks for a passkey (T26-3b-2).
-        keys = await asyncio.to_thread(access.passkey, "passkey_list", session.id)
-        first = keys.get("ok") is True and not keys.get("keys")
-        raise StartSession(session.id, target=base + (KEYS_PATH + "?nueva=1" if first else "/"))
+        raise StartSession(session.id, target=await _first_key_page(session.id) or base + "/")
+
+    if origin is None:  # behind a domain it takes a passkey: this path does not exist (D40)
+        app.post(SIGN_IN_PATH)(sign_in)
 
     # -- signing in with a passkey and touching it again (T26-3c) -----------------------------
 
@@ -478,16 +538,14 @@ def create_app(
         )
         if form is None:
             return JSONResponse({"ok": False, "message": "Formulario no válido."}, status_code=400)
-        inside = await _signed_in(request)
+        inside = await _signed_in_if_known(request)
         reply = await asyncio.to_thread(access.auth, "auth_finish", answer=form["answer"])
         session = reply.get("session")
         if reply.get("ok") is not True or not isinstance(session, str):
             return JSONResponse({"ok": False, "message": str(reply.get("message", ""))}, 400)
         if inside:  # as the link and the password do
             await asyncio.to_thread(access.end, request.state.session.id)
-        response = JSONResponse({"ok": True, "target": base + "/"})
-        response.set_cookie(COOKIE_NAME, session, httponly=True, samesite="strict", path=base)
-        return response
+        return _with_cookie(JSONResponse({"ok": True, "target": base + "/"}), session)
 
     async def _touch_needed(request: Request) -> bool:
         """Does this session have to touch its key first? Only to send the person there before
@@ -503,15 +561,14 @@ def create_app(
     @app.get(TOUCH_PATH, dependencies=protected)
     async def touch_page(request: Request) -> Response:
         t = Translator(_language(request)[0])
-        host = request.headers.get("host", "").lower()
         back = TOUCH_BACK.get(request.query_params.get("volver", ""), "/")
         return _page(
             "touch.html",
             request,
             active="settings",
             t=t,
-            here=host.split(":")[0] == PASSKEY_HOST,
-            origin=f"http://{PASSKEY_HOST}:{port}",
+            here=_at_the_keys_name(request),
+            origin=passkey_origin,
             csrf=request.state.session.csrf,
             begin=base + TOUCH_BEGIN_PATH,
             finish=base + TOUCH_FINISH_PATH,
@@ -560,7 +617,6 @@ def create_app(
             add = status["add"] if status.get("add") in ("ok", "touch", "again") else "ok"
         # A passkey belongs to backtide.localhost: on 127.0.0.1 the page says where to go instead
         # of offering a form that cannot work there.
-        host = request.headers.get("host", "").lower()
         first = request.query_params.get("nueva") == "1"
         return _page(
             "keys.html",
@@ -568,8 +624,9 @@ def create_app(
             active="settings",
             t=t,
             installed=getattr(access, "passwords", False),
-            here=host.split(":")[0] == PASSKEY_HOST,
-            origin=f"http://{PASSKEY_HOST}:{port}",
+            key_only=origin is not None,
+            here=_at_the_keys_name(request),
+            origin=passkey_origin,
             keys=listed.get("keys") if listed.get("ok") is True else [],
             first=first,
             add=add,
@@ -863,6 +920,7 @@ def create_app(
         context = {
             **_helpers(t, now, agent),
             "active": active,
+            "public_host": origin.host if origin is not None else None,
             "lang": t.language,
             "switch": switch,
             "languages": LANGUAGES,
@@ -880,7 +938,12 @@ def create_app(
         response = HTMLResponse(env.get_template(template).render(**context), status_code=status)
         if remember:
             response.set_cookie(
-                LANG_COOKIE, t.language, httponly=True, samesite="strict", path=base
+                LANG_COOKIE,
+                t.language,
+                httponly=True,
+                samesite="strict",
+                path=cookie_path,
+                secure=origin is not None,
             )
         return response
 
@@ -1975,7 +2038,10 @@ def create_app(
                 return True
             last[0] = now
             cookie = request.headers.get("cookie")
-            return await asyncio.to_thread(access.session_of, cookie, use=False) is not None
+            try:
+                return await asyncio.to_thread(access.session_of, cookie, use=False) is not None
+            except SessionsBusy:  # not known now: it ends here, and the browser asks again
+                return False
 
         return alive
 
@@ -2173,7 +2239,7 @@ def create_app(
 
     post_paths = (
         POST_PATH,
-        SIGN_IN_PATH,
+        *(() if origin is not None else (SIGN_IN_PATH,)),
         SIGN_IN_KEY_BEGIN_PATH,
         SIGN_OUT_PATH,
         CLOSE_SESSIONS_PATH,
@@ -2192,7 +2258,12 @@ def create_app(
     if approvals_on:
         post_paths += (DECIDE_PATH,)
     return Guard(
-        app, port=port, prefix=prefix, post_paths=post_paths, large_post_paths=large_post_paths
+        app,
+        port=port,
+        prefix=prefix,
+        post_paths=post_paths,
+        large_post_paths=large_post_paths,
+        origin=origin,
     )
 
 

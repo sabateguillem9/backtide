@@ -44,7 +44,8 @@ integrity.
 
 The socket is bound HERE, to the loopback address and nothing else, and handed to uvicorn: there
 is no setting that could make it listen on a network interface, and with ``--port 0`` we learn
-the real port before the app is built (its ``Host`` check needs it).
+the real port before the app is built (its ``Host`` check needs it). Behind a domain
+(``public_origin``, T26-4a) too: the server's reverse proxy is what reaches it, here.
 """
 
 import errno
@@ -58,6 +59,7 @@ from types import FrameType
 import uvicorn
 
 from backtide.service.control import ControlError
+from backtide.service.origin import PublicOrigin
 from backtide.service.web_control import ask_snapshots
 from backtide.snapshots import Snapshot, SnapshotError, SnapshotStore
 from backtide.web.agents import AgentSource, PendingRequest
@@ -66,7 +68,13 @@ from backtide.web.approve import Approver, ControlApprover
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import WAIT_FOR_SERVICE, ControlRewinder
-from backtide.web.security import ServiceAccess, make_prefix, make_run_name, make_token
+from backtide.web.security import (
+    ServiceAccess,
+    make_prefix,
+    make_run_name,
+    make_token,
+    session_cookie_name,
+)
 from backtide.web.settings import ControlSettings, ControlSpend, SettingsClient
 
 # The installed service runs as root: the narrow socket and the process behind it must be root's.
@@ -214,6 +222,7 @@ def run_web(
     others: Sequence[AgentSource] = (),
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
     web_socket: Path | None = None,
+    public_origin: PublicOrigin | None = None,
 ) -> None:
     """Serve the web of ``paths`` on 127.0.0.1:``port`` until the process is stopped.
     ``announce`` gets the link with the token (printed once, never logged) and the name of
@@ -231,7 +240,11 @@ def run_web(
     ``web_socket`` is `--socket-web` (T12c): the service's narrow socket for the web's group,
     asked instead of the control socket for everything, the snapshot list included, and the
     sign-in (T26-3a): then the service keeps the sessions, and ``announce`` gets the address
-    without a token (``web_base``), which `sudo backtide enlace` completes."""
+    without a token (``web_base``), which `sudo backtide enlace` completes. ``public_origin`` is
+    the domain a reverse proxy brings it to (T26-4a): it still listens only here, and it needs
+    ``web_socket``, whose service keeps the passkeys that are the way in there."""
+    if public_origin is not None and web_socket is None:
+        raise ValueError("a web behind a domain needs the service's narrow socket")
     socks = bind_both(port)
     real_port = socks[0].getsockname()[1]
     token, prefix, run_name = make_token(), make_prefix(), make_run_name()
@@ -250,7 +263,11 @@ def run_web(
         except ControlError as error:  # the pages say the list cannot be read
             raise SnapshotError(str(error)) from None
 
-    access = None if web_socket is None else ServiceAccess(web_socket, server_uid=SERVICE_UID)
+    access = None
+    if web_socket is not None:
+        access = ServiceAccess(
+            web_socket, server_uid=SERVICE_UID, cookie_name=session_cookie_name(public_origin)
+        )
     app = create_app(
         reader=reader,
         port=real_port,
@@ -267,10 +284,11 @@ def run_web(
         others=others,
         pending=pending,
         agent_lines=paths.agent_lines,
+        origin=public_origin,
     )
     server = make_server(app)
     link = web_url(real_port, prefix, token) if access is None else web_base(real_port, prefix)
-    announce(link, run_name)
+    announce(link if public_origin is None else public_origin.link_base, run_name)
     try:
         server.run(sockets=socks)
     finally:

@@ -236,6 +236,121 @@ def test_enlace_never_follows_a_link(capsys, tmp_path: Path) -> None:
     assert code == 1 and BASE not in out
 
 
+# Behind a domain (T26-4a): root's own configuration says the address, never the web's file
+
+DOMAIN = "https://backtide.example.org"
+
+
+def domain_config(tmp_path: Path, origin: str = DOMAIN) -> Path:
+    config = tmp_path / "backtide.toml"
+    config.write_text(
+        f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n'
+        f'\n[web]\npublic_origin = "{origin}"\n'
+    )
+    return config
+
+
+def test_enlace_behind_a_domain_gives_the_domains_link(
+    capsys, tmp_path: Path, service_link: list[Path]
+) -> None:
+    link = tmp_path / "enlace"
+    cli._write_link(link, f"{DOMAIN}/", "marea-faro-nube")  # noqa: SLF001
+    code, out, _ = run(capsys, "enlace", "--archivo", link, "--config", domain_config(tmp_path))
+    assert code == 0
+    assert f"{DOMAIN}/?t=" in out and "marea-faro-nube" in out
+    assert "ssh" not in out and "backtide.localhost" not in out and "127.0.0.1" not in out
+    assert service_link == [tmp_path / "state" / "control.sock"]
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "https://evil.example/",  # a web taken over choosing where root's link goes
+        f"{DOMAIN}.evil.example/",
+        f"{DOMAIN}/?x=",
+        BASE,  # a web that has not been told: on the tunnel still
+    ],
+)
+def test_enlace_never_sends_roots_link_where_the_file_says(
+    capsys, tmp_path: Path, written: str, service_link: list[Path]
+) -> None:
+    link = tmp_path / "enlace"
+    cli._write_link(link, written, "a-b-c")  # noqa: SLF001
+    code, out, err = run(capsys, "enlace", "--archivo", link, "--config", domain_config(tmp_path))
+    assert code == 1 and "public_origin" in err and "?t=" not in out and "evil" not in out
+    assert service_link == []  # no token was even asked for
+
+
+def test_enlace_without_a_domain_refuses_a_file_that_says_one(
+    capsys, tmp_path: Path, service_link: list[Path]
+) -> None:
+    config = tmp_path / "backtide.toml"
+    config.write_text(f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n')
+    link = tmp_path / "enlace"
+    cli._write_link(link, "https://evil.example/", "a-b-c")  # noqa: SLF001
+    code, out, err = run(capsys, "enlace", "--archivo", link, "--config", config)
+    assert code == 1 and "public_origin" in err and "evil" not in out
+    assert service_link == []
+
+
+def test_the_web_behind_a_domain_starts_with_it_and_leaves_its_address(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link = tmp_path / "run" / "enlace"
+    link.parent.mkdir(mode=0o700)
+    seen = {}
+
+    def fake(paths, port, announce, **options) -> None:
+        seen.update(options)
+        announce(f"{DOMAIN}/", "marea-faro-nube")
+        seen["text"] = link.read_text()
+
+    monkeypatch.setattr(server_module, "run_web", fake)
+    sock = tmp_path / "web.sock"
+    code, out, _ = run(capsys, "web", "--config", domain_config(tmp_path), "--enlace-en", link,
+                       "--socket-web", sock)  # fmt: skip
+    assert code == 0
+    assert seen["public_origin"].url == DOMAIN and seen["web_socket"] == sock
+    assert seen["text"] == f"{DOMAIN}/\nmarea-faro-nube\n"
+    assert f"detrás de {DOMAIN}" in out and "solo en este ordenador" not in out
+
+
+def test_the_web_without_a_domain_gets_no_such_option(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "web.toml"
+    config.write_text(f'state_dir = "{tmp_path}/state"\nvolume = "{tmp_path}/vol"\n')
+    seen = {}
+
+    def fake(paths, port, announce, **options) -> None:
+        seen.update(options)
+
+    monkeypatch.setattr(server_module, "run_web", fake)
+    code, _, _ = run(capsys, "web", "--config", config, "--socket-web", tmp_path / "web.sock")
+    assert code == 0 and "public_origin" not in seen
+
+
+def test_a_web_behind_a_domain_needs_the_narrow_socket(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its way in is a passkey, and only the service keeps those."""
+    monkeypatch.setattr(server_module, "run_web", lambda *a, **k: pytest.fail("it started"))
+    code, _, err = run(capsys, "web", "--config", domain_config(tmp_path))
+    assert code == 2 and "public_origin" in err
+
+
+@pytest.mark.parametrize(
+    "origin", ["http://backtide.example.org", "https://dev.example.org/backtide"]
+)
+def test_a_web_with_a_bad_origin_does_not_start_and_says_so(
+    capsys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str
+) -> None:
+    monkeypatch.setattr(server_module, "run_web", lambda *a, **k: pytest.fail("it started"))
+    config = domain_config(tmp_path, origin)
+    code, _, err = run(capsys, "web", "--config", config, "--socket-web", tmp_path / "web.sock")
+    assert code == 2 and "public_origin" in err and origin not in err
+
+
 def test_instalar_passes_the_agent_and_telegram(
     capsys, as_root: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

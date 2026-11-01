@@ -34,6 +34,12 @@ program on this machine that listens on a port of its own (cookies ignore ports)
   * the whole app lives under a random per-run prefix, ``/s/<random>/``: anything else is a
     bare 404, so a squatter or a page that guesses ``/ahora`` finds nothing;
   * every response, errors included, carries the headers below.
+- Behind a domain (``[web] public_origin``, T26-4a, ``backtide.service.origin``) the web still
+  listens only on loopback, and a reverse proxy on this server reaches it. Then the one ``Host``
+  and the one ``Origin`` are the domain's (127.0.0.1's and backtide.localhost's are refused too: a
+  proxy that passes on any name it is asked for must not make a request "local"), the app lives
+  at the root with no random prefix, and the cookie is ``__Host-backtide_web``. The password
+  does not exist there (D40). Nothing here believes ``X-Forwarded-*``: no limit goes by address.
 - ``Access``: the link carries a one-time token. The first request that uses it gets a NEW
   session id (another random value, never one that existed before) in an HttpOnly,
   SameSite=Strict cookie whose Path is the prefix, and the token stops working. A copy of the
@@ -61,14 +67,23 @@ program on this machine that listens on a port of its own (cookies ignore ports)
 import hmac
 import logging
 import secrets
+import threading
 from collections.abc import Awaitable, Callable, MutableMapping
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Protocol
 
-from backtide.service.control import ControlError, PeerCredentials, peer_credentials
+from backtide.service.control import (
+    ControlError,
+    ControlOutcomeUnknown,
+    PeerCredentials,
+    peer_credentials,
+)
+from backtide.service.origin import PublicOrigin
 from backtide.service.sessions import Session, Sessions
 from backtide.service.web_control import (
+    MAX_WEB_CONNECTIONS,
+    SessionCheckRefused,
     ask_auth,
     ask_passkey,
     ask_session_check,
@@ -87,7 +102,9 @@ App = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 TOKEN_BYTES = 32
 COOKIE_NAME = "backtide_web"
+DOMAIN_COOKIE_NAME = "__Host-backtide_web"  # behind a domain (T26-4a)
 LANG_COOKIE = "backtide_lang"
+CHECKS_AT_ONCE = MAX_WEB_CONNECTIONS // 2  # of the narrow socket's connections, the rest for clicks
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
     "font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; "
@@ -177,16 +194,27 @@ def acting_session(server_uid: int | None) -> str | None:
     return ACTING_SESSION.get() if server_uid is not None else None
 
 
-def cookie_values(cookie_header: str | None) -> list[str]:
+def cookie_values(cookie_header: str | None, cookie_name: str = COOKIE_NAME) -> list[str]:
     """Our cookie's values in this ``Cookie`` header, at most ``MAX_COOKIES``. Cookies ignore
     ports, so a stale ``backtide_web`` of another run (or version) on 127.0.0.1 can travel with
     ours, and a parser that keeps only one of two equal names would pick the wrong one."""
     found = []
     for part in (cookie_header or "").split(";"):
         name, _, value = part.strip().partition("=")
-        if name == COOKIE_NAME and value.strip('"'):
+        if name == cookie_name and value.strip('"'):
             found.append(value.strip('"'))
     return found[:MAX_COOKIES]
+
+
+def session_cookie_name(origin: PublicOrigin | None) -> str:
+    """The session cookie's name: behind a domain, with the prefix that makes a browser take it
+    only from https and only as ``Secure``, so nothing on http can plant or overwrite it."""
+    return COOKIE_NAME if origin is None else DOMAIN_COOKIE_NAME
+
+
+class SessionsBusy(Exception):  # noqa: N818 - an HTTP outcome, not an error
+    """Whether this session lives is not known right now: the service's cap, or too many
+    connections (T26-4a). A 503, never a 401: a session may well be alive behind it."""
 
 
 class Access(Protocol):
@@ -204,7 +232,7 @@ class Access(Protocol):
 
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
         """The live session among this header's cookies, or None; with ``use`` it counts as
-        used (a page's own stream checks without it)."""
+        used (a page's own stream checks without it). SessionsBusy if it cannot be known now."""
 
     def end(self, session_id: str, *, every: bool = False) -> bool | None:
         """End this session, or every one (asked from this live one): True if ended, False if
@@ -217,8 +245,9 @@ class LocalAccess:
 
     passwords = False  # only its link
 
-    def __init__(self, sessions: Sessions) -> None:
+    def __init__(self, sessions: Sessions, *, cookie_name: str = COOKIE_NAME) -> None:
         self.sessions = sessions
+        self._cookie_name = cookie_name
 
     def open(self, token: str) -> Session | None:
         return self.sessions.open(token)
@@ -233,7 +262,7 @@ class LocalAccess:
         return {"ok": False, "outcome": "refused", "message": "Solo en la web instalada."}
 
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
-        for value in cookie_values(cookie_header):
+        for value in cookie_values(cookie_header, self._cookie_name):
             session = self.sessions.check(value, use=use)
             if session is not None:
                 return session
@@ -262,11 +291,14 @@ class ServiceAccess:
         server_uid: int,
         wait: float = 2.0,
         peer: PeerCredentials = peer_credentials,
+        cookie_name: str = COOKIE_NAME,
     ) -> None:
         self._path = Path(path)
         self._server_uid = server_uid
         self._wait = wait
         self._peer = peer
+        self._cookie_name = cookie_name
+        self._checking = threading.BoundedSemaphore(CHECKS_AT_ONCE)
 
     def _ask(self) -> dict[str, Any]:
         return {"server_uid": self._server_uid, "wait": self._wait, "peer": self._peer}
@@ -312,14 +344,30 @@ class ServiceAccess:
             return None, "refused"
 
     def session_of(self, cookie_header: str | None, *, use: bool = True) -> Session | None:
-        for value in cookie_values(cookie_header):
+        """A cookie the service would not look at does not end the search (another of them may be
+        the live one), and in the end it is SessionsBusy, not "nobody": T26-4a. A service that
+        cannot be asked at all is nobody, and says so in the log."""
+        busy = False
+        for value in cookie_values(cookie_header, self._cookie_name):
+            # Waiting in line, not at the service's door: a stream of made-up cookies never fills
+            # the connections it takes from anyone, and a live one's turn comes in milliseconds.
+            if not self._checking.acquire(timeout=self._wait):
+                busy = True
+                continue
             try:
                 session = ask_session_check(self._path, value, use=use, **self._ask())
+            except (SessionCheckRefused, ControlOutcomeUnknown):  # there, but it did not answer
+                busy = True
+                continue
             except ControlError as error:
                 logger.error("the service could not check a session: %s", error)
                 return None
+            finally:
+                self._checking.release()
             if session is not None:
                 return session
+        if busy:
+            raise SessionsBusy
         return None
 
     def end(self, session_id: str, *, every: bool = False) -> bool | None:
@@ -335,7 +383,9 @@ PASSKEY_HOST = "backtide.localhost"  # the passkeys' relying party (backtide.ser
 MAX_LARGE_FORM_BYTES = 8192  # a passkey's answer, on its own path only
 
 
-def allowed_hosts(port: int) -> frozenset[str]:
+def allowed_hosts(port: int, origin: PublicOrigin | None = None) -> frozenset[str]:
+    if origin is not None:
+        return frozenset({origin.host})
     return frozenset({f"127.0.0.1:{port}", f"{PASSKEY_HOST}:{port}"})
 
 
@@ -344,7 +394,8 @@ class Guard:
     prefix, and the security headers on every response. It does not touch the body, so streaming
     (SSE) passes through untouched. ``inner`` is the app it guards, ``base`` the prefix path.
     ``post_paths`` are the paths that take a POST: the rewind's, and the Settings page's only
-    when it is on."""
+    when it is on. ``origin`` is the domain it is behind, if any: then it is the one ``Host`` and
+    ``Origin`` it takes, and the app lives at the root, with no random prefix."""
 
     def __init__(
         self,
@@ -354,13 +405,15 @@ class Guard:
         prefix: str,
         post_paths: tuple[str, ...] = (POST_PATH,),
         large_post_paths: tuple[str, ...] = (),
+        origin: PublicOrigin | None = None,
     ) -> None:
         self.inner = app
-        self.base = f"/s/{prefix}"
+        self.base = "" if origin is not None else f"/s/{prefix}"
         self._post_paths = tuple(self.base + path for path in (*post_paths, *large_post_paths))
         # A passkey's answer is bigger than any other form: only its path takes up to 8 KiB.
         self._large_paths = tuple(self.base + path for path in large_post_paths)
-        self._hosts = allowed_hosts(port)
+        self._hosts = allowed_hosts(port, origin)
+        self._origin = None if origin is None else origin.url
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -397,8 +450,8 @@ class Guard:
         if len(hosts) != 1 or hosts[0].decode("latin-1").lower() not in self._hosts:
             return 400, "Host not allowed", []
         # The one Origin a page of ours sends is the name it was opened by: 127.0.0.1's or
-        # backtide.localhost's, never the other one (review of T26-3b-2).
-        own = "http://" + hosts[0].decode("latin-1").lower()
+        # backtide.localhost's, never the other one (review of T26-3b-2). Behind a domain: its own.
+        own = self._origin or "http://" + hosts[0].decode("latin-1").lower()
         if scope["method"] == "POST" and any(
             token_matches(scope["path"], path) for path in self._post_paths
         ):
@@ -448,6 +501,8 @@ class Guard:
 
     def _under_prefix(self, path: str) -> bool:
         """Is ``path`` the prefix itself or something below it? Compared in constant time."""
+        if not self.base:  # behind a domain the app lives at the root: the whole site is its own
+            return True
         head = path[: len(self.base)]
         if not token_matches(head, self.base) or len(head) != len(self.base):
             return False

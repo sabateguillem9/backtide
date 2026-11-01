@@ -767,7 +767,7 @@ def test_opening_sessions_has_a_bucket_of_its_own(
     assert [r["outcome"] for r in opens] == ["refused"] * 3
     assert "Demasiadas" in opens[2]["message"]
     checks = [talk(server, {"cmd": "session_check", "session": SESSION}) for _ in range(4)]
-    assert [r["outcome"] for r in checks] == ["live", "live", "live", "refused"]
+    assert [r["outcome"] for r in checks] == ["live", "live", "live", "busy"]
     assert talk(server, {"cmd": "holds"})["outcome"] == "listed"  # the reads' bucket is apart
 
 

@@ -880,6 +880,39 @@ def test_the_web_reads_its_own_config_and_never_the_services(machine: Machine) -
     assert 'name = "anthropic"' in config and "claude-haiku-4-5" in config
 
 
+def test_the_webs_config_has_no_domain_unless_the_services_does(machine: Machine) -> None:
+    installer(machine, no_key=True).install()
+    assert "[web]" not in machine.paths.web_config_file.read_text()
+
+
+def test_installing_again_keeps_the_domain_in_the_webs_config(machine: Machine) -> None:
+    """T26-4a: the web cannot read the service's file, and an upgrade must not take it away."""
+    from backtide.web.paths import WebPaths
+
+    installer(machine, no_key=True).install()
+    config = machine.paths.config_file
+    config.write_text(
+        config.read_text() + '\n[web]\npublic_origin = "https://Backtide.Example.org:443"\n'
+    )
+    installer(machine, no_key=True).install()
+    assert 'public_origin = "https://backtide.example.org"' in (
+        machine.paths.web_config_file.read_text()
+    )
+    origin = WebPaths.from_file(machine.paths.web_config_file).public_origin
+    assert origin is not None and origin.url == "https://backtide.example.org"
+
+
+def test_a_bad_domain_stops_the_install_and_says_where(machine: Machine) -> None:
+    installer(machine, no_key=True).install()
+    config = machine.paths.config_file
+    config.write_text(
+        config.read_text() + '\n[web]\npublic_origin = "http://secret-in-the-url.example"\n'
+    )
+    with pytest.raises(InstallError, match="public_origin") as stopped:
+        installer(machine, no_key=True).install()
+    assert "secret-in-the-url" not in str(stopped.value)
+
+
 def test_the_paths_under_a_root_keep_the_real_tree(tmp_path: Path) -> None:
     moved = Paths().under(tmp_path)
     assert moved.state_dir == tmp_path / "var/lib/backtide"

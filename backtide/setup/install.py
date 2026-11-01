@@ -76,7 +76,9 @@ from backtide.service.config import (
     ConfigError,
     Secret,
     ServiceConfig,
+    public_origin_of,
 )
+from backtide.service.origin import PublicOrigin
 from backtide.service.settings import TELEGRAM, check_chat_id, check_value
 from backtide.service.telegram_config import STATE_TELEGRAM, TelegramSettings, load_telegram
 from backtide.setup import (
@@ -916,12 +918,30 @@ class Installer:
         return "\n".join(lines)
 
     def render_web_config(self) -> str:
-        return (
+        text = (
             "# The web's configuration (backtide-web.service): only where to read. Written by the\n"
             "# installer, root's, 0640 with the group backtide-web (T13-3).\n"
             f'state_dir = "{self.paths.state_dir}"\n'
             f'volume = "{self.paths.volume_mount}"\n'
         )
+        origin = self._public_origin()
+        if origin is not None:
+            # T26-4a: the web cannot read the service's file, and installing again must not take
+            # the domain away from it. Checked first, so nothing else can get into this TOML.
+            text += f'\n[web]\npublic_origin = "{origin.url}"\n'
+        return text
+
+    def _public_origin(self) -> PublicOrigin | None:
+        """`[web] public_origin` of the service's file, checked. A file that cannot be read says
+        so in the check that follows the writing of this one."""
+        try:
+            data = tomllib.loads(self.paths.config_file.read_text())
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return None
+        try:
+            return public_origin_of(data.get("web", {}))
+        except ConfigError as error:
+            raise InstallError(f"{self.paths.config_file}: {error}") from None
 
     def _model_key(self) -> None:
         options, name = self.options, f"{self.options.provider}.key"

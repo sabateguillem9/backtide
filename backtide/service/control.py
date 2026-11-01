@@ -284,6 +284,12 @@ def peer_credentials(sock: socket.socket) -> tuple[int, int, int]:
     return pid, uid, gid
 
 
+LINK_CLOSED = (
+    "Por el dominio, con llaves registradas, se entra con la llave: el enlace no vale. Si las has "
+    "perdido, `sudo backtide llaves --quitar <id>` y luego `sudo backtide enlace`."
+)
+
+
 class _BadRequest(Exception):
     """A request the server refuses without calling the Guardian. Carries the reply text."""
 
@@ -520,6 +526,20 @@ class ControlServer:
             return self._rename_passkey(request, pid, uid)
         raise _BadRequest("Orden desconocida.")
 
+    def _link_closed(self) -> bool:
+        """Behind a domain it takes a passkey (D40): the link is only there for the first key
+        (T26-4a), and through the internet it would open a session that approves and rewinds
+        without one. A file that cannot be read may hold keys: closed, and the owner hears of it."""
+        if self._passkeys is None or not self._passkeys.on_a_domain:
+            return False
+        from backtide.service.passkeys import PasskeyError
+
+        try:
+            return bool(self._passkeys.keys())
+        except PasskeyError as error:
+            logger.error("%s: the passkeys cannot be read: %s", self.label, error)
+            return True
+
     def _web_link(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         """A new one-time link for the installed web (`sudo backtide enlace`): the unspent one,
         if any, dies. Only here, on root's socket: the web cannot mint its own way in."""
@@ -527,6 +547,10 @@ class ControlServer:
             raise _BadRequest("Una petición de enlace lleva `cmd` y nada más.")
         if self._sessions is None:
             raise _BadRequest("Este servicio no tiene web instalada: no hay enlace que dar.")
+        if self._link_closed():
+            logger.warning("%s: refused a link behind a domain with keys (uid %d, pid %d)",
+                           self.label, uid, pid)  # fmt: skip
+            raise _BadRequest(LINK_CLOSED)
         token = self._sessions.new_link()
         logger.info("%s: a new one-time link for the web was given to uid %d (pid %d)",
                     self.label, uid, pid)  # fmt: skip

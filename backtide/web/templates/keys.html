@@ -28,7 +28,7 @@
   {% elif add == "again" %}
   <p class="note">{{ t('keys.again') }}</p>
   {% else %}
-  <form class="settings-form keys-form" id="passkey-form" data-begin="{{ begin }}" data-finish="{{ finish }}" data-csrf="{{ csrf }}" data-done="{{ t('keys.done') }}" data-failed="{{ t('keys.failed') }}" data-unsupported="{{ t('keys.unsupported') }}" data-cancelled="{{ t('keys.cancelled') }}">
+  <form class="settings-form keys-form" id="passkey-form" data-begin="{{ begin }}" data-finish="{{ finish }}" data-csrf="{{ csrf }}" data-done="{{ t('keys.done') }}" data-failed="{{ t('keys.failed') }}" data-unsupported="{{ t('keys.unsupported.domain') if key_only else t('keys.unsupported') }}" data-cancelled="{{ t('keys.cancelled') }}">
     <div class="setting-field">
       <label class="setting-label" for="passkey-name">{{ t('keys.name') }}</label>
       <input id="passkey-name" class="setting-input" type="text" name="name" maxlength="48" required autocomplete="off" placeholder="{{ t('keys.name.example') }}" aria-describedby="passkey-status">

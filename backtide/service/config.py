@@ -117,6 +117,7 @@ from backtide.jail.proxy_config import ProxyJailConfig
 from backtide.jail.sensor import SensorJailConfig
 from backtide.sensors.tetragon import ReaderConfig
 from backtide.service.holds import HoldTimings
+from backtide.service.origin import PublicOrigin, parse_public_origin
 from backtide.service.price_update import PRICES_URL, check_url
 from backtide.service.prices import (
     CACHE_1H,
@@ -178,7 +179,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "volume_image", "max_volume_bytes", "proxy", "sensor", "gate", "budget", "web",
     }
 )  # fmt: skip
-_WEB_KEYS = frozenset({"session_idle_seconds", "session_lifetime_seconds"})
+_WEB_KEYS = frozenset({"session_idle_seconds", "session_lifetime_seconds", "public_origin"})
 _BUDGET_KEYS = frozenset(
     {"daily_usd", "monthly_usd", "timezone", "max_inflight", "max_inflight_local", "auto_prices",
      "prices_url", "prices"}
@@ -445,6 +446,7 @@ class ServiceConfig:
         self.gate_settings()  # validates [gate]
         self.budget_settings()  # validates [budget]
         self.web_sessions()  # validates [web]
+        self.web_public_origin()
         self._check_cloud_prices()
 
     def _check_identity(self) -> None:
@@ -1122,6 +1124,11 @@ class ServiceConfig:
                 f"never shorter than the idle time): {error}"
             ) from None
 
+    def web_public_origin(self) -> PublicOrigin | None:
+        """The web's domain (T26-4a), if it is behind one. ConfigError if it is not an https
+        origin of a name and perhaps a port."""
+        return public_origin_of(self.web)
+
     def budget_settings(self) -> BudgetSettings:
         """``[budget]``, checked (ConfigError): the spending caps and the prices (T11)."""
         if not isinstance(self.budget, Mapping):
@@ -1262,6 +1269,19 @@ class ServiceConfig:
             agent=agent,
             **optional,
         )
+
+
+def public_origin_of(web: object) -> PublicOrigin | None:
+    """``public_origin`` of a ``[web]`` table (the service's and the web's own file), or None.
+    ConfigError says what is wrong, never quoting it."""
+    if not isinstance(web, Mapping):
+        raise ConfigError("[web] must be a table")
+    if "public_origin" not in web:
+        return None
+    try:
+        return parse_public_origin(web["public_origin"])
+    except ValueError as error:
+        raise ConfigError(f"[web] public_origin: {error}") from None
 
 
 def agent_profile_of(agent: Mapping[str, Any]) -> AgentProfile:

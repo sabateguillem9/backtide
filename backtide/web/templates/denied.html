@@ -1,12 +1,22 @@
 {% extends "base.html" %}
 {% from "icons.html" import ic %}
-{% block head %}{% if sign_in and here %}<script src="{{ base }}/static/webauthn-get.js" defer></script>{% endif %}{% endblock %}
-{% block title %}{{ t('auth.title.installed') if sign_in else t('auth.title') }}{% endblock %}
+{% macro key_button() %}
+  <div class="settings-actions signin-key">
+    <button class="setting-go" type="button" id="webauthn-go" data-begin="{{ key_begin }}" data-finish="{{ key_finish }}" data-cancelled="{{ t('webauthn.cancelled') }}" data-failed="{{ t('webauthn.failed') }}" data-unsupported="{{ t('webauthn.unsupported') }}"><span>{{ t('auth.key') }}</span>{% include "arrow.html" %}</button>
+  </div>
+  <div class="webauthn-said">{{ ic('warning') }}<p class="setting-hint" id="webauthn-status" role="status" aria-live="polite"></p></div>
+{% endmacro %}
+{% block head %}{% if key_only or (sign_in and here) %}<script src="{{ base }}/static/webauthn-get.js" defer></script>{% endif %}{% endblock %}
+{% block title %}{{ t('auth.title.installed') if sign_in or key_only else t('auth.title') }}{% endblock %}
 {% block main %}
 <main class="watch gate-page ic-host">
   {{ ic('key', 'ic--l') }}
-  <h1>{{ t('auth.title.installed') if sign_in else t('auth.title') }}</h1>
-  {% if sign_in %}
+  <h1>{{ t('auth.title.installed') if sign_in or key_only else t('auth.title') }}</h1>
+  {% if key_only %}
+  <p class="lede">{{ t.code('auth.bad.domain') if bad_link else t.code('auth.body.domain') }}</p>
+  {% if sign_in_error %}<p class="signin-error" role="alert">{{ ic('warning') }}<span>{{ t.code('auth.err.' ~ sign_in_error) }}</span></p>{% endif %}
+  {{ key_button() }}
+  {% elif sign_in %}
   <p class="lede">{{ t.code('auth.bad') if bad_link else t.code('auth.body.installed') }}</p>
   <form class="settings-form signin-form" method="post" action="{{ sign_in }}">
     <div class="setting-field">
@@ -19,15 +29,13 @@
     </div>
   </form>
   {% if here %}
-  <div class="settings-actions signin-key">
-    <button class="setting-go" type="button" id="webauthn-go" data-begin="{{ key_begin }}" data-finish="{{ key_finish }}" data-cancelled="{{ t('webauthn.cancelled') }}" data-failed="{{ t('webauthn.failed') }}" data-unsupported="{{ t('webauthn.unsupported') }}"><span>{{ t('auth.key') }}</span>{% include "arrow.html" %}</button>
-  </div>
-  <div class="webauthn-said">{{ ic('warning') }}<p class="setting-hint" id="webauthn-status" role="status" aria-live="polite"></p></div>
+  {{ key_button() }}
   {% else %}
   <p class="note">{{ t.code('auth.key.elsewhere', origin=origin) }}</p>
   {% endif %}
   {% else %}
   <p class="lede">{{ t.code('auth.bad') if bad_link else t.code('auth.body') }}</p>
+  {% if sign_in_error %}<p class="signin-error" role="alert">{{ ic('warning') }}<span>{{ t.code('auth.err.' ~ sign_in_error) }}</span></p>{% endif %}
   {% endif %}
 </main>
 {% endblock %}

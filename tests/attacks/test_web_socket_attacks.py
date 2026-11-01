@@ -19,6 +19,7 @@ import grp
 import json
 import os
 import pwd
+import re
 import secrets
 import shutil
 import stat
@@ -26,6 +27,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 
@@ -1378,4 +1380,424 @@ def test_a_passkey_is_only_registered_from_a_live_session(
         and set(added[0].details) <= {"pid", "name", "tail"},
         f"la llave nueva, en la caja negra con su nombre y el final de su id ({len(added)}), y "
         f"ninguna de las rechazadas",
+    )
+
+
+DOMAIN = "backtide.example.org"
+DOMAIN_URL = f"https://{DOMAIN}"
+
+
+def as_the_proxy(
+    method: str,
+    where: str,
+    *,
+    host: str = DOMAIN,
+    origin: str | None = None,
+    cookie: str | None = None,
+    body: str | None = None,
+    more: dict[str, str] | None = None,
+) -> tuple[int, str, str, str]:
+    """A request as the server's reverse proxy brings it, to the web on loopback: its status, its
+    text, its Set-Cookie and its Retry-After. Nothing here reaches anything outside the VM."""
+    from http.client import HTTPConnection
+
+    from backtide.service import passkeys as pk
+
+    conn = HTTPConnection("127.0.0.1", pk.WEB_PORT, timeout=20)
+    headers = {"Host": host, **(more or {})}
+    if origin is not None:
+        headers["Origin"] = origin
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    if body is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    conn.request(method, where, body=body, headers=headers)
+    response = conn.getresponse()
+    found = (response.status, response.read().decode(errors="replace"),
+             response.getheader("set-cookie") or "",
+             response.getheader("retry-after") or "")  # fmt: skip
+    conn.close()
+    return found
+
+
+def web_says_domain() -> bool:
+    return layout.WEB_LINK_FILE.read_text().splitlines()[0] == f"{DOMAIN_URL}/"
+
+
+@scenario("web-en-un-dominio")
+def test_behind_a_domain_only_its_host_its_origin_and_its_key_get_in(
+    attack: Attack, installed: Installed
+) -> None:
+    """T26-4a: `[web] public_origin` on the real installation, then restored. What a reverse proxy
+    would bring to loopback, with a made-up https origin: each refusal for its reason, next to a
+    control that gets in with the same request."""
+    from backtide.service import passkeys as pk
+    from backtide.web.security import COOKIE_NAME, DOMAIN_COOKIE_NAME
+    from tests.passkey_kit import SoftAuthenticator
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    right = LAB_PASSWORD.read_text().strip()
+    service_toml, web_toml = layout.CONFIG_FILE.read_bytes(), layout.WEB_CONFIG_FILE.read_bytes()
+    assert b"[web]" not in service_toml + web_toml, "the installation already has a [web] table"
+    kept = pk.path_of(layout.STATE_DIR, DOMAIN)
+    assert not kept.exists(), "a key of the domain is left from a run that was killed"
+    table = f'\n[web]\npublic_origin = "{DOMAIN_URL}"\n'.encode()
+    bad_file = Path("/tmp/backtide-bad-origin.toml")  # noqa: S108 - inside the VM, removed below
+    bad_said: list[tuple[int, str, str]] = []
+    results: dict[str, Any] = {}
+
+    def probe(*requests: dict) -> list[dict]:
+        return probe_as(web.pw_uid, web.pw_gid, "", path, *requests)
+
+    def enlace() -> Any:
+        """Root's own command, as root runs it."""
+        return sh(str(layout.PROGRAM), "enlace", check=False)
+
+    def links_given(since: int) -> int:
+        return sum(e.action == "web_link_given" for e in installed.box.events(since_seq=since))
+
+    try:
+        # A bad origin: the web does not start, and says why without quoting it.
+        for bad in ("http://backtide.example.org", "https://x:hunter2@backtide.example.org",
+                    "https://dev.example.org/backtide"):  # fmt: skip
+            bad_file.write_text(
+                f'state_dir = "{layout.STATE_DIR}"\nvolume = "/nowhere"\n\n'
+                f'[web]\npublic_origin = "{bad}"\n'
+            )
+            ran = sh(str(layout.PROGRAM), "web", "--config", str(bad_file), "--puerto", "0",
+                     "--socket-web", path, "--rebobinar", check=False)  # fmt: skip
+            bad_said.append((ran.returncode, ran.stderr, bad))
+        layout.CONFIG_FILE.write_bytes(service_toml + table)
+        layout.WEB_CONFIG_FILE.write_bytes(web_toml + table)
+        restart_service(installed)
+        sh("systemctl", "restart", layout.WEB_UNIT, timeout=120)
+        assert wait(web_says_domain, 60, interval=1), "the web did not come back on its domain"
+        head = installed.box.head()
+        since = head[0] if head is not None else 0
+
+        # The controls: the domain's own Host, with root's link, gets the __Host- cookie.
+        results["sin cookie"] = as_the_proxy("GET", "/")
+        link = as_the_proxy("GET", f"/?t={ask_web_link(CONTROL_SOCKET)}")
+        cookie_line = link[2]
+        value = cookie_line.partition(";")[0].partition("=")[2]
+        cookie = f"{DOMAIN_COOKIE_NAME}={value}"
+        results["dentro"] = as_the_proxy("GET", "/panel", cookie=cookie)
+        results["cookie sin __Host-"] = as_the_proxy(
+            "GET", "/panel", cookie=f"{COOKIE_NAME}={value}"
+        )
+        # Host: with the cookie that gets in above, so it is the Host that stops each one.
+        for host in ("evil.example", f"{DOMAIN}.evil.example", f"127.0.0.1:{pk.WEB_PORT}",
+                     f"{pk.RP_ID}:{pk.WEB_PORT}", f"{DOMAIN}:8443"):  # fmt: skip
+            results[f"Host {host}"] = as_the_proxy("GET", "/panel", host=host, cookie=cookie)
+        results["X-Forwarded-Host"] = as_the_proxy(
+            "GET", "/panel", host="evil.example", cookie=cookie,
+            more={"X-Forwarded-Host": DOMAIN, "X-Forwarded-Proto": "https",
+                  "X-Forwarded-For": "127.0.0.1"},
+        )  # fmt: skip
+        # Origin: the sign-in's first step, which takes no session, so only the Origin differs.
+        begin = "/entrar/llave/empezar"
+        for origin in ("https://evil.example", f"http://{DOMAIN}", f"{DOMAIN_URL}:8443",
+                       f"http://127.0.0.1:{pk.WEB_PORT}"):  # fmt: skip
+            results[f"Origin {origin}"] = as_the_proxy("POST", begin, origin=origin, body="")
+        results["Origin bueno"] = as_the_proxy("POST", begin, origin=DOMAIN_URL, body="")
+        # The password, the right one, by every way there is.
+        results["/entrar"] = as_the_proxy(
+            "POST", "/entrar", origin=DOMAIN_URL, body=f"password={right}"
+        )
+        results["contraseña al socket"] = probe(
+            {"cmd": "session_password", "password": right, "_why": True}
+        )[0]
+        # No way in with no session: every page and order, as `entrar-sin-llave`, at the root.
+        pages = ["/", "/ahora", "/instantaneas", "/peticiones", "/ajustes", "/llaves", "/tocar"]
+        orders = ["/llaves/empezar", "/tocar/empezar", "/ajustes/cerrar-sesiones", "/salir"]
+        made_up = f"{DOMAIN_COOKIE_NAME}={'s' * 43}"
+        no_session = {w: as_the_proxy("GET", w)[0] for w in pages}
+        no_session |= {f"{w} (inventada)": as_the_proxy("GET", w, cookie=made_up)[0] for w in pages}
+        no_session |= {
+            w: as_the_proxy("POST", w, origin=DOMAIN_URL, body="csrf=x", cookie=made_up)[0]
+            for w in orders
+        }
+        # What lasts wants a key here even with none yet (D40).
+        forged = {"cmd": "trust", "hold_id": "h-" + secrets.token_hex(6), "session": value,
+                  "_why": True}  # fmt: skip
+        results["sin llave"] = probe(forged)[0]
+        # `sudo backtide enlace`: the address is root's configuration, never the web's file. The
+        # control: the link it prints gets in. A web taken over that rewrites its file gets no
+        # token sent anywhere, and none is even given.
+        given = enlace()
+        printed = re.search(rf"{re.escape(DOMAIN_URL)}/\?t=([A-Za-z0-9_-]+)", given.stdout)
+        results["enlace"] = given.returncode
+        results["el enlace entra"] = (
+            as_the_proxy("GET", f"/?t={printed[1]}")[0] if printed is not None else 0
+        )
+        written = layout.WEB_LINK_FILE.read_text()
+        before = links_given(since)
+        try:
+            layout.WEB_LINK_FILE.write_text("https://evil.example/\nmarea-faro-nube\n")
+            tricked = enlace()
+        finally:
+            layout.WEB_LINK_FILE.write_text(written)
+        said = tricked.stdout + tricked.stderr
+        results["archivo cambiado"] = (tricked.returncode, "no dicen lo mismo" in tricked.stderr,
+                                       "?t=" in said or "evil" in said,
+                                       links_given(since) - before)  # fmt: skip
+        pending = ask_web_link(CONTROL_SOCKET)  # unspent when the first key arrives
+        # The first key, of this domain, from the session of root's link.
+        begun = probe({"cmd": "passkey_begin", "session": value, "_see": True})[0]
+        assert begun.get("options"), f"no options to register a key: {begun}"
+        results["dominio de la llave"] = json.loads(begun["options"])["rp"]["id"]
+        owner = SoftAuthenticator()
+        answer = owner.create(begun["options"], DOMAIN_URL, rp_id=DOMAIN)
+        results["llave"] = probe(
+            {"cmd": "passkey_finish", "session": value, "answer": answer, "name": "portátil",
+             "_why": True},
+        )[0]  # fmt: skip
+        results["archivo"] = (kept.exists(), pk.path_of(layout.STATE_DIR).exists())
+
+        def attempt(at: str, rp_id: str = DOMAIN) -> dict:
+            first = probe({"cmd": "auth_begin", "_see": True})[0]
+            signed = owner.get(first["options"], at, rp_id=rp_id)
+            return probe({"cmd": "auth_finish", "answer": signed, "_why": True})[0]
+
+        results["firma del túnel"] = attempt(pk.origin_for(pk.WEB_PORT))
+        results["firma de otro sitio"] = attempt("https://evil.example")
+        results["firma sin https"] = attempt(f"http://{DOMAIN}")
+        results["firma de otro dominio"] = attempt(DOMAIN_URL, rp_id=pk.RP_ID)
+        results["firma buena"] = attempt(DOMAIN_URL)
+        # With a key the link is closed (D40), the one already given too, and root says the way
+        # back, which has to work: the key taken out, the sessions gone, and a link again.
+        closed = enlace()
+        results["enlace con llave"] = (closed.returncode, "llaves --quitar" in closed.stderr,
+                                       "?t=" in closed.stdout)  # fmt: skip
+        results["enlace ya dado"] = probe(
+            {"cmd": "session_open", "token": pending, "_why": True}
+        )[0]  # fmt: skip
+        key_id = json.loads(kept.read_text())["keys"][0]["id"]
+        results["quitar"] = sh(str(layout.PROGRAM), "llaves", "--quitar", key_id,
+                               check=False).returncode  # fmt: skip
+        results["sesión tras quitar"] = probe({"cmd": "session_check", "session": value})[0]
+        results["reto sin llaves"] = probe({"cmd": "auth_begin", "_why": True})[0]
+        again = enlace()
+        results["enlace otra vez"] = (again.returncode, f"{DOMAIN_URL}/?t=" in again.stdout)
+        events = installed.box.events(since_seq=since)
+    finally:
+        bad_file.unlink(missing_ok=True)
+        kept.unlink(missing_ok=True)
+        layout.CONFIG_FILE.write_bytes(service_toml)
+        layout.WEB_CONFIG_FILE.write_bytes(web_toml)
+        try:
+            restart_service(installed)
+        finally:  # or the web stays on the domain, and the next scenarios fail for that
+            sh("systemctl", "restart", layout.WEB_UNIT, timeout=120)
+    assert wait(lambda: not web_says_domain(), 60, interval=1), "the web did not go back"
+    # And back on the tunnel, with nothing of the domain left: the same request for the old names.
+    back = as_the_proxy("GET", f"/s/{web_prefix()}/", host=f"{pk.RP_ID}:{pk.WEB_PORT}")
+    domain_gone = as_the_proxy("GET", f"/s/{web_prefix()}/")
+
+    def status(name: str) -> int:
+        return results[name][0]
+
+    def says(name: str, text: str) -> bool:
+        return text in results[name][1]
+
+    hosts = {n: results[n][:2] for n in results if n.startswith("Host ")}
+    origins = {n: results[n][:2] for n in results if n.startswith("Origin ") and "bueno" not in n}
+    entries = [e for e in events if e.action == "web_session_opened"]
+    ways = sorted(str(e.details.get("via")) for e in entries)
+    removed = [e for e in events if e.action == "web_passkey_removed"]
+    bad_origins = [
+        (code, bad) for code, said, bad in bad_said
+        if code != 2 or "public_origin" not in said or "hunter2" in said or bad in said
+    ]  # fmt: skip
+    signatures = ("firma del túnel", "firma de otro sitio", "firma sin https",
+                  "firma de otro dominio")  # fmt: skip
+    ok = (
+        not bad_origins
+        and status("sin cookie") == 401
+        and says("sin cookie", 'id="webauthn-go"')
+        and not says("sin cookie", 'type="password"')
+        and link[0] == 200
+        and cookie_line.startswith(f"{DOMAIN_COOKIE_NAME}=")
+        and {"secure", "httponly", "samesite=strict", "path=/"}
+        <= {part.strip().lower() for part in cookie_line.split(";")[1:]}
+        and status("dentro") == 200
+        and status("cookie sin __Host-") == 401
+        and all(found == (400, "Host not allowed") for found in hosts.values())
+        and results["X-Forwarded-Host"][:2] == (400, "Host not allowed")
+        and all(found == (403, "A change needs our own Origin") for found in origins.values())
+        # The control: with its own Origin it reaches the service, which has no key to sign yet.
+        and status("Origin bueno") == 400
+        and says("Origin bueno", "ninguna llave")
+        and results["/entrar"][:2] == (405, "Read-only")
+        and not results["/entrar"][2]
+        and results["contraseña al socket"].get("outcome") == "refused"
+        and "no lleva contraseña" in results["contraseña al socket"].get("why", "")
+        and all(found == 401 for found in no_session.values())
+        and "tocar tu llave" in results["sin llave"].get("why", "")
+        and results["enlace"] == 0
+        and results["el enlace entra"] == 200
+        and results["archivo cambiado"] == (1, True, False, 0)
+        and results["enlace con llave"] == (1, True, False)
+        and results["enlace ya dado"].get("outcome") == "refused"
+        and "llaves --quitar" in results["enlace ya dado"].get("why", "")
+        and results["quitar"] == 0
+        and results["sesión tras quitar"].get("outcome") == "expired"
+        and "ninguna llave" in results["reto sin llaves"].get("why", "")
+        and results["enlace otra vez"] == (0, True)
+        and results["dominio de la llave"] == DOMAIN
+        and results["llave"].get("outcome") == "added"
+        and results["archivo"] == (True, False)
+        and all(
+            results[name].get("outcome") == "refused"
+            and "firma válida" in results[name].get("why", "")
+            for name in signatures
+        )
+        and results["firma buena"].get("outcome") == "opened"
+        and back[0] == 401
+        and domain_gone[:2] == (400, "Host not allowed")
+        and layout.CONFIG_FILE.read_bytes() == service_toml
+        and layout.WEB_CONFIG_FILE.read_bytes() == web_toml
+    )
+    attack.check(
+        "stopped",
+        ok,
+        f"origen malo, la web no arranca: {[c for c, _, _ in bad_said]} (fuera de lo esperado: "
+        f"{bad_origins or 'ninguno'}); el control entra con su Host y su cookie ({link[0]}, "
+        f"{status('dentro')}) y sin __Host- no ({status('cookie sin __Host-')}); otros Host: "
+        f"{hosts}; X-Forwarded-*: {results['X-Forwarded-Host'][:2]}; otros Origin: {origins}; su "
+        f"Origin: {results['Origin bueno'][:2]}; /entrar con la contraseña buena: "
+        f"{results['/entrar'][:2]}, y por el socket: {results['contraseña al socket'].get('why')}; "
+        f"sin sesión: {no_session}; lo que dura, sin llave: {results['sin llave'].get('why')}; la "
+        f"llave del dominio: {results['dominio de la llave']}, {results['llave'].get('outcome')}, "
+        f"en su archivo {results['archivo']}; firmas de otro sitio: "
+        f"{[results[name].get('why') for name in signatures]}; la buena: "
+        f"{results['firma buena'].get('outcome')}; `backtide enlace`: {results['enlace']}, y entra "
+        f"({results['el enlace entra']}); con el archivo cambiado (código, dice por qué, enseña "
+        f"algo, tokens dados): {results['archivo cambiado']}; con llave, enlace nuevo "
+        f"{results['enlace con llave']} y el ya dado {results['enlace ya dado'].get('why')}; "
+        f"`llaves --quitar`: {results['quitar']}, la sesión "
+        f"{results['sesión tras quitar'].get('outcome')}, sin reto "
+        f"({results['reto sin llaves'].get('why')}) y otra vez enlace "
+        f"{results['enlace otra vez']}; al quitar `public_origin`, el túnel otra vez ({back[0]}) y "
+        f"el dominio no ({domain_gone[:2]})",
+    )
+    attack.check(
+        "recorded",
+        set(ways) == {"None", "passkey"} and ways.count("passkey") == 1 and len(removed) == 1,
+        f"en la caja negra, las entradas con el enlace y una con la llave, ninguna con contraseña: "
+        f"{ways}; y la llave quitada ({len(removed)})",
+    )
+
+
+@scenario("cookies-inventadas")
+def test_made_up_cookies_do_not_throw_the_owner_out(attack: Attack, installed: Installed) -> None:
+    """Review of T26-3c, for T26-4a: with a domain, anyone can send made-up cookies. Hundreds of
+    them never leave a live session out: they empty a bucket of their own, past it the word is a
+    503, never a 401, and root's link gets in however many wrong ones came first. Through the
+    tunnel's names: the buckets are the service's, the same with a domain or without one."""
+    from backtide.service import passkeys as pk
+    from backtide.web.security import COOKIE_NAME
+
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    base = f"/s/{web_prefix()}"
+    host = f"{pk.RP_ID}:{pk.WEB_PORT}"
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    made_up = {"cmd": "session_check", "session": "m" * 43}
+
+    def probe(*requests: dict) -> list[dict]:
+        return probe_as(web.pw_uid, web.pw_gid, "", path, *requests)
+
+    # By the socket, faster than the bucket refills: the live one is asked right after them.
+    opened = {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET), "_see": True}
+    live = {"cmd": "session_check", "session": "<session>"}
+    said = probe(opened, *[made_up] * 600, *[live] * 5, *[made_up] * 30)
+    session = said[0]["session"]
+    flood, owner_after, still = said[1:601], said[601:606], said[606:]
+    outcomes = {o: sum(r.get("outcome") == o for r in flood) for o in ("expired", "busy", "live")}
+
+    # By HTTP, with the owner's page asked for all through a flood of made-up cookies.
+    time.sleep(8)  # its bucket back, so that this flood has something to empty
+    stop = threading.Event()
+    flood_said: list[int] = []
+    owner_said: list[int] = []
+    busy_said: list[tuple[int, str, str, str]] = []
+    errors: list[str] = []
+
+    def flooding() -> None:
+        while not stop.is_set():
+            forged = f"{COOKIE_NAME}={secrets.token_urlsafe(32)}"
+            try:
+                found = as_the_proxy("GET", f"{base}/ahora", host=host, cookie=forged)
+            except (OSError, HTTPException) as error:  # or the flood ends here, and nobody knows
+                errors.append(type(error).__name__)
+                return
+            flood_said.append(found[0])
+            if found[0] == 503:
+                busy_said.append(found)
+
+    threads = [threading.Thread(target=flooding) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    own = f"{COOKIE_NAME}={session}"
+    try:
+        for _ in range(60):
+            owner_said.append(as_the_proxy("GET", f"{base}/ahora", host=host, cookie=own)[0])
+            time.sleep(0.25)
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join()
+    # The control of the 401: the made-up cookie alone, with its bucket back.
+    time.sleep(8)
+    alone = as_the_proxy("GET", f"{base}/ahora", host=host, cookie=f"{COOKIE_NAME}={'m' * 43}")[0]
+    # Root's link, after wrong ones past their bucket.
+    wrong = {"cmd": "session_open", "token": "w" * 43, "_why": True}
+    token = ask_web_link(CONTROL_SOCKET)
+    links = probe(*[wrong] * 12, {"cmd": "session_open", "token": token, "_why": True})
+    recorded = recorded_in_time(
+        installed, since, "too many session_check", lambda: probe(*[made_up] * 400)
+    )
+    ended = probe({"cmd": "session_end", "session": session})
+    ok = (
+        outcomes["busy"] > 0
+        and outcomes["expired"] > 0
+        and outcomes["live"] == 0
+        and flood[0].get("outcome") == "expired"
+        # Not the very last: the bucket gets 40 tokens back a second while this runs.
+        and any(r.get("outcome") == "busy" for r in flood[-30:])
+        and all(r.get("outcome") == "live" for r in owner_after)
+        and any(r.get("outcome") == "busy" for r in still)
+        and all(r.get("outcome") in ("busy", "expired") for r in still)
+        and not errors
+        and len(flood_said) >= 100
+        and set(flood_said) <= {401, 503}
+        and busy_said
+        # The service's cap, not uvicorn's own 503: its Retry-After and the way in.
+        and {found[3] for found in busy_said} == {"5"}
+        and all('id="webauthn-go"' in found[1] for found in busy_said)
+        and alone == 401
+        and owner_said.count(200) >= 57
+        and 401 not in owner_said
+        and "Demasiadas" in links[-2].get("why", "")
+        and links[-1].get("outcome") == "opened"
+        and ended[0].get("outcome") == "ended"
+    )
+    attack.check(
+        "stopped",
+        ok,
+        f"600 cookies inventadas por el socket: {outcomes}, y la sesión viva justo después: "
+        f"{[r.get('outcome') for r in owner_after]}, y otras inventadas: "
+        f"{sorted({str(r.get('outcome')) for r in still})}. Por HTTP: inventadas "
+        f"{sorted(set(flood_said))} ({len(flood_said)}, errores de los hilos: {errors or 'ninguno'}"
+        f", Retry-After de los 503: {sorted({found[3] for found in busy_said})}), el dueño a la "
+        f"vez {owner_said.count(200)} de {len(owner_said)} dentro y "
+        f"{owner_said.count(401)} con 401; una sola, sin avalancha: {alone}. Enlaces equivocados:"
+        f" {links[-2].get('why')}; el bueno: "
+        f"{links[-1].get('outcome')}",
+    )
+    attack.check(
+        "recorded", recorded, f"el tope, en la caja negra por el puente del registro: {recorded}"
     )

@@ -2,7 +2,9 @@
 
 After the first entry with the password, the web asks to register a passkey; with one, the
 owner signs in (``sign_in_begin``, ``sign_in``) and touches it again for what lasts longer than a
-session (``touch_begin``, ``touch``, T26-3c). Through the domain (T26-4) it will be the only way in.
+session (``touch_begin``, ``touch``, T26-3c). Through a domain (T26-4a) it is the way in, with the
+domain as its relying party and its keys in a file of their own (``path_of``); root's one-time
+link is only there for the first key and to recover.
 
 - The service checks the browser's answer with ``webauthn`` (3.0.1, pinned with its packages by
   hash in uv.lock), never the web: the web only carries the challenge and the answer.
@@ -105,8 +107,11 @@ def origin_for(port: int) -> str:
     return f"http://{RP_ID}:{port}"
 
 
-def path_of(state_dir: Path) -> Path:
-    return Path(state_dir) / FOLDER / FILE
+def path_of(state_dir: Path, rp_id: str = RP_ID) -> Path:
+    """Where the keys of this relying party are kept: a key signs for one name and no other, so
+    those of ``backtide.localhost`` wait in their own file while the web is behind a domain
+    (T26-4a), and would otherwise be asked to touch what no browser there can touch."""
+    return Path(state_dir) / FOLDER / (FILE if rp_id == RP_ID else f"passkeys-{rp_id}.json")
 
 
 def name_problem(name: object) -> str | None:
@@ -154,11 +159,17 @@ class Passkeys:
         self._sign_ins: dict[bytes, float] = {}  # challenge -> when it dies
         self._lock = threading.Lock()
 
+    @property
+    def on_a_domain(self) -> bool:
+        """Is the web behind a domain (T26-4a)? There it takes a passkey (D40), even for what a
+        session could do without one through the tunnel."""
+        return self._rp_id != RP_ID
+
     # -- reading and writing the file --------------------------------------------------------
 
     def keys(self) -> list[Passkey]:
         """The kept keys, oldest first. PasskeyError for a file that is not ours."""
-        path = path_of(self._state_dir)
+        path = path_of(self._state_dir, self._rp_id)
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         try:
             fd = os.open(path, flags)
@@ -193,7 +204,8 @@ class Passkeys:
                 raise PasskeyError(f"{folder} no es una carpeta nuestra")
             os.chmod(folder, 0o700)
             data = json.dumps({"keys": [asdict(key) for key in keys]}, indent=2) + "\n"
-            write_private(folder, FILE, data.encode(), private_dir=True)
+            name = path_of(self._state_dir, self._rp_id).name
+            write_private(folder, name, data.encode(), private_dir=True)
         except OSError as error:
             raise PasskeyError(f"no se puede guardar en {folder}: {error.strerror}") from None
         except SettingsError as error:

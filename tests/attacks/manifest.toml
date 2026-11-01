@@ -2255,3 +2255,37 @@ recorded = "yes"
 risk = "n/a"
 recoverable = "n/a"
 held = "n/a"
+
+# ---------------------------------------------------------------------------------------
+# T26-4a: la web en un dominio
+# ---------------------------------------------------------------------------------------
+
+[[scenario]]
+id = "web-en-un-dominio"
+name = "Por el dominio solo entra su Host, su Origin y su llave, y la contraseña no existe"
+story = """T26-4a (D40): con `[web] public_origin` en la instalación de verdad y un origen https de mentira, el escenario hace lo que haría el proxy inverso del servidor, en loopback. Con un origen malo (http, con credenciales, con ruta), la web no arranca y lo dice sin repetirlo. Como control, el `Host` del dominio con el enlace de root recibe la cookie `__Host-` (Secure, HttpOnly, SameSite=Strict, Path=/) y entra; sin ese nombre de cookie, no. Con esa misma cookie, otro `Host` (uno ajeno, 127.0.0.1 y backtide.localhost incluidos: un proxy que pasa cualquier nombre no convierte una petición en local) es un 400 por su motivo, y `X-Forwarded-*` no cambia nada. Otro `Origin` (otro sitio, el mismo nombre sin https, otro puerto) es un 403 por su motivo. La contraseña buena por `/entrar` es un 405 y por el socket estrecho se rechaza: no hay entrada con contraseña. Las páginas y órdenes en la raíz, sin sesión, contestan 401. Sin llave todavía, lo que dura ya pide llave. `sudo backtide enlace` da el enlace del dominio y ese enlace entra; si una web tomada reescribe su archivo con otra dirección, la orden falla, no enseña ningún token y no se da ninguno. La llave se registra para ese dominio, en su propio archivo, y una firma hecha para el túnel, para otro sitio, sin https o para otro dominio no entra; la buena sí. Con una llave registrada, `enlace` no da ninguno y el que ya se había dado no entra; `sudo backtide llaves --quitar` quita la llave de ese dominio y cierra las sesiones, y entonces `enlace` vuelve a dar uno, que es la vuelta si se pierde. En la caja negra, entradas con el enlace y una con la llave, ninguna con contraseña, y la llave quitada. Al terminar, la configuración vuelve a estar como estaba y la web vuelve al túnel."""
+inspired_by = "Un dominio público: un internet entero que prueba nombres, cabeceras y contraseñas"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "cookies-inventadas"
+name = "Seiscientas cookies inventadas no echan al dueño: es un 503, nunca un 401"
+story = """Revisión de T26-3c, para T26-4a: con un dominio, cualquiera en internet puede mandar cookies inventadas. El escenario corre por los nombres del túnel, porque los cubos son del servicio y son los mismos con dominio o sin él. Por el socket estrecho, 600 seguidas agotan su propio cubo (la primera `expired`, entre las últimas `busy`, ninguna `live`) y la sesión viva sigue `live` justo después, porque no gasta ese cubo. Por HTTP, con ocho hilos mandando cookies inventadas, ellas reciben 401 o 503 (el del tope del servicio, con su `Retry-After: 5` y la página de entrar) y el dueño, a la vez, entra al menos 57 de 60 veces y nunca ve un 401. Como control, una cookie inventada sola, con el cubo ya lleno, sí es un 401. Los enlaces equivocados agotan su cubo y el enlace de root entra igualmente. El tope queda en la caja negra por el puente del registro."""
+inspired_by = "Echar al dueño de su propia web sin saber ninguna clave"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"

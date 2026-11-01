@@ -62,6 +62,7 @@ from backtide.jail.config import AGENT_GID, AGENT_UID
 from backtide.jail.identity import AGENT_ID_RANGE
 from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
 from backtide.service.control import (
+    LINK_CLOSED,
     MAX_CONNECTIONS,
     MAX_LIST_REPLY_BYTES,
     REPLY_TIMEOUT,
@@ -121,8 +122,11 @@ TOUCH_CHANGES = frozenset({"set_secret", "clear_secret", "trust"})
 REQUESTS_BURST, REQUESTS_PER_SECOND = 120, 20.0
 CHANGES_BURST, CHANGES_PER_SECOND = 10, 1 / 3
 # Every page and fragment checks its session: a bucket of their own, so the stream of an open
-# tab never starves a click. Opening a session: a person, with a link, now and then.
+# tab never starves a click. Made-up cookies have another (T26-4a): behind a domain anyone can send
+# them, and they must never empty the one of a session that lives. A wrong link spends its bucket
+# the same way (a person, with a link, now and then), and the right one goes through whatever came.
 CHECKS_BURST, CHECKS_PER_SECOND = 240, 40.0
+MADE_UP_BURST, MADE_UP_PER_SECOND = 240, 40.0
 OPENS_BURST, OPENS_PER_SECOND = 5, 1 / 6
 # "Close them all": a bucket of its own, so a stream of made-up links cannot block it.
 ENDS_BURST, ENDS_PER_SECOND = 5, 1 / 6
@@ -155,12 +159,18 @@ PASSWORD_MESSAGES = {
     Verdict.UNSET: "Aún no hay contraseña: ponla con `sudo backtide contraseña`, o entra con "
     "`sudo backtide enlace`.",
 }
+BUSY = "busy"  # a session_check past its bucket: nobody knows yet, and it is not "expired"
 NO_SESSION = "Sin una sesión viva no se cambia nada: vuelve a entrar con `sudo backtide enlace`."
 NEEDS_TOUCH = "Esto pide volver a tocar tu llave: tócala en la web y prueba otra vez."
 FIRST_KEY_TOO_LATE = "La primera llave se registra nada más entrar: vuelve a entrar y regístrala."
 MAX_LISTED_SNAPSHOTS = 5000
 _FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID, *AGENT_ID_RANGE})
 _FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID, *AGENT_ID_RANGE})
+
+
+class SessionCheckRefused(ControlError):
+    """The service would not look at a session right now (its cap, or too many connections): it
+    says nothing about that session, which may be alive (T26-4a)."""
 
 
 class Bucket:
@@ -212,6 +222,7 @@ class WebControlServer(ControlServer):
         changes: Bucket | None = None,
         sessions: Sessions | None = None,
         checks: Bucket | None = None,
+        made_up: Bucket | None = None,
         opens: Bucket | None = None,
         ends: Bucket | None = None,
         passwords: Bucket | None = None,
@@ -249,6 +260,7 @@ class WebControlServer(ControlServer):
         self._requests = requests or Bucket(REQUESTS_BURST, REQUESTS_PER_SECOND)
         self._changes = changes or Bucket(CHANGES_BURST, CHANGES_PER_SECOND)
         self._checks = checks or Bucket(CHECKS_BURST, CHECKS_PER_SECOND)
+        self._made_up = made_up or Bucket(MADE_UP_BURST, MADE_UP_PER_SECOND)
         self._opens = opens or Bucket(OPENS_BURST, OPENS_PER_SECOND)
         self._ends = ends or Bucket(ENDS_BURST, ENDS_PER_SECOND)
         self._passwords = passwords or Bucket(PASSWORDS_BURST, PASSWORDS_PER_SECOND)
@@ -340,13 +352,15 @@ class WebControlServer(ControlServer):
         allowed = {"cmd", key, "use"} if command == "session_check" else {"cmd", key}
         if not {"cmd", key} <= set(request) <= allowed or request.get("use", False) is not False:
             raise _BadRequest(f"Esa orden lleva `cmd` y `{key}`, y nada más.")
+        # A session that lives and the right link are looked at first, so that nobody who only
+        # makes them up can keep them out: looking costs a digest, and tells nothing of 256 bits.
+        if command == "session_check":
+            return self._session_check(request[key], "use" not in request, pid)
         buckets = {
-            "session_open": self._opens,
             "session_end_all": self._ends,
             "session_password": self._passwords,
         }
-        bucket = buckets.get(command, self._checks)
-        if not bucket.take():
+        if command != "session_open" and not buckets.get(command, self._checks).take():
             logger.warning("web socket: too many %s, one from pid %d was refused", command, pid)
             raise _BadRequest("Demasiadas peticiones seguidas: espera un poco.")
         if self._sessions is None:
@@ -355,8 +369,16 @@ class WebControlServer(ControlServer):
         if command == "session_password":
             return self._password(given, pid)
         if command == "session_open":
+            if self._link_closed():  # the link is left as it was, whatever it says
+                logger.warning("web socket: refused a link behind a domain with keys (pid %d)", pid)
+                return {"ok": False, "outcome": "refused", "message": LINK_CLOSED}
             session = self._sessions.open(given)
             if session is None:
+                if not self._opens.take():
+                    logger.warning(
+                        "web socket: too many session_open, one from pid %d was refused", pid
+                    )
+                    raise _BadRequest("Demasiadas peticiones seguidas: espera un poco.")
                 logger.warning(
                     "web socket: refused a link that is wrong, spent or old (pid %d)", pid
                 )
@@ -372,11 +394,6 @@ class WebControlServer(ControlServer):
             )
             return {"ok": True, "outcome": "opened", "message": "",
                     "session": session.id, "csrf": session.csrf}  # fmt: skip
-        if command == "session_check":
-            session = self._sessions.check(given, use="use" not in request)
-            if session is None:
-                return {"ok": False, "outcome": "expired", "message": ""}
-            return {"ok": True, "outcome": "live", "message": "", "csrf": session.csrf}
         if command == "session_end":
             ended = self._sessions.end(given)
             return {"ok": True, "outcome": "ended" if ended else "expired", "message": ""}
@@ -394,6 +411,19 @@ class WebControlServer(ControlServer):
         if self._on_entry is not None:
             self._on_entry("web_sessions_closed", {"pid": pid, "ended": ended})
         return {"ok": True, "outcome": "ended", "message": "", "ended": ended}
+
+    def _session_check(self, given: object, use: bool, pid: int) -> dict[str, Any]:
+        """Does this cookie's session live? Each answer spends its own bucket (T26-4a), and past
+        the cap the word is ``busy``, never ``expired``: the web then says 503, not "sign in"."""
+        if self._sessions is None:
+            raise _BadRequest("Este servicio no lleva sesiones de la web.")
+        session = self._sessions.check(given, use=use)
+        if not (self._made_up if session is None else self._checks).take():
+            logger.warning("web socket: too many session_check, one from pid %d was refused", pid)
+            return {"ok": False, "outcome": BUSY, "message": "Demasiadas comprobaciones seguidas."}
+        if session is None:
+            return {"ok": False, "outcome": "expired", "message": ""}
+        return {"ok": True, "outcome": "live", "message": "", "csrf": session.csrf}
 
     def _passkey_command(self, command: str, request: dict[str, Any], pid: int) -> dict[str, Any]:
         """Register a passkey and list them (T26-3b-2): from a live session only; the service
@@ -536,8 +566,9 @@ class WebControlServer(ControlServer):
 
     def _needs_touch(self, session_id: object) -> bool:
         """Does this session have to touch a passkey first (docs/47 section 5.3)? Only once there
-        is one: through the tunnel the password is enough without any (D40). A file that cannot
-        be read may hold keys: yes, and the owner hears of it."""
+        is one: through the tunnel the password is enough without any (D40). Behind a domain,
+        always: a session of root's link has the first key to register before anything else (D40,
+        T26-4a). A file that cannot be read may hold keys: yes, and the owner hears of it."""
         if self._passkeys is None or self._sessions is None:
             return False
         try:
@@ -545,7 +576,8 @@ class WebControlServer(ControlServer):
         except PasskeyError as error:
             logger.error("web socket: the passkeys cannot be read: %s", error)
             return True
-        return bool(kept) and not self._sessions.recently_touched(session_id)
+        needed = bool(kept) or self._passkeys.on_a_domain
+        return needed and not self._sessions.recently_touched(session_id)
 
     def _add_refusal(self, session_id: str) -> str | None:
         """Why this session may not add a key, or None: with keys, it touches one; the first
@@ -807,14 +839,17 @@ def ask_session_check(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> Session | None:
-    """The live session with this id, or None; with ``use`` it counts as used (a page's own
-    stream asks without it). ControlError as above."""
+    """The live session with this id, or None if the service says it is not one; with ``use`` it
+    counts as used (a page's own stream asks without it). SessionCheckRefused if it would not
+    look (past a cap, or too many connections: T26-4a); ControlError as above."""
     request: dict[str, Any] = {"cmd": "session_check", "session": session_id}
     if not use:
         request["use"] = False
     reply = _ask_session(path, request,
                          server_uid=server_uid, wait=wait, peer=peer, sleep=sleep,
                          monotonic=monotonic)  # fmt: skip
+    if reply["ok"] is not True and reply.get("outcome") != "expired":
+        raise SessionCheckRefused("El servicio no ha mirado esa sesión.")
     return _session_of(reply, session_id)
 
 
@@ -897,6 +932,7 @@ __all__ = [
     "SIGN_IN_COMMANDS",
     "TOUCH_CHANGES",
     "Bucket",
+    "SessionCheckRefused",
     "WebControlServer",
     "ask_auth",
     "ask_passkey",
