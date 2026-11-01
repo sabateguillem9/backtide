@@ -110,7 +110,7 @@ sudo backtide tarea "Hello, who are you and what can you do?"
 
 `tarea` ("task") asks the running backtide first, which records it in the black box, then gives your message to OpenClaw inside its container and prints the reply. The command waits for the answer, which can take a while (15 minutes at most; `--minutos N` changes that, and Ctrl-C stops it). All messages go into the same conversation, the one Telegram uses too, so you can also just write to your bot. Your message reaches the agent as it is, but your own shell still reads `$` and backticks inside double quotes: if the message has them, put it in single quotes.
 
-Those are the two ways to talk to OpenClaw: `tarea` and Telegram. The web shows what it does, and from it you approve, reject and rewind, but it does not send the agent messages. `backtide entrar`, which opens the agent inside your terminal, is only for Claude Code for now: OpenClaw reads Telegram and the web all the time, and what it is told could make it write escape sequences straight into your terminal.
+Those are the two ways to talk to OpenClaw: `tarea` and Telegram. The web shows what it does, and from it you approve, reject and rewind, but it does not send the agent messages. `backtide entrar`, which opens the agent inside your terminal, is only for Claude Code for now: OpenClaw reads Telegram and the web all the time, and what it is told could make it write escape sequences into your terminal. With Claude Code those sequences are filtered on their way to your terminal; that filter has not been opened for OpenClaw yet.
 
 `tarea` with OpenClaw was tested in backtide's development setup. If it fails on your install, tell us.
 

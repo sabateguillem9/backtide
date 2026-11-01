@@ -10,8 +10,8 @@ shell one and is running, and records the request in the black box before anythi
 
 - `entrar`: writes the first-run answers of the profile (Claude Code: ``~/.claude.json``) with
   ``docker exec -i`` as the agent, then ``docker exec -it`` of its interactive program, as the
-  agent's user, in its working folder, connected to this terminal. What the agent prints goes
-  straight to the terminal (docs/34, R5).
+  agent's user, in its working folder, through the terminal relay: what the agent prints reaches
+  this terminal filtered (T26-5c, backtide/service/terminal_relay.py; docs/34, R5).
 - `tarea`: ``docker exec`` of the headless run with the prompt as one argument (after ``--``,
   or glued to the profile's option: OpenClaw's ``--message=<prompt>``), and the answer printed
   (Claude Code: ``result`` of its JSON; OpenClaw: the texts of its JSON's payloads), with its
@@ -86,6 +86,7 @@ from backtide.service.control import (
 )
 from backtide.service.export import BUNDLE_DIR
 from backtide.service.shell import REPO_RE
+from backtide.service.terminal_relay import relay_pipes, relay_terminal
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -114,12 +115,19 @@ PROBE_TIMEOUT = 30.0
 PGREP = "/usr/bin/pgrep"
 PKILL = "/usr/bin/pkill"
 MAX_MINUTES = 24 * 60
-# `entrar`: when the session ends, what the agent may have left in the terminal is undone: a soft
-# reset (DECSTR), out of the alternate screen, no mouse reporting, no bracketed paste, cursor on,
-# and the colour palette back to the terminal's own (OSC 104).
+# `entrar`: when the session ends, what the agent may have left in the terminal is undone. The
+# relay lets these through (terminal_relay.py), so this has to undo each one:
+# - CAN first, in case the session was cut in the middle of a sequence; out of the alternate screen.
+# - A soft reset (DECSTR), and one by one what it covers, because not every terminal has it (the
+#   Linux console and tmux do not): scroll margins and origin, which move the cursor, so between
+#   saving and restoring it; colours and styles, line wrap, cursor and keypad keys, insert mode,
+#   new-line mode (which the relay drops anyway) and the character sets.
+# - No mouse or focus reporting, no bracketed paste, no synchronized output (the terminal would
+#   stop drawing), the cursor on and of its usual shape, and the palette back (OSC 104).
 TERMINAL_RESET = (
-    "\x1b[!p\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
-    "\x1b[?2004l\x1b[?25h\x1b]104\x07"
+    "\x18\x1b[?1049l\x1b[!p\x1b7\x1b[r\x1b[?6l\x1b8\x1b[0m\x1b[?7h\x1b[?1l\x1b>\x1b[4l\x1b[20l"
+    "\x1b(B\x1b)B\x0f\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l"
+    "\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?25h\x1b[0 q\x1b]104\x07"
 )
 SESSION_CLOSED = "Sesión del agente cerrada. Estás otra vez en tu terminal."
 SETTLE = 0.1  # what the terminal still answers to the agent's last queries arrives meanwhile
@@ -228,42 +236,63 @@ def _exec_prefix(reply: dict[str, Any], *flags: str, workdir: str | None = None)
     ]  # fmt: skip
 
 
+def _on_a_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def _interactive(argv: list[str]) -> int:
-    """The docker CLI connected to this terminal (``docker exec -it``)."""
+    """The docker CLI connected to this terminal through the relay (``docker exec -it``), or, with
+    no terminal to connect, to stdin and stdout, filtered all the same (``docker exec -i``)."""
+    program = [docker.PROGRAM, *argv]
     try:
-        return subprocess.call([docker.PROGRAM, *argv])
-    except OSError as problem:
-        error(f"no se puede ejecutar {docker.PROGRAM}: {problem}")
+        stdout_fd = sys.stdout.fileno()
+        if _on_a_terminal():
+            return relay_terminal(program, sys.stdin.fileno(), stdout_fd)
+        return relay_pipes(program, stdout_fd)
+    except (OSError, ValueError, termios.error) as problem:
+        error(f"la sesión con {docker.PROGRAM} no se ha podido abrir o mantener: {problem}")
         return 127
 
 
 # -- entrar --------------------------------------------------------------------------------------
 
 
+def _warn_about_the_terminal(message: str) -> None:
+    """Say it on stderr. If stderr is that same terminal and it is gone, no one can read it."""
+    with contextlib.suppress(OSError, ValueError):
+        error(message)
+
+
 def terminal_guard(fd: int, out: Any) -> Callable[[], None]:
     """Save the terminal's settings of ``fd`` now (if it is a terminal) and return what puts
-    them back after a session (M1 of the review): wait ``SETTLE`` for the terminal's late
-    answers, throw away whatever input is pending (an answer to the agent's queries would
-    otherwise be typed into the owner's shell), restore the settings, and write the soft reset
-    on ``out`` if it is a terminal. Never raises."""
+    things back after a session (M1 of the review). If ``fd`` is a terminal: wait ``SETTLE`` for
+    the terminal's late answers, throw away whatever input is pending (an answer to the agent's
+    queries would otherwise be typed into the owner's shell) and restore the settings. And if
+    ``out`` is a terminal, whatever ``fd`` is (`backtide entrar < archivo` prints there too): write
+    the reset. Says what it could not do, and never raises."""
+    saved = None
     try:
-        saved = termios.tcgetattr(fd) if os.isatty(fd) else None
-    except (OSError, termios.error):
-        saved = None
+        if os.isatty(fd):
+            saved = termios.tcgetattr(fd)
+    except (OSError, termios.error) as problem:
+        _warn_about_the_terminal(f"no se han podido leer los ajustes de la terminal: {problem}")
 
     def restore() -> None:
-        if saved is None:
-            return
-        time.sleep(SETTLE)
+        if saved is not None:
+            time.sleep(SETTLE)
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                termios.tcflush(fd, termios.TCIFLUSH)
+            except (OSError, termios.error) as problem:
+                _warn_about_the_terminal(
+                    f"no se ha podido dejar la terminal como estaba: {problem}"
+                )
         try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-            termios.tcflush(fd, termios.TCIFLUSH)
-        except (OSError, termios.error) as problem:
-            error(f"no se ha podido dejar la terminal como estaba: {problem}")
-        with contextlib.suppress(OSError, ValueError):
             if out.isatty():
                 out.write(TERMINAL_RESET)
                 out.flush()
+        except (OSError, ValueError) as problem:
+            _warn_about_the_terminal(f"no se ha podido reiniciar la terminal: {problem}")
 
     return restore
 
@@ -298,9 +327,8 @@ def entrar(config: ServiceConfig, *, resume: bool = False, run: Runner = _intera
             tail = docker.sanitize((seeded.stderr or seeded.stdout).strip()[-500:])
             error(f"no se han podido preparar los primeros pasos del agente: {tail}")
             return EXIT_FAILED
-    tty = sys.stdin.isatty() and sys.stdout.isatty()
     term = os.environ.get("TERM", "")
-    flags = ["--interactive", *(["--tty"] if tty else [])]
+    flags = ["--interactive", *(["--tty"] if _on_a_terminal() else [])]
     if _TERM_RE.fullmatch(term):
         flags += ["--env", f"TERM={term}"]
     print("Entrando en el agente (sal con /exit o Ctrl-D). Todo lo que haga queda grabado.")

@@ -277,6 +277,50 @@ def test_the_terminal_guard_flushes_pending_input_restores_and_resets(
         os.close(follower)
 
 
+def test_the_reset_goes_to_a_terminal_on_stdout_even_without_one_on_stdin() -> None:
+    """`backtide entrar < archivo`: nothing to restore, but the agent's modes reached stdout."""
+
+    class Out(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    read, write = os.pipe()
+    out = Out()
+    try:
+        shell_cli.terminal_guard(read, out)()
+    finally:
+        os.close(read)
+        os.close(write)
+    assert out.getvalue() == shell_cli.TERMINAL_RESET
+
+
+def test_the_guard_says_what_it_could_not_do(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import termios
+
+    def fails(*_: Any) -> None:
+        raise termios.error(5, "no")
+
+    class Out(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+        def write(self, text: str) -> int:
+            raise OSError(5, "gone")
+
+    monkeypatch.setattr(shell_cli, "SETTLE", 0)
+    leader, follower = os.openpty()
+    try:
+        monkeypatch.setattr(termios, "tcgetattr", fails)
+        shell_cli.terminal_guard(follower, Out())()
+        err = capsys.readouterr().err
+        assert "leer los ajustes" in err and "reiniciar la terminal" in err
+    finally:
+        os.close(leader)
+        os.close(follower)
+
+
 def test_without_a_terminal_the_guard_does_nothing() -> None:
     read, write = os.pipe()
     out = io.StringIO()

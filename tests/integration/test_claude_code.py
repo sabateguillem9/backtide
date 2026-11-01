@@ -13,10 +13,14 @@ as `script` would give it), `rebobinar`, `importar` and `exportar`.
 Only fake keys and made-up ones: nothing reaches Anthropic, GitHub or Telegram (invariant 8).
 """
 
+import fcntl
 import json
 import os
+import signal
+import struct
 import subprocess
 import sys
+import termios
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -253,6 +257,11 @@ def test_entrar_opens_claude_code_on_a_terminal(lab: Lab) -> None:
         assert not any(dialog in screen for dialog in DIALOGS), term.text()[-2000:]
         term.type(write("work/entrar.txt", "tres"))
         wait_for(lambda: target.exists() and target.read_text() == "tres\n", 90, "tres", term)
+        # The relay's own terminal is in the middle: a new window size has to cross it.
+        fcntl.ioctl(term.master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        term.process.send_signal(signal.SIGWINCH)
+        sizes = 'for tty in /dev/pts/[0-9]*; do stty -F "$tty" size; done'
+        wait_for(lambda: "30 100" in exec_in_agent(service, sizes), 30, "the new size", term)
         term.type("/exit")
         code = term.process.wait(timeout=60)
     finally:

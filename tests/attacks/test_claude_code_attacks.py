@@ -20,9 +20,10 @@ and made-up keys: nothing reaches Anthropic, GitHub or anywhere real (invariant 
 - ``clave-falsa-a-otro-host``: the fake model key sent to a host other than the provider is
   never swapped for the real one (the provider is the control: there it is swapped); neither key
   reaches the black box nor the proxy's logs.
-- ``escapes-en-la-terminal``: during `entrar`, escape sequences the agent writes reach the
-  owner's terminal unfiltered (the relay is pending, backlog "Después"); what backtide does do,
-  reset the terminal after the session, is checked (M1 of the review).
+- ``escapes-en-la-terminal``: during `entrar`, the escape sequences the agent writes to its
+  terminal never reach the owner's: the relay of T26-5c drops them, in every form, while the text
+  and the colours pass; what the relay lets through is undone when the session ends (M1 of the
+  review).
 - ``nombres-de-clave-en-la-linea`` (both agents): a secret on the command line in every shape
   the unified table of backtide/blackbox/secret_words.py must strike; none reaches the black box
   or Tetragon's file.
@@ -30,8 +31,10 @@ and made-up keys: nothing reaches Anthropic, GitHub or anywhere real (invariant 
 
 import base64
 import json
+import re
 import secrets
 import sys
+import termios
 from uuid import uuid4
 
 import pytest
@@ -368,17 +371,30 @@ def _proxy_logs(service) -> str:
 
 # --- escapes-en-la-terminal --------------------------------------------------------------------
 
-OSC52 = b"\x1b]52;c;"  # the clipboard escape the agent writes; the relay (pending) would drop it
+# Anywhere in what reaches the owner, from the agent or from Claude Code itself: every OSC but the
+# title and a title that asks, DCS, APC, PM and SOS, the CSI that ask for a report or change the
+# keyboard, ESC Z and the answerback, and the 8-bit controls as UTF-8 (valid text never has C2
+# followed by 80-9F but for those). This is a check of its own, not the relay's list.
+NEVER = re.compile(
+    rb"\x1b\][^02]|\x1b\][02][^;]|\x1b\][02];\?\x07|\x1b[P_^XZ]"
+    rb"|\x1b\[[<=>?]?[0-9;]*[cntx]|\x1b\[[<=>?][0-9;]*[qu]|\x1b\[\??[0-9;]*\$[pwu]"
+    rb"|\x05|\xc2[\x80-\x9f]"
+)
+# What undoes the modes the attack sets, written out here and not taken from the code's own reset.
+UNDONE = (b"\x1b[?1049l", b"\x1b[?1000l", b"\x1b[?2004l", b"\x1b[?25h")
 
 
 @scenario("escapes-en-la-terminal")
-def test_escape_sequences_reach_the_owners_terminal(attack: Attack, cc_lab: Lab) -> None:
+def test_escape_sequences_never_reach_the_owners_terminal(attack: Attack, cc_lab: Lab) -> None:
     from tests.integration.test_agent_profile_assumptions import Terminal, wait_for  # noqa: PLC0415
 
     service = cc_lab.service
     since = sensor_kit.head_seq(service)
     marker = f"t17a5esc{uuid4().hex[:8]}"
-    osc52_marker = OSC52 + base64.b64encode(marker.encode()) + b"\x07"
+    b64 = base64.b64encode(marker.encode())
+    visible = f"\x1b[7m{marker}-visible\x1b[0m".encode()
+    modes = b"\x1b[?1049h\x1b[?1000h\x1b[?2004h\x1b[?25l"
+    clean_title = f"\x1b]0;{marker}-titulo\x07".encode()
     (service.store.workspace / "agente" / "home" / ".claude.json").unlink(missing_ok=True)
     env_argv = [
         "env", f"PYTHONPATH={REPO}", "TERM=xterm-256color", sys.executable, "-m",
@@ -390,33 +406,44 @@ def test_escape_sequences_reach_the_owners_terminal(attack: Attack, cc_lab: Lab)
         wait_for(lambda: "bypasspermissionson" in term.squeezed(), 90, "the prompt", term)
         start = len(term.output)
         outcome = attack.run_script(service.jail, "escapes_en_la_terminal", marker)
-        wait_for(
-            lambda: osc52_marker in bytes(term.output[start:]),
-            30,
-            "the escape bytes on the terminal",
-            term,
-        )
-        reached = osc52_marker in bytes(term.output[start:])
+        # One write, in order: when the last piece is here, the relay has seen all of it.
+        wait_for(lambda: visible in bytes(term.output[start:]), 30, "the agent's write", term)
         term.type("/exit")
         code = term.process.wait(timeout=60)
+        # Back as it was: the relay had it in raw mode.
+        local = termios.tcgetattr(term.master)[3]
+        settings_back = all(local & flag for flag in (termios.ICANON, termios.ECHO, termios.ISIG))
     finally:
         term.close()
     raw = bytes(term.output)
     reset = TERMINAL_RESET.encode()
-    # M1: backtide restores the terminal AFTER the session, so its soft reset comes after the
-    # agent's last escape in the stream.
-    reset_after_escape = reset in raw and raw.rfind(reset) > raw.rfind(osc52_marker)
+    session = raw[: raw.rfind(reset)] if reset in raw else raw  # ours, after the agent's
+    forbidden = sorted({found.group() for found in NEVER.finditer(session)})
+    # Only one of the agent's forms leaves its payload behind: a raw 0x9D is not UTF-8, so it comes
+    # out as U+FFFD and what followed it is plain text on the screen, with nothing to obey.
+    as_text = "\ufffd52;c;".encode() + b64
+    payloads = raw.replace(as_text, b"", 1).count(b64)
+    # M1: what the relay lets through is undone AFTER the session, after the agent's last write.
+    after_modes = raw[raw.rfind(modes) :] if modes in raw else b""
+    undone = all(piece in after_modes for piece in UNDONE)
     attack.check(
         "stopped",
-        reached
-        and outcome["written"]
+        bool(outcome["written"])
         and all(tty.startswith("/dev/pts/") for tty in outcome["written"])
-        and reset_after_escape
+        and not forbidden
+        and as_text in session
+        and payloads == 0
+        and marker.encode() + b".invalid" not in raw
+        and clean_title in session
+        and undone
+        and settings_back
         and SESSION_CLOSED in term.text(),
-        "no se frena (el relé de terminal está en 'Después'): las secuencias del agente llegan a "
-        f"la terminal del dueño sin filtrar (escritas {outcome['written']}, fallidas "
-        f"{outcome['failed']}); al cerrar (código {code}) backtide restaura la terminal y manda "
-        f"su reinicio suave DESPUÉS del escape del agente ({reset_after_escape}).",
+        f"escritas en {outcome['written']} (fallidas {outcome['failed']}); lo prohibido que llegó "
+        f"a la terminal del dueño: {forbidden}; veces que llega el contenido de esas secuencias: "
+        f"{payloads}, y el 0x9D en crudo llega como texto: {as_text in session}; el texto y "
+        f"el color llegan ({visible in session}), y el título, limpio ({clean_title in session}); "
+        f"al cerrar (código {code}) backtide deshace los modos del agente DESPUÉS de ellos "
+        f"({undone}) y la terminal vuelve a sus ajustes ({settings_back}).",
     )
     sensor_kit.wait_event(
         service,
