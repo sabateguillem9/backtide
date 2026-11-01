@@ -1640,7 +1640,7 @@ def test_behind_a_domain_only_its_host_its_origin_and_its_key_get_in(
         and results["archivo cambiado"] == (1, True, False, 0)
         and results["enlace con llave"] == (1, True, False)
         and results["enlace ya dado"].get("outcome") == "refused"
-        and "llaves --quitar" in results["enlace ya dado"].get("why", "")
+        and "el enlace no vale" in results["enlace ya dado"].get("why", "")  # the probe cuts at 80
         and results["quitar"] == 0
         and results["sesión tras quitar"].get("outcome") == "expired"
         and "ninguna llave" in results["reto sin llaves"].get("why", "")
