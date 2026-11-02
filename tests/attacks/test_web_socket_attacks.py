@@ -13,8 +13,8 @@ vigia-dev nor on the Mac (``instalada``). In a clean VM, after `install.sh`, as 
 It only sends requests the service should refuse or answer without changing anything (a forged
 id is an id that does not exist); if the list failed, the export's folder is removed at the end
 and the scenario checks the agent still runs. The exception is ``tarea-sin-sesion``, which gives
-the agent real tasks to read: it first checks that no provider has a key, so no turn reaches
-one (invariant 8). Nothing leaves the VM.
+the agent real tasks to read: it first checks that no provider has a key or that the lab's network
+cut is on (`instalar_lab.sh bloquear`), so no turn reaches one (invariant 8). Nothing leaves the VM.
 """
 
 import grp
@@ -25,6 +25,7 @@ import re
 import secrets
 import shutil
 import stat
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -486,6 +487,15 @@ def test_a_web_taken_over_changes_nothing_without_a_session(
     )
 
 
+def _lab_network_cut() -> bool:
+    """Is the clean lab's cut on? Then what a container sends stops at the VM, and the lab's key,
+    which it made up itself, reaches no provider."""
+    done = subprocess.run(
+        ["nft", "list", "table", "inet", "backtide_lab"], capture_output=True, text=True
+    )
+    return done.returncode == 0 and "drop" in done.stdout
+
+
 @scenario("tarea-sin-sesion")
 def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Installed) -> None:
     """T26-5a: who runs code as `backtide-web` can neither give the agent a task nor read an answer
@@ -499,7 +509,10 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     marker = f"T26-5A-{secrets.token_hex(8)}"
     keys = ask_secrets(CONTROL_SOCKET)
     keyed = [kind for kind in PROVIDERS if keys.get(kind, {}).get("set")]
-    assert not keyed, f"invariant 8: this scenario gives the agent a turn, and {keyed} has a key"
+    assert not keyed or _lab_network_cut(), (
+        f"invariant 8: this scenario gives the agent a turn, {keyed} has a key, and this VM does "
+        "not have the lab's network cut (tests/install/instalar_lab.sh bloquear)"
+    )
     real = ask_task_start(CONTROL_SOCKET, f"{marker}-root di hola", seconds=120)
     assert real["ok"], real
     real_id = real["task"]
