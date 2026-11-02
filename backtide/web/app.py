@@ -134,6 +134,7 @@ from backtide.web.security import (
     SIGN_OUT_PATH,
     TALK_PATH,
     TALK_SEND_PATH,
+    TALK_STOP_PATH,
     TOUCH_BEGIN_PATH,
     TOUCH_FINISH_PATH,
     TOUCH_PATH,
@@ -164,7 +165,16 @@ from backtide.web.settings import (
     views,
 )
 from backtide.web.state import STATE_ACTIONS, AgentStatus, read_status
-from backtide.web.talk import RUNNING, UNKNOWN, TaskClient, TaskView, known_id, known_of, view_of
+from backtide.web.talk import (
+    RUNNING,
+    UNKNOWN,
+    TaskClient,
+    TaskView,
+    is_task_id,
+    known_id,
+    known_of,
+    view_of,
+)
 from backtide.web.text import visible, visible_middle
 from backtide.web.tide import WINDOW, build_tide
 
@@ -2224,6 +2234,7 @@ def create_app(
             running=sum(1 for one in views if not one.ended),
             known=known_id({one.id: one.ended and not one.unread for one in reversed(views)}),
             send=base + TALK_SEND_PATH,
+            stop=base + TALK_STOP_PATH,
             csrf=_csrf(request),
             max_prompt=MAX_PROMPT,
             asked=asked,
@@ -2292,12 +2303,51 @@ def create_app(
             return await again(409, "talk.err.refused", said=reply["message"])
         return RedirectResponse(f"{who.base}{TALK_PATH}", status_code=303)
 
+    async def talk_stop(request: Request) -> Response:
+        """Stop a task inside the agent (a decision that can be undone: docs/47 section 7.1). The
+        service stops every one that runs in that agent, as Ctrl-C does: the page says so."""
+        form = await _read_form(request, ("csrf", "tarea"), AGENT_FIELD)
+        if form is None or not is_task_id(form["tarea"]):
+            return await asyncio.to_thread(
+                _talk_page, request, roster.main, status=400, error="talk.err.form"
+            )
+        if not _csrf_is(request, form["csrf"]):
+            logger.warning("a task's stop from the web was refused: wrong form token")
+            return await asyncio.to_thread(
+                _talk_page, request, roster.main, status=403, error="talk.err.form"
+            )
+        who = _agent_in(form)
+        if await asyncio.to_thread(_talk_state, who) != Availability.READY or tasks is None:
+            return await asyncio.to_thread(
+                _talk_page, request, who, status=503, error="talk.err.not_now"
+            )
+        ask = tasks.stop
+        order = who.order
+
+        def run() -> bool:
+            try:
+                return ask(form["tarea"], **order)
+            except ControlError as error:
+                logger.warning("a task's stop from the web failed: %s", type(error).__name__)
+                return False
+
+        if not await asyncio.to_thread(run):
+            return await asyncio.to_thread(
+                _talk_page, request, who, status=503, error="talk.err.stop"
+            )
+        return RedirectResponse(f"{who.base}{TALK_PATH}", status_code=303)
+
     if talk_on:
         app.post(TALK_SEND_PATH, dependencies=[Depends(require_session)])(talk_send)
+        app.post(TALK_STOP_PATH, dependencies=[Depends(require_session)])(talk_stop)
 
-    def _render_task(t: Translator, who: Agent, view: TaskView, *, oob: bool) -> str:
+    def _render_task(t: Translator, who: Agent, view: TaskView, csrf: str, *, oob: bool) -> str:
         return env.get_template("talk_item.html").render(
-            **_helpers(t, clock(), who), task=view, oob=oob
+            **_helpers(t, clock(), who),
+            task=view,
+            oob=oob,
+            csrf=csrf,
+            stop=base + TALK_STOP_PATH,
         )
 
     def _render_talk_state(t: Translator, who: Agent, running: int, failed: bool) -> str:
@@ -2316,6 +2366,7 @@ def create_app(
         """The chat as it changes: a new line, the end of one (each read once, ``known``) and how
         many are running. Every question goes with the session of the page that asks."""
         ACTING_SESSION.set(request.state.session.id)  # for the threads it asks the service from
+        csrf = _csrf(request)
         loop = asyncio.get_running_loop()
         signed_in = _session_watch(request)
         deadline = loop.time() + stream_seconds
@@ -2349,7 +2400,7 @@ def create_app(
                 if view.unread and had is not None:  # the page has this already: look again
                     continue
                 pieces.append(
-                    await asyncio.to_thread(_render_task, t, who, view, oob=had is not None)
+                    await asyncio.to_thread(_render_task, t, who, view, csrf, oob=had is not None)
                 )
             if not failed:
                 listed = {entry["task"] for entry in entries}
@@ -2629,6 +2680,8 @@ def create_app(
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:
         post_paths += (DECIDE_PATH,)
+    if talk_on:
+        post_paths += (TALK_STOP_PATH,)
     return Guard(
         app,
         port=port,

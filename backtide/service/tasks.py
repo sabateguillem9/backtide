@@ -150,6 +150,7 @@ class _Task:
     asked_at: float = 0.0
     target: ShellOutcome | None = None  # once recorded: the container, by what open_shell said
     stop_asked: bool = False
+    stopped_by: str | None = None  # the web's stop button (T26-5b): the black box says who
     claimed: bool = False  # somebody is writing its end: only once
     status: TaskStatus | None = None  # the end, once recorded
     finished: threading.Event = field(default_factory=threading.Event)
@@ -236,9 +237,10 @@ class AgentTasks:
         with self._lock:
             return [_entry_of(task) for task in self._tasks.values()]
 
-    def stop(self, task_id: str) -> bool | None:
-        """Stop it inside the agent (Ctrl-C): True if nothing of it is left or it was signalled,
-        False if it may run on, None if there is no such task."""
+    def stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None:
+        """Stop it inside the agent (Ctrl-C, or the web's button, which says it is: ``requested_by``
+        goes in the end's event): True if nothing of it is left or it was signalled, False if it
+        may run on, None if there is no such task."""
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
@@ -246,6 +248,7 @@ class AgentTasks:
             if task.claimed:
                 return True
             task.stop_asked = True
+            task.stopped_by = requested_by
             target = task.target
         if target is None:  # not at the container yet: its thread sees ``stop_asked``
             return True
@@ -436,6 +439,7 @@ class AgentTasks:
                         "seconds": took,
                         "answer_chars": len(answer or ""),
                         "requested_by": task.requested_by,
+                        **({} if task.stopped_by is None else {"stopped_by": task.stopped_by}),
                     }
                 )
             except Exception as error:

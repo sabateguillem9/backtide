@@ -330,7 +330,6 @@ def test_the_list_is_closed() -> None:
         READS | SIGNED_IN_READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS | SIGN_IN_COMMANDS
     )
     assert not SIGNED_IN_READS & READS  # an answer is never a read without a session
-    assert "task_stop" not in COMMANDS  # only the CLI's Ctrl-C
     assert {"passkeys", "passkey_remove"}.isdisjoint(COMMANDS)  # only root takes a key out
     assert not READS & CHANGES and not (READS | CHANGES) & SESSION_COMMANDS
     assert not (READS | CHANGES | SESSION_COMMANDS) & PASSKEY_COMMANDS
@@ -664,6 +663,7 @@ CHANGE_REQUESTS = [
     {"cmd": "set_budget", "daily_usd": "2"},
     {"cmd": "accept_prices", "digest": "0123456789abcdef"},
     {"cmd": "task_start", "prompt": "borra todo"},
+    {"cmd": "task_stop", "task": "c0de" * 8},
 ]
 
 
@@ -1810,6 +1810,7 @@ class Tasks:
         self.started: list[tuple[str, bool, int | None, str]] = []
         self.read: list[str] = []
         self.stopped: list[str] = []
+        self.stopped_by: list[str | None] = []
         guardian.task_start = self.task_start  # type: ignore[attr-defined]
         guardian.task_status = self.task_status  # type: ignore[attr-defined]
         guardian.task_stop = self.task_stop  # type: ignore[attr-defined]
@@ -1824,8 +1825,9 @@ class Tasks:
         self.read.append(task_id)
         return TaskStatus(task_id, TaskOutcome.OK, "", SECRET_ANSWER, 0, 1.0)
 
-    def task_stop(self, task_id: str) -> bool:
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool:
         self.stopped.append(task_id)
+        self.stopped_by.append(requested_by)
         return True
 
 
@@ -1893,20 +1895,35 @@ def test_a_live_session_reads_the_answer(
     assert tasks.read == [TASK_ID]
 
 
-def test_the_web_cannot_stop_a_task_nor_open_the_old_way(
+def test_a_stop_takes_a_live_session_and_says_it_was_the_web(
     make_server: Callable[..., WebControlServer], tasks: Tasks
 ) -> None:
-    """Not on its list, with a session or without. Nor `shell`, whose reply names the container."""
+    """T26-5b: it goes on the task's end, with the kernel's uid and pid, whatever the web says."""
     server = make_server()
-    for request in (
-        {"cmd": "task_stop", "task": TASK_ID},
-        signed({"cmd": "task_stop", "task": TASK_ID}),
-    ):
-        reply = talk(server, request)
-        assert reply["outcome"] == "refused" and "no se acepta" in reply["message"]
+    for carried in ({}, {"session": "x" * 43}, {"session": 7}):
+        reply = talk(server, {"cmd": "task_stop", "task": TASK_ID, **carried})
+        assert reply["outcome"] == "refused" and "sesión" in reply["message"]
+    assert tasks.stopped == []
+    reply = talk(server, signed({"cmd": "task_stop", "task": TASK_ID}))
+    assert reply["ok"] is True and reply["outcome"] == "stopped"
+    assert tasks.stopped == [TASK_ID]
+    assert tasks.stopped_by == [f"web (uid {ME}, pid 4242)"]
+
+
+def test_a_stop_cannot_say_it_came_from_elsewhere(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    reply = talk(make_server(), signed({"cmd": "task_stop", "task": TASK_ID, "via": "cli"}))
+    assert reply["outcome"] == "refused" and tasks.stopped == []
+
+
+def test_the_web_cannot_open_the_old_way(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    """Not `shell`, whose reply names the container, with a session or without."""
+    server = make_server()
     request = signed({"cmd": "shell", "kind": "session", "continue": False})
     assert talk(server, request)["outcome"] == "refused"
-    assert tasks.stopped == []
 
 
 def test_the_list_of_tasks_takes_a_live_session_and_does_not_keep_it_alive(

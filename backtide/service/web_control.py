@@ -29,7 +29,8 @@ The socket:
   ``end_batch`` (taking a trust away: they only make the gate ask more), ``set_secret`` and
   ``clear_secret`` (a provider's key or Telegram's token and chat: written by the service at
   0600, never sent back), ``set_budget`` (the caps, checked as `backtide tope` checks them),
-  ``accept_prices`` and ``task_start`` (a task for the agent, T26-5a). Nothing else: no
+  ``accept_prices``, ``task_start`` (a task for the agent, T26-5a) and ``task_stop`` (stopping
+  it, T26-5b). Nothing else: no
   ``resume``, no ``shell``, ``import`` or ``export`` (no path of any kind), no config. Each
   change is handled by the very code of the control socket, with
   ``via`` forced to ``web``, so the black box records it as the control socket does:
@@ -43,9 +44,9 @@ The socket:
   one: a web taken over cannot change anything on its own. A WARNING on every refusal; every
   new session and every "close them all" goes to the black box and is alerted, one by one
   (``on_entry``: ``Guardian.web_access``).
-- The tasks (T26-5a): ``task_start`` is a change, and ``task_status`` and ``task_list`` (T26-5b,
-  the chat) reads that take a live session too, because what they return is not in the black box.
-  ``task_stop`` is not on the list: only the CLI's Ctrl-C asks it, on the control socket.
+- The tasks (T26-5a): ``task_start`` and ``task_stop`` (T26-5b) are changes, and ``task_status``
+  and ``task_list`` (T26-5b, the chat) reads that take a live session too, because what they return
+  is not in the black box. A stop from here is named in the task's end (``stopped_by``).
 - The keys (T26-3b-2, T26-3c, T26-3d): registering, listing and touching them, signing in, and
   ``key_remove`` and ``key_rename`` (``_manage_key``): by the whole id, with a key just touched,
   recorded first, and from here never the last key. Root's own ``passkey_remove``, by the end of
@@ -105,7 +106,7 @@ READS = frozenset({"agents", "snapshots", "holds", "trusted", "batches", "secret
 CHANGES = frozenset(
     {
         "rewind", "decide", "trust", "untrust", "end_batch", "set_secret", "clear_secret",
-        "set_budget", "accept_prices", "task_start",
+        "set_budget", "accept_prices", "task_start", "task_stop",
     }
 )  # fmt: skip
 # A read that takes a live session, unlike READS (T26-5a, docs/47 section 7.1): a task's answer is

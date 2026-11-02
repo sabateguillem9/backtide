@@ -8,7 +8,9 @@ agent writes is hostile: every view of it is walked with an HTML parser (``tests
 import ast
 import os
 import shutil
+import subprocess
 import tempfile
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -19,8 +21,9 @@ from fastapi.testclient import TestClient
 from backtide.jail import docker
 from backtide.jail.profile import MAX_PROMPT
 from backtide.jail.profiles import CLAUDE_CODE
+from backtide.service.control import ask_task_stop
 from backtide.service.sessions import Sessions
-from backtide.service.tasks import AgentTasks
+from backtide.service.tasks import PKILL, AgentTasks
 from backtide.service.web_control import WebControlServer
 from backtide.web.agents import AgentSource
 from backtide.web.reader import BoxReader
@@ -72,6 +75,8 @@ class FakeTasks:
         self.reply: dict[str, Any] = {"ok": True, "outcome": "started", "message": "", "task": "x"}
         self.error: Exception | None = None
         self.status_error: Exception | None = None
+        self.stops: list[tuple[str, str | None]] = []
+        self.stopped = True
 
     def availability(self) -> Availability:
         return self.state
@@ -95,6 +100,12 @@ class FakeTasks:
         if self.error is not None:
             raise self.error
         return self.reply
+
+    def stop(self, task_id: str, *, agent: str | None = None) -> bool:
+        self.stops.append((task_id, agent))
+        if self.error is not None:
+            raise self.error
+        return self.stopped
 
 
 def said(text: str = "listo", outcome: str = "ok", message: str = "", chars: int | None = None):
@@ -458,6 +469,112 @@ def test_a_service_that_went_away_between_page_and_post(web: TestClient, tasks: 
     assert tasks.started == []
 
 
+# --- stopping one ---------------------------------------------------------------------------------
+
+STOP = "/hablar/parar"
+
+
+def test_a_running_task_has_its_button_and_an_ended_one_does_not(
+    web: TestClient, tasks: FakeTasks
+) -> None:
+    tasks.entries = [line(TASK_A), line(TASK_B, "running")]
+    html = web.get(PAGE).text
+    assert html.count('class="task-stop"') == 1
+    assert f'name="tarea" value="{TASK_B}"' in html and f'name="tarea" value="{TASK_A}"' not in html
+
+
+def test_with_several_running_the_page_says_a_stop_stops_them_all(
+    web: TestClient, tasks: FakeTasks
+) -> None:
+    """The pattern finds them all (see "Después" in docs/backlog.md): the button must not lie."""
+    tasks.entries = [line(TASK_A, "running")]
+    assert "Parar una las para todas" not in web.get(PAGE).text
+    tasks.entries = [line(TASK_A, "running"), line(TASK_B, "running")]
+    assert "Parar una las para todas" in web.get(PAGE).text
+
+
+def test_the_streams_line_has_the_button_with_the_sessions_token(
+    live: TestClient, tasks: FakeTasks
+) -> None:
+    tasks.entries = [line(outcome="running")]
+    csrf = csrf_of(live.get(PAGE).text)
+    data = events(stream_of(live), "tasks")[0]["data"]
+    assert f'name="csrf" value="{csrf}"' in data and f'name="tarea" value="{TASK_A}"' in data
+
+
+def stop(web: TestClient, task: str = TASK_A, **fields: str) -> Any:
+    form = {"csrf": csrf_of(web.get(PAGE).text), "tarea": task, **fields}
+    return web.post(STOP, data=form, headers=POST_HEADERS, follow_redirects=False)
+
+
+def test_a_stop_goes_to_the_service_and_back_to_the_page(web: TestClient, tasks: FakeTasks) -> None:
+    reply = stop(web)
+    assert reply.status_code == 303 and reply.headers["location"].endswith("/hablar")
+    assert tasks.stops == [(TASK_A, None)]
+
+
+def test_a_stop_goes_to_the_agent_the_form_says(two: TestClient, tasks: FakeTasks) -> None:
+    form = {"csrf": csrf_of(two.get(PAGE).text), "tarea": TASK_A, "agente": SLUG}
+    reply = two.post(STOP, data=form, headers=POST_HEADERS, follow_redirects=False)
+    assert reply.status_code == 303 and reply.headers["location"].endswith(
+        f"/agentes/{SLUG}/hablar"
+    )
+    assert tasks.stops == [(TASK_A, SLUG)]
+
+
+def test_a_stop_needs_the_forms_token(web: TestClient, tasks: FakeTasks) -> None:
+    web.get(PAGE)
+    form = {"csrf": "no-es", "tarea": TASK_A}
+    assert web.post(STOP, data=form, headers=POST_HEADERS).status_code == 403
+    assert tasks.stops == []
+
+
+def test_a_stop_needs_a_session(tmp_path: Path, tasks: FakeTasks) -> None:
+    new_box(tmp_path)
+    web = new_client(tmp_path, tasks=tasks, logged_in=False)
+    form = {"csrf": "x", "tarea": TASK_A}
+    assert web.post(STOP, data=form, headers=POST_HEADERS).status_code == 401
+    assert tasks.stops == []
+
+
+def test_a_stop_comes_from_our_own_page(web: TestClient, tasks: FakeTasks) -> None:
+    form = {"csrf": csrf_of(web.get(PAGE).text), "tarea": TASK_A}
+    assert web.post(STOP, data=form).status_code == 403
+    evil = {**POST_HEADERS, "origin": "http://evil.example"}
+    assert web.post(STOP, data=form, headers=evil).status_code == 403
+    assert web.get(STOP).status_code in (404, 405)
+    assert tasks.stops == []
+
+
+@pytest.mark.parametrize("task", ["", "x", "A" * 32, "a" * 31, "a" * 33, "../../etc"])
+def test_only_a_task_id_can_be_stopped(web: TestClient, tasks: FakeTasks, task: str) -> None:
+    assert stop(web, task).status_code == 400 and tasks.stops == []
+
+
+def test_without_tareas_there_is_no_stop_either(tmp_path: Path) -> None:
+    new_box(tmp_path)
+    fake = FakeTasks(Availability.DISABLED, enabled=False)
+    web = new_client(tmp_path, tasks=fake)
+    form = {"csrf": "x", "tarea": TASK_A}
+    assert web.post(STOP, data=form, headers=POST_HEADERS).status_code == 405
+    assert fake.stops == []
+
+
+def test_a_stop_that_failed_says_it_may_run_on(web: TestClient, tasks: FakeTasks) -> None:
+    tasks.stopped = False
+    page = stop(web)
+    assert page.status_code == 503 and "puede seguir en marcha" in page.text
+
+
+def test_a_service_that_does_not_answer_a_stop(web: TestClient, tasks: FakeTasks) -> None:
+    from backtide.service.control import ControlOutcomeUnknown
+
+    form = {"csrf": csrf_of(web.get(PAGE).text), "tarea": TASK_A}
+    tasks.error = ControlOutcomeUnknown("MARCA")
+    page = web.post(STOP, data=form, headers=POST_HEADERS)
+    assert page.status_code == 503 and "MARCA" not in page.text
+
+
 # --- which agent ----------------------------------------------------------------------------------
 
 SLUG = "revisor"
@@ -684,6 +801,9 @@ class TaskingGuardian(FakeGuardian):
     def task_list(self) -> Any:
         return self.real.listing()
 
+    def task_stop(self, task_id: str, **options: Any) -> Any:
+        return self.real.stop(task_id, **options)
+
     def settled(self) -> None:
         for task in list(self.real._tasks.values()):  # noqa: SLF001
             assert task.finished.wait(10)
@@ -749,6 +869,53 @@ def test_a_task_from_the_form_to_the_answer_on_the_page(tmp_path: Path, service:
     assert "<b>de verdad" not in html
     assert guardian.ended[0]["requested_by"].startswith("web ")
     assert ANSWER not in str(guardian.ended) and "di hola" not in str(guardian.ended)
+
+
+def test_a_task_that_runs_is_stopped_from_the_page(
+    tmp_path: Path, service: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The button, for real down to the signal: the end says stopped, and who asked."""
+    server, guardian, _ = service
+    running, stopped = threading.Event(), threading.Event()
+    signals: list[list[str]] = []
+
+    def container(args: list[str], **options: Any) -> Any:
+        if PKILL in args:
+            signals.append(args)
+            stopped.set()
+            return subprocess.CompletedProcess([], 0, "", "")
+        running.set()
+        assert stopped.wait(10)
+        return subprocess.CompletedProcess([], 143, "", "")
+
+    monkeypatch.setattr(docker, "run", container)
+    web = real_web(tmp_path, server)
+    assert send(web, "tarda mucho").status_code == 303
+    assert running.wait(10)
+    page = web.get(PAGE).text
+    (task_id,) = [entry.task_id for entry in guardian.real.listing()]
+    assert f'name="tarea" value="{task_id}"' in page
+    form = {"csrf": csrf_of(page), "tarea": task_id}
+    assert (
+        web.post(STOP, data=form, headers=POST_HEADERS, follow_redirects=False).status_code == 303
+    )
+    guardian.settled()
+    assert len(signals) == 1
+    html = web.get(PAGE).text
+    assert "Parada" in html and "task-stop" not in html
+    assert guardian.ended[0]["outcome"] == "stopped"
+    assert guardian.ended[0]["stopped_by"].startswith("web (uid ")
+
+
+def test_the_service_itself_wants_a_session_for_a_stop(tmp_path: Path, service: Any) -> None:
+    server, guardian, sessions = service
+    uid = os.geteuid()
+    ask = {"server_uid": uid, "peer": _service_is(uid), "wait": 0, "via": "web"}
+    assert ask_task_stop(server.path, TASK_A, **ask) is False
+    assert ask_task_stop(server.path, TASK_A, session="s" * 43, **ask) is False
+    sessions.end(SESSION)
+    assert ask_task_stop(server.path, TASK_A, session=SESSION, **ask) is False
+    assert guardian.real.listing() == []
 
 
 def test_a_long_prompt_reaches_the_service_through_the_socket(tmp_path: Path, service: Any) -> None:

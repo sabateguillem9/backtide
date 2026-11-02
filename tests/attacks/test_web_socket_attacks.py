@@ -526,11 +526,12 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     stop = {"cmd": "task_stop", "task": real_id, "_why": True}
     time.sleep(CHANGES_WAIT)
     # 1. Without a session, with a made-up one and with one that ended; and what is not on the list.
-    bare = probe(start, read, listing)
+    bare = probe(start, read, listing, stop)
     made_up = probe(
         {**start, "session": "s" * 43},
         {**read, "session": "s" * 43},
         {**listing, "session": "s" * 43},
+        {**stop, "session": "s" * 43},
     )
     ended = probe(
         {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
@@ -538,28 +539,31 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
         {**start, "session": "<session>"},
         {**read, "session": "<session>"},
         {**listing, "session": "<session>"},
+        {**stop, "session": "<session>"},
     )
-    # 2. Stopping it (only Ctrl-C in the CLI, on root's socket) is off the list: with a session,
-    # and without one, which a read would not refuse for its shape.
-    # 3. The control: a live session reads the same task, and gives one as the web.
+    # 2. The control: a live session reads the same task, gives one as the web and sees the list.
     live = probe(
         {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
         {**read, "session": "<session>"},
         {"cmd": "task_status", "task": "f" * 32, "session": "<session>"},
-        {**stop, "session": "<session>"},
-        stop,
         {"cmd": "task_start", "prompt": f"{marker}-con-sesion di hola", "seconds": 120,
          "session": "<session>", "_see": True},
         {**listing, "session": "<session>"},
-        {"cmd": "session_end", "session": "<session>"},
     )  # fmt: skip
-    web_id = live[5].get("task")
+    web_id = live[3].get("task")
+    # 3. Stopping that one (T26-5b): without a session, nothing; with one, it stops, right away, in
+    # a second go because its id has to be known. Its end says the web did it.
+    stopping = probe(
+        {"cmd": "task_stop", "task": web_id or "f" * 32, "_why": True},
+        {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
+        {"cmd": "task_stop", "task": web_id or "f" * 32, "session": "<session>"},
+        {"cmd": "session_end", "session": "<session>"},
+    )
     root_socket = probe_as(
         web.pw_uid, web.pw_gid, "", str(CONTROL_SOCKET), {"cmd": "task_status", "task": real_id}
     )
-    for task in (real_id, web_id):
-        if task:  # no need for them to end by themselves: their end is what is looked at below
-            ask_task_stop(CONTROL_SOCKET, task)
+    if real_id:  # no need for it to end by itself: its end is what is looked at below
+        ask_task_stop(CONTROL_SOCKET, real_id)
 
     def refused_for(replies: list[dict], word: str) -> bool:
         """Refused for this reason: a full bucket or a wrong shape says refused too."""
@@ -571,26 +575,27 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     says = [r.get("outcome") for r in live]
     attack.check(
         "stopped",
-        len(bare) == 3
+        len(bare) == 4
         and refused_for(bare, "sesión")
-        and len(made_up) == 3
+        and len(made_up) == 4
         and refused_for(made_up, "sesión")
         and [r.get("outcome") for r in ended[:2]] == ["opened", "ended"]
-        and len(ended) == 5
+        and len(ended) == 6
         and refused_for(ended[2:], "sesión")
         and says[0] == "opened"
         and live[1].get("ok") is True
         and says[1] not in ("refused", "unknown")
         and says[2] == "unknown"
-        and refused_for(live[3:5], "no se acepta")
-        and says[5] == "started"
-        and says[6] == "listed"
+        and says[3] == "started"
+        and says[4] == "listed"
         and bool(web_id)
+        and refused_for(stopping[:1], "sesión")
+        and stopping[2].get("outcome") == "stopped"
         and root_socket == [{"errno": "EACCES"}],
         f"como backtide-web, dar una tarea y leer la de root sin sesión: {bare}; con una "
         f"inventada: {made_up}; con una ya cerrada: {[r.get('outcome') for r in ended]}; con una "
-        f"viva (el control), abrir, leer esa tarea, un id inventado, pararla con y sin ella, "
-        f"dar una y la lista: {says}, por {[r.get('why') for r in live[3:5]]}; "
+        f"viva (el control), abrir, leer esa tarea, un id inventado, dar una y la lista: {says}; "
+        f"pararla sin sesión y con ella: {stopping}; "
         f"el socket de root: {root_socket}",
     )
 
@@ -612,6 +617,7 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     web_event = who.get("con-sesion")
     every = json.dumps([[e.target, e.details] for e in events], ensure_ascii=False, default=str)
     closed = {"task", "outcome", "code", "seconds", "answer_chars", "requested_by"}
+    of_web = next((e.details for e in ended_events() if e.details.get("task") == web_id), {})
     attack.check(
         "recorded",
         refused_recorded
@@ -621,8 +627,11 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
         and web_event.details.get("task") == web_id
         and str(web_event.details.get("requested_by", "")).startswith(f"web (uid {web.pw_uid},")
         and {e.details.get("task") for e in ended_events()} >= {real_id, web_id}
-        and all(set(e.details) == closed for e in ended_events()),
-        f"el rechazo está en la caja negra ({refused_recorded}); lo pedido sin sesión no está en "
+        and all(set(e.details) - {"stopped_by"} == closed for e in ended_events())
+        and of_web.get("outcome") == "stopped"
+        and str(of_web.get("stopped_by", "")).startswith(f"web (uid {web.pw_uid},"),
+        f"la tarea que paró la web dice quién: {of_web}; el rechazo está en la caja negra "
+        f"({refused_recorded}); lo pedido sin sesión no está en "
         f"ningún evento ({'sin-sesion' not in every}); de las tareas de verdad: {sorted(who)}, la "
         f"de la web como web ({web_event.details if web_event else None}); cada final con sus "
         f"campos: {[sorted(e.details) for e in ended_events()]}",

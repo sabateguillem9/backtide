@@ -557,6 +557,29 @@ def test_a_task_stopped_before_it_reached_the_container_never_runs(lab: Lab) -> 
     assert lab.container.tasks() == []
 
 
+def test_a_stop_from_the_web_is_named_in_the_end(lab: Lab) -> None:
+    """T26-5b. Ctrl-C's end keeps the fields it always had: see the end's own test."""
+    hold = threading.Event()
+    lab.container.results = [hold, FOUND, subprocess.CompletedProcess([], 143, "", "")]
+    task_id = lab.start()
+    assert lab.container.entered.acquire(timeout=WAIT)
+    assert lab.tasks.stop(task_id, requested_by="web (uid 5, pid 6)") is True
+    hold.set()
+    assert lab.settled(task_id).outcome is TaskOutcome.STOPPED
+    assert lab.ended[0]["stopped_by"] == "web (uid 5, pid 6)"
+
+
+def test_stopping_from_the_cli_adds_nothing_to_the_end(lab: Lab) -> None:
+    hold = threading.Event()
+    lab.container.results = [hold, FOUND, subprocess.CompletedProcess([], 143, "", "")]
+    task_id = lab.start()
+    assert lab.container.entered.acquire(timeout=WAIT)
+    assert lab.tasks.stop(task_id) is True
+    hold.set()
+    lab.settled(task_id)
+    assert "stopped_by" not in lab.ended[0]
+
+
 def test_stopping_what_ended_or_never_was(lab: Lab) -> None:
     lab.container.results = [answer("ok")]
     done = lab.start()

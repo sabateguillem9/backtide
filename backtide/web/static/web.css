@@ -862,6 +862,7 @@ h1 {
 .task-word { font-weight: var(--type-label-weight); color: var(--ink); }
 .task-head .status-dot { margin-right: var(--space-1); }
 .task-part { margin-top: var(--space-3); }
+.task-stop { margin-top: var(--space-3); }
 .task-label { margin: 0 0 var(--space-1); font-size: var(--type-caption-size); line-height: var(--type-caption-leading); color: var(--ink-muted); }
 .task-asked { margin: 0; font: var(--type-body-ui-weight) var(--type-body-ui-size)/1.45 var(--font-sans); color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-text {

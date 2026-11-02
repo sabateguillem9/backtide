@@ -296,7 +296,7 @@ class RewindService(Protocol):
 
     def task_status(self, task_id: str) -> TaskStatus | None: ...
 
-    def task_stop(self, task_id: str) -> bool | None: ...
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None: ...
 
     def task_list(self) -> list[TaskEntry]: ...
 
@@ -986,10 +986,15 @@ class ControlServer:
     def _task_stop(
         self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
     ) -> dict[str, Any]:
-        """Ctrl-C in `backtide tarea`: stop the task inside the agent. Not on the web's list."""
+        """Stop the task inside the agent: Ctrl-C in `backtide tarea`, or the web's button
+        (T26-5b), on its socket with a live session; then the end's event says it was the web."""
+        via = request.pop("via", "cli")
+        if not isinstance(via, str) or via not in TASK_REQUESTERS:
+            raise _BadRequest("`via` es cli o web.")
         task_id = self._task_id_of(request)
+        who = {"requested_by": f"web (uid {uid}, pid {pid})"} if via == "web" else {}
         try:
-            stopped = guardian.task_stop(task_id)
+            stopped = guardian.task_stop(task_id, **who)
         except Exception as error:
             logger.error("stopping a task raised %s instead of answering", type(error).__name__)
             stopped = False
@@ -2990,21 +2995,29 @@ def ask_task_stop(
     path: Path,
     task_id: str,
     *,
+    via: str | None = None,
     wait: float = WAIT_FOR_SERVICE,
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+    session: str | None = None,
     agent: str | None = None,
 ) -> bool:
-    """Ctrl-C in `backtide tarea`: stop the task inside the agent. True if nothing of it is left or
-    it was signalled; False if it may run on, or the service did not say."""
+    """Ctrl-C in `backtide tarea`, or the web's button: stop the task inside the agent. True if
+    nothing of it is left or it was signalled; False if it may run on, or the service won't say."""
+    request: dict[str, Any] = {"cmd": "task_stop", "task": task_id}
+    if via is not None:
+        request["via"] = via
     raw = _ask(
         Path(path),
-        {"cmd": "task_stop", "task": task_id},
+        request,
         what="la orden de parar",
         wait=wait,
         reply_timeout=TASK_STOP_REPLY_TIMEOUT,
         peer=peer,
+        server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
         agent=agent,

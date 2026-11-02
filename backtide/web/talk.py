@@ -2,8 +2,8 @@
 
 The web never runs a task: it asks the service, on its socket, the same way `backtide tarea` does
 (``ask_task_start``, with ``via="web"``), so the CLI and the web do exactly the same. Writes are
-explicit: only `backtide web --tareas` gives a task (``enabled``). Without it the page says how to
-turn it on and the POST does not exist.
+explicit: only `backtide web --tareas` gives a task or stops one (``enabled``). Without it the page
+says how to turn it on and the POSTs do not exist.
 
 What it reads:
 - ``tasks``: every task of the agent, small whatever the answers measure. The stream asks this every
@@ -33,6 +33,7 @@ from backtide.service.control import (
     ask_task_list,
     ask_task_start,
     ask_task_status,
+    ask_task_stop,
     peer_credentials,
 )
 from backtide.web.rewind import WAIT_FOR_SERVICE, Availability, availability_of
@@ -43,6 +44,7 @@ RUNNING = "running"
 UNKNOWN = "unknown"
 _MAX_KNOWN = 64  # far more than the service keeps (MAX_KEPT + MAX_RUNNING)
 _KNOWN = re.compile(r"([re])([0-9a-f]{32})", re.ASCII)
+_TASK_ID = re.compile(r"[0-9a-f]{32}", re.ASCII)
 
 
 class TaskClient(Protocol):
@@ -60,6 +62,8 @@ class TaskClient(Protocol):
     def start(
         self, prompt: str, *, resume: bool = False, agent: str | None = None
     ) -> dict[str, Any]: ...
+
+    def stop(self, task_id: str, *, agent: str | None = None) -> bool: ...
 
 
 class ControlTasks:
@@ -117,6 +121,9 @@ class ControlTasks:
             self._path, prompt, resume=resume, via="web", agent=agent, **self._ask()
         )
 
+    def stop(self, task_id: str, *, agent: str | None = None) -> bool:
+        return ask_task_stop(self._path, task_id, via="web", agent=agent, **self._ask())
+
 
 @dataclass(frozen=True)
 class TaskView:
@@ -162,6 +169,10 @@ def view_of(entry: Mapping[str, Any], status: Mapping[str, Any] | None = None) -
     )
 
 
+def is_task_id(text: str) -> bool:
+    return _TASK_ID.fullmatch(text) is not None
+
+
 def known_of(text: str) -> dict[str, bool]:
     """What a page has, as the stream's id or the page's own ``visto`` said it: task id to "it has
     its end". Anything that is not this shape counts as nothing, which only sends a line again."""
@@ -186,6 +197,7 @@ __all__ = [
     "ControlTasks",
     "TaskClient",
     "TaskView",
+    "is_task_id",
     "known_id",
     "known_of",
     "view_of",

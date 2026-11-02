@@ -60,6 +60,7 @@ class ShellGuardian(FakeGuardian):
         self.task_seen: TaskStatus | None = TaskStatus(TASK_ID, TaskOutcome.RUNNING)
         self.task_stopped: bool | None = True
         self.task_lines: list[TaskEntry] = []
+        self.stop_requested_by: list[str | None] = []
         self.export_outcome = ExportOutcome(
             ExportStatus.DONE, "", "/home/me/out", SNAP, {"files": 2, "bytes": 9}
         )
@@ -85,7 +86,8 @@ class ShellGuardian(FakeGuardian):
             raise self.error
         return self.task_seen
 
-    def task_stop(self, task_id: str) -> bool | None:
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None:
+        self.stop_requested_by.append(requested_by)
         if self.error is not None:
             raise self.error
         return self.task_stopped
@@ -529,6 +531,20 @@ def test_a_task_it_does_not_know(server: ControlServer, guardian: ShellGuardian)
     reply = ask_task_status(server.path, TASK_ID, peer=me)
     assert reply["ok"] is False and reply["outcome"] == "unknown" and reply["answer"] is None
     assert ask_task_stop(server.path, TASK_ID, peer=me) is False
+
+
+def test_ctrl_c_says_nothing_of_the_web(server: ControlServer, guardian: ShellGuardian) -> None:
+    assert ask_task_stop(server.path, TASK_ID, peer=me) is True
+    assert guardian.stop_requested_by == [None]
+
+
+@pytest.mark.parametrize("via", ["telegram", 3, ["web"]])
+def test_a_stop_from_nobody_we_know_is_refused(
+    server: ControlServer, guardian: ShellGuardian, via: object
+) -> None:
+    raw = json.dumps({"cmd": "task_stop", "task": TASK_ID, "via": via}).encode() + b"\n"
+    assert talk(server, raw)["outcome"] == "refused"
+    assert guardian.stop_requested_by == []
 
 
 @pytest.mark.parametrize("stopped", [True, False])

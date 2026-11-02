@@ -13,7 +13,7 @@ program on this machine that listens on a port of its own (cookies ignore ports)
     own ``Origin``, and only that one is taken with it;
   * only GET, except the paths that change something: ``POST /instantaneas/rebobinar`` (T12b);
     only with `backtide web --tareas`, ``POST /hablar/pedir`` (T26-5b: a task for the agent, the one
-    form that may be as long as what the owner asks);
+    form that may be as long as what the owner asks), and ``POST /hablar/parar`` (stopping one);
     only when `backtide web --ajustes` turned the Settings page on, ``POST /ajustes/guardar``
     (T12e: a key set or removed); and only with `backtide web --aprobar`, ``POST
     /peticiones/decidir`` (T10-5: approve, reject, "aprobar y confiar", revoke a batch, take a
@@ -147,6 +147,7 @@ TOUCH_FINISH_PATH = "/tocar/responder"
 SIGN_OUT_PATH = "/salir"
 TALK_PATH = "/hablar"  # the chat (T26-5b): the page, its stream and, with --tareas, its POST
 TALK_SEND_PATH = "/hablar/pedir"
+TALK_STOP_PATH = "/hablar/parar"
 CLOSE_SESSIONS_PATH = "/ajustes/cerrar-sesiones"
 CLOSE_SESSIONS_WORD = "cerrar-todas"  # typed in the form: the confirmation
 MAX_FORM_BYTES = 2048

@@ -342,7 +342,7 @@ class DemoTasks:
             if one is None:
                 return {"ok": False, "outcome": "unknown", "message": "", "answer": None}
             outcome = self._outcome_of(one)
-            answer = None if outcome == "running" else one["answer"]
+            answer = one["answer"] if outcome == "ok" else None
             return {
                 "ok": True,
                 "outcome": outcome,
@@ -365,8 +365,17 @@ class DemoTasks:
             del self._of[agent][:-20]
         return {"ok": True, "outcome": "started", "message": "", "task": task_id}
 
+    def stop(self, task_id: str, *, agent: str | None = None) -> bool:
+        with self._lock:
+            for one in self._of.get(agent, []):
+                if self._outcome_of(one) == "running":
+                    one["stopped"] = True
+        return True
+
     @staticmethod
     def _outcome_of(one: dict[str, Any]) -> str:
+        if one.get("stopped"):
+            return "stopped"
         return "ok" if time.time() - one["asked_at"] >= DEMO_TASK_SECONDS else "running"
 
 
