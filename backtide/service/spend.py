@@ -48,6 +48,11 @@ the next one may go out. Design: docs/33-diseno-t11-tope-de-gasto.md.
   has its own ``max_inflight_local`` calls in flight (2), apart from ``max_inflight``: one can
   take minutes and Ollama serves one at a time, so it must not leave the paid ones without room.
 - Thread-safe: one lock for the totals, the file and what is recorded about them.
+- **Several agents** (T26-2c, docs/47 section 6.4): each has a ``Budget`` of its own, in its own
+  folder and with its own caps, and they share one ``InstallationSpend``
+  (``backtide/service/spend_total.py``, here ``shared``): a call goes out only if both the agent
+  and the whole installation may spend. With one agent nothing is shared, and the agent's caps
+  are the installation's.
 """
 
 import json
@@ -60,7 +65,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, tzinfo
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backtide.blackbox import Event, Source
@@ -100,6 +105,7 @@ INFLIGHT_TTL = 2 * 3600.0
 # billed, at the dearest shipped output price.
 FALLBACK_MICRO = ESTIMATE_MAX_OUTPUT * int(max(row.output for row in DEFAULT_PRICES.values()))
 COST_EVENTS = (("llm", "response"), ("system", "budget_charged"))
+UNCOUNTED = "uncounted"  # what the whole installation answers when it cannot count (T26-2c)
 THRESHOLDS = (50, 80, 100)
 BLOCKED_EVERY = 10.0
 WINDOWS = ("day", "month")
@@ -114,6 +120,32 @@ History = Callable[..., list[Event]]
 
 class BudgetError(Exception):
     """The budget's file or the black box cannot be used. The message is for a log."""
+
+
+@dataclass(frozen=True)
+class Count:
+    """What one agent has spent, as it tells the whole installation (T26-2c)."""
+
+    day: str = ""
+    month: str = ""
+    spent_day: int = 0
+    spent_month: int = 0
+    reserved: int = 0
+    counted: bool = True  # False: its own count cannot be made, so the total cannot either
+
+
+class SharedSpend(Protocol):
+    """The whole installation's spending, as a ``Budget`` sees it (``InstallationSpend``)."""
+
+    def blocked(self) -> str | None: ...
+
+    def reserve(self, slug: str, micro: int) -> bool: ...
+
+    def report(self, slug: str, count: Count) -> None: ...
+
+    def booked(self) -> None: ...
+
+    def status(self) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -220,8 +252,12 @@ class Budget:
         history: History | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
+        shared: SharedSpend | None = None,
+        slug: str = "",
     ) -> None:
         self._settings = settings
+        self._shared = shared
+        self._slug = slug
         self._state_dir = Path(state_dir)
         self._record = record
         self._alert = alert
@@ -252,6 +288,7 @@ class Budget:
         self._blocked = 0
         self._blocked_last = float("-inf")
         self._blocked_window = "day"
+        self._blocked_whole = False  # the installation's cap, not this agent's (T26-2c)
         self._unsaved_told = False
         # B3: the prices the page offers that are only used once the owner accepts them (new
         # models, or more than half below the shipped price), and who applies them.
@@ -264,6 +301,13 @@ class Budget:
         """The totals from ``budget.json``, caught up with the black box (B1), or rebuilt from it.
         Never raises: if neither works, every model call is refused until a restart (recorded,
         alerted)."""
+        with self._lock:
+            try:
+                self._open()
+            finally:
+                self._report()
+
+    def _open(self) -> None:
         with self._lock:
             day, month = self._keys()
             try:
@@ -426,6 +470,12 @@ class Budget:
             if window is not None:
                 self._note_blocked(window, model)
                 return "spend_cap"
+            whole = self._shared.blocked() if self._shared is not None else None
+            if whole == UNCOUNTED:
+                return "spend_unavailable"
+            if whole is not None:
+                self._note_blocked(whole, model, whole_installation=True)
+                return "spend_cap"
             now = self._mono()
             paid = sum(1 for flight in self._flights.values() if not flight.local)
             if paid >= self._settings.max_inflight:
@@ -447,11 +497,16 @@ class Budget:
                 if any(self._spent[w] + reserved >= caps[w] for w in WINDOWS):
                     return "throttled"  # the calls in flight may reach the cap already
                 flight.reserved = self._estimate(flight)
+                if self._shared is not None and not self._shared.reserve(
+                    self._slug, flight.reserved
+                ):
+                    return "throttled"  # what all of them have in flight may reach the total
             key = flow_id if isinstance(flow_id, str) and flow_id else f"anon-{now}"
             old = self._flights.pop(key, None)
             if old is not None:  # cannot be (flow ids are unique); never dropped uncharged
                 self._charge_flight(key, old, "replaced")
             self._flights[key] = flight
+            self._report()
             return None
 
     def _admit_local(self, flow_id: object) -> str | None:
@@ -472,6 +527,7 @@ class Budget:
         with self._lock:
             if isinstance(flow_id, str):
                 self._flights.pop(flow_id, None)
+            self._report()
 
     def charge_unanswered(
         self, flow_id: object, *, why: str, cause: Event | None = None
@@ -492,6 +548,7 @@ class Budget:
             flights, self._flights = self._flights, {}
             for key, flight in flights.items():
                 self._charge_flight(key, flight, "proxy_restart")
+            self._report()
 
     def settle(self, kind: str, details: dict[str, Any], *, local: bool = False) -> Cost:
         """The cost of one ``llm/response`` (it leaves the calls in flight and gives back its
@@ -501,6 +558,7 @@ class Budget:
         with self._lock:
             flow_id = details.get("flow_id")
             flight = self._flights.pop(flow_id, None) if isinstance(flow_id, str) else None
+            self._report()
             if local:
                 if flight is not None and not flight.local:
                     # Admitted as a paid call: what it reserved is charged, never freed by a
@@ -631,6 +689,8 @@ class Budget:
             self._save()
             for window in WINDOWS:
                 self._warn(window, event)
+            if self._shared is not None:
+                self._shared.booked()
 
     def blocked_window(self) -> str | None:
         """``day`` or ``month`` when that cap is reached (the month first), else None."""
@@ -650,9 +710,12 @@ class Budget:
             if self._blocked and self._mono() - self._blocked_last >= BLOCKED_EVERY:
                 self._record_blocked(None)
 
-    def _note_blocked(self, window: str, model: object) -> None:
+    def _note_blocked(
+        self, window: str, model: object, *, whole_installation: bool = False
+    ) -> None:
         self._blocked += 1
         self._blocked_window = window
+        self._blocked_whole = whole_installation
         if self._mono() - self._blocked_last >= BLOCKED_EVERY:
             self._record_blocked(model)
 
@@ -664,6 +727,8 @@ class Budget:
         }
         if isinstance(model, str):
             details["model"] = model[:128]
+        if self._blocked_whole:
+            details["scope"] = "installation"
         self._blocked = 0
         self._blocked_last = self._mono()
         self._safe_record("llm", "blocked", "", details, 2)
@@ -740,7 +805,7 @@ class Budget:
             if not self._unavailable:
                 self._roll(*self._keys())
             book = self.book
-            return {
+            status = {
                 "available": not self._unavailable,
                 "day": {
                     "spent_micro": self._spent["day"],
@@ -771,6 +836,25 @@ class Budget:
                     "pending_digest": pending_digest(self.pending),
                 },
             }
+            if self._shared is not None:
+                whole = self._shared.status()
+                status["installation"] = whole
+                # Without the total nothing goes out: what is shown says so, as with its own.
+                status["available"] = status["available"] and whole["available"]
+                # The cap that binds, and which of them are its own (one with none: MAX_CAP_USD).
+                top = to_micro(MAX_CAP_USD)
+                status["own_caps"] = {
+                    "day": None if self._daily >= top else self._daily,
+                    "month": None if self._monthly >= top else self._monthly,
+                }
+                for window in WINDOWS:
+                    part = status[window]
+                    part["cap_micro"] = min(part["cap_micro"], whole[window]["cap_micro"])
+                if status["blocked"] is None and whole["blocked"] is not None:
+                    # Whoever reads "blocked" learns the truth: no call of this agent goes out.
+                    status["blocked"] = whole["blocked"]
+                    status["blocked_by"] = "installation"
+            return status
 
     def lines(self) -> list[str]:
         """``status`` in Spanish, for ``/estado`` (Telegram)."""
@@ -890,28 +974,7 @@ class Budget:
             return None
 
     def _load(self) -> dict[str, Any] | None:
-        path = self._state_dir / STATE_BUDGET
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        except FileNotFoundError:
-            return None
-        except OSError as error:
-            raise BudgetError(f"cannot open {STATE_BUDGET}: {error.strerror}") from None
-        try:
-            info = os.fstat(fd)
-            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-                raise BudgetError(f"{STATE_BUDGET} is not ours and private")
-            data = os.read(fd, MAX_STATE_BYTES + 1)
-        finally:
-            os.close(fd)
-        if len(data) > MAX_STATE_BYTES:
-            raise BudgetError(f"{STATE_BUDGET} is too big")
-        try:
-            state = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError, RecursionError):
-            raise BudgetError(f"{STATE_BUDGET} is not JSON") from None
-        _check_state(state)
-        return state
+        return read_state(self._state_dir)
 
     def _apply_state(self, state: dict[str, Any]) -> None:
         self._day, self._month = state["day"], state["month"]
@@ -952,6 +1015,55 @@ class Budget:
                 self._safe_record(
                     "system", "budget_unsaved", "", {"error": type(error).__name__}, 1
                 )
+        self._report()
+
+    def _report(self) -> None:
+        """The whole installation hears what this agent has now (T26-2c). Its own lock first and
+        then the installation's, always in that order: the installation never calls back."""
+        if self._shared is not None:
+            self._shared.report(
+                self._slug,
+                Count(
+                    self._day,
+                    self._month,
+                    self._spent["day"],
+                    self._spent["month"],
+                    self._reserved(),
+                    counted=not self._unavailable,
+                ),
+            )
+
+
+def read_private_json(folder: Path, name: str) -> Any:
+    """The JSON of a state file of ours, private and of a reasonable size; None if there is no
+    such file. BudgetError if it cannot be used."""
+    try:
+        fd = os.open(folder / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise BudgetError(f"cannot open {name}: {error.strerror}") from None
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise BudgetError(f"{name} is not ours and private")
+        data = os.read(fd, MAX_STATE_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_STATE_BYTES:
+        raise BudgetError(f"{name} is too big")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise BudgetError(f"{name} is not JSON") from None
+
+
+def read_state(folder: Path) -> dict[str, Any] | None:
+    """The ``budget.json`` of ``folder``, checked; None if there is none. BudgetError otherwise."""
+    state = read_private_json(folder, STATE_BUDGET)
+    if state is not None:
+        _check_state(state)
+    return state
 
 
 def _check_state(state: object) -> None:
@@ -1025,6 +1137,23 @@ CAP_SHAPE = (
 )
 
 
+def whole_lines(whole: dict[str, Any]) -> list[str]:
+    """What the whole installation has spent, in Spanish, and each agent's part (T26-2c)."""
+    lines = []
+    for window, name in (("day", "hoy"), ("month", "este mes")):
+        part = whole[window]
+        lines.append(
+            f"Total de la instalación {name}: {_euroish(part['spent_micro'])} $ de "
+            f"{_euroish(part['cap_micro'])} $."
+        )
+    for slug, part in sorted(whole.get("agents", {}).items()):
+        lines.append(
+            f"  {slug}: {_euroish(part['day_micro'])} $ hoy, "
+            f"{_euroish(part['month_micro'])} $ este mes."
+        )
+    return lines
+
+
 def status_lines(status: dict[str, Any]) -> list[str]:
     """The spending in Spanish, a line per window and one for the prices."""
     if not status.get("available"):
@@ -1035,9 +1164,15 @@ def status_lines(status: dict[str, Any]) -> list[str]:
         lines.append(
             f"Gasto {name}: {_euroish(part['spent_micro'])} $ de {_euroish(part['cap_micro'])} $."
         )
+    whole = status.get("installation")
+    if isinstance(whole, dict):
+        lines.extend(whole_lines(whole))
     blocked = status.get("blocked")
     if blocked:
-        lines.append(f"Tope {WINDOW_NAMES[blocked]} alcanzado: las llamadas al modelo se rechazan.")
+        of_whom = " de toda la instalación" if status.get("blocked_by") == "installation" else ""
+        lines.append(
+            f"Tope {WINDOW_NAMES[blocked]}{of_whom} alcanzado: las llamadas al modelo se rechazan."
+        )
     prices = status["prices"]
     if prices.get("updated_on"):
         lines.append(f"Precios actualizados el {prices['updated_on']} (fuente: Anthropic).")

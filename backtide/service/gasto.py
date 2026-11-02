@@ -14,6 +14,8 @@ else is here, so it is tested without the CLI.
   ones Telegram's ``/estado`` shows). A reply that makes no sense is never shown.
 - A cap typed here is checked first with ``check_cap`` (the service checks it again).
 - Whatever comes back is printed redacted and with control characters escaped.
+- With several agents (T26-2c): ``agent`` (`--agente`) says whose spending or whose cap. Without it
+  this is about the whole installation: its total, each agent's part and its cap.
 
 Exit codes: 0 done (the spending or the caps shown, or the caps changed); 1 not done (no service,
 it cannot count now, the cap was not saved); 2 usage (a cap that does not fit, an unusable lock,
@@ -54,12 +56,18 @@ HOW_TO_CHANGE = "Cámbialos con `backtide tope --dia <dólares> --mes <dólares>
 MAX_MICRO = 10**15  # far above any cap the service accepts
 
 
-def spending(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | None = None) -> int:
+def spending(
+    config: ServiceConfig,
+    *,
+    agent: str | None = None,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+) -> int:
     """`backtide gasto`: today's and this month's spending against the caps. Returns the exit
     code."""
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
-    read = _read(config, err)
+    read = _read(config, err, agent)
     if isinstance(read, int):
         return read
     lines = [_text(line) for line in status_lines(read)]
@@ -78,6 +86,7 @@ def caps(
     daily: str | None,
     monthly: str | None,
     *,
+    agent: str | None = None,
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
@@ -90,13 +99,17 @@ def caps(
             _error(err, CAP_SHAPE)
             return EXIT_ERROR
     if daily is None and monthly is None:
-        return _show_caps(config, out, err)
+        return _show_caps(config, out, err, agent)
     refused = _service(config, err)
     if refused is not None:
         return refused
     try:
         reply = ask_set_budget(
-            config.control_socket, daily_usd=daily, monthly_usd=monthly, via="cli"
+            config.control_socket,
+            daily_usd=daily,
+            monthly_usd=monthly,
+            via="cli",
+            **({} if agent is None else {"agent": agent}),
         )
     except ControlUnavailable:
         _error(err, NOT_ANSWERING)
@@ -122,26 +135,40 @@ def caps(
     return EXIT_ERROR if reply["outcome"] in ("invalid", "refused") else EXIT_FAILED
 
 
-def _show_caps(config: ServiceConfig, out: TextIO, err: TextIO) -> int:
-    read = _read(config, err)
+def _show_caps(config: ServiceConfig, out: TextIO, err: TextIO, agent: str | None) -> int:
+    read = _read(config, err, agent)
     if isinstance(read, int):
         return read
     if read.get("available") is not True:
         _error(err, _text(status_lines(read)[0]))
         return EXIT_FAILED
-    print(f"Tope diario: {_dollars(read['day']['cap_micro'])} $", file=out)
-    print(f"Tope mensual: {_dollars(read['month']['cap_micro'])} $", file=out)
+    whole = read.get("installation")
+    if whole is None:  # one agent: its caps are the installation's
+        print(f"Tope diario: {_dollars(read['day']['cap_micro'])} $", file=out)
+        print(f"Tope mensual: {_dollars(read['month']['cap_micro'])} $", file=out)
+        print(HOW_TO_CHANGE, file=out)
+        return EXIT_OK
+    print(f"Tope diario de toda la instalación: {_dollars(whole['day']['cap_micro'])} $", file=out)
+    print(
+        f"Tope mensual de toda la instalación: {_dollars(whole['month']['cap_micro'])} $", file=out
+    )
+    if agent is not None:
+        own = read.get("own_caps") or {}
+        for key, name in (("day", "diario"), ("month", "mensual")):
+            cap = own.get(key)
+            said = "no tiene, solo el de la instalación" if cap is None else f"{_dollars(cap)} $"
+            print(f"Tope {name} de {_text(agent)}: {said}", file=out)
     print(HOW_TO_CHANGE, file=out)
     return EXIT_OK
 
 
-def _read(config: ServiceConfig, err: TextIO) -> dict[str, Any] | int:
+def _read(config: ServiceConfig, err: TextIO, agent: str | None = None) -> dict[str, Any] | int:
     """What the service says of the spending, checked; or the exit code if it cannot be had."""
     refused = _service(config, err)
     if refused is not None:
         return refused
     try:
-        read = ask_budget(config.control_socket)
+        read = ask_budget(config.control_socket, **({} if agent is None else {"agent": agent}))
     except ControlUnavailable:
         _error(err, NOT_ANSWERING)
         return EXIT_FAILED
@@ -173,7 +200,29 @@ def _makes_sense(read: object) -> bool:
         return False
     if read.get("blocked") not in (None, "day", "month"):
         return False
+    if not _whole_makes_sense(read.get("installation", {}), read.get("own_caps", {})):
+        return False
     return isinstance(defaults_on, str) and isinstance(prices.get("updated_on", ""), str | None)
+
+
+def _whole_makes_sense(whole: object, own: object) -> bool:
+    """What ``status_lines`` and ``_show_caps`` rely on of the whole installation (T26-2c)."""
+    if not isinstance(whole, dict) or not isinstance(own, dict):
+        return False
+    if not all(cap is None or _is_amount(cap) for cap in own.values()):
+        return False
+    if not whole or whole.get("available") is False:
+        return True
+    try:
+        amounts = [whole[w][k] for w in ("day", "month") for k in ("spent_micro", "cap_micro")]
+        parts = [part[k] for part in whole["agents"].values() for k in ("day_micro", "month_micro")]
+    except (KeyError, TypeError, AttributeError):
+        return False
+    return all(_is_amount(a) for a in (*amounts, *parts))
+
+
+def _is_amount(value: object) -> bool:
+    return type(value) is int and 0 <= value <= MAX_MICRO
 
 
 def _service(config: ServiceConfig, err: TextIO) -> int | None:

@@ -728,7 +728,7 @@ def test_a_machine_with_one_agent_calls_the_service_as_it_always_did(
 
 @pytest.mark.parametrize(
     "order",
-    [["vigilar"], ["instantaneas"], ["seguir"], ["retenidas"]],
+    [["vigilar"], ["aprobar", "h-0123456789abcdef"], ["tope"], ["tarea", "hola"]],
 )
 def test_a_file_of_another_agent_that_cannot_be_used_is_said_before_anything_runs(
     home: Path,  # noqa: F811

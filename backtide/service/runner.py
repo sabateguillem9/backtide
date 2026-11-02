@@ -24,6 +24,9 @@ Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
   Every other one runs on a thread of its own (``_Neighbours``): one that cannot start or fails is
   told, in the installation's black box and to the owner, and the others go on. With no others,
   no thread and nothing of this.
+- With ``others`` too (T26-2c): an order on the sockets says which agent it is about
+  (``backtide.service.roster``), each agent is published there once its ``Guardian`` is up and taken
+  out before it stops, and ``InstallationSpend`` adds up what all of them spend.
 """
 
 import dataclasses
@@ -38,7 +41,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import FrameType, TracebackType
-from typing import Protocol
+from typing import Any, Protocol
 
 from backtide.analyzer import (
     AssessedBlackBox,
@@ -104,8 +107,10 @@ from backtide.service.process_sensor import (
     recorded_keys,
 )
 from backtide.service.proxy_channel import KEY_NOT_APPLIED, Policy, known_secrets
+from backtide.service.roster import Desk, Roster
 from backtide.service.settings import Applied, ReloadFailedClosed, Settings
-from backtide.service.spend import Budget
+from backtide.service.spend import MAX_CAP_USD, Budget, SharedSpend
+from backtide.service.spend_total import InstallationSpend
 from backtide.service.telegram_config import load_telegram
 from backtide.service.trust import TrustStore
 from backtide.service.web_control import WebControlServer
@@ -285,13 +290,16 @@ def _record_in_installation(
     details: dict[str, object],
     *,
     risk: int = 0,
-) -> None:
+    source: str = "system",
+) -> bool:
+    """True once it is written. If it cannot be, False: logged, alerted, and who asked decides."""
     try:
         with _INSTALLATION_BOX, open_installation_box(config) as box:
             problems = box.verify().problems
             if problems:
                 raise BlackBoxError(f"its chain does not verify ({len(problems)} problems)")
-            box.append("system", action, target, details=details, risk=risk)
+            box.append(source, action, target, details=details, risk=risk)
+        return True
     except (BlackBoxError, ConfigError, OSError) as error:
         logger.error("the installation's black box cannot be used: %s", error)
         alerts.submit(
@@ -302,6 +310,7 @@ def _record_in_installation(
                 f"{config.installation_dir}: {error}",
             )
         )
+        return False
 
 
 def _box_at(db: Path, key_path: Path, checkpoint: Path) -> BlackBox:
@@ -357,6 +366,7 @@ def build_guardian(
     hold_watch: HoldWatch | None = None,
     sensor_share: SensorShare | None = None,
     log_filter: Callable[[logging.LogRecord], bool] | None = None,
+    spend_total: SharedSpend | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
     reports to (not started) and the black box (not opened).
@@ -382,8 +392,8 @@ def build_guardian(
     the providers' new keys, T12e), and ``hold_watch`` is told about its held requests (the
     Telegram notice, T10-4). ``scrub`` is the process sensor's list of secrets to strike,
     filled here and kept by ``serve`` to refresh it when a key changes. With several agents
-    (T26-2b), ``sensor_share`` is the one Tetragon they have in common and ``log_filter`` says
-    which log records are this one's."""
+    (T26-2b), ``sensor_share`` is the one Tetragon they have in common, ``log_filter`` says
+    which log records are this one's and ``spend_total`` is what they spend together (T26-2c)."""
     jail = jail if jail is not None else AgentJail(config.jail_config())
     try:
         rules = load_rules(config)  # a broken file is an error, not a guess
@@ -435,6 +445,7 @@ def build_guardian(
         timings=hold_timings,
         watch=hold_watch,
         alerts=alerts,
+        spend_total=spend_total,
     )
     if on_egress is not None:
         on_egress(egress)
@@ -509,6 +520,7 @@ def build_egress(
     timings: HoldTimings | None = None,
     watch: HoldWatch | None = None,
     alerts: AlertQueue | None = None,
+    spend_total: SharedSpend | None = None,
 ) -> Egress:
     """The egress proxy of ``config`` (docs/21, section 9): its container, and what backtide lets
     out through it, the allowed hosts of ``[proxy]`` and the model providers' hosts. The channel
@@ -525,7 +537,7 @@ def build_egress(
     # (logged). What is trusted for one agent never lets out another's.
     trust = TrustStore(config.agent_dir)
     trust.load()
-    budget, prices = build_budget(config, box, alerts)
+    budget, prices = build_budget(config, box, alerts, spend_total)
     # The gate (T10-2) reads the black box once, at the first start: the holds a backtide that
     # died left open there are closed.
     return Egress(
@@ -562,20 +574,32 @@ def _channel_not_mounted(argv: list[str]) -> None:
 
 
 def build_budget(
-    config: ServiceConfig, box: AssessedBlackBox, alerts: AlertQueue | None
+    config: ServiceConfig,
+    box: AssessedBlackBox,
+    alerts: AlertQueue | None,
+    spend_total: SharedSpend | None = None,
 ) -> tuple[Budget, PriceUpdater]:
     """The spending cap of ``[budget]`` (T11, docs/33) and, unless ``auto_prices = false``, the
     updater of its prices (Anthropic's page, from the service: never through the agent's proxy).
     Constructed only: the Egress opens the budget and starts the updater at its first start.
     What it keeps goes in the agent's folder: <state_dir> for the main one, and for another its
-    own, so two ledgers never write one file. The cap of the whole installation is T26-2c."""
+    own, so two ledgers never write one file. With ``spend_total`` (several agents, T26-2c)
+    ``[budget]`` is the whole installation's cap, so the agent's own are only those of its file."""
     settings = config.budget_settings()
+    own = settings
+    if spend_total is not None:
+        none_of_its_own = {
+            key: MAX_CAP_USD for key in ("daily_usd", "monthly_usd") if key not in config.own_caps
+        }
+        own = dataclasses.replace(settings, **none_of_its_own)
     budget = Budget(
-        settings,
+        own,
         state_dir=config.agent_dir,
         record=box.append,
         alert=None if alerts is None else alerts.submit,
         history=box.events,
+        shared=spend_total,
+        slug=config.slug,
     )
     # With auto_prices = false it only loads the last good table fetched before (no thread).
     prices = PriceUpdater(
@@ -878,6 +902,22 @@ def _stop_unrecorded_agent(
     error.add_note("Se ha parado al agente que estaba en marcha: sin grabar no hay vigilancia.")
 
 
+def build_spend_total(main: ServiceConfig, others: Sequence[ServiceConfig]) -> InstallationSpend:
+    """What every agent spends together (T26-2c): ``[budget]`` of ``backtide.toml`` is its cap, and
+    the caps the main agent had set, the first time. Not bound yet: its alerts are the main
+    agent's, which needs this to be built."""
+    try:
+        ensure_state_folder(main.installation_dir, "the installation's black box folder")
+    except ConfigError as error:  # as with its box, this stops no agent: its caps cannot change
+        logger.error("the installation's folder cannot be used: %s", error)
+    return InstallationSpend(
+        main.budget_settings(),
+        members={config.slug: config.agent_dir for config in (main, *others)},
+        folder=main.installation_dir,
+        inherit_from=main.agent_dir,
+    )
+
+
 def reload_everyones_keys(
     main: Callable[[], Applied], others: Callable[[], Sequence[Callable[[], Applied]]]
 ) -> Callable[[], Applied]:
@@ -906,6 +946,20 @@ def reload_everyones_keys(
     return reload
 
 
+class _OnTheRoster:
+    """Orders about a neighbour reach it while its ``Guardian`` is up: as the main agent's socket,
+    this is what ``Guardian.run`` starts once it is up and closes before it stops (T26-2c)."""
+
+    def __init__(self, roster: Roster, desk: Desk) -> None:
+        self._roster, self._desk = roster, desk
+
+    def start(self) -> None:
+        self._roster.publish(self._desk)
+
+    def close(self) -> None:
+        self._roster.retire(self._desk.slug)
+
+
 class _Neighbours:
     """The agents other than the main one, each with its Guardian on a thread of its own."""
 
@@ -920,7 +974,11 @@ class _Neighbours:
         told: AlertSink,
         build: Callable[..., tuple[Guardian, AlertQueue, BlackBox]] | None = None,
         run: Callable[..., None] | None = None,
+        roster: Roster | None = None,
+        spend_total: SharedSpend | None = None,
     ) -> None:
+        self._roster = roster
+        self._spend_total = spend_total
         self._main = main
         self._others = others
         self._notifier_for = notifier_for
@@ -974,10 +1032,16 @@ class _Neighbours:
             sensor=self._share is not None,
             sensor_share=self._share,
             log_filter=scope.belongs_to(config.slug),
+            spend_total=self._spend_total,
         )
         with self._lock:
             self._reloads.extend(key_reloader(config, egress, secrets) for egress in built)
-        self._run_guardian(guardian, alerts, box, stop=self._stop, handle_signals=False)
+        control: ControlHook | None = None
+        if self._roster is not None:
+            control = _OnTheRoster(self._roster, _desk_of(config, guardian, built))
+        self._run_guardian(
+            guardian, alerts, box, stop=self._stop, handle_signals=False, control=control
+        )
 
 
 class _Runnable(Protocol):
@@ -990,6 +1054,25 @@ class _Closable(Protocol):
 
 class _Startable(_Closable, Protocol):
     def start(self) -> None: ...
+
+
+def _desk_of(
+    config: ServiceConfig,
+    guardian: Guardian,
+    built: Sequence[Egress],
+    store: SnapshotStore | None = None,
+) -> Desk:
+    """What the sockets act on for this agent."""
+    egress = built[0] if built else None
+    listing = store if store is not None else SnapshotStore(config.volume)
+    return Desk(
+        config.slug,
+        guardian,
+        budget=None if egress is None else egress.budget,
+        waiting=None if egress is None else egress.waiting,
+        snapshots=lambda: listing.snapshots(),
+        name=config.display_name,
+    )
 
 
 def run_guardian(
@@ -1103,8 +1186,9 @@ def serve(
     opens too, right after the control socket, for that group only (and, with ``web_user``,
     that user only).
 
-    With ``others`` (T26-2b) those agents run too, each on its own thread, and this one remains
-    the one behind the sockets and the bot (``--agente``, T26-2c). Each one's alerts say whose."""
+    With ``others`` (T26-2b) those agents run too, each on its own thread, and this one holds
+    the sockets and the bot. An order on a socket says which agent it is about (T26-2c), and what
+    they spend together has a cap of its own. Each one's alerts say whose."""
     settings = load_telegram(config.state_dir)
     with take_lock(config.lock_file):
         telegram = telegram_parts(config, settings) if settings is not None else None
@@ -1114,7 +1198,9 @@ def serve(
         share: SensorShare | None = None
         log_filter = None
         neighbours: _Neighbours | None = None
+        spend_total: InstallationSpend | None = None
         if others:
+            spend_total = build_spend_total(config, others)
             scope.hand_down()  # before any thread of an agent starts
             log_filter = scope.belongs_to(None)
             share = SensorShare() if sensor else None
@@ -1145,13 +1231,36 @@ def serve(
             hold_watch=None if telegram is None else telegram.desk,
             sensor_share=share,
             log_filter=log_filter,
+            spend_total=spend_total,
         )
         # The Settings page (T12e): `backtide web --ajustes` asks through this same socket.
         (egress,) = built
         reload_keys = key_reloader(config, egress, sensor_secrets)
+        # Which agent an order is about: this one, unless it says another (T26-2c).
+        roster = Roster(
+            _desk_of(config, guardian, built, store),
+            [(other.slug, other.display_name) for other in others],
+        )
         if others:
+            if spend_total is not None:
+
+                def record_total(
+                    action: str, target: str, details: dict[str, object], **options: Any
+                ) -> bool:
+                    return _record_in_installation(
+                        config, alerts, action, target, details, **options
+                    )
+
+                spend_total.bind(record=record_total, alert=alerts.submit)
             neighbours = _Neighbours(
-                config, others, notifier_for=notifier_for, stop=stop, share=share, told=alerts
+                config,
+                others,
+                notifier_for=notifier_for,
+                stop=stop,
+                share=share,
+                told=alerts,
+                roster=roster,
+                spend_total=spend_total,
             )
             reload_keys = reload_everyones_keys(reload_keys, neighbours.reloads)
         settings_service = Settings(
@@ -1184,6 +1293,8 @@ def serve(
             on_entry=guardian.web_access,
             password=web_password,
             passkeys=web_passkeys,
+            roster=roster,
+            whole_budget=spend_total,
         )
         if web_group is not None:
             listing = store if store is not None else SnapshotStore(config.volume)
@@ -1202,6 +1313,8 @@ def serve(
                     on_entry=guardian.web_access,
                     password=web_checks,
                     passkeys=web_passkeys,
+                    roster=roster,
+                    whole_budget=spend_total,
                 ),
             )
         if telegram is not None:

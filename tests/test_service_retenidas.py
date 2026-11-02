@@ -58,6 +58,7 @@ def patch(
     monkeypatch.setattr(retenidas, "take_lock", take_lock)
     monkeypatch.setattr(retenidas, "ask_decide", ask_decide)
     monkeypatch.setattr(retenidas, "ask_holds", ask_holds)
+    monkeypatch.setattr(retenidas, "ask_agents", lambda path: [{"slug": "principal"}])
     return asked
 
 

@@ -15,7 +15,8 @@ thread, and what it starts) is the main agent's, which is where it has always go
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 _here = threading.local()
 _lock = threading.Lock()
@@ -30,6 +31,19 @@ def current() -> str | None:
 def enter(slug: str) -> None:
     """From here on this thread, and what it starts, works for the agent ``slug``."""
     _here.slug = slug
+
+
+@contextmanager
+def working_for(slug: str | None) -> Iterator[None]:
+    """For a while this thread works for ``slug`` (None: the main agent's). A connection to the
+    sockets runs on the sockets' thread whichever agent it is about, and what it logs is that
+    agent's (T26-2c)."""
+    before = current()
+    _here.slug = slug
+    try:
+        yield
+    finally:
+        _here.slug = before
 
 
 def hand_down() -> None:

@@ -389,6 +389,9 @@ class ServiceConfig:
     sensor: Mapping[str, Any] = field(default_factory=dict)
     gate: Mapping[str, Any] = field(default_factory=dict)
     budget: Mapping[str, Any] = field(default_factory=dict)
+    # Which caps of ``budget`` are this agent's own (T26-2c): those of its file. With several
+    # agents the rest of ``[budget]`` is the whole installation's cap, not a copy for each.
+    own_caps: tuple[str, ...] = ()
     # The web's sessions (T26-3a-2): only shorter than the design's, for a test of expiry.
     web: Mapping[str, Any] = field(default_factory=dict)
     # One per provider of [proxy] (from_file reads them from keys/): the real and fake keys.

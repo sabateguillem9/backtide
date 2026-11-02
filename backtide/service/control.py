@@ -46,6 +46,11 @@ The server (inside the service):
   exportar`: the service copies the agent's work folder into the owner's new folder).
   Anything else (too big, slow, not UTF-8, not JSON, unknown command, extra keys, an id that is
   not a snapshot id) is refused WITHOUT calling the Guardian.
+  Which agent (T26-2c, ``backtide.service.roster``): what is an agent's (``AGENT_COMMANDS``) may
+  carry ``"agent": <slug>``; without it, it is about the main agent. A name that is nobody's is
+  refused with no agent touched, and what is the machine's (keys, sessions, passkeys) does not take
+  the field. ``{"cmd": "agents"}`` lists them. A new cap with no ``agent`` is the whole
+  installation's, which with one agent is that agent's.
   The installed web, which is not the service's user, gets a second socket of its own with a
   closed subset of these commands (``backtide.service.web_control``, T12c): ``WebControlServer``
   reuses this class, with its own peer check (``refusal_for``) and socket mode and group.
@@ -73,12 +78,13 @@ import stat
 import struct
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from backtide.blackbox import redact
+from backtide.jail import identity
 from backtide.jail.profile import MAX_PROMPT, check_prompt
 from backtide.service.holds import (
     BATCH_ID_RE,
@@ -94,6 +100,7 @@ if TYPE_CHECKING:
     from backtide.service.passkeys import Passkeys  # webauthn: not for every `backtide` command
 from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
+from backtide.service.roster import AgentRefused, Desk, Roster
 from backtide.service.sessions import Sessions
 from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
@@ -210,6 +217,16 @@ TASK_STATUS_OUTCOMES = frozenset(
 )
 TASK_STOP_OUTCOMES = frozenset({"stopped", "failed", TASK_UNKNOWN, REFUSED})
 TASK_STOP_REPLY_TIMEOUT = 2 * 60.0  # up to three ``pkill`` of 30 s each, inside the agent
+MAX_LISTED_SNAPSHOTS = 5000
+# What is one agent's, and so may say which (T26-2c). The rest is the machine's: a key, a session,
+# a passkey, the web's password; each of those refuses a field it does not know.
+AGENT_COMMANDS = frozenset(
+    {
+        "rewind", "resume", "decide", "holds", "trust", "untrust", "end_batch", "trusted",
+        "batches", "shell", "import", "task_start", "task_status", "task_stop", "export",
+        "budget", "set_budget", "accept_prices", "snapshots",
+    }
+)  # fmt: skip
 
 
 class ControlError(Exception):
@@ -298,6 +315,14 @@ class BudgetService(Protocol):
     ) -> CapOutcome: ...
 
 
+class WholeBudget(Protocol):
+    """The cap of the whole installation (``backtide.service.spend_total.InstallationSpend``)."""
+
+    def set_caps(
+        self, daily: Decimal | None, monthly: Decimal | None, *, requested_by: str
+    ) -> CapOutcome: ...
+
+
 BUDGET_OUTCOMES = frozenset({"saved", "invalid", "failed", REFUSED})
 
 PeerCredentials = Callable[[socket.socket], tuple[int, int, int]]
@@ -360,11 +385,20 @@ class ControlServer:
         on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
         password: Checker | None = None,
         passkeys: "Passkeys | None" = None,
+        snapshots: Callable[[], Sequence[Snapshot]] | None = None,
+        roster: Roster | None = None,
+        whole_budget: WholeBudget | None = None,
     ) -> None:
         if sessions is not None and on_entry is None:
             # Never a way into the web that leaves no trace (review of T26-3a).
             raise ControlError("las sesiones de la web necesitan dónde apuntar cada entrada")
-        self._guardian = guardian
+        # Who an order is about (T26-2c): with one agent, the one handed in here. With several,
+        # the service hands in a Roster that both sockets share.
+        self._roster = roster or Roster(
+            Desk(identity.MAIN_SLUG, guardian, budget, waiting, snapshots)
+        )
+        # The cap of the whole installation, when there are several agents to add up.
+        self._whole_budget = whole_budget
         # The web's sign-in (T26-3a): root asks here for a one-time link (`sudo backtide
         # enlace`); the web's narrow socket opens and checks the sessions it gives. Every link
         # given and every session opened goes to ``on_entry`` (``Guardian.web_access``: the black
@@ -377,10 +411,6 @@ class ControlServer:
         # The web's passkeys (T26-3c): root lists and takes them out here (`sudo backtide llaves`).
         self._passkeys = passkeys
         self._settings = settings
-        self._budget = budget
-        # The providers that wait for their key (``Egress.waiting``): the panel says so, next
-        # to the spending. Only names of [proxy], never a key.
-        self._waiting = waiting
         self._path = Path(path)
         self._allowed_uid = allowed_uid if allowed_uid is not None else os.geteuid()
         self._peer = peer
@@ -527,37 +557,60 @@ class ControlServer:
         return request
 
     def _handle(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """One order. What is an agent's is answered with that agent's desk; the field that names
+        it leaves the request here, before anything looks at the request's keys."""
         command = request.get("cmd")
+        if not isinstance(command, str) or command not in AGENT_COMMANDS:
+            return self._machine_command(command, request, pid, uid)
+        named = "agent" in request
+        try:
+            with self._roster.using(*([request.pop("agent")] if named else [])) as desk:
+                return self._agent_command(command, request, pid, uid, desk, named=named)
+        except AgentRefused as refused:
+            raise _BadRequest(str(refused)) from None
+
+    def _agent_command(
+        self, command: str, request: dict[str, Any], pid: int, uid: int, desk: Desk, *, named: bool
+    ) -> dict[str, Any]:
+        """``named``: the order said which agent, which only a new cap tells from not saying."""
+        guardian = desk.guardian
         if command == "rewind":
-            return self._rewind(request, pid, uid)
+            return self._rewind(guardian, request, pid, uid)
         if command == "resume":
-            return self._resume(request, pid, uid)
+            return self._resume(guardian, request, pid, uid)
         if command == "decide":
-            return self._decide(request, pid, uid)
+            return self._decide(guardian, request, pid, uid)
         if command == "holds":
-            return self._holds(request)
+            return self._holds(guardian, request)
         if command == "trust":
-            return self._trust(request, pid, uid)
+            return self._trust(guardian, request, pid, uid)
         if command == "untrust":
-            return self._untrust(request, pid, uid)
+            return self._untrust(guardian, request, pid, uid)
         if command == "end_batch":
-            return self._end_batch(request, pid, uid)
+            return self._end_batch(guardian, request, pid, uid)
         if command in ("trusted", "batches"):
-            return self._listing(request)
+            return self._listing(guardian, request)
+        if command in ("budget", "set_budget", "accept_prices"):
+            return self._budget_command(desk, request, pid, uid, named=named)
+        if command in ("shell", "import"):
+            return self._shell(guardian, request, pid, uid)
+        if command == "task_start":
+            return self._task_start(guardian, request, pid, uid)
+        if command == "task_status":
+            return self._task_status(guardian, request)
+        if command == "task_stop":
+            return self._task_stop(guardian, request, pid, uid)
+        if command == "snapshots":
+            return self._snapshots(desk, request)
+        return self._export(guardian, request, pid, uid)
+
+    def _machine_command(
+        self, command: object, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
+        if command == "agents":
+            return self._agents(request)
         if command in ("secrets", "set_secret", "clear_secret"):
             return self._settings_command(request, pid, uid)
-        if command in ("budget", "set_budget", "accept_prices"):
-            return self._budget_command(request, pid, uid)
-        if command in ("shell", "import"):
-            return self._shell(request, pid, uid)
-        if command == "task_start":
-            return self._task_start(request, pid, uid)
-        if command == "task_status":
-            return self._task_status(request)
-        if command == "task_stop":
-            return self._task_stop(request, pid, uid)
-        if command == "export":
-            return self._export(request, pid, uid)
         if command == "web_link":
             return self._web_link(request, pid, uid)
         if command == "web_end_all":
@@ -719,7 +772,9 @@ class ControlServer:
             self._on_entry("web_sessions_closed", {"uid": uid, "pid": pid, "ended": ended})
         return {"ok": True, "outcome": "ended", "message": "", "ended": ended}
 
-    def _shell(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _shell(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         details: dict[str, Any] | None = None
         if request["cmd"] == "shell":
             if set(request) != {"cmd", "kind", "continue"}:
@@ -735,7 +790,7 @@ class ControlServer:
             details = _import_details(request)
             kind, resume = "import", False
         try:
-            outcome = self._guardian.open_shell(
+            outcome = guardian.open_shell(
                 kind, resume=resume, requested_by=f"cli (uid {uid}, pid {pid})", details=details
             )
         except Exception:
@@ -751,7 +806,9 @@ class ControlServer:
             "workdir": outcome.workdir,
         }
 
-    def _task_start(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _task_start(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         """Take a task (T26-5a, backtide/service/tasks.py). Its id comes back at once: nothing of
         the task runs on this thread. The prompt never reaches a message or a log here."""
         if not {"cmd", "prompt"} <= set(request) <= {"cmd", "prompt", "continue", "seconds", "via"}:
@@ -774,7 +831,7 @@ class ControlServer:
                 f"`prompt` es un texto de {MAX_PROMPT} caracteres como mucho, y no vacío."
             ) from None
         try:
-            started = self._guardian.task_start(
+            started = guardian.task_start(
                 prompt, resume=resume, seconds=seconds, requested_by=f"{via} (uid {uid}, pid {pid})"
             )
         except Exception as error:  # its type alone: its text could carry the prompt
@@ -784,12 +841,12 @@ class ControlServer:
             return _refusal(started.message)
         return {"ok": True, "outcome": "started", "message": "", "task": started.task_id}
 
-    def _task_status(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _task_status(self, guardian: RewindService, request: dict[str, Any]) -> dict[str, Any]:
         """How a task goes, with its answer when it ended: the agent's text, as it came. On the
         web's socket it takes a live session (``WebControlServer``): it is not in the black box."""
         task_id = self._task_id_of(request)
         try:
-            status = self._guardian.task_status(task_id)
+            status = guardian.task_status(task_id)
         except Exception as error:
             logger.error("reading a task raised %s instead of answering", type(error).__name__)
             return _refusal("Ha fallado algo inesperado: no se sabe cómo va la tarea.")
@@ -805,11 +862,13 @@ class ControlServer:
             "seconds": status.seconds,
         }
 
-    def _task_stop(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _task_stop(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         """Ctrl-C in `backtide tarea`: stop the task inside the agent. Not on the web's list."""
         task_id = self._task_id_of(request)
         try:
-            stopped = self._guardian.task_stop(task_id)
+            stopped = guardian.task_stop(task_id)
         except Exception as error:
             logger.error("stopping a task raised %s instead of answering", type(error).__name__)
             stopped = False
@@ -827,7 +886,9 @@ class ControlServer:
             raise _BadRequest("Eso no es el identificador de una tarea.")
         return task_id
 
-    def _export(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _export(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         keys = set(request)
         if keys not in (
             {"cmd", "dest"},
@@ -852,7 +913,7 @@ class ControlServer:
         ):
             raise _BadRequest("`bundle` y `repo` no tienen la forma esperada.")
         try:
-            outcome = self._guardian.export(
+            outcome = guardian.export(
                 destination,
                 requested_by=f"cli (uid {uid}, pid {pid})",
                 **({"bundle": bundle, "repo": repo} if "bundle" in request else {}),
@@ -875,23 +936,26 @@ class ControlServer:
             "skipped": _skipped_names(outcome.details.get("skipped")),
         }
 
-    def _budget_command(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
-        """The spending cap (T11): what it says, or new caps (checked here and by the budget)."""
-        if self._budget is None:
+    def _budget_command(
+        self, desk: Desk, request: dict[str, Any], pid: int, uid: int, *, named: bool
+    ) -> dict[str, Any]:
+        """The spending cap (T11): what it says, or new caps (checked here and by the budget). A
+        new cap that names no agent is the whole installation's (T26-2c), with one agent its own."""
+        if desk.budget is None:
             raise _BadRequest("Este servicio no cuenta el gasto.")
         if request["cmd"] == "budget":
             if set(request) != {"cmd"}:
                 raise _BadRequest("Una petición de gasto lleva `cmd` y nada más.")
             try:
-                status = dict(self._budget.status())
-                if self._waiting is not None:
-                    status["models_waiting"] = sorted(self._waiting())
+                status = dict(desk.budget.status())
+                if desk.waiting is not None:
+                    status["models_waiting"] = sorted(desk.waiting())
             except Exception as error:
                 logger.error("reading the spending raised: %s", type(error).__name__)
                 return {"ok": False, "outcome": "failed", "message": "No se ha podido leer."}
             return {"ok": True, "outcome": "listed", "budget": status, "message": ""}
         if request["cmd"] == "accept_prices":
-            return self._accept_prices(request, pid, uid)
+            return self._accept_prices(desk, request, pid, uid)
         if set(request) - {"cmd", "daily_usd", "monthly_usd", "via"}:
             raise _BadRequest("La petición de tope no lleva lo que debe.")
         via = request.get("via", "cli")
@@ -903,8 +967,9 @@ class ControlServer:
             caps[name] = None if value is None else check_cap(value)
             if value is not None and caps[name] is None:
                 return {"ok": False, "outcome": "invalid", "message": CAP_SHAPE}
+        target = self._whole_budget if self._whole_budget is not None and not named else desk.budget
         try:
-            outcome = self._budget.set_caps(
+            outcome = target.set_caps(
                 caps["daily_usd"], caps["monthly_usd"], requested_by=f"{via} (uid {uid}, pid {pid})"
             )
         except Exception as error:
@@ -912,7 +977,9 @@ class ControlServer:
             return {"ok": False, "outcome": "failed", "message": "Ha fallado algo inesperado."}
         return {"ok": outcome.ok, "outcome": outcome.outcome, "message": outcome.message}
 
-    def _accept_prices(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _accept_prices(
+        self, desk: Desk, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         """B3: the owner's yes to the new prices waiting (the digest says which ones)."""
         if set(request) - {"cmd", "digest", "via"} or not isinstance(request.get("digest"), str):
             raise _BadRequest("La petición de precios no lleva lo que debe.")
@@ -920,7 +987,7 @@ class ControlServer:
         if not isinstance(via, str) or via not in SETTINGS_REQUESTERS:
             raise _BadRequest("Los precios solo se aceptan desde la web o la terminal.")
         try:
-            outcome = self._budget.accept_prices(  # type: ignore[union-attr]
+            outcome = desk.budget.accept_prices(
                 request["digest"][:64], requested_by=f"{via} (uid {uid}, pid {pid})"
             )
         except Exception as error:
@@ -1000,7 +1067,9 @@ class ControlServer:
                 "Ha fallado algo inesperado: mira el registro del servicio y la caja negra.",
             )
 
-    def _decide(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _decide(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         if set(request) - {"via"} != {"cmd", "hold_id", "verdict"}:
             raise _BadRequest(
                 "Una decisión lleva `cmd`, `hold_id`, `verdict` y quizá `via`, y nada más."
@@ -1016,7 +1085,7 @@ class ControlServer:
         if verdict not in DECIDE_VERDICTS:
             raise _BadRequest("`verdict` tiene que ser `approve` o `reject`.")
         try:
-            outcome = self._guardian.decide_hold(
+            outcome = guardian.decide_hold(
                 hold_id, verdict, via=via, requested_by=f"{via} (uid {uid}, pid {pid})"
             )
         except Exception:  # the Guardian should not raise; if it does, nothing was approved
@@ -1029,11 +1098,11 @@ class ControlServer:
             "hold_id": hold_id,
         }
 
-    def _holds(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _holds(self, guardian: RewindService, request: dict[str, Any]) -> dict[str, Any]:
         if set(request) != {"cmd"}:
             raise _BadRequest("Una petición de retenidas lleva `cmd` y nada más.")
         try:
-            holds = self._guardian.pending_holds()
+            holds = guardian.pending_holds()
         except Exception:
             logger.exception("listing the held requests raised instead of answering")
             return {"ok": False, "outcome": "failed", "holds": [],
@@ -1042,7 +1111,9 @@ class ControlServer:
 
     # T10-5: the web's holds page (docs/32, section 11 and decision 9)
 
-    def _trust(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _trust(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         if set(request) != {"cmd", "hold_id", "via"}:
             raise _BadRequest("«Aprobar y confiar» lleva `cmd`, `hold_id` y `via`, y nada más.")
         via, hold_id = request["via"], request["hold_id"]
@@ -1051,7 +1122,7 @@ class ControlServer:
         if not isinstance(hold_id, str) or not HOLD_ID_RE.fullmatch(hold_id):
             raise _BadRequest("Eso no es el identificador de una petición retenida (h-…).")
         try:
-            outcome = self._guardian.trust_hold(
+            outcome = guardian.trust_hold(
                 hold_id, via=via, requested_by=f"{via} (uid {uid}, pid {pid})"
             )
         except Exception:  # the Guardian should not raise; if it does, nothing changed
@@ -1065,7 +1136,9 @@ class ControlServer:
             "hold": None if outcome.hold is None else str(outcome.hold),
         }
 
-    def _untrust(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _untrust(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         if set(request) - {"via"} != {"cmd", "trust_id"}:
             raise _BadRequest("Quitar la confianza lleva `cmd`, `trust_id` y quizá `via`.")
         via, trust_id = request.get("via", "cli"), request["trust_id"]
@@ -1074,9 +1147,7 @@ class ControlServer:
         if not isinstance(trust_id, str) or not TRUST_ID_RE.fullmatch(trust_id):
             raise _BadRequest("Eso no es el identificador de un destinatario de confianza (t-…).")
         try:
-            done = self._guardian.untrust(
-                trust_id, via=via, requested_by=f"{via} (uid {uid}, pid {pid})"
-            )
+            done = guardian.untrust(trust_id, via=via, requested_by=f"{via} (uid {uid}, pid {pid})")
         except Exception:
             logger.exception("removing the trusted recipient %s raised", trust_id)
             done = None
@@ -1094,7 +1165,9 @@ class ControlServer:
             outcome, message = "unknown", "Ese destinatario ya no estaba en la lista."
         return {"ok": done is True, "outcome": outcome, "message": message}
 
-    def _end_batch(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _end_batch(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         if set(request) - {"via"} != {"cmd", "rule_id"}:
             raise _BadRequest("Revocar un lote lleva `cmd`, `rule_id` y quizá `via`.")
         via, rule_id = request.get("via", "cli"), request["rule_id"]
@@ -1103,7 +1176,7 @@ class ControlServer:
         if not isinstance(rule_id, str) or not BATCH_ID_RE.fullmatch(rule_id):
             raise _BadRequest("Eso no es el identificador de un lote (b-…).")
         try:
-            done = self._guardian.end_batch(rule_id, via=via)
+            done = guardian.end_batch(rule_id, via=via)
         except Exception:
             logger.exception("revoking the batch %s raised", rule_id)
             done = False
@@ -1114,23 +1187,25 @@ class ControlServer:
                 "message": "Ese lote ya no está activo (caducó, se revocó o backtide se "
                 "reinició)."}  # fmt: skip
 
-    def _listing(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _listing(self, guardian: RewindService, request: dict[str, Any]) -> dict[str, Any]:
         if set(request) != {"cmd"}:
             raise _BadRequest("Una lista lleva `cmd` y nada más.")
         command = request["cmd"]
         try:
-            items = self._guardian.trusted() if command == "trusted" else self._guardian.batches()
+            items = guardian.trusted() if command == "trusted" else guardian.batches()
         except Exception:
             logger.exception("listing %s raised instead of answering", command)
             return {"ok": False, "outcome": "failed", "items": [],
                     "message": "No se ha podido leer la lista."}  # fmt: skip
         return {"ok": True, "outcome": "listed", "items": redact(items), "message": ""}
 
-    def _resume(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _resume(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         if set(request) != {"cmd"}:
             raise _BadRequest("Una petición de seguir lleva `cmd` y nada más.")
         try:
-            outcome = self._guardian.resume(requested_by=f"cli (uid {uid}, pid {pid})")
+            outcome = guardian.resume(requested_by=f"cli (uid {uid}, pid {pid})")
         except Exception:  # the Guardian should not raise; if it does, say so without its text
             logger.exception("resuming raised instead of answering")
             outcome = ResumeOutcome(
@@ -1145,7 +1220,9 @@ class ControlServer:
             "agent_state": outcome.agent_state,
         }
 
-    def _rewind(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+    def _rewind(
+        self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
         if set(request) - {"via"} != {"cmd", "snapshot_id"}:
             raise _BadRequest(
                 "Una petición de rebobinar lleva `cmd`, `snapshot_id` y quizá `via`, y nada más."
@@ -1165,9 +1242,7 @@ class ControlServer:
                 )
             )
         try:
-            outcome = self._guardian.rewind(
-                snapshot_id, requested_by=f"{via} (uid {uid}, pid {pid})"
-            )
+            outcome = guardian.rewind(snapshot_id, requested_by=f"{via} (uid {uid}, pid {pid})")
         except (
             Exception
         ):  # the Guardian should not raise; if it does, nobody can tell what happened
@@ -1182,6 +1257,34 @@ class ControlServer:
                 ),
             )
         return _reply_of(outcome)
+
+    def _agents(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Every agent of the installation and whether it is watched (T26-2c; docs/47 section
+        6.9): what the CLI, the web and the bot go through. Names of its own config, no path."""
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una lista de agentes lleva `cmd` y nada más.")
+        return {"ok": True, "outcome": "listed", "message": "", "agents": self._roster.listing()}
+
+    def _snapshots(self, desk: Desk, request: dict[str, Any]) -> dict[str, Any]:
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Una lista lleva `cmd` y nada más.")
+        listed = self._listed_ids(desk)
+        if listed is None:
+            return {"ok": False, "outcome": "failed", "snapshots": [],
+                    "message": "No se ha podido leer la lista de instantáneas."}  # fmt: skip
+        return {"ok": True, "outcome": "listed", "message": "",
+                "snapshots": listed[-MAX_LISTED_SNAPSHOTS:]}  # fmt: skip
+
+    def _listed_ids(self, desk: Desk) -> list[str] | None:
+        if desk.snapshots is None:
+            logger.error("%s: there is no snapshot list for the agent %s", self.label, desk.slug)
+            return None
+        try:
+            return [snapshot.id for snapshot in desk.snapshots()]
+        except Exception as error:  # noqa: BLE001 - said, logged and refused: never a rewind
+            logger.error("%s: the snapshot list cannot be read: %s", self.label,
+                         type(error).__name__)  # fmt: skip
+            return None
 
     def _reply(self, sock: socket.socket, reply: dict[str, Any]) -> None:
         """Send the reply and close the conversation properly: our side is shut down, and what
@@ -1401,6 +1504,7 @@ def ask_rewind(
     via: str = "cli",
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to rewind to ``snapshot_id`` and return its reply, checked:
     a dict whose ``outcome`` is known, ``ok`` a bool, ``message`` a str and ``undo`` a str or
@@ -1429,6 +1533,7 @@ def ask_rewind(
         session=session,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     return _checked_reply(raw)
 
@@ -1441,6 +1546,7 @@ def ask_resume(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to resume after a pause by space (`backtide seguir`) and return
     its reply, checked like ``ask_rewind``'s: ``ok`` (the agent may run), ``outcome`` (a
@@ -1454,6 +1560,7 @@ def ask_resume(
         peer=peer,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     try:
         reply = json.loads(raw.decode("utf-8"))
@@ -1491,6 +1598,7 @@ def ask_decide(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service at ``path`` to approve or reject the held request ``hold_id`` (`backtide
     aprobar` / `rechazar`; ``via="telegram"`` from the bot inside the service, T10-4). Returns
@@ -1514,6 +1622,7 @@ def ask_decide(
         session=session,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (
@@ -1537,6 +1646,7 @@ def ask_holds(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    agent: str | None = None,
 ) -> list[dict[str, Any]]:
     """The held requests the service at ``path`` is waiting on (`backtide retenidas`), checked:
     each a dict with its ``hold_id`` and the texts the CLI shows. ControlError if the reply makes
@@ -1552,13 +1662,9 @@ def ask_holds(
         sleep=sleep,
         monotonic=monotonic,
         max_reply=MAX_LIST_REPLY_BYTES,
+        agent=agent,
     )
-    reply = _json_or_none(raw)
-    if not isinstance(reply, dict) or not isinstance(reply.get("holds"), list):
-        raise ControlError("La respuesta del servicio no es la esperada.")
-    if reply.get("ok") is not True:
-        message = reply.get("message")
-        raise ControlError(message if isinstance(message, str) else "No se ha podido listar.")
+    reply = _listed_reply(raw, "holds")
     holds = []
     for item in reply["holds"][:MAX_LISTED_HOLDS]:
         if not isinstance(item, dict) or not isinstance(item.get("hold_id"), str):
@@ -1579,6 +1685,7 @@ def ask_trust(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """ "Aprobar y confiar en este destinatario" from the web (T10-5): the reply, checked:
     ``ok``, ``outcome`` (a ``TrustStatus`` or "refused"), ``message`` and ``hold`` (what
@@ -1594,6 +1701,7 @@ def ask_trust(
         session=session,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (
@@ -1626,10 +1734,12 @@ def _ask_change(
     monotonic: Callable[[], float],
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     raw = _ask(
         Path(path),
         request,
+        agent=agent,
         what="el cambio",
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
@@ -1664,6 +1774,7 @@ def ask_untrust(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Stop trusting the recipient ``trust_id`` (T10-5). ValueError for a ``via`` that cannot
     ask (nothing sent)."""
@@ -1679,6 +1790,7 @@ def ask_untrust(
         monotonic=monotonic,
         server_uid=server_uid,
         session=session,
+        agent=agent,
     )
 
 
@@ -1693,6 +1805,7 @@ def ask_end_batch(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Revoke the batch ``rule_id`` (T10-5, the web; T10-4's bot does it in its process)."""
     if via not in UNTRUST_REQUESTERS:
@@ -1707,6 +1820,7 @@ def ask_end_batch(
         monotonic=monotonic,
         server_uid=server_uid,
         session=session,
+        agent=agent,
     )
 
 
@@ -1719,6 +1833,7 @@ def ask_list(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    agent: str | None = None,
 ) -> list[dict[str, Any]]:
     """``what`` is "trusted" (the recipients trusted from the web) or "batches" (the active
     batch rules): each item a dict with its id (``trust_id`` t-…, ``rule_id`` b-…); anything
@@ -1736,13 +1851,9 @@ def ask_list(
         sleep=sleep,
         monotonic=monotonic,
         max_reply=MAX_LIST_REPLY_BYTES,
+        agent=agent,
     )
-    reply = _json_or_none(raw)
-    if not isinstance(reply, dict) or not isinstance(reply.get("items"), list):
-        raise ControlError("La respuesta del servicio no es la esperada.")
-    if reply.get("ok") is not True:
-        message = reply.get("message")
-        raise ControlError(message if isinstance(message, str) else "No se ha podido listar.")
+    reply = _listed_reply(raw, "items")
     key, pattern = ("trust_id", TRUST_ID_RE) if what == "trusted" else ("rule_id", BATCH_ID_RE)
     return [
         item
@@ -2043,6 +2154,7 @@ def ask_budget(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """What the service says of the spending (``Budget.status``). ControlError if it makes no
     sense. The caller checks each field before showing it."""
@@ -2056,6 +2168,7 @@ def ask_budget(
         server_uid=server_uid,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if not isinstance(reply, dict) or reply.get("ok") is not True:
@@ -2079,6 +2192,7 @@ def ask_set_budget(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service for new spending caps (texts as a person typed them). Its reply, checked:
     ``ok``, ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
@@ -2102,6 +2216,7 @@ def ask_set_budget(
         session=session,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (
@@ -2128,6 +2243,7 @@ def ask_accept_prices(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Accept the new prices waiting whose digest is ``digest`` (B3). The reply, checked: ``ok``,
     ``outcome``, ``message``. ValueError (nothing sent) for an unknown ``via``."""
@@ -2147,6 +2263,7 @@ def ask_accept_prices(
         session=session,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (
@@ -2183,6 +2300,101 @@ def _checked_settings_reply(raw: bytes) -> dict[str, Any]:
     }
 
 
+def _listed_reply(raw: bytes, key: str) -> dict[str, Any]:
+    """A reply that lists under ``key``. If the service refused or could not, ControlError says
+    what it said: an agent that is nobody's, say, comes with a message and no list."""
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    if reply.get("ok") is not True:
+        message = reply.get("message")
+        raise ControlError(message if isinstance(message, str) else "No se ha podido listar.")
+    if not isinstance(reply.get(key), list):
+        raise ControlError("La respuesta del servicio no es la esperada.")
+    return reply
+
+
+def ask_agents(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> list[dict[str, Any]]:
+    """The agents the service at ``path`` has (T26-2c), checked: each a dict with its ``slug``,
+    ``name`` (None or a text), ``main``, ``watched`` and ``state``. What does not look like one is
+    dropped. ControlError if the reply makes no sense."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "agents"},
+        what="la lista",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        server_uid=server_uid,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    found = []
+    for item in _listed_reply(raw, "agents")["agents"]:
+        if (
+            isinstance(item, dict)
+            and _is_agent_name(item.get("slug"))
+            and isinstance(item.get("name"), str | None)
+            and isinstance(item.get("main"), bool)
+            and isinstance(item.get("watched"), bool)
+            and isinstance(item.get("state"), str | None)
+        ):
+            found.append({key: item[key] for key in ("slug", "name", "main", "watched", "state")})
+    return found
+
+
+def _is_agent_name(value: object) -> bool:
+    if value == identity.MAIN_SLUG:
+        return True
+    try:
+        identity.check_slug(value)
+    except identity.SlugError:
+        return False
+    return True
+
+
+def ask_snapshots(
+    path: Path,
+    *,
+    server_uid: int | None = 0,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    agent: str | None = None,
+) -> list[Snapshot]:
+    """The agent's snapshots, oldest first, as the service at ``path`` lists them; anything that
+    is not a snapshot id is dropped. ControlError if the reply makes no sense or the service could
+    not list them. ``server_uid`` 0: the web's narrow socket, root's; None: our own user's."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "snapshots"},
+        agent=agent,
+        what="la lista",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+        max_reply=MAX_LIST_REPLY_BYTES,
+        server_uid=server_uid,
+    )
+    found = []
+    for item in _listed_reply(raw, "snapshots")["snapshots"][-MAX_LISTED_SNAPSHOTS:]:
+        snapshot = Snapshot.parse(item) if isinstance(item, str) else None
+        if snapshot is not None:
+            found.append(snapshot)
+    return found
+
+
 def _json_or_none(raw: bytes) -> Any:
     try:
         return json.loads(raw.decode("utf-8"))
@@ -2203,13 +2415,17 @@ def _ask(
     max_reply: int = MAX_REPLY_BYTES,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> bytes:
     """One conversation: connect (retrying while nobody answers), send ``request``, read the
     whole reply (``max_reply`` bytes at most). ``what`` names the request in the messages ("el
     rebobinado"). ``session`` is the web's (T26-3a): the narrow socket takes no change without
-    a live one; it rides in the request, never in a log."""
+    a live one; it rides in the request, never in a log. ``agent`` says who it is about (T26-2c);
+    without it the request is what it always was."""
     if session is not None:
         request["session"] = session
+    if agent is not None:
+        request["agent"] = agent
     deadline = monotonic() + wait
     while True:
         try:
@@ -2377,6 +2593,7 @@ def ask_shell(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service whether `backtide entrar` (``kind`` "session"), `importar` ("import", with
     ``import_details``: name, source, files, bytes, replace, and the secrets it left out or took)
@@ -2398,6 +2615,7 @@ def ask_shell(
         peer=peer,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (
@@ -2446,6 +2664,7 @@ def ask_task_start(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Give the agent a task (`backtide tarea`, the web's chat). Returns ``ok``, ``outcome``
     ("started" or "refused"), ``message`` and, when ``ok``, its id as ``task``: at once, whatever
@@ -2466,6 +2685,7 @@ def ask_task_start(
         session=session,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (
@@ -2493,6 +2713,7 @@ def ask_task_status(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
     session: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """How a task goes: ``ok`` (False if it is not known here, or refused), ``outcome`` (a
     ``TaskOutcome``, "unknown" or "refused"), ``message``, and its ``answer``, ``code`` and
@@ -2510,6 +2731,7 @@ def ask_task_status(
         sleep=sleep,
         monotonic=monotonic,
         max_reply=MAX_TASK_REPLY_BYTES,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (
@@ -2540,6 +2762,7 @@ def ask_task_stop(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    agent: str | None = None,
 ) -> bool:
     """Ctrl-C in `backtide tarea`: stop the task inside the agent. True if nothing of it is left or
     it was signalled; False if it may run on, or the service did not say."""
@@ -2552,6 +2775,7 @@ def ask_task_stop(
         peer=peer,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if not isinstance(reply, dict) or reply.get("outcome") not in TASK_STOP_OUTCOMES:
@@ -2575,6 +2799,7 @@ def ask_export(
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     """Ask the service to export the agent's work folder into ``destination`` (`backtide
     exportar`). Returns ``ok``, ``outcome``, ``message``, ``destination``, ``snapshot`` and
@@ -2599,6 +2824,7 @@ def ask_export(
         peer=peer,
         sleep=sleep,
         monotonic=monotonic,
+        agent=agent,
     )
     reply = _json_or_none(raw)
     if (

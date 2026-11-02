@@ -16,8 +16,13 @@ The socket:
 - Who: ``SO_PEERCRED`` on every connection; the group the kernel gives (the effective gid at
   connect time) must be the web's, and the agent's and the proxy's ids are refused whatever
   their group. Fails closed: unreadable credentials, no service.
-- What (``COMMANDS``): reading the volume's snapshot list, the held requests, the trusted
-  recipients and batches, what keys are set (the last four characters at most) and the spending;
+- Which agent (T26-2c): a session is not tied to one. A live session is good for all of them, and
+  each order says which it is about with ``agent`` (``backtide.service.roster``; without it, the
+  main one), so what it does is in that agent's black box. A name that is nobody's is refused with
+  no agent touched. Which snapshots a rewind may go to is that agent's list.
+- What (``COMMANDS``): the agents, reading the volume's snapshot list, the held requests, the
+  trusted recipients and batches, what keys are set (the last four characters at most) and the
+  spending;
   and, as changes, ``rewind`` (to a snapshot id that is in the volume's list right now: checked
   HERE before the Guardian is called), ``decide`` (approve or reject a held request by its id),
   ``trust`` ("aprobar y confiar", only from the web, as on the control socket), ``untrust`` and
@@ -68,7 +73,6 @@ from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
 from backtide.service.control import (
     LINK_CLOSED,
     MAX_CONNECTIONS,
-    MAX_LIST_REPLY_BYTES,
     REPLY_TIMEOUT,
     WAIT_FOR_SERVICE,
     BudgetService,
@@ -77,15 +81,18 @@ from backtide.service.control import (
     PeerCredentials,
     RewindService,
     SettingsService,
+    WholeBudget,
     _ask,
     _BadRequest,
     _json_or_none,
     _reply_of,
+    ask_snapshots,
     peer_credentials,
 )
 from backtide.service.passkeys import LAST_KEY, PasskeyError, Passkeys, describe, name_problem
 from backtide.service.password import Checker, PasswordError, Verdict
 from backtide.service.rewind import RewindOutcome, RewindStatus
+from backtide.service.roster import Desk, Roster
 from backtide.service.sessions import Session, Sessions
 from backtide.snapshots import Snapshot
 
@@ -94,7 +101,7 @@ logger = logging.getLogger(__name__)
 WEB_SOCKET_MODE = 0o660
 MAX_WEB_CONNECTIONS = 4
 # What the web may read (it shows them) and change (each behind its own confirmation in the web).
-READS = frozenset({"snapshots", "holds", "trusted", "batches", "secrets", "budget"})
+READS = frozenset({"agents", "snapshots", "holds", "trusted", "batches", "secrets", "budget"})
 CHANGES = frozenset(
     {
         "rewind", "decide", "trust", "untrust", "end_batch", "set_secret", "clear_secret",
@@ -173,7 +180,6 @@ BUSY = "busy"  # a session_check past its bucket: nobody knows yet, and it is no
 NO_SESSION = "Sin una sesión viva no se cambia nada: vuelve a entrar con `sudo backtide enlace`."
 NEEDS_TOUCH = "Esto pide volver a tocar tu llave: tócala en la web y prueba otra vez."
 FIRST_KEY_TOO_LATE = "La primera llave se registra nada más entrar: vuelve a entrar y regístrala."
-MAX_LISTED_SNAPSHOTS = 5000
 _FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID, *AGENT_ID_RANGE})
 _FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID, *AGENT_ID_RANGE})
 
@@ -242,6 +248,8 @@ class WebControlServer(ControlServer):
         passkeys: Passkeys | None = None,
         on_entry: Callable[[str, dict[str, Any]], bool] | None = None,
         password: Checker | None = None,
+        roster: Roster | None = None,
+        whole_budget: WholeBudget | None = None,
     ) -> None:
         if isinstance(group, bool) or not isinstance(group, int) or group in _FORBIDDEN_GIDS:
             raise ControlError(
@@ -260,13 +268,15 @@ class WebControlServer(ControlServer):
             on_entry=on_entry,
             password=password,
             passkeys=passkeys,
+            snapshots=snapshots,
+            roster=roster,
+            whole_budget=whole_budget,
         )
         self.socket_group = group
         # The web's own uid, when it is an account (the installed ``backtide-web``): then the
         # group alone is not enough, so a member of the group who switches to it (``sg``,
         # ``newgrp``) is refused too. Root may always ask (it has the control socket anyway).
         self._user = user
-        self._list_snapshots = snapshots
         self._requests = requests or Bucket(REQUESTS_BURST, REQUESTS_PER_SECOND)
         self._changes = changes or Bucket(CHANGES_BURST, CHANGES_PER_SECOND)
         self._checks = checks or Bucket(CHECKS_BURST, CHECKS_PER_SECOND)
@@ -341,13 +351,17 @@ class WebControlServer(ControlServer):
                 raise _BadRequest("Demasiados cambios seguidos: espera un poco.")
             request["via"] = "web"
             self._warn_lasting(command, request, pid)
-        if command == "snapshots":
-            return self._snapshots(request)
+        return super()._handle(request, pid, uid)
+
+    def _agent_command(
+        self, command: str, request: dict[str, Any], pid: int, uid: int, desk: Desk, *, named: bool
+    ) -> dict[str, Any]:
+        """Here ``agent`` has left the request already, and the list is that agent's."""
         if command == "rewind":
-            refused = self._unlisted(request)
+            refused = self._unlisted(desk, request)
             if refused is not None:
                 return refused
-        return super()._handle(request, pid, uid)
+        return super()._agent_command(command, request, pid, uid, desk, named=named)
 
     def _signed_in(
         self, command: str, request: dict[str, Any], pid: int, *, use: bool = True
@@ -691,24 +705,7 @@ class WebControlServer(ControlServer):
                 pid,
             )
 
-    def _listed_ids(self) -> list[str] | None:
-        try:
-            return [snapshot.id for snapshot in self._list_snapshots()]
-        except Exception as error:  # noqa: BLE001 - said, logged and refused: never a rewind
-            logger.error("web socket: the snapshot list cannot be read: %s", type(error).__name__)
-            return None
-
-    def _snapshots(self, request: dict[str, Any]) -> dict[str, Any]:
-        if set(request) != {"cmd"}:
-            raise _BadRequest("Una lista lleva `cmd` y nada más.")
-        listed = self._listed_ids()
-        if listed is None:
-            return {"ok": False, "outcome": "failed", "snapshots": [],
-                    "message": "No se ha podido leer la lista de instantáneas."}  # fmt: skip
-        return {"ok": True, "outcome": "listed", "message": "",
-                "snapshots": listed[-MAX_LISTED_SNAPSHOTS:]}  # fmt: skip
-
-    def _unlisted(self, request: dict[str, Any]) -> dict[str, Any] | None:
+    def _unlisted(self, desk: Desk, request: dict[str, Any]) -> dict[str, Any] | None:
         """A rewind to an id that is not in the volume's list now is answered here, with
         nothing asked of the Guardian. A request of the wrong shape goes on, to be refused by
         the control socket's own checks."""
@@ -717,7 +714,7 @@ class WebControlServer(ControlServer):
         snapshot_id = request["snapshot_id"]
         if not isinstance(snapshot_id, str) or Snapshot.parse(snapshot_id) is None:
             return None
-        listed = self._listed_ids()
+        listed = self._listed_ids(desk)
         if listed is not None and snapshot_id in listed:
             return None
         logger.warning("web socket: refused a rewind to a snapshot that is not in the list")
@@ -727,44 +724,6 @@ class WebControlServer(ControlServer):
             else "Esa instantánea no está en la lista del volumen: no se ha hecho nada."
         )
         return _reply_of(RewindOutcome(RewindStatus.INVALID, target="", message=message))
-
-
-def ask_snapshots(
-    path: Path,
-    *,
-    server_uid: int = 0,
-    wait: float = WAIT_FOR_SERVICE,
-    peer: PeerCredentials = peer_credentials,
-    sleep: Callable[[float], None] = time.sleep,
-    monotonic: Callable[[], float] = time.monotonic,
-) -> list[Snapshot]:
-    """The volume's snapshots, oldest first, as the service at the narrow socket ``path`` lists
-    them; anything that is not a snapshot id is dropped. ControlError if the reply makes no
-    sense or the service could not list them."""
-    raw = _ask(
-        Path(path),
-        {"cmd": "snapshots"},
-        what="la lista",
-        wait=wait,
-        reply_timeout=REPLY_TIMEOUT * 6,
-        peer=peer,
-        sleep=sleep,
-        monotonic=monotonic,
-        max_reply=MAX_LIST_REPLY_BYTES,
-        server_uid=server_uid,
-    )
-    reply = _json_or_none(raw)
-    if not isinstance(reply, dict) or not isinstance(reply.get("snapshots"), list):
-        raise ControlError("La respuesta del servicio no es la esperada.")
-    if reply.get("ok") is not True:
-        message = reply.get("message")
-        raise ControlError(message if isinstance(message, str) else "No se ha podido listar.")
-    found = []
-    for item in reply["snapshots"][-MAX_LISTED_SNAPSHOTS:]:
-        snapshot = Snapshot.parse(item) if isinstance(item, str) else None
-        if snapshot is not None:
-            found.append(snapshot)
-    return found
 
 
 def _ask_session(

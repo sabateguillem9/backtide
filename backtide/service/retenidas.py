@@ -11,6 +11,10 @@ and calls these; everything else is here, so it is tested without the CLI.
   own user may talk to it, and the agent never sees it, so the agent cannot approve itself.
 - Whatever comes back (the agent wrote the paths and hosts) is printed redacted and with control
   characters escaped.
+- With several agents (T26-2c): a hold is one agent's, and ``agent`` (`--agente`) says whose.
+  Without it, deciding is about the main agent, and listing is about all of them: a hold nobody
+  sees ends rejected, and that must not be how a neighbour's ends. The socket and the lock are the
+  machine's, so this needs nothing of that agent: a broken file stops nobody from rejecting.
 
 Exit codes: 0 decided (approved, preapproved or rejected; the listing printed); 1 not done (no
 such open hold, nothing recorded, no service); 2 usage (an id that is not one, an unusable lock,
@@ -28,6 +32,7 @@ from backtide.service.control import (
     ControlError,
     ControlOutcomeUnknown,
     ControlUnavailable,
+    ask_agents,
     ask_decide,
     ask_holds,
 )
@@ -58,6 +63,7 @@ def decide(
     hold_id: str,
     verdict: str,
     *,
+    agent: str | None = None,
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
@@ -75,7 +81,7 @@ def decide(
     if status is not None:
         return status
     try:
-        reply = ask_decide(config.control_socket, hold_id, verdict)
+        reply = ask_decide(config.control_socket, hold_id, verdict, **_about(agent))
     except ControlUnavailable:
         _error(err, NOT_ANSWERING)
         return EXIT_FAILED
@@ -100,15 +106,25 @@ def decide(
     return code
 
 
-def listing(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | None = None) -> int:
-    """`backtide retenidas`: the held requests waiting for the person, oldest first."""
+def listing(
+    config: ServiceConfig,
+    *,
+    agent: str | None = None,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+) -> int:
+    """`backtide retenidas`: the held requests waiting for the person, oldest first: those of
+    ``agent``, or with several agents and no ``agent``, each one's under its name."""
     out = out if out is not None else sys.stdout
     err = err if err is not None else sys.stderr
     status = _service(config, err)
     if status is not None:
         return status
     try:
-        holds = ask_holds(config.control_socket)
+        agents = [] if agent is not None else ask_agents(config.control_socket)
+        if len(agents) > 1:
+            return _every_agent(config, agents, out, err)
+        holds = ask_holds(config.control_socket, **_about(agent))
     except ControlUnavailable:
         _error(err, NOT_ANSWERING)
         return EXIT_FAILED
@@ -126,6 +142,36 @@ def listing(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | N
         file=out,
     )
     return EXIT_OK
+
+
+def _every_agent(
+    config: ServiceConfig, agents: list[dict[str, Any]], out: TextIO, err: TextIO
+) -> int:
+    """Each agent's, under its name. One that cannot be asked is said, and the rest are listed:
+    what is held elsewhere still has to be seen. Exit 1 if any could not be."""
+    code = EXIT_OK
+    for agent in agents:
+        slug = agent["slug"]
+        print(f"Agente {slug}:", file=out)
+        if not agent["watched"]:
+            print("  no se está vigilando.", file=out)
+            continue
+        try:
+            holds = ask_holds(config.control_socket, agent=slug)
+        except ControlError as error:
+            _error(err, f"{slug}: {error}")
+            code = EXIT_FAILED
+            continue
+        for hold in holds:
+            print(hold_line(hold), file=out)
+        if not holds:
+            print(f"  {NONE_HELD}", file=out)
+    print(
+        "\nApruébalas con `backtide aprobar <id> --agente <agente>` o recházalas con `backtide "
+        "rechazar <id> --agente <agente>`. Sin respuesta, se rechazan solas a los 5 minutos.",
+        file=out,
+    )
+    return code
 
 
 def hold_line(hold: Mapping[str, Any]) -> str:
@@ -153,6 +199,10 @@ def _service(config: ServiceConfig, err: TextIO) -> int | None:
     lock.close()  # nobody owns the agent: let a `backtide vigilar` take it
     _error(err, NO_SERVICE)
     return EXIT_FAILED
+
+
+def _about(agent: str | None) -> dict[str, str]:
+    return {} if agent is None else {"agent": agent}
 
 
 def _text(value: object, limit: int) -> str:

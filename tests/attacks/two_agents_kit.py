@@ -12,6 +12,7 @@ in, and the tests never ran under the unit. So the service here is the real one:
   agent. For another agent nothing does it yet (T26-6a creates them).
 - ``--grupo-web`` with a group that has no account: the case where the narrow socket has only the
   group and its forbidden ids to go by.
+- ``cli``: `backtide` itself, as the owner runs it (T26-2c).
 
 It is not an installation (install.sh never runs in vigia-dev, and the clean VM is someone else's):
 Python and the code come from the dev environment, bind-mounted where ``ProtectHome`` leaves them.
@@ -40,6 +41,7 @@ from backtide.jail.proxy_config import (
     PROXY_UID,
     channel_tmpfs_options,
 )
+from backtide.service.config import STATE_SOCKET
 from backtide.setup import layout, units
 
 REPO = Path(__file__).resolve().parents[2]
@@ -145,6 +147,15 @@ class Lab:
     def verify(self, agent: Agent) -> dict[str, Any]:
         return self.helper("verify", str(agent.box))
 
+    def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """The real `backtide`, as root, on this lab's config."""
+        return sudo(str(BIN / "backtide"), *args, "--config", str(CONFIG), check=False, timeout=180)
+
+    def network_cut(self) -> bool:
+        """What a container sends stops at the VM: the lab's key, made up, reaches nobody."""
+        listed = sudo("nft", "list", "table", "inet", NFT_TABLE, check=False)
+        return listed.returncode == 0 and "drop" in listed.stdout
+
     # The service
 
     def show(self, name: str) -> str:
@@ -189,14 +200,18 @@ class Lab:
         return "\n".join(lines[-20:])
 
     def wait_up(self, timeout: float = START_TIMEOUT) -> None:
-        """The unit active and both agents running."""
+        """The unit active, both agents running, and both up for the sockets: an agent joins the
+        service's list a while after its container runs (T26-2c)."""
 
         def up() -> bool:
             if int(self.show("NRestarts") or 0) > MAX_RESTARTS:
                 raise AssertionError(f"the service keeps restarting\n{self.diagnosis()}")
-            return (
+            if not (
                 self.show("ActiveState") == "active" and self.running(MAIN) and self.running(OTHER)
-            )
+            ):
+                return False
+            watched = self.helper("agents", str(STATE / STATE_SOCKET))
+            return len(watched) == 2 and all(agent["watched"] for agent in watched)
 
         wait(
             up,
