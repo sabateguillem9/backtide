@@ -412,7 +412,7 @@ class InstallationSpend:
         if self._alert is None:
             return
         try:
-            self._alert(Alert(level, title, body))
+            self._alert(Alert(level, title, body, installation=True))
         except Exception:
             logger.exception("an alert about the installation's spending could not be queued")
 
