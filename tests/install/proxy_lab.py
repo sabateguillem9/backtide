@@ -69,9 +69,7 @@ def arrancar() -> None:
       --ignore-certificate-errors-spki-list={spki}
 
 In this VM, `sudo backtide enlace`, and open the link it prints in that Chrome: register a key, sign
-out, and sign in with it. If Chrome will not offer a passkey with that flag, the other way is to
-trust {proxy.ca} on the Mac, and add the name to its /etc/hosts: it can only sign that name.
-Undo it with `python -m tests.install.proxy_lab parar`.""")
+out, and sign in with it. Undo it with `python -m tests.install.proxy_lab parar`.""")
 
 
 def parar() -> None:

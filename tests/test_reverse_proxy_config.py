@@ -159,6 +159,7 @@ def test_the_caps_are_by_the_same_address_and_answer_429() -> None:
     assert re.findall(r"limit_(?:req|conn)_zone\s+(\S+)", RULES) == ["$backtide_client"] * 3
     assert directive("limit_req_status") == ["429"]
     assert directive("limit_conn_status") == ["429"]
+    assert directive("limit_conn", site()) == ["backtide_conn 40"]
 
 
 def backtide_client(address: str) -> str:
@@ -184,6 +185,16 @@ def backtide_client(address: str) -> str:
 )
 def test_an_ipv6_address_counts_by_its_64(address: str, counted_as: str) -> None:
     assert backtide_client(address) == counted_as
+
+
+def test_the_map_counts_by_what_it_captured() -> None:
+    """Or the key would be something else, and the table above says nothing about it."""
+    [body] = blocks(RULES, "map")
+    rules = re.findall(r'"~(.*?)"\s+(\$\w+)', body)
+    assert len(rules) == 2
+    for pattern, value in rules:
+        assert value == "$" + re.findall(r"\(\?<(\w+)>", pattern)[0]
+    assert directive("default", body) == ["$remote_addr"]
 
 
 def test_a_whole_64_is_one_address() -> None:

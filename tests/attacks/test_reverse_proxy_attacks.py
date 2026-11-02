@@ -147,7 +147,8 @@ def clean_slate() -> None:
     """No key of the domain and nobody signed in: each scenario starts where the first one did."""
     if KEYS_FILE.exists():
         for key in json.loads(KEYS_FILE.read_text())["keys"]:
-            sh(str(layout.PROGRAM), "llaves", "--quitar", key["id"])
+            sh(str(layout.PROGRAM), "llaves", f"--quitar={key['id']}")
+    KEYS_FILE.unlink(missing_ok=True)  # taking out the last one leaves the file, with no keys
     ask_web_end_all(CONTROL_SOCKET)
 
 
@@ -241,13 +242,13 @@ def owner_kept_out(domain: Domain, owner: SoftAuthenticator) -> kit.Reply | None
     return None
 
 
-def seconds_until_closed(conn: kit.SNIConnection) -> float:
-    start = time.monotonic()
+def seconds_until_closed(conn: kit.SNIConnection, sent: float) -> float:
+    """How long after ``sent``, when it stopped sending, nginx hung up."""
     assert conn.sock is not None
     conn.sock.settimeout(30)
     while conn.sock.recv(4096):  # whatever it says last; what counts is that it hangs up
         pass
-    return time.monotonic() - start
+    return time.monotonic() - sent
 
 
 @scenario("web-tras-el-proxy")
@@ -336,12 +337,12 @@ def test_through_nginx_only_its_name_gets_in_and_no_token_stays_behind(
               "X-Forwarded-Proto": "https"},
     ).status  # fmt: skip
 
-    # The live page: it keeps coming, event by event, instead of waiting for a buffer to fill.
+    # The live page: its first events come at once, and not when a buffer fills.
     live = kit.SNIConnection(domain.context, source=OWNER, timeout=30)
     start = time.monotonic()
     live.request("GET", "/panel/stream", headers={"Host": DOMAIN, "Cookie": inside})
     stream = live.getresponse()
-    chunks = [stream.read1(4000) for _ in range(5)]  # the panel's card comes every 5 s
+    chunks = [stream.read1(4000) for _ in range(2)]
     results["directo"] = (stream.status, all(chunks), time.monotonic() - start)
     live.close()
 
@@ -355,6 +356,7 @@ def test_through_nginx_only_its_name_gets_in_and_no_token_stays_behind(
         "the web did not come back after the control"
     )
     # Through the proxy, more of them than that, and the owner does not notice.
+    body_sent = time.monotonic()  # the first of them goes right now
     slow = half_sent(domain, 100)
     start = time.monotonic()
     results["con 100 a medias"] = (domain.ask("GET", "/panel", cookie=inside).status,
@@ -363,8 +365,9 @@ def test_through_nginx_only_its_name_gets_in_and_no_token_stays_behind(
     half_head.connect()
     assert half_head.sock is not None
     half_head.sock.sendall(b"GET /panel HTTP/1.1\r\nHost: ")
-    results["cuerpo a medias"] = seconds_until_closed(slow[0])
-    results["cabecera a medias"] = seconds_until_closed(half_head)
+    head_sent = time.monotonic()
+    results["cuerpo a medias"] = seconds_until_closed(slow[0], body_sent)
+    results["cabecera a medias"] = seconds_until_closed(half_head, head_sent)
     for conn in (*slow, half_head):
         conn.close()
     big = domain.ask("POST", SIGN_IN_ANSWER, origin=DOMAIN_URL, body="a" * 20000,
@@ -398,8 +401,16 @@ def test_through_nginx_only_its_name_gets_in_and_no_token_stays_behind(
     outcome = attack.run_script(
         installed.jail, "web_desde_la_carcel", "80,443", targets.proxy, *targets.addresses
     )
-    results["desde la cárcel"] = (outcome["reached"], outcome["answers"],
-                                  outcome["via_proxy_through"])  # fmt: skip
+    # By the proxy, a 502 is its own failure to get there. nginx would show: plain HTTP on 443 is
+    # its 400, and the rule that stops the agent goes by address, whatever the port. A CONNECT
+    # gets a 200 before anything is tried, so it says nothing here: `ssrf-por-el-proxy` follows it.
+    got_there = [
+        found
+        for found in outcome["via_proxy_through"]
+        if found.startswith("GET") and " 502 " not in found and "(no answer)" not in found
+    ]
+    results["desde la cárcel"] = (outcome["reached"], outcome["answers"], got_there)
+    results["la sonda"] = (outcome["control"], outcome["malformed"], outcome["via_proxy_attempts"])
     events = installed.box.events(since_seq=since)
 
     ok = (
@@ -429,7 +440,7 @@ def test_through_nginx_only_its_name_gets_in_and_no_token_stays_behind(
         and results["panel"] == 200
         and results["X-Forwarded"] == 401
         and results["directo"][:2] == (200, True)
-        and results["directo"][2] < 30
+        and results["directo"][2] < 10
         and results["sin proxy, 70 quietas"] == 503
         and results["con 100 a medias"][0] == 200
         and results["con 100 a medias"][1] < 5
@@ -441,6 +452,9 @@ def test_through_nginx_only_its_name_gets_in_and_no_token_stays_behind(
         and not results["en los registros"]
         and not results["registro vivo"]
         and results["desde la cárcel"] == ([], [], [])
+        and results["la sonda"][0].startswith("HTTP/1.1 200")
+        and results["la sonda"][1] == []
+        and results["la sonda"][2] > 0
     )
     attack.check("stopped", ok, f"lo que se ha visto por nginx: {results}")
     ways = sorted(str(e.details.get("via")) for e in events if e.action == "web_session_opened")

@@ -6,8 +6,8 @@ the web listens on the host's loopback and nowhere else. The certificate comes f
 the occasion, whose private key is never written: it signs one name, the file's, and is gone, so
 trusting it for a test leaves nothing that could sign anything else.
 
-Importing this touches nothing; only ``Proxy.start`` runs Docker. What needs Docker runs only in a
-clean VM (``tests/attacks/test_reverse_proxy_attacks.py``, ``tests/install/proxy_lab.py``).
+Importing this touches nothing; only ``start``, ``stop`` and ``Proxy.logged`` run Docker, and only
+in a clean VM (``tests/attacks/test_reverse_proxy_attacks.py``, ``tests/install/proxy_lab.py``).
 """
 
 import base64
