@@ -1003,17 +1003,16 @@ def test_what_is_trusted_for_one_lets_out_nothing_of_the_other(attack: Attack, l
         f"principal no la quita ({wrong_owner}), y por el suyo sí ({removed})",
     )
     # The warning of a recipient trusted for good: in its agent's box, and saying whose (T26-2d).
-    named = f"of the agent {SLUG}"
+    named = f"trust a recipient of the agent {SLUG}"  # other logs name the neighbour too
     wait(
         lambda: bool(said_in(lab.events(OTHER), named)),
         SEEN_TIMEOUT,
         "the warning about trusting",
         lab.diagnosis,
     )
-    warned = said_in(lab.events(OTHER), named)
     attack.check(
         "recorded",
-        "trust a recipient" in json.dumps(warned) and said_in(lab.events(MAIN), named) == [],
+        said_in(lab.events(MAIN), named) == [],
         "el aviso de confiar está en la caja del vecino, con su nombre, y no en la del principal",
     )
     attack.check(
