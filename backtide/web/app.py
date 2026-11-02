@@ -2368,7 +2368,10 @@ def create_app(
         ACTING_SESSION.set(request.state.session.id)  # for the threads it asks the service from
         csrf = _csrf(request)
         loop = asyncio.get_running_loop()
-        signed_in = _session_watch(request)
+        # Before every read, not once a minute: a read with a dead session is a WARNING, recorded
+        # and alerted as what a web taken over would do, and a tab left open would say it every
+        # second.
+        signed_in = _session_watch(request, every=0.0)
         deadline = loop.time() + stream_seconds
         last_sent = loop.time()
         sent_state: tuple[int, bool] | None = None
@@ -2442,14 +2445,17 @@ def create_app(
 
     # -- the stream ------------------------------------------------------------------------
 
-    def _session_watch(request: Request) -> Callable[[float], Awaitable[bool]]:
+    def _session_watch(
+        request: Request, every: float | None = None
+    ) -> Callable[[float], Awaitable[bool]]:
         """For an open stream: does its session still live? Asked of the service at most every
-        ``session_recheck`` seconds, without counting as a use, so "Salir", "Cerrar todas" or
-        the end of the session stop a tab that is open (T26-3a-2)."""
+        ``session_recheck`` seconds (or ``every``), without counting as a use, so "Salir", "Cerrar
+        todas" or the end of the session stop a tab that is open (T26-3a-2)."""
         last = [asyncio.get_running_loop().time()]
+        wait = session_recheck if every is None else every
 
         async def alive(now: float) -> bool:
-            if now - last[0] < session_recheck:
+            if now - last[0] < wait:
                 return True
             last[0] = now
             cookie = request.headers.get("cookie")

@@ -211,8 +211,9 @@ MAX_SKIPPED_TEXT = 300
 TASK_REQUEST_START = b'{"cmd": "task_start", '
 MAX_TASK_REQUEST_BYTES = 12 * MAX_PROMPT + MAX_REQUEST_BYTES
 MAX_TASK_REPLY_BYTES = 6 * TASK_MAX_OUTPUT + MAX_REPLY_BYTES
-# The chat's list (T26-5b): a short line per task, with what was asked as JSON makes it longest.
-MAX_TASK_LIST_REPLY_BYTES = (MAX_KEPT + MAX_RUNNING) * 6 * ASKED_CHARS + MAX_REPLY_BYTES
+# The chat's list (T26-5b): a short line per task, with what was asked as JSON makes it longest,
+# twelve bytes for a character past the BMP (an emoji).
+MAX_TASK_LIST_REPLY_BYTES = (MAX_KEPT + MAX_RUNNING) * 12 * ASKED_CHARS + MAX_REPLY_BYTES
 TASK_LISTED = "listed"
 TASK_REQUESTERS = frozenset({"cli", "web"})
 TASK_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)

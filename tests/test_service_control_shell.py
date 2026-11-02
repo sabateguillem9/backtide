@@ -446,7 +446,7 @@ def test_the_list_of_the_tasks(server: ControlServer, guardian: ShellGuardian) -
 
 def test_the_longest_list_fits_its_reply(server: ControlServer, guardian: ShellGuardian) -> None:
     """What JSON makes longest, at the most the service keeps."""
-    asked = "\x1b" * ASKED_CHARS
+    asked = "😀" * ASKED_CHARS
     guardian.task_lines = [
         TaskEntry(TASK_ID, asked, 1.0, "web", TaskOutcome.OK, 1.0, 1)
         for _ in range(MAX_KEPT + MAX_RUNNING)

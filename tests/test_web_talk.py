@@ -30,6 +30,7 @@ from backtide.web.reader import BoxReader
 from backtide.web.rewind import Availability
 from backtide.web.security import CSP, MAX_PROMPT_FORM_BYTES, ServiceAccess
 from backtide.web.talk import SHOWN_CHARS, ControlTasks, known_id, known_of
+from backtide.web.text import MAX_MARKERS
 from tests.test_service_tasks import READY, answer
 from tests.test_service_web_control import GROUP, FakeGuardian, the_web
 from tests.test_web_rewind import POST_HEADERS, text_of
@@ -755,6 +756,38 @@ def test_a_stream_ends_with_its_session(tmp_path: Path, tasks: FakeTasks) -> Non
     tasks.tasks = ending  # type: ignore[method-assign]
     found = stream_of(web)
     assert events(found, "session")[0]["data"] == "expired"
+
+
+def test_a_tab_whose_session_died_stops_before_it_asks_again(
+    tmp_path: Path, tasks: FakeTasks
+) -> None:
+    """A read with a dead session is a WARNING, recorded and alerted as what a web taken over would
+    do: with the minute of the other streams, a tab left open would say it sixty times."""
+    new_box(tmp_path)
+    sessions = Sessions()
+    sessions.preset(SESSION)
+    from backtide.web.security import LocalAccess
+
+    web = new_client(tmp_path, tasks=tasks, access=LocalAccess(sessions), poll_interval=0.01)
+    real_tasks = tasks.tasks
+
+    def ending(*, agent: str | None = None) -> list[dict[str, Any]]:
+        sessions.end(SESSION)
+        return real_tasks(agent=agent)
+
+    tasks.tasks = ending  # type: ignore[method-assign]
+    assert events(stream_of(web), "session")[0]["data"] == "expired"
+    assert len(tasks.listed) == 1
+
+
+def test_many_invisibles_in_an_answer_are_a_small_page(web: TestClient, tasks: FakeTasks) -> None:
+    """An agent chooses them, and a tab that hangs takes its stop button with it."""
+    tasks.entries = [line(TASK_A), line(TASK_B)]
+    tasks.answers[TASK_A] = said("\u200b" * SHOWN_CHARS)
+    tasks.answers[TASK_B] = said("\u200b\u200c" * (SHOWN_CHARS // 2))
+    html = web.get(PAGE).text
+    assert html.count('class="esc"') <= 1 + MAX_MARKERS
+    assert len(html) < 1024 * 1024 and "U+200B×" in html and 'class="cut"' in html
 
 
 def test_the_app_has_no_answer_in_any_other_path(web: TestClient, tasks: FakeTasks) -> None:

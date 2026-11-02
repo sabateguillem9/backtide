@@ -3,7 +3,7 @@ page, or reorder what the person reads."""
 
 import pytest
 
-from backtide.web.text import tail, visible
+from backtide.web.text import MAX_MARKERS, tail, visible
 
 
 def test_html_is_escaped() -> None:
@@ -50,6 +50,38 @@ def test_a_name_that_spells_a_marker_is_not_a_marker() -> None:
 def test_only_newlines_survive_when_asked_for() -> None:
     kept = str(visible("a\nb‮c", keep_newlines=True))
     assert "a\nb" in kept and "U+202E" in kept and "U+000A" not in kept
+
+
+def test_the_same_invisible_many_times_is_one_marker() -> None:
+    """T26-5b: 64 KiB of U+200B were 65,536 elements in a page, and twenty answers hung the tab."""
+    html = str(visible("a" + "\u200b" * 65_536 + "b"))
+    assert html.count('class="esc"') == 1 and "U+200B×65536" in html
+    assert html.startswith("a") and html.endswith("b") and len(html) < 200
+
+
+def test_one_invisible_has_no_count() -> None:
+    assert "×" not in str(visible("a\u200bb"))
+
+
+def test_invisibles_that_take_turns_stop_at_a_cap_and_say_so() -> None:
+    """They get past the grouping, so there is a cap. What was left out is said, in a marker of
+    ours, and nothing of it reaches the page."""
+    text = "\u200b\u200c" * 32_768 + "FINAL"
+    html = str(visible(text))
+    assert html.count('class="esc"') == MAX_MARKERS
+    assert f'<span class="cut">…({len(text) - MAX_MARKERS})</span>' in html
+    assert "FINAL" not in html
+
+
+def test_a_tower_of_marks_counts_for_the_cap() -> None:
+    html = str(visible(("a" + "\u0301" * 5) * 10_000))
+    assert html.count('class="esc"') == MAX_MARKERS and 'class="cut"' in html
+
+
+def test_a_text_with_its_joiners_keeps_them_all() -> None:
+    """What a real answer in Persian has: well under the cap in the most a page shows."""
+    html = str(visible("می\u200cخواهم " * 1000))
+    assert html.count('class="esc"') == 1000 and 'class="cut"' not in html
 
 
 def test_limit_cuts_and_says_so() -> None:
