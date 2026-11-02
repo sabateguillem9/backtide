@@ -469,7 +469,7 @@ def test_a_state_folder_that_is_a_link_is_refused(home: Path) -> None:
         ('state_dir = "/tmp/x"\n', "state_dir"),
         ('cycle_interval = 1\n', "cycle_interval"),
         ("sensor = {}\n", "sensor"),
-        ("budget = {}\n", "budget"),
+        ("gate = {}\n", "gate"),
         ("slug = \"otro\"\n", "slug"),
     ],
 )  # fmt: skip

@@ -11,6 +11,8 @@ reads the config and calls ``seguir``; everything else is here, so it is tested 
   ``backtide seguir`` resumes it. So without a service this only says so (exit 1) and lets go of
   the lock at once.
 - Whatever comes back is printed redacted and with control characters escaped.
+- ``agent`` (T26-2c, `--agente`) says who: the socket and the lock are the machine's, so this needs
+  nothing of that agent, and a broken file of one stops nobody.
 
 Exit codes: 0 resumed (or nothing to resume); 1 not resumed (a condition stands, another
 reason keeps it paused, no service); 2 usage (an unusable lock, a socket that is not ours, a
@@ -43,7 +45,13 @@ NO_SERVICE = (
 )
 
 
-def seguir(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | None = None) -> int:
+def seguir(
+    config: ServiceConfig,
+    *,
+    agent: str | None = None,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+) -> int:
     """`backtide seguir` with ``config``: ask the running service to resume and say what it did.
     Returns the exit code."""
     out = out if out is not None else sys.stdout
@@ -51,7 +59,7 @@ def seguir(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | No
     try:
         lock = take_lock(config.lock_file)
     except ServiceRunning:
-        return _through_service(config, out, err)
+        return _through_service(config, out, err, agent)
     except ServiceLocked as error:  # the lock file itself is unusable: not "a service"
         _error(err, str(error))
         return EXIT_ERROR
@@ -60,9 +68,9 @@ def seguir(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | No
     return EXIT_FAILED
 
 
-def _through_service(config: ServiceConfig, out: TextIO, err: TextIO) -> int:
+def _through_service(config: ServiceConfig, out: TextIO, err: TextIO, agent: str | None) -> int:
     try:
-        reply = ask_resume(config.control_socket)
+        reply = ask_resume(config.control_socket, **_about(agent))
     except ControlUnavailable:
         _error(
             err,
@@ -88,6 +96,10 @@ def _through_service(config: ServiceConfig, out: TextIO, err: TextIO) -> int:
     else:
         _error(err, text)
     return code
+
+
+def _about(agent: str | None) -> dict[str, str]:
+    return {} if agent is None else {"agent": agent}
 
 
 def _error(err: TextIO, message: str) -> None:

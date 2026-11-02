@@ -8,7 +8,13 @@ volumes, real uids and a real Tetragon. In vigia-dev, and only with the Claude C
 
     make ataques PERFIL=claude-code ATK_PATH=tests/attacks/test_two_agents_attacks.py
 
-`vecino-sin-espacio` goes last: it leaves the neighbour paused (no `seguir --agente` until T26-2c).
+`vecino-sin-espacio` goes last: it leaves the neighbour paused, and `seguir --agente` refuses while
+it is over its cap.
+
+T26-2c (each order says which agent, and what they spend adds up): `vecino-sin-gasto`,
+`gasto-de-toda-la-instalacion`, `aprobar-al-vecino`, `rebobinar-al-vecino`, `agente-inventado`,
+`archivo-roto-no-frena` and `tarea-del-vecino`. No model call reaches a provider (invariant 8): the
+key is made up, and each scenario that gives a turn or calls a model first checks the lab's cut.
 """
 
 import json
@@ -30,6 +36,7 @@ from two_agents_kit import (
     MAIN,
     MAIN_CAP,
     OTHER,
+    SLUG,
     STATE,
     Agent,
     Lab,
@@ -639,6 +646,429 @@ def test_a_broken_installation_box_is_told_and_never_stops_an_agent(
 # --- its space --------------------------------------------------------------------------------
 
 
+# --- what each spends (T26-2c) -----------------------------------------------------------------
+
+
+MODEL_HOST = "api.anthropic.com"
+MODEL = "claude-sonnet-5-5"
+USD = 1_000_000
+
+
+def _fake_of(lab: Lab, agent: Agent) -> str:
+    return lab.helper("fake", str(CONFIG), agent.slug)["fake"]
+
+
+def _call_model(
+    attack: Attack, lab: Lab, agent: Agent, key: str, calls: int = 2
+) -> list[dict[str, Any]]:
+    """The agent calls the model through its proxy. The cut is what answers, if anything does."""
+    assert lab.network_cut(), "invariant 8: no model call without the lab's network cut"
+    outcome = attack.run_script(
+        InContainer(lab, agent), "tope_de_gasto", MODEL_HOST, key, MODEL, str(calls)
+    )
+    return outcome["calls"]
+
+
+def _model_requests(lab: Lab, agent: Agent) -> int:
+    return len([e for e in lab.events(agent, "request") if e["source"] == "llm"])
+
+
+def _refused_by_the_cap(calls: list[dict[str, Any]]) -> bool:
+    return all(c["status"] == 429 and "tope de gasto" in str(c.get("message")) for c in calls)
+
+
+def _spend(lab: Lab, agent: Agent, dollars: int) -> None:
+    """What this agent has spent grows, with the service stopped; when it starts it counts it."""
+    lab.stop()
+    lab.helper("charge", str(agent.box), str(dollars * USD))
+    lab.start()
+
+
+def _llm_blocked(lab: Lab, agent: Agent) -> list[dict[str, Any]]:
+    return [e for e in lab.events(agent, "blocked") if e["source"] == "llm"]
+
+
+@scenario("vecino-sin-gasto")
+def test_an_agent_out_of_money_stops_nobody_else(attack: Attack, lab: Lab) -> None:
+    """A spends all that its own cap lets it, and B goes on. A's fake key, used from B, does not
+    go out: it is not B's, and the spending would be counted to the wrong one. The control of the
+    cap is the neighbour's call that goes through the same gate and reaches the cut."""
+    cap = lab.cli("tope", "--agente", SLUG, "--dia", "1")
+    assert cap.returncode == 0, cap.stderr
+    _spend(lab, OTHER, 1)
+    other_key, main_key = _fake_of(lab, OTHER), _fake_of(lab, MAIN)
+    assert other_key != main_key
+    said = lab.cli("gasto", "--agente", SLUG)
+    before_other = _model_requests(lab, OTHER)
+    before_main = _model_requests(lab, MAIN)
+    blocked_main = len(_llm_blocked(lab, MAIN))
+
+    refused = _call_model(attack, lab, OTHER, other_key)
+    goes_on = _call_model(attack, lab, MAIN, main_key)
+    passed = _model_requests(lab, MAIN) - before_main
+    wait(
+        lambda: bool(_llm_blocked(lab, OTHER)),
+        SEEN_TIMEOUT,
+        "the neighbour's refusals in its box",
+        lab.diagnosis,
+    )
+    (blocked, *_) = _llm_blocked(lab, OTHER)
+
+    # B with A's key.
+    foreign_before = _model_requests(lab, MAIN)
+    foreign = _call_model(attack, lab, MAIN, other_key, 1)
+    wait(
+        lambda: bool(said_in(lab.events(MAIN, "blocked"), "foreign_credential")),
+        SEEN_TIMEOUT,
+        "the foreign key refused in the box of who used it",
+        lab.diagnosis,
+    )
+    attack.check(
+        "stopped",
+        _refused_by_the_cap(refused)
+        and _model_requests(lab, OTHER) == before_other
+        and not any(c["status"] == 429 for c in goes_on)
+        and passed == len(goes_on)
+        and said.returncode == 0
+        and "1,00 $ de 1,00 $" in said.stdout
+        and foreign[0]["status"] == 403
+        and _model_requests(lab, MAIN) == foreign_before
+        and said_in(lab.events(MAIN), other_key) == [],
+        f"el que agotó su tope ({said.stdout.strip()[:120]!r}) recibe {refused} y nada llega al "
+        f"proveedor; el otro pasa la puerta del gasto ({passed} llm/request; responde el corte: "
+        f"{goes_on}); la clave falsa del vecino, usada desde el otro, no sale ({foreign})",
+    )
+    attack.check(
+        "recorded",
+        blocked["details"]["reason"] == "spend_cap"
+        and "scope" not in blocked["details"]
+        and len(_llm_blocked(lab, MAIN)) == blocked_main,
+        f"llm/blocked en la caja de quien se pasó ({blocked['details']}) y ninguno en la del otro",
+    )
+    attack.check("risk", blocked["risk"] == 2, f"llm/blocked con riesgo {blocked['risk']}")
+    lifted = lab.cli("tope", "--agente", SLUG, "--dia", "100")
+    assert lifted.returncode == 0, lifted.stderr
+
+
+@scenario("gasto-de-toda-la-instalacion")
+def test_adding_agents_does_not_multiply_what_is_spent(attack: Attack, lab: Lab) -> None:
+    """Each under its own cap, or with none, and the total stops them all: D13. The control is that
+    raising it lets them through at once, and that the change is in the installation's box."""
+    keys = {agent: _fake_of(lab, agent) for agent in (MAIN, OTHER)}
+    lowered = lab.cli("tope", "--dia", "2")
+    assert lowered.returncode == 0, lowered.stderr
+    changes = lab.installation_events("budget_set")
+    _spend(lab, MAIN, 3)
+    said = lab.cli("gasto")
+    before = {agent: len(_llm_blocked(lab, agent)) for agent in keys}
+    requests = {agent: _model_requests(lab, agent) for agent in keys}
+    refused = {agent: _call_model(attack, lab, agent, key) for agent, key in keys.items()}
+    wait(
+        lambda: all(len(_llm_blocked(lab, agent)) > before[agent] for agent in keys),
+        SEEN_TIMEOUT,
+        "each agent's refusal in its own box",
+        lab.diagnosis,
+    )
+    new = {agent: _llm_blocked(lab, agent)[-1] for agent in keys}
+    raised = lab.cli("tope", "--dia", "50", "--mes", "100")
+    assert raised.returncode == 0, raised.stderr
+    through = _call_model(attack, lab, MAIN, keys[MAIN], 1)
+    attack.check(
+        "stopped",
+        all(_refused_by_the_cap(calls) for calls in refused.values())
+        and _model_requests(lab, OTHER) == requests[OTHER]
+        and through[0]["status"] != 429
+        and _model_requests(lab, MAIN) == requests[MAIN] + 1
+        and "Total de la instalación hoy" in said.stdout,
+        f"con el tope total de 2 $ y 3 $ gastados entre todos, cada uno recibe {refused}; subido "
+        f"el tope, la llamada vuelve a salir ({through}). `gasto` dice: {said.stdout[:200]!r}",
+    )
+    attack.check(
+        "recorded",
+        all(e["details"].get("scope") == "installation" for e in new.values())
+        and changes[-1]["details"]["scope"] == "installation"
+        and changes[-1]["details"]["requested_by"].startswith("cli (uid 0")
+        and bool(lab.installation_events("budget_unblocked")),
+        "llm/blocked con scope installation en la caja de cada agente, y el cambio de tope "
+        f"(settings/budget_set) en la de la instalación: {changes[-1]['details']}",
+    )
+    attack.check("risk", {e["risk"] for e in new.values()} == {2}, "llm/blocked con riesgo 2")
+
+
+# --- each order says about whom (T26-2c) ----------------------------------------------------------
+
+
+def _hold(attack: Attack, lab: Lab, agent: Agent, tag: str) -> str:
+    """A DELETE of this agent, held at its gate, and its id. Its client gives up; the hold stays."""
+    mark = f"{tag}-{secrets.token_hex(4)}"
+    attack.run_script(
+        InContainer(lab, agent),
+        "peticion_delete_retenida",
+        "delete",
+        "cubos.ejemplo.test",
+        f"/{mark}/v1",
+        "5",
+    )
+    wait(
+        lambda: bool(said_in(lab.events(agent, "held"), mark)),
+        SEEN_TIMEOUT,
+        "the request held",
+        lab.diagnosis,
+    )
+    (found,) = said_in(lab.events(agent, "held"), mark)
+    return found["details"]["hold_id"]
+
+
+@scenario("aprobar-al-vecino")
+def test_the_owner_decides_on_the_neighbours_gate(attack: Attack, lab: Lab) -> None:
+    """What `puerta-del-vecino` left: a neighbour's hold no longer ends rejected for lack of a way
+    to answer. The field chooses whose gate, and the wrong one, or nobody, releases nothing."""
+    first = _hold(attack, lab, OTHER, "aprobar")
+    listed = lab.cli("retenidas")
+    wrong_gate = lab.cli("aprobar", first)
+    nobody = lab.cli("aprobar", first, "--agente", "nadie")
+    a_path = lab.cli("aprobar", first, "--agente", "../revisor")
+    released_early = said_in(lab.events(OTHER, "approved"), first)
+    yes = lab.cli("aprobar", first, "--agente", SLUG)
+    second = _hold(attack, lab, OTHER, "rechazar")
+    no = lab.cli("rechazar", second, "--agente", SLUG)
+    approved = said_in(lab.events(OTHER, "approved"), first)
+    rejected = said_in(lab.events(OTHER, "rejected"), second)
+    attack.check(
+        "stopped",
+        wrong_gate.returncode == 1
+        and nobody.returncode == 2
+        and a_path.returncode == 2
+        and released_early == []
+        and yes.returncode == 0
+        and no.returncode == 0
+        and bool(approved)
+        and bool(rejected),
+        f"sin --agente es la puerta del principal, y no suelta nada ({wrong_gate.returncode}); un "
+        f"agente inventado ({nobody.returncode}) o una ruta ({a_path.returncode}) tampoco; con "
+        f"--agente {SLUG}, aprobar y rechazar funcionan",
+    )
+    attack.check(
+        "held",
+        f"Agente {SLUG}:" in listed.stdout and first in listed.stdout,
+        f"`retenidas` enseña lo retenido del vecino bajo su nombre: {listed.stdout[:300]!r}",
+    )
+    attack.check(
+        "recorded",
+        said_in(lab.events(MAIN), first) == []
+        and said_in(lab.events(MAIN), second) == []
+        and "cli (uid 0" in json.dumps(approved),
+        "gate/approved y gate/rejected en la caja del vecino, con quién lo pidió, y nada en la del "
+        "otro",
+    )
+
+
+@scenario("rebobinar-al-vecino")
+def test_the_owner_rewinds_the_neighbour_and_only_it(attack: Attack, lab: Lab) -> None:
+    """`rebobinar --agente`: its workspace goes back, its agent comes back, and the other is left
+    as it was. A snapshot of one is nobody else's: the id says nothing to the other."""
+    tag = secrets.token_hex(4)
+    kept, gone, untouched = f"vuelve-{tag}", f"se-va-{tag}", f"sigue-{tag}"
+    before = set(lab.snapshots(OTHER))
+    assert lab.in_agent(OTHER, f"echo x > {CONTAINER_WORK}/{kept}").returncode == 0
+    wait(
+        lambda: bool(set(lab.snapshots(OTHER)) - before),
+        SEEN_TIMEOUT,
+        "a snapshot with the file",
+        lab.diagnosis,
+    )
+    target = sorted(set(lab.snapshots(OTHER)) - before)[-1]
+    script = f"rm {CONTAINER_WORK}/{kept}; echo x > {CONTAINER_WORK}/{gone}"
+    assert lab.in_agent(OTHER, script).returncode == 0
+    assert lab.in_agent(MAIN, f"echo x > {CONTAINER_WORK}/{untouched}").returncode == 0
+    listed = lab.cli("instantaneas", "--agente", SLUG, "--todas")
+    main_rewinds = len(lab.events(MAIN, "rewind_requested"))
+    main_id = sh("docker", "inspect", "--format", "{{.Id}}", MAIN.container).stdout.strip()
+    elsewhere = lab.cli("rebobinar", target, "--si")
+    invented = lab.cli("rebobinar", target, "--si", "--agente", "nadie")
+    done = lab.cli("rebobinar", target, "--si", "--agente", SLUG)
+    wait(lambda: lab.running(OTHER), SEEN_TIMEOUT, "the neighbour back", lab.diagnosis)
+    seen = lab.in_agent(
+        OTHER, f"ls {CONTAINER_WORK}/{kept}; ls {CONTAINER_WORK}/{gone} 2>&1 || true"
+    )
+    main_seen = lab.in_agent(MAIN, f"ls {CONTAINER_WORK}/{untouched}")
+    same_main = sh("docker", "inspect", "--format", "{{.Id}}", MAIN.container).stdout.strip()
+    requested = lab.events(OTHER, "rewind_requested")[-1]
+    attack.check(
+        "stopped",
+        elsewhere.returncode == 2
+        and invented.returncode == 2
+        and target in listed.stdout
+        and main_id == same_main
+        and main_seen.returncode == 0
+        and len(lab.events(MAIN, "rewind_requested")) == main_rewinds,
+        f"la instantánea del vecino no le dice nada al principal ({elsewhere.returncode}), ni a un "
+        f"agente inventado ({invented.returncode}); el principal sigue igual",
+    )
+    attack.check(
+        "recoverable",
+        done.returncode == 0
+        and f"--agente {SLUG}" in done.stdout
+        and kept in seen.stdout
+        and "No such file" in seen.stdout,
+        f"--agente {SLUG}: su espacio vuelve a {target}, y lo posterior se va ({seen.stdout!r}); "
+        f"el punto para deshacer dice de quién es ({done.stdout[-160:]!r})",
+    )
+    attack.check(
+        "recorded",
+        "cli (uid 0" in json.dumps(requested) and lab.verify(OTHER)["ok"],
+        f"rewind_requested en la caja del vecino: {requested['details']}",
+    )
+
+
+@scenario("agente-inventado")
+def test_a_session_is_good_for_all_and_says_which_each_time(attack: Attack, lab: Lab) -> None:
+    """As the web: one session for every agent, a name that is nobody's refused, the narrow socket's
+    own list of snapshots per agent, and no session, nothing. Each with the real hold of a real
+    neighbour, which only the last order ends: its box says so, and the other's says nothing."""
+    gid = lab.web_gid
+    nobody = int(sh("id", "-u", "nobody").stdout)
+    hold = _hold(attack, lab, OTHER, "sesion")
+    main_id, other_id = lab.snapshots(MAIN)[-1], lab.snapshots(OTHER)[-1]
+    token = lab.helper("link", str(STATE / STATE_SOCKET))["token"]
+    reject = {"cmd": "decide", "hold_id": hold, "verdict": "reject", "_why": True}
+    with_session = {**reject, "session": "<session>"}
+    answers = _probe(
+        nobody,
+        gid,
+        {**reject, "agent": SLUG},
+        {"cmd": "session_open", "token": token},
+        {"cmd": "agents", "_why": True},
+        {**with_session, "agent": "nadie"},
+        {**with_session, "agent": "../revisor"},
+        {**with_session, "agent": 7},
+        with_session,
+        {"cmd": "rewind", "snapshot_id": main_id, "agent": SLUG, "session": "<session>"},
+        {"cmd": "snapshots", "agent": SLUG},
+        {"cmd": "snapshots", "agent": "nadie"},
+        {**with_session, "agent": SLUG},
+    )
+    bare, opened, agents, invented, a_path, a_number, its_own, foreign_rewind = answers[:8]
+    listing, listing_nobody, decided = answers[8:]
+    rejected = said_in(lab.events(OTHER, "rejected"), hold)
+    rewinds = [e for e in lab.events(OTHER, "rewind_requested") if main_id in json.dumps(e)]
+    attack.check(
+        "stopped",
+        bare["outcome"] == "refused"
+        and "sesión" in bare["why"]
+        and opened["ok"] is True
+        and agents["ok"] is True
+        and all(
+            a["outcome"] == "refused" and "agente" in a["why"] for a in (invented, a_path, a_number)
+        )
+        and its_own["outcome"] == "unknown"
+        and foreign_rewind["outcome"] == "invalid"
+        and rewinds == []
+        and listing["ok"] is True
+        and listing["n"] >= 1
+        and listing_nobody["outcome"] == "refused"
+        and decided["ok"] is True,
+        f"sin sesión: {bare}; un agente inventado, una ruta y un número: {invented}, {a_path}, "
+        f"{a_number}; sin agent es la puerta del principal: {its_own}; a una instantánea del "
+        f"principal ({other_id} es la suya): {foreign_rewind}; con su nombre: {decided}",
+    )
+    attack.check(
+        "recorded",
+        bool(rejected)
+        and "web (uid" in json.dumps(rejected)
+        and said_in(lab.events(MAIN), hold) == [],
+        "gate/rejected con «web» en la caja de ese agente, y nada en la del otro",
+    )
+
+
+@scenario("archivo-roto-no-frena")
+def test_a_broken_file_stops_nothing_that_stops_or_undoes(attack: Attack, lab: Lab) -> None:
+    """The owner breaks an agent's file while the service runs: rejecting, resuming and rewinding
+    go on, for the others and for that very agent, whose service has what it read. What lets
+    something out still reads them all, and refuses. The file goes away at the end."""
+    broken = ETC / "agents" / "roto.toml"
+    own = ETC / "agents" / f"{SLUG}.toml"
+    held_main = _hold(attack, lab, MAIN, "roto-a")
+    held_third = _hold(attack, lab, OTHER, "roto-c")
+    target = lab.snapshots(OTHER)[-1]
+    original = sudo("cat", str(own)).stdout
+    _write(broken, "number = 9\n")  # no volume
+    try:
+        approve = lab.cli("aprobar", held_third, "--agente", SLUG)
+        reject_main = lab.cli("rechazar", held_main)
+        resume = lab.cli("seguir", "--agente", SLUG)
+        listed = lab.cli("retenidas")
+        rewind = lab.cli("rebobinar", target, "--si", "--agente", SLUG)
+        wait(lambda: lab.running(OTHER), SEEN_TIMEOUT, "the neighbour back", lab.diagnosis)
+        # And with the file of the agent itself broken: only the service can do it.
+        _write(own, "number = 1\n")  # no volume
+        later = _hold(attack, lab, OTHER, "roto-d")
+        reject_itself = lab.cli("rechazar", later, "--agente", SLUG)
+        target = lab.snapshots(OTHER)[-1]
+        rewind_itself = lab.cli("rebobinar", target, "--si", "--agente", SLUG)
+        wait(lambda: lab.running(OTHER), SEEN_TIMEOUT, "the neighbour back", lab.diagnosis)
+    finally:
+        _write(own, original)
+        sudo("rm", "-f", str(broken))
+    attack.check(
+        "stopped",
+        approve.returncode == 2
+        and "roto.toml" in approve.stderr
+        and not said_in(lab.events(OTHER, "approved"), held_third)
+        and reject_main.returncode == 0
+        and bool(said_in(lab.events(MAIN, "rejected"), held_main))
+        and resume.returncode == 0
+        and listed.returncode == 0
+        and rewind.returncode == 0
+        and reject_itself.returncode == 0
+        and rewind_itself.returncode == 0,
+        f"con un archivo roto, aprobar se niega ({approve.returncode}) y rechazar, seguir, "
+        f"retenidas y rebobinar funcionan ({reject_main.returncode}, {resume.returncode}, "
+        f"{listed.returncode}, {rewind.returncode}), también con el del propio agente "
+        f"({reject_itself.returncode}, {rewind_itself.returncode}: {rewind_itself.stderr[:160]!r})",
+    )
+    attack.check(
+        "recorded",
+        "AVISO" in reject_main.stderr and "roto.toml" in reject_main.stderr,
+        f"se dice qué archivo está roto: {reject_main.stderr[:200]!r}",
+    )
+
+
+@scenario("tarea-del-vecino")
+def test_each_guardian_has_its_own_tasks(attack: Attack, lab: Lab) -> None:
+    """T26-5a over T26-2b: an agent's tasks are its own. A turn of a real Claude Code, whose call
+    stops at the lab's cut (invariant 8), in its box and never in the other's."""
+    assert lab.network_cut(), "invariant 8: no turn of an agent without the lab's network cut"
+    control = str(STATE / STATE_SOCKET)
+    mark = f"T26-2C-{secrets.token_hex(6)}"
+    started = lab.helper("task", control, SLUG, f"{mark} di hola")
+    assert started["ok"], started
+    task = started["task"]
+    asked_there = lab.helper("task_status", control, SLUG, task)
+    asked_main = lab.helper("task_status", control, "-", task)
+    asked_nobody = lab.helper("task_status", control, "nadie", task)
+    wait(
+        lambda: bool(said_in(lab.events(OTHER, "agent_shell"), mark)),
+        SEEN_TIMEOUT,
+        "the task in the box of its agent",
+        lab.diagnosis,
+    )
+    attack.check(
+        "stopped",
+        asked_there["outcome"] != "unknown"
+        and asked_main["outcome"] == "unknown"
+        and asked_nobody["outcome"] == "refused",
+        f"la tarea solo la conoce su agente ({asked_there['outcome']}); el principal no sabe de "
+        f"ella ({asked_main['outcome']}), y un agente inventado se rechaza "
+        f"({asked_nobody['outcome']})",
+    )
+    attack.check(
+        "recorded",
+        said_in(lab.events(MAIN), mark) == [],
+        "system/agent_shell en la caja del vecino, y nada en la del otro",
+    )
+
+
 @scenario("vecino-sin-espacio")
 def test_an_agent_out_of_space_stops_nobody_else(attack: Attack, lab: Lab) -> None:
     """Last: the neighbour stays paused. The fill and the delete are `pausar-por-espacio`'s, which
@@ -693,6 +1123,8 @@ def test_an_agent_out_of_space_stops_nobody_else(attack: Attack, lab: Lab) -> No
     state = sh("docker", "inspect", "--format", "{{.State.Paused}}", MAIN.container).stdout.strip()
     main_usage = lab.usage(MAIN)
     main_pauses = lab.events(MAIN, "space_pause")
+    # Past its cap it stays frozen, even if the owner says to go on: its own pause, and its own say.
+    told = lab.cli("seguir", "--agente", SLUG)
     attack.check(
         "stopped",
         paused == "true"
@@ -701,7 +1133,8 @@ def test_an_agent_out_of_space_stops_nobody_else(attack: Attack, lab: Lab) -> No
         and wrote
         and main_usage["limit"] == main_limit == MAIN_CAP
         and lab.usage(OTHER)["limit"] == NEIGHBOUR_CAP
-        and main_pauses == [],
+        and main_pauses == []
+        and told.returncode == 1,
         f"el vecino, pasado de su tope, queda congelado ({pause['details']['conditions']}); el "
         f"otro sigue en marcha, escribe y hace instantáneas, y su tope no cambia ({main_limit} y "
         f"{main_usage['limit']}); en su caja no hay ninguna pausa",

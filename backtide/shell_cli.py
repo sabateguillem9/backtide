@@ -196,9 +196,15 @@ def talk_of(config: ServiceConfig, *, session: bool = False) -> ShellCommands | 
     return shell
 
 
+def _about(config: ServiceConfig) -> dict[str, str]:
+    """What says which agent an order is about (T26-2c): nothing for the main one, whose orders are
+    what they always were."""
+    return {} if config.is_main else {"agent": config.slug}
+
+
 def _ask(config: ServiceConfig, kind: str, **options: Any) -> dict[str, Any] | None:
     try:
-        reply = ask_shell(config.control_socket, kind, **options)
+        reply = ask_shell(config.control_socket, kind, **options, **_about(config))
     except ControlUnavailable:
         error(NO_SERVICE)
         return None
@@ -360,7 +366,9 @@ def tarea(
         error(f"la tarea no vale: {problem}")
         return EXIT_ERROR
     try:
-        started = ask_task_start(config.control_socket, prompt, resume=resume, seconds=seconds)
+        started = ask_task_start(
+            config.control_socket, prompt, resume=resume, seconds=seconds, **_about(config)
+        )
     except ControlUnavailable:
         error(NO_SERVICE)
         return EXIT_FAILED
@@ -381,7 +389,7 @@ def _wait_for_task(config: ServiceConfig, task_id: str) -> int:
     closing the terminal asks nothing, and it ends at its deadline."""
     try:
         while True:
-            status = ask_task_status(config.control_socket, task_id)
+            status = ask_task_status(config.control_socket, task_id, **_about(config))
             if status["outcome"] != TaskOutcome.RUNNING:
                 return _report_task(status)
             time.sleep(TASK_POLL)
@@ -398,7 +406,7 @@ def _wait_for_task(config: ServiceConfig, task_id: str) -> int:
 
 def _stop_said(config: ServiceConfig, task_id: str) -> str:
     try:
-        stopped = ask_task_stop(config.control_socket, task_id)
+        stopped = ask_task_stop(config.control_socket, task_id, **_about(config))
     except (ControlError, KeyboardInterrupt):
         stopped = False
     return STOPPED_INSIDE if stopped else MAY_RUN_ON
@@ -971,7 +979,7 @@ def exportar(
 def _ask_export(config: ServiceConfig, path: Path, **options: Any) -> dict[str, Any] | int:
     """The service's answer to an export, or the exit code (the error said)."""
     try:
-        reply = ask_export(config.control_socket, str(path), **options)
+        reply = ask_export(config.control_socket, str(path), **options, **_about(config))
     except ControlUnavailable:
         error(NO_SERVICE)
         return EXIT_FAILED

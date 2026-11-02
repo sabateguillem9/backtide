@@ -2550,3 +2550,125 @@ recorded = "yes"
 risk = "2"
 recoverable = "n/a"
 held = "n/a"
+
+[[scenario]]
+id = "vecino-sin-gasto"
+name = "Un agente sin gasto no frena a otro, ni gasta con su clave"
+story = """Cada agente tiene su tope. A lo agota y sus llamadas se rechazan antes de llegar al proveedor; \
+B pasa la misma puerta del gasto y sigue. La clave falsa de A, usada desde B, no sale: no es la suya \
+y el gasto se apuntaría a quien no toca. Ninguna llamada llega a un proveedor: lo gastado se escribe \
+en la caja negra con el servicio parado y el corte de red del laboratorio responde a lo demás."""
+inspired_by = "Un agente en bucle gastó 32 $ en una hora"
+invariants = [7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "2"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "gasto-de-toda-la-instalacion"
+name = "Añadir agentes no multiplica el gasto"
+story = """Hay un tope de toda la instalación (D13). Cada agente está por debajo del suyo, o no tiene, y \
+entre todos llegan al total: se rechazan las llamadas de todos, con `scope: installation` en la caja \
+de cada uno. El cambio de tope va a la caja de la instalación, antes de aplicarse. Subirlo deja salir \
+la siguiente."""
+inspired_by = "Dos agentes con el tope de uno cada uno gastan el doble"
+invariants = [7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "2"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "aprobar-al-vecino"
+name = "Lo retenido del vecino se decide en su puerta"
+story = """`backtide retenidas` enseña lo retenido de cada agente bajo su nombre. `aprobar` sin --agente \
+va a la puerta del principal y no suelta lo del vecino, un agente inventado o una ruta se rechazan, y \
+con --agente se aprueba o se rechaza de verdad, y queda en la caja de ese agente."""
+inspired_by = "Aprobar para un agente y soltar lo de otro"
+invariants = [6, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "yes"
+
+[[scenario]]
+id = "rebobinar-al-vecino"
+name = "Rebobinar a un agente deja al otro como estaba"
+story = """`rebobinar --agente` vuelve su espacio de trabajo a su instantánea, y su contenedor arranca \
+otra vez. El otro agente no se entera: el mismo contenedor, sus archivos y ningún evento en su caja. \
+La instantánea de uno no le dice nada al otro, ni a un agente inventado."""
+inspired_by = "Deshacer lo de un agente y llevarse por delante lo de otro"
+invariants = [7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "yes"
+held = "n/a"
+
+[[scenario]]
+id = "agente-inventado"
+name = "Una sesión vale para todos, y cada orden dice sobre cuál"
+story = """Por el socket estrecho, como la web. Sin sesión, nada. Con ella, un agente inventado, una ruta \
+o un número se rechazan sin tocar a ninguno; sin el campo es el principal, que no conoce esa retención; \
+y una instantánea del principal no vale para el vecino, porque la lista es la de cada uno. Con su \
+nombre se decide de verdad, y queda con «web» en la caja de ese agente."""
+inspired_by = "Un nombre de agente que acaba siendo una ruta"
+invariants = [1, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "archivo-roto-no-frena"
+name = "Un archivo de agente roto no frena lo que frena o deshace"
+story = """Con el servicio en marcha, el dueño rompe el archivo de un agente. Rechazar, seguir, listar y \
+rebobinar siguen funcionando, para los demás y para ese mismo agente, y se dice qué archivo está roto. \
+Aprobar, que deja salir algo, lee todos y se niega."""
+inspired_by = "Un fichero mal editado que deja al dueño sin freno"
+invariants = [6, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "tarea-del-vecino"
+name = "Las tareas son de cada agente"
+story = """Una tarea para un agente corre en el suyo y queda en su caja. El principal no la conoce y un \
+agente inventado se rechaza. El turno del agente no llega a ningún proveedor: la clave es inventada y \
+el laboratorio corta la red."""
+inspired_by = "Leer la respuesta de una tarea de otro agente"
+invariants = [7, 8]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"

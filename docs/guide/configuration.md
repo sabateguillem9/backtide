@@ -151,7 +151,7 @@ models = ["qwen3-coder"]
 
 ## Several agents
 
-One service can run several agents at once. This is early: nothing creates them for you yet, the CLI, the web and the Telegram bot still act on the main agent only, and there is no spending cap across agents.
+One service can run several agents at once. This is early: nothing creates them for you yet, and the web and the Telegram bot still act on the main agent only. The CLI reaches any of them with `--agente` ([CLI reference](cli-reference.md)).
 
 An installation with no `/etc/backtide/agents/` folder has one agent, `principal`, and behaves as it always did. Each other agent is a file, `/etc/backtide/agents/<slug>.toml`, where the slug is lowercase letters, digits and `-`:
 
@@ -163,11 +163,19 @@ workspace_limit = 1073741824                 # in bytes
 
 [agent]
 profile = "claude-code"
+
+[budget]                                     # optional: its own caps, in dollars
+daily_usd = 1
+monthly_usd = 10
 ```
 
 Before the service starts, its volume has to be mounted and its proxy's folder, `<state_dir>/agents/<slug>/proxy-channel`, has to hold the same kind of tmpfs the main agent's has: the hardened service cannot do either of those so that Docker sees them. A file that cannot be used stops the service from starting, and says why: a volume shared with another agent or leading to the state folder through a link, or an id that belongs to an account of the machine. An agent that cannot start once the service runs is written to the installation's black box and alerted, and the others go on.
 
 Each agent has its own container, proxy, networks, volume, black box and fake key. None of them can see another's: the service kills a container that mounts a neighbour's folder. `backtide desinstalar` stops and removes them with the rest, unmounts them, and keeps their data unless you say `--borrar-datos`.
+
+**Spending with several agents.** `[budget]` in `backtide.toml` is the cap of **the whole installation**, so adding agents does not multiply what can be spent. An agent with no cap of its own only has that one. Its file's `[budget]` takes only `daily_usd` and `monthly_usd`, and `backtide tope --agente NAME` sets the same thing; `backtide tope` without `--agente` changes the total, which goes to the installation's black box first. The first time, if you had already changed the main agent's cap, that value becomes the total, and it also stays as the main agent's own cap: raising the total later does not raise it, so change it too with `--agente principal`. A model call goes out only if both the agent and the whole installation may spend, and a call refused because of the total says `scope: installation` in that agent's black box. What an agent that is not running spent still counts. If what an agent spent cannot be read, no agent's model call goes out until it can (it is alerted once).
+
+**A broken agent file.** It stops the service from starting, and until you fix it, what lets something out or starts an agent (`vigilar`, `aprobar`, `tope`, `entrar`, `tarea`, `importar`, `exportar`) refuses too. What stops, undoes or only looks goes on and warns: `rechazar`, `seguir`, `rebobinar`, `retenidas`, `instantaneas` and `gasto`. That holds for the agent whose own file is broken as well, as long as the service is running: without one, `rebobinar` needs that file.
 
 Claude Code and local-model support exist in the code and have tests and attack scenarios in the VM. They have had less hands-on use than the OpenClaw path.
 

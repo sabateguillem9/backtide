@@ -23,11 +23,15 @@ What a file holds, and all it may hold (written by the service, T26-6a, or by ha
     [proxy]                    # lower or higher limits than the machine's [proxy]
     memory = "256m"
 
-Everything else is the machine's, in ``backtide.toml`` (``[sensor]``, ``[gate]``, ``[budget]``,
-``[web]``, what ``[proxy]`` lets out, its limits by default) and comes along. Reading makes the
-agent's folder and its fake keys, as ``from_file`` makes the main one's, and starts nothing. A file
-that cannot be used is a ConfigError, never skipped: an agent that was asked for and does not run
-is not something to find out later.
+    [budget]                   # its own caps, under the whole installation's (T26-2c): optional
+    daily_usd = 1
+    monthly_usd = 10
+
+Everything else is the machine's, in ``backtide.toml`` (``[sensor]``, ``[gate]``, the rest of
+``[budget]``, ``[web]``, what ``[proxy]`` lets out, its limits by default) and comes along. Reading
+makes the agent's folder and its fake keys, as ``from_file`` makes the main one's, and starts
+nothing. A file that cannot be used is a ConfigError, never skipped: an agent that was asked for
+and does not run is not something to find out later.
 
 Together, agents share nothing that would let one reach another: no container or network name, no
 uid or gid, no folder (a volume, the image behind one, a config folder) that holds another's, links
@@ -77,9 +81,10 @@ from backtide.service.config import (
 _FILE_SUFFIX = ".toml"
 _KEYS = frozenset(
     {"number", "name", "volume", "volume_image", "max_volume_bytes", "workspace_limit", "agent",
-     "proxy"}
+     "proxy", "budget"}
 )  # fmt: skip
 _PROXY_LIMITS = frozenset({"memory", "cpus", "pids_limit"})
+_OWN_CAPS = frozenset({"daily_usd", "monthly_usd"})
 _IMAGE = "volume.img"  # the file behind an agent's volume, when it is in its folder (docs/47, 6.3)
 _MAX_KEY_FILE = 1024
 
@@ -94,6 +99,16 @@ class Installation:
     @property
     def agents(self) -> tuple[ServiceConfig, ...]:
         return (self.main, *self.others)
+
+    def agent(self, slug: str | None) -> ServiceConfig:
+        """The agent ``slug`` of this installation (None: the main one). ConfigError if there is
+        none: it is compared with what was read, so it never names a file."""
+        if slug is None:
+            return self.main
+        for config in self.agents:
+            if config.slug == slug:
+                return config
+        raise ConfigError(f"no agent {slug!r} here: {', '.join(c.slug for c in self.agents)}")
 
 
 def load_installation(path: Path) -> Installation:
@@ -125,6 +140,23 @@ def load_installation(path: Path) -> Installation:
     return Installation(first, tuple(rest))
 
 
+def load_agent(path: Path, slug: str | None = None) -> ServiceConfig:
+    """One agent and the machine's file, whatever the other agents' files say (T26-2c): what
+    stops or undoes must work with a neighbour's file broken. Not told of its neighbours, so this
+    is for what never starts a container; to run an agent, ``load_installation``. Raises ConfigError
+    if this agent's own file, or ``backtide.toml``, cannot be used."""
+    main = ServiceConfig.from_file(path)
+    if slug is None or slug == identity.MAIN_SLUG:
+        return main
+    _check_slug(slug)  # a slug, so that it can only name a file of this folder
+    folder = Path(path).parent / AGENTS_FOLDER
+    file = folder / f"{slug}{_FILE_SUFFIX}"
+    if not os.path.lexists(file):
+        raise ConfigError(f"no agent {slug!r} here: there is no {file}")
+    require_own_folder(folder, "the agents' files folder")
+    return _read_agent(main, file, slug)
+
+
 def _check_slug(slug: str) -> None:
     try:
         identity.check_slug(slug)
@@ -140,6 +172,13 @@ def _read_agent(main: ServiceConfig, path: Path, slug: str) -> ServiceConfig:
         raise ConfigError(f"{path}: unknown settings: {', '.join(map(repr, unknown))}")
     agent = _table(path, data, "agent")
     proxy = _table(path, data, "proxy")
+    budget = _table(path, data, "budget")
+    unknown = sorted(set(budget) - _OWN_CAPS)
+    if unknown:
+        raise ConfigError(
+            f"{path}: unknown [budget] settings: {', '.join(map(repr, unknown))}: an agent's file "
+            "only sets its own caps (daily_usd, monthly_usd), and the rest is the machine's"
+        )
     unknown = sorted(set(proxy) - _PROXY_LIMITS)
     if unknown:
         raise ConfigError(
@@ -190,6 +229,8 @@ def _read_agent(main: ServiceConfig, path: Path, slug: str) -> ServiceConfig:
         workspace_limit=data.get("workspace_limit"),
         agent=agent,
         proxy={**machine_proxy, **proxy},
+        budget={**main.budget, **budget},
+        own_caps=tuple(sorted(budget)),
         gateway_token=token,
         struck_token=struck,
         provider_keys=keys,

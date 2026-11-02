@@ -63,6 +63,7 @@ Two commands, `verificar` and `web`, only read files, so you can also try them o
 | Option | Default | Meaning |
 |---|---|---|
 | `--config FILE` | `/etc/backtide/backtide.toml` | The config file. Every command has it except `verificar`. In the development VM the file is `~/backtide-demo-run/backtide.toml`, written by `make demo` and `make probar`. |
+| `--agente NAME` | `principal` | Which agent the command is about, on a machine with [several agents](configuration.md#several-agents). `instantaneas`, `rebobinar`, `seguir`, `retenidas`, `aprobar`, `rechazar`, `gasto`, `tope`, `entrar`, `tarea`, `importar` and `exportar` have it. It takes an agent's name and nothing else: a path is a usage error, and a name the service does not have is refused with nothing done. With one agent you never need it. |
 
 ### Exit codes
 
@@ -179,7 +180,7 @@ When the chain is broken it prints one `MANIPULADO:` ("tampered") line per probl
 Lists the snapshots of the agent's workspace, newest first. It works without a running service.
 
 ```sh
-backtide instantaneas [--config FILE] [--todas]
+backtide instantaneas [--config FILE] [--agente NAME] [--todas]
 ```
 
 | Flag | Default | Effect |
@@ -215,7 +216,7 @@ With none: `No hay instantáneas todavía.` Exit codes: `0` listed; `2` the conf
 Sets the agent's workspace back to a snapshot. A rewind replaces the working folder and what the agent remembers in it. It cannot take back anything that already left the machine (an email sent, a payment).
 
 ```sh
-backtide rebobinar ID [--config FILE] [--si]
+backtide rebobinar ID [--config FILE] [--agente NAME] [--si]
 ```
 
 | Argument | Meaning |
@@ -248,7 +249,7 @@ backtide rebobinar 20261023T115553.000000Z-periodic --config ~/backtide-demo-run
 Resumes an agent that backtide paused because it was running out of disk space (or could not record). The service refuses while the problem still stands. Pausing needs no command of its own on the terminal: the service pauses the agent automatically, and Telegram has `/pausar`.
 
 ```sh
-backtide seguir [--config FILE]
+backtide seguir [--config FILE] [--agente NAME]
 ```
 
 - Needs a running service. Without one it says there is nothing to resume (exit 1). If a pause by space was open when the service stopped, the agent stays stopped on the next start until you run `seguir`.
@@ -263,7 +264,7 @@ The gate holds back requests that write or send something to the outside: a mess
 Lists the held requests, oldest first.
 
 ```sh
-backtide retenidas [--config FILE]
+backtide retenidas [--config FILE] [--agente NAME]
 ```
 
 One block per request (the sample below is illustrative): the id (`h-` and 12 hex characters), the risk (0 to 3), the method and the target, the time left, and whether the agent is still waiting. A second line says what the request would do, when a translator understood it. The text of the target is cut to 160 characters, redacted, and escaped.
@@ -275,16 +276,17 @@ h-3f9a1c0b7d2e  riesgo 2  POST gmail.googleapis.com/…  (caduca en 4 min 12 s; 
 Apruébalas con `backtide aprobar <id>` o recházalas con `backtide rechazar <id>`. Sin respuesta, se rechazan solas a los 5 minutos.
 ```
 
-With none: `No hay ninguna petición retenida esperando.` Exit codes: `0` listed; `1` no service; `2` error.
+With none: `No hay ninguna petición retenida esperando.` With several agents and no `--agente` it lists every agent's, each under `Agente <name>:`, so that no hold ends rejected for going unseen. Exit codes: `0` listed; `1` no service, or an agent could not be asked; `2` error.
 
 ### `backtide aprobar` and `backtide rechazar`
 
 ```sh
-backtide aprobar ID [--config FILE]
-backtide rechazar ID [--config FILE]
+backtide aprobar ID [--config FILE] [--agente NAME]
+backtide rechazar ID [--config FILE] [--agente NAME]
 ```
 
 - `ID` is the `h-…` id from `retenidas` or from the notice. Anything else is exit 2.
+- A hold belongs to one agent's gate. Without `--agente` the command is about the main agent, whose gate does not know a neighbour's hold (exit 1, nothing released).
 - **Approve lets that one request out, once.** If the agent was still waiting, it goes out now. If it had given up, the same request is let through once if it repeats it within 10 minutes.
 - **Reject** stops the request. The same request is refused again without asking for 10 minutes.
 - The decision is written to the black box (`gate/approved` or a rejection) with who made it.
@@ -305,7 +307,7 @@ All four ask the running service first. The service records the request in the b
 Opens Claude Code in your terminal, inside the agent's container, as the agent's user and in its working folder (`/workspace/work`). Everything it does is recorded and can be rewound. Claude Code only, for now (see above).
 
 ```sh
-backtide entrar [--config FILE] [--continue]
+backtide entrar [--config FILE] [--agente NAME] [--continue]
 ```
 
 | Flag | Effect |
@@ -319,7 +321,7 @@ What Claude Code prints goes through a filter on its way to your terminal, so th
 Gives the agent one task without opening an interactive session, and prints its answer. With Claude Code it runs `claude -p`. With OpenClaw it is one message to its main conversation, through `openclaw agent`, and prints the reply. Whatever the agent writes is printed with its control characters made visible, so it cannot move the cursor, rewrite your screen or reach your clipboard. The black box records the task before it starts, with the first 200 characters of what you asked (anything that looks like a secret struck out first).
 
 ```sh
-backtide tarea "TASK TEXT" [--config FILE] [--continue] [--minutos N]
+backtide tarea "TASK TEXT" [--config FILE] [--agente NAME] [--continue] [--minutos N]
 ```
 
 | Argument / flag | Default | Effect |
@@ -341,7 +343,7 @@ backtide tarea "List the files in this folder and say what the project does" --c
 Copies a folder from your computer into the agent's workspace, at `/workspace/work/<name>`.
 
 ```sh
-backtide importar FOLDER [--config FILE] [--nombre NAME] [--reemplazar] [--incluir-secretos]
+backtide importar FOLDER [--config FILE] [--agente NAME] [--nombre NAME] [--reemplazar] [--incluir-secretos]
 ```
 
 | Argument / flag | Default | Effect |
@@ -365,7 +367,7 @@ Prints `Importado <folder> en <target>: N archivos y M carpetas (B bytes).` Exit
 Copies the agent's work out to a **new** folder on your computer. The service first takes a snapshot, then copies from the snapshot, so the copy is consistent.
 
 ```sh
-backtide exportar DEST [--config FILE] [--git FOLDER] [--incluir-config]
+backtide exportar DEST [--config FILE] [--agente NAME] [--git FOLDER] [--incluir-config]
 ```
 
 | Argument / flag | Default | Effect |
@@ -394,7 +396,7 @@ backtide prices every model response from the provider's own usage report, count
 Shows what the agent has spent on model calls today and this month, against the caps.
 
 ```sh
-backtide gasto [--config FILE]
+backtide gasto [--config FILE] [--agente NAME]
 ```
 
 ```text
@@ -403,20 +405,21 @@ Gasto este mes: 0,25 $ de 50,00 $.
 Precios de fábrica del 2026-10-06.
 ```
 
-The last line says whether the price table is the one that ships with backtide ("de fábrica") or was updated from the provider's page (`Precios actualizados el <date> (fuente: Anthropic).`). If a cap is reached, a line says `Tope de hoy alcanzado: las llamadas al modelo se rechazan.` (or "de este mes") and the command adds how to change it. Amounts use a decimal comma. Exit codes: `0` shown; `1` no service, or it cannot count right now (then model calls are refused); `2` error.
+The last line says whether the price table is the one that ships with backtide ("de fábrica") or was updated from the provider's page (`Precios actualizados el <date> (fuente: Anthropic).`). If a cap is reached, a line says `Tope de hoy alcanzado: las llamadas al modelo se rechazan.` (or "de este mes") and the command adds how to change it. Amounts use a decimal comma. With several agents it also says the total of the whole installation and each agent's part. Exit codes: `0` shown; `1` no service, or it cannot count right now (then model calls are refused); `2` error.
 
 ### `backtide tope`
 
 Shows or changes the daily and monthly caps.
 
 ```sh
-backtide tope [--config FILE] [--dia DOLLARS] [--mes DOLLARS]
+backtide tope [--config FILE] [--agente NAME] [--dia DOLLARS] [--mes DOLLARS]
 ```
 
 - Without options it prints `Tope diario: 5,00 $` and `Tope mensual: 50,00 $`.
 - `--dia` and/or `--mes` set new caps in dollars. An amount is greater than 0, has at most two decimals, is at most 100000, and is at most 12 characters. A comma or a dot both work (`7`, `7.5`, `7,50`).
 - The change goes through the service by the same path as the Settings page. It is written to the black box **before** anything changes, and it applies to the next model call. If it lifts the cap above what was spent, calls go through again at once.
 - A cap set this way is stored in the state folder (`budget.json`) and **wins over `[budget]` in the config file** from then on.
+- With several agents, without `--agente` this is the cap of the whole installation, and with it the agent's own. See [spending with several agents](configuration.md#several-agents).
 - Exit codes: `0` shown or changed; `1` no service, or not saved; `2` the amount is not valid, or another error; `3` cannot tell whether it was saved.
 
 ```sh

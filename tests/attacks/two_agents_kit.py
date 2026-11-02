@@ -12,6 +12,7 @@ in, and the tests never ran under the unit. So the service here is the real one:
   agent. For another agent nothing does it yet (T26-6a creates them).
 - ``--grupo-web`` with a group that has no account: the case where the narrow socket has only the
   group and its forbidden ids to go by.
+- ``cli``: `backtide` itself, as the owner runs it (T26-2c).
 
 It is not an installation (install.sh never runs in vigia-dev, and the clean VM is someone else's):
 Python and the code come from the dev environment, bind-mounted where ``ProtectHome`` leaves them.
@@ -144,6 +145,15 @@ class Lab:
 
     def verify(self, agent: Agent) -> dict[str, Any]:
         return self.helper("verify", str(agent.box))
+
+    def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """The real `backtide`, as root, on this lab's config."""
+        return sudo(str(BIN / "backtide"), *args, "--config", str(CONFIG), check=False, timeout=180)
+
+    def network_cut(self) -> bool:
+        """What a container sends stops at the VM: the lab's key, made up, reaches nobody."""
+        listed = sudo("nft", "list", "table", "inet", NFT_TABLE, check=False)
+        return listed.returncode == 0 and "drop" in listed.stdout
 
     # The service
 

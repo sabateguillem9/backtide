@@ -15,10 +15,10 @@ from pathlib import Path
 
 from backtide import __version__, shell_cli
 from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, load_key, redact
-from backtide.jail import ExposedJail, JailError
+from backtide.jail import ExposedJail, JailError, identity
 from backtide.jail.profile import ProfileError
 from backtide.jail.profiles import DEFAULT_PROFILE
-from backtide.service.agents import load_installation
+from backtide.service.agents import load_agent, load_installation
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import (
     OUTCOME_EXIT_CODES,
@@ -29,6 +29,7 @@ from backtide.service.control import (
     ask_passkeys,
     ask_rewind,
     ask_set_password,
+    ask_snapshots,
     ask_web_end_all,
     ask_web_link,
 )
@@ -117,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
         "el servicio esté en marcha.",
     )
     _add_config(listing)
+    _add_agent(listing)
     listing.add_argument(
         "--todas",
         action="store_true",
@@ -137,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
         "uso o de lectura y 3 si se rebobinó pero con un problema (o no se sabe).",
     )
     _add_config(rewind)
+    _add_agent(rewind)
     rewind.add_argument("snapshot", metavar="instantánea", help="identificador de la instantánea")
     rewind.add_argument("--si", action="store_true", help="no pedir confirmación")
     rewind.set_defaults(handler=_rewind)
@@ -150,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         "hay un error de uso y 3 si no se sabe o se reanudó con un problema.",
     )
     _add_config(resume)
+    _add_agent(resume)
     resume.set_defaults(handler=_resume)
     _add_holds(commands)
     _add_spending(commands)
@@ -174,6 +178,7 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "terminó con error y 2 si hay un error de uso (por ejemplo, un agente sin sesión).",
     )
     _add_config(enter)
+    _add_agent(enter)
     enter.add_argument(
         "--continue",
         dest="resume",
@@ -194,6 +199,7 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "Ctrl-C o falló docker: la tarea puede seguir dentro).",
     )
     _add_config(task)
+    _add_agent(task)
     task.add_argument("prompt", metavar="tarea", help="lo que le pides, entre comillas")
     task.add_argument(
         "--continue",
@@ -223,6 +229,7 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "se importó, 1 si no se pudo, 2 si hay un error de uso y 3 si quedó a medias.",
     )
     _add_config(bring)
+    _add_agent(bring)
     bring.add_argument("source", metavar="carpeta", help="la carpeta del anfitrión")
     bring.add_argument("--nombre", help="nombre de la carpeta en el agente (por defecto, el mismo)")
     bring.add_argument(
@@ -255,6 +262,7 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "exportó, 1 si no se pudo, 2 si hay un error de uso y 3 si no se sabe.",
     )
     _add_config(take)
+    _add_agent(take)
     take.add_argument("destination", metavar="ruta", help="carpeta (o bundle) nueva donde copiarla")
     take.add_argument(
         "--git",
@@ -273,15 +281,49 @@ def _add_shell(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
     take.set_defaults(handler=_export)
 
 
-def _main_of(path: Path) -> ServiceConfig:
-    """The main agent's config: every order of the CLI is about it until T26-2c. A file of another
-    agent that cannot be used is an error here too: nothing of an installation is half read."""
-    return load_installation(path).main
+def _whole_config(args: argparse.Namespace) -> ServiceConfig:
+    """The config of the agent an order is about (`--agente`; the main one without it), having read
+    them all: a file of another agent that cannot be used is an error here too, because nothing of
+    an installation that starts or lets something out is half read. Only what stops, undoes or
+    just looks gets by without them: ``_own_config`` and ``_machine_config``."""
+    return load_installation(args.config).agent(getattr(args, "agente", None))
+
+
+def _say_if_a_file_is_broken(path: Path) -> None:
+    """What stops or undoes goes on with a neighbour's file broken (T26-2c), but it is said."""
+    try:
+        load_installation(path)
+    except ConfigError as error:
+        print(
+            f"AVISO: {_printable(redact(str(error)))}. Esto sigue porque no lo necesita, pero el "
+            "servicio no volverá a arrancar hasta que lo arregles.",
+            file=sys.stderr,
+        )
+
+
+def _own_config(args: argparse.Namespace) -> ServiceConfig:
+    """The config of this agent alone: another's broken file stops nothing. Raises ConfigError if
+    its own, or the machine's, cannot be used."""
+    config = load_agent(args.config, args.agente)
+    _say_if_a_file_is_broken(args.config)
+    return config
+
+
+def _machine_config(args: argparse.Namespace) -> ServiceConfig | None:
+    """For what only talks to the service: the lock and the socket are the machine's, so it needs
+    no agent's file, not even that of the agent it is about."""
+    try:
+        config = ServiceConfig.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return None
+    _say_if_a_file_is_broken(args.config)
+    return config
 
 
 def _shell_config(args: argparse.Namespace) -> ServiceConfig | None:
     try:
-        return _main_of(args.config)
+        return _whole_config(args)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return None
@@ -332,6 +374,7 @@ def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "hay un error.",
     )
     _add_config(listing)
+    _add_agent(listing)
     listing.set_defaults(handler=_list_holds)
     for name, verdict, says in (
         ("aprobar", "approve", "deja salir una petición retenida, una sola vez"),
@@ -346,6 +389,7 @@ def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") 
             "reinicio), 2 si hay un error de uso y 3 si no se sabe.",
         )
         _add_config(command)
+        _add_agent(command)
         command.add_argument("hold", metavar="id", help="identificador de la petición (h-…)")
         command.set_defaults(handler=_decide_hold, verdict=verdict)
 
@@ -360,6 +404,7 @@ def _add_spending(commands: "argparse._SubParsersAction[argparse.ArgumentParser]
         "Sale con 0 si lo dice, 1 si no hay servicio o no puede contar, 2 si hay un error.",
     )
     _add_config(spent)
+    _add_agent(spent)
     spent.set_defaults(handler=_spending)
     caps = commands.add_parser(
         "tope",
@@ -371,6 +416,7 @@ def _add_spending(commands: "argparse._SubParsersAction[argparse.ArgumentParser]
         "no se guardó, 2 si el importe no vale o hay un error y 3 si no se sabe.",
     )
     _add_config(caps)
+    _add_agent(caps)
     caps.add_argument("--dia", dest="day", metavar="N", help="nuevo tope diario, en dólares")
     caps.add_argument("--mes", dest="month", metavar="N", help="nuevo tope mensual, en dólares")
     caps.set_defaults(handler=_caps)
@@ -731,6 +777,31 @@ def _add_config(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _agent_name(text: str) -> str:
+    """What `--agente` takes: a slug, never a path. The service says whether it has one."""
+    if text == identity.MAIN_SLUG:
+        return text
+    try:
+        return identity.check_slug(text)
+    except identity.SlugError as error:
+        raise argparse.ArgumentTypeError(f"no es el nombre de un agente: {error}") from None
+
+
+def _about(args: argparse.Namespace) -> dict[str, str]:
+    """What an order says of `--agente`. Without it, nothing: the order is what it always was."""
+    return {} if args.agente is None else {"agent": args.agente}
+
+
+def _add_agent(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--agente",
+        type=_agent_name,
+        default=None,
+        metavar="NOMBRE",
+        help=f"el agente de quien se trata, si hay varios (por defecto {identity.MAIN_SLUG})",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -861,7 +932,7 @@ def _watch(args: argparse.Namespace) -> int:
 
 def _list_snapshots(args: argparse.Namespace) -> int:
     try:
-        config = _main_of(args.config)
+        config = _own_config(args)
         snapshots = SnapshotStore(config.volume).snapshots()
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
@@ -891,11 +962,14 @@ def _rewind(args: argparse.Namespace) -> int:
         )
         return EXIT_ERROR
     try:
-        config = _main_of(args.config)
-        known = SnapshotStore(config.volume).snapshots()
+        config = _own_config(args)
     except ConfigError as error:
-        _error(f"configuración no válida: {error}")
-        return EXIT_ERROR
+        if args.agente in (None, identity.MAIN_SLUG):
+            _error(f"configuración no válida: {error}")
+            return EXIT_ERROR
+        return _rewind_with_a_broken_file(args, target, error)
+    try:
+        known = SnapshotStore(config.volume).snapshots()
     except SnapshotError as error:
         _error(f"no se pueden leer las instantáneas: {error}")
         return EXIT_ERROR
@@ -904,72 +978,117 @@ def _rewind(args: argparse.Namespace) -> int:
         return EXIT_ERROR
 
     lines = config.agent_profile.rewind_notice_lines
-    print(_rewind_notice(target, now=_now(), tz=_local_tz(), agent_lines=lines))
-    if not args.si:
-        confirmed = _confirm()
-        if confirmed is None:
-            _error("sin terminal no se puede preguntar: usa --si para confirmar")
-            return EXIT_ERROR
-        if not confirmed:
-            print("No se ha hecho nada.")
-            return EXIT_FAILED
+    refused = _rewind_refused(args, target, lines)
+    if refused is not None:
+        return refused
 
     try:
         lock = take_lock(config.lock_file)
     except ServiceRunning:
-        return _rewind_through_service(config, target)
+        return _rewind_through_service(config, target, args.agente)
     except ServiceLocked as error:  # the lock file itself is unusable: not "a service"
         _error(str(error))
         return EXIT_ERROR
     with lock:
-        return _rewind_in_process(config, target)
+        return _rewind_in_process(config, target, args.agente)
+
+
+def _rewind_refused(args: argparse.Namespace, target: Snapshot, lines: Sequence[str]) -> int | None:
+    """The notice and the question: None to go on, or the exit code, with nothing done."""
+    print(_rewind_notice(target, now=_now(), tz=_local_tz(), agent_lines=lines))
+    if args.si:
+        return None
+    confirmed = _confirm()
+    if confirmed is None:
+        _error("sin terminal no se puede preguntar: usa --si para confirmar")
+        return EXIT_ERROR
+    if not confirmed:
+        print("No se ha hecho nada.")
+        return EXIT_FAILED
+    return None
+
+
+def _rewind_with_a_broken_file(
+    args: argparse.Namespace, target: Snapshot, broken: ConfigError
+) -> int:
+    """The file of the very agent to rewind cannot be read, and the agent may be running with what
+    it read when it started: the running service has all it takes (T26-2c). With no service this
+    process would need the file, so it is refused."""
+    try:
+        machine = ServiceConfig.from_file(args.config)
+    except ConfigError as error:
+        _error(f"configuración no válida: {error}")
+        return EXIT_ERROR
+    try:
+        take_lock(machine.lock_file).close()
+    except ServiceRunning:
+        pass
+    except ServiceLocked as error:
+        _error(str(error))
+        return EXIT_ERROR
+    else:
+        _error(f"configuración no válida: {broken}")
+        _error("Sin un servicio en marcha hace falta el archivo de ese agente para rebobinar.")
+        return EXIT_ERROR
+    print(f"AVISO: {_printable(redact(str(broken)))}. Se lo pido al servicio en marcha.",
+          file=sys.stderr)  # fmt: skip
+    try:
+        known = ask_snapshots(machine.control_socket, server_uid=None, agent=args.agente)
+    except ControlError as error:
+        _error(str(error))
+        return EXIT_ERROR
+    if target not in known:
+        _error(f"no existe la instantánea {target.id}: mira `backtide instantaneas`")
+        return EXIT_ERROR
+    refused = _rewind_refused(args, target, ())
+    if refused is not None:
+        return refused
+    return _rewind_through_service(machine, target, args.agente)
 
 
 def _resume(args: argparse.Namespace) -> int:
     """`backtide seguir`: everything but reading the config is in backtide/service/seguir.py."""
-    try:
-        config = _main_of(args.config)
-    except ConfigError as error:
-        _error(f"configuración no válida: {error}")
-        return EXIT_ERROR
-    return seguir(config)
+    config = _machine_config(args)
+    return EXIT_ERROR if config is None else seguir(config, **_about(args))
 
 
 def _list_holds(args: argparse.Namespace) -> int:
     """`backtide retenidas`: everything but reading the config is in service/retenidas.py."""
-    try:
-        config = _main_of(args.config)
-    except ConfigError as error:
-        _error(f"configuración no válida: {error}")
-        return EXIT_ERROR
-    return list_holds(config)
+    config = _machine_config(args)
+    return EXIT_ERROR if config is None else list_holds(config, **_about(args))
 
 
 def _decide_hold(args: argparse.Namespace) -> int:
-    """`backtide aprobar` and `backtide rechazar`."""
-    try:
-        config = _main_of(args.config)
-    except ConfigError as error:
-        _error(f"configuración no válida: {error}")
-        return EXIT_ERROR
-    return decide_hold(config, args.hold, args.verdict)
+    """`backtide aprobar` and `backtide rechazar`. Rejecting stops something, so a broken file of
+    an agent never gets in its way; approving lets something out, and reads them all."""
+    if args.verdict == "reject":
+        config = _machine_config(args)
+    else:
+        config = _load_config(args)
+    return (
+        EXIT_ERROR
+        if config is None
+        else decide_hold(config, args.hold, args.verdict, **_about(args))
+    )
 
 
 def _spending(args: argparse.Namespace) -> int:
     """`backtide gasto`: everything but reading the config is in service/gasto.py."""
-    config = _load_config(args)
-    return EXIT_ERROR if config is None else spending(config)
+    config = _machine_config(args)
+    return EXIT_ERROR if config is None else spending(config, **_about(args))
 
 
 def _caps(args: argparse.Namespace) -> int:
     """`backtide tope`."""
     config = _load_config(args)
-    return EXIT_ERROR if config is None else spending_caps(config, args.day, args.month)
+    if config is None:
+        return EXIT_ERROR
+    return spending_caps(config, args.day, args.month, **_about(args))
 
 
 def _load_config(args: argparse.Namespace) -> ServiceConfig | None:
     try:
-        return _main_of(args.config)
+        return _whole_config(args)
     except ConfigError as error:
         _error(f"configuración no válida: {error}")
         return None
@@ -999,10 +1118,14 @@ def _confirm() -> bool | None:
     return answer.strip().lower() in YES_ANSWERS
 
 
-def _rewind_through_service(config: ServiceConfig, target: Snapshot) -> int:
+def _rewind_through_service(
+    config: ServiceConfig, target: Snapshot, agent: str | None = None
+) -> int:
     print("Hay un servicio de backtide en marcha: se lo pido por el socket de control.")
     try:
-        reply = ask_rewind(config.control_socket, target.id)
+        reply = ask_rewind(
+            config.control_socket, target.id, **({} if agent is None else {"agent": agent})
+        )
     except ControlUnavailable:
         _error(
             "hay un servicio de backtide que tiene el cerrojo, pero no contesta en el socket de "
@@ -1032,10 +1155,11 @@ def _rewind_through_service(config: ServiceConfig, target: Snapshot) -> int:
             if reply["agent_started"]
             else "El agente no se ha arrancado."
         ),
+        agent=agent,
     )
 
 
-def _rewind_in_process(config: ServiceConfig, target: Snapshot) -> int:
+def _rewind_in_process(config: ServiceConfig, target: Snapshot, agent: str | None = None) -> int:
     print("No hay un servicio en marcha: rebobino aquí y el agente se queda parado.")
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(_SafeFormatter("%(levelname)s %(name)s: %(message)s"))
@@ -1072,10 +1196,13 @@ def _rewind_in_process(config: ServiceConfig, target: Snapshot) -> int:
         outcome.message,
         outcome.undo,
         agent_line="El agente queda parado: arráncalo con `backtide vigilar`.",
+        agent=agent,
     )
 
 
-def _report_rewind(outcome: str, message: str, undo: str | None, *, agent_line: str) -> int:
+def _report_rewind(
+    outcome: str, message: str, undo: str | None, *, agent_line: str, agent: str | None = None
+) -> int:
     """Print what the rewind did and return the exit code. Everything here may come from the
     service or the agent's world: it is redacted and its control characters escaped."""
     code = OUTCOME_EXIT_CODES[outcome]
@@ -1088,7 +1215,8 @@ def _report_rewind(outcome: str, message: str, undo: str | None, *, agent_line: 
         _error(text)
     if outcome in ("done", "problem"):
         if undo is not None and Snapshot.parse(undo) is not None:
-            print(f"Para deshacer: backtide rebobinar {undo}")
+            whose = "" if agent is None else f" --agente {agent}"
+            print(f"Para deshacer: backtide rebobinar {undo}{whose}")
         elif undo is not None:
             _error("el servicio ha dado un punto para deshacer que no es válido: no se muestra")
         else:

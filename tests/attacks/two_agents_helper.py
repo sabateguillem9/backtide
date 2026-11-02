@@ -14,6 +14,11 @@ program. It runs only what is written here, on the lab's own paths.
     python -m two_agents_helper tamper <db>
     python -m two_agents_helper count <db>
     python -m two_agents_helper decide <control socket> <hold id>
+    python -m two_agents_helper charge <box folder> <micro dollars>
+    python -m two_agents_helper fake <config> <slug>
+    python -m two_agents_helper link <control socket>
+    python -m two_agents_helper task <control socket> <agent> <prompt>
+    python -m two_agents_helper task_status <control socket> <agent or -> <task id>
 """
 
 import json
@@ -27,7 +32,12 @@ from backtide.jail import docker
 from backtide.jail.config import create_env, docker_create_argv
 from backtide.service.agents import load_installation
 from backtide.service.config import STATE_CHECKPOINT, STATE_DB, STATE_KEY, ConfigError
-from backtide.service.control import ask_decide
+from backtide.service.control import (
+    ask_decide,
+    ask_task_start,
+    ask_task_status,
+    ask_web_link,
+)
 from backtide.setup import selftest
 from backtide.snapshots import SnapshotStore, btrfs
 
@@ -135,6 +145,39 @@ def decide(control: str, hold_id: str) -> dict[str, Any]:
     return ask_decide(Path(control), hold_id, "approve", via="cli")
 
 
+def charge(folder: str, micro: str) -> dict[str, Any]:
+    """What an agent has spent, as its black box says: a model call cannot reach a provider here
+    (invariant 8), so the money is written. With the service stopped: the box has one writer. It is
+    the event a call that ended with no answer leaves (docs/33), and the ledger catches up with it
+    when the service starts."""
+    base = Path(folder)
+    with BlackBox(
+        base / STATE_DB, load_key(base / STATE_KEY), checkpoint_path=base / STATE_CHECKPOINT
+    ) as box:
+        details = {"flow_id": "lab", "why": "lab", "cost": {"usd_micro": int(micro)}}
+        event = box.append("system", "budget_charged", "", details=details, risk=1)
+    return {"seq": event.seq}
+
+
+def fake(config: str, slug: str) -> dict[str, str]:
+    """An agent's fake key: what is in its jail. No secret of anybody's."""
+    agent = load_installation(Path(config)).agent(slug)
+    return {"fake": agent.provider_keys["anthropic"].fake}
+
+
+def link(control: str) -> dict[str, str]:
+    return {"token": ask_web_link(Path(control))}
+
+
+def task(control: str, agent: str, prompt: str) -> dict[str, Any]:
+    return ask_task_start(Path(control), prompt, seconds=30, agent=agent)
+
+
+def task_status(control: str, agent: str, task_id: str) -> dict[str, Any]:
+    named = {} if agent == "-" else {"agent": agent}
+    return ask_task_status(Path(control), task_id, **named)
+
+
 ORDERS = {
     "events": events,
     "verify": verify,
@@ -146,6 +189,11 @@ ORDERS = {
     "tamper": tamper,
     "count": count,
     "decide": decide,
+    "charge": charge,
+    "fake": fake,
+    "link": link,
+    "task": task,
+    "task_status": task_status,
 }
 
 if __name__ == "__main__":
