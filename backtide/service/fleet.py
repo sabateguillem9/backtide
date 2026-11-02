@@ -479,6 +479,7 @@ class Fleet:
                 f"Agente nuevo: {spec.slug}",
                 f"Se ha creado el agente {spec.slug} ({spec.profile}). Si no has sido tú, páralo "
                 "con `sudo backtide agentes parar`.",
+                agent=spec.slug,
             )
         )
         if self._neighbours is None:

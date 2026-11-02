@@ -289,6 +289,7 @@ def record_agent_failed(
             AlertLevel.ERROR,
             f"El agente {slug} no se está vigilando",
             f"No ha arrancado o ha dejado de vigilarse, y los demás siguen. Causa: {text}",
+            agent=slug,
         )
     )
 
@@ -319,6 +320,7 @@ def _record_in_installation(
                 "La caja de la instalación no se puede usar",
                 "Cada agente sigue grabándose en su propia caja negra. Mira "
                 f"{config.installation_dir}: {error}",
+                installation=True,
             )
         )
         return False
@@ -1224,7 +1226,9 @@ class _Neighbours:
                 Alert(
                     AlertLevel.ERROR,
                     f"El agente {slug} sigue en marcha sin vigilancia",
-                    f"No se ha podido parar: {text}",
+                    f"No se ha podido parar: {text}. Para intentarlo otra vez: "
+                    f"`sudo backtide agentes parar {slug}`.",
+                    agent=slug,
                 )
             )
             return False
@@ -1239,6 +1243,7 @@ class _Neighbours:
                     f"El agente {slug} corría sin vigilancia",
                     "Lo que corría sin grabarse se ha parado. Mira su caja negra antes de "
                     "arrancarlo.",
+                    agent=slug,
                 )
             )
         return True

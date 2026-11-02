@@ -4299,13 +4299,24 @@ class Guardian:
                     " No ha quedado en la caja negra, así que no se ha quitado."
                 )
             body += not_recorded.get(action, " No ha quedado en la caja negra.")
-        self._alert(AlertLevel.ERROR, title, body, event)
+        self._alert(AlertLevel.ERROR, title, body, event, installation=True)  # a session is for all
         return event is not None
 
-    def _alert(self, level: AlertLevel, title: str, body: str, event: Event | None = None) -> None:
+    def _alert(
+        self,
+        level: AlertLevel,
+        title: str,
+        body: str,
+        event: Event | None = None,
+        *,
+        installation: bool = False,
+    ) -> None:
         """The one door alerts go through: title and body are redacted here, whatever put the
         text together (invariant 5), and the event is cited."""
-        self._alerts.submit(Alert(level, redact(title), redact(body), event.seq if event else None))
+        seq = event.seq if event else None
+        self._alerts.submit(
+            Alert(level, redact(title), redact(body), seq, installation=installation)
+        )
 
     def _due(self, key: str, every: float) -> bool:
         """True at most once per ``every`` seconds for ``key``; calling it counts as using it."""

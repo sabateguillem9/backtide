@@ -41,6 +41,8 @@ which the service made. With one agent there is no table and nothing here change
   a button per agent and one for all of them. What only reads (`/estado`, `/retenidas`, `/lotes`)
   shows them all, each under its name, as `backtide retenidas` does.
 - Every message says whose it is. The slugs are the service's, and go through ``inert`` anyway.
+- An alert about the whole installation is nobody's: no name and no button that would freeze one
+  of them at random. `/pausar` is there for it, and asks.
 """
 
 import logging
@@ -103,7 +105,8 @@ HELP_SEVERAL = (
     "de todos.\n"
     "/lotes [agente]: los lotes de aprobación activos, para revocarlos; sin decir cuál, los de "
     "todos.\n\n"
-    "Cada mensaje dice de qué agente es, y sus botones actúan solo sobre ese. En cada aviso, "
+    "Cada mensaje dice de qué agente es, y sus botones actúan solo sobre ese. Los avisos de toda "
+    "la instalación no llevan botones: /pausar te pregunta a cuál. En cada aviso de un agente, "
     "«Pausar» lo congela y «Rebobinar» devuelve su carpeta a la instantánea de antes del aviso "
     "(antes te enseña qué se deshace y qué no, y te pide confirmación). En cada petición retenida, "
     "«Aprobar» la deja salir una vez, «Rechazar» la para y «Ver» te enseña lo que guarda la caja "
@@ -221,8 +224,8 @@ def _message_id(result: Any) -> int | None:
 class TelegramNotifier:
     """A ``Notifier``: each alert is one message to the founder's chat, with "Pausar" and,
     when there is a snapshot from before its event, "Rebobinar", both about the agent the alert is
-    about (``agents``: the table of them, with several). Raises on failure (the alert queue logs
-    it)."""
+    about (``agents``: the table of them, with several; an alert that is nobody's on it, like one
+    about the whole installation, has none). Raises on failure (the alert queue logs it)."""
 
     def __init__(
         self,

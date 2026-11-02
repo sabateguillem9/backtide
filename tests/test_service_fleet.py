@@ -489,6 +489,7 @@ def test_create_leaves_a_real_agent_with_its_volume_channel_file_and_networks(wo
     assert [c[0] for c in world.neighbours.calls] == ["protect", "add", "start", "wait"]
     alert = world.told.alerts[-1]
     assert alert.level is AlertLevel.ERROR and "tercero" in alert.title
+    assert alert.agent == "tercero"
 
 
 def test_a_route_of_the_machine_keeps_its_subnet_out_and_blind_nothing_is_made(
@@ -1010,7 +1011,8 @@ def test_one_marked_stopped_but_alive_is_stopped_at_the_start_and_told(
         (event,) = box.events(action="agent_stop")
     assert event.target == "bueno" and event.risk == 2
     assert event.details["reason"] == "unsupervised"
-    assert any("sin vigilancia" in alert.title for alert in found._told.alerts)
+    (alert,) = [a for a in found._told.alerts if "sin vigilancia" in a.title]
+    assert alert.agent == "bueno"
     stop.set()
     found.join(10)
 
@@ -1026,7 +1028,9 @@ def test_one_that_could_not_be_stopped_is_the_worst_and_it_is_said(
     with open_installation_box(three[0]) as box:
         (event,) = box.events(action="agent_stop_failed")
     assert event.risk == 3 and "docker no contesta" in event.details["error"]
-    assert any("sigue en marcha" in alert.title for alert in found._told.alerts)
+    (alert,) = [a for a in found._told.alerts if "sigue en marcha" in a.title]
+    assert alert.agent == "bueno"
+    assert "`sudo backtide agentes parar bueno`" in alert.body
     stop.set()
 
 

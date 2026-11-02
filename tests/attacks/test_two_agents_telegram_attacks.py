@@ -19,8 +19,9 @@ from collections.abc import Iterator
 import pytest
 from attack_kit import CONTAINER_WORK, Attack, scenario
 from test_two_agents_attacks import SEEN_TIMEOUT, _hold, said_in
-from two_agents_kit import MAIN, OTHER, SLUG, Agent, Lab, open_lab, sh, wait
+from two_agents_kit import MAIN, OTHER, SLUG, STATE, Agent, Lab, open_lab, sh, sudo, wait
 
+from backtide.service.config import STATE_INSTALLATION, STATE_KEY
 from tests.telegram_fake import OWNER, TOKEN, Call, FakeBotApi, buttons
 
 REWIND_TIMEOUT = 180.0
@@ -194,6 +195,28 @@ def test_a_button_acts_on_its_agent_and_on_no_other(
     seen = lab.in_agent(OTHER, f"ls {kept}/f1 {kept}/f{WRECKED}")
     requested = lab.events(OTHER, "rewind_requested")[-1]
     same_main = sh("docker", "inspect", "--format", "{{.Id}}", MAIN.container).stdout.strip()
+
+    # What the service says through the main agent's queue. The neighbour fails to start (a tmpfs
+    # where its volume goes, as in `volumen-sin-montar`): that alert is the neighbour's, and its
+    # "Pausar" must not freeze the main agent.
+    assert lab.cli("agentes", "parar", SLUG).returncode == 0
+    lab.agents = [MAIN]
+    sudo("umount", str(OTHER.volume))
+    sudo("mount", "-t", "tmpfs", "tmpfs", str(OTHER.volume))
+    asked_at = time.monotonic()
+    assert lab.cli("agentes", "arrancar", SLUG).returncode != 0
+    failed = said_after(fake, f"El agente {SLUG} no se está vigilando", asked_at, 60)
+    press_at = press(fake, failed, "Pausar")
+    not_watched = said_after(fake, "no se está vigilando ahora mismo", press_at)
+    main_not_frozen = not paused(MAIN) and lab.running(MAIN)
+    # And what is about the whole installation names nobody and offers nothing to press: with its
+    # key gone, its box cannot be written, which an order that records there finds out. What the
+    # log says about it is another alert, as the main agent's: a known limit (docs/47, 6.10).
+    sudo("rm", "-f", str(STATE / STATE_INSTALLATION / STATE_KEY))
+    asked_at = time.monotonic()
+    assert lab.cli("agentes", "arrancar", SLUG).returncode != 0
+    whole = said_after(fake, "La caja de la instalación no se puede usar", asked_at, 60)
+
     attack.check(
         "stopped",
         only_it
@@ -201,10 +224,17 @@ def test_a_button_acts_on_its_agent_and_on_no_other(
         and thawed_only_it
         and frozen.params["text"].startswith(f"Agente {SLUG}:\n")
         and main_id == same_main
-        and len(lab.events(MAIN, "rewind_requested")) == main_rewinds,
+        and len(lab.events(MAIN, "rewind_requested")) == main_rewinds
+        and failed.params["text"].startswith(f"backtide, ALERTA: {SLUG}: El agente {SLUG} ")
+        and not_watched.params["text"].startswith(f"Agente {SLUG}:\n")
+        and main_not_frozen
+        and whole.params["text"].startswith("backtide, ALERTA: La caja de la instalación ")
+        and "reply_markup" not in whole.params,
         f"/pausar {SLUG} congela solo al vecino; con los dos congelados, /seguir sin decir cuál, "
         f"una ruta o un agente inventado no sueltan a ninguno, y /seguir {SLUG} solo lo reanuda a "
-        "él; cada mensaje dice de quién es, y su rebobinado no toca al principal",
+        "él; cada mensaje dice de quién es, y su rebobinado no toca al principal; el aviso de que "
+        f"{SLUG} no se vigila es suyo y su «Pausar» no congela al principal; el de la caja de la "
+        "instalación no nombra a nadie ni lleva botones",
     )
     attack.check(
         "recoverable",

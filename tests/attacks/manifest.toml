@@ -2682,7 +2682,9 @@ decir cuál preguntan o se niegan sin tocar a ninguno. El «Aprobar» del vecino
 lo suyo, con lo del principal todavía abierto. `/pausar revisor` congela solo al vecino; con los dos \
 congelados, `/seguir`, una ruta o un agente inventado no sueltan a ninguno, y `/seguir revisor` solo lo \
 reanuda a él. Un borrado masivo del vecino da un aviso de riesgo máximo que vuelve a llevar «Pausar» y \
-«Rebobinar», y este le devuelve su carpeta sin tocar al principal. Lo rechazado queda como telegram_ignored, sin lo que decía."""
+«Rebobinar», y este le devuelve su carpeta sin tocar al principal. Si el vecino no arranca, ese aviso \
+es suyo y su «Pausar» no congela al principal; y el de la caja de la instalación rota no nombra a nadie ni \
+lleva botones. Lo rechazado queda como telegram_ignored, sin lo que decía."""
 inspired_by = "Tocar «Aprobar» en el móvil y soltar lo de otro agente"
 invariants = [6, 7]
 status = "ready"
