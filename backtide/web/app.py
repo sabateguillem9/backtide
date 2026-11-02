@@ -8,6 +8,13 @@ question box on a page of its own). The main agent's pages keep their old addres
 live under ``/agentes/<slug>/``. The security reasoning is in ``backtide.web.security``; the
 rewind's in ``backtide.web.rewind``.
 
+Which agent (T26-2d): the service says which there are (``backtide.web.live``), and a slug from a
+browser is only ever looked up in that list, so one that is nobody's is the page of "nothing here".
+The rewind and the decisions have one POST path each: their form says which agent (``agente``, none
+for the main one), the page and its confirmation name it when there are several, and the one-time
+ticket is bound to it, so a form for one agent acts on no other. Then it goes to the service as
+``agent``, and the service decides again.
+
 Everything here reads black boxes through ``BoxReader`` (read-only, without the key). The one
 thing it can change is the agent's workspace, and only by asking the service (T12b): a
 confirmation page (GET, the fixed notice and a one-time ticket) and then a POST from it. The
@@ -169,6 +176,7 @@ SNAPSHOT_FALLBACK = 200
 MAX_ACTION_CHARS = 64
 RANGES = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}
 FORM_FIELDS = ("csrf", "id", "ticket")  # the rewind's form: these, once each, and nothing else
+AGENT_FIELD = ("agente",)  # ...and which agent, when it is not the main one (T26-2d)
 # The decisions' form (T10-5): these always; ``confirmo`` ticked for "aprobar y confiar".
 DECIDE_FIELDS = ("csrf", "id", "v", "ticket")
 DECIDE_OPTIONAL = ("confirmo",)
@@ -179,7 +187,7 @@ SETTINGS_FIELDS = ("csrf", "ticket", "tipo", "accion")
 SETTINGS_OPTIONAL = ("valor", "chat", "confirmo", "diario", "mensual", "huella")
 SETTINGS_LIMITS = {"valor": 320, "chat": 32, "diario": 16, "mensual": 16, "huella": 32}
 FROM_THE_BOX = "list"  # the rewind state when the list did not come from the volume
-NOT_MAIN = "agent"  # the rewind state of an agent the service does not run (until T17)
+NOT_WATCHED = "unwatched"  # the rewind state of an agent the service is not watching now
 SUMMARY_TTL = 3.0  # an agent's card is read again at most this often...
 SUMMARY_MAX = 20.0  # ...and at least this often, even when its box has not moved
 PANEL_FEED = 40  # lines in the control room's feed when it loads
@@ -229,6 +237,7 @@ def create_app(
     settings: SettingsClient | None = None,
     approver: Approver | None = None,
     spend: SpendClient | None = None,
+    agents_from: Callable[[], Sequence[AgentSource] | None] | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
     session_recheck: float = SESSION_RECHECK,
@@ -246,10 +255,10 @@ def create_app(
     browser reconnects by itself, so no connection lives forever. ``rewinder`` asks the service
     to rewind (``backtide.web.rewind``); without one the rewind buttons are disabled.
 
-    ``reader`` and ``snapshots`` are the main agent's (the one the service runs), called
-    ``agent_name``; ``others`` are more agents, read the same way and never rewound from here
-    (the demo's today, T17's later). ``pending`` lists the gate's requests waiting for a yes
-    (the demo's today, T10's later): the page shows them, and cannot answer them. ``settings``
+    ``reader`` and ``snapshots`` are the main agent's, called ``agent_name``; ``others`` are more
+    agents, read the same way (the demo's), and ``agents_from`` says which others there are now
+    (``backtide.web.live``; None: it cannot say, the list stays). ``pending`` lists the gate's
+    requests waiting for a yes, in the demo: the page shows them. ``settings``
     asks the service about the keys (T12e, ``backtide.web.settings``); its POST path exists
     only when it is enabled (`backtide web --ajustes`). ``approver`` asks the service about the
     held requests (T10-5, ``backtide.web.approve``): without ``pending`` the page lists the real
@@ -299,6 +308,22 @@ def create_app(
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
     # -- access ----------------------------------------------------------------------------
+
+    def _refresh_roster() -> None:
+        """The list as the service says it now (at most every few seconds: ``LiveAgents``). What
+        cannot be said leaves it as it is: never a page's problem."""
+        if agents_from is None:
+            return
+        try:
+            listed = agents_from()
+            if listed is not None:
+                roster.update(listed)
+        except Exception:  # a list that makes no sense must not take the pages down
+            logger.exception("the list of agents cannot be used")
+
+    async def _roster_now() -> None:
+        if agents_from is not None:
+            await asyncio.to_thread(_refresh_roster)
 
     async def _signed_in(request: Request, *, use: bool = True) -> bool:
         """Is the cookie's session live? Then it is this request's (``request.state.session``)
@@ -356,13 +381,14 @@ def create_app(
         if not await _signed_in(request, use=False):
             raise Unauthorized
 
-    protected = [Depends(require_access)]
-    watching = [Depends(require_watching)]
+    protected = [Depends(require_access), Depends(_roster_now)]
+    watching = [Depends(require_watching), Depends(_roster_now)]
 
     async def require_session(request: Request) -> None:
         """The cookie and nothing else: a change never starts from the link's token."""
         if not await _signed_in(request):
             raise Unauthorized
+        await _roster_now()
 
     def _csrf(request: Request) -> str:
         return request.state.session.csrf
@@ -431,7 +457,7 @@ def create_app(
         return _signed_out()
 
     tickets = Tickets(clock)
-    rewinding = threading.Lock()  # one rewind in flight at a time, whoever asks
+    rewinding: dict[str, threading.Lock] = {}  # one rewind in flight per agent, whoever asks
 
     @app.exception_handler(StartSession)
     async def _start_session(request: Request, started: StartSession) -> Response:
@@ -1015,8 +1041,8 @@ def create_app(
 
     summaries: dict[str, tuple[float, Summary]] = {}
     summary_lock = threading.Lock()  # guards ``summaries`` only, held for a moment
-    agent_locks = {a.slug: threading.Lock() for a in roster}  # one read of an agent at a time
-    watches = {a.slug: Watch(a.reader) for a in roster}
+    agent_locks: dict[str, threading.Lock] = {}  # one read of an agent at a time
+    watches: dict[str, Watch] = {}
     versions = itertools.count(1)
 
     def _summary(agent: Agent) -> Summary:
@@ -1032,7 +1058,7 @@ def create_app(
             cached = summaries.get(agent.slug)
         if fresh_enough(cached, time.monotonic()):
             return cached[1]  # type: ignore[index]
-        with agent_locks[agent.slug]:
+        with agent_locks.setdefault(agent.slug, threading.Lock()):
             moment = time.monotonic()
             with summary_lock:
                 cached = summaries.get(agent.slug)
@@ -1058,7 +1084,7 @@ def create_app(
                     now,
                     zone,
                     cut=len(rows) > ACTIVITY_EVENTS,
-                    watch=watches[agent.slug],
+                    watch=watches.setdefault(agent.slug, Watch(agent.reader)),
                     snapshots=marks,
                 )
             except BoxUnavailable:
@@ -1074,8 +1100,10 @@ def create_app(
         come from ``pending``; the real ones from the service or the black box (T10-5)."""
         now = clock()
         try:
-            listed = list(pending()) if pending is not None else _held(now)
-            return live_requests(listed, roster, now), now, False
+            if pending is not None:
+                return live_requests(list(pending()), roster, now), now, False
+            listed, failed = _held(now)
+            return live_requests(listed, roster, now), now, failed
         except Exception:  # a page, not a 500: the log says why, the page says it is unknown
             logger.exception("the pending requests cannot be listed")
             return [], now, True
@@ -1083,7 +1111,8 @@ def create_app(
     # -- the held requests (T10-5) --------------------------------------------------------
 
     decision_tickets = DecisionTickets(clock)
-    box_cache: dict[str, Any] = {}
+    box_cache: dict[str, Any] = {}  # "partial": what the page says of the list
+    box_rows: dict[str, tuple[int, Sequence[Event]]] = {}  # by agent: a slug may be any word
     box_lock = threading.Lock()
 
     def _approvals() -> Availability:
@@ -1095,32 +1124,61 @@ def create_app(
             logger.exception("cannot tell whether the service can be asked about the holds")
             return Availability.OFF
 
-    def _held(now: datetime) -> list[PendingRequest]:
-        """The main agent's holds: from the service when this web may decide (``--aprobar``),
-        else rebuilt from its black box (read again only when it moved). Raises when neither
-        can be read."""
-        if _approvals() is Availability.READY and approver is not None:
-            raw = approver.holds()
-            box_cache["partial"] = False
-        else:
-            reader = roster.main.reader
-            head = reader.head_seq()
-            with box_lock:
-                cached = box_cache.get("rows")
-                if cached is None or cached[0] != head:
-                    rows = reader.events(newest_first=True, limit=BOX_ROWS)
-                    cached = (head, rows)
-                    box_cache["rows"] = cached
-            raw = box_holds(cached[1], now)
-            box_cache["partial"] = box_partial(cached[1], now)
-        found = [held_request(item, now=now) for item in raw if isinstance(item, dict)]
-        return [request for request in found if request is not None]
+    def _held(now: datetime) -> tuple[list[PendingRequest], bool]:
+        """Every agent's holds, and whether some could not be read: from the service when this web
+        may decide (``--aprobar``), else rebuilt from each black box (read again only when it
+        moved). One agent that cannot say never hides what the others hold. One that is not being
+        watched holds nothing: its proxy is not up, and nobody could answer."""
+        ready = _approvals() is Availability.READY and approver is not None
+        found: list[PendingRequest] = []
+        failed = partial = False
+        for who in roster:
+            if ready and not who.source.watched:
+                continue
+            try:
+                if ready:
+                    raw = approver.holds(**who.order)
+                else:
+                    rows = _box_rows(who)
+                    raw = box_holds(rows, now)
+                    partial = partial or box_partial(rows, now)
+            except Exception:  # the page says the list may be old; the log says why
+                logger.exception("the holds of the agent %s cannot be listed", who.slug)
+                failed = True
+                continue
+            shown = (held_request(item, now=now, agent=who.slug) for item in raw)
+            found += [request for request in shown if request is not None]
+        box_cache["partial"] = partial
+        return found, failed
 
-    def _find_hold(hold_id: str) -> PendingRequest | None:
-        requests, _now, failed = _requests()
-        if failed or not requests:
-            return None
-        return next((r for r in requests if r.id == hold_id), None)
+    def _box_rows(who: Agent) -> Sequence[Event]:
+        """The newest rows of an agent's box, read again only when it moved."""
+        head = who.reader.head_seq()
+        with box_lock:
+            cached = box_rows.get(who.slug)
+            if cached is None or cached[0] != head:
+                cached = (head, who.reader.events(newest_first=True, limit=BOX_ROWS))
+                box_rows[who.slug] = cached
+        return cached[1]
+
+    def _find_hold(who: Agent, hold_id: str) -> PendingRequest | None:
+        requests, _now, _failed = _requests()
+        return next((r for r in requests or () if (r.agent, r.id) == (who.slug, hold_id)), None)
+
+    def _shown(who: Agent) -> Agent | None:
+        """The agent a confirmation names: with only one there is nobody to mix it up with, and
+        the page stays what it always was."""
+        return who if len(roster) > 1 else None
+
+    def _bound(who: Agent, subject: str) -> str:
+        """What a one-time ticket is for: this agent's this. A slug has no colon."""
+        return f"{who.slug}:{subject}"
+
+    def _agent_in(form: dict[str, str]) -> Agent:
+        """The agent a form says (none: the main one). One that is nobody's is "nothing here". The
+        ticket, which is bound to one, and the service, which has its own list, come after."""
+        slug = form.get("agente")
+        return roster.main if slug is None else _agent(slug)
 
     def _cards(requests: Sequence[PendingRequest] | None, now: datetime) -> list[Card]:
         return [card(a, _summary(a), requests or (), now) for a in roster]
@@ -1340,8 +1398,8 @@ def create_app(
             ]
         newest_first = list(reversed(rows))
         shown = newest_first if show_all else newest_first[:LISTED_SNAPSHOTS]
-        if not agent.main:
-            rewind_state = NOT_MAIN  # the service rewinds the agent it runs, and only that one
+        if not agent.source.watched:
+            rewind_state = NOT_WATCHED  # the service would refuse, and this says why first
         else:
             rewind_state = FROM_THE_BOX if from_box else str(_availability())
         return _page(
@@ -1371,12 +1429,13 @@ def create_app(
             logger.exception("cannot tell whether the service can be asked to rewind")
             return Availability.OFF
 
-    def _listed() -> list[Snapshot] | None:
-        """The volume's own list, or None: a rewind is only ever to a snapshot in it."""
-        if snapshots is None:
+    def _listed(who: Agent) -> list[Snapshot] | None:
+        """That agent's volume's own list, or None: a rewind is only ever to a snapshot in it."""
+        listing = _snapshot_source(who)
+        if listing is None:
             return None
         try:
-            return list(snapshots())
+            return list(listing())
         except (SnapshotError, OSError) as failure:
             logger.warning("the snapshot list cannot be read: %s", failure)
             return None
@@ -1406,9 +1465,9 @@ def create_app(
     ) -> Response:
         return _rewind_view(request, t, status, "refused", reason=reason, **values)
 
-    def _target(snapshot_id: str) -> tuple[Snapshot | None, str | None]:
-        """The snapshot ``snapshot_id`` names if it is in the volume's list now; else why not."""
-        listed = _listed()
+    def _target(who: Agent, snapshot_id: str) -> tuple[Snapshot | None, str | None]:
+        """The snapshot ``snapshot_id`` names if it is in that agent's list now; else why not."""
+        listed = _listed(who)
         if listed is None:
             return None, "rewind.off.list"
         target = Snapshot.parse(snapshot_id) if len(snapshot_id) <= MAX_FIELD_CHARS else None
@@ -1418,59 +1477,76 @@ def create_app(
 
     @app.get(POST_PATH, dependencies=protected)
     def rewind_confirm(request: Request) -> Response:
-        """The confirmation: the fixed notice, and a form with a ticket for this snapshot. It
-        changes nothing, and it is the only way to get a ticket."""
+        return _rewind_confirm(request, roster.main)
+
+    @app.get("/agentes/{slug}" + POST_PATH, dependencies=protected)
+    def agent_rewind_confirm(request: Request, slug: str) -> Response:
+        return _rewind_confirm(request, _agent(slug))
+
+    def _rewind_confirm(request: Request, who: Agent) -> Response:
+        """The confirmation: the fixed notice, and a form with a ticket for this snapshot of this
+        agent. It changes nothing, and it is the only way to get a ticket."""
         t = Translator(_language(request)[0])
-        target, why = _target(request.query_params.get("id", ""))
+        named = _shown(who)
+        target, why = _target(who, request.query_params.get("id", ""))
         if target is None:
-            return _not_now(request, t, 200, why or "rewind.err.not_listed")
+            return _not_now(request, t, 200, why or "rewind.err.not_listed", agent=named)
+        if not who.source.watched:
+            reason = f"rewind.off.{NOT_WATCHED}"
+            return _not_now(request, t, 200, reason, snap=target, agent=named)
         state = _availability()
         if state is not Availability.READY:
-            return _not_now(request, t, 200, f"rewind.off.{state}", snap=target)
+            return _not_now(request, t, 200, f"rewind.off.{state}", snap=target, agent=named)
+        lines = agent_lines if who.main else who.source.notice_lines
         return _rewind_view(
             request,
             t,
             200,
             "confirm",
             snap=target,
-            notice=rewind_notice(target.taken_at, now=clock(), tz=zone, agent_lines=agent_lines),
+            agent=named,
+            notice=rewind_notice(target.taken_at, now=clock(), tz=zone, agent_lines=lines),
             csrf=_csrf(request),
-            ticket=tickets.issue(target.id),
+            ticket=tickets.issue(_bound(who, target.id)),
         )
 
     @app.post(POST_PATH, dependencies=[Depends(require_session)])
     async def rewind(request: Request) -> Response:
         """The rewind. The Guard already checked where it comes from and its size."""
         t = Translator(_language(request)[0])
-        form = await _read_form(request)
+        form = await _read_form(request, FORM_FIELDS, AGENT_FIELD)
         if form is None:
             return _not_now(request, t, 400, "rewind.err.form")
         if not _csrf_is(request, form["csrf"]):
             logger.warning("a rewind from the web was refused: wrong form token")
             return _not_now(request, t, 403, "rewind.err.form")
-        redeemed = tickets.redeem(form["ticket"], form["id"])
+        who = _agent_in(form)
+        named = _shown(who)
+        lock = rewinding.setdefault(who.slug, threading.Lock())
+        redeemed = tickets.redeem(form["ticket"], _bound(who, form["id"]))
         if redeemed is Redeemed.SPENT:  # a second click on the same form
-            return _not_now(request, t, 400, "rewind.err.used")
+            return _not_now(request, t, 400, "rewind.err.used", agent=named)
         if redeemed is not Redeemed.OK:
-            if rewinding.locked():
-                return _not_now(request, t, 409, "rewind.err.busy")
-            return _not_now(request, t, 400, "rewind.err.expired")
-        target, why = await asyncio.to_thread(_target, form["id"])
+            if lock.locked():
+                return _not_now(request, t, 409, "rewind.err.busy", agent=named)
+            return _not_now(request, t, 400, "rewind.err.expired", agent=named)
+        target, why = await asyncio.to_thread(_target, who, form["id"])
         if target is None:
-            return _not_now(request, t, 503 if why == "rewind.off.list" else 400, why or "")
+            status = 503 if why == "rewind.off.list" else 400
+            return _not_now(request, t, status, why or "", agent=named)
         state = await asyncio.to_thread(_availability)
         if state is not Availability.READY or rewinder is None:
-            return _not_now(request, t, 503, f"rewind.off.{state}", snap=target)
+            return _not_now(request, t, 503, f"rewind.off.{state}", snap=target, agent=named)
         ask = rewinder.rewind
 
         def run() -> tuple[str, dict[str, Any] | None]:
             # Taken and released in this thread, which runs the rewind to its end whatever the
             # browser does (a closed tab does not stop it), so the lock is held exactly as long
             # as the rewind and the next one waits for it.
-            if not rewinding.acquire(blocking=False):
+            if not lock.acquire(blocking=False):
                 return "busy", None
             try:
-                return "asked", ask(target.id)
+                return "asked", ask(target.id, **who.order)
             except ControlUnavailable:
                 return "no_service", None
             except ControlOutcomeUnknown as error:
@@ -1480,14 +1556,16 @@ def create_app(
                 logger.error("a rewind from the web was not sent: %s", error)
                 return "untrusted", None
             finally:
-                rewinding.release()
+                lock.release()
 
         what, reply = await asyncio.to_thread(run)
         if what == "busy":
-            return _not_now(request, t, 409, "rewind.err.busy", snap=target)
+            return _not_now(request, t, 409, "rewind.err.busy", snap=target, agent=named)
         if reply is None:
             status = 503 if what == "no_service" else 200
-            return _rewind_view(request, t, status, "result", snap=target, outcome=what)
+            return _rewind_view(
+                request, t, status, "result", snap=target, outcome=what, agent=named
+            )
         undo = Snapshot.parse(reply["undo"]) if isinstance(reply.get("undo"), str) else None
         return _rewind_view(
             request,
@@ -1495,6 +1573,7 @@ def create_app(
             200,
             "result",
             snap=target,
+            agent=named,
             outcome=reply["outcome"],
             message=reply["message"],
             undo=undo,
@@ -1854,25 +1933,38 @@ def create_app(
             "hold_step.html", request, status=status, active="holds", t=t, view=view, **values
         )
 
-    def _hold_refused(request: Request, t: Translator, status: int, reason: str) -> Response:
-        return _hold_view(request, t, status, "refused", reason=reason)
+    def _hold_refused(
+        request: Request, t: Translator, status: int, reason: str, agent: Agent | None = None
+    ) -> Response:
+        return _hold_view(request, t, status, "refused", reason=reason, agent=agent)
 
-    def _lists() -> tuple[list[BatchView] | None, list[TrustView] | None]:
-        """The active batches and the recipients trusted from here, from the service (None:
-        not asked, or it could not say)."""
+    def _lists_of(who: Agent) -> tuple[list[BatchView] | None, list[TrustView] | None]:
+        """That agent's active batches and the recipients trusted from here, from the service
+        (None: not asked, or it could not say)."""
         if _approvals() is not Availability.READY or approver is None:
             return None, None
         try:
-            batches = batch_views(approver.batches())
+            batches = batch_views(approver.batches(**who.order), who.slug)
         except ControlError as error:
             logger.warning("the batches cannot be listed: %s", error)
             batches = None
         try:
-            trusted = trust_views(approver.trusted())
+            trusted = trust_views(approver.trusted(**who.order), who.slug)
         except ControlError as error:
             logger.warning("the trusted recipients cannot be listed: %s", error)
             trusted = None
         return batches, trusted
+
+    def _lists() -> tuple[list[BatchView] | None, list[TrustView] | None]:
+        """Those of every agent the service is watching, each saying whose. None only if nothing
+        could be read: one agent that cannot say does not hide what the others have."""
+        read = [_lists_of(who) for who in roster if who.source.watched]
+        kept = [batches for batches, _ in read if batches is not None]
+        trust = [trusted for _, trusted in read if trusted is not None]
+        return (
+            [view for views in kept for view in views] if kept else None,
+            [view for views in trust for view in views] if trust else None,
+        )
 
     @app.get(HOLDS_PATH, dependencies=protected)
     def holds_page(request: Request) -> Response:
@@ -1893,30 +1985,39 @@ def create_app(
 
     @app.get(HOLDS_PATH + "/ver", dependencies=protected)
     def hold_detail(request: Request) -> Response:
-        """ "Ver": the hold as the black box keeps it (the 2 KiB excerpt, every recipient and
-        attachment). Reads only; the agent's text is shown as the agent's."""
+        return _hold_detail(request, roster.main)
+
+    @app.get("/agentes/{slug}" + HOLDS_PATH + "/ver", dependencies=protected)
+    def agent_hold_detail(request: Request, slug: str) -> Response:
+        return _hold_detail(request, _agent(slug))
+
+    def _hold_detail(request: Request, who: Agent) -> Response:
+        """ "Ver": the hold as that agent's black box keeps it (the 2 KiB excerpt, every recipient
+        and attachment). Reads only; the agent's text is shown as the agent's."""
         t = Translator(_language(request)[0])
+        named = _shown(who)
         hold_id = request.query_params.get("id", "")
         if not id_fits(APPROVE, hold_id):
-            return _hold_refused(request, t, 404, "hold.err.unknown")
-        listed = _find_hold(hold_id)
+            return _hold_refused(request, t, 404, "hold.err.unknown", agent=named)
+        listed = _find_hold(who, hold_id)
         event = None
         try:
             if listed is not None and listed.seq is not None:
-                rows = roster.main.reader.events(since_seq=listed.seq - 1, limit=1)
+                rows = who.reader.events(since_seq=listed.seq - 1, limit=1)
                 event = held_event(rows, hold_id)
             if event is None:
-                rows = roster.main.reader.events(newest_first=True, limit=BOX_ROWS)
+                rows = who.reader.events(newest_first=True, limit=BOX_ROWS)
                 event = held_event(rows, hold_id)
         except BoxUnavailable:
             event = None
         if event is None and listed is None:
-            return _hold_refused(request, t, 404, "hold.err.unknown")
+            return _hold_refused(request, t, 404, "hold.err.unknown", agent=named)
         return _page(
             "hold_view.html",
             request,
             active="holds",
             t=t,
+            agent=named,
             hold=listed,
             detail=None if event is None else detail_of(event),
             risk=listed.risk if listed is not None else (event.risk if event else 0),
@@ -1926,32 +2027,41 @@ def create_app(
 
     @app.get(DECIDE_PATH, dependencies=protected)
     def decide_confirm(request: Request) -> Response:
-        """The confirmation of one decision: what it is, and a form with a ticket bound to that
-        verb and that id. It changes nothing, and it is the only way to get a ticket."""
+        return _decide_confirm(request, roster.main)
+
+    @app.get("/agentes/{slug}" + DECIDE_PATH, dependencies=protected)
+    def agent_decide_confirm(request: Request, slug: str) -> Response:
+        return _decide_confirm(request, _agent(slug))
+
+    def _decide_confirm(request: Request, who: Agent) -> Response:
+        """The confirmation of one decision: what it is, on which agent, and a form with a ticket
+        bound to that verb, that agent and that id. It changes nothing, and it is the only way to
+        get a ticket."""
         t = Translator(_language(request)[0])
+        named = _shown(who)
         verb, subject = request.query_params.get("v", ""), request.query_params.get("id", "")
         if not id_fits(verb, subject):
-            return _hold_refused(request, t, 200, "hold.err.form")
+            return _hold_refused(request, t, 200, "hold.err.form", agent=named)
         state = _approvals()
         if state is not Availability.READY:
-            return _hold_refused(request, t, 200, f"hold.off.{state}")
-        values: dict[str, Any] = {"verb": verb, "csrf": _csrf(request)}
+            return _hold_refused(request, t, 200, f"hold.off.{state}", agent=named)
+        values: dict[str, Any] = {"verb": verb, "csrf": _csrf(request), "agent": named}
         if verb in (APPROVE, REJECT, TRUST):
-            listed, _now, failed = _requests()
-            found = [] if failed or not listed else listed
+            listed, _now, _failed = _requests()
+            found = [r for r in listed or () if r.agent == who.slug]
             hold = next((r for r in found if r.id == subject), None)
             if hold is None:
-                return _hold_refused(request, t, 200, "hold.err.unknown")
+                return _hold_refused(request, t, 200, "hold.err.unknown", agent=named)
             if verb == TRUST and not hold.trustable:
-                return _hold_refused(request, t, 200, "hold.err.not_trustable")
+                return _hold_refused(request, t, 200, "hold.err.not_trustable", agent=named)
             values["hold"] = hold
             if verb == TRUST:  # our notes: who reads it, and what is still held (final review)
                 values["trust_note"] = trust_note(hold)
                 values["others"] = same_recipient(hold, found)
             values["now"] = clock()
-            ticket = decision_tickets.issue(verb, subject, until=hold.expires_at)
+            ticket = decision_tickets.issue(verb, _bound(who, subject), until=hold.expires_at)
         else:
-            batches, trusted = _lists()
+            batches, trusted = _lists_of(who)
             if verb == REVOKE:
                 found = next((b for b in batches or [] if b.rule_id == subject), None)
                 values["batch"] = found
@@ -1959,33 +2069,35 @@ def create_app(
                 found = next((x for x in trusted or [] if x.trust_id == subject), None)
                 values["trust"] = found
             if found is None:
-                return _hold_refused(request, t, 200, "hold.err.unknown")
-            ticket = decision_tickets.issue(verb, subject)
+                return _hold_refused(request, t, 200, "hold.err.unknown", agent=named)
+            ticket = decision_tickets.issue(verb, _bound(who, subject))
         return _hold_view(request, t, 200, "confirm", ticket=ticket, subject=subject, **values)
 
     async def decide(request: Request) -> Response:
         """A decision. The Guard already checked where it comes from and its size (and that
         this web may decide at all)."""
         t = Translator(_language(request)[0])
-        form = await _read_form(request, DECIDE_FIELDS, DECIDE_OPTIONAL)
+        form = await _read_form(request, DECIDE_FIELDS, (*DECIDE_OPTIONAL, *AGENT_FIELD))
         if form is None or not id_fits(form["v"], form["id"]):
             return _hold_refused(request, t, 400, "hold.err.form")
         verb, subject = form["v"], form["id"]
         if not _csrf_is(request, form["csrf"]):
             logger.warning("a decision from the web was refused: wrong form token")
             return _hold_refused(request, t, 403, "hold.err.form")
-        redeemed = decision_tickets.redeem(form["ticket"], verb, subject)
+        who = _agent_in(form)
+        named = _shown(who)
+        redeemed = decision_tickets.redeem(form["ticket"], verb, _bound(who, subject))
         if redeemed is Redeemed.SPENT:
-            return _hold_refused(request, t, 400, "hold.err.used")
+            return _hold_refused(request, t, 400, "hold.err.used", agent=named)
         if redeemed is not Redeemed.OK:
-            return _hold_refused(request, t, 400, "hold.err.expired")
+            return _hold_refused(request, t, 400, "hold.err.expired", agent=named)
         if verb == TRUST and form.get("confirmo") != "si":
-            return _hold_refused(request, t, 400, "hold.err.confirm")
+            return _hold_refused(request, t, 400, "hold.err.confirm", agent=named)
         if verb != TRUST and "confirmo" in form:
-            return _hold_refused(request, t, 400, "hold.err.form")
+            return _hold_refused(request, t, 400, "hold.err.form", agent=named)
         state = await asyncio.to_thread(_approvals)
         if state is not Availability.READY or approver is None:
-            return _hold_refused(request, t, 503, f"hold.off.{state}")
+            return _hold_refused(request, t, 503, f"hold.off.{state}", agent=named)
         if verb == TRUST and await _touch_needed(request):
             return _go_touch("peticiones")
         client = approver
@@ -1994,12 +2106,12 @@ def create_app(
             try:
                 if verb in (APPROVE, REJECT):
                     verdict = "approve" if verb == APPROVE else "reject"
-                    return "asked", client.decide(subject, verdict)
+                    return "asked", client.decide(subject, verdict, **who.order)
                 if verb == TRUST:
-                    return "asked", client.trust(subject)
+                    return "asked", client.trust(subject, **who.order)
                 if verb == REVOKE:
-                    return "asked", client.end_batch(subject)
-                return "asked", client.untrust(subject)
+                    return "asked", client.end_batch(subject, **who.order)
+                return "asked", client.untrust(subject, **who.order)
             except ControlUnavailable:
                 return "no_service", None
             except ControlOutcomeUnknown as error:
@@ -2012,7 +2124,7 @@ def create_app(
         what, reply = await asyncio.to_thread(run)
         if reply is None:
             status = 503 if what == "no_service" else 200
-            return _hold_view(request, t, status, "result", verb=verb, outcome=what)
+            return _hold_view(request, t, status, "result", verb=verb, outcome=what, agent=named)
         status = 400 if reply["outcome"] == "refused" else 200
         return _hold_view(
             request,
@@ -2020,6 +2132,7 @@ def create_app(
             status,
             "result",
             verb=verb,
+            agent=named,
             outcome=str(reply["outcome"]),
             message=str(reply["message"]),
             hold_out=reply.get("hold"),
@@ -2219,10 +2332,18 @@ def create_app(
                 yield _sse("feed", _render_feed(t, changed), None)
             if moved or now_t - last_requests >= REQUESTS_EVERY:
                 last_requests = now_t
+                await _roster_now()
+                if [a.slug for a in roster] != [a.slug for a in agents]:
+                    # Other agents, so other cards: the page itself has to change (web.js).
+                    yield _sse("roster", "changed", None)
+                    return
                 requests, now, failed = await asyncio.to_thread(_requests)
                 if failed:
-                    # Not "nothing waits": the last list read stays, said to be maybe old.
-                    requests = live_requests(last_good, roster, now) if last_good else []
+                    # Not "nothing waits": what could be read, and the rest of the last list
+                    # read, said to be maybe old.
+                    known = {(r.agent, r.id) for r in requests or ()}
+                    older = [r for r in last_good or () if (r.agent, r.id) not in known]
+                    requests = live_requests([*(requests or ()), *older], roster, now)
                 else:
                     last_good = requests
                 key = (_requests_key(requests), failed)
@@ -2340,7 +2461,7 @@ def _started(agent: Agent, line: Line) -> tuple[str, str, int]:
 
 
 def _requests_key(requests: Sequence[PendingRequest] | None) -> tuple[Any, ...] | None:
-    return None if requests is None else tuple((r.id, r.expires_at) for r in requests)
+    return None if requests is None else tuple((r.agent, r.id, r.expires_at) for r in requests)
 
 
 MAX_AGENTS_IN_ID = 64

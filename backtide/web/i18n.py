@@ -257,8 +257,9 @@ ES: dict[str, str] = {
     "`backtide aprobar`.",
     "hold.off.off": "Desde esta web no se decide: usa Telegram o `backtide aprobar`.",
     "nav.holds": "Peticiones",
-    "rewind.off.agent": "Desde aquí solo se rebobina el agente que lleva el servicio. Los demás, "
-    "todavía no.",
+    "rewind.off.unwatched": "Este agente no se está vigilando ahora mismo (no ha arrancado o ha "
+    "fallado): no se rebobina hasta que vuelva.",
+    "order.for": "Para el agente",
     "lang.label": "Idioma",
     "agent.label": "El agente",
     "state.watched": "vigilado",
@@ -1079,8 +1080,9 @@ EN: dict[str, str] = {
     "`backtide aprobar`.",
     "hold.off.off": "This web does not decide: use Telegram or `backtide aprobar`.",
     "nav.holds": "Requests",
-    "rewind.off.agent": "From here only the agent the service runs can be rewound. The others "
-    "cannot be rewound yet.",
+    "rewind.off.unwatched": "This agent is not being watched right now (it did not start, or it "
+    "failed): it cannot be rewound until it is back.",
+    "order.for": "For the agent",
     "lang.label": "Language",
     "agent.label": "Your agent",
     "state.watched": "watched",

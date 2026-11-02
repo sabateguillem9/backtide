@@ -15,6 +15,7 @@
   <section class="settings-step" data-view="{{ view }}"{% if outcome %} data-outcome="{{ outcome }}"{% endif %} aria-labelledby="hold-step-title">
   {% if view == 'confirm' %}
     <h2 id="hold-step-title">{{ t('hold.confirm.' ~ verb) }}</h2>
+    {% if agent %}{% set whose = agent %}{% include "order_for.html" %}{% endif %}
     {% if hold %}
     <div class="hold-one">
       <p class="hold-id"><span class="sid">{{ hold.id }}</span> · <span class="hold-risk risk-{{ hold.risk }}"><span class="dot dot-{{ hold.risk }}" aria-hidden="true"></span>{{ t('risk.' ~ hold.risk) }}</span> · {{ t('wait.left') }} <span class="num">{{ countdown(hold.left(now)) }}</span></p>
@@ -30,7 +31,7 @@
         {% if hold.attachments %}<p><span class="muted">{{ t('hold.attachments') }}</span> {% for a in hold.attachments %}<span class="name">{{ vis(a, 100) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
         {% if hold.request %}<p class="req-lines"><span class="name">{{ vis(hold.request, 400) }}</span></p>{% endif %}
       </div>
-      <p><a class="settings-back" href="{{ base }}/peticiones/ver?id={{ hold.id | urlencode }}">{{ t('wait.view') }}</a></p>
+      <p><a class="settings-back" href="{{ abase }}/peticiones/ver?id={{ hold.id | urlencode }}">{{ t('wait.view') }}</a></p>
     </div>
     {% elif batch %}
     <p class="hold-rule-what">{{ t('holds.batch.' ~ batch.scope) }}{% if batch.translator %} · <span lang="{{ t.language }}">{{ api(batch.translator) }}</span>{% endif %}</p>
@@ -48,6 +49,7 @@
       <input type="hidden" name="ticket" value="{{ ticket }}">
       <input type="hidden" name="id" value="{{ subject }}">
       <input type="hidden" name="v" value="{{ verb }}">
+      {% if agent and not agent.main %}<input type="hidden" name="agente" value="{{ agent.slug }}">{% endif %}
       {% if verb == 'confiar' %}
       <label class="setting-check"><input type="checkbox" name="confirmo" value="si" required> <span>{{ t('hold.confirm.confiar.box') }}</span></label>
       {% endif %}
@@ -61,6 +63,7 @@
        something goes out or is trusted, a cross when it stays in, a warning when nobody knows. #}
     {% set good = outcome in ('released', 'preapproved', 'rejected', 'trusted', 'ended', 'removed') %}
     <h2 id="hold-step-title" class="settings-outcome is-{{ 'ok' if good else ('none' if outcome == 'unknown' else 'bad') }}">{{ ic('approve' if outcome in ('released', 'preapproved', 'trusted') else ('reject' if outcome in ('rejected', 'ended', 'removed') else 'warning'), 'ic--m') }}<span>{{ t('hold.out.' ~ outcome) if t.has('hold.out.' ~ outcome) else t('hold.out.other') }}</span></h2>
+    {% if agent %}{% set whose = agent %}{% include "order_for.html" %}{% endif %}
     {% if hold_out and t.has('hold.out.' ~ hold_out) %}<p>{{ t('hold.out.' ~ hold_out) }}</p>{% endif %}
     {% if message %}<p class="settings-said"><span class="muted">{{ t('rewind.said') }}</span> <span lang="es">{{ vis(message, 600) }}</span></p>{% endif %}
     <p class="settings-actions"><a class="settings-back" href="{{ base }}/peticiones">{{ t('holds.back') }}</a></p>

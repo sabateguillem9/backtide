@@ -10,6 +10,7 @@ stays out of all of it (the last section).
 import dataclasses
 import logging
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from typing import Any
 import pytest
 
 from backtide import cli
-from backtide.blackbox import BlackBoxError
+from backtide.blackbox import BlackBoxError, create_key
 from backtide.jail import AgentJail, JailError
 from backtide.jail.config import Protected
 from backtide.notify import Alert, AlertLevel, Labelled, LogBridge, LoggedProblem
@@ -33,8 +34,9 @@ from backtide.service.runner import (
     serve,
 )
 from backtide.service.settings import Applied, ReloadFailedClosed
-from backtide.setup import selftest
+from backtide.setup import layout, selftest
 from backtide.setup.preflight import Status
+from backtide.web import BoxReader
 from tests.test_service_agents import (
     Sink,
     add_agent,
@@ -736,3 +738,220 @@ def test_a_file_of_another_agent_that_cannot_be_used_is_said_before_anything_run
     assert cli.main([*order, "--config", str(main_config(home))]) == cli.EXIT_ERROR
     err = capsys.readouterr().err
     assert "revisor.toml" in err and "'volume'" in err
+
+
+# --- the web reads the neighbour's black box (T26-2d) ---------------------------------------------
+
+
+GID = os.getegid()
+
+
+def shared(config: ServiceConfig) -> dict[str, int]:
+    """The mode of what the web's group gets, by name."""
+    db = config.blackbox_db
+    return {
+        path.name: stat.S_IMODE(os.lstat(path).st_mode)
+        for path in (config.agents_dir, config.agent_dir, db)
+    }
+
+
+def test_the_webs_group_gets_the_neighbours_box_and_nothing_else(home: Path) -> None:  # noqa: F811
+    _main, (other, *_) = two_configs(home)
+    runner.share_box_with_web(other, GID)
+    assert shared(other) == {"agents": 0o710, other.slug: 0o710, "blackbox.db": 0o640}
+    for path in (other.agents_dir, other.agent_dir, other.blackbox_db):
+        assert os.lstat(path).st_gid == GID
+    key = other.blackbox_key
+    assert stat.S_IMODE(os.lstat(key).st_mode) == 0o600, "the key is made first, and stays private"
+    # What else is in there is what it was: not one more bit for the group.
+    others = [p for p in other.agent_dir.rglob("*") if p != other.blackbox_db and p.is_file()]
+    assert others and all(stat.S_IMODE(os.lstat(p).st_mode) & 0o077 == 0 for p in others)
+
+
+def test_the_box_shared_works_for_the_service_and_for_the_web(home: Path) -> None:  # noqa: F811
+    _main, (other, *_) = two_configs(home)
+    runner.share_box_with_web(other, GID)
+    with runner.open_black_box(other) as box:
+        box.append("exec", "run", "del-vecino")
+        wal = other.blackbox_db.with_name(f"{other.blackbox_db.name}-wal")
+        assert stat.S_IMODE(os.lstat(other.blackbox_db).st_mode) == 0o640
+        if os.path.lexists(wal):
+            assert stat.S_IMODE(os.lstat(wal).st_mode) == 0o640, "SQLite copies the mode"
+        reader = BoxReader(other.blackbox_db)
+        try:
+            assert [event.target for event in reader.events()][-1] == "del-vecino"
+        finally:
+            reader.close()
+    runner.share_box_with_web(other, GID)  # again at the next start: nothing changes
+    assert shared(other)["blackbox.db"] == 0o640
+    with runner.open_black_box(other) as box:
+        assert not box.verify().problems
+
+
+def test_a_box_of_before_with_its_wal_is_shared_too(home: Path) -> None:  # noqa: F811
+    _main, (other, *_) = two_configs(home)
+    with runner.open_black_box(other) as box:
+        box.append("exec", "run", "de-antes")
+        before = stat.S_IMODE(os.lstat(other.blackbox_db).st_mode)
+        assert before == 0o600
+        runner.share_box_with_web(other, GID)
+        for name in ("blackbox.db", "blackbox.db-wal", "blackbox.db-shm"):
+            path = other.agent_dir / name
+            if os.path.lexists(path):
+                assert stat.S_IMODE(os.lstat(path).st_mode) == 0o640, name
+
+
+@pytest.mark.parametrize("what", ["db", "folder"])
+def test_a_link_is_never_followed(
+    home: Path,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+    what: str,
+) -> None:
+    _main, (other, *_) = two_configs(home)
+    outside = home / "outside"
+    if what == "db":
+        outside.write_text("")
+        outside.chmod(0o600)
+        other.blackbox_db.parent.mkdir(exist_ok=True)
+        create_key(other.blackbox_key)
+        other.blackbox_db.symlink_to(outside)
+    else:
+        outside.mkdir(mode=0o700)
+        outside.rmdir()
+        other.agent_dir.rename(outside)
+        outside.chmod(0o700)
+        other.agent_dir.symlink_to(outside)
+    runner.share_box_with_web(other, GID)
+    assert stat.S_IMODE(os.lstat(outside).st_mode) in (0o600, 0o700), "what it led to is as it was"
+    assert "the web cannot be given the black box of the agent" in caplog.text
+
+
+def test_a_box_without_its_key_is_left_for_what_stops_the_agent(
+    home: Path,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """It must not get in the way of ``build_guardian``, which stops an agent it cannot record:
+    a container that lived through the service's death would go on without a box."""
+    _main, (other, *_) = two_configs(home)
+    other.blackbox_db.write_text("")
+    runner.share_box_with_web(other, GID)
+    assert not other.blackbox_key.exists()
+    assert "the web cannot be given the black box of the agent" in caplog.text
+    assert stat.S_IMODE(os.lstat(other.agent_dir).st_mode) == 0o700
+    built: list[bool] = []
+
+    def build(*args: Any, **options: Any) -> Any:
+        built.append(True)
+        raise BlackBoxError("the real one refuses it here, and stops the agent")
+
+    neighbours = _Neighbours(
+        _main, (other,), notifier_for=lambda slug: None, stop=threading.Event(), share=None,
+        told=None, build=build, web_group=GID,
+    )  # fmt: skip
+    with pytest.raises(BlackBoxError):
+        neighbours._serve_one(other)
+    assert built == [True]
+
+
+def test_what_the_folder_had_open_is_closed_first(home: Path) -> None:  # noqa: F811
+    """The folder was 0700: an image made by hand with umask 022 was nobody's business. Now the
+    web's group goes through it."""
+    _main, (other, *_) = two_configs(home)
+    image = other.agent_dir / "volume.img"
+    image.write_text("todo el volumen")
+    image.chmod(0o644)
+    token = other.agent_dir / "gateway.token"
+    token.write_text("de otra vida")
+    token.chmod(0o640)
+    open_folder = other.agent_dir / "abierta"
+    open_folder.mkdir()
+    open_folder.chmod(0o755)
+    ca = other.agent_ca_dir
+    ca.mkdir(exist_ok=True)
+    ca.chmod(0o755)
+    runner.share_box_with_web(other, GID)
+    assert stat.S_IMODE(os.lstat(image).st_mode) & 0o077 == 0
+    assert stat.S_IMODE(os.lstat(token).st_mode) & 0o077 == 0
+    assert stat.S_IMODE(os.lstat(open_folder).st_mode) & 0o077 == 0
+    assert stat.S_IMODE(os.lstat(ca).st_mode) == 0o755, "the certificate alone, as on the main one"
+    assert stat.S_IMODE(os.lstat(other.agent_dir).st_mode) == 0o710
+
+
+@pytest.mark.parametrize(
+    ("mode", "gid", "bits"),
+    [
+        (0o750, 7, 0),  # the agent's or the proxy's folder: the group is theirs
+        (0o640, 7, 0),
+        (0o644, 7, 0o004),
+        (0o755, 7, 0o005),
+        (0o640, 9, 0o040),  # the web's own group
+        (0o750, 9, 0o050),
+        (0o600, 9, 0),
+    ],
+)
+def test_only_what_lets_the_webs_group_in_counts(mode: int, gid: int, bits: int) -> None:
+    assert runner.bits_for_the_web(mode, gid, 9) == bits
+
+
+def test_a_folder_of_the_agents_group_keeps_what_the_agent_needs(home: Path) -> None:  # noqa: F811
+    """`<profile>/` and `proxy-ca/` are 0750 with the agent's and the proxy's group: closing them
+    would leave the jail without its config."""
+    others = [gid for gid in os.getgroups() if gid != GID]
+    if not others:
+        pytest.skip("it takes a user with a second group")
+    _main, (other, *_) = two_configs(home)
+    theirs = other.agent_dir / "de-su-grupo"
+    theirs.mkdir()
+    os.chown(theirs, -1, others[0])
+    theirs.chmod(0o750)
+    runner.share_box_with_web(other, GID)
+    assert stat.S_IMODE(os.lstat(theirs).st_mode) == 0o750
+
+
+def test_a_link_in_the_folder_leaves_it_closed(
+    home: Path,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """What it leads to cannot be judged from here. Shared at an earlier start, it closes again."""
+    _main, (other, *_) = two_configs(home)
+    runner.share_box_with_web(other, GID)
+    assert stat.S_IMODE(os.lstat(other.agent_dir).st_mode) == 0o710
+    outside = home / "fuera"
+    outside.write_text("")
+    outside.chmod(0o644)
+    (other.agent_dir / "enlace").symlink_to(outside)
+    runner.share_box_with_web(other, GID)
+    assert stat.S_IMODE(os.lstat(other.agent_dir).st_mode) == 0o700
+    assert stat.S_IMODE(os.lstat(outside).st_mode) == 0o644, "not followed"
+    assert "the web cannot be given the black box of the agent" in caplog.text
+
+
+def test_a_neighbour_gets_its_box_shared_before_it_is_built(home: Path) -> None:  # noqa: F811
+    main, (other, *_) = two_configs(home)
+    order: list[str] = []
+    real = runner.share_box_with_web
+
+    def share(config: ServiceConfig, group: int) -> None:
+        order.append("shared")
+        real(config, group)
+
+    def build(*args: Any, **options: Any) -> Any:
+        order.append("built")
+        raise RuntimeError("enough")
+
+    neighbours = _Neighbours(
+        main, (other,), notifier_for=lambda slug: None, stop=threading.Event(), share=None,
+        told=None, build=build, web_group=GID,
+    )  # fmt: skip
+    original, runner.share_box_with_web = runner.share_box_with_web, share
+    try:
+        with pytest.raises(RuntimeError, match="enough"):
+            neighbours._serve_one(other)
+    finally:
+        runner.share_box_with_web = original
+    assert order == ["shared", "built"]
+
+
+def test_the_modes_are_the_installers(home: Path) -> None:  # noqa: F811
+    assert runner.WEB_FOLDER_MODE == layout.STATE_DIR_MODE
+    assert runner.WEB_BOX_MODE == layout.BLACKBOX_DB_MODE

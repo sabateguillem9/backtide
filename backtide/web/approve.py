@@ -19,6 +19,10 @@ first lines, the request) stay the agent's: the templates mark them as such and 
 ``visible`` (escaped, invisible characters made visible), never as markup. Our words (what it
 does, the notes) come from ``backtide.gate.phrase``, built from closed tables.
 
+Which agent (T26-2d): each one has its own holds, batches and trusted recipients, asked one by one
+with ``agent`` (without it, the main one, as always). Its page and its form name it, and the app
+binds the ticket to it too ("<slug>:<id>"), so a form for one never acts on another.
+
 Confirmations (``DecisionTickets``): every change has a page of its own (GET, changes nothing)
 with a one-time ticket bound to that verb and that id: a ticket to reject never approves, one for
 this hold never decides another, and one for a hold lives no longer than the hold. Only a POST
@@ -92,19 +96,19 @@ class Approver(Protocol):
 
     def availability(self) -> Availability: ...
 
-    def holds(self) -> list[dict[str, Any]]: ...
+    def holds(self, *, agent: str | None = None) -> list[dict[str, Any]]: ...
 
-    def decide(self, hold_id: str, verdict: str) -> dict[str, Any]: ...
+    def decide(self, hold_id: str, verdict: str, *, agent: str | None = None) -> dict[str, Any]: ...
 
-    def trust(self, hold_id: str) -> dict[str, Any]: ...
+    def trust(self, hold_id: str, *, agent: str | None = None) -> dict[str, Any]: ...
 
-    def trusted(self) -> list[dict[str, Any]]: ...
+    def trusted(self, *, agent: str | None = None) -> list[dict[str, Any]]: ...
 
-    def untrust(self, trust_id: str) -> dict[str, Any]: ...
+    def untrust(self, trust_id: str, *, agent: str | None = None) -> dict[str, Any]: ...
 
-    def batches(self) -> list[dict[str, Any]]: ...
+    def batches(self, *, agent: str | None = None) -> list[dict[str, Any]]: ...
 
-    def end_batch(self, rule_id: str) -> dict[str, Any]: ...
+    def end_batch(self, rule_id: str, *, agent: str | None = None) -> dict[str, Any]: ...
 
 
 class ControlApprover:
@@ -147,26 +151,26 @@ class ControlApprover:
         """``_require`` plus, on the narrow socket, the session of who asked (T26-3a)."""
         return {**self._require(), "session": acting_session(self._server_uid)}
 
-    def holds(self) -> list[dict[str, Any]]:
-        return ask_holds(self._path, **self._require())
+    def holds(self, *, agent: str | None = None) -> list[dict[str, Any]]:
+        return ask_holds(self._path, agent=agent, **self._require())
 
-    def decide(self, hold_id: str, verdict: str) -> dict[str, Any]:
-        return ask_decide(self._path, hold_id, verdict, via="web", **self._change())
+    def decide(self, hold_id: str, verdict: str, *, agent: str | None = None) -> dict[str, Any]:
+        return ask_decide(self._path, hold_id, verdict, via="web", agent=agent, **self._change())
 
-    def trust(self, hold_id: str) -> dict[str, Any]:
-        return ask_trust(self._path, hold_id, **self._change())
+    def trust(self, hold_id: str, *, agent: str | None = None) -> dict[str, Any]:
+        return ask_trust(self._path, hold_id, agent=agent, **self._change())
 
-    def trusted(self) -> list[dict[str, Any]]:
-        return ask_list(self._path, "trusted", **self._require())
+    def trusted(self, *, agent: str | None = None) -> list[dict[str, Any]]:
+        return ask_list(self._path, "trusted", agent=agent, **self._require())
 
-    def untrust(self, trust_id: str) -> dict[str, Any]:
-        return ask_untrust(self._path, trust_id, via="web", **self._change())
+    def untrust(self, trust_id: str, *, agent: str | None = None) -> dict[str, Any]:
+        return ask_untrust(self._path, trust_id, via="web", agent=agent, **self._change())
 
-    def batches(self) -> list[dict[str, Any]]:
-        return ask_list(self._path, "batches", **self._require())
+    def batches(self, *, agent: str | None = None) -> list[dict[str, Any]]:
+        return ask_list(self._path, "batches", agent=agent, **self._require())
 
-    def end_batch(self, rule_id: str) -> dict[str, Any]:
-        return ask_end_batch(self._path, rule_id, via="web", **self._change())
+    def end_batch(self, rule_id: str, *, agent: str | None = None) -> dict[str, Any]:
+        return ask_end_batch(self._path, rule_id, via="web", agent=agent, **self._change())
 
 
 # -- what the page shows of a hold -----------------------------------------------------------
@@ -475,6 +479,7 @@ def detail_of(event: Event) -> Detail:
 
 @dataclass(frozen=True)
 class BatchView:
+    agent: str  # whose gate it is on (T26-2d)
     rule_id: str
     scope: str  # "recipient" or "kind"
     translator: str | None
@@ -485,7 +490,7 @@ class BatchView:
     uses: int
 
 
-def batch_views(raw: Sequence[Mapping[str, Any]]) -> list[BatchView]:
+def batch_views(raw: Sequence[Mapping[str, Any]], agent: str = MAIN_SLUG) -> list[BatchView]:
     views = []
     for item in raw:
         rule_id = item.get("rule_id")
@@ -495,6 +500,7 @@ def batch_views(raw: Sequence[Mapping[str, Any]]) -> list[BatchView]:
         translator = item.get("translator")
         views.append(
             BatchView(
+                agent=agent,
                 rule_id=rule_id,
                 scope="recipient" if item.get("scope") == "recipient" else "kind",
                 translator=translator if isinstance(translator, str) else None,
@@ -517,6 +523,7 @@ def batch_views(raw: Sequence[Mapping[str, Any]]) -> list[BatchView]:
 
 @dataclass(frozen=True)
 class TrustView:
+    agent: str  # whose recipient it is (T26-2d)
     trust_id: str
     translator: str
     recipient: str  # the agent's text once: shown as such
@@ -524,7 +531,7 @@ class TrustView:
     by: str
 
 
-def trust_views(raw: Sequence[Mapping[str, Any]]) -> list[TrustView]:
+def trust_views(raw: Sequence[Mapping[str, Any]], agent: str = MAIN_SLUG) -> list[TrustView]:
     views = []
     for item in raw:
         trust_id, translator = item.get("trust_id"), item.get("translator")
@@ -535,6 +542,7 @@ def trust_views(raw: Sequence[Mapping[str, Any]]) -> list[TrustView]:
             continue
         views.append(
             TrustView(
+                agent=agent,
                 trust_id=trust_id,
                 translator=_text(translator, 20),
                 recipient=_text(recipient, MAX_RECIPIENT_CHARS),

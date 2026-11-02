@@ -146,7 +146,7 @@ class DemoApprover:
     def availability(self) -> Availability:
         return Availability.READY
 
-    def holds(self) -> list[dict[str, Any]]:
+    def holds(self, *, agent: str | None = None) -> list[dict[str, Any]]:
         return []  # the page lists the made-up ones through ``demo_requests``
 
     def _open(self, hold_id: str) -> dict[str, Any] | None:
@@ -158,7 +158,7 @@ class DemoApprover:
             (r for r in raw if isinstance(r, dict) and r.get("id") == hold_id), None
         ) if isinstance(raw, list) else None  # fmt: skip
 
-    def decide(self, hold_id: str, verdict: str) -> dict[str, Any]:
+    def decide(self, hold_id: str, verdict: str, *, agent: str | None = None) -> dict[str, Any]:
         with self._lock:
             if hold_id in self._decided or self._open(hold_id) is None:
                 return {"ok": False, "outcome": "unknown", "message": self._said}
@@ -166,7 +166,7 @@ class DemoApprover:
         outcome = "released" if verdict == "approve" else "rejected"
         return {"ok": True, "outcome": outcome, "message": self._said}
 
-    def trust(self, hold_id: str) -> dict[str, Any]:
+    def trust(self, hold_id: str, *, agent: str | None = None) -> dict[str, Any]:
         with self._lock:
             found = self._open(hold_id)
             if hold_id in self._decided or found is None:
@@ -187,11 +187,13 @@ class DemoApprover:
             )
         return {"ok": True, "outcome": "trusted", "message": self._said, "hold": "released"}
 
-    def trusted(self) -> list[dict[str, Any]]:
+    def trusted(self, *, agent: str | None = None) -> list[dict[str, Any]]:
+        if agent is not None:  # the made-up lists are the main agent's
+            return []
         with self._lock:
             return copy.deepcopy(self._trusted)
 
-    def untrust(self, trust_id: str) -> dict[str, Any]:
+    def untrust(self, trust_id: str, *, agent: str | None = None) -> dict[str, Any]:
         with self._lock:
             kept = [t for t in self._trusted if t["trust_id"] != trust_id]
             gone = len(kept) != len(self._trusted)
@@ -199,11 +201,13 @@ class DemoApprover:
         outcome = "removed" if gone else "unknown"
         return {"ok": gone, "outcome": outcome, "message": self._said}
 
-    def batches(self) -> list[dict[str, Any]]:
+    def batches(self, *, agent: str | None = None) -> list[dict[str, Any]]:
+        if agent is not None:
+            return []
         with self._lock:
             return copy.deepcopy(self._batches)
 
-    def end_batch(self, rule_id: str) -> dict[str, Any]:
+    def end_batch(self, rule_id: str, *, agent: str | None = None) -> dict[str, Any]:
         with self._lock:
             kept = [b for b in self._batches if b["rule_id"] != rule_id]
             gone = len(kept) != len(self._batches)

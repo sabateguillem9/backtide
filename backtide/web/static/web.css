@@ -498,6 +498,8 @@ h1 {
 }
 .rewind-step h2:focus { outline: 0; }
 .rewind-step h2:focus-visible { outline: var(--focus-width) solid var(--focus-color); outline-offset: var(--focus-offset); }
+/* Whose a confirmation is, when there are several agents (T26-2d). */
+.order-for { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--space-2); margin: var(--space-2) 0 0; }
 .rewind-snap { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--space-3); margin: var(--space-2) 0 0; }
 .rewind-snap .snaptitle { font-size: var(--type-body-size); }
 .rewind-snap .sid { margin: 0; }

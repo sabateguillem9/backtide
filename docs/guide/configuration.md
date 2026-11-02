@@ -151,7 +151,7 @@ models = ["qwen3-coder"]
 
 ## Several agents
 
-One service can run several agents at once. This is early: nothing creates them for you yet, and the web and the Telegram bot still act on the main agent only. The CLI reaches any of them with `--agente` ([CLI reference](cli-reference.md)).
+One service can run several agents at once. This is early: nothing creates them for you yet. The Telegram bot says which agent each message is about, and its buttons and orders act on that agent. The CLI reaches any of them with `--agente` ([CLI reference](cli-reference.md)). The web lists the agents the service has, on the panel, and you rewind and approve on each one: every confirmation names the agent it is about, and each agent's held requests, batches and trusted recipients are its own. An agent the service is not watching shows as stopped and cannot be rewound until it is back. So that the web can read each black box, the service gives the web's group that file when the agent starts, as the installer does with the main agent's, and first closes whatever else in the agent's folder that group could read (a volume image made by hand with `umask 022`, say). Only the agent's CA certificate stays open, as on the main agent.
 
 An installation with no `/etc/backtide/agents/` folder has one agent, `principal`, and behaves as it always did. Each other agent is a file, `/etc/backtide/agents/<slug>.toml`, where the slug is lowercase letters, digits and `-`:
 

@@ -51,6 +51,7 @@ class Desk:
     waiting: Callable[[], Mapping[str, str]] | None = None
     snapshots: Callable[[], Sequence[Snapshot]] | None = None
     name: str | None = None
+    notice: tuple[str, ...] = ()  # what the rewind notice says of it (its profile's lines)
 
 
 class Roster:
@@ -81,7 +82,8 @@ class Roster:
                 self._changed.wait(left)
 
     def listing(self) -> list[dict[str, Any]]:
-        """Each agent and whether it is watched, the main one first. No secret and no path."""
+        """Each agent and whether it is watched, the main one first. No secret and no path.
+        ``notice`` is what the web's rewind confirmation says of this agent, from its profile."""
         with self._changed:
             desks = {self._main.slug: self._main, **self._desks}
             named = dict(self._named)
@@ -95,6 +97,7 @@ class Roster:
                     "main": slug == self._main.slug,
                     "watched": desk is not None,
                     "state": None if desk is None else _state_of(desk),
+                    "notice": [] if desk is None else list(desk.notice),
                 }
             )
         return found

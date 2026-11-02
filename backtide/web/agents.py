@@ -1,11 +1,13 @@
 """The agents the web shows, and what the control room says about each one. Presentation only.
 
-Today ``backtide web`` watches one agent: the black box it reads (``BoxReader``, read-only and
-without the key) and the snapshot list. That is the roster's first agent, the MAIN one: its pages
-keep their old addresses (``/ahora``, ``/historia``...) and it is the only one the rewind acts on
-(the service's control socket knows one agent). The demo (``scripts/web-demo``) adds more, each
-with its own black box, through ``create_app(others=...)``; T17 will hand the real list over the
-same way. Every agent is read the same way as the main one: a ``BoxReader``, nothing else.
+``backtide web`` watches the agents of the installation: the black box each one has (``BoxReader``,
+read-only and without the key) and its snapshot list. The roster's first agent is the MAIN one: its
+pages keep their old addresses (``/ahora``, ``/historia``...), and an order about it says no agent,
+byte for byte what it always was. The others live under ``/agentes/<slug>/``, and the service is who
+says which there are (``backtide.web.live``, T26-2d); the demo (``scripts/web-demo``) brings its
+own, each with its own black box, through ``create_app(others=...)``. Every agent is read the same
+way as the main one: a ``BoxReader``, nothing else. A slug from a browser is only ever a key of this
+list; an order says it as ``agent`` and the service decides again (``backtide.service.roster``).
 
 The gate's held requests (T10): ``PendingRequest`` is the shape the control room draws. The real
 web builds them from the service's list (``backtide web --aprobar``) or from the black box
@@ -18,6 +20,7 @@ visible and escaped, in its own isolated span (``backtide.web.narrate.sentence``
 """
 
 import re
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, tzinfo
@@ -71,6 +74,8 @@ class AgentSource:
     name: str | None
     reader: BoxReader
     snapshots: Callable[[], Sequence[Snapshot]] | None = None
+    watched: bool = True  # False: the service has it, and is not watching it now
+    notice_lines: tuple[str, ...] = ()  # what the rewind notice says of it (its profile's lines)
 
     def __post_init__(self) -> None:
         if not isinstance(self.slug, str) or not SLUG.fullmatch(self.slug):
@@ -87,7 +92,7 @@ class Agent:
 
     source: AgentSource
     colour: int  # 1..COLOURS: its identity colour (a-<colour> in the CSS)
-    main: bool  # the one the service runs: its pages keep the old addresses, and it rewinds
+    main: bool  # its pages keep the old addresses, and an order about it names no agent
     base: str  # the root of its pages
 
     @property
@@ -102,26 +107,46 @@ class Agent:
     def reader(self) -> BoxReader:
         return self.source.reader
 
+    @property
+    def order(self) -> dict[str, str]:
+        """What an order about this agent says of it: nothing for the main one, as always."""
+        return {} if self.main else {"agent": self.slug}
+
 
 class Roster:
-    """The agents, in order: the main one first, then the rest. Colours follow the order, so an
-    agent keeps its colour for the whole run."""
+    """The agents, in order: the main one first, then the rest. Colours follow the order. The main
+    one never changes; the others are what the service says now (``update``), and whoever is going
+    through the list keeps the one it took: it is replaced, never changed."""
 
     def __init__(self, main: AgentSource, others: Iterable[AgentSource], base: str) -> None:
-        sources = [main, *others]
+        self._main = main
+        self._base = base
+        self._lock = threading.Lock()
+        self._sources: tuple[AgentSource, ...] = ()
+        self.agents: tuple[Agent, ...] = ()
+        self._by_slug: dict[str, Agent] = {}
+        self.update(others)
+
+    def update(self, others: Iterable[AgentSource]) -> None:
+        """The agents other than the main one are now these. RosterError leaves it as it was."""
+        sources = (self._main, *others)
         slugs = [s.slug for s in sources]
         if len(set(slugs)) != len(slugs):
             raise RosterError("two agents have the same slug")
-        self.agents = tuple(
-            Agent(
-                source,
-                colour=i % COLOURS + 1,
-                main=i == 0,
-                base=base if i == 0 else f"{base}/agentes/{source.slug}",
+        with self._lock:
+            if sources == self._sources:
+                return
+            agents = tuple(
+                Agent(
+                    source,
+                    colour=i % COLOURS + 1,
+                    main=i == 0,
+                    base=self._base if i == 0 else f"{self._base}/agentes/{source.slug}",
+                )
+                for i, source in enumerate(sources)
             )
-            for i, source in enumerate(sources)
-        )
-        self._by_slug = {a.slug: a for a in self.agents}
+            self._sources, self.agents = sources, agents
+            self._by_slug = {a.slug: a for a in agents}
 
     @property
     def main(self) -> Agent:
@@ -550,8 +575,11 @@ class Card:
 
 
 def card(agent: Agent, summary: Summary, pending: Sequence[PendingRequest], now: datetime) -> Card:
+    """An agent the service has and is not watching says so, whatever its box last said: "idle"
+    would read as if somebody were looking."""
     mine = tuple(p for p in pending if p.agent == agent.slug)
-    return Card(agent, summary, state_of(summary, len(mine), now), mine)
+    state = state_of(summary, len(mine), now) if agent.source.watched else STOPPED
+    return Card(agent, summary, state, mine)
 
 
 def merged_feed(cards: Sequence[Card], limit: int) -> list[tuple[Agent, Line]]:

@@ -19,6 +19,9 @@ when it is given the service's narrow socket for the web (``--socket-web``, T12c
 only that group and only a closed list of commands. A reader with neither cannot ask and says so.
 ``ControlRewinder.availability`` tells which case this is, without connecting.
 
+Which agent (T26-2d): the page and its form name it, the ticket is bound to it too (the app binds
+"<slug>:<id>"), and the service gets it as ``agent``. Without it, the main one.
+
 Confirmations (``Tickets``): the confirmation page hands out a one-time ticket bound to one
 snapshot id, and only a POST that carries it (plus the session's CSRF token) rewinds. So no
 single request can rewind blindly: the notice has to have been fetched for that very snapshot
@@ -67,7 +70,7 @@ class Rewinder(Protocol):
 
     def availability(self) -> Availability: ...
 
-    def rewind(self, snapshot_id: str) -> dict[str, Any]: ...
+    def rewind(self, snapshot_id: str, *, agent: str | None = None) -> dict[str, Any]: ...
 
 
 class ControlRewinder:
@@ -103,7 +106,8 @@ class ControlRewinder:
             egid=self._egid,
         )
 
-    def rewind(self, snapshot_id: str) -> dict[str, Any]:
+    def rewind(self, snapshot_id: str, *, agent: str | None = None) -> dict[str, Any]:
+        """Rewind ``agent`` (None: the main one). The service decides whether it is one."""
         if not self._enabled:  # the app never gets here without READY; still, never by accident
             raise ControlError("esta web no se lanzó con --rebobinar")
         return ask_rewind(
@@ -114,6 +118,7 @@ class ControlRewinder:
             peer=self._peer,
             server_uid=self._server_uid,
             session=acting_session(self._server_uid),
+            agent=agent,
         )
 
 

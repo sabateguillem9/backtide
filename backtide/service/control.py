@@ -216,6 +216,7 @@ TASK_STATUS_OUTCOMES = frozenset(
     {*(str(outcome) for outcome in TaskOutcome), TASK_UNKNOWN, REFUSED}
 )
 TASK_STOP_OUTCOMES = frozenset({"stopped", "failed", TASK_UNKNOWN, REFUSED})
+MAX_NOTICE_LINES, MAX_NOTICE_LINE = 8, 600  # what `agents` carries of an agent's rewind notice
 TASK_STOP_REPLY_TIMEOUT = 2 * 60.0  # up to three ``pkill`` of 30 s each, inside the agent
 MAX_LISTED_SNAPSHOTS = 5000
 # What is one agent's, and so may say which (T26-2c). The rest is the machine's: a key, a session,
@@ -2324,8 +2325,9 @@ def ask_agents(
     server_uid: int | None = None,
 ) -> list[dict[str, Any]]:
     """The agents the service at ``path`` has (T26-2c), checked: each a dict with its ``slug``,
-    ``name`` (None or a text), ``main``, ``watched`` and ``state``. What does not look like one is
-    dropped. ControlError if the reply makes no sense."""
+    ``name`` (None or a text), ``main``, ``watched``, ``state`` and ``notice`` (the lines of the
+    rewind notice about it, T26-2d). What does not look like one is dropped. ControlError if the
+    reply makes no sense."""
     raw = _ask(
         Path(path),
         {"cmd": "agents"},
@@ -2347,8 +2349,20 @@ def ask_agents(
             and isinstance(item.get("watched"), bool)
             and isinstance(item.get("state"), str | None)
         ):
-            found.append({key: item[key] for key in ("slug", "name", "main", "watched", "state")})
+            found.append(
+                {key: item[key] for key in ("slug", "name", "main", "watched", "state")}
+                | {"notice": _notice_lines(item.get("notice"))}
+            )
     return found
+
+
+def _notice_lines(value: object) -> list[str]:
+    """The lines of a rewind notice as the service sent them, or none if they make no sense."""
+    if not isinstance(value, list) or len(value) > MAX_NOTICE_LINES:
+        return []
+    if not all(isinstance(line, str) and len(line) <= MAX_NOTICE_LINE for line in value):
+        return []
+    return list(value)
 
 
 def _is_agent_name(value: object) -> bool:

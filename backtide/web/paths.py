@@ -19,6 +19,7 @@ from pathlib import Path
 
 from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.service.config import (
+    AGENTS_FOLDER,
     MAX_CONFIG_BYTES,
     STATE_DB,
     STATE_SOCKET,
@@ -41,6 +42,11 @@ class WebPaths:
     agent_lines: tuple[str, ...] = DEFAULT_PROFILE.rewind_notice_lines
     # The domain the web is behind, if any (T26-4a): `[web] public_origin`, the installer's copy.
     public_origin: PublicOrigin | None = None
+
+    def agent_box(self, slug: str) -> Path:
+        """Where another agent's black box is (``ServiceConfig.blackbox_db``). ``slug`` comes from
+        the service's list, checked to be a slug (``backtide.web.live``)."""
+        return self.blackbox_db.parent / AGENTS_FOLDER / slug / STATE_DB
 
     @classmethod
     def from_file(cls, path: Path) -> "WebPaths":

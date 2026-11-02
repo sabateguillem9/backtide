@@ -13,6 +13,9 @@ in, and the tests never ran under the unit. So the service here is the real one:
 - ``--grupo-web`` with a group that has no account: the case where the narrow socket has only the
   group and its forbidden ids to go by.
 - ``cli``: `backtide` itself, as the owner runs it (T26-2c).
+- ``Web``: `backtide web` itself, with the group and the narrow socket of the installed one, and
+  a browser's requests (T26-2d). The main agent's box is given to that group by hand: on an
+  installation the installer does it, and here nothing does.
 
 It is not an installation (install.sh never runs in vigia-dev, and the clean VM is someone else's):
 Python and the code come from the dev environment, bind-mounted where ``ProtectHome`` leaves them.
@@ -22,15 +25,20 @@ bridges would forward out while the lab is up (invariant 8; the same rule as ins
 Everything is the lab's and goes at the end: unit, mounts, containers, networks, groups, folders.
 """
 
+import html
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import httpx2 as httpx
 
 from backtide.jail import identity
 from backtide.jail.config import AGENT_UID
@@ -41,7 +49,7 @@ from backtide.jail.proxy_config import (
     PROXY_UID,
     channel_tmpfs_options,
 )
-from backtide.service.config import STATE_SOCKET
+from backtide.service.config import STATE_DB, STATE_SOCKET, STATE_WEB_SOCKET
 from backtide.setup import layout, units
 
 REPO = Path(__file__).resolve().parents[2]
@@ -250,6 +258,104 @@ class Lab:
         sudo("nft", "delete", "table", "inet", NFT_TABLE, check=False)
 
 
+class Web:
+    """The real `backtide web` as the installed one runs: not root, the web's group as its only
+    group, on the narrow socket, on a port of its own. ``client`` is a browser without a session
+    until ``sign_in``: the service gives the link, as `sudo backtide enlace` does."""
+
+    def __init__(self, lab: Lab) -> None:
+        self.lab = lab
+        self.url = ""
+        self.cookie = ""
+        box = str(STATE / STATE_DB)
+        sudo(
+            "sh", "-c",
+            f'for f in "{box}" "{box}-wal" "{box}-shm"; do [ -e "$f" ] || continue; '
+            f'chgrp {WEB_GROUP} "$f"; chmod 0640 "$f"; done',
+        )  # fmt: skip
+        self.process = subprocess.Popen(  # noqa: S603 - the lab's own program
+            [
+                "sudo", "-n", "setpriv", "--reuid", str(os.getuid()), "--regid", str(lab.web_gid),
+                "--clear-groups", "--", str(BIN / "backtide"), "web", "--config", str(CONFIG),
+                "--socket-web", str(STATE / STATE_WEB_SOCKET), "--port", "0", "--rebobinar",
+                "--aprobar", "--ajustes",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )  # fmt: skip
+        said: list[str] = []
+        reader = threading.Thread(target=self._read, args=(said,), daemon=True)
+        reader.start()
+        try:
+            wait(lambda: bool(self.url), 60, "the web's address", lambda: "\n".join(said))
+        except BaseException:  # left alive it would hold the lab's mounts for the next run
+            self._stop()
+            raise
+        self.client = httpx.Client(base_url=self.url, timeout=60)
+
+    def _read(self, said: list[str]) -> None:
+        for line in self.process.stdout or ():
+            said.append(line)
+            found = re.search(r"http://127\.0\.0\.1:[0-9]+/s/[A-Za-z0-9_-]+", line)
+            if found:
+                self.url = found[0]
+
+    def sign_in(self) -> None:
+        token = self.lab.helper("link", str(STATE / STATE_SOCKET))["token"]
+        entered = self.client.get("/", params={"t": token})
+        assert entered.status_code == 200, entered.text[:300]
+        self.cookie = entered.cookies["backtide_web"]
+
+    def get(self, path: str, *, signed_in: bool = True) -> httpx.Response:
+        headers = {"cookie": f"backtide_web={self.cookie}"} if signed_in else {}
+        self.client.cookies.clear()
+        return self.client.get(path, headers=headers)
+
+    def post(self, path: str, fields: dict[str, str], *, signed_in: bool = True) -> httpx.Response:
+        headers = {"origin": self.url.split("/s/")[0], "sec-fetch-site": "same-origin"}
+        if signed_in:
+            headers["cookie"] = f"backtide_web={self.cookie}"
+        self.client.cookies.clear()
+        # A rewind is answered when it ends: stopping the agent alone can take 30 s. As `Lab.cli`.
+        return self.client.post(path, data=fields, headers=headers, timeout=180)
+
+    def read_stream(self, path: str, until: str, seconds: float) -> str:
+        """What the stream sends until ``until`` shows up or the time is over."""
+        got = ""
+        deadline = time.monotonic() + seconds
+        headers = {"cookie": f"backtide_web={self.cookie}"}
+        self.client.cookies.clear()
+        try:
+            with self.client.stream("GET", path, headers=headers, timeout=seconds + 5) as stream:
+                for line in stream.iter_lines():
+                    got += line + "\n"
+                    if until in got or time.monotonic() > deadline:
+                        break
+        except httpx.ReadTimeout:
+            pass
+        return got
+
+    def close(self) -> None:
+        self.client.close()
+        self._stop()
+
+    def _stop(self) -> None:
+        sudo("kill", str(self.process.pid), check=False)
+        try:
+            self.process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            sudo("kill", "-9", str(self.process.pid), check=False)
+
+
+def form_in(page: str) -> dict[str, str]:
+    """The hidden fields of a confirmation."""
+    return {
+        name: html.unescape(value)
+        for name, value in re.findall(r'<input type="hidden" name="(\w+)" value="([^"]*)"', page)
+    }
+
+
 _UNMOUNT_ALL = (
     f"findmnt -rn -o TARGET | grep -E '^({LAB}|{OPT})' | sort -r | while read -r point; do "
     'umount "$point"; done'
@@ -280,10 +386,10 @@ def _write_as_root(path: Path, text: str, mode: str = "0644") -> None:
     )
 
 
-def _make_volume(image: Path, mount: Path) -> None:
+def _make_volume(image: Path, mount: Path, *, mode: str = "0600") -> None:
     """As the installer does (backtide/setup/volume.py): sparse, squota, loop, 0700."""
     sudo("truncate", "-s", str(VOLUME_SIZE), str(image))
-    sudo("chmod", "0600", str(image))
+    sudo("chmod", mode, str(image))
     sudo("mkfs.btrfs", "-q", "-O", "squota", str(image))
     sudo("mkdir", "-p", str(mount))
     sudo("mount", "-o", "loop,noatime,nosuid,nodev", str(image), str(mount))
@@ -388,7 +494,9 @@ def open_lab(*, telegram: str | None = None) -> Lab:
             "0600",
         )
         _make_volume(STATE / "volume.img", MAIN_VOLUME)
-        _make_volume(OTHER.box / "volume.img", OTHER.volume)
+        # By hand, as nothing makes them yet (T26-6a), and with the umask of a person: what the
+        # service closes before the web's group goes through this folder (T26-2d).
+        _make_volume(OTHER.box / "volume.img", OTHER.volume, mode="0644")
         sudo("mkdir", "-p", str(STATE / "proxy-channel"))
         for channel, uid, gid in (
             (STATE / "proxy-channel", PROXY_UID, PROXY_GID),
@@ -412,4 +520,4 @@ def open_lab(*, telegram: str | None = None) -> Lab:
     return lab
 
 
-__all__ = ["LAB", "MAIN", "OTHER", "Lab", "layout", "open_lab"]
+__all__ = ["LAB", "MAIN", "OTHER", "Lab", "Web", "form_in", "layout", "open_lab"]

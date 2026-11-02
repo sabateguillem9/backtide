@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from backtide.jail.config import AGENT_GID, AGENT_UID
-from backtide.jail.identity import AGENT_ID_RANGE
+from backtide.jail.identity import AGENT_ID_RANGE, MAIN_SLUG
 from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
 from backtide.service.control import (
     LINK_CLOSED,
@@ -361,6 +361,8 @@ class WebControlServer(ControlServer):
             refused = self._unlisted(desk, request)
             if refused is not None:
                 return refused
+        if command == "trust":
+            _warn_trust(desk, pid)
         return super()._agent_command(command, request, pid, uid, desk, named=named)
 
     def _signed_in(
@@ -691,17 +693,14 @@ class WebControlServer(ControlServer):
 
     @staticmethod
     def _warn_lasting(command: str, request: dict[str, Any], pid: int) -> None:
-        """Changes that outlast the web (review of T12c, M1): who gets the alerts (Telegram) and
-        a recipient trusted for good. A WARNING, which the log bridge records and sends over the
-        alert channel there is NOW (a new Telegram only applies at the next restart), so the
-        owner hears of it even if it was not them."""
-        if command == "trust" or (
-            command in ("set_secret", "clear_secret") and request.get("kind") == "telegram"
-        ):
+        """A change that outlasts the web (review of T12c, M1): who gets the alerts (Telegram). A
+        WARNING, which the log bridge records and sends over the alert channel there is NOW (a new
+        Telegram only applies at the next restart), so the owner hears of it even if it was not
+        them. The other one, a recipient trusted for good, is an agent's: ``_warn_trust``."""
+        if command in ("set_secret", "clear_secret") and request.get("kind") == "telegram":
             logger.warning(
-                "web socket: the web asked %s (pid %d); if it was not you, check Settings and "
-                "the trusted recipients",
-                "to trust a recipient" if command == "trust" else "to change Telegram",
+                "web socket: the web asked to change Telegram (pid %d); if it was not you, check "
+                "Settings and the trusted recipients",
                 pid,
             )
 
@@ -724,6 +723,18 @@ class WebControlServer(ControlServer):
             else "Esa instantánea no está en la lista del volumen: no se ha hecho nada."
         )
         return _reply_of(RewindOutcome(RewindStatus.INVALID, target="", message=message))
+
+
+def _warn_trust(desk: Desk, pid: int) -> None:
+    """A recipient trusted for good: the warning of ``_warn_lasting``, written while this thread
+    works for that agent, so it reaches that agent's black box (T26-2d), and saying whose."""
+    whose = "" if desk.slug == MAIN_SLUG else f" of the agent {desk.slug}"
+    logger.warning(
+        "web socket: the web asked to trust a recipient%s (pid %d); if it was not you, check "
+        "Settings and the trusted recipients",
+        whose,
+        pid,
+    )
 
 
 def _ask_session(

@@ -122,6 +122,8 @@ logger = logging.getLogger(__name__)
 SYSTEMD_RUN_MARK = "INVOCATION_ID"  # systemd sets it for every service it runs
 NEIGHBOURS_STOP = 110.0  # under the unit's TimeoutStopSec, which ends it all at 120
 _FAILED_AGENT_CHARS = 300
+# What the web's group has of another agent's black box (T26-2d), as of the main one's (D25).
+WEB_FOLDER_MODE, WEB_BOX_MODE = 0o710, 0o640
 _INSTALLATION_BOX = (
     threading.Lock()
 )  # one writer: agents may fail at once, and its key is made once
@@ -331,6 +333,110 @@ def _box_at(db: Path, key_path: Path, checkpoint: Path) -> BlackBox:
             )
         key = create_key(key_path)
     return BlackBox(db, key, checkpoint_path=checkpoint)
+
+
+def share_box_with_web(config: ServiceConfig, group: int) -> None:
+    """Let the web's group read the black box of an agent other than the main one (T26-2d; D25, as
+    the installer does for the main one): its database and SQLite's -wal and -shm, which copy their
+    owner and mode, root's 0640 with that group, and its folders 0710, to go through and not to
+    list. Done each time it starts: the service owns these folders, and nothing else tends them.
+
+    The agent's folder has been 0700, so something in it may be open and nobody knew (an image made
+    by hand with umask 022 is 0644). All of that is closed first (``_close_to_the_web``). Only then
+    does the group get to go through. What cannot be closed leaves the folder 0700.
+
+    Whatever fails is said, and nothing is opened: the web cannot read that box, and says so. Never
+    a reason for this to stop what comes next, which decides what to do with a box that cannot be
+    used (``build_guardian`` stops an agent it cannot record)."""
+    try:
+        _close_to_the_web(config, group)
+        for folder in (config.agents_dir, config.agent_dir):
+            _open_to_group(folder, group, WEB_FOLDER_MODE, stat.S_ISDIR)
+        open_black_box(config)  # the key comes before the box, or the box would be refused
+        db = config.blackbox_db
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            os.close(os.open(db, flags, 0o600))
+        except FileExistsError:
+            pass
+        for path in _box_files(db):
+            try:
+                _open_to_group(path, group, WEB_BOX_MODE, stat.S_ISREG)
+            except FileNotFoundError:
+                continue
+    except (OSError, BlackBoxError) as error:
+        logger.error(
+            "the web cannot be given the black box of the agent %s: %s", config.slug, error
+        )
+        _close_folder(config.agent_dir)
+
+
+def _box_files(db: Path) -> tuple[Path, Path, Path]:
+    return db, db.with_name(f"{db.name}-wal"), db.with_name(f"{db.name}-shm")
+
+
+def bits_for_the_web(mode: int, gid: int, group: int) -> int:
+    """The bits of ``mode`` that let the web's group in. A folder of the agent's or the proxy's
+    group (0750) lets it in by nothing: that group is theirs, and they need it."""
+    return mode & (0o077 if gid == group else 0o007)
+
+
+def _close_to_the_web(config: ServiceConfig, group: int) -> None:
+    """What is directly in the agent's folder and open to the web's group stops being, but for the
+    box and the agent's CA (0755: the certificate alone, as on the main agent's, which the agent
+    reads). Never followed. OSError for what it cannot judge or close: a link, or not a file or a
+    folder. Below these it does not go: nobody gets past a folder that lets them in by nothing."""
+    allowed = {path.name for path in _box_files(config.blackbox_db)} | {config.agent_ca_dir.name}
+    folder = os.open(config.agent_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        with os.scandir(folder) as entries:
+            names = [entry.name for entry in entries]
+        for name in names:
+            if name not in allowed:
+                _close_one(name, folder, group)
+    finally:
+        os.close(folder)
+
+
+def _close_one(name: str, folder: int, group: int) -> None:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=folder)
+    try:
+        info = os.fstat(fd)
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise OSError(errno.EPERM, f"{name} is neither a file nor a folder")
+        mode = stat.S_IMODE(info.st_mode)
+        extra = bits_for_the_web(mode, info.st_gid, group)
+        if extra:
+            os.fchmod(fd, mode & ~extra)
+            logger.warning(
+                "%s, in the folder of an agent, was open to the web's group: it is %04o now",
+                name,
+                mode & ~extra,
+            )
+    finally:
+        os.close(fd)
+
+
+def _close_folder(path: Path) -> None:
+    """Back to 0700, if it is still a folder of ours: it was shared at an earlier start."""
+    try:
+        _open_to_group(path, -1, 0o700, stat.S_ISDIR)
+    except OSError as error:
+        logger.error("the folder %s could not be closed to the web: %s", path, error)
+
+
+def _open_to_group(path: Path, group: int, mode: int, is_right_kind: Callable[[int], bool]) -> None:
+    """``path`` with this group (-1: the one it has) and this mode, if it is what it should be and
+    ours. Never followed. OSError otherwise."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not is_right_kind(info.st_mode) or info.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, f"{path} is not what it should be, or not ours")
+        os.fchown(fd, -1, group)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
 
 
 def load_rules(config: ServiceConfig) -> RuleSet:
@@ -977,10 +1083,12 @@ class _Neighbours:
         roster: Roster | None = None,
         spend_total: SharedSpend | None = None,
         telegram: Mapping[str, TelegramNeighbour] | None = None,
+        web_group: int | None = None,
     ) -> None:
         self._roster = roster
         self._telegram = telegram or {}
         self._spend_total = spend_total
+        self._web_group = web_group
         self._main = main
         self._others = others
         self._notifier_for = notifier_for
@@ -1024,6 +1132,8 @@ class _Neighbours:
             record_agent_failed(self._main, self._told, config.slug, error)
 
     def _serve_one(self, config: ServiceConfig) -> None:
+        if self._web_group is not None:
+            share_box_with_web(config, self._web_group)
         built: list[Egress] = []
         secrets = LiveScrub()
         telegram = self._telegram.get(config.slug)
@@ -1087,6 +1197,7 @@ def _desk_of(
         waiting=None if egress is None else egress.waiting,
         snapshots=lambda: listing.snapshots(),
         name=config.display_name,
+        notice=config.agent_profile.rewind_notice_lines,
     )
 
 
@@ -1275,6 +1386,7 @@ def serve(
                 roster=roster,
                 spend_total=spend_total,
                 telegram={} if telegram is None else telegram.neighbours,
+                web_group=web_group,
             )
             reload_keys = reload_everyones_keys(reload_keys, neighbours.reloads)
         settings_service = Settings(
