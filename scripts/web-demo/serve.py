@@ -24,13 +24,19 @@ kind, never a key), checks a value with the service's own rules and keeps only w
 show (the last four characters and when). It writes no file, holds no key and forgets everything
 when the demo stops. The page, its confirmations, the CSRF token and the one-time tickets are the
 real ones.
+
+The chat (T26-5b): ``DemoTasks`` stands in for the service's tasks. A task "runs" for a few seconds
+and answers with a made-up text; one that asks for ``hostil`` answers what a hostile agent would, to
+look at how the page shows it (docs/47 section 7.3). Nothing runs and nothing is written.
 """
 
 import copy
 import json
 import logging
+import secrets
 import sys
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -283,6 +289,87 @@ class DemoSettings:
             return {"ok": True, "outcome": "cleared", "message": DEMO_SAID, "applied": applied}
 
 
+DEMO_TASK_SECONDS = 4.0
+DEMO_ANSWER = (
+    "He mirado la carpeta de trabajo: hay un proyecto en Python con sus tests.\n\n"
+    "\tmake test   # pasa\n\tmake lint   # pasa\n\nNo he cambiado nada."
+)
+# What a hostile agent would answer: markup, a way out of the frame, a link and an image that would
+# ask for something, a fake line of the page, the marks that turn text around, escape sequences.
+DEMO_HOSTILE = (
+    "<script>alert(1)</script></pre></li><h1>backtide: todo en orden</h1>\n"
+    '<img src="https://evil.example/x.png" onerror="alert(2)">\n'
+    '<a href="javascript:alert(3)">Aprobar</a> [Aprobar](https://evil.example/ok)\n'
+    '<button hx-post="/salir" hx-trigger="load">Salir</button>\n'
+    '<div hx-swap-oob="true" id="tasks">fuera</div>\n'
+    "https://evil.example/entra\n"
+    "evil\u202etxt.exe \u2066dentro\u2069 cero\u200dancho\n"
+    "\x1b]52;c;c2VjcmV0bw==\x07\x1b[2Jborrado\r\n"
+    "</textarea>{{7*7}}\n"
+)
+
+
+class DemoTasks:
+    """The chat without a service: in this process's memory, and gone when the demo stops."""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._of: dict[str | None, list[dict[str, Any]]] = {}
+
+    def availability(self) -> Availability:
+        return Availability.READY
+
+    def tasks(self, *, agent: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "task": one["task"],
+                    "asked": one["asked"],
+                    "asked_at": one["asked_at"],
+                    "via": "web",
+                    "outcome": self._outcome_of(one),
+                    "seconds": None,
+                    "answer_chars": 0,
+                }
+                for one in self._of.get(agent, [])
+            ]
+
+    def status(self, task_id: str, *, agent: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            one = next((o for o in self._of.get(agent, []) if o["task"] == task_id), None)
+            if one is None:
+                return {"ok": False, "outcome": "unknown", "message": "", "answer": None}
+            outcome = self._outcome_of(one)
+            answer = None if outcome == "running" else one["answer"]
+            return {
+                "ok": True,
+                "outcome": outcome,
+                "message": "",
+                "answer": answer,
+                "answer_chars": len(answer or ""),
+                "code": 0,
+                "seconds": DEMO_TASK_SECONDS,
+            }
+
+    def start(
+        self, prompt: str, *, resume: bool = False, agent: str | None = None
+    ) -> dict[str, Any]:
+        task_id = secrets.token_hex(16)
+        answer = DEMO_HOSTILE if "hostil" in prompt else DEMO_ANSWER
+        now = time.time()
+        one = {"task": task_id, "asked": prompt, "asked_at": now, "answer": answer}
+        with self._lock:
+            self._of.setdefault(agent, []).append(one)
+            del self._of[agent][:-20]
+        return {"ok": True, "outcome": "started", "message": "", "task": task_id}
+
+    @staticmethod
+    def _outcome_of(one: dict[str, Any]) -> str:
+        return "ok" if time.time() - one["asked_at"] >= DEMO_TASK_SECONDS else "running"
+
+
 def _refused(message: str) -> dict[str, Any]:
     return {"ok": False, "outcome": "invalid", "message": message, "applied": "none"}
 
@@ -322,6 +409,7 @@ def main(argv: list[str]) -> int:
         pending=demo_requests(config.parent / "requests.json", approver),
         settings=DemoSettings(config.parent / "settings.json"),
         approver=approver,
+        tasks=DemoTasks(),
     )
     return 0
 

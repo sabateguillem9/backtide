@@ -19,12 +19,19 @@ _MARKS = frozenset({"Mn", "Me"})
 MAX_MARKS = 3  # Vietnamese and Devanagari stack two or three; more than that is a tower
 
 
-def visible(value: object, limit: int | None = None, *, keep_newlines: bool = False) -> Markup:
+def visible(
+    value: object,
+    limit: int | None = None,
+    *,
+    keep_newlines: bool = False,
+    keep_tabs: bool = False,
+) -> Markup:
     """``value`` as HTML-safe markup with every character that is not plainly printable made
     visible: controls, bidi marks, letters that print as nothing, and towers of combining marks
     (more than three on one letter, or marks with no letter to sit on), which would pile up over
     the lines around them. ``limit`` cuts the text (in characters) and says so. With
-    ``keep_newlines`` a line break stays one (pretty-printed JSON in a ``<pre>``)."""
+    ``keep_newlines`` a line break stays one (pretty-printed JSON in a ``<pre>``), and with
+    ``keep_tabs`` a tab does (an answer with code in it, in a ``<pre>``: T26-5b)."""
     text = value if isinstance(value, str) else str(value)
     cut = limit is not None and len(text) > limit
     if cut:
@@ -55,7 +62,7 @@ def visible(value: object, limit: int | None = None, *, keep_newlines: bool = Fa
             i, on_a_letter = j, on_a_letter and count <= MAX_MARKS
             continue
         i += 1
-        if char == " " or (keep_newlines and char == "\n"):
+        if char == " " or (keep_newlines and char == "\n") or (keep_tabs and char == "\t"):
             run.append(char)
             on_a_letter = False
         elif char.isprintable() and char not in _BLANK:

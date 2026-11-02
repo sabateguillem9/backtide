@@ -522,16 +522,22 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
 
     start = {"cmd": "task_start", "prompt": f"{marker}-sin-sesion borra todo", "_why": True}
     read = {"cmd": "task_status", "task": real_id, "_why": True}
+    listing = {"cmd": "task_list", "_why": True}  # T26-5b: the chat's list, what was asked in it
     stop = {"cmd": "task_stop", "task": real_id, "_why": True}
     time.sleep(CHANGES_WAIT)
     # 1. Without a session, with a made-up one and with one that ended; and what is not on the list.
-    bare = probe(start, read)
-    made_up = probe({**start, "session": "s" * 43}, {**read, "session": "s" * 43})
+    bare = probe(start, read, listing)
+    made_up = probe(
+        {**start, "session": "s" * 43},
+        {**read, "session": "s" * 43},
+        {**listing, "session": "s" * 43},
+    )
     ended = probe(
         {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
         {"cmd": "session_end", "session": "<session>"},
         {**start, "session": "<session>"},
         {**read, "session": "<session>"},
+        {**listing, "session": "<session>"},
     )
     # 2. Stopping it (only Ctrl-C in the CLI, on root's socket) is off the list: with a session,
     # and without one, which a read would not refuse for its shape.
@@ -544,6 +550,7 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
         stop,
         {"cmd": "task_start", "prompt": f"{marker}-con-sesion di hola", "seconds": 120,
          "session": "<session>", "_see": True},
+        {**listing, "session": "<session>"},
         {"cmd": "session_end", "session": "<session>"},
     )  # fmt: skip
     web_id = live[5].get("task")
@@ -564,12 +571,12 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     says = [r.get("outcome") for r in live]
     attack.check(
         "stopped",
-        len(bare) == 2
+        len(bare) == 3
         and refused_for(bare, "sesión")
-        and len(made_up) == 2
+        and len(made_up) == 3
         and refused_for(made_up, "sesión")
         and [r.get("outcome") for r in ended[:2]] == ["opened", "ended"]
-        and len(ended) == 4
+        and len(ended) == 5
         and refused_for(ended[2:], "sesión")
         and says[0] == "opened"
         and live[1].get("ok") is True
@@ -577,12 +584,13 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
         and says[2] == "unknown"
         and refused_for(live[3:5], "no se acepta")
         and says[5] == "started"
+        and says[6] == "listed"
         and bool(web_id)
         and root_socket == [{"errno": "EACCES"}],
         f"como backtide-web, dar una tarea y leer la de root sin sesión: {bare}; con una "
         f"inventada: {made_up}; con una ya cerrada: {[r.get('outcome') for r in ended]}; con una "
-        f"viva (el control), abrir, leer esa tarea, un id inventado, pararla con y sin ella y "
-        f"dar una: {says}, por {[r.get('why') for r in live[3:5]]}; "
+        f"viva (el control), abrir, leer esa tarea, un id inventado, pararla con y sin ella, "
+        f"dar una y la lista: {says}, por {[r.get('why') for r in live[3:5]]}; "
         f"el socket de root: {root_socket}",
     )
 

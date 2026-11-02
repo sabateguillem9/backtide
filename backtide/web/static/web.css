@@ -836,3 +836,38 @@ h1 {
   .snaprow.is-previewing .snapinfo { transform: translateX(var(--space-2)); }
 }
 .is-hidden *, .is-hidden *::before, .is-hidden *::after { animation-play-state: paused !important; }
+
+/* -- the chat (T26-5b, docs/47 section 7.3) ----------------------------------------------------
+   What the agent wrote sits in its own frame, in the mono face, under a label of ours, with its
+   height bounded: it can neither look like this page nor push the rest of it away. */
+.talk-form { margin-top: var(--space-6); max-width: var(--measure); }
+.talk-input {
+  display: block; width: 100%; min-height: 6rem; padding: 0.625rem 0.875rem; resize: vertical;
+  font: var(--type-body-ui-weight) var(--type-body-ui-size)/1.4 var(--font-sans); color: var(--ink);
+  background: var(--paper); border: var(--stroke-hair) solid var(--edge); border-radius: var(--radius-m);
+}
+.talk-input::placeholder { color: var(--ink-muted); opacity: 1; }
+.talk-input:hover { border-color: var(--ink-muted); }
+.talk-input:focus-visible { border-color: var(--ink); outline-offset: 2px; }
+.talk-input[aria-invalid="true"] { border-color: var(--danger); }
+.talk-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3) var(--space-6); margin-top: var(--space-3); }
+.talk-resume { display: inline-flex; align-items: center; gap: var(--space-2); min-height: var(--size-target); font-size: var(--type-label-size); color: var(--ink-soft); cursor: pointer; }
+.talk-resume input { width: 1.125rem; height: 1.125rem; margin: 0; accent-color: var(--ink); }
+.talk-error { margin: var(--space-4) 0 0; max-width: var(--measure); font-size: var(--type-label-size); line-height: var(--type-caption-leading); color: var(--danger); }
+.talk-live { margin-top: var(--space-8); }
+.talk-list { list-style: none; margin: var(--space-4) 0 0; padding: 0; border-top: var(--stroke-hair) solid var(--line); }
+.talk-list:has(li) + .empty { display: none; }
+.task { padding: var(--space-5) 0; border-bottom: var(--stroke-hair) solid var(--hair); }
+.task-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--space-2); margin: 0; font-size: var(--type-label-size); line-height: var(--type-caption-leading); color: var(--ink-muted); }
+.task-word { font-weight: var(--type-label-weight); color: var(--ink); }
+.task-head .status-dot { margin-right: var(--space-1); }
+.task-part { margin-top: var(--space-3); }
+.task-label { margin: 0 0 var(--space-1); font-size: var(--type-caption-size); line-height: var(--type-caption-leading); color: var(--ink-muted); }
+.task-asked { margin: 0; font: var(--type-body-ui-weight) var(--type-body-ui-size)/1.45 var(--font-sans); color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-text {
+  margin: 0; max-height: 28rem; overflow: auto; padding: var(--space-3) var(--space-4);
+  font: var(--type-code-weight) var(--type-caption-size)/var(--type-code-leading) var(--font-mono); color: var(--ink);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--band); border: var(--stroke-hair) solid var(--hair); border-radius: var(--radius-m);
+}
+.task-text .esc { font-family: var(--font-sans); }

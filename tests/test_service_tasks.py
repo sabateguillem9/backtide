@@ -21,6 +21,7 @@ from backtide.jail.profiles.claude_code import CLAUDE
 from backtide.service import tasks as tasks_module
 from backtide.service.shell import ShellOutcome, ShellStatus
 from backtide.service.tasks import (
+    ASKED_CHARS,
     GRACE,
     MAX_KEPT,
     MAX_KEPT_CHARS,
@@ -652,6 +653,108 @@ def test_what_is_kept_has_a_cap_in_size(monkeypatch: pytest.MonkeyPatch, lab: La
     bigger = lab.start()
     assert lab.settled(bigger).answer == "c" * 2000
     assert lab.tasks.status(new) is None
+
+
+def test_what_brought_no_answer_goes_before_any_answer(lab: Lab) -> None:
+    """T26-5b: twenty refusals in a row must not push out the answers somebody came to read."""
+    lab.container.results = [answer("la que importa")]
+    kept = lab.start()
+    lab.settled(kept)
+    lab.outcome = ShellOutcome(ShellStatus.NOT_RUNNING, "en pausa")
+    refused = []
+    for _ in range(MAX_KEPT + 3):
+        refused.append(lab.start())
+        lab.settled(refused[-1])
+    assert lab.tasks.status(kept).answer == "la que importa"
+    assert lab.tasks.status(refused[-1]).outcome is TaskOutcome.REFUSED  # the last always stays
+    assert lab.tasks.status(refused[0]) is None
+    assert len(lab.tasks.listing()) == MAX_KEPT
+
+
+def test_a_refusal_goes_before_an_older_answer_only_when_there_are_too_many(lab: Lab) -> None:
+    lab.outcome = ShellOutcome(ShellStatus.NOT_RUNNING, "en pausa")
+    refused = lab.start()
+    lab.settled(refused)
+    lab.outcome = READY
+    answers = []
+    for n in range(MAX_KEPT - 1):
+        lab.container.results = [answer(f"respuesta {n}")]
+        answers.append(lab.start())
+        lab.settled(answers[-1])
+    assert lab.tasks.status(refused) is not None  # twenty so far: nothing goes yet
+    lab.container.results = [answer("otra")]
+    lab.settled(lab.start())
+    assert lab.tasks.status(refused) is None
+    assert all(lab.tasks.status(one) is not None for one in answers)
+
+
+def test_past_the_size_the_oldest_goes_even_with_a_refusal_around(
+    monkeypatch: pytest.MonkeyPatch, lab: Lab
+) -> None:
+    """A refusal measures nothing: taking it out would not bring the size down."""
+    monkeypatch.setattr(tasks_module, "MAX_KEPT_CHARS", 1000)
+    lab.container.results = [answer("a" * 600)]
+    big = lab.start()
+    lab.settled(big)
+    lab.outcome = ShellOutcome(ShellStatus.NOT_RUNNING, "en pausa")
+    refused = lab.start()
+    lab.settled(refused)
+    lab.outcome = READY
+    lab.container.results = [answer("b" * 600)]
+    lab.settled(lab.start())
+    assert lab.tasks.status(big) is None and lab.tasks.status(refused) is not None
+
+
+# --- the chat's list (T26-5b) -------------------------------------------------------------------
+
+
+def test_the_list_says_what_was_asked_and_how_each_goes_in_order(lab: Lab) -> None:
+    hold = threading.Event()
+    lab.container.results = [answer("ya"), hold, answer("luego")]
+    first = lab.start("uno", requested_by="web (uid 5, pid 6)")
+    lab.settled(first)
+    second = lab.start("dos", requested_by="cli (uid 0, pid 1)")
+    assert lab.container.entered.acquire(timeout=WAIT)
+    one, two = lab.tasks.listing()
+    assert (one.task_id, one.asked, one.via, one.outcome) == (first, "uno", "web", TaskOutcome.OK)
+    assert one.answer_chars == 2 and one.seconds is not None and one.asked_at > 0
+    assert (two.task_id, two.asked, two.via) == (second, "dos", "cli")
+    assert two.outcome is TaskOutcome.RUNNING and two.answer_chars == 0
+    hold.set()
+    lab.settled(second)
+
+
+def test_the_list_never_has_an_answer(lab: Lab) -> None:
+    lab.container.results = [answer(SECRET_ANSWER)]
+    lab.settled(lab.start())
+    assert SECRET_ANSWER not in repr(lab.tasks.listing())
+
+
+def test_the_list_strikes_what_was_asked_and_then_cuts_it(lab: Lab) -> None:
+    """A secret said in a prompt is never kept once it has run, and a secret at the cut's edge is
+    struck whole: in that order, as in the black box."""
+    secret = "sk-ant-api03-" + "A1b2C3d4" * 8
+    lab.container.results = [answer("ok")]
+    task_id = lab.start("usa " + secret + " y ya")
+    lab.settled(task_id)
+    (entry,) = lab.tasks.listing()
+    assert secret not in entry.asked and "usa " in entry.asked and "y ya" in entry.asked
+    lab.container.results = [answer("ok")]
+    edge = lab.start("x" * (ASKED_CHARS - 10) + " " + secret)
+    lab.settled(edge)
+    cut = lab.tasks.listing()[-1].asked
+    assert len(cut) == ASKED_CHARS + 1 and cut.endswith("…") and "sk-ant" not in cut
+
+
+def test_what_the_list_keeps_counts_for_the_size(monkeypatch: pytest.MonkeyPatch, lab: Lab) -> None:
+    monkeypatch.setattr(tasks_module, "MAX_KEPT_CHARS", 100)
+    lab.container.results = [answer("a")]
+    old = lab.start("p" * 60)
+    lab.settled(old)
+    lab.container.results = [answer("b")]
+    new = lab.start("q" * 60)
+    lab.settled(new)
+    assert lab.tasks.status(old) is None and lab.tasks.status(new) is not None
 
 
 def test_the_prompt_is_not_kept_past_its_run(lab: Lab) -> None:

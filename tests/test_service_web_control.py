@@ -36,7 +36,7 @@ from backtide.service.control import (
 from backtide.service.sessions import IDLE_SECONDS, Sessions
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
 from backtide.service.spend import CapOutcome
-from backtide.service.tasks import TaskOutcome, TaskStart, TaskStatus
+from backtide.service.tasks import TaskEntry, TaskOutcome, TaskStart, TaskStatus
 from backtide.service.web_control import (
     CHANGES,
     COMMANDS,
@@ -1907,6 +1907,28 @@ def test_the_web_cannot_stop_a_task_nor_open_the_old_way(
     request = signed({"cmd": "shell", "kind": "session", "continue": False})
     assert talk(server, request)["outcome"] == "refused"
     assert tasks.stopped == []
+
+
+def test_the_list_of_tasks_takes_a_live_session_and_does_not_keep_it_alive(
+    make_server: Callable[..., WebControlServer], tasks: Tasks, guardian: FakeGuardian
+) -> None:
+    """T26-5b: the chat's stream asks this every second, and what was asked is not in the box."""
+    guardian.task_list = lambda: [  # type: ignore[attr-defined]
+        TaskEntry(TASK_ID, "di hola", 1.0, "web", TaskOutcome.RUNNING)
+    ]
+    now = [0.0]
+    sessions = Sessions(clock=lambda: now[0])
+    sessions.preset(SESSION)
+    server = make_server(sessions=sessions)
+    for carried in ({}, {"session": "x" * 43}, {"session": 7}):
+        reply = talk(server, {"cmd": "task_list", **carried})
+        assert reply["outcome"] == "refused" and "sesión" in reply["message"]
+    for _ in range(2):
+        now[0] += IDLE_SECONDS / 2 - 1
+        reply = talk(server, signed({"cmd": "task_list"}))
+        assert reply["ok"] is True and reply["tasks"][0]["asked"] == "di hola"
+    now[0] += 10
+    assert talk(server, signed({"cmd": "task_list"}))["outcome"] == "refused"
 
 
 def test_reading_an_answer_does_not_keep_a_session_alive(

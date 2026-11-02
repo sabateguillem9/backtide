@@ -412,6 +412,7 @@ The web view is read-only unless you switch things on. Each switch is a flag of 
 | `--rebobinar` | off | Rewind from the Snapshots page (with the notice and a confirmation) |
 | `--aprobar` | off | Approve, reject and trust from the Requests page (each behind a confirmation) |
 | `--ajustes` | off | Changes on the Settings page |
+| `--tareas` | off | Giving each agent tasks and reading its answers on its Hablar page. The answers stay in the service's memory, the last 20 per agent, and are lost when it restarts: nothing of them goes to a file or to the black box |
 | `--puerto N` | `8765` | The port, on `127.0.0.1` only (`0`: a free one) |
 
 All details of the command are in the [command-line reference](cli-reference.md#backtide-web). The web only listens on `127.0.0.1`; it is never exposed to the network. As root it refuses to start unless a flag is given.

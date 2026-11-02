@@ -43,9 +43,9 @@ The socket:
   one: a web taken over cannot change anything on its own. A WARNING on every refusal; every
   new session and every "close them all" goes to the black box and is alerted, one by one
   (``on_entry``: ``Guardian.web_access``).
-- The tasks (T26-5a): ``task_start`` is a change, and ``task_status`` a read that takes a live
-  session too, because it returns answers that are not in the black box. ``task_stop`` is not on
-  the list: only the CLI's Ctrl-C asks it, on the control socket.
+- The tasks (T26-5a): ``task_start`` is a change, and ``task_status`` and ``task_list`` (T26-5b,
+  the chat) reads that take a live session too, because what they return is not in the black box.
+  ``task_stop`` is not on the list: only the CLI's Ctrl-C asks it, on the control socket.
 - The keys (T26-3b-2, T26-3c, T26-3d): registering, listing and touching them, signing in, and
   ``key_remove`` and ``key_rename`` (``_manage_key``): by the whole id, with a key just touched,
   recorded first, and from here never the last key. Root's own ``passkey_remove``, by the end of
@@ -111,7 +111,7 @@ CHANGES = frozenset(
 # A read that takes a live session, unlike READS (T26-5a, docs/47 section 7.1): a task's answer is
 # not in the black box, which the web's group may read anyway. It does not count as using the
 # session: a chat left open, which asks by itself, must not keep the session alive.
-SIGNED_IN_READS = frozenset({"task_status"})
+SIGNED_IN_READS = frozenset({"task_status", "task_list"})
 # The sign-in (T26-3a): opening, checking and ending the web's sessions.
 SESSION_COMMANDS = frozenset(
     {"session_open", "session_password", "session_check", "session_end", "session_end_all"}

@@ -5,6 +5,7 @@ import threading
 import warnings
 from collections.abc import Callable
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,72 @@ class WatchedReader(BoxReader):
         with self._changed:
             if not self._changed.wait_for(done, timeout):
                 raise AssertionError(why)
+
+
+# What a hostile agent answers (docs/47 section 7.3): markup, a way out of its frame, an image and a
+# link that would ask for something, a button htmx would act on, a sentence in backtide's voice, the
+# marks that turn text around or hide it, escape sequences, and what a template engine would run.
+HOSTILE_ANSWER = (
+    "<script>alert(1)</script></pre></li><h1>backtide: todo en orden</h1>\n"
+    '<img src="https://evil.example/x.png" onerror="alert(2)">\n'
+    '<a href="javascript:alert(3)">Aprobar</a> [Aprobar](https://evil.example/ok)\n'
+    '<button hx-post="/salir" hx-trigger="load">Salir</button>\n'
+    '<div hx-swap-oob="true" id="tasks">fuera</div>\n'
+    "https://evil.example/entra\n"
+    "evil\u202etxt.exe \u2066dentro\u2069 cero\u200bancho\n"
+    "\x1b]52;c;c2VjcmV0bw==\x07\x1b[2Jborrado\rvuelta\n"
+    "</textarea></ol>{{7*7}}\n"
+)
+_NEVER_RAW = ("\u202e", "\u2066", "\u2069", "\u200b", "\x1b", "\x07", "\r")
+_INSIDE_A_TEXT = {"span": {"esc", "cut"}}  # all a <pre> of the agent's text may have inside: ours
+
+
+class _AnswerWalk(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.problems: list[str] = []
+        self.depth = 0  # how many <pre> of text we are inside
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        found = dict(attrs)
+        for name, value in attrs:
+            if name.startswith("on") or name == "style":
+                self.problems.append(f"<{tag} {name}>: inline")
+            if "evil.example" in (value or "") or "javascript:" in (value or ""):
+                self.problems.append(f"<{tag} {name}={value!r}>: asks for something")
+        if tag == "script" and "src" not in found:
+            self.problems.append("an inline script element")
+        if self.depth:
+            allowed = _INSIDE_A_TEXT.get(tag, set())
+            if not set((found.get("class") or "").split()) & allowed or set(found) - {
+                "class",
+                "title",
+            }:
+                self.problems.append(f"<{tag}> inside a text: {found}")
+        if tag == "pre":
+            self.depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "pre":
+            self.depth -= 1
+        if self.depth < 0:
+            self.problems.append("a </pre> of the agent's closed the frame")
+            self.depth = 0
+
+    def handle_data(self, data: str) -> None:
+        if self.depth == 0 and ("todo en orden" in data or "fuera" in data or "Salir" in data):
+            self.problems.append(f"the agent's text outside its frame: {data[:60]!r}")
+
+
+def answer_problems(html: str) -> list[str]:
+    """What is wrong with a page or a fragment that shows ``HOSTILE_ANSWER``: an empty list if it
+    is only text. By parsing, as a browser would: no element or attribute of the agent's, nothing
+    of it out of its ``<pre>``, and none of the characters that deceive as themselves."""
+    problems = [f"raw {char!r}" for char in _NEVER_RAW if char in html]
+    walk = _AnswerWalk()
+    walk.feed(html)
+    walk.close()
+    return problems + walk.problems
 
 
 def parse_sse(body: str) -> list[dict[str, str]]:

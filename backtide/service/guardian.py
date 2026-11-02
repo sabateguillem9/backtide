@@ -157,7 +157,7 @@ from backtide.service.shell import (
     ShellOutcome,
     ShellStatus,
 )
-from backtide.service.tasks import AgentTasks, TaskStart, TaskStatus
+from backtide.service.tasks import AgentTasks, TaskEntry, TaskStart, TaskStatus
 from backtide.snapshots import (
     PruneIncomplete,
     Reason,
@@ -2695,6 +2695,10 @@ class Guardian:
     def task_status(self, task_id: str) -> TaskStatus | None:
         """How that task goes, with its answer once it ended; None if it is not known here."""
         return self._tasks.status(task_id)
+
+    def task_list(self) -> list[TaskEntry]:
+        """The agent's tasks, for the chat: what was asked and how each goes, never an answer."""
+        return self._tasks.listing()
 
     def task_stop(self, task_id: str) -> bool | None:
         """Stop that task inside the agent: False if it may run on, None if it is not known."""

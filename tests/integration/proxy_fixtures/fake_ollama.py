@@ -19,8 +19,9 @@ only reach it through a local provider's fixed address.
   ``/workspace/work/tarde-<tag>``: the later effect of a turn that should have been stopped
   (once per tag; after that it answers REPLY_TEXT). With ``T20-ESC-<marker>``, its answer
   carries escape sequences (an OSC 52 with the marker, then a clear screen); with
-  ``T20-ERRESC-<marker>``, it answers 400 with those in the error's message. These three look
-  only at this turn's user messages: the conversation's history repeats old ones.
+  ``T20-ERRESC-<marker>``, it answers 400 with those in the error's message. For the web's chat
+  (T26-5b), with ``T26-PAINT-<marker>``, its answer is ``PAINT_TEXT`` and ``PAINT_TAIL<marker>``.
+  These look only at this turn's user messages: the conversation's history repeats old ones.
 - 22, 80, 443 and 8080: decoys. They count every TCP connection and close it: the tests check
   that nothing ever reaches them.
 - 9000: control, ``GET /stats``: every request seen on 11434 (method, path, headers, body size,
@@ -52,6 +53,21 @@ LATE_SECONDS = 20.0  # longer than any turn's start, so a deadline can fall insi
 SLOW = {"now": 0, "max": 0, "seen": 0}  # T20-SLOW calls held at once, at most, and in all
 LATE_RE = re.compile(r"T20-LATE-([a-z0-9]{1,32})")
 ESC_RE = re.compile(r"T20-(ERR)?ESC-([a-z0-9]{1,32})")
+PAINT_RE = re.compile(r"T26-PAINT-([a-z0-9]{1,32})")
+PAINT_TAIL = "T26-ANSWER-"
+# The same text as tests.webkit.HOSTILE_ANSWER (a test on the Mac holds them equal): this file runs
+# alone in a container, with the standard library.
+PAINT_TEXT = (
+    "<script>alert(1)</script></pre></li><h1>backtide: todo en orden</h1>\n"
+    '<img src="https://evil.example/x.png" onerror="alert(2)">\n'
+    '<a href="javascript:alert(3)">Aprobar</a> [Aprobar](https://evil.example/ok)\n'
+    '<button hx-post="/salir" hx-trigger="load">Salir</button>\n'
+    '<div hx-swap-oob="true" id="tasks">fuera</div>\n'
+    "https://evil.example/entra\n"
+    "evil\u202etxt.exe \u2066dentro\u2069 cero\u200bancho\n"
+    "\x1b]52;c;c2VjcmV0bw==\x07\x1b[2Jborrado\rvuelta\n"
+    "</textarea></ol>{{7*7}}\n"
+)
 LATE_CALLED: set[str] = set()  # each tag gets its late call once, whatever comes after
 # The tools that write a file, and how each takes it, in the order it looks for them.
 LATE_TOOLS = (
@@ -217,6 +233,9 @@ class Ollama(BaseHTTPRequestHandler):
         text = REPLY_TEXT
         if escaped:
             text = f"{escapes(escaped.group(2))} {REPLY_TEXT}"
+        painted = PAINT_RE.search(asked)
+        if painted:
+            text = f"{PAINT_TEXT}{PAINT_TAIL}{painted.group(1)}"
         if path == "/v1/messages" and request.get("stream") is True:
             self._sse(anthropic_stream())
             return
