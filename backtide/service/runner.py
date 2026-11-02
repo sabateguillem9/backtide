@@ -1260,6 +1260,9 @@ class _Neighbours:
             self._reloads.pop(slug, None)
             self._guardians.pop(slug, None)
             self._newcomers = [item for item in self._newcomers if item[0] != slug]
+        side = self._telegram.get(slug)
+        if side is not None:  # what an alert about it issued since, from the main agent's queue
+            side.book.forget_agent(slug)
 
     def wait_settled(self, slug: str, timeout: float) -> None:
         """Until the agent is up, or its thread ended. See ``failure_of`` and the roster."""

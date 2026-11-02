@@ -387,7 +387,7 @@ What the export leaves out by default, and why. **What the agent wrote is untrus
 
 Limits: 8 GiB and 500,000 entries. Prints `Exportado a <dest>: N archivos y M carpetas (B bytes), de la instantánea <id>.`, lists what it skipped, and ends with `AVISO:` lines. Exit codes: `0` exported; `1` could not; `2` usage error (a destination the service refuses, or `--git` with `--incluir-config`); `3` unknown.
 
-## Several agents: create, stop, start, freeze
+## Several agents: create, stop, start, freeze, delete
 
 ### `backtide agentes`
 
@@ -396,6 +396,8 @@ backtide agentes crear SLUG --perfil claude-code|openclaw --volumen 10|20|50 [--
                        [--memoria 512m|1g|2g|4g] [--cpus 1|2|4] [--memoria-proxy 256m|512m|1g]
                        [--dia DOLLARS] [--mes DOLLARS] [--reiniciar] [--config FILE]
 backtide agentes parar|arrancar|pausar|seguir SLUG [--config FILE]
+backtide agentes borrar|vaciar SLUG [--confirmar SLUG] [--config FILE]
+backtide agentes recuperar SLUG [--reiniciar] [--config FILE]
 backtide agentes lista [--config FILE]
 ```
 
@@ -410,7 +412,15 @@ The running service does all of it, on its root-only socket: it asks the service
 
 **`parar`** stops one agent: what it had held is rejected, its containers stop, and it stays stopped, also after a reboot, until **`arrancar`**. **`pausar`** freezes one as the pause by space does, and **`seguir`** thaws it (the same as `backtide seguir --agente`). `principal` can be frozen but not stopped from here: it runs the service's sockets, so to stop it you stop the service. **`lista`** says which agents there are and how they are. All of it is recorded in the installation's black box, with who asked, and in the agent's.
 
-Exit codes: `0` done; `1` not done (no service, refused, or it failed and was undone); `2` usage error or an order outside its shape; `3` unknown.
+**`borrar`** deletes one agent, not `principal`. It asks you to type the agent's name, or takes it from `--confirmar`. The agent stops, what it had held is rejected, and its containers, networks and mounts go. Its black box stays for good: it ends with a `system/agent_deleted` event, whose hash also goes in the installation's box, and it stays read-only. You can still check it with [`backtide verificar`](#backtide-verificar) and its `--db`, `--key` and `--checkpoint` under `<state_dir>/agents/<slug>/`. Its volume and snapshots stay in the bin for 7 days. If a step fails, the agent stays stopped and nothing of it runs: fix what it says and repeat the order. The service also finishes it at its next start.
+
+**`recuperar`** brings a deleted agent back whole and stopped, for you to look at before **`arrancar`**: its volume, its snapshots, its black box, whose chain goes on, its number, its trusted recipients and its spending. If it would be the only agent besides `principal`, it restarts the service and needs `--reiniciar`.
+
+**`vaciar`** empties the bin now, and there is no way back. It removes the volume, the snapshots and the agent's other files, and keeps its black box, the key to check it and its number. It asks for the name as `borrar` does. Without it, the bin empties by itself after 7 days, with an alert a day before and another when it empties, and never less than a full day after the first alert. If the system clock is not synchronised, it waits. An image you placed outside the agent's folder is never removed: `vaciar` tells you where it is.
+
+A slug and a number that were used are never used again, not even after emptying. What a deleted agent spent still counts towards the whole installation's cap until the month ends. Deleting the last agent besides `principal` keeps that cap in place. **`lista`** shows what is in the bin and until when. The web cannot do any of this yet.
+
+Exit codes: `0` done; `1` not done (no service, refused, or it failed and was undone); `2` usage error, an order outside its shape, or a name that does not match; `3` unknown.
 
 ## Spending
 

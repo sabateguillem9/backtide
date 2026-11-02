@@ -918,7 +918,10 @@ def test_what_its_last_alerts_issued_goes_when_its_thread_ends(tmp_path: Path) -
     neighbours._stops[OTHER] = threading.Event()
     neighbours._settled[OTHER] = threading.Event()
     with patch.object(runner, "record_agent_failed"):
-        neighbours._watch(config)  # type: ignore[arg-type]
+        # On a thread of its own, as ever: it says this thread works for that agent.
+        thread = threading.Thread(target=neighbours._watch, args=(config,))
+        thread.start()
+        thread.join()
     assert len(book) == 0
 
 

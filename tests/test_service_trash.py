@@ -11,6 +11,7 @@ import threading
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 from backtide import cli
 from backtide.blackbox import BlackBox, BlackBoxError, load_key
 from backtide.notify import AlertLevel
+from backtide.notify.buttons import Action, ButtonBook
 from backtide.service import agent_disk, agentes, fleet, runner, trash
 from backtide.service.agents import check_alone, load_agent, load_installation, load_retired
 from backtide.service.config import (
@@ -248,6 +250,8 @@ def test_delete_closes_the_box_keeps_the_volume_and_leaves_nothing_running(world
     assert "/" not in json.dumps([v for v in world.roster.deleted()[0].values()]), "no path"
     assert world.told.alerts[-1].level is AlertLevel.ERROR
     assert SLUG in world.told.alerts[-1].title
+    # About everybody: an alert about it would carry a «Pausar» good for 24 hours.
+    assert world.told.alerts[-1].installation and world.told.alerts[-1].agent is None
 
     # Asking again changes nothing.
     assert world.fleet.delete(DELETE, BY)["outcome"] == "already"
@@ -891,6 +895,7 @@ def test_a_warning_a_day_before_and_empty_after_the_wait(world: World) -> None: 
     assert recorded["agent_purge"]["reason"] == "expired"
     assert world.told.alerts[-1].level is AlertLevel.ERROR
     assert "vaciada" in world.told.alerts[-1].title
+    assert all(alert.installation for alert in world.told.alerts)
     assert world.roster.deleted()[0]["purged"] is True
 
 
@@ -1041,7 +1046,11 @@ def test_an_agent_that_comes_back_is_watched_with_nothing_of_before(home: Path) 
     neighbours.start_one(config)
     neighbours.wait_settled("revisor", 10)
     assert neighbours.failure_of("revisor") is not None
+    book = ButtonBook()
+    book.issue(Action.PAUSE, agent="revisor")
+    neighbours._telegram = {"revisor": SimpleNamespace(book=book)}
     neighbours.forget("revisor")
+    assert len(book) == 0, "not even the alert of its failure, which came through the main queue"
     assert neighbours.failure_of("revisor") is None
     assert neighbours.config_of("revisor") is None
     assert not neighbours.is_running("revisor")

@@ -967,6 +967,7 @@ class Fleet:
                 f"Se ha borrado el agente {slug}. Su caja negra se queda, y su volumen espera "
                 f"hasta el {_day(mark.purge_after)}. Si no has sido tú, `sudo backtide agentes "
                 f"recuperar {slug}` lo devuelve.",
+                installation=True,  # no button that could outlive it
             )
         )
 
@@ -1089,6 +1090,7 @@ class Fleet:
                 f"Agente recuperado: {slug}",
                 f"El agente {slug} ha vuelto de la papelera, parado. Si no has sido tú, bórralo "
                 "otra vez.",
+                installation=True,
             )
         )
         self._roster.add(new.slug, new.display_name)
@@ -1233,6 +1235,7 @@ class Fleet:
                         AlertLevel.ERROR,
                         f"No se ha podido vaciar la papelera de {slug}",
                         f"{said}. Se vuelve a intentar. Su caja negra sigue.",
+                        installation=True,
                     )
                 )
             raise _Refused(
@@ -1252,6 +1255,7 @@ class Fleet:
                 f"Papelera vaciada: {slug}",
                 f"El volumen y las instantáneas de {slug} ya no están. Su caja negra se queda."
                 f"{left}",
+                installation=True,
             )
         )
         return _reply(
@@ -1278,7 +1282,12 @@ class Fleet:
             except _Refused as refused:
                 self._record("agent_delete_unfinished", slug, {"why": str(refused)[:300]}, risk=2)
                 self._told.submit(
-                    Alert(AlertLevel.ERROR, f"Agente borrado a medias: {slug}", str(refused))
+                    Alert(
+                        AlertLevel.ERROR,
+                        f"Agente borrado a medias: {slug}",
+                        str(refused),
+                        installation=True,
+                    )
                 )
             except Exception:  # the service starts all the same: nothing of this agent runs
                 logger.exception("what was left of the deleted agent %s", slug)
@@ -1327,6 +1336,7 @@ class Fleet:
                     f"Mañana se vacía la papelera de {mark.slug}",
                     f"El volumen y las instantáneas de {mark.slug} se borran para siempre en un "
                     f"día. Si los quieres, `sudo backtide agentes recuperar {mark.slug}`.",
+                    installation=True,
                 )
             )
         else:
