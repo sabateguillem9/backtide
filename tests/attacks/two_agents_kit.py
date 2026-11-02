@@ -41,6 +41,7 @@ from backtide.jail.proxy_config import (
     PROXY_UID,
     channel_tmpfs_options,
 )
+from backtide.service.config import STATE_SOCKET
 from backtide.setup import layout, units
 
 REPO = Path(__file__).resolve().parents[2]
@@ -199,14 +200,18 @@ class Lab:
         return "\n".join(lines[-20:])
 
     def wait_up(self, timeout: float = START_TIMEOUT) -> None:
-        """The unit active and both agents running."""
+        """The unit active, both agents running, and both up for the sockets: an agent joins the
+        service's list a while after its container runs (T26-2c)."""
 
         def up() -> bool:
             if int(self.show("NRestarts") or 0) > MAX_RESTARTS:
                 raise AssertionError(f"the service keeps restarting\n{self.diagnosis()}")
-            return (
+            if not (
                 self.show("ActiveState") == "active" and self.running(MAIN) and self.running(OTHER)
-            )
+            ):
+                return False
+            watched = self.helper("agents", str(STATE / STATE_SOCKET))
+            return len(watched) == 2 and all(agent["watched"] for agent in watched)
 
         wait(
             up,

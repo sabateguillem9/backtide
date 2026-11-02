@@ -164,8 +164,45 @@ def _check_slug(slug: str) -> None:
         raise ConfigError(f"agents/: a file for no agent: {error}") from None
 
 
+def check_alone(path: Path, config: ServiceConfig) -> None:
+    """For what touches this agent's volume in this process, with no service to say it is whose
+    (T26-2c): no other agent whose file can be read holds any of its folders. A file copied without
+    changing its volume stops the service, and rewinding here would rewind the other's and write
+    it in this one's box. ConfigError if so. A file that cannot be read stops nothing."""
+    main = ServiceConfig.from_file(path)
+    others = [] if config.is_main else [main]
+    folder = Path(path).parent / AGENTS_FOLDER
+    if os.path.lexists(folder):
+        require_own_folder(folder, "the agents' files folder")
+        for name in sorted(os.listdir(folder)):
+            slug = name.removesuffix(_FILE_SUFFIX)
+            if not name.endswith(_FILE_SUFFIX) or slug == config.slug:
+                continue
+            try:
+                _check_slug(slug)
+                others.append(_read_agent(main, folder / name, slug))
+            except ConfigError:
+                continue  # `_say_if_a_file_is_broken` says it: that one is not for this to judge
+    for other in others:
+        _check_folders_apart(config, other)
+
+
 def _read_agent(main: ServiceConfig, path: Path, slug: str) -> ServiceConfig:
-    """The ServiceConfig of the agent of ``path``: the machine's, with what its file says."""
+    """The ServiceConfig of the agent of ``path``. Whatever is wrong with the file is a ConfigError,
+    also a value of the wrong type that makes something below raise: what gets by with a broken
+    file only knows that one. The message has the file's name and never what it holds."""
+    try:
+        return _agent_from_file(main, path, slug)
+    except ConfigError:
+        raise
+    except Exception as error:
+        raise ConfigError(
+            f"{path}: it cannot be used: a setting has the wrong type ({type(error).__name__})"
+        ) from None
+
+
+def _agent_from_file(main: ServiceConfig, path: Path, slug: str) -> ServiceConfig:
+    """The machine's config, with what the agent's file says."""
     data = _read_toml(path)
     unknown = sorted(set(data) - _KEYS)
     if unknown:
@@ -290,15 +327,19 @@ def _check_apart(agents: tuple[ServiceConfig, ...]) -> None:
             _only_once(ids, number, config.slug, "the id")
     for index, config in enumerate(agents):
         for other in agents[index + 1 :]:
-            for mine in _held(config):
-                for theirs in _held(other):
-                    if _overlap(Path(os.path.realpath(mine)), Path(os.path.realpath(theirs))):
-                        raise ConfigError(
-                            f"the agents {config.slug} and {other.slug} share a folder: {mine} "
-                            f"and {theirs} (a volume, its image or a config folder holds only one "
-                            "agent)"
-                        )
+            _check_folders_apart(config, other)
     _check_no_shared_secret(agents)
+
+
+def _check_folders_apart(config: ServiceConfig, other: ServiceConfig) -> None:
+    """A volume, its image or a config folder holds only one agent, links resolved."""
+    for mine in _held(config):
+        for theirs in _held(other):
+            if _overlap(Path(os.path.realpath(mine)), Path(os.path.realpath(theirs))):
+                raise ConfigError(
+                    f"the agents {config.slug} and {other.slug} share a folder: {mine} and "
+                    f"{theirs} (a volume, its image or a config folder holds only one agent)"
+                )
 
 
 def _check_no_shared_secret(agents: tuple[ServiceConfig, ...]) -> None:

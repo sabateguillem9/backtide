@@ -2573,9 +2573,9 @@ held = "n/a"
 id = "gasto-de-toda-la-instalacion"
 name = "Añadir agentes no multiplica el gasto"
 story = """Hay un tope de toda la instalación (D13). Cada agente está por debajo del suyo, o no tiene, y \
-entre todos llegan al total: se rechazan las llamadas de todos, con `scope: installation` en la caja \
-de cada uno. El cambio de tope va a la caja de la instalación, antes de aplicarse. Subirlo deja salir \
-la siguiente."""
+ninguno llega solo, pero la suma llega al total: se rechazan las llamadas de todos, con `scope: \
+installation` en la caja de cada uno. El cambio de tope va a la caja de la instalación. Un dólar por \
+encima, o subirlo después, deja salir la siguiente, que se para en el corte del laboratorio."""
 inspired_by = "Dos agentes con el tope de uno cada uno gastan el doble"
 invariants = [7]
 status = "ready"
@@ -2593,6 +2593,24 @@ name = "Lo retenido del vecino se decide en su puerta"
 story = """`backtide retenidas` enseña lo retenido de cada agente bajo su nombre. `aprobar` sin --agente \
 va a la puerta del principal y no suelta lo del vecino, un agente inventado o una ruta se rechazan, y \
 con --agente se aprueba o se rechaza de verdad, y queda en la caja de ese agente."""
+inspired_by = "Aprobar para un agente y soltar lo de otro"
+invariants = [6, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "yes"
+
+[[scenario]]
+id = "confiar-en-el-vecino"
+name = "Lo que se confía para un agente no suelta nada de otro"
+story = """Los destinatarios de confianza son de cada agente. El dueño confía un chat para el vecino, \
+como la web: el mismo mensaje del otro agente, al mismo chat, sigue retenido. Confiar sin nombrar al \
+agente va a la puerta del principal, que no conoce esa retención, y quitar la confianza va por el mismo \
+campo. Nada sale de la VM: el token es inventado y el laboratorio corta la red."""
 inspired_by = "Aprobar para un agente y soltar lo de otro"
 invariants = [6, 7]
 status = "ready"
@@ -2659,8 +2677,8 @@ held = "n/a"
 [[scenario]]
 id = "tarea-del-vecino"
 name = "Las tareas son de cada agente"
-story = """Una tarea para un agente corre en el suyo y queda en su caja. El principal no la conoce y un \
-agente inventado se rechaza. El turno del agente no llega a ningún proveedor: la clave es inventada y \
+story = """Una tarea para un agente corre en su contenedor, y su orden y su final quedan en su caja. El \
+principal no la conoce y un agente inventado se rechaza. El turno del agente no llega a ningún proveedor: la clave es inventada y \
 el laboratorio corta la red."""
 inspired_by = "Leer la respuesta de una tarea de otro agente"
 invariants = [7, 8]

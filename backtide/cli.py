@@ -18,7 +18,7 @@ from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, lo
 from backtide.jail import ExposedJail, JailError, identity
 from backtide.jail.profile import ProfileError
 from backtide.jail.profiles import DEFAULT_PROFILE
-from backtide.service.agents import load_agent, load_installation
+from backtide.service.agents import check_alone, load_agent, load_installation
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import (
     OUTCOME_EXIT_CODES,
@@ -297,6 +297,11 @@ def _say_if_a_file_is_broken(path: Path) -> None:
         print(
             f"AVISO: {_printable(redact(str(error)))}. Esto sigue porque no lo necesita, pero el "
             "servicio no volverá a arrancar hasta que lo arregles.",
+            file=sys.stderr,
+        )
+    except Exception as error:  # a warning never stops what stops or undoes; only its type
+        print(
+            f"AVISO: no se han podido leer los archivos de los agentes ({type(error).__name__}).",
             file=sys.stderr,
         )
 
@@ -990,6 +995,11 @@ def _rewind(args: argparse.Namespace) -> int:
         _error(str(error))
         return EXIT_ERROR
     with lock:
+        try:
+            check_alone(args.config, config)
+        except ConfigError as error:  # without a service nobody else would say it
+            _error(f"configuración no válida: {error}")
+            return EXIT_ERROR
         return _rewind_in_process(config, target, args.agente)
 
 

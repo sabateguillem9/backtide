@@ -232,19 +232,33 @@ def test_a_budget_that_could_not_count_leaves_the_total_unknown(machine: Machine
     assert a.admit("f1", model="m", max_tokens=1) == "spend_unavailable"
     assert machine.total.status()["uncounted"] == ["revisor"]
     assert machine.total.status()["blocked"] is None
+    # Whoever reads an agent's status does not hear that all is well.
+    assert a.status()["available"] is False
+    assert status_lines(a.status())[0].startswith("Gasto: no se puede contar")
 
 
-def test_two_agents_at_once_pass_the_total_by_one_call_each_at_most(machine: Machine) -> None:
-    """What is reserved is the whole installation's: M5 of T11, for several books."""
+def test_each_agent_passes_the_total_by_one_call_at_most(machine: Machine) -> None:
+    """M5 of T11, for several books: one call of each, and then each waits for its own."""
     a, b = machine.book("principal"), machine.book("revisor")
     machine.spend("principal", 9.99)
-    # A big call reserves far past the cap: the next, of whichever agent, waits.
     assert a.admit("f1", model="claude-opus-5-5", max_tokens=4_000_000) is None
     assert machine.total.status()["reserved_micro"] > 0
-    assert b.admit("f2", model="claude-opus-5-5", max_tokens=1) == "throttled"
+    assert a.admit("f2", model="claude-opus-5-5", max_tokens=1) == "throttled"
+    assert b.admit("f3", model="claude-opus-5-5", max_tokens=4_000_000) is None
+    assert b.admit("f4", model="claude-opus-5-5", max_tokens=1) == "throttled"
     a.forget("f1")
-    assert machine.total.status()["reserved_micro"] == 0
-    assert b.admit("f3", model="claude-opus-5-5", max_tokens=1) is None
+    assert a.admit("f5", model="claude-opus-5-5", max_tokens=1) is None
+
+
+def test_a_huge_call_of_one_leaves_the_others_their_model(machine: Machine) -> None:
+    """Review of T26-2c: a provider refuses a `max_tokens` of a billion for free, again and again,
+    and what it reserved meanwhile must not throttle anybody else."""
+    a, b = machine.book("principal"), machine.book("revisor")
+    for flow in range(3):
+        assert a.admit(f"a{flow}", model="desconocido", max_tokens=10**9) is None
+        assert b.admit(f"b{flow}", model="claude-opus-5-5", max_tokens=64) is None
+        b.forget(f"b{flow}")
+        a.forget(f"a{flow}")
 
 
 def test_many_threads_never_book_more_than_each_agents_own_reports(machine: Machine) -> None:
@@ -314,25 +328,58 @@ def test_raising_the_cap_unblocks_at_once_and_it_is_said(machine: Machine) -> No
 def test_the_caps_the_main_agent_had_become_the_totals_the_first_time(machine: Machine) -> None:
     """Until now the owner's cap was the installation's: a new agent must not drop it to 5 $ and
     block the main one."""
-    (machine.folders["principal"] / STATE_BUDGET).write_text(
-        json.dumps(
-            {
-                "version": 1, "day": "2026-11-02", "month": "2026-11", "day_micro": 0,
-                "month_micro": 0, "warned": {"day": [], "month": []}, "estimated_calls": 0,
-                "caps": {"daily_micro": 20 * MICRO, "monthly_micro": 200 * MICRO},
-            }
-        )
-    )  # fmt: skip
-    (machine.folders["principal"] / STATE_BUDGET).chmod(0o600)
+    (machine.installation / STATE_BUDGET).unlink()
+    main_caps(machine, 20 * MICRO, 200 * MICRO)
     status = machine.make_total().status()
     assert status["day"]["cap_micro"] == 20 * MICRO
     assert status["month"]["cap_micro"] == 200 * MICRO
 
 
-def test_a_broken_total_file_falls_back_to_the_machines_caps(machine: Machine) -> None:
+def test_a_broken_total_file_falls_back_to_the_machines_caps_and_says_so(
+    machine: Machine,
+) -> None:
+    """Even with caps of the main agent to inherit: they were only for the first time."""
+    main_caps(machine, 20 * MICRO, 200 * MICRO)
     (machine.installation / STATE_BUDGET).write_text('{"version": 1, "extra": true}')
     (machine.installation / STATE_BUDGET).chmod(0o600)
     assert machine.make_total().status()["day"]["cap_micro"] == 10 * MICRO
+    assert machine.recorded[-1][0] == "budget_file_unusable"
+    assert machine.alerts[-1].title == "No se ha podido leer el tope de toda la instalación"
+
+
+def main_caps(machine: Machine, daily: int, monthly: int) -> None:
+    """What the main agent's budget.json says it has been set."""
+    (machine.folders["principal"] / STATE_BUDGET).write_text(
+        json.dumps(
+            {
+                "version": 1, "day": "2026-11-02", "month": "2026-11", "day_micro": 0,
+                "month_micro": 0, "warned": {"day": [], "month": []}, "estimated_calls": 0,
+                "caps": {"daily_micro": daily, "monthly_micro": monthly},
+            }
+        )
+    )  # fmt: skip
+    (machine.folders["principal"] / STATE_BUDGET).chmod(0o600)
+
+
+def test_no_own_cap_never_becomes_the_total(machine: Machine) -> None:
+    """Review of T26-2c: `tope --agente principal --mes 10` leaves 100000 $ a day in its file,
+    meaning it has none. A restart before the total was ever saved must not make that the total's,
+    with no event, for a whole installation."""
+    (machine.installation / STATE_BUDGET).unlink()
+    a = machine.book("principal")
+    assert a.set_caps(None, Decimal("10"), requested_by="cli").ok
+    total = machine.make_total()
+    status = total.status()
+    assert status["day"]["cap_micro"] == 10 * MICRO  # [budget]
+    assert status["month"]["cap_micro"] == 10 * MICRO  # the one that was really set
+
+
+def test_what_is_inherited_is_inherited_once(machine: Machine) -> None:
+    (machine.installation / STATE_BUDGET).unlink()
+    main_caps(machine, 20 * MICRO, 200 * MICRO)
+    assert machine.make_total().status()["day"]["cap_micro"] == 20 * MICRO
+    main_caps(machine, 30 * MICRO, 300 * MICRO)  # later it is the main agent's own, not the total
+    assert machine.make_total().status()["day"]["cap_micro"] == 20 * MICRO
 
 
 def test_status_says_both_and_whoever_reads_blocked_learns_the_truth(machine: Machine) -> None:

@@ -18,13 +18,17 @@ exists: its caps are the installation's, as they always were.
   leaves the total unknown, and without a count nothing goes out (``spend_unavailable``), for every
   agent, as with one (docs/33). It is recorded and alerted once, and it ends by itself when the
   count comes back.
-- **The check is one step.** ``reserve`` looks at what is spent and in flight and takes its part
-  with one lock, so that two agents at once pass the cap by one call each at most, like the calls of
-  one (security review of T11, M5).
+- **The check is one step.** ``reserve`` looks at what all of them have spent and at what this
+  agent has in flight, and takes its part with one lock, so that several at once pass the cap by one
+  call each at most (security review of T11, M5). What another has in flight does not count: a call
+  of an agent with a huge ``max_tokens``, which a provider refuses for free, would leave the others
+  with no model for nothing (review of T26-2c).
 - **What it keeps.** ``<state_dir>/installation/budget.json``: the caps set by the owner (they win
-  over ``[budget]``, as an agent's do) and the warnings already given. The first time, with no such
-  file, the caps are the ones the main agent had set: until now they were the installation's. It
-  holds no totals.
+  over ``[budget]``, as an agent's do) and the warnings already given, and no totals. The first
+  time, with no such file, the caps are the ones the main agent had really set, which until now
+  were the installation's, and that is written at once, so it happens once. ``MAX_CAP_USD`` there
+  means it has none of its own, and is never taken. A file that cannot be used gives ``[budget]``,
+  said.
 - **What goes where.** The warnings and the changes of its caps are the installation's, so they go
   to its black box (``settings/budget_set``, recorded before anything changes, and
   ``system/budget_warning`` and ``budget_exceeded``). A call that is refused is the agent's: its
@@ -109,6 +113,7 @@ class InstallationSpend:
         self._month = ""
         self._warned: dict[str, set[int]] = {window: set() for window in WINDOWS}
         self._said_uncounted: tuple[str, ...] = ()
+        self._file_was_broken = False
         self._ended_blocked: str | None = None  # a window that was blocked and ended, to be said
         self._load(inherit_from)
 
@@ -116,6 +121,14 @@ class InstallationSpend:
         """Where it writes and who it tells (the installation's box and the owner). Separate
         because the alerts are born with the main agent's ``Guardian``, which needs this."""
         self._record, self._alert = record, alert
+        if self._file_was_broken:
+            self._file_was_broken = False
+            self._record("budget_file_unusable", "", {"file": STATE_BUDGET}, risk=1)
+            self._tell(
+                AlertLevel.WARNING,
+                "No se ha podido leer el tope de toda la instalación",
+                "Se usa el de [budget] de backtide.toml hasta que lo cambies (mira el registro).",
+            )
 
     # -- what a Budget asks -----------------------------------------------------------------
 
@@ -138,17 +151,17 @@ class InstallationSpend:
         return window
 
     def reserve(self, slug: str, micro: int) -> bool:
-        """Take ``micro`` for a call in flight, unless what all of them have spent and hold
-        already reaches a cap. The agent's own next ``report`` says the same, exactly."""
+        """Take ``micro`` for a call in flight, unless what all of them have spent and what this
+        one holds already reaches a cap. The agent's own next ``report`` says the same, exactly."""
         with self._lock:
             totals = self._totals()
+            count = self._counts.get(slug, Count())
             if (
                 totals.uncounted
-                or totals.day + totals.reserved >= self._daily
-                or totals.month + totals.reserved >= self._monthly
+                or totals.day + count.reserved >= self._daily
+                or totals.month + count.reserved >= self._monthly
             ):
                 return False
-            count = self._counts.get(slug, Count())
             self._counts[slug] = dataclasses.replace(count, reserved=count.reserved + micro)
             return True
 
@@ -401,7 +414,9 @@ class InstallationSpend:
         except BudgetError as error:
             # Its own caps are lost, and the ones of [budget] apply: said, like an agent's file.
             logger.error("the installation's %s cannot be used: %s", STATE_BUDGET, error)
-            state = None
+            self._file_was_broken = True
+            self._first_time(None)
+            return
         if state is None:
             self._first_time(inherit_from)
             return
@@ -422,14 +437,17 @@ class InstallationSpend:
         except BudgetError:
             state = None  # the agent's own Budget says so, when it opens it
         caps = None if state is None else state.get("caps")
-        if caps is not None:
-            self._daily, self._monthly = caps["daily_micro"], caps["monthly_micro"]
-            self._caps_from = "web"
+        top = to_micro(MAX_CAP_USD)
+        if caps is not None and caps["daily_micro"] < top:  # at the top: it has none of its own
+            self._daily, self._caps_from = caps["daily_micro"], "web"
+        if caps is not None and caps["monthly_micro"] < top:
+            self._monthly, self._caps_from = caps["monthly_micro"], "web"
         totals = self._totals()
         self._warned = {
             "day": set(_crossed(totals.day, self._daily)),
             "month": set(_crossed(totals.month, self._monthly)),
         }
+        self._save()  # the first time is one: a restart does not inherit again
 
     def _save(self) -> None:
         from backtide.service.settings import SettingsError, write_private

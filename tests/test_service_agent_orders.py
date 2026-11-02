@@ -753,6 +753,92 @@ def test_seguir_goes_on_with_a_broken_file(
     assert asked == [{"agent": "roto"}]
 
 
+@pytest.mark.parametrize(
+    "broken",
+    ['[agent]\nprofile = ["x"]\n', "[agent]\nprofile = 7\n", "number = 2\n", "no es toml ["],
+    ids=["a list", "a number", "no volume", "not toml"],
+)
+def test_whatever_is_wrong_with_a_file_rejecting_goes_on(
+    home: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    broken: str,
+) -> None:
+    """Review of T26-2c: a value of the wrong type raised a TypeError, and the warning itself
+    stopped the very thing it warned about."""
+    volume = home / "agent-volumes" / "roto"
+    start = "" if broken.startswith(("number", "no es")) else f'number = 2\nvolume = "{volume}"\n'
+    add_agent(home, "roto", start + broken)
+    service_running(monkeypatch, retenidas)
+    monkeypatch.setattr(
+        retenidas,
+        "ask_decide",
+        lambda *a, **k: {"ok": True, "outcome": "rejected", "message": "Rechazada."},
+    )
+    assert cli.main(["rechazar", HOLD, "--config", str(main_config(home))]) == 0
+    assert "AVISO" in capsys.readouterr().err
+    with pytest.raises(ConfigError):
+        load_installation(main_config(home))
+
+
+def test_a_value_of_the_wrong_type_never_reaches_the_message(home: Path) -> None:  # noqa: F811
+    volume = home / "agent-volumes" / "roto"
+    add_agent(home, "roto", f'number = 2\nvolume = "{volume}"\n[agent]\nprofile = ["secreto"]\n')
+    with pytest.raises(ConfigError) as refused:
+        load_agent(main_config(home), "roto")
+    assert "secreto" not in str(refused.value)
+
+
+def test_rebobinar_with_no_service_refuses_a_volume_that_is_anothers_too(
+    home: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review of T26-2c: a file copied without changing its volume. The service refuses it; with no
+    service, rewinding b would rewind a's and write it in b's box."""
+    same = home / "agent-volumes" / "a"
+    for slug, number in (("a", 1), ("b", 2)):
+        add_agent(
+            home, slug, f'number = {number}\nvolume = "{same}"\n[agent]\nprofile = "claude-code"\n'
+        )
+    add_agent(home, "roto", "number = 3\n")
+    target = Snapshot.parse(SNAPSHOT)
+
+    class Store:
+        def __init__(self, volume: Path, **_: Any) -> None: ...
+        def snapshots(self) -> list[Any]:
+            return [target]
+
+    monkeypatch.setattr(cli, "SnapshotStore", Store)
+    monkeypatch.setattr(cli, "_rewind_in_process", lambda *a: pytest.fail("it rewound"))
+    code = cli.main(
+        ["rebobinar", SNAPSHOT, "--si", "--agente", "b", "--config", str(main_config(home))]
+    )
+    assert code == cli.EXIT_ERROR
+    assert "share a folder" in capsys.readouterr().err
+
+
+def test_rebobinar_with_no_service_is_not_stopped_by_a_file_that_cannot_be_read(
+    home: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broken_neighbour(home)
+    target = Snapshot.parse(SNAPSHOT)
+    done: list[tuple[Any, ...]] = []
+
+    class Store:
+        def __init__(self, volume: Path, **_: Any) -> None: ...
+        def snapshots(self) -> list[Any]:
+            return [target]
+
+    monkeypatch.setattr(cli, "SnapshotStore", Store)
+    monkeypatch.setattr(cli, "_rewind_in_process", lambda *a: done.append(a) or 0)
+    code = cli.main(
+        ["rebobinar", SNAPSHOT, "--si", "--agente", "bueno", "--config", str(main_config(home))]
+    )
+    assert code == 0 and len(done) == 1
+
+
 def test_a_broken_machine_file_stops_even_what_stops(
     home: Path,  # noqa: F811
     capsys: pytest.CaptureFixture[str],

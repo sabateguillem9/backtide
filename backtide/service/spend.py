@@ -839,6 +839,8 @@ class Budget:
             if self._shared is not None:
                 whole = self._shared.status()
                 status["installation"] = whole
+                # Without the total nothing goes out: what is shown says so, as with its own.
+                status["available"] = status["available"] and whole["available"]
                 # The cap that binds, and which of them are its own (one with none: MAX_CAP_USD).
                 top = to_micro(MAX_CAP_USD)
                 status["own_caps"] = {
@@ -1137,8 +1139,6 @@ CAP_SHAPE = (
 
 def whole_lines(whole: dict[str, Any]) -> list[str]:
     """What the whole installation has spent, in Spanish, and each agent's part (T26-2c)."""
-    if not whole.get("available"):
-        return ["Total de la instalación: no se puede contar; las llamadas al modelo se rechazan."]
     lines = []
     for window, name in (("day", "hoy"), ("month", "este mes")):
         part = whole[window]

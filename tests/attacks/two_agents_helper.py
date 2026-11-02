@@ -17,6 +17,10 @@ program. It runs only what is written here, on the lab's own paths.
     python -m two_agents_helper charge <box folder> <micro dollars>
     python -m two_agents_helper fake <config> <slug>
     python -m two_agents_helper link <control socket>
+    python -m two_agents_helper agents <control socket>
+    python -m two_agents_helper budget <control socket>
+    python -m two_agents_helper trusted <control socket> <agent or ->
+    python -m two_agents_helper untrust <control socket> <agent or -> <trust id>
     python -m two_agents_helper task <control socket> <agent> <prompt>
     python -m two_agents_helper task_status <control socket> <agent or -> <task id>
 """
@@ -33,9 +37,14 @@ from backtide.jail.config import create_env, docker_create_argv
 from backtide.service.agents import load_installation
 from backtide.service.config import STATE_CHECKPOINT, STATE_DB, STATE_KEY, ConfigError
 from backtide.service.control import (
+    ControlError,
+    ask_agents,
+    ask_budget,
     ask_decide,
+    ask_list,
     ask_task_start,
     ask_task_status,
+    ask_untrust,
     ask_web_link,
 )
 from backtide.setup import selftest
@@ -165,6 +174,30 @@ def fake(config: str, slug: str) -> dict[str, str]:
     return {"fake": agent.provider_keys["anthropic"].fake}
 
 
+def agents(control: str) -> list[dict[str, Any]]:
+    """Who the service has, and an empty list while it does not answer yet."""
+    try:
+        return ask_agents(Path(control), wait=0.0)
+    except ControlError:
+        return []
+
+
+def budget(control: str) -> dict[str, Any]:
+    return ask_budget(Path(control))
+
+
+def _whose(agent: str) -> dict[str, str]:
+    return {} if agent == "-" else {"agent": agent}
+
+
+def trusted(control: str, agent: str) -> list[dict[str, Any]]:
+    return ask_list(Path(control), "trusted", **_whose(agent))
+
+
+def untrust(control: str, agent: str, trust_id: str) -> dict[str, Any]:
+    return ask_untrust(Path(control), trust_id, **_whose(agent))
+
+
 def link(control: str) -> dict[str, str]:
     return {"token": ask_web_link(Path(control))}
 
@@ -174,8 +207,7 @@ def task(control: str, agent: str, prompt: str) -> dict[str, Any]:
 
 
 def task_status(control: str, agent: str, task_id: str) -> dict[str, Any]:
-    named = {} if agent == "-" else {"agent": agent}
-    return ask_task_status(Path(control), task_id, **named)
+    return ask_task_status(Path(control), task_id, **_whose(agent))
 
 
 ORDERS = {
@@ -192,6 +224,10 @@ ORDERS = {
     "charge": charge,
     "fake": fake,
     "link": link,
+    "agents": agents,
+    "budget": budget,
+    "trusted": trusted,
+    "untrust": untrust,
     "task": task,
     "task_status": task_status,
 }

@@ -12,9 +12,10 @@ volumes, real uids and a real Tetragon. In vigia-dev, and only with the Claude C
 it is over its cap.
 
 T26-2c (each order says which agent, and what they spend adds up): `vecino-sin-gasto`,
-`gasto-de-toda-la-instalacion`, `aprobar-al-vecino`, `rebobinar-al-vecino`, `agente-inventado`,
-`archivo-roto-no-frena` and `tarea-del-vecino`. No model call reaches a provider (invariant 8): the
-key is made up, and each scenario that gives a turn or calls a model first checks the lab's cut.
+`gasto-de-toda-la-instalacion`, `aprobar-al-vecino`, `confiar-en-el-vecino`,
+`rebobinar-al-vecino`, `agente-inventado`, `archivo-roto-no-frena` and `tarea-del-vecino`. No model
+call reaches a provider (invariant 8): the key is made up, and each scenario that gives a turn or
+calls a model first checks the lab's cut, and then that no model answered.
 """
 
 import json
@@ -652,6 +653,7 @@ def test_a_broken_installation_box_is_told_and_never_stops_an_agent(
 MODEL_HOST = "api.anthropic.com"
 MODEL = "claude-sonnet-5-5"
 USD = 1_000_000
+TASK_SECONDS = 30  # two_agents_helper's task: the turn stops at the cut, and this ends it
 
 
 def _fake_of(lab: Lab, agent: Agent) -> str:
@@ -673,14 +675,28 @@ def _model_requests(lab: Lab, agent: Agent) -> int:
     return len([e for e in lab.events(agent, "request") if e["source"] == "llm"])
 
 
+def _answers(lab: Lab, agent: Agent) -> list[dict[str, Any]]:
+    return [e for e in lab.events(agent, "response") if e["source"] == "llm"]
+
+
+def _stopped_at_the_cut(lab: Lab, agent: Agent, calls: list[dict[str, Any]]) -> bool:
+    """It went through the spending's gate and nobody answered: an error of the proxy or none, and
+    no answer of a model in its box. A 401 here would mean it reached a provider (invariant 8)."""
+    return all(c["status"] is None or c["status"] >= 500 for c in calls) and not _answers(
+        lab, agent
+    )
+
+
 def _refused_by_the_cap(calls: list[dict[str, Any]]) -> bool:
     return all(c["status"] == 429 and "tope de gasto" in str(c.get("message")) for c in calls)
 
 
-def _spend(lab: Lab, agent: Agent, dollars: int) -> None:
-    """What this agent has spent grows, with the service stopped; when it starts it counts it."""
+def _spend(lab: Lab, *agents: Agent) -> None:
+    """Each of these has spent one dollar more, written with the service stopped; it counts it when
+    it starts."""
     lab.stop()
-    lab.helper("charge", str(agent.box), str(dollars * USD))
+    for agent in agents:
+        lab.helper("charge", str(agent.box), str(USD))
     lab.start()
 
 
@@ -692,10 +708,18 @@ def _llm_blocked(lab: Lab, agent: Agent) -> list[dict[str, Any]]:
 def test_an_agent_out_of_money_stops_nobody_else(attack: Attack, lab: Lab) -> None:
     """A spends all that its own cap lets it, and B goes on. A's fake key, used from B, does not
     go out: it is not B's, and the spending would be counted to the wrong one. The control of the
-    cap is the neighbour's call that goes through the same gate and reaches the cut."""
+    cap is the neighbour's call that goes through the same gate and stops at the cut."""
+    try:
+        _an_agent_out_of_money(attack, lab)
+    finally:
+        lifted = lab.cli("tope", "--agente", SLUG, "--dia", "100")
+        assert lifted.returncode == 0, lifted.stderr
+
+
+def _an_agent_out_of_money(attack: Attack, lab: Lab) -> None:
     cap = lab.cli("tope", "--agente", SLUG, "--dia", "1")
     assert cap.returncode == 0, cap.stderr
-    _spend(lab, OTHER, 1)
+    _spend(lab, OTHER)
     other_key, main_key = _fake_of(lab, OTHER), _fake_of(lab, MAIN)
     assert other_key != main_key
     said = lab.cli("gasto", "--agente", SLUG)
@@ -723,20 +747,22 @@ def test_an_agent_out_of_money_stops_nobody_else(attack: Attack, lab: Lab) -> No
         "the foreign key refused in the box of who used it",
         lab.diagnosis,
     )
+    # The sensor has it in the command that ran the script, whose argument it was: not a secret.
+    written = [e for e in lab.events(MAIN) if e["source"] != "exec"]
     attack.check(
         "stopped",
         _refused_by_the_cap(refused)
         and _model_requests(lab, OTHER) == before_other
-        and not any(c["status"] == 429 for c in goes_on)
+        and _stopped_at_the_cut(lab, MAIN, goes_on)
         and passed == len(goes_on)
         and said.returncode == 0
         and "1,00 $ de 1,00 $" in said.stdout
         and foreign[0]["status"] == 403
         and _model_requests(lab, MAIN) == foreign_before
-        and said_in(lab.events(MAIN), other_key) == [],
+        and said_in(written, other_key) == [],
         f"el que agotó su tope ({said.stdout.strip()[:120]!r}) recibe {refused} y nada llega al "
-        f"proveedor; el otro pasa la puerta del gasto ({passed} llm/request; responde el corte: "
-        f"{goes_on}); la clave falsa del vecino, usada desde el otro, no sale ({foreign})",
+        f"proveedor; el otro pasa la puerta del gasto ({passed} llm/request) y se para en el corte "
+        f"({goes_on}); la clave falsa del vecino, usada desde el otro, no sale ({foreign})",
     )
     attack.check(
         "recorded",
@@ -746,19 +772,46 @@ def test_an_agent_out_of_money_stops_nobody_else(attack: Attack, lab: Lab) -> No
         f"llm/blocked en la caja de quien se pasó ({blocked['details']}) y ninguno en la del otro",
     )
     attack.check("risk", blocked["risk"] == 2, f"llm/blocked con riesgo {blocked['risk']}")
-    lifted = lab.cli("tope", "--agente", SLUG, "--dia", "100")
-    assert lifted.returncode == 0, lifted.stderr
+
+
+def _dollars(micro: int) -> str:
+    return f"{micro // 10_000 / 100:.2f}"
 
 
 @scenario("gasto-de-toda-la-instalacion")
 def test_adding_agents_does_not_multiply_what_is_spent(attack: Attack, lab: Lab) -> None:
-    """Each under its own cap, or with none, and the total stops them all: D13. The control is that
-    raising it lets them through at once, and that the change is in the installation's box."""
+    """Each under its own cap, or with none, and the sum stops them all: D13. Neither alone reaches
+    the cap, so a total that were not the sum would let them through. The controls: a cap a dollar
+    above lets a call out, and so does raising it afterwards. The change is in the installation's
+    box."""
+    try:
+        _adding_agents(attack, lab)
+    finally:
+        raised = lab.cli("tope", "--dia", "50", "--mes", "100")
+        assert raised.returncode == 0, raised.stderr
+
+
+def _adding_agents(attack: Attack, lab: Lab) -> None:
+    control = str(STATE / STATE_SOCKET)
     keys = {agent: _fake_of(lab, agent) for agent in (MAIN, OTHER)}
-    lowered = lab.cli("tope", "--dia", "2")
-    assert lowered.returncode == 0, lowered.stderr
+    _spend(lab, MAIN, OTHER)
+
+    def spent() -> int:
+        return lab.helper("budget", control)["installation"]["day"]["spent_micro"]
+
+    above = lab.cli("tope", "--dia", _dollars(spent() + USD))
+    assert above.returncode == 0, above.stderr
+    before_control = _model_requests(lab, MAIN)
+    allowed = _call_model(attack, lab, MAIN, keys[MAIN], 1)
+    passed_under = _model_requests(lab, MAIN) == before_control + 1
+
+    total = spent()
+    parts = lab.helper("budget", control)["installation"]["agents"]
+    alone = max(part["day_micro"] for part in parts.values())
+    cap = lab.cli("tope", "--dia", _dollars(total))
+    assert cap.returncode == 0, cap.stderr
+    assert alone < total // 10_000 * 10_000, (alone, total)  # neither alone reaches it
     changes = lab.installation_events("budget_set")
-    _spend(lab, MAIN, 3)
     said = lab.cli("gasto")
     before = {agent: len(_llm_blocked(lab, agent)) for agent in keys}
     requests = {agent: _model_requests(lab, agent) for agent in keys}
@@ -777,11 +830,13 @@ def test_adding_agents_does_not_multiply_what_is_spent(attack: Attack, lab: Lab)
         "stopped",
         all(_refused_by_the_cap(calls) for calls in refused.values())
         and _model_requests(lab, OTHER) == requests[OTHER]
-        and through[0]["status"] != 429
+        and passed_under
+        and _stopped_at_the_cut(lab, MAIN, [*allowed, *through])
         and _model_requests(lab, MAIN) == requests[MAIN] + 1
         and "Total de la instalación hoy" in said.stdout,
-        f"con el tope total de 2 $ y 3 $ gastados entre todos, cada uno recibe {refused}; subido "
-        f"el tope, la llamada vuelve a salir ({through}). `gasto` dice: {said.stdout[:200]!r}",
+        f"con un dólar de margen la llamada sale ({allowed}); con el tope en lo gastado entre "
+        f"todos ({total} µ$, y el que más, {alone}), cada uno recibe {refused}; subido el tope, "
+        f"vuelve a salir ({through}). `gasto` dice: {said.stdout[:200]!r}",
     )
     attack.check(
         "recorded",
@@ -863,6 +918,90 @@ def test_the_owner_decides_on_the_neighbours_gate(attack: Attack, lab: Lab) -> N
     )
 
 
+@scenario("confiar-en-el-vecino")
+def test_what_is_trusted_for_one_lets_out_nothing_of_the_other(attack: Attack, lab: Lab) -> None:
+    """Section 6.5: the trusted recipients are each agent's. The owner trusts a chat for the
+    neighbour, from the web's socket: the same message of the other agent is still held, and the
+    list and taking it away go by the field too. The control is the neighbour's own message, which
+    passes once it is trusted and is held again after."""
+    control = str(STATE / STATE_SOCKET)
+    nobody = int(sh("id", "-u", "nobody").stdout)
+    token = f"7{secrets.randbelow(10**8):08d}:{secrets.token_urlsafe(26)}"
+    chat = f"9{secrets.randbelow(10**8):08d}"
+    tag = secrets.token_hex(6)
+
+    def send(agent: Agent, mark: str) -> None:
+        assert lab.network_cut(), "invariant 8: no message without the lab's network cut"
+        attack.run_script(
+            InContainer(lab, agent),
+            "un_get_que_envia",
+            token,
+            chat,
+            f"hola {tag}-{mark}",
+            "sendMessage",
+            "5",
+        )
+
+    def held_with(agent: Agent, mark: str) -> list[dict[str, Any]]:
+        return said_in(lab.events(agent, "held"), f"{tag}-{mark}")
+
+    def wait_held(agent: Agent, mark: str) -> str:
+        wait(lambda: bool(held_with(agent, mark)), SEEN_TIMEOUT, f"{mark} held", lab.diagnosis)
+        return held_with(agent, mark)[-1]["details"]["hold_id"]
+
+    send(OTHER, "primero")
+    first = wait_held(OTHER, "primero")
+    link = lab.helper("link", control)["token"]
+    trust = {"cmd": "trust", "hold_id": first, "via": "web", "session": "<session>", "_why": True}
+    _, wrong_gate, right = _probe(
+        nobody,
+        lab.web_gid,
+        {"cmd": "session_open", "token": link},
+        trust,
+        {**trust, "agent": SLUG},
+    )
+    theirs = lab.helper("trusted", control, SLUG)
+    mine = lab.helper("trusted", control, "-")
+
+    send(MAIN, "del-otro")
+    other_held = wait_held(MAIN, "del-otro")
+    send(OTHER, "pasa")
+    passed = said_in(lab.events(OTHER, "request"), f"{tag}-pasa")
+    not_held = held_with(OTHER, "pasa")
+
+    trust_id = next(item["trust_id"] for item in theirs if chat in json.dumps(item))
+    wrong_owner = lab.helper("untrust", control, "-", trust_id)
+    removed = lab.helper("untrust", control, SLUG, trust_id)
+    send(OTHER, "otra-vez")
+    wait_held(OTHER, "otra-vez")
+    lab.cli("rechazar", other_held)
+    attack.check(
+        "stopped",
+        wrong_gate["ok"] is False
+        and right["ok"] is True
+        and not any(chat in json.dumps(item) for item in mine)
+        and bool(passed)
+        and not_held == []
+        and wrong_owner["outcome"] == "unknown"
+        and removed["outcome"] == "removed",
+        f"confiar sin agent es la puerta del principal, que no conoce esa retención "
+        f"({wrong_gate}); con su nombre sí ({right}), y la lista es la suya; quitarla por el "
+        f"principal no la quita ({wrong_owner}), y por el suyo sí ({removed})",
+    )
+    attack.check(
+        "held",
+        bool(other_held),
+        f"el mismo mensaje del otro agente, al mismo chat, sigue retenido ({other_held}), y el del "
+        "vecino vuelve a retenerse al quitar la confianza",
+    )
+    attack.check(
+        "recorded",
+        bool(said_in(lab.events(OTHER, "trust_added"), first))
+        and said_in(lab.events(MAIN, "trust_added"), first) == [],
+        "gate/trust_added en la caja de ese agente, y nada en la del otro",
+    )
+
+
 @scenario("rebobinar-al-vecino")
 def test_the_owner_rewinds_the_neighbour_and_only_it(attack: Attack, lab: Lab) -> None:
     """`rebobinar --agente`: its workspace goes back, its agent comes back, and the other is left
@@ -886,6 +1025,9 @@ def test_the_owner_rewinds_the_neighbour_and_only_it(attack: Attack, lab: Lab) -
     main_id = sh("docker", "inspect", "--format", "{{.Id}}", MAIN.container).stdout.strip()
     elsewhere = lab.cli("rebobinar", target, "--si")
     invented = lab.cli("rebobinar", target, "--si", "--agente", "nadie")
+    # The one way a name becomes a file: load_agent, which these two reach unless a path is refused.
+    a_path = lab.cli("rebobinar", target, "--si", "--agente", "../revisor")
+    a_list = lab.cli("instantaneas", "--agente", "../revisor")
     done = lab.cli("rebobinar", target, "--si", "--agente", SLUG)
     wait(lambda: lab.running(OTHER), SEEN_TIMEOUT, "the neighbour back", lab.diagnosis)
     seen = lab.in_agent(
@@ -898,6 +1040,10 @@ def test_the_owner_rewinds_the_neighbour_and_only_it(attack: Attack, lab: Lab) -
         "stopped",
         elsewhere.returncode == 2
         and invented.returncode == 2
+        and a_path.returncode == 2
+        and "--agente" in a_path.stderr
+        and a_list.returncode == 2
+        and "--agente" in a_list.stderr
         and target in listed.stdout
         and main_id == same_main
         and main_seen.returncode == 0
@@ -1037,7 +1183,8 @@ def test_a_broken_file_stops_nothing_that_stops_or_undoes(attack: Attack, lab: L
 @scenario("tarea-del-vecino")
 def test_each_guardian_has_its_own_tasks(attack: Attack, lab: Lab) -> None:
     """T26-5a over T26-2b: an agent's tasks are its own. A turn of a real Claude Code, whose call
-    stops at the lab's cut (invariant 8), in its box and never in the other's."""
+    stops at the lab's cut (invariant 8): its command runs in that container and its end is in that
+    box. Only after a sentinel has reached the other's box is it fair to say that nothing did."""
     assert lab.network_cut(), "invariant 8: no turn of an agent without the lab's network cut"
     control = str(STATE / STATE_SOCKET)
     mark = f"T26-2C-{secrets.token_hex(6)}"
@@ -1047,25 +1194,39 @@ def test_each_guardian_has_its_own_tasks(attack: Attack, lab: Lab) -> None:
     asked_there = lab.helper("task_status", control, SLUG, task)
     asked_main = lab.helper("task_status", control, "-", task)
     asked_nobody = lab.helper("task_status", control, "nadie", task)
+
+    def ran_there() -> list[dict[str, Any]]:
+        return [e for e in said_in(lab.events(OTHER), mark) if e["source"] == "exec"]
+
+    wait(lambda: bool(ran_there()), SEEN_TIMEOUT, "the task's command in its box", lab.diagnosis)
     wait(
-        lambda: bool(said_in(lab.events(OTHER, "agent_shell"), mark)),
+        lambda: bool(said_in(lab.events(OTHER, "agent_task_end"), task)),
+        TASK_SECONDS + SEEN_TIMEOUT,
+        "the end of the task",
+        lab.diagnosis,
+    )
+    sentinel = f"fin-{secrets.token_hex(6)}"
+    lab.in_agent(MAIN, f"/bin/true {sentinel}")
+    wait(
+        lambda: bool(said_in(lab.events(MAIN), sentinel)),
         SEEN_TIMEOUT,
-        "the task in the box of its agent",
+        "the sentinel in the other's box",
         lab.diagnosis,
     )
     attack.check(
         "stopped",
         asked_there["outcome"] != "unknown"
         and asked_main["outcome"] == "unknown"
-        and asked_nobody["outcome"] == "refused",
+        and asked_nobody["outcome"] == "refused"
+        and not _answers(lab, OTHER),
         f"la tarea solo la conoce su agente ({asked_there['outcome']}); el principal no sabe de "
-        f"ella ({asked_main['outcome']}), y un agente inventado se rechaza "
-        f"({asked_nobody['outcome']})",
+        f"ella ({asked_main['outcome']}), un agente inventado se rechaza "
+        f"({asked_nobody['outcome']}) y ningún modelo ha contestado a su turno",
     )
     attack.check(
         "recorded",
         said_in(lab.events(MAIN), mark) == [],
-        "system/agent_shell en la caja del vecino, y nada en la del otro",
+        "su orden y su final en la caja del vecino, y nada en la del otro",
     )
 
 
