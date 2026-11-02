@@ -49,13 +49,16 @@ class AlertLevel(StrEnum):
 class Alert:
     """What the user is told. ``title`` and ``body`` are in Spanish; ``event_seq`` is the
     black-box event that explains it. ``agent``: whose it is when a machine has several (T26-2b),
-    and so whose box that event is in and whom its Telegram buttons act on (T26-2e)."""
+    and so whose box that event is in and whom its Telegram buttons act on (T26-2e).
+    ``installation``: it is about all of them, so nobody's name goes on it and, with several, no
+    button either."""
 
     level: AlertLevel
     title: str
     body: str
     event_seq: int | None = None
     agent: str | None = None
+    installation: bool = False
 
 
 class Notifier(Protocol):
@@ -89,7 +92,9 @@ class LogNotifier:
 class Labelled:
     """Says which agent an alert is about, when a machine has several (T26-2b), and hands one
     agent's alert at a time: each agent's queue calls this from its own thread, and ``notifier``
-    is the same for all of them. ``lock`` is theirs to share."""
+    is the same for all of them. ``lock`` is theirs to share. The agent is this queue's, unless the
+    alert says another (the service tells about a neighbour through the main agent's queue) or that
+    it is about the whole installation."""
 
     def __init__(self, notifier: Notifier, label: str, lock: threading.Lock) -> None:
         self._notifier = notifier
@@ -97,9 +102,13 @@ class Labelled:
         self._lock = lock
 
     def send(self, alert: Alert) -> None:
-        labelled = replace(alert, title=f"{self._label}: {alert.title}", agent=self._label)
+        labelled = alert if alert.installation else self._labelled(alert)
         with self._lock:
             self._notifier.send(labelled)
+
+    def _labelled(self, alert: Alert) -> Alert:
+        agent = alert.agent if alert.agent is not None else self._label
+        return replace(alert, title=f"{agent}: {alert.title}", agent=agent)
 
 
 class FanOut:

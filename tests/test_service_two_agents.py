@@ -315,6 +315,34 @@ def test_every_alert_says_whose_and_keeps_that_agent_on_it() -> None:
     assert alert.title == "revisor: Algo" and alert.agent == "revisor" and alert.event_seq == 7
 
 
+def test_an_alert_that_already_says_whose_keeps_it() -> None:
+    """What the service says about a neighbour goes through the main agent's queue."""
+    seen: list[Alert] = []
+
+    class Keep:
+        def send(self, alert: Alert) -> None:
+            seen.append(alert)
+
+    Labelled(Keep(), "principal", threading.Lock()).send(
+        Alert(AlertLevel.ERROR, "Algo", "cuerpo", agent="revisor")
+    )
+    (alert,) = seen
+    assert alert.title == "revisor: Algo" and alert.agent == "revisor"
+
+
+def test_an_alert_of_the_whole_installation_is_nobodys() -> None:
+    seen: list[Alert] = []
+
+    class Keep:
+        def send(self, alert: Alert) -> None:
+            seen.append(alert)
+
+    whole = Alert(AlertLevel.ERROR, "Algo", "cuerpo", installation=True)
+    Labelled(Keep(), "principal", threading.Lock()).send(whole)
+    assert seen == [whole]
+    assert seen[0].title == "Algo" and seen[0].agent is None
+
+
 def test_a_new_key_reaches_every_proxy() -> None:
     calls: list[str] = []
 
@@ -500,6 +528,8 @@ def test_a_neighbour_that_fails_later_is_told_the_same(home: Path) -> None:  # n
         "El agente bueno no se está vigilando",
         "El agente malo no se está vigilando",
     ]
+    assert sorted(a.agent for a in told.alerts) == ["bueno", "malo"]
+    assert not any(a.installation for a in told.alerts)
 
 
 def test_a_secret_in_an_error_never_reaches_the_installations_box(home: Path) -> None:  # noqa: F811

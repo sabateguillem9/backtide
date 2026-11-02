@@ -46,12 +46,12 @@ from backtide.service.bot import (
     TelegramParts,
     telegram_parts,
 )
-from backtide.service.config import Secret, ServiceConfig
+from backtide.service.config import STATE_KEY, Secret, ServiceConfig
 from backtide.service.control import ControlServer, ask_decide, ask_rewind
 from backtide.service.holds import BatchOutcome, BatchStatus, HoldStatus
 from backtide.service.pause import PauseOutcome, PauseStatus, ResumeOutcome, ResumeStatus
 from backtide.service.roster import Desk, Roster
-from backtide.service.runner import _Neighbours
+from backtide.service.runner import _Neighbours, _record_in_installation, record_agent_failed
 from backtide.service.telegram_config import TelegramSettings
 from backtide.snapshots import Snapshot
 from tests.test_service_agents import add_agent, main_config
@@ -132,6 +132,7 @@ class Rig:
         add_agent(home, OTHER)
         found = load_installation(main_config(home))
         main, others = found.main, found.others
+        self.config = main
         main = _with_short_socket(main, sockets)
         self.settings = TelegramSettings(_secret(), OWNER, fake.base)
         self.parts: TelegramParts = telegram_parts(main, self.settings, others)
@@ -192,6 +193,9 @@ class Rig:
         self.notifiers[slug].send(Alert(AlertLevel.ERROR, "Algo", "cuerpo", seq))
         return self.bound(self.fake.wait_call("sendMessage", after=before))
 
+    def main_queue(self) -> "MainQueue":
+        return MainQueue(self.notifiers[MAIN])
+
     def press(self, call: Call, label: str) -> float:
         before = time.monotonic()
         self.fake.push_callback(dict(buttons(call))[label], call.message_id)
@@ -216,6 +220,18 @@ class Rig:
 
     def ignored(self) -> list[dict[str, Any]]:
         return [e.details for e in self.main_box.events() if e.action == "telegram_ignored"]
+
+
+class MainQueue:
+    """The main agent's alert queue, at once: what the service says that is not the main agent's
+    goes through it, and so through its ``Labelled``."""
+
+    def __init__(self, notifier: Labelled) -> None:
+        self._notifier = notifier
+
+    def submit(self, alert: Alert) -> bool:
+        self._notifier.send(alert)
+        return True
 
 
 def _secret() -> Secret:
@@ -320,6 +336,75 @@ def test_an_alert_of_nobody_on_the_list_offers_no_button(rig: Rig, agent: str | 
     rig.parts.notifier.send(Alert(AlertLevel.WARNING, "Algo", "cuerpo", 1, agent=agent))
     sent = rig.fake.wait_call("sendMessage", after=before)
     assert "reply_markup" not in sent.params
+    assert len(rig.book) == 0
+
+
+# --- what is not the main agent's, through the main agent's queue --------------------------------
+
+
+def test_a_neighbour_that_fails_is_told_as_its_own_and_its_pause_goes_to_it(rig: Rig) -> None:
+    before = time.monotonic()
+    record_agent_failed(rig.config, rig.main_queue(), OTHER, RuntimeError("se rompió"))
+    call = rig.bound(rig.fake.wait_call("sendMessage", after=before))
+    head = f"backtide, ALERTA: {OTHER}: El agente {OTHER} no se está vigilando\n"
+    assert call.params["text"].startswith(head) and MAIN not in call.params["text"]
+    assert [label for label, _ in buttons(call)] == ["Pausar"]
+    before = rig.press(call, "Pausar")
+    reply = rig.message("congelado", after=before)
+    assert reply.params["text"].startswith(f"Agente {OTHER}:\n")
+    assert rig.other.pauses == ["telegram"]
+    assert not rig.main.touched()
+
+
+def test_the_pause_of_a_neighbour_no_longer_watched_says_so_and_freezes_nobody(rig: Rig) -> None:
+    rig.watch.close()
+    before = time.monotonic()
+    record_agent_failed(rig.config, rig.main_queue(), OTHER, RuntimeError("se rompió"))
+    call = rig.bound(rig.fake.wait_call("sendMessage", after=before))
+    before = rig.press(call, "Pausar")
+    reply = rig.message("no se está vigilando ahora mismo", after=before)
+    assert reply.params["text"].startswith(f"Agente {OTHER}:\n")
+    assert not rig.main.touched() and not rig.other.touched()
+
+
+def test_one_that_is_not_on_the_table_is_said_with_no_button_for_anybody(rig: Rig) -> None:
+    """Created with the service running: the table is made at the start."""
+    before = time.monotonic()
+    record_agent_failed(rig.config, rig.main_queue(), "tercero", RuntimeError("se rompió"))
+    call = rig.fake.wait_call("sendMessage", after=before)
+    assert call.params["text"].startswith("backtide, ALERTA: tercero: El agente tercero no se")
+    assert "reply_markup" not in call.params
+    assert len(rig.book) == 0
+
+
+def test_an_alert_of_the_whole_installation_names_nobody_and_offers_nothing(rig: Rig) -> None:
+    before = time.monotonic()
+    rig.main_queue().submit(Alert(AlertLevel.ERROR, "Tope", "cuerpo", installation=True))
+    call = rig.fake.wait_call("sendMessage", after=before)
+    assert call.params["text"] == "backtide, ALERTA: Tope\n\ncuerpo"
+    assert "reply_markup" not in call.params
+    assert len(rig.book) == 0
+
+
+def test_one_citing_an_event_of_the_main_box_still_offers_no_rewind(rig: Rig) -> None:
+    """An entry to the web: the event stays in the main agent's box, and nobody is rewound."""
+    seq = rig.main_box.append("system", "web_session_opened", "web", details={}, risk=1).seq
+    before = time.monotonic()
+    rig.main_queue().submit(Alert(AlertLevel.ERROR, "Entrada", "cuerpo", seq, installation=True))
+    call = rig.fake.wait_call("sendMessage", after=before)
+    assert call.params["text"].startswith("backtide, ALERTA: Entrada\n")
+    assert "reply_markup" not in call.params
+    assert len(rig.book) == 0
+
+
+def test_a_broken_installation_box_is_told_as_nobodys(rig: Rig) -> None:
+    assert _record_in_installation(rig.config, rig.main_queue(), "x", "", {})  # it exists now
+    (rig.config.installation_dir / STATE_KEY).unlink()
+    before = time.monotonic()
+    assert not _record_in_installation(rig.config, rig.main_queue(), "x", "", {})
+    call = rig.fake.wait_call("sendMessage", after=before)
+    assert call.params["text"].startswith("backtide, ALERTA: La caja de la instalación no se")
+    assert "reply_markup" not in call.params
     assert len(rig.book) == 0
 
 
@@ -564,6 +649,7 @@ def test_the_help_with_several_says_how_to_name_them(rig: Rig) -> None:
     (said,) = rig.replies_after(before)
     assert f"Hay varios agentes: {MAIN}, {OTHER}." in said
     assert "/pausar <agente>" in said and len(said) < MAX_TEXT
+    assert "toda la instalación no llevan botones" in said
 
 
 def test_retenidas_lists_each_agents_under_its_name_with_buttons_for_it(rig: Rig) -> None:
@@ -875,6 +961,29 @@ def test_alone_nothing_is_labelled_and_no_button_names_an_agent(alone: Any) -> N
     parts.desk.held(notice())
     held = fake.wait_call("sendMessage", lambda c: "RETENIDA" in c.params["text"])
     assert held.params["text"].startswith("⏸ backtide · RETENIDA")
+
+
+def test_alone_an_alert_of_the_installation_is_as_it_always_was(alone: Any) -> None:
+    fake, parts, guard, box = alone
+    seq = box.append("system", "web_session_opened", "web", details={}, risk=1).seq
+    parts.notifier.send(Alert(AlertLevel.ERROR, "Algo", "cuerpo", seq, installation=True))
+    call = fake.wait_call("sendMessage")
+    cited = f"(evento {seq} de la caja negra)"
+    assert call.params["text"] == f"backtide, ALERTA: Algo\n\ncuerpo\n\n{cited}"
+    assert [label for label, _ in buttons(call)] == ["Pausar", "Rebobinar"]
+    time.sleep(0.1)  # the bot binds its buttons once the Bot API's answer reaches it
+    fake.push_callback(dict(buttons(call))["Pausar"], call.message_id)
+    fake.wait_call("sendMessage", lambda c: "congelado" in c.params["text"])
+    assert guard.pauses == ["telegram"]
+
+
+def test_alone_the_alert_of_a_new_agent_has_no_button_that_freezes_the_only_one(alone: Any) -> None:
+    fake, parts, guard, _ = alone
+    parts.notifier.send(Alert(AlertLevel.ERROR, "Agente nuevo: otro", "cuerpo", agent="otro"))
+    call = fake.wait_call("sendMessage")
+    assert call.params["text"] == "backtide, ALERTA: Agente nuevo: otro\n\ncuerpo"
+    assert "reply_markup" not in call.params
+    assert guard.pauses == []
 
 
 @pytest.mark.parametrize("order", ["/pausar", "/pausar otro", "/pausar@MiBot ../x y z"])

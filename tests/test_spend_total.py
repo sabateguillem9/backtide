@@ -219,6 +219,7 @@ def test_a_count_that_cannot_be_made_lets_nothing_out_and_is_said_once(machine: 
     assert [a.title for a in machine.alerts] == [
         "No se puede contar el gasto de toda la instalación"
     ]
+    assert machine.alerts[0].installation and machine.alerts[0].agent is None
     # It ends by itself when the count comes back.
     (machine.folders["revisor"] / STATE_BUDGET).unlink()
     assert a.admit("f3", model="m", max_tokens=1) is None
@@ -292,6 +293,7 @@ def test_the_warnings_of_the_total_go_to_its_box_once_each(machine: Machine) -> 
     ]
     assert all(r[2]["scope"] == "installation" for r in machine.recorded if "pct" in r[2])
     assert any("Tope de gasto de hoy de toda la instalación" in a.title for a in machine.alerts)
+    assert all(a.installation and a.agent is None for a in machine.alerts)
     # Saved, so a restart does not announce them again.
     again = machine.make_total()
     again.booked()

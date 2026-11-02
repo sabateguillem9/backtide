@@ -3368,6 +3368,13 @@ def test_each_link_and_each_entry_is_recorded_and_alerted(world: World) -> None:
     assert {a.level for a in world.alerts.sent if "web" in a.title} == {AlertLevel.ERROR}
 
 
+def test_a_way_into_the_web_is_about_the_whole_installation(world: World) -> None:
+    """A session reaches every agent: its alert must not offer to freeze the main one alone."""
+    world.guardian.web_access("web_session_opened", {"pid": 8})
+    (alert,) = world.alerts.titled("Alguien ha entrado en la web")
+    assert alert.installation and alert.agent is None and alert.event_seq is not None
+
+
 def test_an_entry_the_box_does_not_take_is_said_and_refused(world: World) -> None:
     world.box.append_error = BlackBoxError("disk full")
     assert world.guardian.web_access("web_session_opened", {"pid": 8}) is False
