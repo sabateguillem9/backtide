@@ -1,0 +1,37 @@
+{# One line of the chat. ``asked``, ``said`` and ``answer`` are not ours (docs/47 section 7.3): they
+   are only ever shown with ``vis``, each in its own <pre> under a label of ours, and what the agent
+   wrote is never a link, an image or anything else that asks for something by itself. #}
+<li class="task" id="task-{{ task.id }}"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <p class="task-head" id="task-head-{{ task.id }}">
+    {% if not task.ended %}<span class="status-dot st-working" aria-hidden="true"></span>{% endif %}<span class="task-word">{{ t('talk.word.' ~ task.outcome) }}</span>
+    <span>·</span> <time data-ago datetime="{{ task.asked_at }}" title="{{ stamp(task.asked_at) }}">{{ age(parse_ts(task.asked_at)) }}</time>
+    {% if task.seconds is not none %}<span>·</span> <span>{{ t('talk.took', seconds=task.seconds) }}</span>{% endif %}
+    {% if task.from_cli %}<span>·</span> <span>{{ t('talk.from_cli') }}</span>{% endif %}
+  </p>
+  {% if not task.ended %}
+  <form class="task-stop" id="task-stop-{{ task.id }}" action="{{ stop }}" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="tarea" value="{{ task.id }}">
+    {% if not agent.main %}<input type="hidden" name="agente" value="{{ agent.slug }}">{% endif %}
+    <button class="setting-remove" type="submit">{{ t('talk.stop') }}</button>
+  </form>
+  {% endif %}
+  <div class="task-part">
+    <p class="task-label">{{ t('talk.asked') }}</p>
+    <pre class="task-asked" hx-disable>{{ vis(task.asked, keep_newlines=True, keep_tabs=True) }}</pre>
+  </div>
+  {% if task.said %}
+  <div class="task-part">
+    <p class="task-label">{{ t('talk.said') }}</p>
+    <pre class="task-text" tabindex="0" hx-disable>{{ vis(task.said, keep_newlines=True, keep_tabs=True) }}</pre>
+  </div>
+  {% endif %}
+  {% if task.answer is not none %}
+  <div class="task-part">
+    <p class="task-label">{{ t('talk.answer') }}</p>
+    <pre class="task-text" tabindex="0" hx-disable>{{ vis(task.answer, keep_newlines=True, keep_tabs=True) }}</pre>
+    {% if task.cut %}<p class="note">{{ t('talk.cut', shown=task.answer | length, total=task.answer_chars) }}</p>{% endif %}
+  </div>
+  {% endif %}
+  {% if task.unread %}<p class="note">{{ t('talk.unread') }}</p>{% endif %}
+</li>

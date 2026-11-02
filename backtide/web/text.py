@@ -17,14 +17,27 @@ _MARK = '<span class="esc" title="{title}">U+{code:04X}{times}</span>'
 _BLANK = frozenset("\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0\u034f")
 _MARKS = frozenset({"Mn", "Me"})
 MAX_MARKS = 3  # Vietnamese and Devanagari stack two or three; more than that is a tower
+# Markers one text may turn into (T26-5b): each is an element, and an agent chooses how many. Alone,
+# Persian's or Hindi's joiners stay well under it in the 64 KiB an answer shows; past it the text
+# stops, and says how much was left out, so twenty answers can never hang the tab with the stop in.
+MAX_MARKERS = 4096
 
 
-def visible(value: object, limit: int | None = None, *, keep_newlines: bool = False) -> Markup:
+def visible(
+    value: object,
+    limit: int | None = None,
+    *,
+    keep_newlines: bool = False,
+    keep_tabs: bool = False,
+) -> Markup:
     """``value`` as HTML-safe markup with every character that is not plainly printable made
     visible: controls, bidi marks, letters that print as nothing, and towers of combining marks
     (more than three on one letter, or marks with no letter to sit on), which would pile up over
-    the lines around them. ``limit`` cuts the text (in characters) and says so. With
-    ``keep_newlines`` a line break stays one (pretty-printed JSON in a ``<pre>``)."""
+    the lines around them. The same character many times in a row is one marker (``U+200B×500``),
+    and past MAX_MARKERS the text stops and says so. ``limit`` cuts the text (in characters) and
+    says so. With ``keep_newlines`` a line break stays one (pretty-printed JSON in a ``<pre>``), and
+    with
+    ``keep_tabs`` a tab does (an answer with code in it, in a ``<pre>``: T26-5b)."""
     text = value if isinstance(value, str) else str(value)
     cut = limit is not None and len(text) > limit
     if cut:
@@ -32,6 +45,7 @@ def visible(value: object, limit: int | None = None, *, keep_newlines: bool = Fa
     pieces: list[str] = []
     run: list[str] = []
     on_a_letter = False  # the last thing written is a visible, non-blank character
+    markers = 0
 
     def flush() -> None:
         nonlocal run
@@ -41,6 +55,10 @@ def visible(value: object, limit: int | None = None, *, keep_newlines: bool = Fa
 
     i, size = 0, len(text)
     while i < size:
+        if markers >= MAX_MARKERS:
+            flush()
+            pieces.append(f'<span class="cut">…({size - i})</span>')
+            break
         char = text[i]
         if unicodedata.category(char) in _MARKS:
             j = i
@@ -52,10 +70,11 @@ def visible(value: object, limit: int | None = None, *, keep_newlines: bool = Fa
             else:
                 flush()
                 pieces.append(_marker(char, f"×{count}"))
+                markers += 1
             i, on_a_letter = j, on_a_letter and count <= MAX_MARKS
             continue
         i += 1
-        if char == " " or (keep_newlines and char == "\n"):
+        if char == " " or (keep_newlines and char == "\n") or (keep_tabs and char == "\t"):
             run.append(char)
             on_a_letter = False
         elif char.isprintable() and char not in _BLANK:
@@ -63,7 +82,12 @@ def visible(value: object, limit: int | None = None, *, keep_newlines: bool = Fa
             on_a_letter = True
         else:
             flush()
-            pieces.append(_marker(char, ""))
+            start = i
+            while i < size and text[i] == char:
+                i += 1
+            count = i - start + 1
+            pieces.append(_marker(char, f"×{count}" if count > 1 else ""))
+            markers += 1
             on_a_letter = False
     flush()
     if cut:

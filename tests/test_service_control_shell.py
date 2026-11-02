@@ -14,16 +14,27 @@ from backtide.jail.profile import MAX_PROMPT
 from backtide.service import control
 from backtide.service.control import (
     MAX_REQUEST_BYTES,
+    REPLY_TIMEOUT,
+    ControlError,
     ControlOutcomeUnknown,
     ControlServer,
     ask_export,
     ask_shell,
+    ask_task_list,
     ask_task_start,
     ask_task_status,
     ask_task_stop,
 )
 from backtide.service.shell import ExportOutcome, ExportStatus, ShellOutcome, ShellStatus
-from backtide.service.tasks import TaskOutcome, TaskStart, TaskStatus
+from backtide.service.tasks import (
+    ASKED_CHARS,
+    MAX_KEPT,
+    MAX_RUNNING,
+    TaskEntry,
+    TaskOutcome,
+    TaskStart,
+    TaskStatus,
+)
 from tests.test_service_control import FakeGuardian, me, talk
 
 CONTAINER_ID = "ab12" * 16
@@ -48,6 +59,8 @@ class ShellGuardian(FakeGuardian):
         self.task_started = TaskStart(TASK_ID)
         self.task_seen: TaskStatus | None = TaskStatus(TASK_ID, TaskOutcome.RUNNING)
         self.task_stopped: bool | None = True
+        self.task_lines: list[TaskEntry] = []
+        self.stop_requested_by: list[str | None] = []
         self.export_outcome = ExportOutcome(
             ExportStatus.DONE, "", "/home/me/out", SNAP, {"files": 2, "bytes": 9}
         )
@@ -73,10 +86,16 @@ class ShellGuardian(FakeGuardian):
             raise self.error
         return self.task_seen
 
-    def task_stop(self, task_id: str) -> bool | None:
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None:
+        self.stop_requested_by.append(requested_by)
         if self.error is not None:
             raise self.error
         return self.task_stopped
+
+    def task_list(self) -> list[TaskEntry]:
+        if self.error is not None:
+            raise self.error
+        return self.task_lines
 
     def export(self, destination: str, *, requested_by: str, **bundle: Any) -> ExportOutcome:
         self.exports.append((destination, requested_by, bundle))
@@ -381,9 +400,117 @@ def test_a_task_longer_than_its_own_limit_is_refused(
 def test_the_status_of_a_task_that_ended(server: ControlServer, guardian: ShellGuardian) -> None:
     guardian.task_seen = TaskStatus(TASK_ID, TaskOutcome.OK, "", "listo \x1b[2J", 0, 1.5)
     assert ask_task_status(server.path, TASK_ID, peer=me) == {
-        "ok": True, "outcome": "ok", "message": "", "answer": "listo \x1b[2J", "code": 0,
-        "seconds": 1.5,
+        "ok": True, "outcome": "ok", "message": "", "answer": "listo \x1b[2J", "answer_chars": 10,
+        "code": 0, "seconds": 1.5,
     }  # fmt: skip
+
+
+def test_the_status_can_come_cut_and_says_how_long_it_was(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    """T26-5b: what the chat's page shows, without 48 MiB through the socket for each load."""
+    guardian.task_seen = TaskStatus(TASK_ID, TaskOutcome.OK, "", "x" * 1000, 0, 1.5)
+    reply = ask_task_status(server.path, TASK_ID, cut=10, peer=me)
+    assert reply["answer"] == "x" * 10 and reply["answer_chars"] == 1000
+
+
+def test_a_cut_of_a_task_without_an_answer_is_no_answer(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    reply = ask_task_status(server.path, TASK_ID, cut=10, peer=me)
+    assert reply["answer"] is None and reply["answer_chars"] == 0
+
+
+@pytest.mark.parametrize("cut", [0, -1, 1.5, True, "10", [1]])
+def test_a_cut_that_is_not_a_number_of_characters_is_refused(
+    server: ControlServer, guardian: ShellGuardian, cut: object
+) -> None:
+    reply = talk(
+        server, json.dumps({"cmd": "task_status", "task": TASK_ID, "cut": cut}).encode() + b"\n"
+    )
+    assert reply["outcome"] == "refused"
+
+
+def test_the_list_of_the_tasks(server: ControlServer, guardian: ShellGuardian) -> None:
+    guardian.task_lines = [
+        TaskEntry(TASK_ID, "di hola", 123.5, "web", TaskOutcome.OK, 1.5, 9),
+        TaskEntry("b" * 32, "\x1b[2J<b>", 124.0, "cli", TaskOutcome.RUNNING),
+    ]
+    assert ask_task_list(server.path, peer=me) == [
+        {"task": TASK_ID, "asked": "di hola", "asked_at": 123.5, "via": "web", "outcome": "ok",
+         "seconds": 1.5, "answer_chars": 9},
+        {"task": "b" * 32, "asked": "\x1b[2J<b>", "asked_at": 124.0, "via": "cli",
+         "outcome": "running", "seconds": None, "answer_chars": 0},
+    ]  # fmt: skip
+
+
+def test_the_longest_list_fits_its_reply(server: ControlServer, guardian: ShellGuardian) -> None:
+    """What JSON makes longest, at the most the service keeps."""
+    asked = "😀" * ASKED_CHARS
+    guardian.task_lines = [
+        TaskEntry(TASK_ID, asked, 1.0, "web", TaskOutcome.OK, 1.0, 1)
+        for _ in range(MAX_KEPT + MAX_RUNNING)
+    ]
+    assert len(ask_task_list(server.path, peer=me)) == MAX_KEPT + MAX_RUNNING
+
+
+def test_a_list_with_a_broken_line_is_no_list(
+    monkeypatch: pytest.MonkeyPatch, server: ControlServer
+) -> None:
+    from backtide.service import control
+
+    for broken in ({"task": "x"}, {"task": TASK_ID}, "nada"):
+        raw = json.dumps({"ok": True, "outcome": "listed", "message": "", "tasks": [broken]})
+        monkeypatch.setattr(control, "_ask", lambda *a, raw=raw, **k: raw.encode())
+        with pytest.raises(ControlOutcomeUnknown):
+            ask_task_list(server.path, peer=me)
+
+
+def test_a_guardian_that_raises_on_the_list_is_a_refusal(
+    server: ControlServer, guardian: ShellGuardian, caplog: pytest.LogCaptureFixture
+) -> None:
+    guardian.error = RuntimeError("MARCA-DEL-PROMPT")
+    with pytest.raises(ControlError, match="inesperado"):
+        ask_task_list(server.path, peer=me)
+    assert "MARCA-DEL-PROMPT" not in caplog.text
+
+
+@pytest.mark.parametrize("extra", [{"task": TASK_ID}, {"cut": 1}, {"all": True}])
+def test_the_list_takes_nothing_else(
+    server: ControlServer, guardian: ShellGuardian, extra: dict[str, Any]
+) -> None:
+    assert talk(server, json.dumps({"cmd": "task_list", **extra}).encode() + b"\n")["ok"] is False
+
+
+class Slow:
+    """A client socket's other end, for what ``_reply`` gives it."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, seconds: float) -> None:
+        self.timeouts.append(seconds)
+
+    def sendall(self, data: bytes) -> None:
+        pass
+
+    def shutdown(self, how: int) -> None:
+        pass
+
+    def recv(self, size: int) -> bytes:
+        return b""
+
+
+def test_a_long_reply_has_time_to_go(server: ControlServer) -> None:
+    """T26-5b: 48 MiB in 5 seconds, all of it (the timeout of sendall is for the whole call), lost
+    an answer as soon as the machine was busy. The time goes with the length, and a short reply
+    still has the 5 seconds it always had."""
+    short, long = Slow(), Slow()
+    server._reply(short, {"ok": True})  # type: ignore[arg-type]  # noqa: SLF001
+    assert short.timeouts[0] == pytest.approx(REPLY_TIMEOUT, abs=0.01)
+    answer = "x" * (48 * 1024 * 1024)
+    server._reply(long, {"ok": True, "answer": answer})  # type: ignore[arg-type]  # noqa: SLF001
+    assert long.timeouts[0] == pytest.approx(REPLY_TIMEOUT + 48, abs=0.01)
 
 
 def test_the_status_of_a_task_that_runs(server: ControlServer, guardian: ShellGuardian) -> None:
@@ -404,6 +531,20 @@ def test_a_task_it_does_not_know(server: ControlServer, guardian: ShellGuardian)
     reply = ask_task_status(server.path, TASK_ID, peer=me)
     assert reply["ok"] is False and reply["outcome"] == "unknown" and reply["answer"] is None
     assert ask_task_stop(server.path, TASK_ID, peer=me) is False
+
+
+def test_ctrl_c_says_nothing_of_the_web(server: ControlServer, guardian: ShellGuardian) -> None:
+    assert ask_task_stop(server.path, TASK_ID, peer=me) is True
+    assert guardian.stop_requested_by == [None]
+
+
+@pytest.mark.parametrize("via", ["telegram", 3, ["web"]])
+def test_a_stop_from_nobody_we_know_is_refused(
+    server: ControlServer, guardian: ShellGuardian, via: object
+) -> None:
+    raw = json.dumps({"cmd": "task_stop", "task": TASK_ID, "via": via}).encode() + b"\n"
+    assert talk(server, raw)["outcome"] == "refused"
+    assert guardian.stop_requested_by == []
 
 
 @pytest.mark.parametrize("stopped", [True, False])

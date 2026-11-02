@@ -114,8 +114,12 @@ from backtide.service.shell import (
 )
 from backtide.service.spend import CAP_SHAPE, CapOutcome, check_cap
 from backtide.service.tasks import (
+    ASKED_CHARS,
+    MAX_KEPT,
+    MAX_RUNNING,
     MAX_TASK_SECONDS,
     TASK_MAX_OUTPUT,
+    TaskEntry,
     TaskOutcome,
     TaskStart,
     TaskStatus,
@@ -128,6 +132,9 @@ logger = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 4096
 REQUEST_TIMEOUT = 5.0  # seconds, in total, to receive a request
 REPLY_TIMEOUT = 5.0  # seconds to hand the reply to a client that does not read it
+# ...and more for a reply that is long: a task's answer goes up to 48 MiB of JSON (T26-5b). A client
+# that reads slower than this loses its reply, and the connection is the only thing it held.
+REPLY_BYTES_PER_SECOND = 1024 * 1024
 MAX_CONNECTIONS = 8
 DRAIN_SECONDS = 1.0  # after replying, read what is left so the reply is not lost to a reset
 DRAIN_BYTES = 1 << 20
@@ -204,6 +211,10 @@ MAX_SKIPPED_TEXT = 300
 TASK_REQUEST_START = b'{"cmd": "task_start", '
 MAX_TASK_REQUEST_BYTES = 12 * MAX_PROMPT + MAX_REQUEST_BYTES
 MAX_TASK_REPLY_BYTES = 6 * TASK_MAX_OUTPUT + MAX_REPLY_BYTES
+# The chat's list (T26-5b): a short line per task, with what was asked as JSON makes it longest,
+# twelve bytes for a character past the BMP (an emoji).
+MAX_TASK_LIST_REPLY_BYTES = (MAX_KEPT + MAX_RUNNING) * 12 * ASKED_CHARS + MAX_REPLY_BYTES
+TASK_LISTED = "listed"
 TASK_REQUESTERS = frozenset({"cli", "web"})
 TASK_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 TASK_UNKNOWN = "unknown"
@@ -215,6 +226,7 @@ TASK_START_OUTCOMES = frozenset({"started", REFUSED})
 TASK_STATUS_OUTCOMES = frozenset(
     {*(str(outcome) for outcome in TaskOutcome), TASK_UNKNOWN, REFUSED}
 )
+TASK_OUTCOME_WORDS = frozenset(str(outcome) for outcome in TaskOutcome)
 TASK_STOP_OUTCOMES = frozenset({"stopped", "failed", TASK_UNKNOWN, REFUSED})
 MAX_NOTICE_LINES, MAX_NOTICE_LINE = 8, 600  # what `agents` carries of an agent's rewind notice
 TASK_STOP_REPLY_TIMEOUT = 2 * 60.0  # up to three ``pkill`` of 30 s each, inside the agent
@@ -224,7 +236,8 @@ MAX_LISTED_SNAPSHOTS = 5000
 AGENT_COMMANDS = frozenset(
     {
         "rewind", "resume", "decide", "holds", "trust", "untrust", "end_batch", "trusted",
-        "batches", "shell", "import", "task_start", "task_status", "task_stop", "export",
+        "batches", "shell", "import", "task_start", "task_status", "task_stop", "task_list",
+        "export",
         "budget", "set_budget", "accept_prices", "snapshots", "agent_pause", "agent_resume",
     }
 )  # fmt: skip
@@ -287,7 +300,9 @@ class RewindService(Protocol):
 
     def task_status(self, task_id: str) -> TaskStatus | None: ...
 
-    def task_stop(self, task_id: str) -> bool | None: ...
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None: ...
+
+    def task_list(self) -> list[TaskEntry]: ...
 
     def export(
         self,
@@ -626,6 +641,8 @@ class ControlServer:
             return self._task_status(guardian, request)
         if command == "task_stop":
             return self._task_stop(guardian, request, pid, uid)
+        if command == "task_list":
+            return self._task_list(guardian, request)
         if command == "snapshots":
             return self._snapshots(desk, request)
         if command in ("agent_pause", "agent_resume"):
@@ -926,6 +943,9 @@ class ControlServer:
     def _task_status(self, guardian: RewindService, request: dict[str, Any]) -> dict[str, Any]:
         """How a task goes, with its answer when it ended: the agent's text, as it came. On the
         web's socket it takes a live session (``WebControlServer``): it is not in the black box."""
+        cut = request.pop("cut", None)
+        if cut is not None and (type(cut) is not int or cut < 1):
+            raise _BadRequest("`cut` es un número de caracteres.")
         task_id = self._task_id_of(request)
         try:
             status = guardian.task_status(task_id)
@@ -939,18 +959,55 @@ class ControlServer:
             "outcome": str(status.outcome),
             "message": status.message,
             "task": task_id,
-            "answer": status.answer,
+            "answer": status.answer
+            if cut is None or status.answer is None
+            else status.answer[:cut],
+            "answer_chars": len(status.answer or ""),
             "code": status.code,
             "seconds": status.seconds,
+        }
+
+    def _task_list(self, guardian: RewindService, request: dict[str, Any]) -> dict[str, Any]:
+        """The agent's tasks, for the chat (T26-5b): no answer in it, whatever they measure. On the
+        web's socket it takes a live session, as ``task_status``: what was asked is not in the black
+        box as long as this."""
+        if set(request) != {"cmd"}:
+            raise _BadRequest("Esa orden lleva `cmd`, y nada más.")
+        try:
+            tasks = guardian.task_list()
+        except Exception as error:
+            logger.error("listing the tasks raised %s instead of answering", type(error).__name__)
+            return _refusal("Ha fallado algo inesperado: no se sabe cómo van las tareas.")
+        return {
+            "ok": True,
+            "outcome": TASK_LISTED,
+            "message": "",
+            "tasks": [
+                {
+                    "task": entry.task_id,
+                    "asked": entry.asked,
+                    "asked_at": entry.asked_at,
+                    "via": entry.via,
+                    "outcome": str(entry.outcome),
+                    "seconds": entry.seconds,
+                    "answer_chars": entry.answer_chars,
+                }
+                for entry in tasks
+            ],
         }
 
     def _task_stop(
         self, guardian: RewindService, request: dict[str, Any], pid: int, uid: int
     ) -> dict[str, Any]:
-        """Ctrl-C in `backtide tarea`: stop the task inside the agent. Not on the web's list."""
+        """Stop the task inside the agent: Ctrl-C in `backtide tarea`, or the web's button
+        (T26-5b), on its socket with a live session; then the end's event says it was the web."""
+        via = request.pop("via", "cli")
+        if not isinstance(via, str) or via not in TASK_REQUESTERS:
+            raise _BadRequest("`via` es cli o web.")
         task_id = self._task_id_of(request)
+        who = {"requested_by": f"web (uid {uid}, pid {pid})"} if via == "web" else {}
         try:
-            stopped = guardian.task_stop(task_id)
+            stopped = guardian.task_stop(task_id, **who)
         except Exception as error:
             logger.error("stopping a task raised %s instead of answering", type(error).__name__)
             stopped = False
@@ -1379,7 +1436,8 @@ class ControlServer:
         the client still sends is read for a moment, so a reset does not eat the reply."""
         data = json.dumps(reply).encode() + b"\n"
         try:
-            sock.settimeout(REPLY_TIMEOUT)
+            # The timeout of sendall is for all of it, however little goes at a time.
+            sock.settimeout(REPLY_TIMEOUT + len(data) / REPLY_BYTES_PER_SECOND)
             sock.sendall(data)
             sock.shutdown(socket.SHUT_WR)
             self._drain(sock)
@@ -2880,6 +2938,7 @@ def ask_task_status(
     path: Path,
     task_id: str,
     *,
+    cut: int | None = None,
     wait: float = WAIT_FOR_SERVICE,
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
@@ -2891,10 +2950,14 @@ def ask_task_status(
     """How a task goes: ``ok`` (False if it is not known here, or refused), ``outcome`` (a
     ``TaskOutcome``, "unknown" or "refused"), ``message``, and its ``answer``, ``code`` and
     ``seconds`` once it ended. The answer and the message can carry the agent's text, as it came:
-    whoever shows them escapes them."""
+    whoever shows them escapes them. With ``cut`` the answer comes cut to that many characters
+    (the chat's page shows no more), and ``answer_chars`` says how long it was."""
+    request: dict[str, Any] = {"cmd": "task_status", "task": task_id}
+    if cut is not None:
+        request["cut"] = cut
     raw = _ask(
         Path(path),
-        {"cmd": "task_status", "task": task_id},
+        request,
         what="la pregunta",
         wait=wait,
         reply_timeout=REPLY_TIMEOUT * 6,
@@ -2913,6 +2976,7 @@ def ask_task_status(
         or not isinstance(reply.get("ok"), bool)
         or not isinstance(reply.get("message"), str)
         or not isinstance(reply.get("answer"), str | None)
+        or not (reply.get("answer_chars") is None or type(reply.get("answer_chars")) is int)
         or not (reply.get("code") is None or type(reply.get("code")) is int)
         or not (reply.get("seconds") is None or type(reply.get("seconds")) in (int, float))
     ):
@@ -2922,30 +2986,92 @@ def ask_task_status(
         "outcome": reply["outcome"],
         "message": reply["message"],
         "answer": reply.get("answer"),
+        "answer_chars": reply.get("answer_chars") or 0,
         "code": reply.get("code"),
         "seconds": reply.get("seconds"),
     }
+
+
+def ask_task_list(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+    session: str | None = None,
+    agent: str | None = None,
+) -> list[dict[str, Any]]:
+    """The agent's tasks, oldest first (the web's chat, T26-5b): for each its ``task``, ``asked``,
+    ``asked_at``, ``via``, ``outcome``, ``seconds`` and ``answer_chars``. Never an answer. A refusal
+    raises ControlError with its message, and a reply that makes no sense ControlOutcomeUnknown.
+    ``asked`` is the owner's text as it came: whoever shows it escapes it."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "task_list"},
+        what="la lista de tareas",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        server_uid=server_uid,
+        session=session,
+        sleep=sleep,
+        monotonic=monotonic,
+        max_reply=MAX_TASK_LIST_REPLY_BYTES,
+        agent=agent,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict) or not isinstance(reply.get("message"), str):
+        raise ControlOutcomeUnknown("La respuesta del servicio no es la esperada.")
+    if reply.get("ok") is not True or reply.get("outcome") != TASK_LISTED:
+        raise ControlError(reply["message"])
+    tasks = reply.get("tasks")
+    if not isinstance(tasks, list) or not all(_is_task_line(one) for one in tasks):
+        raise ControlOutcomeUnknown("La respuesta del servicio no es la esperada.")
+    return tasks
+
+
+def _is_task_line(one: object) -> bool:
+    return (
+        isinstance(one, dict)
+        and _is_task_id(one.get("task"))
+        and isinstance(one.get("asked"), str)
+        and type(one.get("asked_at")) in (int, float)
+        and isinstance(one.get("via"), str)
+        and one.get("outcome") in TASK_OUTCOME_WORDS
+        and (one.get("seconds") is None or type(one.get("seconds")) in (int, float))
+        and type(one.get("answer_chars")) is int
+    )
 
 
 def ask_task_stop(
     path: Path,
     task_id: str,
     *,
+    via: str | None = None,
     wait: float = WAIT_FOR_SERVICE,
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+    session: str | None = None,
     agent: str | None = None,
 ) -> bool:
-    """Ctrl-C in `backtide tarea`: stop the task inside the agent. True if nothing of it is left or
-    it was signalled; False if it may run on, or the service did not say."""
+    """Ctrl-C in `backtide tarea`, or the web's button: stop the task inside the agent. True if
+    nothing of it is left or it was signalled; False if it may run on, or the service won't say."""
+    request: dict[str, Any] = {"cmd": "task_stop", "task": task_id}
+    if via is not None:
+        request["via"] = via
     raw = _ask(
         Path(path),
-        {"cmd": "task_stop", "task": task_id},
+        request,
         what="la orden de parar",
         wait=wait,
         reply_timeout=TASK_STOP_REPLY_TIMEOUT,
         peer=peer,
+        server_uid=server_uid,
+        session=session,
         sleep=sleep,
         monotonic=monotonic,
         agent=agent,

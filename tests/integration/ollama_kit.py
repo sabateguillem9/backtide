@@ -38,6 +38,7 @@ OLLAMA_UID = 61003
 CONTAINER_PREFIX = "backtide-test-agent-"  # under the cleanup's prefixes (conftest)
 READY_LINE = "t20-ollama-ready"  # proxy_fixtures/fake_ollama.py
 REPLY_TEXT = "T20 PONG FROM THE FAKE OLLAMA"
+PAINT_TAIL = "T26-ANSWER-"  # proxy_fixtures/fake_ollama.py: what ends its hostile answer
 MODEL = "t20-fake-coder:7b"
 PORT = 11434
 DECOYS = (22, 80, 443, 8080)
