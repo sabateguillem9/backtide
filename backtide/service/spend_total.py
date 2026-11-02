@@ -190,6 +190,16 @@ class InstallationSpend:
 
     # -- what the sockets ask ---------------------------------------------------------------
 
+    def add_member(self, slug: str, folder: Path) -> None:
+        """A new agent (T26-6a): what it spends counts from now on, and it starts at nothing."""
+        with self._lock:
+            self._members[slug] = Path(folder)
+
+    def caps(self) -> tuple[Decimal, Decimal]:
+        """The whole installation's caps now, a day and a month, in dollars."""
+        with self._lock:
+            return Decimal(usd(self._daily)), Decimal(usd(self._monthly))
+
     def status(self) -> dict[str, Any]:
         """The total, its caps and each agent's part. No secret."""
         with self._lock:

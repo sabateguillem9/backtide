@@ -289,6 +289,10 @@ class Egress:
             if error is not None:
                 details["error"] = _short(error)
             self._record("proxy_stop", details, risk=0 if error is None else 2)
+            if self.budget is not None:
+                # What it had in flight got out and nobody will say what it cost: each is charged
+                # its estimate, and no reservation stays in a count the others add up (T26-6a).
+                self.budget.forget_all()
         self.local_refusals.flush()  # nothing counted is lost (decision 9)
 
     def check(self) -> None:

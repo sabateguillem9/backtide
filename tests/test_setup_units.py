@@ -75,9 +75,13 @@ SERVICE = {
     "ProtectSystem": ["strict"],
     # The export folder with "-": a service whose folder is missing still starts (S1).
     "ReadWritePaths": [
-        f"{layout.STATE_DIR} {layout.VOLUME_MOUNT} -{layout.AGENT_VOLUMES} -{layout.EXPORT_DIR}"
+        f"{layout.STATE_DIR} {layout.VOLUME_MOUNT} -{layout.AGENT_VOLUMES} "
+        f"-{layout.AGENT_CONFIGS} -{layout.EXPORT_DIR}"
     ],
-    "Environment": [f"BACKTIDE_EXPORT_DIR={layout.EXPORT_DIR}"],
+    "Environment": [
+        f"BACKTIDE_EXPORT_DIR={layout.EXPORT_DIR}",
+        f"BACKTIDE_AGENT_VOLUMES={layout.AGENT_VOLUMES}",
+    ],
     "ProtectHome": ["yes"],
     "PrivateTmp": ["yes"],
     "ProtectKernelModules": ["yes"],
@@ -159,8 +163,10 @@ def test_no_placeholder_or_specifier_is_left(rendered: dict[str, str]) -> None:
 
 def test_no_secret_reaches_a_unit(rendered: dict[str, str]) -> None:
     for name, text in rendered.items():
-        # One variable only, and not a secret: where `backtide exportar` may write (S1).
+        # Two, and neither a secret: where `backtide exportar` may write (S1), and where the
+        # volumes of the agents it creates go (T26-6a).
         text = text.replace(f"Environment=BACKTIDE_EXPORT_DIR={layout.EXPORT_DIR}\n", "")
+        text = text.replace(f"Environment=BACKTIDE_AGENT_VOLUMES={layout.AGENT_VOLUMES}\n", "")
         lowered = text.lower()
         assert "environment" not in lowered, name
         assert "credential" not in lowered, name

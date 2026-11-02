@@ -18,11 +18,14 @@ program. It runs only what is written here, on the lab's own paths.
     python -m two_agents_helper fake <config> <slug>
     python -m two_agents_helper link <control socket>
     python -m two_agents_helper agents <control socket>
-    python -m two_agents_helper budget <control socket>
+    python -m two_agents_helper budget <control socket> [<agent>]
     python -m two_agents_helper trusted <control socket> <agent or ->
     python -m two_agents_helper untrust <control socket> <agent or -> <trust id>
     python -m two_agents_helper task <control socket> <agent> <prompt>
     python -m two_agents_helper task_status <control socket> <agent or -> <task id>
+    python -m two_agents_helper order <control socket> <the order, in JSON>
+    python -m two_agents_helper clear_key <control socket> <kind>
+    python -m two_agents_helper set_key <control socket> <kind> <value>
 """
 
 import json
@@ -38,10 +41,13 @@ from backtide.service.agents import load_installation
 from backtide.service.config import STATE_CHECKPOINT, STATE_DB, STATE_KEY, ConfigError
 from backtide.service.control import (
     ControlError,
+    ask_agent_order,
     ask_agents,
     ask_budget,
+    ask_clear_secret,
     ask_decide,
     ask_list,
+    ask_set_secret,
     ask_task_start,
     ask_task_status,
     ask_untrust,
@@ -182,8 +188,8 @@ def agents(control: str) -> list[dict[str, Any]]:
         return []
 
 
-def budget(control: str) -> dict[str, Any]:
-    return ask_budget(Path(control))
+def budget(control: str, agent: str = "-") -> dict[str, Any]:
+    return ask_budget(Path(control), **({} if agent == "-" else {"agent": agent}))
 
 
 def _whose(agent: str) -> dict[str, str]:
@@ -210,6 +216,18 @@ def task_status(control: str, agent: str, task_id: str) -> dict[str, Any]:
     return ask_task_status(Path(control), task_id, **_whose(agent))
 
 
+def order(control: str, text: str) -> dict[str, Any]:
+    return ask_agent_order(Path(control), json.loads(text))
+
+
+def clear_key(control: str, kind: str) -> dict[str, Any]:
+    return ask_clear_secret(Path(control), kind)
+
+
+def set_key(control: str, kind: str, value: str) -> dict[str, Any]:
+    return ask_set_secret(Path(control), kind, value)
+
+
 ORDERS = {
     "events": events,
     "verify": verify,
@@ -230,6 +248,9 @@ ORDERS = {
     "untrust": untrust,
     "task": task,
     "task_status": task_status,
+    "order": order,
+    "clear_key": clear_key,
+    "set_key": set_key,
 }
 
 if __name__ == "__main__":

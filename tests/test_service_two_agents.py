@@ -51,6 +51,8 @@ def _keys_read_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
     import backtide.service.config as config  # noqa: PLC0415
 
     monkeypatch.setattr(config, "KEY_SETTLE_S", 0.0)
+    # What is mounted is tests/test_service_fleet.py's, and the lab's: here nothing is.
+    monkeypatch.setattr(runner, "ensure_on_disk", lambda _: None)
 
 
 # --- what each jail is told of the others -----------------------------------------------------
@@ -846,10 +848,10 @@ def test_a_box_without_its_key_is_left_for_what_stops_the_agent(
 
     neighbours = _Neighbours(
         _main, (other,), notifier_for=lambda slug: None, stop=threading.Event(), share=None,
-        told=None, build=build, web_group=GID,
+        told=None, build=build, web_group=GID, prepare=lambda config: None,
     )  # fmt: skip
     with pytest.raises(BlackBoxError):
-        neighbours._serve_one(other)
+        neighbours._serve_one(other, threading.Event(), threading.Event())
     assert built == [True]
 
 
@@ -941,12 +943,12 @@ def test_a_neighbour_gets_its_box_shared_before_it_is_built(home: Path) -> None:
 
     neighbours = _Neighbours(
         main, (other,), notifier_for=lambda slug: None, stop=threading.Event(), share=None,
-        told=None, build=build, web_group=GID,
+        told=None, build=build, web_group=GID, prepare=lambda config: None,
     )  # fmt: skip
     original, runner.share_box_with_web = runner.share_box_with_web, share
     try:
         with pytest.raises(RuntimeError, match="enough"):
-            neighbours._serve_one(other)
+            neighbours._serve_one(other, threading.Event(), threading.Event())
     finally:
         runner.share_box_with_web = original
     assert order == ["shared", "built"]

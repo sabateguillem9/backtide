@@ -454,7 +454,10 @@ def _config(root: Path) -> str:
 
 
 def _agent(root: Path, number: int, volume: Path) -> str:
-    return f'number = {number}\nvolume = "{volume}"\n[agent]\nprofile = "claude-code"\n'
+    return (
+        f'number = {number}\nvolume = "{volume}"\nworkspace_limit = {MAIN_CAP}\n[agent]\n'
+        'profile = "claude-code"\n'
+    )
 
 
 def _vigilar(config: Path, *more: str) -> subprocess.CompletedProcess[str]:

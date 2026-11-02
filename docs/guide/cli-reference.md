@@ -387,6 +387,31 @@ What the export leaves out by default, and why. **What the agent wrote is untrus
 
 Limits: 8 GiB and 500,000 entries. Prints `Exportado a <dest>: N archivos y M carpetas (B bytes), de la instantánea <id>.`, lists what it skipped, and ends with `AVISO:` lines. Exit codes: `0` exported; `1` could not; `2` usage error (a destination the service refuses, or `--git` with `--incluir-config`); `3` unknown.
 
+## Several agents: create, stop, start, freeze
+
+### `backtide agentes`
+
+```bash
+backtide agentes crear SLUG --perfil claude-code|openclaw --volumen 10|20|50 [--tope-espacio MIB] [--nombre NAME]
+                       [--memoria 512m|1g|2g|4g] [--cpus 1|2|4] [--memoria-proxy 256m|512m|1g]
+                       [--dia DOLLARS] [--mes DOLLARS] [--reiniciar] [--config FILE]
+backtide agentes parar|arrancar|pausar|seguir SLUG [--config FILE]
+backtide agentes lista [--config FILE]
+```
+
+The running service does all of it, on its root-only socket: it asks the service and says what the service answers. The web has none of these yet, and no agent can reach that socket. See [several agents](configuration.md#several-agents).
+
+**`crear`** makes a new agent and starts it. The slug is its name for good, and a slug that was ever used is not used again, because the black box of an agent stays when the agent goes. There is no option for an image, a path or a mount: the profile gives the image, and the volume is new and empty. Everything else comes from a short list. `--tope-espacio` goes from 64 MiB to half the volume, 5 % of it by default. `--dia` and `--mes` are its own spending caps, never above the whole installation's. The first agent besides `principal` restarts the service, and with it the main agent, so it needs `--reiniciar`; from the second on, the others are not touched. It is refused, with nothing made, if:
+
+- it does not fit in memory: the limits of what is running, the new one and the sensor, plus 1 GiB for the system, have to fit in the machine's;
+- it does not fit on disk: the images are sparse and take nothing today, but what every volume may grow to, this one included, plus 4 GiB, has to be free. A full disk pauses every agent;
+- its profile's image is not on this machine. The service does not download it: the message says what to run;
+- there are 8 agents already, or the service is not running under its unit.
+
+**`parar`** stops one agent: what it had held is rejected, its containers stop, and it stays stopped, also after a reboot, until **`arrancar`**. **`pausar`** freezes one as the pause by space does, and **`seguir`** thaws it (the same as `backtide seguir --agente`). `principal` can be frozen but not stopped from here: it runs the service's sockets, so to stop it you stop the service. **`lista`** says which agents there are and how they are. All of it is recorded in the installation's black box, with who asked, and in the agent's.
+
+Exit codes: `0` done; `1` not done (no service, refused, or it failed and was undone); `2` usage error or an order outside its shape; `3` unknown.
+
 ## Spending
 
 backtide prices every model response from the provider's own usage report, counts the day and the month, and refuses new model calls once a cap is reached. The values and the 50 / 80 / 100 % notices are in [configuration](configuration.md#budget-spending-cap). Both commands ask the running service.

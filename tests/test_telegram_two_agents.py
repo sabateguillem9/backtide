@@ -828,6 +828,7 @@ def test_the_neighbours_watch_hands_the_gate_its_desk_and_binds_while_up(
     neighbours = _Neighbours(
         main, others, notifier_for=lambda slug: None, stop=stop, share=None,  # type: ignore[arg-type,return-value]
         told=None, build=build, run=run, roster=roster, telegram=parts.neighbours,  # type: ignore[arg-type]
+        prepare=lambda config: None,
     )  # fmt: skip
     neighbours.start()
     neighbours.join(10)

@@ -9,7 +9,9 @@ in, and the tests never ran under the unit. So the service here is the real one:
   are the ones an installation has. The clock check, every 20 s.
 - Each agent's volume is a real btrfs with simple quotas in a file, and each channel a real tmpfs,
   mounted before the service starts by this kit: what the units of an installation do for the main
-  agent. For another agent nothing does it yet (T26-6a creates them).
+  agent. For another agent the service does it (T26-6a), and the kit makes the one it starts with
+  by hand, as an owner with `sudo` can. ``open_lab(only_main=True)`` starts with one agent, for
+  tests/attacks/test_agent_orders_attacks.py to create the rest.
 - ``--grupo-web`` with a group that has no account: the case where the narrow socket has only the
   group and its forbidden ids to go by.
 - ``cli``: `backtide` itself, as the owner runs it (T26-2c).
@@ -74,6 +76,9 @@ MIB = 1024**2
 VOLUME_SIZE = GIB
 MAIN_CAP = 48 * MIB
 OTHER_CAP = 64 * MIB
+# So that three fit in the VM's 8 GiB (decision 15): 1,25 GiB each, the sensor and the system.
+AGENT_MEMORY = "1g"
+PROXY_MEMORY = "256m"
 SLUG = "revisor"
 NUMBER = 1
 START_TIMEOUT = 240.0
@@ -121,6 +126,12 @@ OTHER = Agent(
     identity.agent_network(SLUG), AGENT_VOLUMES / SLUG, STATE / "agents" / SLUG,
     identity.agent_id(NUMBER), identity.proxy_id(NUMBER),
 )  # fmt: skip
+THIRD_SLUG = "tercero"
+THIRD = Agent(
+    THIRD_SLUG, identity.agent_container(THIRD_SLUG), identity.proxy_container(THIRD_SLUG),
+    identity.agent_network(THIRD_SLUG), AGENT_VOLUMES / THIRD_SLUG,
+    STATE / "agents" / THIRD_SLUG, identity.agent_id(NUMBER + 1), identity.proxy_id(NUMBER + 1),
+)  # fmt: skip
 
 
 class Lab:
@@ -130,6 +141,7 @@ class Lab:
         self.main = MAIN
         self.other = OTHER
         self.web_gid = 0
+        self.agents: list[Agent] = [MAIN, OTHER]  # who must be up for it to be up
 
     # Reading what happened (as root: the state is root's)
 
@@ -157,7 +169,7 @@ class Lab:
 
     def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         """The real `backtide`, as root, on this lab's config."""
-        return sudo(str(BIN / "backtide"), *args, "--config", str(CONFIG), check=False, timeout=180)
+        return sudo(str(BIN / "backtide"), *args, "--config", str(CONFIG), check=False, timeout=360)
 
     def network_cut(self) -> bool:
         """What a container sends stops at the VM: the lab's key, made up, reaches nobody."""
@@ -208,23 +220,25 @@ class Lab:
         return "\n".join(lines[-20:])
 
     def wait_up(self, timeout: float = START_TIMEOUT) -> None:
-        """The unit active, both agents running, and both up for the sockets: an agent joins the
-        service's list a while after its container runs (T26-2c)."""
+        """The unit active, its agents running, and all of them up for the sockets: an agent joins
+        the service's list a while after its container runs (T26-2c)."""
 
         def up() -> bool:
             if int(self.show("NRestarts") or 0) > MAX_RESTARTS:
                 raise AssertionError(f"the service keeps restarting\n{self.diagnosis()}")
-            if not (
-                self.show("ActiveState") == "active" and self.running(MAIN) and self.running(OTHER)
-            ):
+            if self.show("ActiveState") != "active" or not all(map(self.running, self.agents)):
                 return False
-            watched = self.helper("agents", str(STATE / STATE_SOCKET))
-            return len(watched) == 2 and all(agent["watched"] for agent in watched)
+            try:
+                listed = self.helper("agents", str(STATE / STATE_SOCKET), timeout=30)
+            except subprocess.CalledProcessError:  # the socket is not there yet
+                return False
+            watched = {agent["slug"] for agent in listed if agent["watched"]}
+            return watched == {agent.slug for agent in self.agents}
 
         wait(
             up,
             timeout,
-            "both agents to run under the unit",
+            "the agents to run under the unit",
             self.diagnosis,
         )
 
@@ -246,10 +260,12 @@ class Lab:
         sudo("rm", "-f", str(UNIT_FILE), check=False)
         sudo("systemctl", "daemon-reload", check=False)
         sudo("systemctl", "reset-failed", UNIT, check=False)
-        names = [MAIN.container, MAIN.proxy, OTHER.container, OTHER.proxy, "backtide-sensor"]
+        names = [MAIN.container, MAIN.proxy, OTHER.container, OTHER.proxy, THIRD.container,
+                 THIRD.proxy, "backtide-sensor"]  # fmt: skip
         sh("docker", "rm", "--force", *names, check=False)
         nets = [
-            MAIN.network, "backtide-salida-net", OTHER.network, identity.egress_network(SLUG)
+            MAIN.network, "backtide-salida-net", OTHER.network, identity.egress_network(SLUG),
+            THIRD.network, identity.egress_network(THIRD_SLUG),
         ]  # fmt: skip
         sh("docker", "network", "rm", *nets, check=False)
         sudo("sh", "-c", _UNMOUNT_ALL, check=False)
@@ -438,6 +454,7 @@ def _unit() -> str:
             "VOLUME_MOUNT": str(MAIN_VOLUME),
             "PROXY_CHANNEL_DIR": str(STATE / "proxy-channel"),
             "AGENT_VOLUMES": str(AGENT_VOLUMES),
+            "AGENT_CONFIGS": str(ETC / "agents"),
             "EXPORT_DIR": str(LAB / "export"),
             "WEB_USER": WEB_GROUP,
         },
@@ -452,6 +469,9 @@ cycle_interval = 3.0
 prune_interval = 20
 [agent]
 profile = "claude-code"
+memory = "{AGENT_MEMORY}"
+[proxy]
+memory = "{PROXY_MEMORY}"
 [[proxy.providers]]
 name = "anthropic"
 kind = "anthropic"
@@ -469,14 +489,17 @@ volume = "{OTHER.volume}"
 workspace_limit = {OTHER_CAP}
 [agent]
 profile = "claude-code"
+memory = "{AGENT_MEMORY}"
 """
 
 
-def open_lab(*, telegram: str | None = None) -> Lab:
-    """Build it all and wait for both agents. Whatever is left from a run that died goes first.
+def open_lab(*, telegram: str | None = None, only_main: bool = False) -> Lab:
+    """Build it all and wait for its agents. Whatever is left from a run that died goes first.
     ``telegram``: the service's ``telegram.toml``, pointed at a fake Bot API (T26-2e)."""
     lab = Lab()
     lab.close()
+    if only_main:
+        lab.agents = [MAIN]
     try:
         _cut()
         sudo("groupadd", "--system", WEB_GROUP)
@@ -486,7 +509,6 @@ def open_lab(*, telegram: str | None = None) -> Lab:
         sudo("install", "-d", "-m", "0710", "-g", WEB_GROUP, str(STATE))
         sudo("install", "-d", "-m", "0700", str(STATE / "keys"))
         sudo("install", "-d", "-m", "0700", str(STATE / "agents"))
-        sudo("install", "-d", "-m", "0700", str(OTHER.box))
         _programs()
         _write_as_root(
             STATE / "keys" / "anthropic.key",
@@ -494,14 +516,14 @@ def open_lab(*, telegram: str | None = None) -> Lab:
             "0600",
         )
         _make_volume(STATE / "volume.img", MAIN_VOLUME)
-        # By hand, as nothing makes them yet (T26-6a), and with the umask of a person: what the
-        # service closes before the web's group goes through this folder (T26-2d).
-        _make_volume(OTHER.box / "volume.img", OTHER.volume, mode="0644")
-        sudo("mkdir", "-p", str(STATE / "proxy-channel"))
-        for channel, uid, gid in (
-            (STATE / "proxy-channel", PROXY_UID, PROXY_GID),
-            (OTHER.box / "proxy-channel", OTHER.proxy_uid, OTHER.proxy_uid),
-        ):
+        channels = [(STATE / "proxy-channel", PROXY_UID, PROXY_GID)]
+        if not only_main:
+            sudo("install", "-d", "-m", "0700", str(OTHER.box))
+            # By hand, as the lab does not use `agentes crear`, and with the umask of a person: what
+            # the service closes before the web's group goes through this folder (T26-2d).
+            _make_volume(OTHER.box / "volume.img", OTHER.volume, mode="0644")
+            channels.append((OTHER.box / "proxy-channel", OTHER.proxy_uid, OTHER.proxy_uid))
+        for channel, uid, gid in channels:
             sudo("mkdir", "-p", str(channel))
             options = channel_tmpfs_options(CHANNEL_SIZE, uid, gid)
             sudo("mount", "-t", "tmpfs", "-o", options, CHANNEL_TMPFS_SOURCE, str(channel))
@@ -509,7 +531,8 @@ def open_lab(*, telegram: str | None = None) -> Lab:
             _write_as_root(STATE / "telegram.toml", telegram, "0600")
         _write_as_root(CONFIG, MAIN_CONFIG)
         sudo("install", "-d", "-m", "0755", str(ETC / "agents"))
-        _write_as_root(ETC / "agents" / f"{SLUG}.toml", OTHER_FILE)
+        if not only_main:
+            _write_as_root(ETC / "agents" / f"{SLUG}.toml", OTHER_FILE)
         _write_as_root(UNIT_FILE, _unit())
         sudo("systemctl", "daemon-reload")
         lab.start()
@@ -520,4 +543,4 @@ def open_lab(*, telegram: str | None = None) -> Lab:
     return lab
 
 
-__all__ = ["LAB", "MAIN", "OTHER", "Lab", "Web", "form_in", "layout", "open_lab"]
+__all__ = ["LAB", "MAIN", "OTHER", "THIRD", "Lab", "Web", "form_in", "layout", "open_lab"]

@@ -66,6 +66,12 @@ from tests.test_service_web_control import (
 TASK = "a" * 32
 
 
+@pytest.fixture(autouse=True)
+def _nothing_to_mount(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What is mounted is tests/test_service_fleet.py's, and the lab's: here nothing is."""
+    monkeypatch.setattr(runner, "ensure_on_disk", lambda _: None)
+
+
 class Agent(FakeGuardian):
     """A Guardian with its tasks and its shell, all of it written down."""
 

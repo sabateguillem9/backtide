@@ -51,6 +51,9 @@ def private(path: Path, text: str, mode: int = 0o600) -> None:
     path.chmod(mode)
 
 
+CAP = 100 * 1024**2
+
+
 def write_main(home: Path, extra: str = "", *, provider: bool = True) -> Path:
     path = home / "etc" / "backtide.toml"
     private(
@@ -68,6 +71,8 @@ def add_agent(home: Path, slug: str, text: str | None = None, *, number: int = 1
     path = folder / f"{slug}.toml"
     if text is None:
         text = claude_code(home, slug, number)
+    if "volume = " in text and "workspace_limit" not in text:  # required, and not what these test
+        text = f"workspace_limit = {CAP}\n{text}"
     private(path, text)
     return path
 

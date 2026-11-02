@@ -797,7 +797,7 @@ def test_a_container_named_like_an_agent_without_its_label_stays(machine: Machin
 
 def test_a_file_that_is_not_an_agent_is_the_persons(machine: Machine) -> None:
     folder = machine.paths.config_dir / "agents"
-    folder.mkdir()
+    folder.mkdir(exist_ok=True)  # the installer makes it (T26-6a)
     (folder / "notas.txt").write_text("mine")
     (folder / "Mal Nombre.toml").write_text("mine too")
     (folder / "principal.toml").write_text("not an agent: reserved")

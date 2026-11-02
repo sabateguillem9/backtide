@@ -24,6 +24,7 @@ from backtide.jail.proxy_config import (
     PROXY_UID,
     channel_tmpfs_options,
 )
+from backtide.service.agent_disk import AGENT_VOLUMES_ENV
 from backtide.service.config import STATE_WEB_SOCKET
 from backtide.service.export import EXPORT_DIR_ENV
 from backtide.setup import layout
@@ -70,6 +71,8 @@ def unit_values() -> dict[str, str]:
         "VOLUME_IMAGE": str(layout.VOLUME_IMAGE),
         "VOLUME_MOUNT": str(layout.VOLUME_MOUNT),
         "AGENT_VOLUMES": str(layout.AGENT_VOLUMES),
+        "AGENT_VOLUMES_ENV": AGENT_VOLUMES_ENV,
+        "AGENT_CONFIGS": str(layout.AGENT_CONFIGS),
         "EXPORT_DIR": str(layout.EXPORT_DIR),
         "EXPORT_DIR_ENV": EXPORT_DIR_ENV,
         "PROXY_CHANNEL_DIR": str(layout.PROXY_CHANNEL_DIR),
