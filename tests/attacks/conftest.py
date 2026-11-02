@@ -57,7 +57,6 @@ def _load_vm_fixtures() -> ModuleType:
 
 _vm = _load_vm_fixtures()
 # Re-exported so pytest finds them here. Their scopes are the originals' (docs in that file).
-btrfs_volume = _vm.btrfs_volume
 quota_volume = _vm.quota_volume
 running_agent = _vm.running_agent
 real_service = _vm.real_service
@@ -231,6 +230,16 @@ def canary_environment() -> Iterator[dict[str, str]]:
         for name, value in canaries.items():
             patch.setenv(name, value)
         yield canaries
+
+
+@pytest.fixture(scope="module")
+def btrfs_volume(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """A 2 GiB btrfs per file of scenarios: over a whole battery, what the agents leave in one
+    shared volume filled it, and the files that ran last failed with ENOSPC."""
+    base = tmp_path_factory.mktemp("btrfs").resolve()
+    with _vm._mounted_btrfs(base, 2 * _vm.GIB) as mnt:  # noqa: SLF001
+        yield mnt
+    (base / _vm.VOLUME_IMAGE).unlink()  # only reached after a checked, successful unmount
 
 
 @pytest.fixture(scope="module")
