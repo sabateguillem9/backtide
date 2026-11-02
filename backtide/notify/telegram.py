@@ -28,13 +28,27 @@ thread, one at a time, so polling never waits for it. A rewind always shows the 
 What the bot can do is a ``BotActions`` (``backtide.service.bot`` puts the Guardian and the control
 socket behind it). Texts are in Spanish and plain text (no ``parse_mode``): what an alert quotes
 from the agent (a file name) cannot become markup, and control characters are escaped.
+
+Several agents (T26-2e; docs/47, section 6.10): one bot and a table of them, ``agents``, by slug,
+which the service made. With one agent there is no table and nothing here changes, texts included.
+
+- A button acts on the agent it was issued for (``Button.agent``, in the server-side book), through
+  that agent's own actions. A slug that is not in the table does nothing: it never falls back on
+  the main agent.
+- A written order names its agent with one more word (`/pausar revisor`), and that word is only
+  ever compared with the keys of the table, so ``../x`` is simply nobody, and it is not repeated.
+- An order that acts and does not say which does not guess: `/seguir` refuses, `/pausar` asks, with
+  a button per agent and one for all of them. What only reads (`/estado`, `/retenidas`, `/lotes`)
+  shows them all, each under its name, as `backtide retenidas` does.
+- Every message says whose it is. The slugs are the service's, and go through ``inert`` anyway.
 """
 
 import logging
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from backtide.notify import Alert, AlertLevel
@@ -80,6 +94,32 @@ HELP = (
     "confirmación). En cada petición retenida, «Aprobar» la deja salir una vez, «Rechazar» la "
     "para y «Ver» te enseña lo que guarda la caja negra; si no respondes, se rechaza sola."
 )
+HELP_SEVERAL = (
+    "Hay varios agentes: {names}. Cada orden dice de cuál:\n"
+    "/pausar <agente>: congela a ese agente al momento, desde fuera. Sin decir cuál, te pregunta.\n"
+    "/seguir <agente>: lo reanuda.\n"
+    "/estado [agente]: cómo está; sin decir cuál, todos.\n"
+    "/retenidas [agente]: las peticiones que esperan tu sí, con sus botones; sin decir cuál, las "
+    "de todos.\n"
+    "/lotes [agente]: los lotes de aprobación activos, para revocarlos; sin decir cuál, los de "
+    "todos.\n\n"
+    "Cada mensaje dice de qué agente es, y sus botones actúan solo sobre ese. En cada aviso, "
+    "«Pausar» lo congela y «Rebobinar» devuelve su carpeta a la instantánea de antes del aviso "
+    "(antes te enseña qué se deshace y qué no, y te pide confirmación). En cada petición retenida, "
+    "«Aprobar» la deja salir una vez, «Rechazar» la para y «Ver» te enseña lo que guarda la caja "
+    "negra; si no respondes, se rechaza sola."
+)
+NOBODY = "Ese agente no existe en esta instalación: no se ha hecho nada. Los que hay: {names}."
+NOBODY_BUTTON = "Ese agente ya no está en esta instalación: no se hace nada."
+RESUME_WHICH = (
+    "Hay varios agentes y no se ha reanudado ninguno. Di cuál: /seguir <agente>. Los que hay: "
+    "{names}."
+)
+PAUSE_WHICH = (
+    "Hay varios agentes y todavía no se ha congelado ninguno. Toca cuál, o escribe /pausar "
+    "<agente>. Los que hay: {names}."
+)
+PAUSE_FAILED = "No se ha podido congelar: mira el registro del servicio."
 HOLD_ANSWERS = {
     Action.APPROVE: "Aprobando…",
     Action.REJECT: "Rechazando…",
@@ -102,6 +142,11 @@ LEVEL_MARK = {
     AlertLevel.WARNING: "backtide, aviso",
     AlertLevel.ERROR: "backtide, ALERTA",
 }
+
+
+def said_by(agent: str | None, text: str) -> str:
+    """``text`` saying which agent it is about, when a machine has several."""
+    return text if agent is None else f"Agente {inert(agent)}:\n{text}"
 
 
 class BotActions(Protocol):
@@ -133,6 +178,14 @@ class BotActions(Protocol):
         ...
 
     def record(self, action: str, details: dict[str, Any], risk: int) -> None: ...
+
+
+@dataclass(frozen=True)
+class AgentSide:
+    """What the bot acts on for one agent, when a machine has several (T26-2e)."""
+
+    actions: BotActions
+    desk: HoldDesk | None = None
 
 
 def alert_text(alert: Alert) -> str:
@@ -167,19 +220,29 @@ def _message_id(result: Any) -> int | None:
 
 class TelegramNotifier:
     """A ``Notifier``: each alert is one message to the founder's chat, with "Pausar" and,
-    when there is a snapshot from before its event, "Rebobinar". Raises on failure (the alert
-    queue logs it)."""
+    when there is a snapshot from before its event, "Rebobinar", both about the agent the alert is
+    about (``agents``: the table of them, with several). Raises on failure (the alert queue logs
+    it)."""
 
-    def __init__(self, api: BotApi, chat_id: int, book: ButtonBook, actions: BotActions) -> None:
+    def __init__(
+        self,
+        api: BotApi,
+        chat_id: int,
+        book: ButtonBook,
+        actions: BotActions,
+        *,
+        agents: Mapping[str, AgentSide] | None = None,
+    ) -> None:
         self._api = api
         self._chat_id = chat_id
         self._book = book
         self._actions = actions
+        self._agents = agents or {}
 
     def send(self, alert: Alert) -> None:
-        if alert.elsewhere:
-            # "Pausar" and "Rebobinar" act on the main agent: never offered about another one, and
-            # its event's number means nothing in the main agent's box (T26-2e gives them back).
+        actions = self._actions_of(alert.agent)
+        if actions is None:
+            # Whose it is cannot be told: said, but with no button that would act on someone.
             self._call_with_retry(
                 {
                     "chat_id": self._chat_id,
@@ -188,11 +251,11 @@ class TelegramNotifier:
                 }
             )
             return
-        tokens = [self._book.issue(Action.PAUSE)]
+        tokens = [self._book.issue(Action.PAUSE, agent=alert.agent)]
         row = [("Pausar", tokens[0])]
-        target = self._target(alert)
+        target = self._target(alert, actions)
         if target is not None:
-            tokens.append(self._book.issue(Action.NOTICE, snapshot_id=target))
+            tokens.append(self._book.issue(Action.NOTICE, snapshot_id=target, agent=alert.agent))
             row.append(("Rebobinar", tokens[-1]))
         params = {
             "chat_id": self._chat_id,
@@ -211,11 +274,17 @@ class TelegramNotifier:
             raise TelegramError("sendMessage: the reply has no message_id")
         self._book.bind(tokens, message_id)
 
-    def _target(self, alert: Alert) -> str | None:
+    def _actions_of(self, agent: str | None) -> BotActions | None:
+        if not self._agents:
+            return self._actions if agent is None else None
+        side = self._agents.get(agent) if agent is not None else None
+        return None if side is None else side.actions
+
+    def _target(self, alert: Alert, actions: BotActions) -> str | None:
         if alert.event_seq is None:
             return None
         try:
-            return self._actions.target_for(alert.event_seq)
+            return actions.target_for(alert.event_seq)
         except Exception as error:  # the alert still goes out, without the button
             delivery_logger.warning("cannot find the snapshot to offer for an alert: %s", error)
             return None
@@ -253,10 +322,13 @@ class TelegramBot:
         max_command_age: float = MAX_COMMAND_AGE,
         limit: RateLimit | None = None,
         desk: HoldDesk | None = None,
+        agents: Mapping[str, AgentSide] | None = None,
     ) -> None:
         if type(chat_id) is not int:
             raise TypeError("chat_id must be an int")
         self._desk = desk
+        self._agents = dict(agents or {})  # with several agents: each one, the main one included
+        self._names = ", ".join(inert(slug) for slug in self._agents)
         self._api = api
         self._chat_id = chat_id
         self._book = book
@@ -417,9 +489,14 @@ class TelegramBot:
         ):
             self._ignore("forwarded_or_bot", "message", chat_id, from_id)
             return
-        command = _command(message.get("text"))
+        text = message.get("text")
+        command = _command(text)
         if command == "pausar":  # first, and late or not: freezing is the safe side
-            self._reply(self._actions.pause())
+            picked = self._picked(text, chat_id, from_id)
+            if len(picked) > 1:  # it did not say which
+                self._ask_which_to_pause()
+            elif picked:
+                self._pause(picked[0])
             return
         date = message.get("date")
         age = self._clock() - date if isinstance(date, int | float) else None
@@ -431,25 +508,32 @@ class TelegramBot:
             )
             return
         if command == "estado":
-            if self._allowed(chat_id, from_id):
-                self._submit(lambda: self._reply(self._actions.status()))
+            picked = self._picked(text, chat_id, from_id)
+            if picked and self._allowed(chat_id, from_id):
+                self._submit(lambda: self._tell_status(picked))
             return
         if command == "seguir":
-            if self._allowed(chat_id, from_id):
+            picked = self._picked(text, chat_id, from_id)
+            if len(picked) > 1:  # it did not say which: this one lets an agent run again
+                self._reply(RESUME_WHICH.format(names=self._names))
+            elif picked and self._allowed(chat_id, from_id):
+                agent = picked[0]
+                side = self._side(agent)
                 # Taken now, on the thread that also runs /pausar: a /pausar sent after this
                 # /seguir wins, however long the seguir waits for the worker or for the lock.
-                mark = self._actions.pause_mark()
-                self._submit(lambda: self._resume(mark, date))
+                mark = side.actions.pause_mark()
+                self._submit(lambda: self._resume(side, agent, mark, date))
             return
         if command in ("retenidas", "lotes"):
-            desk = self._desk
-            if desk is None:
+            picked = self._picked(text, chat_id, from_id)
+            if not picked:
+                return
+            if any(self._side(agent).desk is None for agent in picked):
                 self._reply("Sin el bot completo no hay peticiones retenidas que enseñar aquí.")
             elif self._allowed(chat_id, from_id):
-                listing = desk.list_holds if command == "retenidas" else desk.list_batches
-                self._submit(lambda: self._reply_if(listing()))
+                self._submit(lambda: self._tell_lists(picked, command))
             return
-        self._reply(HELP)
+        self._reply(HELP_SEVERAL.format(names=self._names) if self._agents else HELP)
 
     # Buttons
 
@@ -476,26 +560,36 @@ class TelegramBot:
             self._ignore(str(button), "callback_query", chat_id, from_id)
             self._answer(query_id, self._refused_text(button, query.get("data")))
             return
+        if button.action is Action.PAUSE_ALL:
+            self._pause_everyone()
+            self._answer(query_id, "")
+            return
+        agent = button.agent
+        side = self._side(agent)
+        if side is None:  # never another agent in its place
+            self._ignore("unknown_agent", "callback_query", chat_id, from_id)
+            self._answer(query_id, NOBODY_BUTTON)
+            return
         if button.action in HOLD_ACTIONS:
-            self._on_hold_button(button, query_id, chat_id, from_id)
+            self._on_hold_button(button, side, query_id)
             return
         if button.action is Action.PAUSE:
-            text = self._actions.pause()
+            text = side.actions.pause()
             self._answer(query_id, "")
-            self._reply(text)
+            self._reply(text, agent)
             return
         if button.action is Action.NOTICE:  # rate limited above
             self._answer(query_id, "")
-            self._submit(lambda: self._ask_to_confirm(button))
+            self._submit(lambda: self._ask_to_confirm(button, side))
             return
         if button.action is Action.CONFIRM:
             self._answer(query_id, "Rebobinando…")
-            self._reply("Rebobinando: tarda unos segundos.")
+            self._reply("Rebobinando: tarda unos segundos.", agent)
             snapshot_id = button.snapshot_id or ""
-            self._submit(lambda: self._reply(self._actions.rewind(snapshot_id)))
+            self._submit(lambda: self._reply(side.actions.rewind(snapshot_id), agent))
             return
         self._answer(query_id, "Cancelado.")
-        self._reply("No se ha rebobinado nada.")
+        self._reply("No se ha rebobinado nada.", agent)
 
     def _refused_text(self, refused: Refused, data: Any) -> str:
         """Why a press did nothing; for a held request's button, how its hold ended."""
@@ -507,43 +601,131 @@ class TelegramBot:
                 return "Esa retención ha caducado: se rechazó."
         return REFUSED_TEXT[refused]
 
-    def _on_hold_button(self, button: Button, query_id: Any, chat_id: Any, from_id: Any) -> None:
-        """A held request's button (T10-4). Saying no (Rechazar, Cancelar, Revocar) is never
-        rate limited; saying yes or asking for more is, like a command (``RATE_LIMITED``,
-        checked in ``_on_button`` before the button is taken)."""
-        desk = self._desk
+    def _on_hold_button(self, button: Button, side: AgentSide, query_id: Any) -> None:
+        """A held request's button (T10-4), on that agent's own desk. Saying no (Rechazar,
+        Cancelar, Revocar) is never rate limited; saying yes or asking for more is, like a command
+        (``RATE_LIMITED``, checked in ``_on_button`` before the button is taken)."""
+        desk = side.desk
         if desk is None:
             self._answer(query_id, REFUSED_TEXT[Refused.UNKNOWN])
             return
         self._answer(query_id, HOLD_ANSWERS.get(button.action, ""))
-        self._submit(lambda: self._reply_if(desk.press(button)))
+        self._submit(lambda: self._reply_if(desk.press(button), button.agent))
 
-    def _reply_if(self, text: str | None) -> None:
+    def _reply_if(self, text: str | None, agent: str | None = None) -> None:
         if text:
+            self._reply(text, agent)
+
+    # Which agent
+
+    def _side(self, agent: str | None) -> AgentSide | None:
+        """Whom ``agent`` acts on. With several agents only one of the table, and with one only
+        that one: nobody else ever takes its place."""
+        if not self._agents:
+            return AgentSide(self._actions, self._desk) if agent is None else None
+        return None if agent is None else self._agents.get(agent)
+
+    def _picked(self, text: Any, chat_id: Any, from_id: Any) -> list[str | None]:
+        """Whom an order is about: ``[None]`` with one agent, whatever it says after the command,
+        as always; with several, the one it names or, if it names nobody, all of them, for the
+        order to decide. Anything else is nobody: said, and with no agent touched."""
+        if not self._agents:
+            return [None]
+        said = text.split()[1:]
+        if not said:
+            return list(self._agents)
+        if len(said) == 1 and said[0] in self._agents:
+            return [said[0]]
+        self._ignore("unknown_agent", "message", chat_id, from_id)  # never what it said
+        self._reply(NOBODY.format(names=self._names))
+        return []
+
+    def _pause(self, agent: str | None) -> None:
+        self._reply(self._side(agent).actions.pause(), agent)
+
+    def _ask_which_to_pause(self) -> None:
+        text = PAUSE_WHICH.format(names=self._names)
+        try:
+            self._work.put_nowait(self._send_pause_buttons)
+        except queue.Full:  # a long order is running: the words alone still say what to do
             self._reply(text)
 
-    def _resume(self, mark: int | None, date: float) -> None:
-        if self._clock() - date > self._max_age:
-            self._reply("Esta orden de seguir ha esperado demasiado y no se ejecuta.")
+    def _send_pause_buttons(self) -> None:
+        tokens = [self._book.issue(Action.PAUSE_ALL, ttl=CONFIRM_TTL)]
+        row = [("Pausar todos", tokens[0])]
+        rows = [row]
+        for slug in self._agents:
+            tokens.append(self._book.issue(Action.PAUSE, ttl=CONFIRM_TTL, agent=slug))
+            rows.append([(f"Pausar {inert(slug)}", tokens[-1])])
+        try:
+            result = self._api.call(
+                "sendMessage",
+                {
+                    "chat_id": self._chat_id,
+                    "text": PAUSE_WHICH.format(names=self._names),
+                    "reply_markup": _keyboard(rows),
+                },
+            )
+        except TelegramError as error:
+            self._book.forget(tokens)
+            delivery_logger.warning("telegram: cannot ask which agent to pause: %s", error)
             return
-        self._reply(self._actions.resume(mark))
+        message_id = _message_id(result)
+        if message_id is None:
+            self._book.forget(tokens)
+            return
+        self._book.bind(tokens, message_id)
 
-    def _ask_to_confirm(self, button: Button) -> None:
-        snapshot_id = button.snapshot_id or ""
-        notice = self._actions.notice(snapshot_id)
-        if notice is None:
-            self._reply("Esa instantánea ya no existe: no se puede rebobinar a ella.")
+    def _pause_everyone(self) -> None:
+        """On the polling thread, as every pause. One that fails does not save the others."""
+        said = []
+        for slug, side in self._agents.items():
+            try:
+                said.append(said_by(slug, side.actions.pause()))
+            except Exception:
+                logger.exception("telegram: an agent could not be paused")
+                said.append(said_by(slug, PAUSE_FAILED))
+        self._reply("\n\n".join(said))
+
+    def _tell_status(self, picked: list[str | None]) -> None:
+        self._reply("\n\n".join(said_by(a, self._side(a).actions.status()) for a in picked))
+
+    def _tell_lists(self, picked: list[str | None], command: str) -> None:
+        said = []
+        for agent in picked:
+            desk = self._side(agent).desk
+            listing = desk.list_holds if command == "retenidas" else desk.list_batches
+            text = listing()
+            if text:
+                said.append(said_by(agent, text))
+        self._reply_if("\n\n".join(said))
+
+    def _resume(self, side: AgentSide, agent: str | None, mark: int | None, date: float) -> None:
+        if self._clock() - date > self._max_age:
+            self._reply("Esta orden de seguir ha esperado demasiado y no se ejecuta.", agent)
             return
-        group = self._book.issue(Action.CANCEL, ttl=CONFIRM_TTL, single_use=True)
+        self._reply(side.actions.resume(mark), agent)
+
+    def _ask_to_confirm(self, button: Button, side: AgentSide) -> None:
+        snapshot_id = button.snapshot_id or ""
+        agent = button.agent
+        notice = side.actions.notice(snapshot_id)
+        if notice is None:
+            self._reply("Esa instantánea ya no existe: no se puede rebobinar a ella.", agent)
+            return
+        group = self._book.issue(Action.CANCEL, ttl=CONFIRM_TTL, single_use=True, agent=agent)
         confirm = self._book.issue(
             Action.CONFIRM,
             snapshot_id=snapshot_id,
             ttl=CONFIRM_TTL,
             single_use=True,
             group=group,
+            agent=agent,
         )
         tokens = [confirm, group]
-        text = printable(notice) + "\n\n¿Rebobinar? (Este botón caduca en 2 minutos.)"
+        text = said_by(
+            agent, printable(notice) + "\n\n¿Rebobinar? (Este botón caduca en 2 minutos.)"
+        )
         try:
             result = self._api.call(
                 "sendMessage",
@@ -594,8 +776,9 @@ class TelegramBot:
                 logger.exception("telegram: an order failed")
                 self._reply("Ha fallado algo al hacer la orden. Detalles en la caja negra.")
 
-    def _reply(self, text: str) -> None:
-        self._send("sendMessage", {"chat_id": self._chat_id, "text": printable(text)[:MAX_TEXT]})
+    def _reply(self, text: str, agent: str | None = None) -> None:
+        shown = printable(said_by(agent, text))[:MAX_TEXT]
+        self._send("sendMessage", {"chat_id": self._chat_id, "text": shown})
 
     def _answer(self, query_id: Any, text: str) -> None:
         if isinstance(query_id, str):

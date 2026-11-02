@@ -73,7 +73,7 @@ from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
 from backtide.service import scope
-from backtide.service.bot import Hooks, telegram_parts
+from backtide.service.bot import Hooks, TelegramNeighbour, telegram_parts
 from backtide.service.config import (
     KEY_UNUSABLE,
     ConfigError,
@@ -976,8 +976,10 @@ class _Neighbours:
         run: Callable[..., None] | None = None,
         roster: Roster | None = None,
         spend_total: SharedSpend | None = None,
+        telegram: Mapping[str, TelegramNeighbour] | None = None,
     ) -> None:
         self._roster = roster
+        self._telegram = telegram or {}
         self._spend_total = spend_total
         self._main = main
         self._others = others
@@ -1024,9 +1026,11 @@ class _Neighbours:
     def _serve_one(self, config: ServiceConfig) -> None:
         built: list[Egress] = []
         secrets = LiveScrub()
+        telegram = self._telegram.get(config.slug)
         guardian, alerts, box = self._build(
             config,
             notifier=self._notifier_for(config.slug),
+            hold_watch=None if telegram is None else telegram.desk,
             on_egress=built.append,
             scrub=secrets,
             sensor=self._share is not None,
@@ -1038,7 +1042,18 @@ class _Neighbours:
             self._reloads.extend(key_reloader(config, egress, secrets) for egress in built)
         control: ControlHook | None = None
         if self._roster is not None:
-            control = _OnTheRoster(self._roster, _desk_of(config, guardian, built))
+            desk = _desk_of(config, guardian, built)
+            control = _OnTheRoster(self._roster, desk)
+            if telegram is not None:
+                # Off the bot before it goes off the roster, which waits for what is in flight.
+                watch = telegram.watch(
+                    guardian,
+                    box,
+                    SnapshotStore(config.volume),
+                    budget=desk.budget,
+                    waiting=desk.waiting,
+                )
+                control = Hooks(control, watch)
         self._run_guardian(
             guardian, alerts, box, stop=self._stop, handle_signals=False, control=control
         )
@@ -1191,7 +1206,7 @@ def serve(
     they spend together has a cap of its own. Each one's alerts say whose."""
     settings = load_telegram(config.state_dir)
     with take_lock(config.lock_file):
-        telegram = telegram_parts(config, settings) if settings is not None else None
+        telegram = telegram_parts(config, settings, others) if settings is not None else None
         if telegram is not None:
             notifier = FanOut(notifier or LogNotifier(), telegram.notifier)
         stop = stop if stop is not None else threading.Event()
@@ -1208,9 +1223,7 @@ def serve(
             one_at_a_time = threading.Lock()
 
             def notifier_for(slug: str) -> Notifier:
-                return Labelled(
-                    machine_notifier, slug, one_at_a_time, elsewhere=slug != config.slug
-                )
+                return Labelled(machine_notifier, slug, one_at_a_time)
 
             notifier = notifier_for(config.slug)
         built: list[Egress] = []
@@ -1261,6 +1274,7 @@ def serve(
                 told=alerts,
                 roster=roster,
                 spend_total=spend_total,
+                telegram={} if telegram is None else telegram.neighbours,
             )
             reload_keys = reload_everyones_keys(reload_keys, neighbours.reloads)
         settings_service = Settings(

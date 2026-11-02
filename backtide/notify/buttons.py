@@ -17,6 +17,11 @@ When a hold ends (whoever ended it), ``retire_hold`` uses all of them up with a 
 says how ("aprobada", "caducada"...), so a late or replayed press answers that; ``peek`` reads a
 button without using it. A batch's confirmation is a single-use pair like a rewind's.
 
+With several agents (T26-2e) each button also keeps its ``agent``, here and never in Telegram: the
+``callback_data`` is still only the token, well under Telegram's 64 bytes, so nobody can write a
+button for another agent, and the bot looks that slug up in the service's list. ``forget_agent``
+takes away all of an agent's buttons when it stops being watched.
+
 The book is in memory: after a restart of the service every old button answers "caducado".
 Forged data (anything that is not a token we issued) is just an unknown token. Thread-safe.
 """
@@ -36,6 +41,7 @@ CAPACITY = 1024
 
 class Action(StrEnum):
     PAUSE = "pause"
+    PAUSE_ALL = "pause_all"  # every agent: the answer to a /pausar that does not say which (T26-2e)
     NOTICE = "notice"  # show the fixed notice of a rewind and ask for confirmation
     CONFIRM = "confirm"  # rewind
     CANCEL = "cancel"
@@ -73,6 +79,7 @@ class Button:
     kind: str | None = None  # a batch's kind
     rule_id: str | None = None  # a batch rule's id (/lotes)
     note: str | None = None  # how its hold ended, once ``retire_hold`` used it up
+    agent: str | None = None  # whose it is, with several agents; None with only one (T26-2e)
 
 
 class ButtonBook:
@@ -99,6 +106,7 @@ class ButtonBook:
         hold_id: str | None = None,
         kind: str | None = None,
         rule_id: str | None = None,
+        agent: str | None = None,
     ) -> str:
         """A new token for ``action``. Buttons of one ``group`` are used up together."""
         token = secrets.token_urlsafe(18)
@@ -106,7 +114,7 @@ class ButtonBook:
             self._make_room()
             self._buttons[token] = Button(
                 action, snapshot_id, self._clock() + ttl, single_use, group or token,
-                hold_id=hold_id, kind=kind, rule_id=rule_id,
+                hold_id=hold_id, kind=kind, rule_id=rule_id, agent=agent,
             )  # fmt: skip
         return token
 
@@ -117,13 +125,21 @@ class ButtonBook:
         with self._lock:
             return self._buttons.get(token)
 
-    def retire_hold(self, hold_id: str, note: str) -> None:
-        """The hold ``hold_id`` ended: every button of it is used up, saying ``note``."""
+    def retire_hold(self, hold_id: str, note: str, *, agent: str | None = None) -> None:
+        """The hold ``hold_id`` of ``agent`` ended: every button of it is used up, saying ``note``.
+        Each agent's gate makes its own ids, so the same id of another agent is another hold."""
         with self._lock:
             for button in self._buttons.values():
-                if button.hold_id == hold_id and not button.used:
+                if button.hold_id == hold_id and button.agent == agent and not button.used:
                     button.used = True
                     button.note = note
+
+    def forget_agent(self, agent: str) -> None:
+        """``agent`` is no longer watched: none of its buttons does anything from now on, not even
+        for another agent that takes its name later."""
+        with self._lock:
+            for token in [t for t, b in self._buttons.items() if b.agent == agent]:
+                del self._buttons[token]
 
     def bind(self, tokens: list[str], message_id: int) -> None:
         """The message the buttons ``tokens`` were sent on: only a press there counts."""

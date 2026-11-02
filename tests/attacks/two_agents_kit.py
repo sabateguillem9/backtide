@@ -366,8 +366,9 @@ profile = "claude-code"
 """
 
 
-def open_lab() -> Lab:
-    """Build it all and wait for both agents. Whatever is left from a run that died goes first."""
+def open_lab(*, telegram: str | None = None) -> Lab:
+    """Build it all and wait for both agents. Whatever is left from a run that died goes first.
+    ``telegram``: the service's ``telegram.toml``, pointed at a fake Bot API (T26-2e)."""
     lab = Lab()
     lab.close()
     try:
@@ -396,6 +397,8 @@ def open_lab() -> Lab:
             sudo("mkdir", "-p", str(channel))
             options = channel_tmpfs_options(CHANNEL_SIZE, uid, gid)
             sudo("mount", "-t", "tmpfs", "-o", options, CHANNEL_TMPFS_SOURCE, str(channel))
+        if telegram is not None:
+            _write_as_root(STATE / "telegram.toml", telegram, "0600")
         _write_as_root(CONFIG, MAIN_CONFIG)
         sudo("install", "-d", "-m", "0755", str(ETC / "agents"))
         _write_as_root(ETC / "agents" / f"{SLUG}.toml", OTHER_FILE)

@@ -33,6 +33,10 @@ with their buttons, and `/lotes` lists the batches with a "Revocar" for each.
 
 ``held`` and ``closed`` are the ``HoldWatch`` of the proxy's channel: called under its gate lock,
 they only queue (never block, never raise); the desk's own thread talks to Telegram.
+
+**Several agents** (T26-2e): one desk per agent, with its own actions, its own budget (a neighbour
+that floods hides nothing of another) and its slug on every message and every button. The slug is
+ours, from the service's list, and goes outside the agent's block, with ``inert`` all the same.
 """
 
 import logging
@@ -47,7 +51,7 @@ from typing import Any, Protocol
 from backtide.gate.phrase import action, api_name, cut_middle, note_texts
 from backtide.notify.buttons import CONFIRM_TTL, Action, Button, ButtonBook
 from backtide.notify.telegram_api import BotApi, TelegramError
-from backtide.notify.text import agent_text
+from backtide.notify.text import agent_text, inert
 
 delivery_logger = logging.getLogger("backtide.notify.telegram")
 # Not under backtide.notify: a held request of risk 3 that gets no notice of its own must reach
@@ -542,7 +546,9 @@ class HoldDesk:
         clock: Callable[[], float] = time.monotonic,
         per_minute: int = NOTICES_PER_MINUTE,
         summary_every: float = SUMMARY_EVERY,
+        agent: str | None = None,
     ) -> None:
+        self._agent = agent  # whose, when a machine has several: said on all it sends (T26-2e)
         self._api = api
         self._chat_id = chat_id
         self._book = book
@@ -583,7 +589,7 @@ class HoldDesk:
     def closed(self, hold_id: str, status: str, by: str | None) -> None:
         try:
             # At once: a press after this answers how it ended, before the edit goes out.
-            self._book.retire_hold(hold_id, retired_note(status))
+            self._retire(hold_id, status)
         except Exception:
             delivery_logger.exception("cannot retire the buttons of a held request")
         self._put(("closed", hold_id, status, by))
@@ -667,7 +673,7 @@ class HoldDesk:
                 self._closed.popitem(last=False)
             self._notices.pop(hold_id, None)
             messages = self._messages.pop(hold_id, [])
-        self._book.retire_hold(hold_id, retired_note(status))  # buttons issued meanwhile too
+        self._retire(hold_id, status)  # buttons issued meanwhile too
         line = result_line(status, by)
         for message_id, text in messages:
             self._edit(message_id, _fit(text + "\n\n" + line))
@@ -696,13 +702,18 @@ class HoldDesk:
             self._summary_edited = now
             self._summary_shown, self._summary_shown3 = count, count3
         if message_id is not None and token is not None:
-            self._edit(message_id, summary_text(count, count3), keyboard([[("Pausar", token)]]))
+            text = self._said(summary_text(count, count3))
+            self._edit(message_id, text, keyboard([[("Pausar", token)]]))
             return
-        token = self._book.issue(Action.PAUSE)
+        token = self._issue(Action.PAUSE)
         markup = keyboard([[("Pausar", token)]])
         sent = self._call(
             "sendMessage",
-            {"chat_id": self._chat_id, "text": summary_text(count, count3), "reply_markup": markup},
+            {
+                "chat_id": self._chat_id,
+                "text": self._said(summary_text(count, count3)),
+                "reply_markup": markup,
+            },
         )
         found = _message_id(sent)
         if found is None:
@@ -725,21 +736,21 @@ class HoldDesk:
             return  # it expires now: its end edits nothing, and no button would work
         notice = {**notice, "expires_in_s": left}
         ttl = float(left)
-        approve = self._book.issue(Action.APPROVE, ttl=ttl, hold_id=hold_id)
-        reject = self._book.issue(Action.REJECT, ttl=ttl, hold_id=hold_id)
-        view = self._book.issue(Action.VIEW, ttl=ttl, hold_id=hold_id)
+        approve = self._issue(Action.APPROVE, ttl=ttl, hold_id=hold_id)
+        reject = self._issue(Action.REJECT, ttl=ttl, hold_id=hold_id)
+        view = self._issue(Action.VIEW, ttl=ttl, hold_id=hold_id)
         rows = [[("Aprobar", approve), ("Rechazar", reject), ("Ver", view)]]
         tokens = [approve, reject, view]
         batch_row = []
         for kind in notice.get("batches") or []:
             if kind not in ("recipient", "kind"):
                 continue
-            token = self._book.issue(Action.BATCH, ttl=ttl, hold_id=hold_id, kind=kind)
+            token = self._issue(Action.BATCH, ttl=ttl, hold_id=hold_id, kind=kind)
             tokens.append(token)
             batch_row.append((batch_label(notice, kind), token))
         if batch_row:
             rows.append(batch_row)
-        text = hold_text(notice)
+        text = self._said(hold_text(notice))
         sent = self._call(
             "sendMessage",
             {
@@ -762,8 +773,20 @@ class HoldDesk:
             if ended is None:
                 self._messages.setdefault(hold_id, []).append((message_id, text))
         if ended is not None:  # it ended while this went out
-            self._book.retire_hold(hold_id, retired_note(ended[0]))
+            self._retire(hold_id, ended[0])
             self._edit(message_id, _fit(text + "\n\n" + result_line(*ended)))
+
+    def _said(self, text: str) -> str:
+        """``text`` saying whose it is, when a machine has several agents. On a line of its own and
+        before anything else, so it reads the same in every notice and no text of the agent's can
+        come before it. Past ``_fit``: Telegram's limit leaves room for it."""
+        return text if self._agent is None else f"Agente {inert(self._agent)}:\n{text}"
+
+    def _issue(self, action: Action, **fields: Any) -> str:
+        return self._book.issue(action, agent=self._agent, **fields)
+
+    def _retire(self, hold_id: str, status: str) -> None:
+        self._book.retire_hold(hold_id, retired_note(status), agent=self._agent)
 
     def _edit(self, message_id: int, text: str, markup: dict[str, Any] | None = None) -> None:
         self._call(
@@ -786,7 +809,7 @@ class HoldDesk:
             return None
 
     def _send(self, text: str, rows: list[list[tuple[str, str]]] | None = None) -> int | None:
-        fitted = _fit(text)
+        fitted = self._said(_fit(text))
         params: dict[str, Any] = {
             "chat_id": self._chat_id,
             "text": fitted,
@@ -859,8 +882,8 @@ class HoldDesk:
         if left <= 0:
             return "Esa retención ya no está abierta."
         ttl = min(CONFIRM_TTL, float(left))
-        cancel = self._book.issue(Action.BATCH_CANCEL, ttl=ttl, single_use=True, hold_id=hold_id)
-        confirm = self._book.issue(
+        cancel = self._issue(Action.BATCH_CANCEL, ttl=ttl, single_use=True, hold_id=hold_id)
+        confirm = self._issue(
             Action.BATCH_CONFIRM, ttl=ttl, single_use=True, group=cancel, hold_id=hold_id, kind=kind
         )
         message_id = self._send(
@@ -907,7 +930,7 @@ class HoldDesk:
         rows: list[list[tuple[str, str]]] = []
         for n, rule in enumerate(rules, start=1):
             ttl = float(max(1, rule.get("left_s") or 0))
-            token = self._book.issue(
+            token = self._issue(
                 Action.BATCH_END, ttl=ttl, single_use=True, rule_id=str(rule.get("rule_id"))
             )
             tokens.append(token)

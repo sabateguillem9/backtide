@@ -399,6 +399,7 @@ Behavior:
 - The bot answers only your private chat. Everyone else is ignored without a reply, and each attempt is recorded.
 - It uses long polling: backtide asks Telegram for news. No port is opened to the internet.
 - Alert rates, the limit of commands, and the lifetime of a rewind confirmation (2 minutes) are fixed.
+- **With several agents** there is still one bot. Every message says which agent it is about, and its buttons act on that agent alone. Orders take the agent's name: `/pausar revisor`, `/seguir revisor`. A name that does not exist does nothing. Without a name, `/seguir` refuses and `/pausar` asks, with a button per agent and one for all of them; `/estado`, `/retenidas` and `/lotes` show every agent. With one agent, no name is needed.
 
 **Status:** all of this is tested against a fake Bot API. With a real bot, only a hold notice arriving has been seen so far; `/estado`, `/pausar`, `/seguir` and approving from the phone are not yet tried by hand. If the token leaks, send `/revoke` to @BotFather, put the new token in the file and restart.
 

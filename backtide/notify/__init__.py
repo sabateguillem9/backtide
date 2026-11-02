@@ -48,15 +48,14 @@ class AlertLevel(StrEnum):
 @dataclass(frozen=True)
 class Alert:
     """What the user is told. ``title`` and ``body`` are in Spanish; ``event_seq`` is the
-    black-box event that explains it. ``elsewhere``: it is about an agent other than the one the
-    Telegram bot acts on (T26-2b), and its event is in that agent's box: no button may offer to do
-    anything about it until the bot knows each agent (T26-2e)."""
+    black-box event that explains it. ``agent``: whose it is when a machine has several (T26-2b),
+    and so whose box that event is in and whom its Telegram buttons act on (T26-2e)."""
 
     level: AlertLevel
     title: str
     body: str
     event_seq: int | None = None
-    elsewhere: bool = False
+    agent: str | None = None
 
 
 class Notifier(Protocol):
@@ -90,18 +89,15 @@ class LogNotifier:
 class Labelled:
     """Says which agent an alert is about, when a machine has several (T26-2b), and hands one
     agent's alert at a time: each agent's queue calls this from its own thread, and ``notifier``
-    is the same for all of them. ``lock`` is theirs to share. ``elsewhere``: see ``Alert``."""
+    is the same for all of them. ``lock`` is theirs to share."""
 
-    def __init__(
-        self, notifier: Notifier, label: str, lock: threading.Lock, *, elsewhere: bool = False
-    ) -> None:
+    def __init__(self, notifier: Notifier, label: str, lock: threading.Lock) -> None:
         self._notifier = notifier
         self._label = label
         self._lock = lock
-        self._elsewhere = elsewhere
 
     def send(self, alert: Alert) -> None:
-        labelled = replace(alert, title=f"{self._label}: {alert.title}", elsewhere=self._elsewhere)
+        labelled = replace(alert, title=f"{self._label}: {alert.title}", agent=self._label)
         with self._lock:
             self._notifier.send(labelled)
 

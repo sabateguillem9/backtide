@@ -16,12 +16,17 @@ socket. Built in ``runner.serve`` when ``<state_dir>/telegram.toml`` exists.
   which refuses them while the agent is paused or rewound; ``held_details`` reads the
   ``gate/held`` of a hold back from the black box ("Ver").
 - Every text goes out redacted; none quotes the agent.
+- With several agents (T26-2e; docs/47, section 6.10) each one has its ``GuardianActions`` and its
+  ``HoldDesk``, so a button can only reach the agent whose desk it came from. What goes through the
+  control socket carries its ``agent`` (the main one's is byte for byte as always), and the socket
+  is the machine's, the main config's. A neighbour's side is bound while its ``Guardian`` is up
+  (``NeighbourWatch``); before and after, it says it is not being watched.
 """
 
 import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any, Protocol
@@ -30,8 +35,9 @@ from backtide.blackbox import BlackBox, BlackBoxError, redact
 from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.notify.buttons import ButtonBook
 from backtide.notify.hold_notice import HoldDesk
-from backtide.notify.telegram import TelegramBot, TelegramNotifier
+from backtide.notify.telegram import AgentSide, TelegramBot, TelegramNotifier
 from backtide.notify.telegram_api import BotApi
+from backtide.service import scope
 from backtide.service.config import ServiceConfig
 from backtide.service.control import (
     ControlError,
@@ -66,6 +72,11 @@ REASON_NAMES = {
 # A late pause the space thread will still lift by itself (``Guardian.late_pause_lifts``).
 LATE_LIFTS = "el hilo de espacio llegó tarde (sigue solo en cuanto vuelva a comprobar)"
 REWIND_WAIT = 10.0  # seconds to wait for the control socket (the service is up: it is ours)
+STARTING = "backtide está arrancando: prueba otra vez en unos segundos."
+NOT_WATCHED = (
+    "El agente {slug} no se está vigilando ahora mismo (no ha arrancado, ha fallado o se está "
+    "parando): no se ha hecho nada."
+)
 
 
 class _Guardian(Protocol):
@@ -106,7 +117,8 @@ AskDecide = Callable[..., dict[str, Any]]
 class GuardianActions:
     """``BotActions`` for a running service. ``bind`` hands it the Guardian once it exists
     (the alert queue, and so the notifier, is built before it); until then every action says
-    that backtide is starting."""
+    that backtide is starting. ``agent``: the neighbour this one acts on (T26-2e), whose name the
+    control socket gets, and who may stop being watched (``unbind``); None is the main agent."""
 
     def __init__(
         self,
@@ -117,8 +129,11 @@ class GuardianActions:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         tz: tzinfo | None = None,
         agent_lines: Sequence[str] = DEFAULT_PROFILE.rewind_notice_lines,
+        agent: str | None = None,
     ) -> None:
         self._socket = control_socket
+        self._agent = agent
+        self._about = {} if agent is None else {"agent": agent}
         self._agent_lines = tuple(agent_lines)  # the profile's lines of the rewind notice
         self._ask = ask
         self._ask_decision = ask_decision
@@ -145,30 +160,42 @@ class GuardianActions:
         self._budget = budget
         self._waiting = waiting
 
+    def unbind(self) -> None:
+        """Its Guardian is about to stop, and its black box to close."""
+        self._guardian, self._box, self._store = None, None, None
+        self._budget, self._waiting = None, None
+
+    def _not_up(self, starting: str = STARTING) -> str:
+        return starting if self._agent is None else redact(NOT_WATCHED.format(slug=self._agent))
+
     # BotActions
 
     def pause(self) -> str:
-        if self._guardian is None:
-            return "backtide está arrancando: prueba otra vez en unos segundos."
-        return redact(self._guardian.pause_by_user(requested_by=REQUESTER).message)
+        guardian = self._guardian
+        if guardian is None:
+            return self._not_up()
+        return redact(guardian.pause_by_user(requested_by=REQUESTER).message)
 
     def pause_mark(self) -> int | None:
-        return None if self._guardian is None else self._guardian.user_pause_mark()
+        guardian = self._guardian
+        return None if guardian is None else guardian.user_pause_mark()
 
     def resume(self, pause_mark: int | None) -> str:
-        if self._guardian is None:
-            return "backtide está arrancando: prueba otra vez en unos segundos."
-        outcome = self._guardian.resume(requested_by=REQUESTER, pause_mark=pause_mark)
+        guardian = self._guardian
+        if guardian is None:
+            return self._not_up()
+        outcome = guardian.resume(requested_by=REQUESTER, pause_mark=pause_mark)
         return redact(outcome.message)
 
     def status(self) -> str:
-        if self._guardian is None:
-            return "backtide está arrancando."
-        state = str(self._guardian.agent_state)
+        guardian = self._guardian
+        if guardian is None:
+            return self._not_up("backtide está arrancando.")
+        state = str(guardian.agent_state)
         lines = [f"Agente: {STATE_NAMES.get(state, state)}."]
-        reasons = sorted(self._guardian.pause_reasons)
+        reasons = sorted(guardian.pause_reasons)
         if reasons:
-            lifts = self._guardian.late_pause_lifts
+            lifts = guardian.late_pause_lifts
             names = ", ".join(
                 LATE_LIFTS if reason == "late" and lifts else REASON_NAMES.get(reason, reason)
                 for reason in reasons
@@ -184,18 +211,19 @@ class GuardianActions:
             )
         else:
             lines.append("No hay instantáneas (o no se pueden leer).")
-        holds, batches = len(self._guardian.pending_holds()), len(self._guardian.batches())
+        holds, batches = len(guardian.pending_holds()), len(guardian.batches())
         lines.append(f"Peticiones retenidas: {holds} (/retenidas). Lotes activos: {batches} "
                      "(/lotes).")  # fmt: skip
-        if self._budget is not None:
+        budget, waiting_for = self._budget, self._waiting
+        if budget is not None:
             try:
-                lines.extend(self._budget.lines())
+                lines.extend(budget.lines())
             except Exception:
                 logger.exception("the spending could not be read for /estado")
                 lines.append("Gasto: no se ha podido leer.")
-        if self._waiting is not None:
+        if waiting_for is not None:
             try:
-                waiting = sorted(self._waiting())
+                waiting = sorted(waiting_for())
             except Exception:
                 logger.exception("the providers waiting for their key could not be read")
                 waiting = []
@@ -208,7 +236,9 @@ class GuardianActions:
 
     def rewind(self, snapshot_id: str) -> str:
         try:
-            reply = self._ask(self._socket, snapshot_id, via=REQUESTER, wait=REWIND_WAIT)
+            reply = self._ask(
+                self._socket, snapshot_id, via=REQUESTER, wait=REWIND_WAIT, **self._about
+            )
         except ControlUnavailable:
             return "El servicio no contesta en su socket de control: no se ha rebobinado nada."
         except ControlOutcomeUnknown as error:
@@ -230,10 +260,11 @@ class GuardianActions:
         return "\n\n".join(paragraphs)
 
     def target_for(self, event_seq: int) -> str | None:
-        if self._box is None:
+        box = self._box
+        if box is None:
             return None
         try:
-            found = self._box.events(since_seq=event_seq - 1, limit=1) if event_seq >= 1 else []
+            found = box.events(since_seq=event_seq - 1, limit=1) if event_seq >= 1 else []
         except BlackBoxError as error:
             logger.warning("cannot read the event of an alert to offer a rewind: %s", error)
             return None
@@ -250,7 +281,7 @@ class GuardianActions:
     def decide(self, hold_id: str, verdict: str) -> tuple[str, str]:
         try:
             reply = self._ask_decision(
-                self._socket, hold_id, verdict, via=REQUESTER, wait=REWIND_WAIT
+                self._socket, hold_id, verdict, via=REQUESTER, wait=REWIND_WAIT, **self._about
             )
         except ControlUnavailable:
             return "failed", "El servicio no contesta en su socket de control: no se ha decidido."
@@ -261,35 +292,38 @@ class GuardianActions:
         return str(reply["outcome"]), redact(str(reply["message"]))
 
     def create_batch(self, hold_id: str, kind: str) -> tuple[str, str]:
-        if self._guardian is None:
-            return "failed", "backtide está arrancando: prueba otra vez en unos segundos."
+        guardian = self._guardian
+        if guardian is None:
+            return "failed", self._not_up()
         requested_by = f"{REQUESTER} (el bot, pid {os.getpid()})"
         try:
-            outcome = self._guardian.create_batch(
-                hold_id, kind, via=REQUESTER, requested_by=requested_by
-            )
+            outcome = guardian.create_batch(hold_id, kind, via=REQUESTER, requested_by=requested_by)
         except ValueError:
             return "failed", "Ese lote no existe."
         return str(outcome.status), redact(outcome.message)
 
     def end_batch(self, rule_id: str) -> str:
-        if self._guardian is None:
-            return "backtide está arrancando: prueba otra vez en unos segundos."
-        if self._guardian.end_batch(rule_id, via=REQUESTER):
+        guardian = self._guardian
+        if guardian is None:
+            return self._not_up()
+        if guardian.end_batch(rule_id, via=REQUESTER):
             return "Lote revocado: lo que cubría vuelve a preguntar."
         return "Ese lote ya no está activo (caducó, se revocó o backtide se reinició)."
 
     def batches(self) -> list[dict[str, Any]]:
-        return [] if self._guardian is None else self._guardian.batches()
+        guardian = self._guardian
+        return [] if guardian is None else guardian.batches()
 
     def pending_holds(self) -> list[dict[str, Any]]:
-        return [] if self._guardian is None else self._guardian.pending_holds()
+        guardian = self._guardian
+        return [] if guardian is None else guardian.pending_holds()
 
     def held_details(self, seq: int) -> dict[str, Any] | None:
-        if self._box is None or seq < 1:
+        box = self._box
+        if box is None or seq < 1:
             return None
         try:
-            found = self._box.events(since_seq=seq - 1, limit=1)
+            found = box.events(since_seq=seq - 1, limit=1)
         except BlackBoxError as error:
             logger.warning("cannot read a held request back from the black box: %s", error)
             return None
@@ -300,18 +334,20 @@ class GuardianActions:
         return dict(found[0].details)
 
     def record(self, action: str, details: dict[str, Any], risk: int) -> None:
-        if self._box is None:
+        box = self._box
+        if box is None:
             return
         try:
-            self._box.append("system", action, "", details=details, risk=risk)
+            box.append("system", action, "", details=details, risk=risk)
         except BlackBoxError as error:
             logger.error("cannot write system/%s to the black box: %s", action, error)
 
     def _snapshots(self) -> list[Snapshot]:
-        if self._store is None:
+        store = self._store
+        if store is None:
             return []
         try:
-            return sorted(self._store.snapshots(), key=lambda snap: snap.taken_at)
+            return sorted(store.snapshots(), key=lambda snap: snap.taken_at)
         except SnapshotError as error:
             logger.warning("cannot list the snapshots for Telegram: %s", error)
             return []
@@ -360,26 +396,104 @@ class Hooks:
             raise failure
 
 
+class _WorkingFor:
+    """``target`` with each call on this thread working for the agent ``slug``: the bot's threads
+    are the main agent's, and what one logs about a neighbour is that neighbour's (T26-2c)."""
+
+    def __init__(self, target: Any, slug: str) -> None:
+        self._target, self._slug = target, slug
+
+    def __getattr__(self, name: str) -> Any:
+        found = getattr(self._target, name)
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            with scope.working_for(self._slug):
+                return found(*args, **kwargs)
+
+        return call
+
+
+@dataclass(frozen=True)
+class TelegramNeighbour:
+    """The Telegram side of an agent other than the main one (T26-2e). ``desk`` is its gate's
+    HoldWatch, built with it; ``watch`` gives what runs while its ``Guardian`` is up."""
+
+    slug: str
+    actions: GuardianActions
+    desk: HoldDesk
+    book: ButtonBook
+
+    def watch(
+        self, guardian: Any, box: BlackBox, store: Any, *, budget: Any = None, waiting: Any = None
+    ) -> "NeighbourWatch":
+        return NeighbourWatch(self, guardian, box, store, budget, waiting)
+
+
+class NeighbourWatch:
+    """A ``ControlHook``: what the bot can do for a neighbour starts once its ``Guardian`` is up and
+    ends before it stops. Its desk's thread starts here, on the neighbour's own thread, so what the
+    desk logs reaches the neighbour's black box. Its old buttons go with it."""
+
+    def __init__(
+        self,
+        side: TelegramNeighbour,
+        guardian: Any,
+        box: BlackBox,
+        store: Any,
+        budget: Any,
+        waiting: Any,
+    ) -> None:
+        self._side = side
+        self._parts = (guardian, box, store)
+        self._budget, self._waiting = budget, waiting
+
+    def start(self) -> None:
+        self._side.actions.bind(*self._parts, budget=self._budget, waiting=self._waiting)
+        self._side.desk.start()
+
+    def close(self) -> None:
+        self._side.actions.unbind()
+        self._side.book.forget_agent(self._side.slug)
+        self._side.desk.close()
+
+
 @dataclass(frozen=True)
 class TelegramParts:
     """The notifier the alert queue delivers to, the actions to ``bind`` once the Guardian
     exists, the bot to run as a hook next to the control socket (it runs the desk too), and the
-    desk the egress tells about its held requests."""
+    desk the egress tells about its held requests. ``neighbours``: the same for each other agent."""
 
     notifier: TelegramNotifier
     actions: GuardianActions
     bot: TelegramBot
     desk: HoldDesk  # the gate's HoldWatch: the notices of the held requests (T10-4)
+    neighbours: Mapping[str, TelegramNeighbour] = field(default_factory=dict)
 
 
-def telegram_parts(config: ServiceConfig, settings: TelegramSettings) -> TelegramParts:
-    """The Telegram side of the service. Touches no network: the bot connects when started."""
+def telegram_parts(
+    config: ServiceConfig, settings: TelegramSettings, others: Sequence[ServiceConfig] = ()
+) -> TelegramParts:
+    """The Telegram side of the service, with ``others`` the other agents it runs (T26-2e). One bot
+    and one book for all of them. Touches no network: the bot connects when started."""
     api = BotApi(settings.token.reveal(), base=settings.api_base)
     book = ButtonBook()
     actions = GuardianActions(
         config.control_socket, agent_lines=config.agent_profile.rewind_notice_lines
     )
-    notifier = TelegramNotifier(api, settings.chat_id, book, actions)
-    desk = HoldDesk(api, settings.chat_id, book, actions)
-    bot = TelegramBot(api, settings.chat_id, book, actions, desk=desk)
-    return TelegramParts(notifier, actions, bot, desk)
+    chat = settings.chat_id
+    desk = HoldDesk(api, chat, book, actions, agent=config.slug if others else None)
+    agents: dict[str, AgentSide] = {config.slug: AgentSide(actions, desk)} if others else {}
+    neighbours: dict[str, TelegramNeighbour] = {}
+    for other in others:
+        theirs = GuardianActions(
+            config.control_socket,  # the machine's: it is one, and says which agent by name
+            agent_lines=other.agent_profile.rewind_notice_lines,
+            agent=other.slug,
+        )
+        scoped = _WorkingFor(theirs, other.slug)
+        their_desk = HoldDesk(api, chat, book, scoped, agent=other.slug)  # type: ignore[arg-type]
+        neighbours[other.slug] = TelegramNeighbour(other.slug, theirs, their_desk, book)
+        agents[other.slug] = AgentSide(scoped, _WorkingFor(their_desk, other.slug))  # type: ignore[arg-type]
+    notifier = TelegramNotifier(api, chat, book, actions, agents=agents)
+    bot = TelegramBot(api, chat, book, actions, desk=desk, agents=agents)
+    return TelegramParts(notifier, actions, bot, desk, neighbours)

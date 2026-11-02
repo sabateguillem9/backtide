@@ -21,7 +21,6 @@ from backtide.blackbox import BlackBoxError
 from backtide.jail import AgentJail, JailError
 from backtide.jail.config import Protected
 from backtide.notify import Alert, AlertLevel, Labelled, LogBridge, LoggedProblem
-from backtide.notify.telegram import ButtonBook, TelegramNotifier
 from backtide.service import runner, scope
 from backtide.service.agents import load_installation
 from backtide.service.config import ConfigError, ServiceConfig, ensure_state_folder
@@ -297,23 +296,19 @@ class FakeActions:
 # --- the keys are the machine's ---------------------------------------------------------------
 
 
-def test_every_alert_of_a_neighbour_offers_no_button_that_acts_on_the_main_agent() -> None:
-    """Its event is in another box: "Pausar" would freeze the wrong agent, and "Rebobinar" would
-    offer a snapshot of the main one for a number that means nothing there."""
-    api = FakeApi()
-    actions = FakeActions()
-    notifier = TelegramNotifier(api, 42, ButtonBook(), actions)  # type: ignore[arg-type]
-    lock = threading.Lock()
-    Labelled(notifier, "revisor", lock, elsewhere=True).send(
+def test_every_alert_says_whose_and_keeps_that_agent_on_it() -> None:
+    """Whom its buttons act on, in Telegram (T26-2e: tests/test_telegram_two_agents.py)."""
+    seen: list[Alert] = []
+
+    class Keep:
+        def send(self, alert: Alert) -> None:
+            seen.append(alert)
+
+    Labelled(Keep(), "revisor", threading.Lock()).send(
         Alert(AlertLevel.ERROR, "Algo", "cuerpo", event_seq=7)
     )
-    (sent,) = api.sent
-    assert "reply_markup" not in sent and "revisor: Algo" in sent["text"]
-    assert actions.asked == []
-    Labelled(notifier, "principal", lock).send(
-        Alert(AlertLevel.ERROR, "Algo", "cuerpo", event_seq=7)
-    )
-    assert "reply_markup" in api.sent[1] and actions.asked == [7]
+    (alert,) = seen
+    assert alert.title == "revisor: Algo" and alert.agent == "revisor" and alert.event_seq == 7
 
 
 def test_a_new_key_reaches_every_proxy() -> None:
