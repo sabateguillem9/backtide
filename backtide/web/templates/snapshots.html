@@ -39,7 +39,7 @@
       <span class="rewind">
         {% if rewind_state == 'ready' %}
         <small>{{ t('snaps.go_back') }}</small>
-        <a class="dot-button rewind-go" href="{{ base }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-get="{{ base }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-target="#rewind-panel" hx-swap="innerHTML" aria-label="{{ t('snaps.rewind.to', time=day_time(snap.taken_at)) }}">{% include "arrow.html" %}</a>
+        <a class="dot-button rewind-go" href="{{ abase }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-get="{{ abase }}/instantaneas/rebobinar?id={{ snap.id | urlencode }}" hx-target="#rewind-panel" hx-swap="innerHTML" aria-label="{{ t('snaps.rewind.to', time=day_time(snap.taken_at)) }}">{% include "arrow.html" %}</a>
         {% else %}
         <button class="dot-button" type="button" disabled aria-label="{{ t('snaps.go_back') }}: {{ t('snaps.rewind.off') }}">{% include "arrow.html" %}</button>
         {% endif %}

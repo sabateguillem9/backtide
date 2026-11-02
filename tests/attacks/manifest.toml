@@ -2535,6 +2535,74 @@ recoverable = "n/a"
 held = "n/a"
 
 [[scenario]]
+id = "web-los-dos-agentes"
+name = "El Panel enseña los dos agentes que dice el servicio"
+story = """La web de verdad, sin root y con su grupo. La lista la da el servicio, y la caja del vecino se \
+lee con el grupo de la web, como la del principal. Eso es todo lo que el grupo tiene de su carpeta: no \
+puede listarla, ni leer su clave, ni leer su imagen, aunque se hiciera a mano con 0644: el servicio la \
+cierra antes de abrir la carpeta. Solo le queda el certificado de `agent-ca`."""
+inspired_by = "Abrir la carpeta de un agente para enseñar su caja, y dejar ver también su volumen"
+invariants = [2, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "web-rebobinar-al-vecino"
+name = "Desde la web se rebobina el segundo agente, y solo ese"
+story = """La confirmación dice a quién, y el billete es de ese agente: el mismo formulario sin su nombre, \
+con un nombre inventado, con una ruta o sin sesión no rebobina a nadie. Con su nombre vuelve su \
+espacio de trabajo, su caja dice que lo pidió la web, y el otro sigue como estaba."""
+inspired_by = "Un formulario abierto para un agente que acaba actuando sobre otro"
+invariants = [4, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "yes"
+held = "n/a"
+
+[[scenario]]
+id = "web-aprobar-sin-sesion-ni-agente"
+name = "Aprobar desde la web pide sesión y un agente que exista"
+story = """Una retención de verdad del vecino. Sin sesión no se entra, exista o no el agente. Con ella, un \
+agente inventado es la página de «aquí no hay nada», no un 500, y el billete de un agente no vale en \
+el otro. Con su nombre se decide, y queda con «web» en la caja de ese agente."""
+inspired_by = "Un nombre de agente del navegador que decide a quién se le aprueba algo"
+invariants = [6, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "yes"
+
+[[scenario]]
+id = "web-eventos-de-cada-uno"
+name = "Lo que hace un agente no sale en las páginas del otro"
+story = """Algo nuevo en las dos cajas a la vez. La historia de cada agente y el directo del vecino \
+enseñan lo suyo y nada del otro. Mirar a un agente no puede dar a entender lo que ha hecho otro."""
+inspired_by = "Un directo que mezcla dos agentes y hace creer que uno ha hecho lo del otro"
+invariants = [7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
 id = "vecino-sin-espacio"
 name = "Un agente sin espacio no para a nadie más"
 story = """Un volumen por agente. Un agente llena el suyo y borra tras una instantánea hasta pasar \

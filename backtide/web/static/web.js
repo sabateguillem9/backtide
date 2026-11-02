@@ -787,7 +787,9 @@
 
   document.body.addEventListener("htmx:sseMessage", function (event) {
     var target = event.target;
-    if (target && target.id === "tide") {
+    if (target && target.hasAttribute && target.hasAttribute("data-roster")) {
+      window.location.reload();
+    } else if (target && target.id === "tide") {
       rememberMarks(true);
       runCounters(frame, false);
       reapply();

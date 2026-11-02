@@ -334,7 +334,8 @@ def test_an_unknown_agent_is_a_calm_404(room: TestClient, slug: str) -> None:
     assert response.status_code == 404 and "Aquí no hay nada" in response.text
 
 
-def test_only_the_main_agent_can_be_rewound_from_here(tmp_path: Path, boxes) -> None:
+def test_without_a_service_to_ask_no_agent_can_be_rewound_from_here(tmp_path: Path, boxes) -> None:
+    """Rewinding each agent, with a service to ask, is in tests/test_web_two_agents.py."""
     taken = Snapshot(START, str(Reason.PERIODIC))
     web = new_client(
         tmp_path,
@@ -342,7 +343,6 @@ def test_only_the_main_agent_can_be_rewound_from_here(tmp_path: Path, boxes) -> 
         others=[source(tmp_path, "codigo", "Agente de código", [taken])],
     )
     html = web.get("/agentes/codigo/instantaneas").text
-    assert "Desde aquí solo se rebobina el agente que lleva el servicio" in text_of(html)
     assert "rebobinar?id=" not in html and "rewind-go" not in html
     assert 'disabled aria-label="Volver aquí' in html
 

@@ -220,21 +220,25 @@ class SpendView:
 
 
 def spend_view(raw: object) -> SpendView | None:
-    """``SpendClient.spend``'s reply, checked; None if it makes no sense."""
+    """``SpendClient.spend``'s reply, checked; None if it makes no sense. With several agents the
+    reply has ``installation``, and that is what these numbers are: the total and its caps, which
+    are the ones this page changes (T26-2c). The main agent's alone may have no cap at all."""
     if not isinstance(raw, dict):
         return None
     waiting = _waiting(raw.get("models_waiting"))
-    if raw.get("available") is not True:
+    whole = raw.get("installation")
+    counted = whole if isinstance(whole, dict) else raw
+    if raw.get("available") is not True or counted.get("available") is not True:
         return SpendView(False, waiting=waiting)
     try:
-        day, month = raw["day"], raw["month"]
+        day, month = counted["day"], counted["month"]
         amounts = [day["spent_micro"], day["cap_micro"], month["spent_micro"], month["cap_micro"]]
     except (KeyError, TypeError):
         return None
     if not all(type(a) is int and 0 <= a <= 10**15 for a in amounts):
         return None
     prices = raw.get("prices") if isinstance(raw.get("prices"), dict) else {}
-    blocked = raw.get("blocked")
+    blocked = counted.get("blocked") or raw.get("blocked")
     return SpendView(
         True,
         day_spent=_money(amounts[0]),

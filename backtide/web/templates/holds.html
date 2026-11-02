@@ -21,12 +21,14 @@
     <p class="note">{{ t('holds.batches.lede') }}</p>
     <ul class="hold-rules">
       {% for b in batches %}
+      {% set whose = roster.get(b.agent) %}
       <li class="hold-rule">
+        {% if roster | length > 1 %}{% include "order_for.html" %}{% endif %}
         <p class="hold-rule-what">{{ t('holds.batch.' ~ b.scope) }}{% if b.translator %} · <span lang="{{ t.language }}">{{ api(b.translator) }}</span>{% endif %}</p>
         {% if b.recipients %}<p><span class="muted">{{ t('hold.to') }}</span> {% for rc in b.recipients %}<span class="name">{{ vis_mid(rc, 120) }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
         {% if b.request %}<p><span class="name">{{ vis(b.request, 300) }}</span></p>{% endif %}
         <p class="muted">{% if b.until %}{{ t('holds.until', when=stamp(b.until)) }} · {% endif %}{{ t('holds.uses', n=b.uses) }}</p>
-        <p><a class="req-no" href="{{ base }}/peticiones/decidir?id={{ b.rule_id | urlencode }}&amp;v=revocar">{{ t('holds.revoke') }}</a></p>
+        <p><a class="req-no" href="{{ whose.base }}/peticiones/decidir?id={{ b.rule_id | urlencode }}&amp;v=revocar">{{ t('holds.revoke') }}</a></p>
       </li>
       {% endfor %}
     </ul>
@@ -42,10 +44,12 @@
     <p class="note">{{ t('holds.trusted.lede') }}</p>
     <ul class="hold-rules">
       {% for x in trusted %}
+      {% set whose = roster.get(x.agent) %}
       <li class="hold-rule">
+        {% if roster | length > 1 %}{% include "order_for.html" %}{% endif %}
         <p class="hold-rule-what"><span lang="{{ t.language }}">{{ api(x.translator) }}</span> · <span class="name">{{ vis_mid(x.recipient, 120) }}</span></p>
         <p class="muted">{% if x.added_at %}{{ t('holds.added', when=stamp(x.added_at)) }}{% endif %}</p>
-        <p><a class="req-no" href="{{ base }}/peticiones/decidir?id={{ x.trust_id | urlencode }}&amp;v=olvidar">{{ t('holds.forget') }}</a></p>
+        <p><a class="req-no" href="{{ whose.base }}/peticiones/decidir?id={{ x.trust_id | urlencode }}&amp;v=olvidar">{{ t('holds.forget') }}</a></p>
       </li>
       {% endfor %}
     </ul>

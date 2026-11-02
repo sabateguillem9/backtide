@@ -62,8 +62,8 @@
     </div>
     <div class="req-actions">
       {% if approvals == 'ready' %}
-      <a class="req-yes" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=aprobar"><span>{{ t('wait.approve') }}</span>{% include "arrow.html" %}</a>
-      <a class="req-no" href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=rechazar">{{ t('wait.reject') }}</a>
+      <a class="req-yes" href="{{ who.base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=aprobar"><span>{{ t('wait.approve') }}</span>{% include "arrow.html" %}</a>
+      <a class="req-no" href="{{ who.base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=rechazar">{{ t('wait.reject') }}</a>
       {% else %}
       <button class="req-yes" type="button" disabled aria-describedby="soon-{{ r.id }}"><span>{{ t('wait.approve') }}</span>{% include "arrow.html" %}</button>
       <button class="req-no" type="button" disabled aria-describedby="soon-{{ r.id }}">{{ t('wait.reject') }}</button>
@@ -74,16 +74,14 @@
        and the whole request. #}
     {% set can_trust = approvals == 'ready' and r.trustable %}
     {% set trust_note = approvals == 'ready' and not r.trustable and r.trust_off %}
-    {% if can_trust or trust_note or who.main %}
     <details class="req-more">
       <summary>{{ t('wait.more') }}</summary>
-      {% if can_trust or who.main %}<ul>
-        {% if can_trust %}<li><a href="{{ base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=confiar">{{ t('wait.trust_long') }}</a></li>{% endif %}
-        {% if who.main %}<li><a href="{{ base }}/peticiones/ver?id={{ r.id | urlencode }}">{{ t('wait.view_long') }}</a></li>{% endif %}
-      </ul>{% endif %}
+      <ul>
+        {% if can_trust %}<li><a href="{{ who.base }}/peticiones/decidir?id={{ r.id | urlencode }}&amp;v=confiar">{{ t('wait.trust_long') }}</a></li>{% endif %}
+        <li><a href="{{ who.base }}/peticiones/ver?id={{ r.id | urlencode }}">{{ t('wait.view_long') }}</a></li>
+      </ul>
       {% if trust_note %}<p class="req-soon" data-trust-off="{{ r.trust_off }}">{{ t('wait.trust_off.' ~ r.trust_off) }}</p>{% endif %}
     </details>
-    {% endif %}
     </div>
   </li>
   {% endfor %}

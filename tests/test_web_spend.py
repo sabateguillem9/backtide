@@ -18,7 +18,7 @@ from backtide.blackbox import BlackBox
 from backtide.service.control import ControlServer
 from backtide.service.spend import Budget, BudgetSettings
 from backtide.web.rewind import Availability
-from backtide.web.settings import ControlSettings, ControlSpend, spend_view
+from backtide.web.settings import ControlSettings, ControlSpend, SpendView, spend_view
 from tests.test_service_control import FakeGuardian, me
 from tests.test_web_settings import NOW, FakeSettings, confirm, hidden, post, text_of
 from tests.webkit import KEY, new_box, new_client
@@ -295,3 +295,30 @@ def test_b3_without_ajustes_or_without_new_prices_nothing_is_offered(
     plain = prices_client(tmp_path / "plain", fake, STATUS)
     assert "tipo=precios" not in plain.get("/ajustes").text
     assert "<form" not in plain.get("/ajustes/cambiar?tipo=precios").text
+
+
+def test_with_several_agents_the_numbers_are_the_whole_installations() -> None:
+    """Those are the caps this page changes. The main agent's alone may have none."""
+    mine = {"spent_micro": 1_000_000, "cap_micro": 100_000 * 1_000_000}
+    whole_day = {"spent_micro": 3_000_000, "cap_micro": 5_000_000}
+    whole_month = {"spent_micro": 4_000_000, "cap_micro": 50_000_000}
+    raw = {
+        "available": True,
+        "day": mine,
+        "month": mine,
+        "blocked": None,
+        "installation": {
+            "available": True,
+            "day": whole_day,
+            "month": whole_month,
+            "blocked": "day",
+        },
+    }
+    shown = spend_view(raw)
+    assert shown is not None
+    assert (shown.day_spent, shown.day_cap) == ("3,00", "5,00")
+    assert (shown.month_spent, shown.month_cap) == ("4,00", "50,00")
+    assert shown.day_cap_plain == "5.00" and shown.blocked == "day"
+    assert spend_view({**raw, "installation": {**raw["installation"], "available": False}}) == (
+        SpendView(False)
+    )

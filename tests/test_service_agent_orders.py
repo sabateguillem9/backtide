@@ -13,6 +13,7 @@ import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -115,7 +116,12 @@ class Two:
             [("revisor", "Revisor"), ("parado", None)],
         )
         self.desk = Desk(
-            "revisor", self.other, self.other_budget, lambda: {"anthropic": "x"}, lambda: [NEWER]
+            "revisor",
+            self.other,
+            self.other_budget,
+            lambda: {"anthropic": "x"},
+            lambda: [NEWER],
+            notice=("Sus canales.",),
         )
         self.roster.publish(self.desk)
         self.control = ControlServer(
@@ -300,10 +306,13 @@ def test_each_agent_has_its_own_tasks(two: Two) -> None:
 def test_the_list_of_agents_has_no_path(two: Two) -> None:
     agents = ask_agents(two.control.path, peer=me)
     assert agents == [
-        {"slug": "principal", "name": "Uno", "main": True, "watched": True, "state": "running"},
-        {"slug": "revisor", "name": "Revisor", "main": False, "watched": True, "state": "running"},
-        {"slug": "parado", "name": None, "main": False, "watched": False, "state": None},
-    ]
+        {"slug": "principal", "name": "Uno", "main": True, "watched": True, "state": "running",
+         "notice": []},
+        {"slug": "revisor", "name": "Revisor", "main": False, "watched": True, "state": "running",
+         "notice": ["Sus canales."]},
+        {"slug": "parado", "name": None, "main": False, "watched": False, "state": None,
+         "notice": []},
+    ]  # fmt: skip
 
 
 def test_what_the_list_says_is_checked_on_the_way_back(
@@ -1084,3 +1093,49 @@ def test_the_shell_orders_name_a_neighbour_and_not_the_main_one(home: Path) -> N
 
 def test_the_web_still_finds_the_snapshots_client_where_it_was() -> None:
     assert web_control.ask_snapshots is ask_snapshots
+
+
+@pytest.mark.parametrize("notice", [7, ["x" * 601], ["uno"] * 9, [7], None])
+def test_a_notice_that_makes_no_sense_is_none(two: Two, notice: object) -> None:
+    """What the web shows on a rewind's confirmation is checked like the rest of the list."""
+    item = {"slug": "bueno", "name": None, "main": False, "watched": True, "state": None}
+    with patch.object(two.roster, "listing", return_value=[{**item, "notice": notice}]):
+        assert ask_agents(two.control.path, peer=me) == [{**item, "notice": []}]
+
+
+@pytest.mark.parametrize(
+    ("agent", "seen"),
+    [("revisor", "the agent revisor"), (None, None)],
+)
+def test_trusting_warns_in_the_box_of_that_agent_and_names_it(
+    two: Two, caplog: pytest.LogCaptureFixture, agent: str | None, seen: str | None
+) -> None:
+    """The warning of a recipient trusted for good: while that agent's order runs, so the log
+    bridge takes it to its box, and saying whose (review of T26-2c)."""
+    scopes: list[str | None] = []
+
+    class Note(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "to trust a recipient" in record.getMessage():
+                scopes.append(scope.current())
+
+    note = Note()
+    logging.getLogger("backtide.service.web_control").addHandler(note)
+    try:
+        request = {"cmd": "trust", "hold_id": HOLD, "session": SESSION, "via": "web"}
+        talk(two.web, {**request, **({"agent": agent} if agent else {})})
+    finally:
+        logging.getLogger("backtide.service.web_control").removeHandler(note)
+    message = next(
+        r.getMessage() for r in caplog.records if "to trust a recipient" in r.getMessage()
+    )
+    assert (seen in message) if seen else ("the agent" not in message)
+    assert scopes == [agent]
+
+
+def test_trusting_nobody_warns_only_of_the_refusal(
+    two: Two, caplog: pytest.LogCaptureFixture
+) -> None:
+    request = {"cmd": "trust", "hold_id": HOLD, "session": SESSION, "agent": "nadie"}
+    assert talk(two.web, request)["outcome"] == "refused"
+    assert "to trust a recipient" not in caplog.text

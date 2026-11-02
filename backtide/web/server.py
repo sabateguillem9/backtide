@@ -65,6 +65,7 @@ from backtide.snapshots import Snapshot, SnapshotError, SnapshotStore
 from backtide.web.agents import AgentSource, PendingRequest
 from backtide.web.app import create_app
 from backtide.web.approve import Approver, ControlApprover
+from backtide.web.live import LiveAgents
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import WAIT_FOR_SERVICE, ControlRewinder
@@ -236,7 +237,8 @@ def run_web(
     buttons disabled, and the POST that decides does not exist; ``approver`` replaces the
     control socket's client (the demo). ``agent_name``,
     ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
-    requests) are only given by the demo today: T17 and T10 will fill them for real.
+    requests) are only given by the demo: the real web asks the service which agents there are
+    and what waits (``backtide.web.live``, T26-2d).
     ``web_socket`` is `--socket-web` (T12c): the service's narrow socket for the web's group,
     asked instead of the control socket for everything, the snapshot list included, and the
     sign-in (T26-3a): then the service keeps the sessions, and ``announce`` gets the address
@@ -263,6 +265,9 @@ def run_web(
         except ControlError as error:  # the pages say the list cannot be read
             raise SnapshotError(str(error)) from None
 
+    live = None
+    if not others and pending is None:
+        live = LiveAgents(control, box_of=paths.agent_box, server_uid=server_uid)
     access = None
     if web_socket is not None:
         access = ServiceAccess(
@@ -282,6 +287,7 @@ def run_web(
         spend=ControlSpend(control, server_uid=server_uid),
         agent_name=agent_name,
         others=others,
+        agents_from=live,
         pending=pending,
         agent_lines=paths.agent_lines,
         origin=public_origin,
@@ -295,5 +301,7 @@ def run_web(
         reader.close()
         for other in others:
             other.reader.close()
+        if live is not None:
+            live.close()
         for sock in socks:
             sock.close()

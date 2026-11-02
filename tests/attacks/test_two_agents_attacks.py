@@ -16,11 +16,18 @@ T26-2c (each order says which agent, and what they spend adds up): `vecino-sin-g
 `rebobinar-al-vecino`, `agente-inventado`, `archivo-roto-no-frena` and `tarea-del-vecino`. No model
 call reaches a provider (invariant 8): the key is made up, and each scenario that gives a turn or
 calls a model first checks the lab's cut, and then that no model answered.
+
+T26-2d (the web with the service's list, on the real `backtide web`, not root and with the web's
+group): `web-los-dos-agentes`, `web-rebobinar-al-vecino`, `web-aprobar-sin-sesion-ni-agente` and
+`web-eventos-de-cada-uno`.
 """
 
+import html
 import json
+import re
 import secrets
 import subprocess
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -41,6 +48,8 @@ from two_agents_kit import (
     STATE,
     Agent,
     Lab,
+    Web,
+    form_in,
     open_lab,
     sh,
     sudo,
@@ -50,6 +59,7 @@ from two_agents_kit import (
 from backtide.jail.config import AGENT_GID, AGENT_UID, PROXY_PORT
 from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
 from backtide.service.config import (
+    STATE_AGENT_CA,
     STATE_DB,
     STATE_INSTALLATION,
     STATE_KEY,
@@ -57,6 +67,7 @@ from backtide.service.config import (
     STATE_WEB_SOCKET,
 )
 from backtide.snapshots.space import MIB
+from backtide.web.i18n import ES
 
 SEEN_TIMEOUT = 60.0  # the reader reads every half second; a heartbeat may hold it a few
 CLOCK_CHECKS = 50.0  # prune_interval is 20: two clock checks under the unit's filter
@@ -988,6 +999,20 @@ def test_what_is_trusted_for_one_lets_out_nothing_of_the_other(attack: Attack, l
         f"({wrong_gate}); con su nombre sí ({right}), y la lista es la suya; quitarla por el "
         f"principal no la quita ({wrong_owner}), y por el suyo sí ({removed})",
     )
+    # The warning of a recipient trusted for good: in its agent's box, and saying whose (T26-2d).
+    named = f"of the agent {SLUG}"
+    wait(
+        lambda: bool(said_in(lab.events(OTHER), named)),
+        SEEN_TIMEOUT,
+        "the warning about trusting",
+        lab.diagnosis,
+    )
+    warned = said_in(lab.events(OTHER), named)
+    attack.check(
+        "recorded",
+        "trust a recipient" in json.dumps(warned) and said_in(lab.events(MAIN), named) == [],
+        "el aviso de confiar está en la caja del vecino, con su nombre, y no en la del principal",
+    )
     attack.check(
         "held",
         bool(other_held),
@@ -1227,6 +1252,263 @@ def test_each_guardian_has_its_own_tasks(attack: Attack, lab: Lab) -> None:
         "recorded",
         said_in(lab.events(MAIN), mark) == [],
         "su orden y su final en la caja del vecino, y nada en la del otro",
+    )
+
+
+# --- the web with both of them (T26-2d) -----------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def web(lab: Lab) -> Iterator[Web]:
+    found = Web(lab)
+    try:
+        found.sign_in()
+        yield found
+    finally:
+        found.close()
+
+
+def clean(page: str) -> str:
+    """A page's text, as a person reads it."""
+    return html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page))).strip()
+
+
+def as_the_web(lab: Lab, *argv: str) -> subprocess.CompletedProcess[str]:
+    """A command with the uid of nobody and the web's group as its only group."""
+    nobody = sh("id", "-u", "nobody").stdout.strip()
+    return sudo(
+        "setpriv", "--reuid", nobody, "--regid", str(lab.web_gid), "--clear-groups", "--", *argv,
+        check=False,
+    )  # fmt: skip
+
+
+@scenario("web-los-dos-agentes")
+def test_the_panel_shows_the_two_agents_the_service_has(attack: Attack, lab: Lab, web: Web) -> None:
+    """The list comes from the service and each box is read with the web's group: that is all the
+    group gets of the neighbour's folder. Its key and the list of files stay out, and so does its
+    image, which the lab made 0644 as a person would. As root: nothing else there lets it in."""
+    box = OTHER.box / STATE_DB
+    read_box = as_the_web(lab, "head", "-c", "16", str(box))
+    read_key = as_the_web(lab, "head", "-c", "16", str(OTHER.box / STATE_KEY))
+    read_image = as_the_web(lab, "head", "-c", "16", str(OTHER.box / "volume.img"))
+    list_folder = as_the_web(lab, "ls", str(OTHER.box))
+    reachable = sudo(
+        "find", str(OTHER.box), "-mindepth", "1", "-maxdepth", "1",
+        "(", "-perm", "/o=rwx", "-o", "(", "-group", str(lab.web_gid), "-perm", "/g=rwx", ")", ")",
+        "-printf", "%f\\n",
+    ).stdout.split()  # fmt: skip
+    expected = {STATE_DB, f"{STATE_DB}-wal", f"{STATE_DB}-shm", STATE_AGENT_CA}
+    panel = web.get("/panel")
+    unreadable = ES["box.unreadable"]
+    attack.check(
+        "stopped",
+        read_box.returncode == 0
+        and read_box.stdout.startswith("SQLite format 3")
+        and read_key.returncode != 0
+        and "Permission denied" in read_key.stderr
+        and read_image.returncode != 0
+        and "Permission denied" in read_image.stderr
+        and list_folder.returncode != 0
+        and "Permission denied" in list_folder.stderr
+        and set(reachable) <= expected
+        and panel.status_code == 200
+        and f'id="card-{MAIN.slug}"' in panel.text
+        and f'id="card-{SLUG}"' in panel.text
+        and "Revisor" in panel.text
+        and unreadable not in clean(panel.text),
+        f"la caja con el grupo de la web: {read_box.returncode}; la clave: {read_key.stderr!r}; la "
+        f"imagen: {read_image.stderr!r}; la carpeta: {list_folder.stderr!r}; lo que deja entrar a "
+        f"ese grupo: {sorted(reachable)}; el Panel, {panel.status_code}, con las dos tarjetas de "
+        "la lista del servicio",
+    )
+
+
+@scenario("web-rebobinar-al-vecino")
+def test_the_web_rewinds_the_second_agent_and_only_it(attack: Attack, lab: Lab, web: Web) -> None:
+    """The criterion of T26-2d. The confirmation says which agent, a form for that one acts on no
+    other, and the rewind reaches that agent: its files go back, its box says the web asked, and
+    the other one is left as it was."""
+    tag = secrets.token_hex(4)
+    kept, gone, untouched = f"vuelve-{tag}", f"se-va-{tag}", f"sigue-{tag}"
+    before = set(lab.snapshots(OTHER))
+    assert lab.in_agent(OTHER, f"echo x > {CONTAINER_WORK}/{kept}").returncode == 0
+    wait(
+        lambda: bool(set(lab.snapshots(OTHER)) - before),
+        SEEN_TIMEOUT,
+        "a snapshot with the file",
+        lab.diagnosis,
+    )
+    target = sorted(set(lab.snapshots(OTHER)) - before)[-1]
+    script = f"rm {CONTAINER_WORK}/{kept}; echo x > {CONTAINER_WORK}/{gone}"
+    assert lab.in_agent(OTHER, script).returncode == 0
+    assert lab.in_agent(MAIN, f"echo x > {CONTAINER_WORK}/{untouched}").returncode == 0
+    main_rewinds = len(lab.events(MAIN, "rewind_requested"))
+    main_started = lab_started(MAIN)
+    other_rewinds = len(lab.events(OTHER, "rewind_requested"))
+    path = f"/agentes/{SLUG}/instantaneas/rebobinar?id={target}"
+    confirmation = web.get(path)
+    fields = form_in(confirmation.text)
+    # Each of these would rewind somebody if the form, and not the ticket, decided.
+    to_the_main = web.post(
+        "/instantaneas/rebobinar", {k: v for k, v in fields.items() if k != "agente"}
+    )
+    fields = form_in(web.get(path).text)
+    invented = web.post("/instantaneas/rebobinar", {**fields, "agente": "nadie"})
+    a_path = web.post("/instantaneas/rebobinar", {**fields, "agente": "../revisor"})
+    no_session = web.post("/instantaneas/rebobinar", fields, signed_in=False)
+    asked_before = len(lab.events(OTHER, "rewind_requested"))
+    done = web.post("/instantaneas/rebobinar", fields)
+    wait(lambda: lab.running(OTHER), SEEN_TIMEOUT, "the neighbour back", lab.diagnosis)
+    seen = lab.in_agent(
+        OTHER, f"ls {CONTAINER_WORK}/{kept}; ls {CONTAINER_WORK}/{gone} 2>&1 || true"
+    )
+    main_seen = lab.in_agent(MAIN, f"ls {CONTAINER_WORK}/{untouched}")
+    requested = lab.events(OTHER, "rewind_requested")[-1]
+    attack.check(
+        "stopped",
+        "Para el agente Revisor" in clean(confirmation.text)
+        and to_the_main.status_code == 400
+        and ES["rewind.err.expired"][:30] in clean(to_the_main.text)
+        and invented.status_code == 404
+        and a_path.status_code == 404
+        and no_session.status_code == 401
+        and asked_before == other_rewinds
+        and 'data-outcome="done"' in done.text
+        and len(lab.events(MAIN, "rewind_requested")) == main_rewinds
+        and lab_started(MAIN) == main_started
+        and main_seen.returncode == 0,
+        f"la misma forma hacia el principal: {to_the_main.status_code}; inventado y una ruta: "
+        f"{invented.status_code}, {a_path.status_code}; sin sesión: {no_session.status_code}; "
+        f"con su nombre: {done.status_code}; rebobinados de más antes de la buena: "
+        f"{asked_before - other_rewinds}; el "
+        f"principal: {main_seen.stdout!r}",
+    )
+    attack.check(
+        "recorded",
+        target in json.dumps(requested)
+        and "web (uid" in json.dumps(requested)
+        and lab.verify(OTHER)["ok"],
+        f"snapshot/rewind_requested en la caja del vecino, con «web», y su cadena verifica: "
+        f"{requested['details']}",
+    )
+    attack.check(
+        "recoverable",
+        kept in seen.stdout and "No such file" in seen.stdout,
+        f"el archivo vuelve y el nuevo se va: {seen.stdout!r}",
+    )
+
+
+def lab_started(agent: Agent) -> str:
+    return sh(
+        "docker", "inspect", "--format", "{{.State.StartedAt}}", agent.container
+    ).stdout.strip()  # fmt: skip
+
+
+@scenario("web-aprobar-sin-sesion-ni-agente")
+def test_the_web_decides_on_each_gate_with_a_session_and_a_real_name(
+    attack: Attack, lab: Lab, web: Web
+) -> None:
+    """A real hold of the neighbour. Without a session, nothing, and the same answer whether the
+    agent exists or not. With one, a name that is nobody's is a page of "nothing here", not a 500,
+    and a ticket for this agent does nothing on the other. With its name, it ends."""
+    hold = _hold(attack, lab, OTHER, "web")
+    path = f"/agentes/{SLUG}/peticiones/decidir?id={hold}&v=rechazar"
+    panel = web.get("/panel").text
+    known_anon = web.get(path, signed_in=False)
+    invented_anon = web.get(f"/agentes/nadie/peticiones/decidir?id={hold}&v=rechazar",
+                            signed_in=False)  # fmt: skip
+    page = web.get(path)
+    fields = form_in(page.text)
+    no_session = web.post("/peticiones/decidir", fields, signed_in=False)
+    invented_page = web.get(f"/agentes/nadie/peticiones/decidir?id={hold}&v=rechazar")
+    invented_form = web.post("/peticiones/decidir", {**fields, "agente": "nadie"})
+    on_the_main = web.post(
+        "/peticiones/decidir", {k: v for k, v in fields.items() if k != "agente"}
+    )
+    still_held = not said_in(lab.events(OTHER, "rejected"), hold)
+    fields = form_in(web.get(path).text)
+    done = web.post("/peticiones/decidir", fields)
+    rejected = said_in(lab.events(OTHER, "rejected"), hold)
+    attack.check(
+        "stopped",
+        f"/agentes/{SLUG}/peticiones/decidir?id={hold}" in panel
+        and known_anon.status_code == invented_anon.status_code == 401
+        and no_session.status_code == 401
+        and invented_page.status_code == 404
+        and invented_form.status_code == 404
+        and on_the_main.status_code == 400
+        and still_held
+        and "Para el agente Revisor" in clean(page.text),
+        f"sin sesión: {known_anon.status_code}, {invented_anon.status_code}, "
+        f"{no_session.status_code}; inventado: {invented_page.status_code}, "
+        f"{invented_form.status_code}; el billete en el principal: {on_the_main.status_code}",
+    )
+    attack.check(
+        "recorded",
+        bool(rejected)
+        and "web (uid" in json.dumps(rejected)
+        and said_in(lab.events(MAIN), hold) == [],
+        "gate/rejected con «web» en la caja de ese agente, y nada en la del otro",
+    )
+    attack.check(
+        "held",
+        done.status_code == 200 and bool(rejected),
+        f"retenida hasta la orden con su nombre: {done.status_code}",
+    )
+
+
+@scenario("web-eventos-de-cada-uno")
+def test_what_one_agent_does_is_not_on_the_pages_of_the_other(
+    attack: Attack, lab: Lab, web: Web
+) -> None:
+    """The history of each one and the neighbour's live stream, with something new in both boxes
+    (the main agent's stream, on the Mac). The panel is the one place they are together."""
+    tag = secrets.token_hex(4)
+    mine, theirs = f"del-principal-{tag}", f"del-vecino-{tag}"
+    page = web.get(f"/agentes/{SLUG}/ahora").text
+    head = re.search(r"ahora/stream\?after=([0-9]+)", page)
+    assert head is not None, page[:300]
+    stream: list[str] = []
+
+    def listen() -> None:
+        stream.append(
+            web.read_stream(f"/agentes/{SLUG}/ahora/stream?after={head[1]}", theirs, SEEN_TIMEOUT)
+        )
+
+    listening = threading.Thread(target=listen)
+    listening.start()
+    time.sleep(2)  # the stream is open: both of these come after it
+    # Each in its box before the next: the stream stops at the neighbour's, so a stream that mixed
+    # them has had the other one to send by then.
+    assert lab.in_agent(MAIN, f"echo x > {CONTAINER_WORK}/{mine}").returncode == 0
+    wait(
+        lambda: bool(said_in(lab.events(MAIN, "create"), mine)),
+        SEEN_TIMEOUT,
+        "its file event",
+        lab.diagnosis,
+    )
+    assert lab.in_agent(OTHER, f"echo x > {CONTAINER_WORK}/{theirs}").returncode == 0
+    wait(
+        lambda: bool(said_in(lab.events(OTHER, "create"), theirs)),
+        SEEN_TIMEOUT,
+        "its file event",
+        lab.diagnosis,
+    )
+    listening.join(SEEN_TIMEOUT + 10)
+    live = stream[0] if stream else ""
+    main_history = web.get("/historia").text
+    other_history = web.get(f"/agentes/{SLUG}/historia").text
+    attack.check(
+        "stopped",
+        mine in main_history
+        and theirs not in main_history
+        and theirs in other_history
+        and mine not in other_history
+        and theirs in live
+        and mine not in live,
+        f"historia del principal: {mine in main_history}/{theirs in main_history}; del vecino: "
+        f"{theirs in other_history}/{mine in other_history}; directo del vecino: "
+        f"{theirs in live}/{mine in live}",
     )
 
 
