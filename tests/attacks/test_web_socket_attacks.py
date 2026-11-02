@@ -1061,8 +1061,6 @@ def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> No
     from backtide.service import passkeys as pk
     from backtide.web.security import COOKIE_NAME
 
-    web = pwd.getpwnam(layout.WEB_USER)
-    path = str(WEB_SOCKET)
     prefix = web_prefix()
     base = f"/s/{prefix}"
     host = f"{pk.RP_ID}:{pk.WEB_PORT}"
@@ -1077,16 +1075,28 @@ def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> No
         body = None
         if method == "POST":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
-            # Exactly the fields its form asks for: any other says 403 too, even with a session.
-            more = {"/llaves/registrar": "&answer=x&name=x", "/tocar/responder": "&answer=x",
-                    "/llaves/quitar": "&ticket=x&llave=x",
-                    "/llaves/nombre": "&ticket=x&llave=x&nombre=x"}  # fmt: skip
-            body = f"csrf={csrf}{more.get(where, '')}"
+            body = order_form(where, csrf)
         conn.request(method, base + where, body=body, headers=headers)
         status = conn.getresponse().status
         conn.close()
         return status
 
+    no_way_in(attack, fetch, pk.path_of(layout.STATE_DIR))
+
+
+def order_form(where: str, csrf: str) -> str:
+    """Exactly the fields its form asks for: any other says 403 too, even with a session."""
+    more = {"/llaves/registrar": "&answer=x&name=x", "/tocar/responder": "&answer=x",
+            "/llaves/quitar": "&ticket=x&llave=x",
+            "/llaves/nombre": "&ticket=x&llave=x&nombre=x"}  # fmt: skip
+    return f"csrf={csrf}{more.get(where, '')}"
+
+
+def no_way_in(attack: Attack, fetch: Callable[..., int], keys_file: Path) -> None:
+    """`entrar-sin-llave`, by whichever way ``fetch`` takes (method, path, the cookie's value,
+    CSRF; it answers the status): the tunnel's names, or the domain's through the proxy (T26-4b)."""
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
     pages = ["/", "/ahora", "/instantaneas", "/peticiones", "/ajustes", "/llaves", "/tocar"]
     orders = ["/llaves/empezar", "/llaves/registrar", "/tocar/empezar", "/tocar/responder",
               "/llaves/quitar", "/llaves/nombre", "/ajustes/cerrar-sesiones", "/salir"]  # fmt: skip
@@ -1132,7 +1142,7 @@ def test_no_way_in_without_a_session(attack: Attack, installed: Installed) -> No
             r.get("outcome") == "refused" and "sesión viva" in r.get("why", "") for r in commands
         )
         and no_keys[0].get("outcome") == "refused"
-        and not pk.path_of(layout.STATE_DIR).exists(),
+        and not keys_file.exists(),
         f"{len(pages) + len(key_pages)} páginas y {len(orders)} órdenes sin cookie, con una "
         "inventada y con una "
         f"cerrada: las que no dicen 401: {let_in or 'ninguna'}; con una sesión viva, las que no "
