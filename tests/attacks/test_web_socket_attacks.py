@@ -50,6 +50,7 @@ from backtide.service.config import STATE_SOCKET, STATE_WEB_SOCKET
 from backtide.service.control import (
     ask_secrets,
     ask_task_start,
+    ask_task_status,
     ask_task_stop,
     ask_web_end_all,
     ask_web_link,
@@ -60,6 +61,7 @@ from backtide.snapshots import Snapshot
 
 pytestmark = pytest.mark.instalada
 CHANGES_WAIT = 31  # the narrow socket's changes: 10 at once, then one every 3 s
+TASK_END_WAIT = 180  # a task of 120 s, and the 30 + 30 of its timeout's grace and of killing it
 WEB_SOCKET = layout.STATE_DIR / STATE_WEB_SOCKET
 CONTROL_SOCKET = layout.STATE_DIR / STATE_SOCKET
 
@@ -498,10 +500,13 @@ def _lab_network_cut() -> bool:
 
 @scenario("tarea-sin-sesion")
 def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Installed) -> None:
-    """T26-5a: who runs code as `backtide-web` can neither give the agent a task nor read an answer
-    without a live session. The answers are not in the black box, so they are the one read of this
-    socket that takes a session. The task whose answer it asks for is real, given by root, and the
-    control is that a live session reads that very task and gives one of its own."""
+    """T26-5a and T26-5b: who runs code as `backtide-web` can neither give the agent a task, nor
+    read an answer or the list, nor stop one without a live session. Answers and the whole of what
+    was asked are not in the black box, so those are the reads of this socket that take a session.
+    The task it asks about is real, given by root, and the control is that a live session reads
+    that very task, gives one of its own and stops it. Root's is stopped first: an agent of one
+    conversation (OpenClaw) would answer "busy" to the web's, and that end says nothing of who
+    stopped it."""
     web = pwd.getpwnam(layout.WEB_USER)
     path = str(WEB_SOCKET)
     head = installed.box.head()
@@ -525,7 +530,7 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     listing = {"cmd": "task_list", "_why": True}  # T26-5b: the chat's list, what was asked in it
     stop = {"cmd": "task_stop", "task": real_id, "_why": True}
     time.sleep(CHANGES_WAIT)
-    # 1. Without a session, with a made-up one and with one that ended; and what is not on the list.
+    # 1. Without a session, with a made-up one and with one that ended.
     bare = probe(start, read, listing, stop)
     made_up = probe(
         {**start, "session": "s" * 43},
@@ -541,6 +546,12 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
         {**listing, "session": "<session>"},
         {**stop, "session": "<session>"},
     )
+    # Root's task, while all of that was refused, goes now (see the docstring).
+    ask_task_stop(CONTROL_SOCKET, real_id)
+    assert wait(
+        lambda: ask_task_status(CONTROL_SOCKET, real_id)["outcome"] != "running",
+        TASK_END_WAIT,
+    ), "root's task did not end after it was stopped"
     # 2. The control: a live session reads the same task, gives one as the web and sees the list.
     live = probe(
         {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
@@ -562,8 +573,6 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     root_socket = probe_as(
         web.pw_uid, web.pw_gid, "", str(CONTROL_SOCKET), {"cmd": "task_status", "task": real_id}
     )
-    if real_id:  # no need for it to end by itself: its end is what is looked at below
-        ask_task_stop(CONTROL_SOCKET, real_id)
 
     def refused_for(replies: list[dict], word: str) -> bool:
         """Refused for this reason: a full bucket or a wrong shape says refused too."""
@@ -602,7 +611,7 @@ def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Inst
     def ended_events() -> list[Any]:
         return [e for e in installed.box.events(since_seq=since) if e.action == "agent_task_end"]
 
-    wait(lambda: len(ended_events()) >= 2, 120, interval=2)
+    wait(lambda: len(ended_events()) >= 2, TASK_END_WAIT, interval=2)
     refused_recorded = recorded_in_time(
         installed,
         since,

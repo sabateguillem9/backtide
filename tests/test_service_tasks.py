@@ -569,6 +569,18 @@ def test_a_stop_from_the_web_is_named_in_the_end(lab: Lab) -> None:
     assert lab.ended[0]["stopped_by"] == "web (uid 5, pid 6)"
 
 
+def test_a_ctrl_c_after_the_webs_stop_does_not_take_its_name_out(lab: Lab) -> None:
+    hold = threading.Event()
+    lab.container.results = [hold, FOUND, FOUND, subprocess.CompletedProcess([], 143, "", "")]
+    task_id = lab.start()
+    assert lab.container.entered.acquire(timeout=WAIT)
+    assert lab.tasks.stop(task_id, requested_by="web (uid 5, pid 6)") is True
+    assert lab.tasks.stop(task_id) is True
+    hold.set()
+    lab.settled(task_id)
+    assert lab.ended[0]["stopped_by"] == "web (uid 5, pid 6)"
+
+
 def test_stopping_from_the_cli_adds_nothing_to_the_end(lab: Lab) -> None:
     hold = threading.Event()
     lab.container.results = [hold, FOUND, subprocess.CompletedProcess([], 143, "", "")]

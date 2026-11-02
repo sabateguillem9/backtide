@@ -248,7 +248,7 @@ class AgentTasks:
             if task.claimed:
                 return True
             task.stop_asked = True
-            task.stopped_by = requested_by
+            task.stopped_by = requested_by or task.stopped_by  # a Ctrl-C after it names nobody
             target = task.target
         if target is None:  # not at the container yet: its thread sees ``stop_asked``
             return True
