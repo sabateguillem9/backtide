@@ -69,6 +69,7 @@ def unit_values() -> dict[str, str]:
         "STATE_DIR": str(layout.STATE_DIR),
         "VOLUME_IMAGE": str(layout.VOLUME_IMAGE),
         "VOLUME_MOUNT": str(layout.VOLUME_MOUNT),
+        "AGENT_VOLUMES": str(layout.AGENT_VOLUMES),
         "EXPORT_DIR": str(layout.EXPORT_DIR),
         "EXPORT_DIR_ENV": EXPORT_DIR_ENV,
         "PROXY_CHANNEL_DIR": str(layout.PROXY_CHANNEL_DIR),

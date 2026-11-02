@@ -398,6 +398,8 @@ class ServiceConfig:
     slug: str = identity.MAIN_SLUG
     number: int = 0
     display_name: str | None = None  # what the founder calls it: never a path nor a Docker name
+    # What of the other agents this one must never see (T26-2b, backtide.service.agents).
+    neighbours: tuple[Protected, ...] = ()
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("volume", self.volume)):
@@ -817,7 +819,7 @@ class ServiceConfig:
         ]
         if self.volume_image is not None:
             protected.append(Protected("the volume's image", self.volume_image))
-        return tuple(protected)
+        return (*protected, *self.neighbours)
 
     def model_providers(self) -> Providers:
         """The providers as the proxy gets them through the channel (docs/21, section 6): host,
@@ -975,7 +977,11 @@ class ServiceConfig:
         jail = self.sensor_jail_config()
         return ReaderConfig(
             events_dir=jail.events_dir,
-            cursor_file=jail.cursor_file,
+            # One Tetragon and one file for every agent, read by one reader per agent (T26-2b):
+            # how far each has read is its own.
+            cursor_file=jail.cursor_file
+            if self.is_main
+            else self.agent_dir / jail.cursor_file.name,
             agent_name=self.jail_config().name,
             sensor_name=jail.name,
             **limits,

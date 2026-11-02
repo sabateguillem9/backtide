@@ -703,3 +703,139 @@ def test_an_empty_export_folder_goes_with_the_rest(machine: Machine) -> None:
     assert machine.paths.export_dir.is_dir()
     assert remover(machine).uninstall()
     assert not machine.paths.export_dir.exists()
+
+
+# --- the other agents (T26-2b; docs/47, section 6.8) --------------------------------------------
+
+
+def with_an_agent(machine: Machine, slug: str = "revisor") -> Path:
+    """What an agent other than the main one leaves on a machine, none of it in the manifest."""
+    p = machine.paths
+    volume = p.agent_volumes / slug
+    volume.mkdir(parents=True)
+    home = p.state_dir / "agents" / slug
+    home.mkdir(parents=True)
+    (home / "blackbox.db").write_text("its chain")
+    (home / "volume.img").write_text("its work")
+    (home / "proxy-channel").mkdir()
+    folder = p.config_dir / "agents"
+    folder.mkdir(exist_ok=True)
+    (folder / f"{slug}.toml").write_text(
+        f'number = 1\nvolume = "{volume}"\nvolume_image = "{home / "volume.img"}"\n'
+        'max_volume_bytes = 1000000\n[agent]\nprofile = "claude-code"\n'
+    )
+    for name, role in (
+        (f"backtide-{slug}-agente", "agent"),
+        (f"backtide-{slug}-egress", "proxy"),
+    ):
+        machine.containers[name] = {"backtide.role": role}
+    machine.extra_mounts += [volume, home / "proxy-channel"]
+    return home
+
+
+def test_the_other_agents_containers_networks_and_mounts_go(machine: Machine) -> None:
+    home = with_an_agent(machine)
+    machine.networks["backtide-revisor-net"] = "172.29.1.0/24"
+    machine.networks["backtide-revisor-salida"] = "172.29.2.0/24"
+    machine.network_labels["backtide-revisor-net"] = {"backtide.role": "agent-network"}
+    machine.network_labels["backtide-revisor-salida"] = {"backtide.role": "egress"}
+    machine.calls.clear()
+    prompter = Answering()
+    assert remover(machine, prompter).uninstall()
+    assert machine.containers == {}
+    assert machine.networks == {}
+    assert machine.extra_mounts == []
+    calls = machine.calls
+    assert ("docker", "stop", "--time", "30", docker_id("backtide-revisor-agente")) in calls
+    channel = str(home / "proxy-channel")
+    volume = str(machine.paths.agent_volumes / "revisor")
+    assert calls.index(("umount", channel)) < calls.index(("umount", volume))
+    assert not machine.paths.agent_volumes.exists()
+    assert "revisor" in said(prompter)
+
+
+def test_their_data_stays_unless_asked_and_their_file_beside_it(machine: Machine) -> None:
+    home = with_an_agent(machine)
+    source = machine.paths.config_dir / "agents" / "revisor.toml"
+    text = source.read_text()
+    assert remover(machine).uninstall()
+    assert (home / "blackbox.db").read_text() == "its chain"
+    assert (home / "volume.img").read_text() == "its work"
+    assert (home / "agent-file.toml").read_text() == text
+    assert oct(os.lstat(home / "agent-file.toml").st_mode & 0o777) == "0o600"
+    assert not machine.paths.config_dir.exists()
+
+
+def test_erasing_takes_the_other_agents_data_too(machine: Machine) -> None:
+    home = with_an_agent(machine)
+    prompter = Answering(interactive=True, typed=HOST)
+    assert remover(machine, prompter, erase_data=True, yes=False).uninstall()
+    assert not home.exists() and not machine.paths.state_dir.exists()
+    assert not machine.paths.config_dir.exists()
+    assert machine.extra_mounts == []
+
+
+def test_a_busy_volume_of_another_agent_stops_the_uninstall_and_says_why(machine: Machine) -> None:
+    with_an_agent(machine)
+    volume = machine.paths.agent_volumes / "revisor"
+    machine.fail[("umount", str(volume))] = 1
+    with pytest.raises(UninstallError, match="algo lo está usando"):
+        remover(machine).uninstall()
+    assert machine.paths.opt_dir.exists()
+    assert remover(machine).uninstall()
+    assert machine.extra_mounts == []
+
+
+def test_a_container_named_like_an_agent_without_its_label_stays(machine: Machine) -> None:
+    with_an_agent(machine)
+    machine.containers["backtide-revisor-agente"] = {}
+    prompter = Answering()
+    remover(machine, prompter).uninstall()
+    assert "backtide-revisor-agente" in machine.containers
+    assert "backtide-revisor-agente" in said(prompter)
+
+
+def test_a_file_that_is_not_an_agent_is_the_persons(machine: Machine) -> None:
+    folder = machine.paths.config_dir / "agents"
+    folder.mkdir()
+    (folder / "notas.txt").write_text("mine")
+    (folder / "Mal Nombre.toml").write_text("mine too")
+    (folder / "principal.toml").write_text("not an agent: reserved")
+    prompter = Answering()
+    remover(machine, prompter).uninstall()
+    assert sorted(p.name for p in folder.iterdir()) == [
+        "Mal Nombre.toml",
+        "notas.txt",
+        "principal.toml",
+    ]
+    assert not any(c[:2] == ("docker", "stop") and "notas" in str(c) for c in machine.calls)
+
+
+def test_a_file_that_cannot_be_read_still_names_its_containers(machine: Machine) -> None:
+    with_an_agent(machine)
+    source = machine.paths.config_dir / "agents" / "revisor.toml"
+    source.write_text("this is not = = toml")
+    machine.extra_mounts.clear()
+    assert remover(machine).uninstall()
+    assert "backtide-revisor-agente" not in machine.containers
+
+
+def test_a_volume_outside_our_folders_is_unmounted_and_never_removed(
+    machine: Machine, tmp_path: Path
+) -> None:
+    elsewhere = tmp_path / "their-disk"
+    elsewhere.mkdir()
+    (elsewhere / "work").write_text("theirs")
+    home = with_an_agent(machine)
+    source = machine.paths.config_dir / "agents" / "revisor.toml"
+    source.write_text(f'number = 1\nvolume = "{elsewhere}"\n[agent]\nprofile = "claude-code"\n')
+    machine.extra_mounts = [elsewhere, home / "proxy-channel"]
+    assert remover(machine).uninstall()
+    assert machine.extra_mounts == []
+    assert (elsewhere / "work").read_text() == "theirs"
+
+
+def test_with_no_other_agents_no_umount_is_run(machine: Machine) -> None:
+    machine.calls.clear()
+    remover(machine).uninstall()
+    assert not any(c[0] == "umount" for c in machine.calls)

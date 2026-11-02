@@ -33,6 +33,8 @@ Other guides: [command-line reference](cli-reference.md), [getting started](gett
 
 Also in the state folder: `backtide.lock`, `control.sock` (the [control socket](cli-reference.md#four-ideas-used-on-this-page)), `rewind.pending`, `proxy-ca/`, `agent-ca/`, `proxy-channel/`, `sensor/` and the agent's config folder (`<state_dir>/<profile name>`). They are backtide's own; do not edit them.
 
+Other agents have the same files in `<state_dir>/agents/<slug>/` (see [Several agents](#several-agents)).
+
 **The agent's container never sees the state folder** (apart from its own config folder and the proxy's CA certificate). That is a core guarantee: the config cannot be made to mount it, and the service refuses to start if the paths overlap.
 
 ### File rules (backtide checks them)
@@ -146,6 +148,26 @@ kind = "anthropic"
 local = "http://host.lima.internal:11434"
 models = ["qwen3-coder"]
 ```
+
+## Several agents
+
+One service can run several agents at once. This is early: nothing creates them for you yet, the CLI, the web and the Telegram bot still act on the main agent only, and there is no spending cap across agents.
+
+An installation with no `/etc/backtide/agents/` folder has one agent, `principal`, and behaves as it always did. Each other agent is a file, `/etc/backtide/agents/<slug>.toml`, where the slug is lowercase letters, digits and `-`:
+
+```toml
+number = 1                                   # 1-99: gives its ids, 61100 + n and 61200 + n
+name = "Reviewer"                            # optional: what to call it
+volume = "/var/lib/backtide-agents/reviewer" # its own Btrfs volume, with simple quotas
+workspace_limit = 1073741824                 # in bytes
+
+[agent]
+profile = "claude-code"
+```
+
+Before the service starts, its volume has to be mounted and its proxy's folder, `<state_dir>/agents/<slug>/proxy-channel`, has to hold the same kind of tmpfs the main agent's has: the hardened service cannot do either of those so that Docker sees them. A file that cannot be used stops the service from starting, and says why: a volume shared with another agent or leading to the state folder through a link, or an id that belongs to an account of the machine. An agent that cannot start once the service runs is written to the installation's black box and alerted, and the others go on.
+
+Each agent has its own container, proxy, networks, volume, black box and fake key. None of them can see another's: the service kills a container that mounts a neighbour's folder. `backtide desinstalar` stops and removes them with the rest, unmounts them, and keeps their data unless you say `--borrar-datos`.
 
 Claude Code and local-model support exist in the code and have tests and attack scenarios in the VM. They have had less hands-on use than the OpenClaw path.
 

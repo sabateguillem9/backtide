@@ -25,6 +25,7 @@ from backtide.sensors.tetragon import ReaderConfig, TetragonReader
 from backtide.service.process_sensor import (
     ProcessSensor,
     SensorHooks,
+    SensorShare,
     SensorState,
     SnapshotBefore,
     recorded_keys,
@@ -1182,3 +1183,188 @@ def test_the_streak_limit_is_a_setting(tmp_path: Path) -> None:
     world.reader.unseen_streak = lambda: 120.0  # type: ignore[method-assign]
     world.beat(1)
     assert world.reasons == ["sensor_novelty_streak"]
+
+
+# --- several agents, one Tetragon (T26-2b; docs/47, section 6.6) ------
+
+
+def two_on_one_container(tmp_path: Path, *, required: bool = False) -> tuple[World, World]:
+    """Two agents' sensors, each with its reader and cursor, over the same fake container."""
+    first = make_world(tmp_path / "a", required=required)
+    share = SensorShare()
+    second = make_world(tmp_path / "b", required=required)
+    second.jail = first.jail
+    second.agent.sensor = first.jail
+    second.agent.id = "b" * 64
+    second.reader = TetragonReader(
+        ReaderConfig(
+            events_dir=first.jail.config.events_dir, cursor_file=tmp_path / "b" / "cursor"
+        ),
+        second.box,
+        clock=first.clock,
+        wall=lambda: WALL,
+        sleep=first.clock.sleep,
+    )
+    second.clock = first.clock
+    second.log = first.log
+    first.sensor = ProcessSensor(
+        first.jail,  # type: ignore[arg-type]
+        first.reader,
+        first.agent,  # type: ignore[arg-type]
+        required=required,
+        clock=first.clock,
+        sleep=first.clock.sleep,
+        thread=False,
+        share=share,
+    )
+    second.sensor = ProcessSensor(
+        first.jail,  # type: ignore[arg-type]
+        second.reader,
+        second.agent,  # type: ignore[arg-type]
+        required=required,
+        clock=first.clock,
+        sleep=first.clock.sleep,
+        thread=False,
+        share=share,
+    )
+    return first, second
+
+
+def test_two_agents_make_one_container_and_the_last_one_removes_it(tmp_path: Path) -> None:
+    one, two = two_on_one_container(tmp_path)
+    assert one.start() and two.start()
+    assert one.log.count("sensor.create") == 1
+    assert two.box.of("sensor_start")[0].details["reused"] is True
+    one.sensor.stop()
+    assert "sensor.stop" not in one.log and "sensor.remove" not in one.log
+    assert one.jail.running  # the other agent still needs it
+    assert one.sensor.state is SensorState.OFF
+    two.sensor.stop()
+    assert one.log[-2:] == ["sensor.stop", "sensor.remove"]
+
+
+def test_each_reader_keeps_only_its_own_agents_lines(tmp_path: Path) -> None:
+    """The defence behind `eventos-del-vecino`: the same file, and an event in one box."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    one.sensor.follow_agent()
+    two.sensor.follow_agent()
+    one.jail.write_exec("in-a", docker=one.agent.id)
+    one.jail.write_exec("in-b", docker=two.agent.id)
+    one.reader.poll()
+    two.reader.poll()
+    assert [e.details["argv"] for e in one.box.of("exec")] == ["in-a"]
+    assert [e.details["argv"] for e in two.box.of("exec")] == ["in-b"]
+    one.sensor.stop()
+    two.sensor.stop()
+
+
+def test_one_agents_failed_heartbeats_never_take_tetragon_from_the_other(tmp_path: Path) -> None:
+    """A hostile agent that makes its own probes fail would otherwise restart the one Tetragon,
+    three times an hour, and blind its neighbour for up to 40 s each time."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    one.sensor.agent_started()
+    two.sensor.agent_started()
+    created = one.log.count("sensor.create")
+    stops = one.log.count("sensor.stop")
+    one.agent.id = "c" * 64  # its probes come from a container its reader does not follow
+    one.sensor._state = SensorState.DOWN  # noqa: SLF001 - three missed beats, already proven above
+    one.sensor.tick()
+    (restart,) = one.box.of("sensor_restart")
+    assert restart.details["attempt"] == 1
+    assert one.log.count("sensor.create") == created and one.log.count("sensor.stop") == stops
+    assert one.jail.running and two.sensor.state is SensorState.UP
+
+
+def test_a_tetragon_that_hangs_is_replaced_once_nobody_sees_through_it(tmp_path: Path) -> None:
+    """It runs and answers, and exports nothing: with both down it is everyone's, and it goes."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    created, stops = one.log.count("sensor.create"), one.log.count("sensor.stop")
+    one.sensor._state = two.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.sensor.tick()
+    assert one.log.count("sensor.stop") == stops + 1
+    assert one.log.count("sensor.create") == created + 1
+    assert one.sensor.state is SensorState.UP
+
+
+def test_a_tetragon_slow_to_serve_is_not_taken_from_the_other_agent(tmp_path: Path) -> None:
+    """A flood can keep `tetra status` from answering in time: that one agent gives up, not the
+    container the other one sees through."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    removes = one.log.count("sensor.remove")
+    one.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.jail.serves = False
+    one.sensor.tick()
+    assert one.log.count("sensor.remove") == removes
+    assert one.jail.running and one.sensor.state is SensorState.DOWN
+    assert two.sensor.state is SensorState.UP
+    assert one.box.of("sensor_failed")[-1].details["stage"] == "ready"
+
+
+def test_a_slow_tetragon_with_nobody_else_on_it_still_goes(tmp_path: Path) -> None:
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    two.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.jail.serves = False
+    one.sensor.tick()
+    assert "sensor.remove" in one.log
+
+
+def test_a_running_sensor_that_looks_wrong_is_not_replaced_under_the_other_agent(
+    tmp_path: Path,
+) -> None:
+    """A passing error of Docker in the check would otherwise take it from a neighbour that sees."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    removes = one.log.count("sensor.remove")
+    one.sensor._state = SensorState.DOWN  # noqa: SLF001
+    one.jail.start_error = JailError("docker did not answer")
+    one.sensor.tick()
+    assert one.log.count("sensor.remove") == removes
+    assert one.sensor.state is SensorState.DOWN and two.sensor.state is SensorState.UP
+
+
+def test_tetragon_is_replaced_when_nobody_sees_through_it(tmp_path: Path) -> None:
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    created = one.log.count("sensor.create")
+    one.jail.die()
+    one.sensor.tick()  # the container stopped: down at once, and it is everyone's problem
+    two.sensor.tick()
+    assert one.log.count("sensor.create") >= created + 1
+    assert one.jail.running
+    assert one.sensor.state is SensorState.UP and two.sensor.state is SensorState.UP
+
+
+def test_tetragons_losses_are_told_to_every_agent(tmp_path: Path) -> None:
+    """Its buffer is everyone's: a flood in one loses events of all (docs/47, section 6.6)."""
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.start()
+    one.sensor.agent_started()
+    two.sensor.agent_started()
+    one.jail.lose("kernel", 7)
+    one.beat()
+    two.sensor.tick()
+    assert [e.details["kind"] for e in one.box.of("sensor_gap")] == ["kernel_lost"]
+    assert [e.details["kind"] for e in two.box.of("sensor_gap")] == ["kernel_lost"]
+
+
+def test_a_sensor_that_never_started_leaves_the_others_alone(tmp_path: Path) -> None:
+    one, two = two_on_one_container(tmp_path)
+    one.start()
+    two.sensor.stop()  # its Guardian fell before starting the sensor
+    assert one.jail.running and "sensor.remove" not in one.log
+    one.sensor.stop()
+    assert "sensor.remove" in one.log

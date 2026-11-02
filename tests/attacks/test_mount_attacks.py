@@ -18,6 +18,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 from attack_kit import Attack, scenario
 from risk_kit import summary
@@ -121,6 +122,22 @@ def test_mounting_what_the_agent_must_not_see(
         lambda: _recreate(service, network="bridge"),
         "the Guardian to kill the agent recreated on the bridge network",
     )
+    # T26-2a: the folders of the other agents and the installation's own box are inside the state
+    # folder, so its label would refuse them anyway: what is asked for here is their own label.
+    for folder in (service.config.installation_dir, service.config.agents_dir / "revisor"):
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    inside_state = {
+        label: _tamper(
+            service,
+            lambda folder=folder: _recreate_showing(service, folder),
+            f"the Guardian to kill the agent that shows {folder}",
+        )
+        for label, folder in (
+            ("holds the installation's black box", service.config.installation_dir),
+            ("holds the agents' folders", service.config.agents_dir),
+            ("is inside the agents' folders", service.config.agents_dir / "revisor"),
+        )
+    }
     # 5. The same container, altered: Docker would start it again on its own.
     updated = _tamper(
         service,
@@ -130,6 +147,10 @@ def test_mounting_what_the_agent_must_not_see(
     time.sleep(5)  # a restart policy that took would show by now
     came_back = service.jail.is_running()
     assert service.stop() == 0
+    labelled = all(
+        event is not None and any(label in p for p in event.details["problems"])
+        for label, event in inside_state.items()
+    )
     bridged_problems = bridged.details["problems"] if bridged else []
     updated_problems = updated.details["problems"] if updated else []
     attack.check(
@@ -140,8 +161,11 @@ def test_mounting_what_the_agent_must_not_see(
         and any("networks are 'bridge'" in p for p in bridged_problems)
         and updated is not None
         and any("RestartPolicy.Name is 'always'" in p for p in updated_problems)
-        and not came_back,
-        "con los mismos montajes: recreado en la red `bridge` de Docker (salida directa sin "
+        and not came_back
+        and labelled,
+        "con un `-v` de la caja de la instalación o de las carpetas de los demás agentes, muere "
+        "y dice cuál de las dos enseñaba. Con los mismos montajes: recreado en la red `bridge` de "
+        "Docker (salida directa sin "
         "proxy, invariante 3), el Guardian lo mata porque ya no es el contenedor que arrancó y "
         "no está solo en su red; alterado con `docker update --restart always`, lo mata porque "
         "ya no es la jaula, y Docker no lo vuelve a arrancar. Problemas: "
@@ -162,6 +186,16 @@ def _recreate(service: Service, *, network: str) -> None:
     jail_docker.run(["rm", "--force", name])
     argv = docker_create_argv(service.jail.config)
     argv[argv.index("--network") + 1] = network
+    jail_docker.run(argv, env=create_env(service.jail.config))
+    jail_docker.run(["start", name])
+
+
+def _recreate_showing(service: Service, folder: Path) -> None:
+    """The agent's container made again by hand, with one more ``-v`` of ``folder``."""
+    name = service.jail.config.name
+    jail_docker.run(["rm", "--force", name])
+    argv = docker_create_argv(service.jail.config)
+    argv[1:1] = ["--volume", f"{folder}:/mnt/ajeno"]
     jail_docker.run(argv, env=create_env(service.jail.config))
     jail_docker.run(["start", name])
 

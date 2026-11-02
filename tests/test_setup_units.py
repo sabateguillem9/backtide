@@ -74,7 +74,9 @@ SERVICE = {
     "NoNewPrivileges": ["yes"],
     "ProtectSystem": ["strict"],
     # The export folder with "-": a service whose folder is missing still starts (S1).
-    "ReadWritePaths": [f"{layout.STATE_DIR} {layout.VOLUME_MOUNT} -{layout.EXPORT_DIR}"],
+    "ReadWritePaths": [
+        f"{layout.STATE_DIR} {layout.VOLUME_MOUNT} -{layout.AGENT_VOLUMES} -{layout.EXPORT_DIR}"
+    ],
     "Environment": [f"BACKTIDE_EXPORT_DIR={layout.EXPORT_DIR}"],
     "ProtectHome": ["yes"],
     "PrivateTmp": ["yes"],

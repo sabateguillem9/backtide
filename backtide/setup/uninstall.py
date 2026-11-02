@@ -30,6 +30,12 @@ half way (a busy mount, a network someone else is using) is run again and goes o
 6. ``docker``: with --quitar-docker only.
 7. ``config``, ``exports``, ``program``, ``accounts``: ``/etc/backtide``, the export folder (only
    when empty: the copies are the owner's), the command, ``backtide-web``.
+
+The other agents (T26-2b; docs/47, section 6.8) are not in the manifest: they are the files of
+``/etc/backtide/agents/``, whose names say their containers and networks. They are stopped and
+removed with the main one, by label like everything else, and their mounts go (``umount``: nothing
+else is needed to take them away). Their black boxes and volumes are data: they stay with the rest
+of the state unless ``--borrar-datos``. Without it, each agent's file is kept beside its box.
 8. ``data``: with --borrar-datos, ``/var/lib/backtide``; without it, the manifest is kept with
    what is left, for the next install.
 9. ``opt``: ``/opt/backtide``, the program itself, last (this program runs from it: everything
@@ -41,18 +47,23 @@ import os
 import shutil
 import stat
 import time
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from backtide.jail import identity
 from backtide.jail.docker import sanitize
 from backtide.service.config import (
+    AGENTS_FOLDER,
+    MAX_CONFIG_BYTES,
     STATE_CHECKPOINT,
     STATE_DB,
     STATE_INSTALLATION,
     STATE_KEY,
     STATE_KEYS,
+    STATE_PROXY_CHANNEL,
     ConfigError,
     ServiceConfig,
 )
@@ -72,6 +83,28 @@ DOCKER_UNITS = ("docker.service", "docker.socket", "containerd.service")
 DEFAULT_CONTAINERS = {"backtide-agente": "agent", "backtide-egress": "proxy",
                       "backtide-sensor": "sensor"}  # fmt: skip
 DOCKER_EXTRAS = ("docker-buildx-plugin", "docker-compose-plugin", "docker-ce-rootless-extras")
+
+
+_AGENT_FILE_SUFFIX = ".toml"
+SAVED_AGENT_FILE = "agent-file.toml"  # beside its black box, once the machine's copy is gone
+
+
+@dataclass(frozen=True)
+class _OtherAgent:
+    """An agent other than the main one, as its file says (T26-2b)."""
+
+    slug: str
+    volume: Path | None
+    image: Path | None
+
+
+def _path_in(settings: dict[str, object], key: str) -> Path | None:
+    """An absolute, plain path of an agent's file, or None: what is not one is not looked at."""
+    value = settings.get(key)
+    if not isinstance(value, str) or not value.startswith("/") or "\0" in value:
+        return None
+    path = Path(value)
+    return path if os.path.normpath(value) == value else None
 
 
 class UninstallError(Exception):
@@ -144,6 +177,7 @@ class Uninstaller:
             ("Contenedores de backtide", self.containers),
             ("Redes de Docker", self.networks),
             ("Imágenes", self.images),
+            ("Volúmenes de los demás agentes", self.other_volumes),
             ("Volumen del agente", self.volume),
             ("Ajustes de Docker", self.docker_settings),
             ("Docker", self.docker),
@@ -168,6 +202,12 @@ class Uninstaller:
             lines.append(f"las unidades de systemd: {', '.join(m.created['units'])}")
         if m.facts.get("containers"):
             lines.append(f"los contenedores: {', '.join(m.facts['containers'])}")
+        others = self._other_agents()
+        if others:
+            lines.append(
+                f"los demás agentes: {', '.join(a.slug for a in others)} (sus contenedores, sus "
+                "redes y sus montajes; sus cajas negras y sus volúmenes son datos)"
+            )
         if m.created["networks"]:
             lines.append(f"las redes de Docker: {', '.join(m.created['networks'])}")
         if m.created["images"]:
@@ -230,8 +270,8 @@ class Uninstaller:
         agent's container, should it still run; then the web."""
         if layout.SERVICE_UNIT in self.manifest.created["units"]:
             self._systemctl("stop", layout.SERVICE_UNIT)
-        agent = next((n for n, r in self._expected_containers().items() if r == "agent"), None)
-        if agent and self._docker():
+        agents = [n for n, r in self._expected_containers().items() if r == "agent"]
+        for agent in agents if self._docker() else []:
             found, object_id = self._inspect("container", agent, "agent")
             if found is Found.OURS:
                 self._check(("docker", "stop", "--time", "30", object_id),
@@ -300,6 +340,14 @@ class Uninstaller:
         self._save()
 
     def _expected_containers(self) -> dict[str, str]:
+        """What the service makes: the main agent's and those of the agents in the files of
+        ``agents/``, which the manifest does not know."""
+        expected = self._expected_main_containers()
+        for agent in self._other_agents():
+            expected |= containers.containers_of_agent(agent.slug)
+        return expected
+
+    def _expected_main_containers(self) -> dict[str, str]:
         """What the manifest says the service makes; for a manifest from before it said so (an
         install older than T13-4), the names this version's service would use."""
         recorded = self.manifest.facts.get("containers")
@@ -314,9 +362,13 @@ class Uninstaller:
 
     def networks(self) -> None:
         names = list(self.manifest.created["networks"])
+        roles = dict(self.manifest.facts.get("network_roles") or {})
+        for agent in self._other_agents():
+            found = containers.networks_of_agent(agent.slug)
+            names += list(found)
+            roles |= found
         if not names:
             return
-        roles = self.manifest.facts.get("network_roles") or {}
         docker = self._docker()
         for name in names:
             found = Found.ABSENT
@@ -336,7 +388,8 @@ class Uninstaller:
                     )
                     continue
                 self._did(f"red {name}")
-            self.manifest.remove("networks", name)
+            if self.manifest.has("networks", name):
+                self.manifest.remove("networks", name)
             self.manifest.facts.get("subnets", {}).pop(name, None)
             self._save()
 
@@ -365,6 +418,29 @@ class Uninstaller:
                 self._did(f"imagen {images.by_digest(ref)}")
             self.manifest.remove("images", ref)
             self._save()
+
+    def other_volumes(self) -> None:
+        """What the other agents have mounted goes, and their empty mount points. Never a file: an
+        agent's image is its work, and it goes with the state or not at all."""
+        for agent in self._other_agents():
+            for point in self._mounts_of(agent):
+                if self._mounted(point):
+                    ran = self.run(("umount", str(point)))
+                    if ran is None or ran.returncode != 0:
+                        raise UninstallError(
+                            f"{point} sigue montado: algo lo está usando. Mira `findmnt {point}` y "
+                            "`fuser -vm` sobre él, ciérralo y vuelve a ejecutar la desinstalación."
+                        )
+                    self._did(f"montaje {point}")
+            if agent.image is not None:
+                self._detach_loops(agent.image)
+            volume = agent.volume
+            if volume is not None and self._inside(volume, self.paths.agent_volumes):
+                if os.path.lexists(volume) and self._rmdir(volume):
+                    self._did(f"carpeta {volume}")
+        folder = self.paths.agent_volumes
+        if os.path.lexists(folder) and not self._listdir(folder) and self._rmdir(folder):
+            self._did(f"carpeta {folder}")
 
     def volume(self) -> None:
         mount, image = self.paths.volume_mount, self.paths.volume_image
@@ -494,6 +570,8 @@ class Uninstaller:
         folder = self.paths.config_dir
         if not self.options.erase_data and self.manifest.has("files", self.paths.config_file):
             self._keep_config()
+        if not self.options.erase_data:
+            self._keep_agent_files()
         if self.options.erase_data and self.manifest.has("dirs", folder):
             if self._rmtree(folder):
                 self._did(f"carpeta {folder}")
@@ -729,6 +807,7 @@ class Uninstaller:
         if self.options.erase_data:
             trees.append(p.state_dir)
         expected = {str(p.volume_mount), str(p.channel_dir)}
+        expected |= {str(m) for agent in self._other_agents() for m in self._mounts_of(agent)}
         found = [m for m in self._mount_points() if m not in expected
                  and any(self._inside(m, tree) for tree in trees)]  # fmt: skip
         if found:
@@ -848,6 +927,70 @@ class Uninstaller:
                     os.fchown(fd, self.owner[0], self.owner[1])
             finally:
                 os.close(fd)
+
+    def _other_agents(self) -> list[_OtherAgent]:
+        """The agents of ``agents/``. A file that says nothing usable still names an agent: its
+        containers and networks are found by its slug, and only its mounts need the file."""
+        folder = self.paths.config_dir / AGENTS_FOLDER
+        found = []
+        for name in self._listdir(folder):
+            slug = name.removesuffix(_AGENT_FILE_SUFFIX)
+            if name == slug or not identity.SLUG.fullmatch(slug) or slug in identity.RESERVED_SLUGS:
+                continue
+            settings = self._agent_settings(folder / name)
+            found.append(
+                _OtherAgent(slug, _path_in(settings, "volume"), _path_in(settings, "volume_image"))
+            )
+        return found
+
+    def _agent_settings(self, path: Path) -> dict[str, object]:
+        fd = self._open_file(path)
+        if fd is None:
+            return {}
+        try:
+            data = os.read(fd, MAX_CONFIG_BYTES)
+        finally:
+            os.close(fd)
+        try:
+            return tomllib.loads(data.decode())
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return {}
+
+    def _mounts_of(self, agent: _OtherAgent) -> list[Path]:
+        """Its proxy's tmpfs first: nothing of the agent is left using the volume then."""
+        channel = self.paths.state_dir / AGENTS_FOLDER / agent.slug / STATE_PROXY_CHANNEL
+        return [channel, *([] if agent.volume is None else [agent.volume])]
+
+    def _keep_agent_files(self) -> None:
+        """Each agent's file goes beside its black box, for whoever comes back to it. Nothing reads
+        it there. The other files of the folder are the person's: they stay."""
+        folder = self.paths.config_dir / AGENTS_FOLDER
+        for agent in self._other_agents():
+            source = folder / f"{agent.slug}{_AGENT_FILE_SUFFIX}"
+            fd = self._open_file(source)
+            if fd is None:
+                continue
+            try:
+                data = os.read(fd, MAX_CONFIG_BYTES)
+            finally:
+                os.close(fd)
+            home = self.paths.state_dir / AGENTS_FOLDER / agent.slug
+            home.mkdir(mode=0o700, parents=True, exist_ok=True)
+            target = home / SAVED_AGENT_FILE
+            temp = target.with_name(f".{target.name}.tmp")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+            out = os.open(temp, flags, 0o600)
+            try:
+                os.fchmod(out, 0o600)
+                os.write(out, data)
+                os.fsync(out)
+            finally:
+                os.close(out)
+            os.replace(temp, target)
+            if self._unlink(source):
+                self._did(str(source))
+        if os.path.lexists(folder) and not self._listdir(folder) and self._rmdir(folder):
+            self._did(f"carpeta {folder}")
 
     def _keep_config(self) -> None:
         """Copy backtide.toml (no secret in it) to the kept state, for the next install."""
@@ -974,7 +1117,7 @@ class Uninstaller:
         if not path.is_absolute() or os.path.normpath(text) != text:
             return False
         p = self.paths
-        trees = (p.opt_dir, p.config_dir, p.state_dir, p.volume_mount)
+        trees = (p.opt_dir, p.config_dir, p.state_dir, p.volume_mount, p.agent_volumes)
         exact = {p.bin_link, p.apt_keyring, p.apt_source, p.dnf_repo, p.rpm_key, p.daemon_json,
                  p.export_dir,  # the folder only, emptied by nobody but the owner
                  *(p.unit_dir / name for name in self._unit_names)}  # fmt: skip

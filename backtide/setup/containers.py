@@ -12,6 +12,7 @@ import re
 from collections.abc import Collection
 from enum import Enum
 
+from backtide.jail import identity
 from backtide.jail.config import AGENT_LABEL, AGENT_NETWORK_LABEL, ROLE_LABEL
 from backtide.jail.docker import sanitize
 from backtide.jail.proxy_config import EGRESS_LABEL, PROXY_LABEL
@@ -54,6 +55,22 @@ def expected_networks(config: ServiceConfig) -> dict[str, str]:
     return {
         config.jail_config().network: role(AGENT_NETWORK_LABEL),
         config.proxy_jail_config().network: role(EGRESS_LABEL),
+    }
+
+
+def containers_of_agent(slug: str) -> dict[str, str]:
+    """What the service makes for the agent ``slug``, other than the main one (T26-2b): its names
+    are decided by its slug alone, so no file of it has to be read or trusted to find them."""
+    return {
+        identity.agent_container(slug): role(AGENT_LABEL),
+        identity.proxy_container(slug): role(PROXY_LABEL),
+    }
+
+
+def networks_of_agent(slug: str) -> dict[str, str]:
+    return {
+        identity.agent_network(slug): role(AGENT_NETWORK_LABEL),
+        identity.egress_network(slug): role(EGRESS_LABEL),
     }
 
 
