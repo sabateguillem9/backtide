@@ -399,7 +399,7 @@ The service reads it when it starts (`sudo systemctl restart backtide`); a resta
 
 ### `[web] public_origin`: the web on a domain
 
-By default you reach the web through an SSH tunnel or a private network, and that is what we recommend. If you want it on a domain, put a reverse proxy of your own in front of it, with HTTPS, on a **subdomain of its own**. Under a path of another site it would share that site's origin, so a flaw there would reach your session: backtide refuses a path.
+By default you reach the web through an SSH tunnel or a private network, and that is what we recommend. If you want it on a domain, put a [reverse proxy](reverse-proxy.md) of your own in front of it, with HTTPS, on a **subdomain of its own**. Under a path of another site it would share that site's origin, so a flaw there would reach your session: backtide refuses a path.
 
 The web still listens only on `127.0.0.1` and `[::1]`, and your proxy is what reaches it. Put the same line in both `/etc/backtide/backtide.toml` and `/etc/backtide/web.toml` (the web cannot read the first; installing again copies it to the second):
 
@@ -416,13 +416,7 @@ Then `sudo systemctl restart backtide backtide-web`. Anything other than `https`
 - **Until there is a key**, a session can register one and look, but not change what outlasts it (provider keys, Telegram, "approve and trust").
 - The web lives at the root of the domain, and its cookie is `__Host-backtide_web`.
 
-**What your proxy has to do:**
-
-- Pass `Host` as the browser sent it (Caddy does by default; in nginx, `proxy_set_header Host $host;`). Otherwise every request gets a 400.
-- Answer only for this name, and redirect port 80 to HTTPS with HSTS.
-- Cap requests per address on `/entrar/llave/`. backtide's own caps are for the whole web, because it does not believe `X-Forwarded-For`: anyone can empty them with a stream of requests, and for that while **you cannot sign in with your key from the internet** (SSH and Telegram still work).
-- Set timeouts and buffer request bodies, so that slow connections do not hold the web's 64 slots.
-- Not log the query string of `/`: the one-time link's token travels in it.
+**Your proxy has things to do too**: pass `Host` as the browser sent it, answer only for this name, HTTPS with HSTS, cap requests per address on `/entrar/llave/`, timeouts, and no query strings in its logs. Without that cap, anyone with a `curl` can keep you from signing in with your key for as long as they keep at it. [The web behind a reverse proxy](reverse-proxy.md) has a file for nginx that does all of it, what happens without each part, and the way back.
 
 An answer of 503 from the web means it could not check a session just then (too many requests); it does not mean you are signed out.
 

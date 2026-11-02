@@ -24,6 +24,7 @@ It is **pre-alpha**. Read the [README](../../README.md) first for what works tod
 
 - [Command line reference](cli-reference.md): every `backtide` command and the useful `make` targets.
 - [Configuration](configuration.md): settings, the web's Settings page, the spend cap, allowed hosts and the gate.
+- [The web behind a reverse proxy](reverse-proxy.md): the web on a domain of your own, with an example for nginx, what the proxy has to do and what backtide does by itself.
 - [Contributing](../../CONTRIBUTING.md) and [Security policy](../../SECURITY.md).
 
 ## A note on languages

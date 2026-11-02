@@ -2289,3 +2289,63 @@ recorded = "yes"
 risk = "n/a"
 recoverable = "n/a"
 held = "n/a"
+
+[[scenario]]
+id = "web-tras-el-proxy"
+name = "Tras un nginx de verdad solo entra su nombre, y ningún token se queda en sus registros"
+story = """T26-4b: el archivo de ejemplo tal cual, en un nginx de un contenedor de la VM, con HTTPS de una CA de pruebas y `public_origin` en la instalación de verdad. Sin esa CA, con otro nombre en el saludo TLS o sin nombre no hay conexión. El puerto 80 lleva a https sin repetir nada de la petición. Otro `Host`, en la cabecera o en la línea de la petición, se queda sin respuesta; lo que nginx deja pasar con otro puerto lo rechaza la web por su motivo. El camino entero, por HTTPS: el enlace de root, la primera llave, salir, una firma de otro sitio que no entra y la buena que sí; un `Origin` ajeno se rechaza por su motivo y HSTS va en cada respuesta, también en los rechazos. La página en directo sigue llegando. Como control, 70 conexiones quietas a la web sin proxy la dejan sin sitio; por nginx, 100 peticiones a medias no se notan, y a los 10 s nginx corta el cuerpo y la cabecera a medias. Un cuerpo enorme es un 413. Con la web en marcha y con ella parada, el token del enlace y `?t=` no aparecen en ningún registro (aunque vengan en el `Referer`), y esas mismas peticiones sí están, sin su consulta. Desde la cárcel, el agente no llega a los puertos 80 y 443 de la VM, ni directo ni por su proxy. Es el mismo archivo que copia quien lo instale."""
+inspired_by = "Un dominio público: un internet entero al otro lado del proxy, y un proxy que lo apunta todo"
+invariants = [2, 5, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "entrar-sin-llave-por-el-proxy"
+name = "Sin una sesión, por el dominio y a través de nginx, la web no enseña ni cambia nada"
+story = """T26-4b: lo mismo que `entrar-sin-llave`, página por página y orden por orden, por https y a través de nginx: sin cookie, con una inventada y con la de una sesión que ya se cerró, todas contestan 401; con una sesión viva, las mismas peticiones sí llegan. Por el socket estrecho, las órdenes de las llaves sin sesión se rechazan, sin llaves no hay reto que firmar y no aparece ninguna llave."""
+inspired_by = "Abrir la web desde internet sin haber entrado, o con una cookie vieja"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "cookies-inventadas-por-el-proxy"
+name = "Una avalancha de cookies inventadas por el dominio no echa al dueño"
+story = """T26-4b: la avalancha de `cookies-inventadas`, por https y a través de nginx. Desde muchas direcciones, para que el tope de nginx por dirección no la pare, llega a los cubos del servicio: ellas reciben 401 o 503 (el del tope, con su `Retry-After: 5` y la página de entrar) y el dueño, a la vez, entra al menos 57 de 60 veces y nunca ve un 401. Como control, una inventada sola, con el cubo ya lleno, sí es un 401. Desde una sola dirección, 600 seguidas: nginx para las que pasan de su tope con un 429, y el dueño sigue dentro."""
+inspired_by = "Echar al dueño de su propia web sin saber ninguna clave, desde internet"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "tope-por-direccion"
+name = "Una sola dirección no deja al dueño sin entrar; muchas sí, y entonces queda SSH"
+story = """T26-4b: los cubos de entrar con llave son de toda la web, porque backtide no cree `X-Forwarded-For`. Como control, sin nada delante, 40 peticiones como las de un `curl` los agotan y el dueño se queda fuera, que es lo que avisa la guía. A través de nginx, desde una dirección, 200 peticiones a los dos pasos de entrar: se quedan casi todas en un 429 (con HSTS) y al servicio llegan como mucho 10, y el dueño, desde otra dirección, firma y entra; esa dirección sigue topada. Desde 40 direcciones el tope no basta, y es el límite que la guía dice: el cubo se agota y el dueño se queda fuera, `backtide llaves` por SSH sigue funcionando y, cuando paran, el dueño vuelve a entrar solo."""
+inspired_by = "Dejar al dueño fuera de su propia web con un `curl`"
+invariants = [2, 7]
+status = "ready"
+profiles = ["openclaw", "claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
