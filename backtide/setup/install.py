@@ -179,6 +179,7 @@ class Paths:
     volume_image: Path = layout.VOLUME_IMAGE
     volume_mount: Path = layout.VOLUME_MOUNT
     agent_volumes: Path = layout.AGENT_VOLUMES
+    agent_configs: Path = layout.AGENT_CONFIGS
     export_dir: Path = layout.EXPORT_DIR
     channel_dir: Path = layout.PROXY_CHANNEL_DIR
     manifest: Path = layout.MANIFEST
@@ -439,6 +440,12 @@ class Installer:
             self.manifest.add("dirs", self.paths.config_dir)
         if self._ensure_dir(self.paths.export_dir, 0o700, self.owner):
             self.manifest.add("dirs", self.paths.export_dir)
+        # What the service writes when it creates an agent (T26-6a): the unit can only let it in
+        # if they are there when it starts. The volumes' folder is closed as the main volume's is.
+        for folder, mode in ((self.paths.agent_configs, DIR_MODE_CONFIG),
+                             (self.paths.agent_volumes, 0o755)):  # fmt: skip
+            if self._ensure_dir(folder, mode, (root_uid, root_gid)):
+                self.manifest.add("dirs", folder)
 
     def tools(self) -> None:
         missing = packages.missing_tools(self.host)

@@ -151,15 +151,15 @@ models = ["qwen3-coder"]
 
 ## Several agents
 
-One service can run several agents at once. This is early: nothing creates them for you yet, and the web and the Telegram bot still act on the main agent only. The CLI reaches any of them with `--agente` ([CLI reference](cli-reference.md)).
+One service can run several agents at once. This is early: the web and the Telegram bot still act on the main agent only. [`backtide agentes crear`](cli-reference.md#backtide-agentes) makes one for you, and the CLI reaches any of them with `--agente` ([CLI reference](cli-reference.md)).
 
-An installation with no `/etc/backtide/agents/` folder has one agent, `principal`, and behaves as it always did. Each other agent is a file, `/etc/backtide/agents/<slug>.toml`, where the slug is lowercase letters, digits and `-`:
+An installation with no file in `/etc/backtide/agents/` has one agent, `principal`, and behaves as it always did. Each other agent is a file, `/etc/backtide/agents/<slug>.toml`, which `backtide agentes crear` writes for you or you write by hand with `sudo`, where the slug is lowercase letters, digits and `-`:
 
 ```toml
 number = 1                                   # 1-99: gives its ids, 61100 + n and 61200 + n
 name = "Reviewer"                            # optional: what to call it
 volume = "/var/lib/backtide-agents/reviewer" # its own Btrfs volume, with simple quotas
-workspace_limit = 1073741824                 # in bytes
+workspace_limit = 1073741824                 # in bytes: required
 
 [agent]
 profile = "claude-code"
@@ -169,7 +169,7 @@ daily_usd = 1
 monthly_usd = 10
 ```
 
-Before the service starts, its volume has to be mounted and its proxy's folder, `<state_dir>/agents/<slug>/proxy-channel`, has to hold the same kind of tmpfs the main agent's has: the hardened service cannot do either of those so that Docker sees them. A file that cannot be used stops the service from starting, and says why: a volume shared with another agent or leading to the state folder through a link, or an id that belongs to an account of the machine. An agent that cannot start once the service runs is written to the installation's black box and alerted, and the others go on.
+Its volume is a Btrfs in a file, by default `<state_dir>/agents/<slug>/volume.img`, or the one `volume_image` says. When an agent is about to start, also after a reboot, the installed service mounts it and its proxy's tmpfs through `systemd-mount` if they are not there, and refuses to run the agent unless `volume` is the mount point of that very file. On a machine whose own disk is Btrfs a plain folder would work with no quota at all, which is why `workspace_limit` is required here and optional for the main agent. A file that cannot be used stops the service from starting, and says why: no cap, a volume shared with another agent or leading to the state folder through a link, or an id that belongs to an account of the machine. An agent that cannot start once the service runs is written to the installation's black box and alerted, and the others go on.
 
 Each agent has its own container, proxy, networks, volume, black box and fake key. None of them can see another's: the service kills a container that mounts a neighbour's folder. `backtide desinstalar` stops and removes them with the rest, unmounts them, and keeps their data unless you say `--borrar-datos`.
 

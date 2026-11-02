@@ -495,6 +495,9 @@ def test_a_clean_fedora_ends_installed_and_tested(machine: Machine, key_file: Pa
     # The layout and its permissions (docs/25, section 3; D25)
     assert mode(paths.state_dir) == 0o710
     assert mode(paths.keys_dir) == 0o700
+    # What the service writes when it creates an agent: the unit only lets it in if they are there.
+    assert mode(paths.agent_configs) == 0o755
+    assert mode(paths.agent_volumes) == 0o755
     assert mode(paths.config_file) == 0o600
     assert mode(paths.web_config_file) == 0o640
     assert mode(paths.gateway_token) == 0o600

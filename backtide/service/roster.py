@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 
 RETIRE_WAIT = 90.0  # a rewind takes seconds; this only keeps a stuck order from holding the stop
 NOBODY = "Ese agente no existe en esta instalación: no se ha hecho nada."
+STOPPED_BY_OWNER = "stopped_by_owner"  # in the list, for an agent the owner stopped (T26-6a)
 _MAIN = object()
+
+
+class OrderInvalid(Exception):  # noqa: N818 - reads better than OrderInvalidError
+    """An order about the agents outside its closed shape (T26-6a): nothing was touched. The
+    message is the reply's text, and never repeats what the order said."""
 
 
 class AgentRefused(Exception):  # noqa: N818 - reads better than AgentRefusedError
@@ -56,12 +62,40 @@ class Desk:
 class Roster:
     """Every agent of the installation, by slug: the main one always, the others while watched."""
 
-    def __init__(self, main: Desk, others: Sequence[tuple[str, str | None]] = ()) -> None:
+    def __init__(
+        self,
+        main: Desk,
+        others: Sequence[tuple[str, str | None]] = (),
+        stopped: Sequence[str] = (),
+    ) -> None:
         self._main = main
         self._named = {main.slug: main.name, **dict(others)}
+        self._stopped = set(stopped)  # by the owner: not a failure, and it stays so (T26-6a)
         self._desks: dict[str, Desk] = {}
         self._busy: dict[str, int] = {}
         self._changed = threading.Condition()
+
+    def add(self, slug: str, name: str | None) -> None:
+        """A new agent of this installation (T26-6a): it exists, and it is not watched yet."""
+        with self._changed:
+            self._named[slug] = name
+
+    def knows(self, slug: object) -> bool:
+        """Whether ``slug`` names an agent of this installation. A lookup: never the disk."""
+        with self._changed:
+            return isinstance(slug, str) and slug in self._named
+
+    def watched(self, slug: str) -> bool:
+        with self._changed:
+            return slug in self._desks
+
+    def mark_stopped(self, slug: str, *, stopped: bool) -> None:
+        """Stopped by the owner, or not any more: what the list says of one that is not watched."""
+        with self._changed:
+            if stopped:
+                self._stopped.add(slug)
+            else:
+                self._stopped.discard(slug)
 
     def publish(self, desk: Desk) -> None:
         """This agent is up: orders about it reach it from now on."""
@@ -85,16 +119,18 @@ class Roster:
         with self._changed:
             desks = {self._main.slug: self._main, **self._desks}
             named = dict(self._named)
+            stopped = set(self._stopped)
         found = []
         for slug, name in named.items():
             desk = desks.get(slug)
+            state = STOPPED_BY_OWNER if slug in stopped else None
             found.append(
                 {
                     "slug": slug,
                     "name": name,
                     "main": slug == self._main.slug,
                     "watched": desk is not None,
-                    "state": None if desk is None else _state_of(desk),
+                    "state": state if desk is None else _state_of(desk),
                 }
             )
         return found

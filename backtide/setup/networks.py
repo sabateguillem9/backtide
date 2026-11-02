@@ -69,6 +69,25 @@ def host_routes(run: Runner) -> list[Route]:
     return found
 
 
+def routes_from_proc(text: str) -> list[Route]:
+    """The IPv4 routes of ``/proc/net/route``, the default one left out. What the hardened service
+    reads (T26-6a): its unit has no AF_NETLINK, so ``ip route`` is not for it. The main table only:
+    a VPN in another table is what `backtide comprobar` looks for, from outside the unit."""
+    found: list[Route] = []
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            destination = ipaddress.IPv4Address(bytes.fromhex(fields[1])[::-1])
+            mask = ipaddress.IPv4Address(bytes.fromhex(fields[7])[::-1])
+        except ValueError:
+            continue
+        if int(mask) != 0:
+            found.append(Route(ipaddress.ip_network(f"{destination}/{mask}", False), fields[0]))
+    return found
+
+
 def docker_subnets(run: Runner) -> list[IPv4Network]:
     """The IPv4 subnets of every Docker network that exists."""
     listed = run(DOCKER_NETWORKS_ARGV)

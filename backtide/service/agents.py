@@ -14,7 +14,7 @@ What a file holds, and all it may hold (written by the service, T26-6a, or by ha
     volume = "/var/lib/backtide-agents/revisor"
     volume_image = "..."       # with max_volume_bytes, as in backtide.toml
     max_volume_bytes = 0
-    workspace_limit = 0
+    workspace_limit = 0        # required (T26-6a): an agent with no cap is an agent with no pause
 
     [agent]                    # as in backtide.toml, but its names, ids and folder: those are not
     profile = "claude-code"    # settings (ServiceConfig refuses them and every setting of the jail)
@@ -31,7 +31,10 @@ Everything else is the machine's, in ``backtide.toml`` (``[sensor]``, ``[gate]``
 ``[budget]``, ``[web]``, what ``[proxy]`` lets out, its limits by default) and comes along. Reading
 makes the agent's folder and its fake keys, as ``from_file`` makes the main one's, and starts
 nothing. A file that cannot be used is a ConfigError, never skipped: an agent that was asked for
-and does not run is not something to find out later.
+and does not run is not something to find out later. ``workspace_limit`` is required here, unlike
+in ``backtide.toml`` (review of T26-2b): whether the volume is really mounted is checked before the
+agent runs (``backtide.service.agent_disk``), and together they are why an agent never writes on
+the machine's disk with no cap.
 
 Together, agents share nothing that would let one reach another: no container or network name, no
 uid or gid, no folder (a volume, the image behind one, a config folder) that holds another's, links
@@ -226,6 +229,11 @@ def _agent_from_file(main: ServiceConfig, path: Path, slug: str) -> ServiceConfi
         raise ConfigError(f"{path}: the setting 'number' is required")
     if "volume" not in data:
         raise ConfigError(f"{path}: the setting 'volume' is required")
+    if "workspace_limit" not in data:
+        raise ConfigError(
+            f"{path}: the setting 'workspace_limit' is required: without a cap the agent is never "
+            "paused for lack of space"
+        )
     image = data.get("volume_image")
     image = None if image is None else _as_path("volume_image", image)
     home = main.agents_dir / slug
@@ -370,14 +378,14 @@ def _check_ids_free(config: ServiceConfig) -> None:
     files if it got out, and share the kernel's limits per uid (docs/47, section 6.8). The main
     agent's are checked when installing, as they always were."""
     for number in (identity.agent_id(config.number), identity.proxy_id(config.number)):
-        if _id_taken(number):
+        if id_taken(number):
             raise ConfigError(
                 f"the agent {config.slug} would run as id {number}, which is an account or a group "
                 "of this machine: give it another number, or change that account's id"
             )
 
 
-def _id_taken(number: int) -> bool:
+def id_taken(number: int) -> bool:
     try:
         pwd.getpwuid(number)
     except KeyError:
@@ -396,15 +404,23 @@ def _told_of_neighbours(config: ServiceConfig, agents: tuple[ServiceConfig, ...]
     mount is checked against them too (a ConfigError if it would show one)."""
     neighbours: list[Protected] = []
     for other in agents:
-        if other.slug == config.slug:
-            continue
-        neighbours.append(Protected(f"the volume of the agent {other.slug}", other.volume))
-        if other.volume_image is not None:
-            neighbours.append(Protected(f"the image of the agent {other.slug}", other.volume_image))
-        neighbours.append(
-            Protected(f"the config of the agent {other.slug}", other.agent_config_dir)
-        )
+        if other.slug != config.slug:
+            neighbours += protected_of(other)
     return dataclasses.replace(config, neighbours=tuple(neighbours))
+
+
+def protected_of(other: ServiceConfig) -> list[Protected]:
+    """What of the agent ``other`` every other agent's jail must never show."""
+    found = [Protected(f"the volume of the agent {other.slug}", other.volume)]
+    if other.volume_image is not None:
+        found.append(Protected(f"the image of the agent {other.slug}", other.volume_image))
+    found.append(Protected(f"the config of the agent {other.slug}", other.agent_config_dir))
+    return found
+
+
+def image_of(config: ServiceConfig) -> Path:
+    """The file behind this agent's volume: what its file says, or the one in its folder."""
+    return config.volume_image if config.volume_image is not None else config.agent_dir / _IMAGE
 
 
 def _only_once[T](seen: dict[T, str], value: T, slug: str, what: str) -> None:

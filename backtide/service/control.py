@@ -98,9 +98,9 @@ from backtide.service.password import Checker, PasswordError
 
 if TYPE_CHECKING:
     from backtide.service.passkeys import Passkeys  # webauthn: not for every `backtide` command
-from backtide.service.pause import RESUME_EXIT_CODES, ResumeOutcome, ResumeStatus
+from backtide.service.pause import RESUME_EXIT_CODES, PauseStatus, ResumeOutcome, ResumeStatus
 from backtide.service.rewind import EXIT_CODES, RewindOutcome, RewindStatus
-from backtide.service.roster import AgentRefused, Desk, Roster
+from backtide.service.roster import AgentRefused, Desk, OrderInvalid, Roster
 from backtide.service.sessions import Sessions
 from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
@@ -224,9 +224,12 @@ AGENT_COMMANDS = frozenset(
     {
         "rewind", "resume", "decide", "holds", "trust", "untrust", "end_batch", "trusted",
         "batches", "shell", "import", "task_start", "task_status", "task_stop", "export",
-        "budget", "set_budget", "accept_prices", "snapshots",
+        "budget", "set_budget", "accept_prices", "snapshots", "agent_pause", "agent_resume",
     }
 )  # fmt: skip
+# Which agents there are (T26-6a, ``backtide.service.fleet``): the service's, on this socket only.
+FLEET_COMMANDS = frozenset({"agent_create", "agent_start", "agent_stop"})
+AGENT_ORDER_REPLY_TIMEOUT = 300.0  # an agent's start: its checks and its first snapshot
 
 
 class ControlError(Exception):
@@ -291,6 +294,17 @@ class RewindService(Protocol):
         repo: str | None = None,
         include_config: bool = False,
     ) -> ExportOutcome: ...
+
+
+class FleetOrders(Protocol):
+    """What the control socket calls for ``FLEET_COMMANDS`` (``backtide.service.fleet.Fleet``).
+    Each may raise ``OrderInvalid``, with nothing touched."""
+
+    def create(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
+
+    def start(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
+
+    def stop(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
 
 
 class SettingsService(Protocol):
@@ -388,7 +402,9 @@ class ControlServer:
         snapshots: Callable[[], Sequence[Snapshot]] | None = None,
         roster: Roster | None = None,
         whole_budget: WholeBudget | None = None,
+        fleet: FleetOrders | None = None,
     ) -> None:
+        self._fleet = fleet
         if sessions is not None and on_entry is None:
             # Never a way into the web that leaves no trace (review of T26-3a).
             raise ControlError("las sesiones de la web necesitan dónde apuntar cada entrada")
@@ -602,13 +618,66 @@ class ControlServer:
             return self._task_stop(guardian, request, pid, uid)
         if command == "snapshots":
             return self._snapshots(desk, request)
+        if command in ("agent_pause", "agent_resume"):
+            return self._pause_or_resume(command, guardian, request, pid, uid, named=named)
         return self._export(guardian, request, pid, uid)
+
+    def _pause_or_resume(
+        self,
+        command: str,
+        guardian: RewindService,
+        request: dict[str, Any],
+        pid: int,
+        uid: int,
+        *,
+        named: bool,
+    ) -> dict[str, Any]:
+        """Freezing a whole agent says which, always: a slip must not freeze the main one."""
+        if not named or set(request) != {"cmd"}:
+            raise _BadRequest("Esa orden lleva `cmd` y `agent`, y nada más.")
+        if command == "agent_resume":
+            return self._resume(guardian, request, pid, uid)
+        outcome = guardian.pause_by_user(requested_by=f"cli (uid {uid}, pid {pid})")
+        return {
+            "ok": outcome.status in (PauseStatus.FROZEN, PauseStatus.STOPPED, PauseStatus.KILLED),
+            "outcome": str(outcome.status),
+            "message": redact(outcome.message),
+            "agent_state": outcome.agent_state,
+        }
+
+    def _fleet_order(
+        self, command: str, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
+        """Which agents there are. Nothing here is a path or an image: see ``fleet``."""
+        if self._fleet is None:
+            logger.warning("%s: refused %s: it takes no such order", self.label, command)
+            raise _BadRequest("Este servicio no atiende esa orden.")
+        order = {
+            "agent_create": self._fleet.create,
+            "agent_start": self._fleet.start,
+            "agent_stop": self._fleet.stop,
+        }[command]
+        try:
+            return order(request, f"cli (uid {uid}, pid {pid})")
+        except OrderInvalid as bad:
+            logger.warning("%s: refused %s outside its shape", self.label, command)
+            return {"ok": False, "outcome": "invalid", "message": str(bad)}
+        except Exception:  # said, with its trace in the log: the box says how far it got
+            logger.exception("%s failed", command)
+            return {
+                "ok": False,
+                "outcome": "failed",
+                "message": "Ha fallado algo inesperado: mira la caja de la instalación y el "
+                "registro del servicio antes de repetirlo.",
+            }
 
     def _machine_command(
         self, command: object, request: dict[str, Any], pid: int, uid: int
     ) -> dict[str, Any]:
         if command == "agents":
             return self._agents(request)
+        if command in FLEET_COMMANDS:
+            return self._fleet_order(str(command), request, pid, uid)
         if command in ("secrets", "set_secret", "clear_secret"):
             return self._settings_command(request, pid, uid)
         if command == "web_link":
@@ -2312,6 +2381,43 @@ def _listed_reply(raw: bytes, key: str) -> dict[str, Any]:
     if not isinstance(reply.get(key), list):
         raise ControlError("La respuesta del servicio no es la esperada.")
     return reply
+
+
+def ask_agent_order(
+    path: Path,
+    request: dict[str, Any],
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> dict[str, Any]:
+    """An order about which agents there are, or freezing one (T26-6a). Its ``ok``, ``outcome`` and
+    ``message``. ControlOutcomeUnknown if the reply makes no sense: it may have been done."""
+    raw = _ask(
+        Path(path),
+        request,
+        what="la orden",
+        wait=wait,
+        reply_timeout=AGENT_ORDER_REPLY_TIMEOUT,
+        peer=peer,
+        server_uid=server_uid,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("outcome"), str)
+        or not isinstance(reply.get("message"), str)
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. No se sabe si se ha hecho: mira la caja "
+            "de la instalación."
+        )
+    return {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
 
 
 def ask_agents(

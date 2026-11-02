@@ -18,6 +18,8 @@ from backtide.blackbox import BlackBox, BlackBoxError, Problem, VerifyReport, lo
 from backtide.jail import ExposedJail, JailError, identity
 from backtide.jail.profile import ProfileError
 from backtide.jail.profiles import DEFAULT_PROFILE
+from backtide.service.agentes import listing as agent_listing
+from backtide.service.agentes import order as agent_order
 from backtide.service.agents import check_alone, load_agent, load_installation
 from backtide.service.config import ConfigError, ServiceConfig
 from backtide.service.control import (
@@ -33,6 +35,7 @@ from backtide.service.control import (
     ask_web_end_all,
     ask_web_link,
 )
+from backtide.service.fleet import CPUS, MEMORIES, PROFILES, PROXY_MEMORIES, VOLUME_SIZES_GIB
 from backtide.service.gasto import caps as spending_caps
 from backtide.service.gasto import spending
 from backtide.service.guardian import BOOT_STOP_FAILED_NOTE
@@ -160,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_check(commands)
     _add_web(commands)
     _add_shell(commands)
+    _add_agents(commands)
     return parser
 
 
@@ -366,6 +370,87 @@ def _export(args: argparse.Namespace) -> int:
     return shell_cli.exportar(
         config, args.destination, git=args.git, include_config=args.incluir_config
     )
+
+
+def _add_agents(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """`backtide agentes`: create, start, stop and freeze the agents (T26-6a; docs/47, section 8).
+    Each choice is what the service takes, and it checks them again."""
+    agents = commands.add_parser(
+        "agentes", help="crear, arrancar, parar y pausar agentes, a través del servicio"
+    )
+    orders = agents.add_subparsers(dest="agent_order", required=True)
+    create = orders.add_parser("crear", help="crear un agente nuevo y arrancarlo")
+    create.add_argument("slug", type=_agent_name, help="su nombre corto, para siempre")
+    create.add_argument("--perfil", required=True, choices=PROFILES, help="qué agente es")
+    create.add_argument(
+        "--volumen", required=True, type=int, choices=VOLUME_SIZES_GIB,
+        help="tamaño de su volumen, en GiB",
+    )  # fmt: skip
+    create.add_argument(
+        "--tope-espacio", type=int, metavar="MIB",
+        help="su tope de espacio, en MiB (por defecto, el 5 %% del volumen)",
+    )  # fmt: skip
+    create.add_argument("--nombre", help="el nombre que se ve")
+    create.add_argument("--memoria", choices=MEMORIES, help="su límite de memoria")
+    create.add_argument("--cpus", type=int, choices=CPUS, help="sus CPU")
+    create.add_argument("--memoria-proxy", choices=PROXY_MEMORIES, help="la memoria de su proxy")
+    create.add_argument("--dia", metavar="USD", help="su tope de gasto al día")
+    create.add_argument("--mes", metavar="USD", help="su tope de gasto al mes")
+    create.add_argument(
+        "--reiniciar", action="store_true",
+        help="aceptar que el servicio se reinicie: hace falta para el primero tras el principal",
+    )  # fmt: skip
+    _add_config(create)
+    create.set_defaults(handler=_agents_create)
+    for name, cmd, text in (
+        ("parar", "agent_stop", "parar un agente: no arranca hasta `arrancar`"),
+        ("arrancar", "agent_start", "arrancar un agente que se paró"),
+        ("pausar", "agent_pause", "congelar un agente: no hace nada hasta `seguir`"),
+        ("seguir", "agent_resume", "descongelar un agente"),
+    ):
+        command = orders.add_parser(name, help=text)
+        command.add_argument("slug", type=_agent_name, help="de qué agente")
+        _add_config(command)
+        command.set_defaults(handler=_agents_order, cmd=cmd)
+    listed = orders.add_parser("lista", help="qué agentes hay y cómo están")
+    _add_config(listed)
+    listed.set_defaults(handler=_agents_list)
+
+
+def _agents_create(args: argparse.Namespace) -> int:
+    config = _machine_config(args)
+    if config is None:
+        return EXIT_ERROR
+    request: dict[str, object] = {
+        "cmd": "agent_create", "slug": args.slug, "profile": args.perfil,
+        "volume_gib": args.volumen,
+    }  # fmt: skip
+    for key, value in (
+        ("workspace_mib", args.tope_espacio),
+        ("name", args.nombre),
+        ("memory", args.memoria),
+        ("cpus", args.cpus),
+        ("proxy_memory", args.memoria_proxy),
+        ("daily_usd", args.dia),
+        ("monthly_usd", args.mes),
+    ):
+        if value is not None:
+            request[key] = value
+    if args.reiniciar:
+        request["restart"] = True
+    return agent_order(config, request)
+
+
+def _agents_order(args: argparse.Namespace) -> int:
+    config = _machine_config(args)
+    if config is None:
+        return EXIT_ERROR
+    return agent_order(config, {"cmd": args.cmd, "agent": args.slug})
+
+
+def _agents_list(args: argparse.Namespace) -> int:
+    config = _machine_config(args)
+    return EXIT_ERROR if config is None else agent_listing(config)
 
 
 def _add_holds(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:

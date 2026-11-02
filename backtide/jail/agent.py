@@ -36,6 +36,7 @@ Design: docs/13-diseno-t03-jaula.md. Synchronous, like SnapshotStore: async call
   sanitized before it reaches a message, and never trusted to configure backtide's own probes.
 """
 
+import dataclasses
 import json
 import logging
 import os
@@ -55,6 +56,7 @@ from backtide.jail.config import (
     AGENT_DIR,
     CA_CERT_FILE,
     AgentJailConfig,
+    Protected,
     create_env,
     docker_create_argv,
     jail_env_names,
@@ -133,6 +135,12 @@ class AgentJail:
     def __init__(self, config: AgentJailConfig) -> None:
         self.config = config
         self._started: _Checked | None = None
+
+    def protect_also(self, items: tuple[Protected, ...]) -> None:
+        """A new agent of the machine (T26-6a): from now on its paths must never be seen here
+        either. Made again, so it is refused (ValueError) if this jail already mounts one. One
+        assignment: whatever is checking the mounts sees the old list or the new one."""
+        self.config = dataclasses.replace(self.config, protected=(*self.config.protected, *items))
 
     # Setup
 

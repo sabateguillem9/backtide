@@ -100,7 +100,7 @@ from uuid import uuid4
 import backtide
 from backtide.blackbox import BlackBox, BlackBoxError, Event, redact
 from backtide.jail import AgentJail, ExposedJail, JailError
-from backtide.jail.config import AGENT_DIR
+from backtide.jail.config import AGENT_DIR, Protected
 from backtide.jail.profile import (
     CONTAINER_WORK,
     CONTAINER_WORKSPACE,
@@ -4246,6 +4246,15 @@ class Guardian:
             self._bb_streak = 0
             self._bb_failing_since = None
         return event
+
+    def protect_also(self, items: tuple[Protected, ...]) -> None:
+        """A new agent of the machine (T26-6a): its paths are now what this jail must never show.
+        Raises ValueError if this agent's own folders hold one."""
+        self._jail.protect_also(items)
+
+    def owner_order(self, action: str, details: dict[str, Any]) -> None:
+        """An order of the owner about this agent as a whole (T26-6a), in its own black box."""
+        self._record("system", action, details=dict(details), risk=1)
 
     def web_access(self, action: str, details: dict[str, Any]) -> bool:
         """A way into the web (T26-3a): ``web_link_given`` (`sudo backtide enlace`) or

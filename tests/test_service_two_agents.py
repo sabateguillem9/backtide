@@ -50,6 +50,8 @@ def _keys_read_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
     import backtide.service.config as config  # noqa: PLC0415
 
     monkeypatch.setattr(config, "KEY_SETTLE_S", 0.0)
+    # What is mounted is tests/test_service_fleet.py's, and the lab's: here nothing is.
+    monkeypatch.setattr(runner, "ensure_on_disk", lambda _: None)
 
 
 # --- what each jail is told of the others -----------------------------------------------------

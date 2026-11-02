@@ -403,6 +403,8 @@ class ServiceConfig:
     display_name: str | None = None  # what the founder calls it: never a path nor a Docker name
     # What of the other agents this one must never see (T26-2b, backtide.service.agents).
     neighbours: tuple[Protected, ...] = ()
+    # The file this was read from (T26-6a): what tells the service where the agents' files are.
+    config_file: Path | None = None
 
     def __post_init__(self) -> None:
         for label, path in (("state_dir", self.state_dir), ("volume", self.volume)):
@@ -1276,6 +1278,7 @@ class ServiceConfig:
             gateway_token=token,
             struck_token=struck,
             agent=agent,
+            config_file=Path(path),
             **optional,
         )
 

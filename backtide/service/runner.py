@@ -27,6 +27,9 @@ Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
 - With ``others`` too (T26-2c): an order on the sockets says which agent it is about
   (``backtide.service.roster``), each agent is published there once its ``Guardian`` is up and taken
   out before it stops, and ``InstallationSpend`` adds up what all of them spend.
+- ``backtide.service.fleet`` (T26-6a) creates, starts and stops the others while the service runs:
+  each has a stop of its own, its volume and channel are mounted before it is built
+  (``agent_disk``), and one the owner stopped stays stopped across a restart.
 """
 
 import dataclasses
@@ -57,6 +60,7 @@ from backtide.gate import protocol
 from backtide.gate.providers import Providers
 from backtide.gate.translate.base import MAIL_TRANSLATORS
 from backtide.jail import AgentJail, JailError, ca
+from backtide.jail.config import Protected
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
 from backtide.notify import (
@@ -73,6 +77,7 @@ from backtide.sensors.files import FileWatcher, WatcherConfig
 from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
 from backtide.service import scope
+from backtide.service.agent_disk import SYSTEMD_RUN_MARK, ensure_on_disk, is_stopped
 from backtide.service.bot import Hooks, telegram_parts
 from backtide.service.config import (
     KEY_UNUSABLE,
@@ -86,6 +91,7 @@ from backtide.service.config import (
 )
 from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
+from backtide.service.fleet import Fleet
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
 from backtide.service.holds import HoldTimings, HoldWatch
 from backtide.service.local_models import (
@@ -119,7 +125,6 @@ from backtide.snapshots.grow import NOT_CONFIGURED, GrowLimits, VolumeGrower
 
 logger = logging.getLogger(__name__)
 
-SYSTEMD_RUN_MARK = "INVOCATION_ID"  # systemd sets it for every service it runs
 NEIGHBOURS_STOP = 110.0  # under the unit's TimeoutStopSec, which ends it all at 120
 _FAILED_AGENT_CHARS = 300
 _INSTALLATION_BOX = (
@@ -567,6 +572,25 @@ def _proxy_jail(config: ServiceConfig) -> ProxyJail:
     return ProxyJail(config.proxy_jail_config())
 
 
+def stop_unwatched(config: ServiceConfig) -> bool:
+    """What Docker says runs of this agent, with no Guardian: it is stopped. True if there was
+    something to stop. Raises JailError if it keeps running."""
+    jail = AgentJail(config.jail_config())
+    proxy = ProxyJail(config.proxy_jail_config(), mount=_channel_not_mounted)
+    try:
+        found = jail.is_running()
+    except JailError:
+        found = True  # cannot tell: halt_agent confirms
+    if found:
+        error = halt_agent(jail, kill_first=True)  # unwatched: no grace period
+        if error is not None:
+            raise error
+    if proxy.is_running():  # with no channel it lets nothing out, and it is not left behind
+        found = True
+        proxy.kill()
+    return found
+
+
 def _channel_not_mounted(argv: list[str]) -> None:
     raise JailError(
         f"the channel's tmpfs has to be mounted before the service starts: {' '.join(argv)}"
@@ -950,11 +974,12 @@ class _OnTheRoster:
     """Orders about a neighbour reach it while its ``Guardian`` is up: as the main agent's socket,
     this is what ``Guardian.run`` starts once it is up and closes before it stops (T26-2c)."""
 
-    def __init__(self, roster: Roster, desk: Desk) -> None:
-        self._roster, self._desk = roster, desk
+    def __init__(self, roster: Roster, desk: Desk, up: Callable[[], None] = lambda: None) -> None:
+        self._roster, self._desk, self._up = roster, desk, up
 
     def start(self) -> None:
         self._roster.publish(self._desk)
+        self._up()
 
     def close(self) -> None:
         self._roster.retire(self._desk.slug)
@@ -976,38 +1001,166 @@ class _Neighbours:
         run: Callable[..., None] | None = None,
         roster: Roster | None = None,
         spend_total: SharedSpend | None = None,
+        prepare: Callable[[ServiceConfig], None] | None = None,
+        stop_alive: Callable[[ServiceConfig], bool] | None = None,
     ) -> None:
+        self._stop_alive = stop_alive if stop_alive is not None else stop_unwatched
         self._roster = roster
         self._spend_total = spend_total
         self._main = main
-        self._others = others
+        self._others = {config.slug: config for config in others}
         self._notifier_for = notifier_for
         self._stop = stop
         self._share = share
         self._told = told
         self._build = build if build is not None else build_guardian
         self._run_guardian = run if run is not None else run_guardian
-        self._threads: list[threading.Thread] = []
+        self._prepare = prepare if prepare is not None else ensure_on_disk
         self._lock = threading.Lock()
-        self._reloads: list[Callable[[], Applied]] = []
+        self._threads: dict[str, threading.Thread] = {}
+        self._stops: dict[str, threading.Event] = {}
+        self._settled: dict[str, threading.Event] = {}
+        self._failures: dict[str, str] = {}
+        self._reloads: dict[str, list[Callable[[], Applied]]] = {}
+        self._guardians: dict[str, Guardian] = {}
+        self._newcomers: list[tuple[str, tuple[Protected, ...]]] = []
 
     def reloads(self) -> list[Callable[[], Applied]]:
-        """Who to hand new keys to: the proxies built so far."""
+        """Who to hand new keys to: the proxies of the agents up so far."""
         with self._lock:
-            return list(self._reloads)
+            return [reload for each in self._reloads.values() for reload in each]
 
     def start(self) -> None:
-        for config in self._others:
-            thread = threading.Thread(
-                target=self._watch, args=(config,), name=f"backtide-agent-{config.slug}"
+        threading.Thread(
+            target=self._pass_on_the_stop, name="backtide-agents-stop", daemon=True
+        ).start()
+        for config in self._others.values():
+            if is_stopped(config):
+                logger.info("the agent %s stays stopped, as its owner left it", config.slug)
+                self.halt(config)  # the mark is what was asked: Docker says whether it holds
+            else:
+                self.start_one(config)
+
+    def _pass_on_the_stop(self) -> None:
+        """The service stops: so does each of them, at once with the others."""
+        self._stop.wait()
+        with self._lock:
+            stops = list(self._stops.values())
+        for stop in stops:
+            stop.set()
+
+    def add(self, config: ServiceConfig) -> None:
+        with self._lock:
+            self._others[config.slug] = config
+
+    def config_of(self, slug: str) -> ServiceConfig | None:
+        with self._lock:
+            return self._others.get(slug)
+
+    def start_one(self, config: ServiceConfig) -> None:
+        """A thread for this agent, with a stop of its own. ``wait_settled`` tells its start."""
+        thread = threading.Thread(
+            target=self._watch, args=(config,), name=f"backtide-agent-{config.slug}"
+        )
+        with self._lock:
+            self._others[config.slug] = config
+            self._failures.pop(config.slug, None)
+            self._stops[config.slug] = threading.Event()
+            self._settled[config.slug] = threading.Event()
+            self._threads[config.slug] = thread
+            if self._stop.is_set():  # the service is already going: this one goes too
+                self._stops[config.slug].set()
+        thread.start()
+
+    def halt(self, config: ServiceConfig) -> bool:
+        """Nothing of this agent runs with no Guardian: what does is stopped and told. True once
+        Docker says so. Only for an agent whose thread is not running. Never raises."""
+        slug = config.slug
+        try:
+            found = self._stop_alive(config)
+        except Exception as error:  # the worst case: it runs, unrecorded, and it is said
+            logger.exception("the agent %s runs with nobody watching it", slug)
+            text = str(redact(f"{type(error).__name__}: {error}"))[:_FAILED_AGENT_CHARS]
+            _record_in_installation(
+                self._main, self._told, "agent_stop_failed", slug,
+                {"reason": "unsupervised", "error": text}, risk=3,
+            )  # fmt: skip
+            self._told.submit(
+                Alert(
+                    AlertLevel.ERROR,
+                    f"El agente {slug} sigue en marcha sin vigilancia",
+                    f"No se ha podido parar: {text}",
+                )
             )
-            thread.start()
-            self._threads.append(thread)
+            return False
+        if found:
+            logger.error("the agent %s was running with nobody watching it: stopped", slug)
+            _record_in_installation(
+                self._main, self._told, "agent_stop", slug, {"reason": "unsupervised"}, risk=2
+            )
+            self._told.submit(
+                Alert(
+                    AlertLevel.ERROR,
+                    f"El agente {slug} corría sin vigilancia",
+                    "Lo que corría sin grabarse se ha parado. Mira su caja negra antes de "
+                    "arrancarlo.",
+                )
+            )
+        return True
+
+    def wait_settled(self, slug: str, timeout: float) -> None:
+        """Until the agent is up, or its thread ended. See ``failure_of`` and the roster."""
+        with self._lock:
+            settled = self._settled.get(slug)
+        if settled is not None:
+            settled.wait(timeout)
+
+    def is_running(self, slug: str) -> bool:
+        """Whether its thread is alive: whatever it is doing, its Guardian answers for it."""
+        with self._lock:
+            thread = self._threads.get(slug)
+        return thread is not None and thread.is_alive()
+
+    def failure_of(self, slug: str) -> str | None:
+        with self._lock:
+            return self._failures.get(slug)
+
+    def stop_one(self, slug: str, requested_by: str = "") -> None:
+        """This agent alone stops, as the service would stop it: what it holds ends, its proxy
+        goes, and Tetragon stays while others use it. Waits for it."""
+        with self._lock:
+            stop, thread, guardian = (
+                self._stops.get(slug), self._threads.get(slug), self._guardians.get(slug)
+            )  # fmt: skip
+        try:
+            if guardian is not None:
+                with scope.working_for(slug):
+                    guardian.owner_order("agent_stop_asked", {"requested_by": requested_by})
+        except Exception:  # noting it never gets in the way of stopping
+            logger.exception("the stop of the agent %s could not be noted in its box", slug)
+        finally:
+            if stop is not None:
+                stop.set()
+        if thread is not None:
+            thread.join(NEIGHBOURS_STOP)
+            if thread.is_alive():
+                logger.error("%s did not stop in %s s", thread.name, NEIGHBOURS_STOP)
+
+    def protect_also(self, slug: str, items: tuple[Protected, ...]) -> None:
+        """The agent ``slug`` is new: no jail here may show what is its. Also those that are still
+        being built, which read the installation before it existed."""
+        with self._lock:
+            self._newcomers.append((slug, items))
+            guardians = dict(self._guardians)
+        for guardian in guardians.values():
+            guardian.protect_also(items)
 
     def join(self, timeout: float = NEIGHBOURS_STOP) -> None:
         """They were told to stop (``stop``): each stops its own agent, at once with the others."""
         deadline = time.monotonic() + timeout
-        for thread in self._threads:
+        with self._lock:
+            threads = list(self._threads.values())
+        for thread in threads:
             thread.join(max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
                 logger.error("%s did not stop in %s s", thread.name, timeout)
@@ -1015,13 +1168,29 @@ class _Neighbours:
     def _watch(self, config: ServiceConfig) -> None:
         """One agent's whole watch. What goes wrong in it stays in it."""
         scope.enter(config.slug)
+        with self._lock:
+            stop, settled = self._stops[config.slug], self._settled[config.slug]
         try:
-            self._serve_one(config)
+            self._serve_one(config, stop, settled)
         except Exception as error:  # the Guardian already stopped its agent, or said it could not
             logger.exception("the agent %s is not being watched", config.slug)
+            with self._lock:
+                self._failures[config.slug] = str(redact(f"{error}"))[:_FAILED_AGENT_CHARS]
             record_agent_failed(self._main, self._told, config.slug, error)
+        finally:
+            with self._lock:
+                self._reloads.pop(config.slug, None)
+                self._guardians.pop(config.slug, None)
+            settled.set()
 
-    def _serve_one(self, config: ServiceConfig) -> None:
+    def _serve_one(
+        self, config: ServiceConfig, stop: threading.Event, settled: threading.Event
+    ) -> None:
+        try:
+            self._prepare(config)  # its volume and its channel: also after a reboot
+        except Exception:
+            self.halt(config)  # no Guardian is coming to stop what a killed service left
+            raise
         built: list[Egress] = []
         secrets = LiveScrub()
         guardian, alerts, box = self._build(
@@ -1035,13 +1204,17 @@ class _Neighbours:
             spend_total=self._spend_total,
         )
         with self._lock:
-            self._reloads.extend(key_reloader(config, egress, secrets) for egress in built)
+            self._reloads[config.slug] = [key_reloader(config, egress, secrets) for egress in built]
+            self._guardians[config.slug] = guardian
+            newcomers = [items for slug, items in self._newcomers if slug != config.slug]
+        for items in newcomers:  # read before it existed; one read after it says the same
+            missing = tuple(item for item in items if item not in config.agent_protected())
+            if missing:
+                guardian.protect_also(missing)
         control: ControlHook | None = None
         if self._roster is not None:
-            control = _OnTheRoster(self._roster, _desk_of(config, guardian, built))
-        self._run_guardian(
-            guardian, alerts, box, stop=self._stop, handle_signals=False, control=control
-        )
+            control = _OnTheRoster(self._roster, _desk_of(config, guardian, built), up=settled.set)
+        self._run_guardian(guardian, alerts, box, stop=stop, handle_signals=False, control=control)
 
 
 class _Runnable(Protocol):
@@ -1240,17 +1413,16 @@ def serve(
         roster = Roster(
             _desk_of(config, guardian, built, store),
             [(other.slug, other.display_name) for other in others],
+            [other.slug for other in others if is_stopped(other)],
         )
+
+        def record_total(
+            action: str, target: str, details: dict[str, object], **options: Any
+        ) -> bool:
+            return _record_in_installation(config, alerts, action, target, details, **options)
+
         if others:
             if spend_total is not None:
-
-                def record_total(
-                    action: str, target: str, details: dict[str, object], **options: Any
-                ) -> bool:
-                    return _record_in_installation(
-                        config, alerts, action, target, details, **options
-                    )
-
                 spend_total.bind(record=record_total, alert=alerts.submit)
             neighbours = _Neighbours(
                 config,
@@ -1263,6 +1435,27 @@ def serve(
                 spend_total=spend_total,
             )
             reload_keys = reload_everyones_keys(reload_keys, neighbours.reloads)
+        # Creating, starting and stopping the others (T26-6a): on root's socket only.
+        fleet = None
+        if config.config_file is not None:
+
+            def first_event(new: ServiceConfig, details: dict[str, Any]) -> None:
+                with open_black_box(new) as new_box:
+                    new_box.append("system", "agent_created", new.slug, details=details, risk=1)
+
+            fleet = Fleet(
+                config,
+                config.config_file,
+                roster=roster,
+                neighbours=neighbours,
+                stop=stop,
+                told=alerts,
+                record=record_total,
+                first_event=first_event,
+                protect_main=guardian.protect_also,
+                add_to_total=None if spend_total is None else spend_total.add_member,
+                whole_caps=None if spend_total is None else spend_total.caps,
+            )
         settings_service = Settings(
             config.state_dir,
             record=box.append,
@@ -1295,6 +1488,7 @@ def serve(
             passkeys=web_passkeys,
             roster=roster,
             whole_budget=spend_total,
+            fleet=fleet,
         )
         if web_group is not None:
             listing = store if store is not None else SnapshotStore(config.volume)
