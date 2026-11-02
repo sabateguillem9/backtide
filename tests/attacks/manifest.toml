@@ -3050,3 +3050,109 @@ recorded = "yes"
 risk = "n/a"
 recoverable = "n/a"
 held = "n/a"
+
+[[scenario]]
+id = "borrar-sin-esperar"
+name = "Borrar deja la caja negra entera y el volumen en la papelera"
+story = """El criterio de T26-6c. Un agente con trabajo hecho y una petición retenida se borra: se para, sin contenedores, redes \
+ni montajes, y lo retenido termina rechazado. Su caja se queda entera, verifica, termina en `agent_deleted` (con el mismo hash en \
+la caja de la instalación), es de solo lectura y el grupo de la web la lee sin poder escribir en su carpeta. Su imagen se queda. \
+Con el nombre mal escrito no se hace nada, y con una sesión viva de la web las tres órdenes se rechazan por no estar en su lista. \
+T26-6b añade solo `agent_delete`, con la llave recién tocada: este escenario cambia con él."""
+inspired_by = "Quien toma la web intenta borrar lo que le delata"
+invariants = [2, 4, 6, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "yes"
+
+[[scenario]]
+id = "recuperar-entero"
+name = "Un agente borrado se recupera entero"
+story = """El otro criterio de T26-6c. `backtide agentes recuperar` lo devuelve parado, con su archivo tal cual, y `arrancar` lo \
+arranca: su trabajo, sus instantáneas, su id, su tope y su volumen montado de su imagen. Su cadena sigue desde el hash con el que \
+terminó, y verifica entera."""
+inspired_by = "Borrar por error, o que lo borre quien no debía"
+invariants = [4, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "borrar-a-medias"
+name = "Un borrado a medias no es de nadie y se puede terminar"
+story = """Un contenedor ajeno en su red para el borrado a medias, de verdad. Queda la marca: un reinicio del servicio no lo \
+arranca y lo dice en la caja de la instalación, no se recupera ni se vacía, y al quitar el estorbo la misma orden lo termina. Su \
+caja se cierra una sola vez."""
+inspired_by = "Una máquina que muere en mitad de borrar"
+invariants = [4, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "nombre-borrado-no-vuelve"
+name = "Un nombre borrado no se hereda ni sirve de ruta"
+story = """Crear otro con su nombre se niega. `recuperar` y `vaciar` con `..`, una ruta o un campo de más son `invalid` sin tocar \
+nada. El principal no se borra. Ninguna orden llega al borrado, y un archivo escrito a mano con su nombre no se lee, se dice y no \
+se toca. Su caja sigue como estaba."""
+inspired_by = "Un agente nuevo con el nombre de uno viejo hereda su caja, sus botones y sus confianzas"
+invariants = [1, 2, 4, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "papelera-caducada"
+name = "La papelera avisa un día antes y se vacía después"
+story = """Con las fechas de su marca atrasadas, como las vería una máquina días después: al arrancar el servicio avisa primero, \
+aunque la fecha ya haya pasado, y solo se vacía un día después del aviso. `agent_purge` queda en la caja de la instalación antes \
+de hacerlo, con su motivo y el hash final. Su caja y su número se quedan. Con el reloj sin sincronizar no se hace nada: el aviso no \
+llega y el escenario falla por eso."""
+inspired_by = "Borrar datos tiene su espera, y la espera no puede saltarse un aviso"
+invariants = [4, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
+id = "vaciar-la-papelera"
+name = "Vaciar antes de tiempo, desde la terminal del servidor"
+story = """`backtide agentes vaciar` sobre el vecino montado a mano, con enlaces plantados en su carpeta de trabajo. Con el nombre \
+mal escrito no se hace. Quita el volumen y esa carpeta sin seguir ningún enlace, y deja la caja, que verifica sin nada añadido, y \
+su número. El nombre no se vuelve a usar. Sin vecinos, el servicio reinicia y el principal sigue con el total de la instalación \
+encima: quitar al último no deja al principal sin tope."""
+inspired_by = "Lo irreversible no puede depender del proceso que da la cara a internet"
+invariants = [4, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "yes"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"

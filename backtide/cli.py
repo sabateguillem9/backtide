@@ -373,10 +373,11 @@ def _export(args: argparse.Namespace) -> int:
 
 
 def _add_agents(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
-    """`backtide agentes`: create, start, stop and freeze the agents (T26-6a; docs/47, section 8).
+    """`backtide agentes`: create, start, stop, freeze and delete the agents (T26-6a and T26-6c;
+    docs/47, section 8).
     Each choice is what the service takes, and it checks them again."""
     agents = commands.add_parser(
-        "agentes", help="crear, arrancar, parar y pausar agentes, a través del servicio"
+        "agentes", help="crear, arrancar, parar, pausar y borrar agentes, a través del servicio"
     )
     orders = agents.add_subparsers(dest="agent_order", required=True)
     create = orders.add_parser("crear", help="crear un agente nuevo y arrancarlo")
@@ -412,6 +413,34 @@ def _add_agents(commands: "argparse._SubParsersAction[argparse.ArgumentParser]")
         command.add_argument("slug", type=_agent_name, help="de qué agente")
         _add_config(command)
         command.set_defaults(handler=_agents_order, cmd=cmd)
+    for name, cmd, text in (
+        (
+            "borrar",
+            "agent_delete",
+            "borrar un agente: su caja negra se queda y su volumen espera 7 días",
+        ),
+        (
+            "vaciar",
+            "agent_purge",
+            "vaciar ya la papelera de un agente borrado: no tiene vuelta atrás",
+        ),
+    ):
+        command = orders.add_parser(name, help=text)
+        command.add_argument("slug", type=_agent_name, help="de qué agente")
+        command.add_argument(
+            "--confirmar", metavar="NOMBRE",
+            help="el nombre del agente otra vez, para no tener que escribirlo cuando lo pregunte",
+        )  # fmt: skip
+        _add_config(command)
+        command.set_defaults(handler=_agents_typed, cmd=cmd)
+    recover = orders.add_parser("recuperar", help="devolver entero un agente borrado, parado")
+    recover.add_argument("slug", type=_agent_name, help="de qué agente")
+    recover.add_argument(
+        "--reiniciar", action="store_true",
+        help="aceptar que el servicio se reinicie: hace falta si es el primero tras el principal",
+    )  # fmt: skip
+    _add_config(recover)
+    recover.set_defaults(handler=_agents_recover)
     listed = orders.add_parser("lista", help="qué agentes hay y cómo están")
     _add_config(listed)
     listed.set_defaults(handler=_agents_list)
@@ -446,6 +475,33 @@ def _agents_order(args: argparse.Namespace) -> int:
     if config is None:
         return EXIT_ERROR
     return agent_order(config, {"cmd": args.cmd, "agent": args.slug})
+
+
+def _agents_typed(args: argparse.Namespace) -> int:
+    """`borrar` and `vaciar`: the service wants the name written again (docs/47, section 8.2)."""
+    config = _machine_config(args)
+    if config is None:
+        return EXIT_ERROR
+    typed = args.confirmar
+    if typed is None:
+        if not sys.stdin.isatty():
+            _error("sin una terminal hay que decirlo con --confirmar y el nombre del agente")
+            return EXIT_ERROR
+        try:
+            typed = input(f"Escribe «{args.slug}» para seguir: ").strip()
+        except EOFError:
+            typed = ""
+    return agent_order(config, {"cmd": args.cmd, "agent": args.slug, "typed": typed})
+
+
+def _agents_recover(args: argparse.Namespace) -> int:
+    config = _machine_config(args)
+    if config is None:
+        return EXIT_ERROR
+    request: dict[str, object] = {"cmd": "agent_restore", "agent": args.slug}
+    if args.reiniciar:
+        request["restart"] = True
+    return agent_order(config, request)
 
 
 def _agents_list(args: argparse.Namespace) -> int:

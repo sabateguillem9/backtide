@@ -20,7 +20,7 @@
     {% else %}
     <p class="note">{{ t('holds.batches.lede') }}</p>
     <ul class="hold-rules">
-      {% for b in batches %}
+      {% for b in batches if roster.get(b.agent) %}
       {% set whose = roster.get(b.agent) %}
       <li class="hold-rule">
         {% if roster | length > 1 %}{% include "order_for.html" %}{% endif %}
@@ -43,7 +43,7 @@
     {% else %}
     <p class="note">{{ t('holds.trusted.lede') }}</p>
     <ul class="hold-rules">
-      {% for x in trusted %}
+      {% for x in trusted if roster.get(x.agent) %}
       {% set whose = roster.get(x.agent) %}
       <li class="hold-rule">
         {% if roster | length > 1 %}{% include "order_for.html" %}{% endif %}

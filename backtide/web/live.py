@@ -114,6 +114,14 @@ class LiveAgents:
         self._last = tuple(
             source for item in listed if (source := self._source_of(item)) is not None
         )
+        self._let_go_of_others({item["slug"] for item in listed})
+
+    def _let_go_of_others(self, listed: set[str]) -> None:
+        """An agent no longer listed was deleted (T26-6c): its reader goes, or the service could
+        not take its box out of WAL, which a reader that may not write in the folder needs."""
+        for slug in [slug for slug in self._readers if slug not in listed]:
+            self._readers.pop(slug).close()
+            self._listings.pop(slug, None)
 
     def _source_of(self, item: dict[str, Any]) -> AgentSource | None:
         slug = item["slug"]

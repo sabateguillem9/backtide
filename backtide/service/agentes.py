@@ -20,6 +20,7 @@ from backtide.service.control import (
     ControlUnavailable,
     ask_agent_order,
     ask_agents,
+    ask_deleted,
 )
 from backtide.service.roster import STOPPED_BY_OWNER
 
@@ -72,6 +73,7 @@ def listing(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | N
     err = err if err is not None else sys.stderr
     try:
         agents = ask_agents(config.control_socket)
+        deleted = ask_deleted(config.control_socket)
     except ControlUnavailable:
         print(f"backtide: {NO_SERVICE}", file=err)
         return EXIT_FAILED
@@ -80,6 +82,8 @@ def listing(config: ServiceConfig, *, out: TextIO | None = None, err: TextIO | N
         return EXIT_ERROR
     for agent in agents:
         print(_line(agent), file=out)
+    for agent in deleted:
+        print(_deleted_line(agent), file=out)
     return EXIT_OK
 
 
@@ -92,6 +96,16 @@ def _line(agent: dict[str, Any]) -> str:
     else:
         state = "sin vigilar: no ha arrancado o ha fallado"
     return f"{agent['slug']}{name}: {state}"
+
+
+def _deleted_line(agent: dict[str, Any]) -> str:
+    slug = agent["slug"]
+    if agent["purged"]:
+        return f"{slug}: borrado y vaciado; queda su caja negra"
+    if agent["state"] != "retired":
+        return f"{slug}: a medio borrar; repite `backtide agentes borrar {slug}`"
+    day = _text(agent["purge_after"])[:10]
+    return f"{slug}: en la papelera hasta el {day}; `backtide agentes recuperar {slug}` lo devuelve"
 
 
 def _text(text: str) -> str:

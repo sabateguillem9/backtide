@@ -30,6 +30,9 @@ Design: docs/19-diseno-t04.md, sections "Los procesos" and 3.
 - ``backtide.service.fleet`` (T26-6a) creates, starts and stops the others while the service runs:
   each has a stop of its own, its volume and channel are mounted before it is built
   (``agent_disk``), and one the owner stopped stays stopped across a restart.
+- It deletes them too (T26-6c): a deleted agent is nobody here, its box and its volume wait in its
+  folder (``backtide.service.trash``), and its spending still counts. Deleting the last one does
+  not take the installation back to one agent's budget (``spend_total_for``).
 """
 
 import dataclasses
@@ -91,7 +94,7 @@ from backtide.service.config import (
 )
 from backtide.service.control import ControlServer
 from backtide.service.egress import Egress
-from backtide.service.fleet import Fleet
+from backtide.service.fleet import Fleet, TrashWatch
 from backtide.service.guardian import ControlHook, Guardian, SpaceGate, halt_agent
 from backtide.service.holds import HoldTimings, HoldWatch
 from backtide.service.local_models import (
@@ -115,9 +118,10 @@ from backtide.service.process_sensor import (
 from backtide.service.proxy_channel import KEY_NOT_APPLIED, Policy, known_secrets
 from backtide.service.roster import Desk, Roster
 from backtide.service.settings import Applied, ReloadFailedClosed, Settings
-from backtide.service.spend import MAX_CAP_USD, Budget, SharedSpend
+from backtide.service.spend import MAX_CAP_USD, STATE_BUDGET, Budget, SharedSpend
 from backtide.service.spend_total import InstallationSpend
 from backtide.service.telegram_config import load_telegram
+from backtide.service.trash import retired_agents
 from backtide.service.trust import TrustStore
 from backtide.service.web_control import WebControlServer
 from backtide.snapshots import SnapshotStore, utc_now
@@ -1032,17 +1036,38 @@ def _stop_unrecorded_agent(
     error.add_note("Se ha parado al agente que estaba en marcha: sin grabar no hay vigilancia.")
 
 
+def spend_total_for(
+    main: ServiceConfig, others: Sequence[ServiceConfig]
+) -> InstallationSpend | None:
+    """The total, if this installation has one: with other agents, and also if it had them and they
+    were deleted (T26-6c). Going back to one agent's way would drop the caps set for the whole
+    installation, and the main agent's ``budget.json`` says ``MAX_CAP_USD`` for what had no cap of
+    its own: with no total above it, that is 100000 $. An installation that never had another agent
+    has neither that file nor a deleted agent, and nothing changes for it."""
+    if (
+        others
+        or os.path.lexists(main.installation_dir / STATE_BUDGET)
+        or retired_agents(main.agents_dir)
+    ):
+        return build_spend_total(main, others)
+    return None
+
+
 def build_spend_total(main: ServiceConfig, others: Sequence[ServiceConfig]) -> InstallationSpend:
     """What every agent spends together (T26-2c): ``[budget]`` of ``backtide.toml`` is its cap, and
-    the caps the main agent had set, the first time. Not bound yet: its alerts are the main
-    agent's, which needs this to be built."""
+    the caps the main agent had set, the first time. A deleted agent is a member too: what it spent
+    this month was spent (T26-6c). Not bound yet: its alerts are the main agent's, which needs this
+    to be built."""
     try:
         ensure_state_folder(main.installation_dir, "the installation's black box folder")
     except ConfigError as error:  # as with its box, this stops no agent: its caps cannot change
         logger.error("the installation's folder cannot be used: %s", error)
     return InstallationSpend(
         main.budget_settings(),
-        members={config.slug: config.agent_dir for config in (main, *others)},
+        members={
+            **{slug: main.agents_dir / slug for slug in retired_agents(main.agents_dir)},
+            **{config.slug: config.agent_dir for config in (main, *others)},
+        },
         folder=main.installation_dir,
         inherit_from=main.agent_dir,
     )
@@ -1218,6 +1243,19 @@ class _Neighbours:
             )
         return True
 
+    def forget(self, slug: str) -> None:
+        """This agent was deleted (T26-6c) and its thread has ended: nothing of it stays here for
+        whoever comes back with that name."""
+        with self._lock:
+            self._others.pop(slug, None)
+            self._threads.pop(slug, None)
+            self._stops.pop(slug, None)
+            self._settled.pop(slug, None)
+            self._failures.pop(slug, None)
+            self._reloads.pop(slug, None)
+            self._guardians.pop(slug, None)
+            self._newcomers = [item for item in self._newcomers if item[0] != slug]
+
     def wait_settled(self, slug: str, timeout: float) -> None:
         """Until the agent is up, or its thread ended. See ``failure_of`` and the roster."""
         with self._lock:
@@ -1291,6 +1329,9 @@ class _Neighbours:
             with self._lock:
                 self._reloads.pop(config.slug, None)
                 self._guardians.pop(config.slug, None)
+            side = self._telegram.get(config.slug)
+            if side is not None:  # what its last alerts issued as they went out, after its watch
+                side.book.forget_agent(config.slug)
             settled.set()
 
     def _serve_one(
@@ -1497,9 +1538,8 @@ def serve(
         share: SensorShare | None = None
         log_filter = None
         neighbours: _Neighbours | None = None
-        spend_total: InstallationSpend | None = None
+        spend_total = spend_total_for(config, others)
         if others:
-            spend_total = build_spend_total(config, others)
             scope.hand_down()  # before any thread of an agent starts
             log_filter = scope.belongs_to(None)
             share = SensorShare() if sensor else None
@@ -1545,9 +1585,9 @@ def serve(
         ) -> bool:
             return _record_in_installation(config, alerts, action, target, details, **options)
 
+        if spend_total is not None:
+            spend_total.bind(record=record_total, alert=alerts.submit)
         if others:
-            if spend_total is not None:
-                spend_total.bind(record=record_total, alert=alerts.submit)
             neighbours = _Neighbours(
                 config,
                 others,
@@ -1579,6 +1619,8 @@ def serve(
                 record=record_total,
                 first_event=first_event,
                 protect_main=guardian.protect_also,
+                open_box=open_black_box,
+                stop_alive=stop_unwatched,
                 add_to_total=None if spend_total is None else spend_total.add_member,
                 whole_caps=None if spend_total is None else spend_total.caps,
             )
@@ -1643,7 +1685,11 @@ def serve(
                 guardian, box, snapshots, budget=egress.budget, waiting=egress.waiting
             )
             control = Hooks(control, telegram.bot)
+        if fleet is not None:
+            control = Hooks(control, TrashWatch(fleet))
         record_installation_start(config, alerts, others)
+        if fleet is not None:
+            fleet.finish_interrupted()
         if neighbours is not None:
             neighbours.start()
         try:

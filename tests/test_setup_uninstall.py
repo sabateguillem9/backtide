@@ -369,6 +369,27 @@ def test_the_black_box_is_given_roots_group_before_the_web_user_goes(machine: Ma
     assert machine.calls.index(("userdel", layout.WEB_USER)) > 0
 
 
+def test_the_other_agents_folders_and_boxes_are_given_roots_group_too(machine: Machine) -> None:
+    """Review of T26-2d: the service gives them to the web's group, also those of an agent in the
+    trash, whose file is gone."""
+    others = [g for g in os.getgroups() if g != os.getgid()]
+    if not others:
+        pytest.skip("the tests' user has a single group")
+    folder = machine.paths.state_dir / "agents"
+    live, gone = folder / "revisor", folder / "borrado"
+    gone.mkdir(parents=True)
+    live.mkdir()
+    (gone / "retired.json").write_text("{}")
+    boxes = [live / "blackbox.db", gone / "blackbox.db", gone / "blackbox.db-wal"]
+    for box in boxes:
+        box.write_text("")
+    m = remover(machine)
+    m.owner = (os.getuid(), others[0])
+    m.uninstall()
+    for path in (folder, live, gone, *boxes):
+        assert os.lstat(path).st_gid == others[0], path
+
+
 # Docker
 
 

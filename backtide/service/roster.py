@@ -70,6 +70,7 @@ class Roster:
         stopped: Sequence[str] = (),
     ) -> None:
         self._main = main
+        self._deleted: list[dict[str, Any]] = []  # T26-6c: only the list reads it, no order
         self._named = {main.slug: main.name, **dict(others)}
         self._stopped = set(stopped)  # by the owner: not a failure, and it stays so (T26-6a)
         self._desks: dict[str, Desk] = {}
@@ -80,6 +81,23 @@ class Roster:
         """A new agent of this installation (T26-6a): it exists, and it is not watched yet."""
         with self._changed:
             self._named[slug] = name
+
+    def forget(self, slug: str) -> None:
+        """This agent was deleted (T26-6c): it is nobody from now on, and nothing of it stays here
+        for whoever comes back with that name. Its Guardian was already taken out (``retire``)."""
+        with self._changed:
+            self._named.pop(slug, None)
+            self._desks.pop(slug, None)
+            self._stopped.discard(slug)  # its count of orders in flight ends by itself
+
+    def set_deleted(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """What the list says of the deleted agents: never something an order can reach."""
+        with self._changed:
+            self._deleted = [dict(item) for item in items]
+
+    def deleted(self) -> list[dict[str, Any]]:
+        with self._changed:
+            return [dict(item) for item in self._deleted]
 
     def knows(self, slug: object) -> bool:
         """Whether ``slug`` names an agent of this installation. A lookup: never the disk."""

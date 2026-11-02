@@ -170,6 +170,8 @@ STATE_KEYS = "keys"  # the real keys of the model providers (T06-4): never mount
 STATE_SENSOR = "sensor"  # Tetragon's events, settings and the reader's cursor (T07)
 STATE_INSTALLATION = "installation"  # the installation's own black box (T26-2a)
 AGENTS_FOLDER = "agents"  # the other agents': <state_dir>/agents/<slug>/, <etc>/agents/<slug>.toml
+RETIRED_MARK = "retired.json"  # in an agent's folder: it was deleted (T26-6c, service/trash.py)
+SAVED_AGENT_FILE = "agent-file.toml"  # beside its black box, once the machine's copy is gone
 MAX_RULES_BYTES = 64 * 1024
 MAX_OWNER_PRICES = 64
 

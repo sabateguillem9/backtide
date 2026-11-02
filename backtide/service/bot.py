@@ -453,8 +453,8 @@ class NeighbourWatch:
 
     def close(self) -> None:
         self._side.actions.unbind()
+        self._side.desk.close()  # first: it issues buttons until it is closed (review of T26-2e)
         self._side.book.forget_agent(self._side.slug)
-        self._side.desk.close()
 
 
 @dataclass(frozen=True)

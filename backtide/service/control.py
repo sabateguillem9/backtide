@@ -229,8 +229,11 @@ AGENT_COMMANDS = frozenset(
     }
 )  # fmt: skip
 # Which agents there are (T26-6a, ``backtide.service.fleet``): the service's, on this socket only.
-FLEET_COMMANDS = frozenset({"agent_create", "agent_start", "agent_stop"})
+FLEET_COMMANDS = frozenset(
+    {"agent_create", "agent_start", "agent_stop", "agent_delete", "agent_restore", "agent_purge"}
+)
 AGENT_ORDER_REPLY_TIMEOUT = 300.0  # an agent's start: its checks and its first snapshot
+DELETED_KEYS = ("slug", "name", "state", "deleted_at", "purge_after", "purged")
 
 
 class ControlError(Exception):
@@ -306,6 +309,12 @@ class FleetOrders(Protocol):
     def start(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
 
     def stop(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
+
+    def delete(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
+
+    def restore(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
+
+    def purge(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]: ...
 
 
 class SettingsService(Protocol):
@@ -657,6 +666,9 @@ class ControlServer:
             "agent_create": self._fleet.create,
             "agent_start": self._fleet.start,
             "agent_stop": self._fleet.stop,
+            "agent_delete": self._fleet.delete,
+            "agent_restore": self._fleet.restore,
+            "agent_purge": self._fleet.purge,
         }[command]
         try:
             return order(request, f"cli (uid {uid}, pid {pid})")
@@ -1333,7 +1345,13 @@ class ControlServer:
         6.9): what the CLI, the web and the bot go through. Names of its own config, no path."""
         if set(request) != {"cmd"}:
             raise _BadRequest("Una lista de agentes lleva `cmd` y nada más.")
-        return {"ok": True, "outcome": "listed", "message": "", "agents": self._roster.listing()}
+        return {
+            "ok": True,
+            "outcome": "listed",
+            "message": "",
+            "agents": self._roster.listing(),
+            "deleted": self._roster.deleted(),  # T26-6c: what the trash has, and no order reaches
+        }
 
     def _snapshots(self, desk: Desk, request: dict[str, Any]) -> dict[str, Any]:
         if set(request) != {"cmd"}:
@@ -2460,6 +2478,41 @@ def ask_agents(
                 | {"notice": _notice_lines(item.get("notice"))}
             )
     return found
+
+
+def ask_deleted(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> list[dict[str, Any]]:
+    """The deleted agents the service at ``path`` still has (T26-6c), checked: each with its
+    ``slug``, ``name``, ``state``, ``deleted_at``, ``purge_after`` and ``purged``. What does not
+    look like one is dropped. ControlError if the reply makes no sense."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "agents"},
+        what="la lista",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        server_uid=server_uid,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    listed = _listed_reply(raw, "agents").get("deleted")
+    return [
+        {key: item[key] for key in DELETED_KEYS}
+        for item in (listed if isinstance(listed, list) else [])
+        if isinstance(item, dict)
+        and _is_agent_name(item.get("slug"))
+        and isinstance(item.get("name"), str | None)
+        and all(isinstance(item.get(key), str) for key in ("state", "deleted_at", "purge_after"))
+        and isinstance(item.get("purged"), bool)
+    ]
 
 
 def _notice_lines(value: object) -> list[str]:

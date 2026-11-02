@@ -11,12 +11,14 @@ import threading
 from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlencode
 
 import pytest
 from fastapi.testclient import TestClient
 
+import backtide.web.app as app_module
 from backtide.blackbox import BlackBox
 from backtide.service.config import AGENTS_FOLDER, STATE_DB
 from backtide.service.control import ControlError, ask_rewind
@@ -35,6 +37,7 @@ from tests import test_web_decide as decide
 from tests.conftest import FakeClock
 from tests.test_service_agent_orders import Agent
 from tests.test_service_web_control import GROUP, the_web
+from tests.test_web_panel import request
 from tests.test_web_rewind import POST_HEADERS, FakeRewinder, form_of, text_of
 from tests.webkit import (
     KEY,
@@ -854,6 +857,47 @@ def test_live_agents_ask_at_most_so_often_and_keep_the_last_answer(
     rig.server.close()
     moment[0] += 6
     assert [a.slug for a in live()] == [SLUG, "parado"]
+
+
+def test_an_agent_gone_while_the_page_was_being_made_is_left_out(
+    rig: Rig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T26-6c: the list can change between reading what it holds and showing it, and a list that
+    says someone who is not there anymore is not a reason for a page to fail."""
+    gone = SimpleNamespace(agent="borrado")
+    monkeypatch.setattr(app_module, "batch_views", lambda *_: [gone])
+    monkeypatch.setattr(app_module, "trust_views", lambda *_: [gone])
+    web = rig.web(tmp_path)
+    page = web.get("/peticiones")
+    assert page.status_code == 200
+    assert "borrado" not in page.text and "v=revocar" not in page.text
+
+
+def test_a_request_of_an_agent_that_went_is_left_out(
+    tmp_path: Path, boxes: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone = request(id="gone", agent="borrado")
+    monkeypatch.setattr(app_module, "live_requests", lambda *_: [gone])
+    page = new_client(tmp_path, clock=lambda: NOW, pending=lambda: []).get("/peticiones")
+    assert page.status_code == 200 and 'id="req-gone"' not in page.text
+
+
+def test_a_reader_goes_with_the_agent_it_read(rig: Rig, tmp_path: Path) -> None:
+    """T26-6c: an open reader is what keeps the service from taking a deleted box out of WAL."""
+    live = LiveAgents(rig.server.path, box_of=lambda slug: tmp_path / slug, every=0, **rig.ours)
+    first = live()
+    assert first is not None
+    reader = first[0].reader
+    closed: list[str] = []
+    real = reader.close
+    reader.close = lambda: (closed.append("yes"), real())  # type: ignore[method-assign]
+    rig.roster.forget(SLUG)
+    found = live()
+    assert found is not None and SLUG not in [a.slug for a in found]
+    assert closed == ["yes"] and SLUG not in live._readers
+    rig.roster.add(SLUG, NAME)
+    again = live()
+    assert again is not None and [a for a in again if a.slug == SLUG][0].reader is not reader
 
 
 def test_live_agents_say_nothing_before_the_first_answer(tmp_path: Path) -> None:

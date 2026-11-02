@@ -18,7 +18,9 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from telegram_fake import OWNER, STRANGER, TOKEN, Call, FakeBotApi, buttons
@@ -38,7 +40,7 @@ from backtide.notify.telegram import (
     TelegramNotifier,
 )
 from backtide.notify.telegram_api import BotApi
-from backtide.service import scope
+from backtide.service import runner, scope
 from backtide.service.agents import load_installation
 from backtide.service.bot import (
     GuardianActions,
@@ -775,6 +777,63 @@ def test_the_desk_of_a_neighbour_runs_on_a_thread_of_that_neighbour(tmp_path: Pa
         time.sleep(0.01)
     watch.close()
     assert seen[0] == OTHER
+
+
+def test_its_desk_ends_before_its_buttons_go_so_none_outlives_the_watch(tmp_path: Path) -> None:
+    """Review of T26-2e: a desk still working could issue a button after they were forgotten, and an
+    agent back with this slug would inherit it."""
+    order: list[str] = []
+    actions = GuardianActions(tmp_path / "c.sock", agent=OTHER)
+    book = ButtonBook()
+
+    class Desk:
+        def start(self) -> None: ...
+
+        def close(self) -> None:
+            order.append("desk")
+            book.issue(Action.PAUSE, agent=OTHER)
+
+    real = book.forget_agent
+
+    def forget(agent: str) -> None:
+        order.append("buttons")
+        real(agent)
+
+    book.forget_agent = forget  # type: ignore[method-assign]
+    side = TelegramNeighbour(OTHER, actions, Desk(), book)  # type: ignore[arg-type]
+    side.watch(None, None, None).close()  # type: ignore[arg-type]
+    assert order == ["desk", "buttons"]
+    assert len(book) == 0
+
+
+def test_what_its_last_alerts_issued_goes_when_its_thread_ends(tmp_path: Path) -> None:
+    """Its alerts go out after its watch closed (``run_guardian`` flushes them last), and each comes
+    with a «Pausar» good for 24 hours: none may be there for an agent back with this slug."""
+    book = ButtonBook()
+    actions = GuardianActions(tmp_path / "c.sock", agent=OTHER)
+    side = TelegramNeighbour(OTHER, actions, None, book)  # type: ignore[arg-type]
+    config = SimpleNamespace(slug=OTHER)
+
+    def prepare(_: object) -> None:
+        book.issue(Action.PAUSE, agent=OTHER)  # as if an alert had gone out as it stopped
+        raise ValueError("it stops here")
+
+    neighbours = runner._Neighbours(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        [],
+        notifier_for=lambda slug: None,  # type: ignore[arg-type,return-value]
+        stop=threading.Event(),
+        share=None,
+        told=SimpleNamespace(submit=lambda alert: None),  # type: ignore[arg-type]
+        telegram={OTHER: side},
+        prepare=prepare,
+        stop_alive=lambda config: False,
+    )
+    neighbours._stops[OTHER] = threading.Event()
+    neighbours._settled[OTHER] = threading.Event()
+    with patch.object(runner, "record_agent_failed"):
+        neighbours._watch(config)  # type: ignore[arg-type]
+    assert len(book) == 0
 
 
 # --- as ``serve`` puts it together ----------------------------------------------------------------

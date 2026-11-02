@@ -58,6 +58,7 @@ from backtide.jail.docker import sanitize
 from backtide.service.config import (
     AGENTS_FOLDER,
     MAX_CONFIG_BYTES,
+    SAVED_AGENT_FILE,
     STATE_CHECKPOINT,
     STATE_DB,
     STATE_INSTALLATION,
@@ -86,7 +87,6 @@ DOCKER_EXTRAS = ("docker-buildx-plugin", "docker-compose-plugin", "docker-ce-roo
 
 
 _AGENT_FILE_SUFFIX = ".toml"
-SAVED_AGENT_FILE = "agent-file.toml"  # beside its black box, once the machine's copy is gone
 
 
 @dataclass(frozen=True)
@@ -909,10 +909,19 @@ class Uninstaller:
     def _state_to_root(self) -> None:
         """The state folder is 0710 root:backtide-web and the black box 0640 (D25). Before the
         group goes, give them root's group, so no later group that gets its number reads them;
-        the next install sets backtide-web's again."""
+        the next install sets backtide-web's again. The other agents' folders and boxes too, the
+        ones in the trash among them: the service gives those to the web's group the same way
+        (T26-2d)."""
         state = self.paths.state_dir
         names = [STATE_DB, f"{STATE_DB}-wal", f"{STATE_DB}-shm"]
-        for path in [state, *(state / n for n in names)]:
+        paths = [state, *(state / n for n in names)]
+        agents = state / AGENTS_FOLDER
+        if self._is_real_dir(agents):
+            paths.append(agents)
+            for name in self._listdir(agents):
+                if self._is_real_dir(agents / name):
+                    paths += [agents / name, *(agents / name / n for n in names)]
+        for path in paths:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
             except FileNotFoundError:
@@ -927,6 +936,13 @@ class Uninstaller:
                     os.fchown(fd, self.owner[0], self.owner[1])
             finally:
                 os.close(fd)
+
+    @staticmethod
+    def _is_real_dir(path: Path) -> bool:
+        try:
+            return stat.S_ISDIR(os.lstat(path).st_mode)
+        except OSError:
+            return False
 
     def _other_agents(self) -> list[_OtherAgent]:
         """The agents of ``agents/``. A file that says nothing usable still names an agent: its

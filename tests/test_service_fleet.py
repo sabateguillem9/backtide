@@ -4,12 +4,15 @@ Real files and real checks, a fake machine: ``Machine`` answers every command an
 be mounted. The real thing, under the real unit, is tests/attacks/test_agent_orders_attacks.py.
 """
 
+import hashlib
+import json
 import os
 import shutil
 import tempfile
 import threading
 import tomllib
 from collections.abc import Iterator, Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -50,7 +53,7 @@ from backtide.service.fleet import (
     still_to_grow,
 )
 from backtide.service.roster import STOPPED_BY_OWNER, Desk, OrderInvalid, Roster
-from backtide.service.runner import _Neighbours, open_installation_box
+from backtide.service.runner import _Neighbours, open_black_box, open_installation_box
 from backtide.service.spend import BudgetSettings
 from backtide.service.spend_total import InstallationSpend
 from backtide.service.web_control import COMMANDS, WebControlServer
@@ -226,6 +229,14 @@ class Machine:
         self.fail: str | None = None
         self.no_image = False
         self.docker_networks: list[str] = []
+        self.containers: list[str] = []  # T26-6c: what Docker has, which deleting takes away
+        self.not_ours: set[str] = set()
+
+    def _inspect(self, name: str, there: Sequence[str], role: str) -> Ran:
+        if name not in there:
+            return Ran(1, "", f"Error: No such object: {name}")
+        labels = {} if name in self.not_ours else {"backtide.role": role}
+        return Ran(0, f"{_docker_id(name)} {json.dumps(labels)}\n", "")
 
     def run(self, argv: Sequence[str]) -> Ran | None:
         argv = tuple(argv)
@@ -251,7 +262,16 @@ class Machine:
         elif argv[:3] == ("docker", "network", "create"):
             self.docker_networks.append(argv[-1])
         elif argv[:3] == ("docker", "network", "rm"):
-            self.docker_networks.remove(argv[-1])
+            found = [n for n in self.docker_networks if argv[-1] in (n, _docker_id(n))]
+            self.docker_networks.remove(found[0])
+        elif argv[:3] == ("docker", "network", "inspect"):
+            role = "agent-network" if argv[-1].endswith("-net") else "egress"
+            return self._inspect(argv[-1], self.docker_networks, role)
+        elif argv[:3] == ("docker", "container", "inspect"):
+            role = "proxy" if argv[-1].endswith("-egress") else "agent"
+            return self._inspect(argv[-1], self.containers, role)
+        elif argv[:3] == ("docker", "rm", "--force"):
+            self.containers = [c for c in self.containers if _docker_id(c) != argv[-1]]
         elif argv[:2] == ("ip", "-j"):
             return Ran(0, "[]", "")
         elif argv[:3] == ("docker", "network", "ls"):
@@ -268,6 +288,10 @@ class Machine:
 
     def commands(self, program: str) -> list[tuple[str, ...]]:
         return [argv for argv in self.ran if argv[0] == program]
+
+
+def _docker_id(name: str) -> str:
+    return hashlib.sha256(name.encode()).hexdigest()
 
 
 class FakeNeighbours:
@@ -318,6 +342,10 @@ class FakeNeighbours:
         self.calls.append(("halt", config.slug))
         return self.halts
 
+    def forget(self, slug: str) -> None:
+        self.calls.append(("forget", slug))
+        self.configs.pop(slug, None)
+
 
 class World:
     """One service with one neighbour, or with none (``alone``)."""
@@ -349,6 +377,9 @@ class World:
         self.routes: list[Any] = []
         self.memory = 64 * GIB
         self.free = 1000 * GIB
+        self.now = datetime(2026, 11, 2, 12, tzinfo=UTC)
+        self.clock_good = True
+        self.stopped_alive: list[str] = []
         self.fleet = self.make()
 
     def make(self, **options: Any) -> Fleet:
@@ -362,6 +393,10 @@ class World:
             record=self.record,
             first_event=lambda new, details: self.first_events.append(new.slug),
             protect_main=self.main_protected.append,
+            open_box=options.pop("open_box", open_black_box),
+            stop_alive=options.pop("stop_alive", self.stop_alive),
+            now=lambda: self.now,
+            clock_ok=options.pop("clock_ok", lambda: self.clock_good),
             add_to_total=lambda slug, folder: self.total.append(slug),
             run=self.machine.run,
             memory_total=lambda: self.memory,
@@ -372,6 +407,10 @@ class World:
             routes=options.pop("routes", lambda: self.routes),
             **options,
         )
+
+    def stop_alive(self, config: ServiceConfig) -> bool:
+        self.stopped_alive.append(config.slug)
+        return False
 
     def record(self, action: str, target: str, details: dict[str, Any], **_: Any) -> bool:
         if not self.record_works:
@@ -1148,6 +1187,15 @@ class Recording:
     def create(self, request: Any, by: str) -> dict[str, Any]:
         return self._call("create", request, by)
 
+    def delete(self, request: Any, by: str) -> dict[str, Any]:
+        return self._call("delete", request, by)
+
+    def restore(self, request: Any, by: str) -> dict[str, Any]:
+        return self._call("restore", request, by)
+
+    def purge(self, request: Any, by: str) -> dict[str, Any]:
+        return self._call("purge", request, by)
+
     def start(self, request: Any, by: str) -> dict[str, Any]:
         return self._call("start", request, by)
 
@@ -1226,8 +1274,11 @@ def test_with_no_fleet_nothing_is_created(sock_dir: Path) -> None:
 
 @pytest.mark.parametrize(
     "command",
-    ["agent_create", "agent_start", "agent_stop", "agent_pause", "agent_resume", "agent_delete"],
-)
+    [
+        "agent_create", "agent_start", "agent_stop", "agent_pause", "agent_resume", "agent_delete",
+        "agent_restore", "agent_purge",
+    ],
+)  # fmt: skip
 def test_none_of_these_is_on_the_webs_list(command: str, sock_dir: Path) -> None:
     """Prepared for T26-6b, and off its list until then: not even a live session gets there."""
     assert command not in COMMANDS
@@ -1345,7 +1396,9 @@ def test_the_egress_charges_what_it_had_in_flight_when_it_stops() -> None:
         ["agentes", "crear", "tercero", "--perfil", "claude-code", "--volumen", "10",
          "--imagen", "evil"],
         ["agentes", "parar", "/etc"],
-        ["agentes", "borrar", "tercero"],
+        ["agentes", "borrar", "../x", "--confirmar", "../x"],
+        ["agentes", "vaciar", "/etc", "--confirmar", "/etc"],
+        ["agentes", "recuperar", "a/b"],
     ],
 )  # fmt: skip
 def test_the_cli_only_takes_what_the_service_takes(
@@ -1455,6 +1508,7 @@ def test_the_list_says_who_was_stopped_and_who_failed(
             {"slug": "b", "name": None, "main": False, "watched": False, "state": None},
         ],
     )
+    monkeypatch.setattr(agentes, "ask_deleted", lambda path: [])
     assert cli.main(["agentes", "lista", "--config", str(main_config(home))]) == 0
     out = capsys.readouterr().out
     assert (

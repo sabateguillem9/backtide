@@ -91,6 +91,17 @@ def mounted_at(point: Path, mountinfo: str) -> tuple[str, str] | None:
     return found
 
 
+def anything_mounted_under(folder: Path, mountinfo: str) -> bool:
+    """Whether something is mounted at ``folder`` or below it (links resolved). What removes a
+    folder asks this first: it would go on into whatever is mounted there."""
+    real = Path(os.path.realpath(folder))
+    for line in mountinfo.splitlines():
+        fields = line.split(" - ")[0].split()
+        if len(fields) >= 5 and Path(_unescape(fields[4])).is_relative_to(real):
+            return True
+    return False
+
+
 def _unescape(field: str) -> str:
     """mountinfo writes space, tab, newline and backslash as octal escapes."""
     for octal, plain in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):

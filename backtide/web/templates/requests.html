@@ -28,7 +28,7 @@
 {% if stale %}<p class="note is-stale">{{ t('wait.stale') }}</p>{% endif %}
 {% if holds_partial() %}<p class="note is-stale" data-partial>{{ t.code('wait.partial') }}</p>{% endif %}
 <ol class="requests">
-  {% for r in requests %}
+  {% for r in requests if roster.get(r.agent) %}
   {% set who = roster.get(r.agent) %}
   {% set cost = r.kind if r.kind in ('email', 'message', 'delete') else 'other' %}
   <li class="req a-{{ who.colour }} risk-{{ r.risk }}" id="req-{{ r.id }}">

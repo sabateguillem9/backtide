@@ -36,6 +36,9 @@ in ``backtide.toml`` (review of T26-2b): whether the volume is really mounted is
 agent runs (``backtide.service.agent_disk``), and together they are why an agent never writes on
 the machine's disk with no cap.
 
+An agent that was deleted (T26-6c, ``backtide.service.trash``) has a mark in its folder, and with
+the mark it is nobody here: its file, if a machine that died left it, is not read.
+
 Together, agents share nothing that would let one reach another: no container or network name, no
 uid or gid, no folder (a volume, the image behind one, a config folder) that holds another's, links
 resolved, and no secret (a fake key, a Gateway token, a black box's key: a copied folder would
@@ -65,6 +68,8 @@ from backtide.service.config import (
     AGENTS_FOLDER,
     MAX_CONFIG_BYTES,
     MAX_TOKEN_BYTES,
+    RETIRED_MARK,
+    SAVED_AGENT_FILE,
     STATE_TOKEN,
     ConfigError,
     Secret,
@@ -129,6 +134,7 @@ def load_installation(path: Path) -> Installation:
     slugs = [name.removesuffix(_FILE_SUFFIX) for name in names if name.endswith(_FILE_SUFFIX)]
     for slug in slugs:  # all of them first: a bad name makes no folder for the good ones
         _check_slug(slug)
+    slugs = [slug for slug in slugs if not is_retired(main, slug)]
     if 1 + len(slugs) > MAX_AGENTS:
         raise ConfigError(f"at most {MAX_AGENTS} agents, the main one included")
     others = [_read_agent(main, folder / f"{slug}{_FILE_SUFFIX}", slug) for slug in slugs]
@@ -156,8 +162,33 @@ def load_agent(path: Path, slug: str | None = None) -> ServiceConfig:
     file = folder / f"{slug}{_FILE_SUFFIX}"
     if not os.path.lexists(file):
         raise ConfigError(f"no agent {slug!r} here: there is no {file}")
+    if is_retired(main, slug):
+        raise ConfigError(f"no agent {slug!r} here: it was deleted, whatever {file} says")
     require_own_folder(folder, "the agents' files folder")
     return _read_agent(main, file, slug)
+
+
+def is_retired(main: ServiceConfig, slug: str) -> bool:
+    """Whether the agent ``slug`` was deleted (T26-6c). The mark is the truth: with it there is no
+    such agent, whatever ``agents/<slug>.toml`` says, and nothing of it runs. ``slug`` is a checked
+    one."""
+    return os.path.lexists(main.agents_dir / slug / RETIRED_MARK)
+
+
+def load_retired(path: Path, slug: str) -> ServiceConfig:
+    """A deleted agent as it was, from the copy of its file beside its black box (T26-6c): what
+    finishes deleting it or brings it back. It is not an agent of the installation: nothing runs
+    from this but what the order about it does. Raises ConfigError."""
+    _check_slug(slug)
+    main = ServiceConfig.from_file(path)
+    return _read_agent(main, main.agents_dir / slug / SAVED_AGENT_FILE, slug)
+
+
+def check_fits(installation: Installation, config: ServiceConfig) -> None:
+    """Whether ``config`` could be one more agent of ``installation``: the same as reading them all
+    with it there, before anything is touched. Raises ConfigError."""
+    _check_apart((*installation.agents, config))
+    _check_ids_free(config)
 
 
 def _check_slug(slug: str) -> None:
@@ -183,7 +214,8 @@ def check_alone(path: Path, config: ServiceConfig) -> None:
                 continue
             try:
                 _check_slug(slug)
-                others.append(_read_agent(main, folder / name, slug))
+                if not is_retired(main, slug):
+                    others.append(_read_agent(main, folder / name, slug))
             except ConfigError:
                 continue  # `_say_if_a_file_is_broken` says it: that one is not for this to judge
     for other in others:

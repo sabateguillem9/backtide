@@ -35,6 +35,16 @@ Making a jail is the power of backtide itself, so the order has a closed shape:
   service's start, or said. The main agent is not stopped here: it runs the sockets, and stopping it
   is stopping the service.
 - Each order is in the installation's box with who asked, and starts with the agent's own.
+- **Deleting** (T26-6c; ``backtide.service.trash``): ``agent_delete`` says the slug twice (the
+  second written by a person), and it stops the agent, closes its black box with
+  ``system/agent_deleted``,
+  removes its containers and networks and unmounts its volume, which waits ``trash.KEEP_DAYS`` in
+  the image. Not recorded, not done; and each step can be tried again, by the same order or by the
+  next start of the service (``finish_interrupted``). ``agent_restore`` brings it back as it was,
+  stopped; ``agent_purge`` empties it, and so does ``tend_trash`` after the wait, with a warning a
+  day before. Nothing of it is on the web's list: T26-6b adds ``agent_delete`` alone, and emptying
+  stays on root's socket for good, because what cannot be undone must not hang on the process that
+  faces the internet. The main agent is never deleted, and a slug that was used stays taken.
 """
 
 import json
@@ -45,21 +55,24 @@ import shutil
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
-from backtide.blackbox import redact
+from backtide.blackbox import BlackBox, BlackBoxError, redact
 from backtide.jail import identity
 from backtide.jail.config import AgentJailConfig, Protected
 from backtide.jail.config import network_create_argv as agent_network_argv
 from backtide.jail.identity import MAX_AGENTS, MAX_NUMBER
 from backtide.jail.proxy_config import network_create_argv as egress_network_argv
 from backtide.notify import Alert, AlertLevel, AlertSink
+from backtide.service import trash
 from backtide.service.agent_disk import (
     AGENT_VOLUMES_ENV,
     AgentDiskError,
+    anything_mounted_under,
     channel_mount_argv,
     clear_stopped,
     ensure_on_disk,
@@ -76,13 +89,18 @@ from backtide.service.agent_disk import (
 )
 from backtide.service.agents import (
     Installation,
+    check_fits,
     id_taken,
     image_of,
     load_installation,
+    load_retired,
     protected_of,
 )
+from backtide.service.clock import clock_synced
 from backtide.service.config import (
     AGENTS_FOLDER,
+    RETIRED_MARK,
+    SAVED_AGENT_FILE,
     STATE_DB,
     STATE_PROXY_CHANNEL,
     STATE_TOKEN,
@@ -93,7 +111,8 @@ from backtide.service.config import (
 )
 from backtide.service.roster import NOBODY, OrderInvalid, Roster
 from backtide.service.spend import check_cap
-from backtide.setup import host, images, layout, networks, volume
+from backtide.service.trash import NUMBER_FILE
+from backtide.setup import containers, host, images, layout, networks, volume
 from backtide.setup.host import Runner
 from backtide.setup.secrets import new_token
 
@@ -115,13 +134,13 @@ CREATE_FIELDS = frozenset(
 CREATED, RESTARTING, STARTED, STOPPED, ALREADY = (
     "created", "restarting", "started", "stopped", "already",
 )  # fmt: skip
+DELETED, RESTORED, PURGED = "deleted", "restored", "purged"
 INVALID, REFUSED, FAILED, NEEDS_RESTART = "invalid", "refused", "failed", "needs_restart"
-OUTCOMES = frozenset(
-    {CREATED, RESTARTING, STARTED, STOPPED, ALREADY, INVALID, REFUSED, FAILED, NEEDS_RESTART}
-)
+DONE = frozenset({CREATED, RESTARTING, STARTED, STOPPED, ALREADY, DELETED, RESTORED, PURGED})
+OUTCOMES = DONE | {INVALID, REFUSED, FAILED, NEEDS_RESTART}
 CREATING = "creating"  # in the agent's folder, while it is not one yet
-NUMBER_FILE = "number"  # in the agent's folder: its number outlives its file (decision 14)
 START_WAIT = 240.0  # an agent's start, with its image's checks and its first snapshot
+TRASH_EVERY = 3600.0  # how often the trash is looked at: its times are days
 _MEMORY = re.compile(r"([0-9]+)([bkmg]?)", re.ASCII)
 _UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
 
@@ -337,6 +356,8 @@ class Neighbours(Protocol):
 
     def halt(self, config: ServiceConfig) -> bool: ...
 
+    def forget(self, slug: str) -> None: ...
+
 
 class Fleet:
     """The orders about which agents there are. One at a time: a second one is refused, because
@@ -354,6 +375,8 @@ class Fleet:
         record: Callable[..., bool],
         first_event: Callable[[ServiceConfig, dict[str, Any]], None],
         protect_main: Callable[[tuple[Protected, ...]], None],
+        open_box: Callable[[ServiceConfig], BlackBox],
+        stop_alive: Callable[[ServiceConfig], bool],
         add_to_total: Callable[[str, Path], None] | None = None,
         whole_caps: Callable[[], tuple[Decimal, Decimal]] | None = None,
         run: Runner = host.run,
@@ -364,7 +387,13 @@ class Fleet:
         mountinfo: Callable[[], str] = read_mountinfo,
         backing: Callable[[str], str | None] = read_backing,
         routes: Callable[[], list[networks.Route]] = read_routes,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        clock_ok: Callable[[], bool] = clock_synced,
     ) -> None:
+        self._open_box = open_box
+        self._stop_alive = stop_alive
+        self._now = now
+        self._clock_ok = clock_ok
         self._routes = routes
         self._mountinfo = mountinfo
         self._backing = backing
@@ -385,6 +414,7 @@ class Fleet:
         self._unit = unit
         self._start_wait = start_wait
         self._busy = threading.Lock()
+        self._purge_said: set[str] = set()
 
     @property
     def _volumes(self) -> Path:
@@ -492,7 +522,9 @@ class Fleet:
         home = self._main.agents_dir / spec.slug
         if os.path.lexists(self._file_of(spec.slug)):
             raise _Refused(REFUSED, f"Ya hay un agente {spec.slug}.")
-        if os.path.lexists(home) and not os.path.lexists(home / CREATING):
+        if os.path.lexists(home) and (
+            not os.path.lexists(home / CREATING) or os.path.lexists(home / RETIRED_MARK)
+        ):
             raise _Refused(
                 REFUSED,
                 f"El nombre {spec.slug} ya se usó: su caja negra se queda, y dos agentes no "
@@ -512,7 +544,7 @@ class Fleet:
             memory_bytes(spec.memory or _default(AgentJailConfig, "memory"))
             + memory_bytes(spec.proxy_memory or self._main.proxy_jail_config().memory),
         )
-        self._check_disk(spec, installation)
+        self._check_disk(spec.volume_gib * layout.GIB * 3 // 2, installation)
 
     def _check_caps(self, spec: AgentSpec) -> None:
         if self._whole_caps is not None:
@@ -555,8 +587,8 @@ class Fleet:
                 "otro agente o crea este con menos.",
             )
 
-    def _check_disk(self, spec: AgentSpec, installation: Installation) -> None:
-        size = spec.volume_gib * layout.GIB
+    def _check_disk(self, new: int, installation: Installation) -> None:
+        """``new``: what the agent about to be here may still take of the disk."""
         left = [
             still_to_grow(
                 image_of(config),
@@ -564,9 +596,7 @@ class Fleet:
             )
             for config in installation.agents
         ]
-        missing = disk_missing(
-            self._free_bytes(self._main.state_dir), left, size * 3 // 2, layout.GROW_ROOM
-        )
+        missing = disk_missing(self._free_bytes(self._main.state_dir), left, new, layout.GROW_ROOM)
         if missing:
             raise _Refused(
                 REFUSED,
@@ -583,6 +613,9 @@ class Fleet:
             names = []
         for name in names:
             used.add(_number_in(self._main.agents_dir / name / NUMBER_FILE))
+        for mark in trash.retired_agents(self._main.agents_dir).values():
+            if mark is not None:  # the file `number` is there, unless someone took it away
+                used.add(mark.number)
         number = max(used, default=0) + 1
         while number <= MAX_NUMBER:
             if not (id_taken(identity.agent_id(number)) or id_taken(identity.proxy_id(number))):
@@ -778,6 +811,570 @@ class Fleet:
             raise _Refused(REFUSED, NOBODY)
         return self._neighbours
 
+    # Delete, bring back and empty (T26-6c)
+
+    def delete(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]:
+        slug = _typed_agent_of(request)
+        try:
+            with self._one_at_a_time():
+                return self._delete(slug, requested_by)
+        except _Refused as refused:
+            logger.warning("refused to delete the agent %s: %s", slug, refused.outcome)
+            return _reply(refused.outcome, str(refused))
+
+    def _delete(self, slug: str, requested_by: str) -> dict[str, Any]:
+        _not_the_main(slug)
+        mark = self._mark_of(slug)
+        if mark is not None and mark.state == trash.RETIRED:
+            return _reply(ALREADY, f"El agente {slug} ya está borrado.")
+        if not self._unit():
+            raise _Refused(
+                REFUSED,
+                "Borrar un agente pide el servicio instalado: fuera de su unidad no se puede "
+                "desmontar su volumen.",
+            )
+        if mark is None:
+            config, mark = self._close_agent(slug, requested_by)
+        else:  # a try that stopped half way, or a machine that died: it goes on from there
+            config = self._resume_delete(slug, requested_by)
+        self._finish_delete(config, mark)
+        return _reply(
+            DELETED,
+            f"Agente {slug} borrado: está parado y sin contenedores ni redes. Su caja negra se "
+            f"queda. Su volumen y sus instantáneas esperan hasta el {_day(mark.purge_after)}: "
+            f"`sudo backtide agentes recuperar {slug}` lo devuelve entero.",
+        )
+
+    def _close_agent(self, slug: str, requested_by: str) -> tuple[ServiceConfig, trash.Retired]:
+        """Up to the mark: from then on it is nobody. Whatever fails here leaves it a stopped agent,
+        which can be started or asked for again, with its black box closed or not."""
+        neighbours = self._others(slug)
+        config = neighbours.config_of(slug)
+        if config is None:
+            raise _Refused(REFUSED, NOBODY)
+        try:
+            text = trash.read_agent_file(self._file_of(slug))
+        except (OSError, ValueError):
+            text = None
+        if text is None:
+            raise _Refused(
+                REFUSED,
+                f"No se puede leer el archivo del agente {slug}, y sin él no se podría recuperar: "
+                "no se ha hecho nada.",
+            )
+        self._must_record("agent_delete", slug, {"requested_by": requested_by}, risk=2)
+        try:
+            mark_stopped(config)  # first: if the machine dies now, it stays stopped
+        except OSError as error:
+            raise _Refused(
+                FAILED, f"No se ha podido dejar la marca de parado ({error.strerror}): sigue igual."
+            ) from None
+        self._roster.mark_stopped(slug, stopped=True)
+        neighbours.stop_one(slug, requested_by)
+        if neighbours.is_running(slug) or not neighbours.halt(config):
+            raise _Refused(
+                FAILED,
+                f"El agente {slug} no ha terminado de pararse, así que no se ha borrado nada: "
+                "mira `docker ps` y la caja negra, y repítelo.",
+            )
+        try:
+            now = self._now()
+            seq, final = self._last_event(config, requested_by, now)
+            trash.save_agent_file(config.agent_dir, text)
+            if not os.path.lexists(
+                config.agent_dir / NUMBER_FILE
+            ):  # one written by hand: decision 14
+                _write_new(config.agent_dir / NUMBER_FILE, f"{config.number}\n")
+            mark = trash.new_mark(
+                config, now=now, requested_by=requested_by, final_seq=seq, final_hash=final
+            )
+            trash.write_mark(config.agent_dir, mark)
+        except (BlackBoxError, ConfigError, OSError) as error:
+            said = str(redact(f"{type(error).__name__}: {error}"))[:300]
+            self._record("agent_delete_failed", slug, {"error": said}, risk=2)
+            raise _Refused(
+                FAILED,
+                f"El agente {slug} está parado y no se ha borrado: no se ha podido cerrar su caja "
+                f"negra ({said}), y sin cerrarla no se borra.",
+            ) from None
+        return config, mark
+
+    def _must_record(self, action: str, slug: str, details: dict[str, Any], risk: int) -> None:
+        if not self._record(action, slug, details, risk=risk):
+            raise _Refused(
+                FAILED, "No se ha podido apuntar en la caja de la instalación: no se ha hecho nada."
+            )
+
+    def _resume_delete(self, slug: str, requested_by: str) -> ServiceConfig:
+        config = self._config_of_deleted(slug)
+        self._must_record("agent_delete_resumed", slug, {"requested_by": requested_by}, risk=2)
+        self._stop_what_is_left(config)
+        return config
+
+    def _last_event(
+        self, config: ServiceConfig, requested_by: str, now: datetime
+    ) -> tuple[int, str]:
+        """The box of this agent ends here, and this says how: what the mark and the installation's
+        box keep. What was already wrong with it is said in the event itself."""
+        with self._open_box(config) as box:
+            report = box.verify()
+            event = box.append(
+                "system",
+                "agent_deleted",
+                config.slug,
+                details={
+                    "requested_by": requested_by,
+                    "at": now.isoformat(),
+                    "checked": report.checked,
+                    "problems": len(report.problems),
+                },
+                risk=2,
+            )
+        return event.seq, event.hash
+
+    def _finish_delete(self, config: ServiceConfig, mark: trash.Retired) -> None:
+        """From the mark on, in an order that can be repeated from any step. Raises _Refused."""
+        slug, home = config.slug, config.agent_dir
+        try:
+            self._remove_from_docker(slug)
+            self._unmount(config)
+            mark = replace(mark, box_settled=trash.settle_box(home))
+            trash.seal_box(home)
+            self._file_of(slug).unlink(missing_ok=True)
+            # Before the mark says it is over: nothing tries this again after it, and a second
+            # try only repeats the event. This is what a box cut short is compared with.
+            self._must_record("agent_deleted", slug, _end_of(mark), risk=2)
+            mark = replace(mark, state=trash.RETIRED)
+            trash.write_mark(home, mark)
+        except (containers.DockerObjectError, AgentDiskError, OSError) as error:
+            said = str(redact(f"{type(error).__name__}: {error}"))[:300]
+            logger.error("the agent %s is not deleted yet: %s", slug, said)
+            self._record("agent_delete_failed", slug, {"error": said}, risk=2)
+            raise _Refused(
+                FAILED,
+                f"El agente {slug} está parado y su caja negra cerrada, pero no se ha terminado de "
+                f"borrar: {said}. Repite la orden cuando esté arreglado.",
+            ) from None
+        self._roster.forget(slug)
+        if self._neighbours is not None:
+            self._neighbours.forget(slug)
+        self._list_deleted()
+        self._told.submit(
+            Alert(
+                AlertLevel.ERROR,
+                f"Agente borrado: {slug}",
+                f"Se ha borrado el agente {slug}. Su caja negra se queda, y su volumen espera "
+                f"hasta el {_day(mark.purge_after)}. Si no has sido tú, `sudo backtide agentes "
+                f"recuperar {slug}` lo devuelve.",
+            )
+        )
+
+    def _remove_from_docker(self, slug: str) -> None:
+        """By the slug and the label: what is not backtide's is not touched, and that stops this."""
+        for kind, names in (
+            ("container", containers.containers_of_agent(slug)),
+            ("network", containers.networks_of_agent(slug)),
+        ):
+            for name, role in names.items():
+                if containers.remove(kind, name, role, run=self._run) is containers.Found.NOT_OURS:
+                    raise containers.DockerObjectError(
+                        f"{name} no lleva la etiqueta de backtide y no se toca: quítalo o cámbialo "
+                        "de nombre"
+                    )
+
+    def _unmount(self, config: ServiceConfig) -> None:
+        for point in (config.proxy_jail_config().channel_dir, config.volume):
+            if mounted_at(point, self._mountinfo()) is not None:
+                ran = self._run(umount_argv(point))
+                if ran is None or ran.returncode != 0:
+                    logger.error("this failed: %s", " ".join(umount_argv(point)))
+            if mounted_at(point, self._mountinfo()) is not None:
+                raise AgentDiskError(f"{point} sigue montado: algo lo está usando")
+        self._rmdir_mount_point(config.slug)
+
+    def _rmdir_mount_point(self, slug: str) -> None:
+        point = self._volumes / slug
+        try:
+            os.rmdir(point)
+        except FileNotFoundError:
+            pass
+        except OSError as error:  # it holds nothing of anybody's that counts: said, and it goes on
+            logger.warning("the mount point %s stays: %s", point, error.strerror)
+
+    def _mark_of(self, slug: str) -> trash.Retired | None:
+        """The mark of this agent, looked up in what the folder has. A slug is never a path."""
+        found = trash.retired_agents(self._main.agents_dir)
+        if slug in found and found[slug] is None:
+            raise _Refused(
+                FAILED,
+                f"La marca de borrado de {slug} no se puede leer, y nada se hace por lo que diga: "
+                "mira el registro del servicio.",
+            )
+        return found.get(slug)
+
+    def _config_of_deleted(self, slug: str) -> ServiceConfig:
+        try:
+            return load_retired(self._path, slug)
+        except ConfigError as error:
+            raise _Refused(
+                FAILED, f"La copia del archivo de {slug} no se puede usar: {redact(str(error))}"
+            ) from None
+
+    def _stop_what_is_left(self, config: ServiceConfig) -> None:
+        try:
+            self._stop_alive(config)
+        except Exception as error:  # that it keeps running stops all of this: said by the caller
+            logger.exception("the agent %s keeps running", config.slug)
+            said = str(redact(f"{type(error).__name__}: {error}"))[:300]
+            raise _Refused(FAILED, f"El agente {config.slug} sigue en marcha: {said}") from None
+
+    def _list_deleted(self) -> None:
+        found = trash.retired_agents(self._main.agents_dir)
+        self._roster.set_deleted([mark.listed() for mark in found.values() if mark is not None])
+
+    def restore(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]:
+        slug, restart = _restore_of(request)
+        try:
+            with self._one_at_a_time():
+                return self._restore(slug, restart, requested_by)
+        except _Refused as refused:
+            logger.warning("refused to bring back the agent %s: %s", slug, refused.outcome)
+            return _reply(refused.outcome, str(refused))
+
+    def _restore(self, slug: str, restart: bool, requested_by: str) -> dict[str, Any]:
+        _not_the_main(slug)
+        mark = self._mark_of(slug)
+        if mark is None:
+            raise _Refused(REFUSED, f"No hay ningún agente {slug} en la papelera.")
+        if mark.state != trash.RETIRED:
+            raise _Refused(
+                REFUSED,
+                f"El agente {slug} quedó a medio borrar: termina de borrarlo con `agentes borrar` "
+                "y luego recupéralo.",
+            )
+        if mark.purged_at is not None:
+            raise _Refused(REFUSED, f"La papelera de {slug} ya se vació: queda solo su caja negra.")
+        if not self._unit():
+            raise _Refused(
+                REFUSED, "Recuperar un agente pide el servicio instalado: fuera no se monta nada."
+            )
+        if self._neighbours is None and not restart:
+            raise _Refused(
+                NEEDS_RESTART,
+                "Sería el primer agente además del principal: el servicio tiene que reiniciarse, y "
+                "con él el principal, que se para y vuelve a arrancar. Lo que tenga a medias se "
+                "pierde. Si te va bien, pídelo otra vez aceptándolo.",
+            )
+        config, text = self._check_can_restore(slug)
+        details = {"requested_by": requested_by, "final_hash": mark.final_hash}
+        self._must_record("agent_restore", slug, details, risk=2)
+        made: list[Callable[[], None]] = []
+        try:
+            new = self._bring_back(config, mark, text, requested_by, made)
+        except Exception as error:
+            logger.exception("the agent %s could not be brought back", slug)
+            for undo in reversed(made):
+                _quietly(undo)
+            said = str(redact(f"{type(error).__name__}: {error}"))[:300]
+            self._record("agent_restore_failed", slug, {"error": said}, risk=2)
+            return _reply(
+                FAILED, f"No se ha podido recuperar: {said}. Sigue en la papelera, como estaba."
+            )
+        self._record("agent_restored", slug, details, risk=2)
+        self._list_deleted()
+        self._told.submit(
+            Alert(
+                AlertLevel.ERROR,
+                f"Agente recuperado: {slug}",
+                f"El agente {slug} ha vuelto de la papelera, parado. Si no has sido tú, bórralo "
+                "otra vez.",
+            )
+        )
+        self._roster.add(new.slug, new.display_name)
+        self._roster.mark_stopped(slug, stopped=True)
+        if self._neighbours is None:
+            self._stop.set()  # the control socket answers this order before it closes
+            return _reply(
+                RESTARTING,
+                f"Agente {slug} recuperado, parado. El servicio se reinicia para llevar a más de "
+                f"un agente. Arráncalo con `backtide agentes arrancar {slug}`.",
+            )
+        items = tuple(protected_of(new))
+        self._protect_main(items)
+        self._neighbours.protect_also(new.slug, items)
+        if self._add_to_total is not None:
+            self._add_to_total(new.slug, new.agent_dir)
+        self._neighbours.add(new)
+        return _reply(
+            RESTORED,
+            f"Agente {slug} recuperado entero, y parado: mira su caja negra si quieres, y "
+            f"arráncalo con `backtide agentes arrancar {slug}`.",
+        )
+
+    def _check_can_restore(self, slug: str) -> tuple[ServiceConfig, str]:
+        """Everything that can be said before anything is touched."""
+        installation = self._read_all()
+        if len(installation.agents) >= MAX_AGENTS:
+            raise _Refused(REFUSED, f"Como mucho {MAX_AGENTS} agentes, contando el principal.")
+        config = self._config_of_deleted(slug)
+        try:
+            text = trash.read_agent_file(config.agent_dir / SAVED_AGENT_FILE)
+            there = trash.read_agent_file(self._file_of(slug))
+        except (OSError, ValueError) as error:
+            raise _Refused(REFUSED, f"No se puede leer su archivo: {error}") from None
+        if text is None:
+            raise _Refused(REFUSED, f"No está la copia del archivo de {slug}.")
+        if there is not None and there != text:
+            raise _Refused(
+                REFUSED,
+                f"Ya hay un archivo {self._file_of(slug)}, distinto del que tenía este agente: "
+                "quítalo si no lo quieres y vuelve a pedirlo.",
+            )
+        image = image_of(config)
+        if not os.path.isfile(image):
+            raise _Refused(REFUSED, f"La imagen de su volumen no está: {image}.")
+        try:
+            check_fits(installation, config)
+        except ConfigError as error:
+            raise _Refused(REFUSED, f"No puede volver: {redact(str(error))}") from None
+        ceiling = config.max_volume_bytes if config.max_volume_bytes is not None else 0
+        self._check_disk(still_to_grow(image, ceiling), installation)
+        return config, text
+
+    def _bring_back(
+        self,
+        config: ServiceConfig,
+        mark: trash.Retired,
+        text: str,
+        requested_by: str,
+        made: list[Callable[[], None]],
+    ) -> ServiceConfig:
+        """The file last but for the box, and the box's event once nothing can fail: the chain goes
+        on from ``final_hash``, so nothing in it needs undoing."""
+        home, file = config.agent_dir, self._file_of(config.slug)
+        self._remove_from_docker(config.slug)  # what a try that died left: its networks are named
+        trash.unseal_box(home)
+        made.append(lambda: trash.seal_box(home))
+        mark_stopped(config)
+        self._make_networks(config, made)
+        if not os.path.lexists(file):
+            _write_whole(file, text)
+            made.append(lambda: file.unlink(missing_ok=True))
+        os.unlink(home / RETIRED_MARK)
+        made.append(lambda: trash.write_mark(home, mark))
+        new = load_installation(self._path).agent(config.slug)
+        with self._open_box(new) as box:
+            box.append(
+                "system",
+                "agent_restored",
+                new.slug,
+                details={
+                    "requested_by": requested_by,
+                    "deleted_at": mark.deleted_at.isoformat(),
+                },
+                risk=2,
+            )
+        try:
+            os.unlink(home / SAVED_AGENT_FILE)  # the machine's copy is the one that counts again
+        except OSError as error:
+            logger.warning("the copy of the file of %s stays: %s", new.slug, error.strerror)
+        return new
+
+    def purge(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]:
+        slug = _typed_agent_of(request)
+        try:
+            with self._one_at_a_time():
+                _not_the_main(slug)
+                mark = self._mark_of(slug)
+                if mark is None:
+                    if self._roster.knows(slug):
+                        raise _Refused(
+                            REFUSED, f"El agente {slug} no está borrado: no hay nada que vaciar."
+                        )
+                    raise _Refused(REFUSED, f"No hay ningún agente {slug} en la papelera.")
+                return self._empty(mark, requested_by, "owner")
+        except _Refused as refused:
+            logger.warning("refused to empty the trash of %s: %s", slug, refused.outcome)
+            return _reply(refused.outcome, str(refused))
+
+    def _empty(self, mark: trash.Retired, requested_by: str, reason: str) -> dict[str, Any]:
+        """For good. The box, its key and the number stay, and nothing is written in the box: its
+        last event is still the one the installation's box has the hash of."""
+        slug, home = mark.slug, self._main.agents_dir / mark.slug
+        if mark.state != trash.RETIRED:
+            raise _Refused(
+                REFUSED,
+                f"El agente {slug} quedó a medio borrar: termina de borrarlo con `agentes borrar`.",
+            )
+        if mark.purged_at is not None:
+            return _reply(ALREADY, f"La papelera de {slug} ya está vacía.")
+        info = self._mountinfo()
+        if anything_mounted_under(home, info) or anything_mounted_under(self._volumes / slug, info):
+            raise _Refused(FAILED, f"Algo de {slug} sigue montado: no se ha vaciado nada.")
+        details = {
+            "requested_by": requested_by,
+            "reason": reason,
+            "final_hash": mark.final_hash,
+        }
+        self._must_record("agent_purge", slug, details, risk=3)
+        elsewhere = trash.image_elsewhere(home)
+        try:
+            trash.empty_folder(home)
+            trash.write_mark(home, replace(mark, purged_at=self._now()))
+        except Exception as error:  # also a tree too deep, which an agent can leave behind
+            said = str(redact(f"{type(error).__name__}: {error}"))[:300]
+            logger.error("the trash of the agent %s is not empty yet: %s", slug, said)
+            self._record("agent_purge_failed", slug, {"error": said}, risk=3)
+            if slug not in self._purge_said:  # the next look tries again: once is enough
+                self._purge_said.add(slug)
+                self._told.submit(
+                    Alert(
+                        AlertLevel.ERROR,
+                        f"No se ha podido vaciar la papelera de {slug}",
+                        f"{said}. Se vuelve a intentar. Su caja negra sigue.",
+                    )
+                )
+            raise _Refused(
+                FAILED, f"No se ha terminado de vaciar ({said}): repítelo. Su caja negra sigue."
+            ) from None
+        self._rmdir_mount_point(slug)
+        self._record("agent_purged", slug, details, risk=3)
+        self._list_deleted()
+        left = (
+            ""
+            if elsewhere is None
+            else f" La imagen de su volumen está en {elsewhere}, fuera de su carpeta: se queda."
+        )
+        self._told.submit(
+            Alert(
+                AlertLevel.ERROR,
+                f"Papelera vaciada: {slug}",
+                f"El volumen y las instantáneas de {slug} ya no están. Su caja negra se queda."
+                f"{left}",
+            )
+        )
+        return _reply(
+            PURGED,
+            f"Vaciado: el volumen y las instantáneas de {slug} ya no están. Su caja negra se queda "
+            f"y su nombre no se vuelve a usar.{left}",
+        )
+
+    def finish_interrupted(self) -> None:
+        """At the service's start, before any agent: what a machine that died left half deleted
+        goes on, nothing of it runs, and what makes no sense is said. Never raises."""
+        for slug, mark in trash.retired_agents(self._main.agents_dir).items():
+            try:
+                if mark is None:
+                    raise _Refused(FAILED, "su marca de borrado no se puede leer")
+                if mark.state != trash.RETIRED:
+                    self._finish_delete(self._resume_delete(slug, "service"), mark)
+                elif os.path.lexists(self._file_of(slug)):
+                    raise _Refused(
+                        FAILED,
+                        f"hay un archivo {self._file_of(slug)}, y no se usa: ese agente está "
+                        "borrado. O lo recuperas, o lo quitas",
+                    )
+            except _Refused as refused:
+                self._record("agent_delete_unfinished", slug, {"why": str(refused)[:300]}, risk=2)
+                self._told.submit(
+                    Alert(AlertLevel.ERROR, f"Agente borrado a medias: {slug}", str(refused))
+                )
+            except Exception:  # the service starts all the same: nothing of this agent runs
+                logger.exception("what was left of the deleted agent %s", slug)
+        self._list_deleted()
+
+    def tend_trash(self) -> None:
+        """A look at the trash: its boxes, its warnings and what has waited long enough. Each from
+        its mark, so a restart loses nothing. If an order is running, the next look. Never raises:
+        it runs on its own thread, and what fails is logged and tried again."""
+        if not self._busy.acquire(blocking=False):
+            return
+        try:
+            for mark in trash.retired_agents(self._main.agents_dir).values():
+                if mark is None:
+                    continue
+                try:
+                    self._tend_one(mark)
+                except _Refused as refused:
+                    logger.error("the trash of the agent %s: %s", mark.slug, refused)
+                except Exception:
+                    logger.exception("the trash of the agent %s", mark.slug)
+            self._list_deleted()
+        finally:
+            self._busy.release()
+
+    def _tend_one(self, mark: trash.Retired) -> None:
+        home = self._main.agents_dir / mark.slug
+        if mark.state == trash.RETIRED and not mark.box_settled:
+            mark = self._settle(home, mark)
+        now = self._now()
+        step = trash.due(mark, now)
+        if step is None:
+            return
+        if not self._clock_is_good():
+            logger.warning("the clock cannot be trusted: nothing leaves the trash on its word")
+            return
+        if step == trash.WARN:
+            trash.write_mark(home, replace(mark, warned_at=now))  # not written, not warned
+            self._record(
+                "agent_trash_warned", mark.slug, {"purge_after": mark.purge_after.isoformat()},
+                risk=1,
+            )  # fmt: skip
+            self._told.submit(
+                Alert(
+                    AlertLevel.WARNING,
+                    f"Mañana se vacía la papelera de {mark.slug}",
+                    f"El volumen y las instantáneas de {mark.slug} se borran para siempre en un "
+                    f"día. Si los quieres, `sudo backtide agentes recuperar {mark.slug}`.",
+                )
+            )
+        else:
+            self._empty(mark, "service", "expired")
+
+    def _settle(self, home: Path, mark: trash.Retired) -> trash.Retired:
+        trash.unseal_box(home)
+        try:
+            settled = trash.settle_box(home)
+        finally:
+            trash.seal_box(home)
+        if settled:
+            mark = replace(mark, box_settled=True)
+            trash.write_mark(home, mark)
+        return mark
+
+    def _clock_is_good(self) -> bool:
+        try:
+            return self._clock_ok()
+        except OSError as error:
+            logger.warning("cannot read the state of the clock: %s", error)
+            return False
+
+
+class TrashWatch:
+    """A ``ControlHook``: ``Fleet.tend_trash`` now and every ``every`` seconds while the service is
+    up. On a thread of its own, so a slow disk never holds up a socket."""
+
+    def __init__(self, fleet: Fleet, *, every: float = TRASH_EVERY) -> None:
+        self._fleet = fleet
+        self._every = every
+        self._closing = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="backtide-trash", daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._closing.set()
+        if self._thread is not None:
+            self._thread.join(5)
+
+    def _run(self) -> None:
+        while True:
+            self._fleet.tend_trash()
+            if self._closing.wait(self._every):
+                return
+
 
 class _Refused(Exception):  # noqa: N818 - a refusal is not an error here
     def __init__(self, outcome: str, message: str) -> None:
@@ -789,18 +1386,65 @@ def _agent_of(request: Mapping[str, Any]) -> str:
     """The closed shape of ``agent_start`` and ``agent_stop``: the order and whom, nothing else."""
     if set(request) != {"cmd", "agent"}:
         raise OrderInvalid("Esa orden lleva `cmd` y `agent`, y nada más.")
-    slug = request["agent"]
+    return _slug_of(request["agent"])
+
+
+def _typed_agent_of(request: Mapping[str, Any]) -> str:
+    """The closed shape of ``agent_delete`` and ``agent_purge``: whom, and that name written again
+    by a person, so that no slip and no form with the wrong agent does it (docs/47, 8.2)."""
+    if set(request) != {"cmd", "agent", "typed"}:
+        raise OrderInvalid("Esa orden lleva `cmd`, `agent` y `typed`, y nada más.")
+    slug = _slug_of(request["agent"])
+    if request["typed"] != slug:
+        raise OrderInvalid("El nombre escrito no es el de ese agente: no se ha hecho nada.")
+    return slug
+
+
+def _restore_of(request: Mapping[str, Any]) -> tuple[str, bool]:
+    """The closed shape of ``agent_restore``: whom, and whether a restart is accepted."""
+    if not {"cmd", "agent"} <= set(request) <= {"cmd", "agent", "restart"}:
+        raise OrderInvalid("Esa orden lleva `cmd`, `agent` y, si acaso, `restart`, y nada más.")
+    restart = request.get("restart", False)
+    if not isinstance(restart, bool):
+        raise OrderInvalid("`restart` es sí o no.")
+    return _slug_of(request["agent"]), restart
+
+
+def _slug_of(slug: object) -> str:
+    """A slug, or the main agent's name, so that it can be told what it cannot have. Never a path:
+    it is only compared with the lists after this."""
     if slug != identity.MAIN_SLUG:
         try:
             identity.check_slug(slug)
         except identity.SlugError:
             raise OrderInvalid(NOBODY) from None
-    return slug
+    return str(slug)
+
+
+def _not_the_main(slug: str) -> None:
+    if slug == identity.MAIN_SLUG:
+        raise _Refused(
+            REFUSED,
+            "El principal no se borra: lleva los sockets y al resto de los agentes. Para quitarlo "
+            "todo está la desinstalación.",
+        )
+
+
+def _end_of(mark: trash.Retired) -> dict[str, Any]:
+    return {
+        "requested_by": mark.requested_by,
+        "final_seq": mark.final_seq,
+        "final_hash": mark.final_hash,
+        "purge_after": mark.purge_after.isoformat(),
+    }
+
+
+def _day(moment: datetime) -> str:
+    return moment.date().isoformat()
 
 
 def _reply(outcome: str, message: str) -> dict[str, Any]:
-    ok = outcome in (CREATED, RESTARTING, STARTED, STOPPED, ALREADY)
-    return {"ok": ok, "outcome": outcome, "message": str(redact(message))}
+    return {"ok": outcome in DONE, "outcome": outcome, "message": str(redact(message))}
 
 
 def _write_new(path: Path, text: str) -> None:
