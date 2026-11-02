@@ -12,7 +12,9 @@ vigia-dev nor on the Mac (``instalada``). In a clean VM, after `install.sh`, as 
 
 It only sends requests the service should refuse or answer without changing anything (a forged
 id is an id that does not exist); if the list failed, the export's folder is removed at the end
-and the scenario checks the agent still runs. Nothing leaves the VM.
+and the scenario checks the agent still runs. The exception is ``tarea-sin-sesion``, which gives
+the agent real tasks to read: it first checks that no provider has a key, so no turn reaches
+one (invariant 8). Nothing leaves the VM.
 """
 
 import grp
@@ -44,11 +46,19 @@ from test_install_attacks import (
 
 from backtide.jail.config import AGENT_GID, AGENT_UID
 from backtide.service.config import STATE_SOCKET, STATE_WEB_SOCKET
-from backtide.service.control import ask_web_end_all, ask_web_link
+from backtide.service.control import (
+    ask_secrets,
+    ask_task_start,
+    ask_task_stop,
+    ask_web_end_all,
+    ask_web_link,
+)
+from backtide.service.settings import PROVIDERS
 from backtide.setup import layout
 from backtide.snapshots import Snapshot
 
 pytestmark = pytest.mark.instalada
+CHANGES_WAIT = 31  # the narrow socket's changes: 10 at once, then one every 3 s
 WEB_SOCKET = layout.STATE_DIR / STATE_WEB_SOCKET
 CONTROL_SOCKET = layout.STATE_DIR / STATE_SOCKET
 
@@ -110,7 +120,7 @@ for line in sys.argv[2:]:
             said["why"] = str(reply.get("message") or "")[:80]
         if see:
             said["options"], said["session"] = reply.get("options"), reply.get("session")
-            said["csrf"] = reply.get("csrf")
+            said["csrf"], said["task"] = reply.get("csrf"), reply.get("task")
         out.append(said)
     except OSError as e:
         out.append({"errno": errno.errorcode.get(e.errno, str(e.errno))})
@@ -476,6 +486,128 @@ def test_a_web_taken_over_changes_nothing_without_a_session(
     )
 
 
+@scenario("tarea-sin-sesion")
+def test_no_task_and_no_answer_without_a_session(attack: Attack, installed: Installed) -> None:
+    """T26-5a: who runs code as `backtide-web` can neither give the agent a task nor read an answer
+    without a live session. The answers are not in the black box, so they are the one read of this
+    socket that takes a session. The task whose answer it asks for is real, given by root, and the
+    control is that a live session reads that very task and gives one of its own."""
+    web = pwd.getpwnam(layout.WEB_USER)
+    path = str(WEB_SOCKET)
+    head = installed.box.head()
+    since = head[0] if head is not None else 0
+    marker = f"T26-5A-{secrets.token_hex(8)}"
+    keys = ask_secrets(CONTROL_SOCKET)
+    keyed = [kind for kind in PROVIDERS if keys.get(kind, {}).get("set")]
+    assert not keyed, f"invariant 8: this scenario gives the agent a turn, and {keyed} has a key"
+    real = ask_task_start(CONTROL_SOCKET, f"{marker}-root di hola", seconds=120)
+    assert real["ok"], real
+    real_id = real["task"]
+
+    def probe(*requests: dict) -> list[dict]:
+        return probe_as(web.pw_uid, web.pw_gid, "", path, *requests)
+
+    start = {"cmd": "task_start", "prompt": f"{marker}-sin-sesion borra todo", "_why": True}
+    read = {"cmd": "task_status", "task": real_id, "_why": True}
+    stop = {"cmd": "task_stop", "task": real_id, "_why": True}
+    time.sleep(CHANGES_WAIT)
+    # 1. Without a session, with a made-up one and with one that ended; and what is not on the list.
+    bare = probe(start, read)
+    made_up = probe({**start, "session": "s" * 43}, {**read, "session": "s" * 43})
+    ended = probe(
+        {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
+        {"cmd": "session_end", "session": "<session>"},
+        {**start, "session": "<session>"},
+        {**read, "session": "<session>"},
+    )
+    # 2. Stopping it (only Ctrl-C in the CLI, on root's socket) is off the list: with a session,
+    # and without one, which a read would not refuse for its shape.
+    # 3. The control: a live session reads the same task, and gives one as the web.
+    live = probe(
+        {"cmd": "session_open", "token": ask_web_link(CONTROL_SOCKET)},
+        {**read, "session": "<session>"},
+        {"cmd": "task_status", "task": "f" * 32, "session": "<session>"},
+        {**stop, "session": "<session>"},
+        stop,
+        {"cmd": "task_start", "prompt": f"{marker}-con-sesion di hola", "seconds": 120,
+         "session": "<session>", "_see": True},
+        {"cmd": "session_end", "session": "<session>"},
+    )  # fmt: skip
+    web_id = live[5].get("task")
+    root_socket = probe_as(
+        web.pw_uid, web.pw_gid, "", str(CONTROL_SOCKET), {"cmd": "task_status", "task": real_id}
+    )
+    for task in (real_id, web_id):
+        if task:  # no need for them to end by themselves: their end is what is looked at below
+            ask_task_stop(CONTROL_SOCKET, task)
+
+    def refused_for(replies: list[dict], word: str) -> bool:
+        """Refused for this reason: a full bucket or a wrong shape says refused too."""
+        return all(
+            r.get("outcome") == "refused" and r.get("ok") is False and word in r.get("why", "")
+            for r in replies
+        )
+
+    says = [r.get("outcome") for r in live]
+    attack.check(
+        "stopped",
+        len(bare) == 2
+        and refused_for(bare, "sesión")
+        and len(made_up) == 2
+        and refused_for(made_up, "sesión")
+        and [r.get("outcome") for r in ended[:2]] == ["opened", "ended"]
+        and len(ended) == 4
+        and refused_for(ended[2:], "sesión")
+        and says[0] == "opened"
+        and live[1].get("ok") is True
+        and says[1] not in ("refused", "unknown")
+        and says[2] == "unknown"
+        and refused_for(live[3:5], "no se acepta")
+        and says[5] == "started"
+        and bool(web_id)
+        and root_socket == [{"errno": "EACCES"}],
+        f"como backtide-web, dar una tarea y leer la de root sin sesión: {bare}; con una "
+        f"inventada: {made_up}; con una ya cerrada: {[r.get('outcome') for r in ended]}; con una "
+        f"viva (el control), abrir, leer esa tarea, un id inventado, pararla con y sin ella y "
+        f"dar una: {says}, por {[r.get('why') for r in live[3:5]]}; "
+        f"el socket de root: {root_socket}",
+    )
+
+    def ended_events() -> list[Any]:
+        return [e for e in installed.box.events(since_seq=since) if e.action == "agent_task_end"]
+
+    wait(lambda: len(ended_events()) >= 2, 120, interval=2)
+    refused_recorded = recorded_in_time(
+        installed,
+        since,
+        "refused a %s without a live session",
+        lambda: probe(read),
+        saying="task_status",
+    )
+    events = installed.box.events(since_seq=since)
+    shells = [e for e in events if e.action == "agent_shell" and e.target == "task"]
+    asked = {str(e.details.get("prompt", "")): e for e in shells}
+    who = {prompt.split(" ")[0].removeprefix(f"{marker}-"): e for prompt, e in asked.items()}
+    web_event = who.get("con-sesion")
+    every = json.dumps([[e.target, e.details] for e in events], ensure_ascii=False, default=str)
+    closed = {"task", "outcome", "code", "seconds", "answer_chars", "requested_by"}
+    attack.check(
+        "recorded",
+        refused_recorded
+        and "sin-sesion" not in every
+        and "root" in who
+        and web_event is not None
+        and web_event.details.get("task") == web_id
+        and str(web_event.details.get("requested_by", "")).startswith(f"web (uid {web.pw_uid},")
+        and {e.details.get("task") for e in ended_events()} >= {real_id, web_id}
+        and all(set(e.details) == closed for e in ended_events()),
+        f"el rechazo está en la caja negra ({refused_recorded}); lo pedido sin sesión no está en "
+        f"ningún evento ({'sin-sesion' not in every}); de las tareas de verdad: {sorted(who)}, la "
+        f"de la web como web ({web_event.details if web_event else None}); cada final con sus "
+        f"campos: {[sorted(e.details) for e in ended_events()]}",
+    )
+
+
 def restart_service(installed: Installed) -> None:
     """The service again, with the agent answering and the web's socket back."""
     sh("systemctl", "restart", layout.SERVICE_UNIT, timeout=300)
@@ -699,9 +831,6 @@ def soft_key(rp_id: str = "backtide.localhost") -> dict[str, str]:
     return {"_credential": answer["id"], "_attestation": answer["response"]["attestationObject"]}
 
 
-CHANGES_WAIT = 31  # the narrow socket's changes: 10 at once, then one every 3 s
-
-
 def key_for_the_owner(web: Any, path: str) -> tuple[Any, str]:
     """A session from a link root gives and, as the web's user, the first key registered with it:
     the key (made here, it signs) and the session."""
@@ -726,13 +855,17 @@ def key_for_the_owner(web: Any, path: str) -> tuple[Any, str]:
     return owner, opened["session"]
 
 
-def recorded_in_time(installed: Installed, since: int, kind: str, cause: Callable[[], Any]) -> bool:
+def recorded_in_time(
+    installed: Installed, since: int, kind: str, cause: Callable[[], Any], *, saying: str = ""
+) -> bool:
     """A refusal reaches the black box through the log bridge (once a minute per kind): while it
-    is not there since the probes began, cause it again."""
+    is not there since the probes began (``saying`` this, if the template is shared), cause it
+    again."""
 
     def seen() -> bool:
         found = any(
             kind in str(e.details.get("template", ""))
+            and saying in str(e.details.get("message", ""))
             for e in installed.box.events(source="system", since_seq=since)
             if e.action == "log"
         )

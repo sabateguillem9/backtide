@@ -1,12 +1,17 @@
 """`backtide entrar`, `tarea`, `importar` and `exportar` (T17a-4, backtide/shell_cli.py): the
 docker commands they run, what they ask the service first, and every refusal. The service is a
 fake ``ask_shell``/``ask_export``, and docker a fake ``docker.run`` (the VM test runs them for
-real: tests/integration/test_claude_code.py)."""
+real: tests/integration/test_claude_code.py). `tarea` goes all the way through a real control
+socket to the service's own ``AgentTasks`` (T26-5a): only the Guardian and docker are doubles."""
 
 import io
 import os
+import shutil
 import subprocess
 import tarfile
+import tempfile
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +20,22 @@ import pytest
 from backtide import shell_cli
 from backtide.cli import main
 from backtide.jail import docker
+from backtide.jail.profile import ShellCommands
+from backtide.jail.profiles import CLAUDE_CODE, OPENCLAW
 from backtide.jail.profiles.claude_code import CLAUDE, SEED
+from backtide.service import control
 from backtide.service.config import ServiceConfig
-from backtide.service.control import ControlUnavailable
+from backtide.service.control import ControlOutcomeUnknown, ControlServer, ControlUnavailable
+from backtide.service.shell import ShellOutcome, ShellStatus
+from backtide.service.tasks import (
+    GRACE,
+    MAX_RUNNING,
+    PKILL,
+    TASK_MAX_OUTPUT,
+    AgentTasks,
+    task_pattern,
+)
+from tests.test_service_control import me
 
 PROVIDER = '[[proxy.providers]]\nname = "anthropic"\nkind = "anthropic"\n'
 READY = {
@@ -57,10 +75,58 @@ class Calls:
         self.runs: list[tuple[list[str], dict[str, Any]]] = []
         self.reply: dict[str, Any] = dict(READY)
         self.results: list[subprocess.CompletedProcess[str]] = []
+        self.shell: ShellCommands | None = CLAUDE_CODE.shell
+        self.ended: list[dict[str, Any]] = []
+        self.tasks = AgentTasks(
+            commands=lambda: self.shell,
+            open_shell=self.open_shell,
+            record_end=self.ended.append,
+            sleep=lambda _: None,
+        )
+        self._server: ControlServer | None = None
 
     def ask_shell(self, path: Path, kind: str, **options: Any) -> dict[str, Any]:
         self.asked.append((kind, options))
         return self.reply
+
+    def open_shell(
+        self, kind: str, *, resume: bool, requested_by: str, details: dict[str, Any]
+    ) -> ShellOutcome:
+        """The Guardian's, for a task: what it was asked, and what ``reply`` says."""
+        self.asked.append((kind, {"resume": resume, "prompt": details["prompt"]}))
+        reply = self.reply
+        return ShellOutcome(
+            ShellStatus(reply["outcome"]),
+            reply["message"],
+            reply.get("container", ""),
+            reply.get("user", ""),
+            reply.get("workdir", ""),
+            reply.get("container_id", ""),
+        )
+
+    def task_start(self, *args: Any, **options: Any) -> Any:
+        return self.tasks.start(*args, **options)
+
+    def task_status(self, task_id: str) -> Any:
+        return self.tasks.status(task_id)
+
+    def task_stop(self, task_id: str) -> Any:
+        return self.tasks.stop(task_id)
+
+    def socket(self) -> Path:
+        """The control socket that runs the tasks: only the tests of `tarea` start one."""
+        if self._server is None:
+            folder = Path(tempfile.mkdtemp(prefix="vg"))
+            folder.chmod(0o700)
+            self._server = ControlServer(self, folder / "control.sock", peer=me)  # type: ignore[arg-type]
+            self._server.start()
+        return self._server.path
+
+    def close(self) -> None:
+        self.tasks.close(wait=0.5)
+        if self._server is not None:
+            self._server.close()
+            shutil.rmtree(self._server.path.parent, ignore_errors=True)
 
     def run(self, args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
         self.runs.append((list(args), options))
@@ -70,11 +136,20 @@ class Calls:
 
 
 @pytest.fixture
-def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
+def calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[Calls]:
     made = Calls()
     monkeypatch.setattr(shell_cli, "ask_shell", made.ask_shell)
     monkeypatch.setattr(docker, "run", made.run)
-    return made
+    monkeypatch.setattr(shell_cli, "TASK_POLL", 0.01)
+    for name in ("ask_task_start", "ask_task_status", "ask_task_stop"):
+        real = getattr(control, name)
+
+        def through_the_socket(path: Path, *args: Any, _real: Any = real, **options: Any) -> Any:
+            return _real(made.socket(), *args, peer=me, **options)
+
+        monkeypatch.setattr(shell_cli, name, through_the_socket)
+    yield made
+    made.close()
 
 
 # By the id of the container the service checked, never by its name (B4).
@@ -155,6 +230,7 @@ def test_without_a_service_nothing_runs(
         raise ControlUnavailable("nobody")
 
     monkeypatch.setattr(shell_cli, "ask_shell", unavailable)
+    monkeypatch.setattr(shell_cli, "ask_task_start", unavailable)
     code = main([*argv, "--config", str(write_config(tmp_path))])
     assert code == 1 and "backtide vigilar" in capsys.readouterr().err
     assert calls.runs == []
@@ -362,7 +438,7 @@ def test_tarea_runs_claude_p_with_the_prompt_after_dashes(
     ((argv, options),) = calls.runs
     assert argv == [*PREFIX, *TIMEOUT, "3600", CLAUDE, "-p", "--output-format", "json",
                     *SETTINGS, "--continue", "--", "-rf todo"]  # fmt: skip
-    assert options["timeout"] > 3600 + 30 and options["max_output"] == shell_cli.TASK_MAX_OUTPUT
+    assert options["timeout"] > 3600 + 30 and options["max_output"] == TASK_MAX_OUTPUT
     out = capsys.readouterr().out
     assert "listo\nhecho" in out and "\x1b" not in out
 
@@ -401,7 +477,7 @@ def test_a_task_this_side_gave_up_on_is_stopped_inside(
     real = calls.run
 
     def timing_out(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
-        if "claude" in " ".join(args) and shell_cli.PKILL not in args:
+        if "claude" in " ".join(args) and PKILL not in args:
             calls.runs.append((list(args), options))
             raise docker.JailError("timed out")
         return real(args, **options)
@@ -412,26 +488,9 @@ def test_a_task_this_side_gave_up_on_is_stopped_inside(
     assert kill[: len(PREFIX)] == PREFIX
     assert kill[len(PREFIX) :] == [
         "/usr/bin/pkill", "-TERM", "-P", "0", "-u", "61000", "-f",
-        shell_cli._task_pattern(config.agent_profile.shell),  # noqa: SLF001
+        task_pattern(config.agent_profile.shell),
     ]  # fmt: skip
     assert "Se ha parado dentro del agente" in capsys.readouterr().err
-
-
-def test_the_task_pattern_finds_the_task_and_only_it() -> None:
-    import re
-
-    from backtide.jail.profiles import CLAUDE_CODE
-
-    assert CLAUDE_CODE.shell is not None
-    pattern = re.compile(shell_cli._task_pattern(CLAUDE_CODE.shell))  # noqa: SLF001
-    run = ["/usr/bin/timeout", "-k", "30", "3600", *CLAUDE_CODE.shell.task_argv("hola")]
-    task = " ".join(run)
-    assert pattern.search(task)
-    assert pattern.search(" ".join(run[:4] + list(CLAUDE_CODE.shell.task)))  # nothing after
-    assert not pattern.search(task.replace(".local", "xlocal"))  # the dots are literal
-    assert not pattern.search(f"sh -c {task}") and not pattern.search(f"{CLAUDE} -p hola")
-    # The whole program, not just its first word: an interactive session is not a task.
-    assert not pattern.search(" ".join([*run[:4], CLAUDE, *SETTINGS]))
 
 
 @pytest.mark.parametrize(("code", "said"), [(124, "pasó de 60 minutos"), (137, "se ha cortado")])
@@ -1171,7 +1230,8 @@ def test_a_refused_export_is_a_usage_error(
 
 
 @pytest.fixture
-def claw(tmp_path: Path) -> ServiceConfig:
+def claw(tmp_path: Path, calls: Calls) -> ServiceConfig:
+    calls.shell = OPENCLAW.shell
     return ServiceConfig.from_file(write_config(tmp_path, "openclaw"))
 
 
@@ -1199,11 +1259,11 @@ def test_tarea_with_openclaw_is_one_turn_through_its_gateway(
     assert calls.asked == [("task", {"resume": False, "prompt": "-rf todo; $(rm x)"})]
     (probe, _), (argv, options) = calls.runs
     assert probe[len(PREFIX) : len(PREFIX) + 3] == ["/usr/bin/pgrep", "-P", "0"]
-    assert probe[-1] == shell_cli._task_pattern(claw.agent_profile.shell)  # noqa: SLF001
+    assert probe[-1] == task_pattern(claw.agent_profile.shell)
     # Its own deadline first (the Gateway stops the turn there), the timeout around it after.
     assert argv == [*PREFIX, *TIMEOUT, "150", *OPENCLAW_TURN, "--timeout=120",
                     "--message=-rf todo; $(rm x)"]  # fmt: skip
-    assert options["max_output"] == shell_cli.TASK_MAX_OUTPUT and options["timeout"] > 150 + 30
+    assert options["max_output"] == TASK_MAX_OUTPUT and options["timeout"] > 150 + 30
     out = capsys.readouterr().out
     assert "hecho\n" in out and "\x1b" not in out and "\x07" not in out
 
@@ -1213,8 +1273,9 @@ def test_tarea_with_openclaw_waits_15_minutes_unless_told(
 ) -> None:
     calls.results = [NOT_RUNNING, turn("ok"), answer("ok")]
     assert shell_cli.tarea(claw, "hola") == 0
-    assert calls.runs[1][0][len(PREFIX) + 3] == str(15 * 60 + shell_cli.GRACE)
+    assert calls.runs[1][0][len(PREFIX) + 3] == str(15 * 60 + GRACE)
     assert "--timeout=900" in calls.runs[1][0]
+    calls.shell = CLAUDE_CODE.shell
     assert shell_cli.tarea(config, "hola") == 0  # Claude Code: 60
     assert calls.runs[2][0][len(PREFIX) + 3] == "3600"
 
@@ -1277,16 +1338,16 @@ def test_an_openclaw_error_message_is_printed_escaped(
     assert "no gateway \\x1b]52;c;bWFyaw==\\x07\\x1b[2J" in printed.out
 
 
-def stopped_by(
-    claw: ServiceConfig, calls: Calls, monkeypatch: pytest.MonkeyPatch, raised: BaseException
+def turn_docker_gave_up_on(
+    claw: ServiceConfig, calls: Calls, monkeypatch: pytest.MonkeyPatch
 ) -> int:
-    """`tarea` where the run raises ``raised``; returns its exit code."""
+    """`tarea` where the docker CLI of the run fails, in the service; returns its exit code."""
     real = calls.run
 
     def failing(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
         if "--json" in args:
             calls.runs.append((list(args), options))
-            raise raised
+            raise docker.JailError("timed out")
         return real(args, **options)
 
     calls.results = [NOT_RUNNING]
@@ -1294,24 +1355,62 @@ def stopped_by(
     return shell_cli.tarea(claw, "hola")
 
 
-@pytest.mark.parametrize("raised", [docker.JailError("timed out"), KeyboardInterrupt()])
-def test_an_openclaw_turn_this_side_gave_up_on_is_stopped_inside(
+def ctrl_c_during_a_turn(claw: ServiceConfig, calls: Calls, monkeypatch: pytest.MonkeyPatch) -> int:
+    """`tarea` where the owner presses Ctrl-C while the turn runs in the service. The docker CLI
+    does not pass it on: only the service's ``task_stop`` can reach the turn."""
+    reached, let_go = threading.Event(), threading.Event()
+    real = calls.run
+
+    def holding(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        if "--json" in args:
+            calls.runs.append((list(args), options))
+            reached.set()
+            assert let_go.wait(10)
+            return subprocess.CompletedProcess(args, 124, "", "")
+        return real(args, **options)
+
+    def ctrl_c(*args: object, **options: object) -> dict[str, Any]:
+        assert reached.wait(10)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(docker, "run", holding)
+    monkeypatch.setattr(shell_cli, "ask_task_status", ctrl_c)
+    try:
+        return shell_cli.tarea(claw, "hola")
+    finally:
+        let_go.set()
+
+
+def test_an_openclaw_turn_docker_gave_up_on_is_stopped_inside(
     claw: ServiceConfig,
     monkeypatch: pytest.MonkeyPatch,
     calls: Calls,
     capsys: pytest.CaptureFixture[str],
-    raised: BaseException,
 ) -> None:
-    """The docker CLI timed out, or the owner pressed Ctrl-C (which the docker CLI does not pass
-    on): a TERM to the timeout around the turn, which passes it to the CLI, which asks the
-    Gateway to abort the turn (OpenClaw's SIGTERM handling). Exit 3: it may not have stopped."""
-    assert stopped_by(claw, calls, monkeypatch, raised) == 3
+    """The docker CLI timed out: a TERM to the timeout around the turn, which passes it to the CLI,
+    which asks the Gateway to abort the turn (OpenClaw's SIGTERM handling). Exit 3: it may not have
+    stopped."""
+    assert turn_docker_gave_up_on(claw, calls, monkeypatch) == 3
     kill = calls.runs[-1][0]
     assert kill[len(PREFIX) : len(PREFIX) + 4] == ["/usr/bin/pkill", "-TERM", "-P", "0"]
-    assert kill[-1] == shell_cli._task_pattern(claw.agent_profile.shell)  # noqa: SLF001
+    assert kill[-1] == task_pattern(claw.agent_profile.shell)
     err = capsys.readouterr().err
-    assert "Se ha parado dentro del agente" in err
-    assert ("Ctrl-C" in err) is isinstance(raised, KeyboardInterrupt)
+    assert "Se ha parado dentro del agente" in err and "Ctrl-C" not in err
+
+
+def test_ctrl_c_stops_the_turn_inside_and_exits_with_3(
+    claw: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls.results = [NOT_RUNNING, subprocess.CompletedProcess([], 0, "", "")]
+    assert ctrl_c_during_a_turn(claw, calls, monkeypatch) == 3
+    kill = calls.runs[-1][0]
+    assert kill[len(PREFIX) : len(PREFIX) + 4] == ["/usr/bin/pkill", "-TERM", "-P", "0"]
+    assert kill[-1] == task_pattern(claw.agent_profile.shell)
+    err = capsys.readouterr().err
+    assert "Se ha parado dentro del agente" in err and "Ctrl-C" in err
 
 
 def test_ctrl_c_with_a_stop_that_fails_says_it_may_run_on(
@@ -1321,31 +1420,106 @@ def test_ctrl_c_with_a_stop_that_fails_says_it_may_run_on(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls.results = [NOT_RUNNING, subprocess.CompletedProcess([], 2, "", "")]  # pkill broke
-    real = calls.run
-
-    def interrupted(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
-        if "--json" in args:
-            raise KeyboardInterrupt
-        return real(args, **options)
-
-    monkeypatch.setattr(docker, "run", interrupted)
-    assert shell_cli.tarea(claw, "hola") == 3
+    assert ctrl_c_during_a_turn(claw, calls, monkeypatch) == 3
     assert "Puede seguir en marcha" in capsys.readouterr().err
 
 
-def test_the_openclaw_task_pattern_finds_the_turn_and_only_it() -> None:
-    import re
+def test_ctrl_c_with_a_service_that_does_not_answer_says_it_may_run_on(
+    claw: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def gone(*args: object, **options: object) -> bool:
+        raise ControlUnavailable("nobody")
 
-    from backtide.jail.profiles import OPENCLAW
+    monkeypatch.setattr(shell_cli, "ask_task_stop", gone)
+    calls.results = [NOT_RUNNING]
+    assert ctrl_c_during_a_turn(claw, calls, monkeypatch) == 3
+    assert "Puede seguir en marcha" in capsys.readouterr().err
 
-    pattern = re.compile(shell_cli._task_pattern(OPENCLAW.shell))  # noqa: SLF001
-    timeout = ["/usr/bin/timeout", "-k", "30", "60"]
-    assert pattern.search(" ".join([*timeout, *OPENCLAW_TURN, "--timeout=30", "--message=x"]))
-    assert not pattern.search("node openclaw.mjs gateway")
-    assert not pattern.search(" ".join(OPENCLAW_TURN))
-    # Anchored to the CLI itself: any other node under a timeout is not a task.
-    assert not pattern.search(" ".join([*timeout, "/usr/local/bin/node", "/workspace/x.mjs"]))
-    assert not pattern.search(" ".join([*timeout, *OPENCLAW_TURN[:3], "--agent", "otro"]))
+
+@pytest.mark.parametrize(
+    "problem", [ControlUnavailable("nadie"), ControlOutcomeUnknown("no contesta")]
+)
+def test_a_service_that_goes_away_during_a_task_is_said(
+    config: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+    problem: Exception,
+) -> None:
+    def gone(*args: object, **options: object) -> dict[str, Any]:
+        raise problem
+
+    calls.results = [answer("ok")]
+    monkeypatch.setattr(shell_cli, "ask_task_status", gone)
+    assert shell_cli.tarea(config, "hola") == 3
+    assert "puede seguir en marcha" in capsys.readouterr().err
+
+
+def test_a_service_restarted_during_a_task_does_not_know_it(
+    config: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Its answers lived in the memory of the service that ran it."""
+    calls.results = [answer("ok")]
+
+    def forgotten(path: Path, task_id: str, **options: Any) -> dict[str, Any]:
+        return {
+            "ok": False, "outcome": "unknown", "message": control.TASK_UNKNOWN_MESSAGE,
+            "answer": None, "code": None, "seconds": None,
+        }  # fmt: skip
+
+    monkeypatch.setattr(shell_cli, "ask_task_status", forgotten)
+    assert shell_cli.tarea(config, "hola") == 3
+    assert "no conoce esa tarea" in capsys.readouterr().err
+
+
+def test_a_task_it_cannot_take_is_said_and_nothing_runs(
+    config: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hold = threading.Event()
+    real = calls.run
+
+    def holding(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        assert hold.wait(10)
+        return real(args, **options)
+
+    monkeypatch.setattr(docker, "run", holding)
+    try:
+        started = [calls.tasks.start("t", requested_by="t") for _ in range(MAX_RUNNING)]
+        assert all(one.task_id for one in started)
+        assert shell_cli.tarea(config, "una más") == 1
+        assert "a la vez" in capsys.readouterr().err
+    finally:
+        hold.set()
+
+
+def test_ctrl_c_as_the_task_is_asked_says_it_may_run_on(
+    config: ServiceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def ctrl_c(*args: object, **options: object) -> dict[str, Any]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(shell_cli, "ask_task_start", ctrl_c)
+    assert shell_cli.tarea(config, "hola") == 3
+    assert "Puede seguir en marcha" in capsys.readouterr().err
+
+
+def test_a_long_prompt_reaches_the_task_whole(config: ServiceConfig, calls: Calls) -> None:
+    """Far more than the 4 KiB of any other request: `tarea` always took up to MAX_PROMPT."""
+    prompt = "ñ" * (32 * 1024)
+    calls.results = [answer("ok")]
+    assert shell_cli.tarea(config, prompt) == 0
+    assert calls.runs[0][0][-1] == prompt
 
 
 @pytest.mark.parametrize("minutes", [0.001, 0.008, 0, -1, 1441])

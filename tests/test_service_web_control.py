@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from backtide.jail.config import AGENT_GID, AGENT_UID
+from backtide.jail.profile import MAX_PROMPT
 from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
 from backtide.service.control import (
     ControlError,
@@ -29,16 +30,20 @@ from backtide.service.control import (
     ask_decide,
     ask_rewind,
     ask_set_budget,
+    ask_task_start,
     ask_trust,
 )
-from backtide.service.sessions import Sessions
+from backtide.service.sessions import IDLE_SECONDS, Sessions
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
 from backtide.service.spend import CapOutcome
+from backtide.service.tasks import TaskOutcome, TaskStart, TaskStatus
 from backtide.service.web_control import (
     CHANGES,
     COMMANDS,
     READS,
     SESSION_COMMANDS,
+    SIGNED_IN_READS,
+    TOUCH_CHANGES,
     Bucket,
     WebControlServer,
     ask_snapshots,
@@ -309,7 +314,11 @@ def test_nothing_outside_the_list_is_served(
 def test_the_list_is_closed() -> None:
     from backtide.service.web_control import PASSKEY_COMMANDS, SIGN_IN_COMMANDS
 
-    assert COMMANDS == READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS | SIGN_IN_COMMANDS
+    assert COMMANDS == (
+        READS | SIGNED_IN_READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS | SIGN_IN_COMMANDS
+    )
+    assert not SIGNED_IN_READS & READS  # an answer is never a read without a session
+    assert "task_stop" not in COMMANDS  # only the CLI's Ctrl-C
     assert {"passkeys", "passkey_remove"}.isdisjoint(COMMANDS)  # only root takes a key out
     assert not READS & CHANGES and not (READS | CHANGES) & SESSION_COMMANDS
     assert not (READS | CHANGES | SESSION_COMMANDS) & PASSKEY_COMMANDS
@@ -642,6 +651,7 @@ CHANGE_REQUESTS = [
     {"cmd": "clear_secret", "kind": "openai"},
     {"cmd": "set_budget", "daily_usd": "2"},
     {"cmd": "accept_prices", "digest": "0123456789abcdef"},
+    {"cmd": "task_start", "prompt": "borra todo"},
 ]
 
 
@@ -1773,3 +1783,177 @@ def test_the_web_sees_each_keys_whole_id_to_ask_by_it(
     listed = talk(server, {"cmd": "passkey_list", "session": keyed.session})["keys"]
     assert [k["id"] for k in listed] == [k.id for k in keyed.keys.keys()]
     assert all(set(k) == {"id", "name", "tail", "added"} for k in listed)  # never a public key
+
+
+# --- the tasks (T26-5a, docs/47 section 7.1) ------------------------------------------------------
+
+TASK_ID = "c0de" * 8
+SECRET_ANSWER = "la clave era sk-ant-api03-" + "A1b2C3d4" * 8
+
+
+class Tasks:
+    """What a Guardian does with tasks: records what reaches it."""
+
+    def __init__(self, guardian: FakeGuardian) -> None:
+        self.started: list[tuple[str, bool, int | None, str]] = []
+        self.read: list[str] = []
+        self.stopped: list[str] = []
+        guardian.task_start = self.task_start  # type: ignore[attr-defined]
+        guardian.task_status = self.task_status  # type: ignore[attr-defined]
+        guardian.task_stop = self.task_stop  # type: ignore[attr-defined]
+
+    def task_start(
+        self, prompt: str, *, resume: bool = False, seconds: int | None = None, requested_by: str
+    ) -> TaskStart:
+        self.started.append((prompt, resume, seconds, requested_by))
+        return TaskStart(TASK_ID)
+
+    def task_status(self, task_id: str) -> TaskStatus:
+        self.read.append(task_id)
+        return TaskStatus(task_id, TaskOutcome.OK, "", SECRET_ANSWER, 0, 1.0)
+
+    def task_stop(self, task_id: str) -> bool:
+        self.stopped.append(task_id)
+        return True
+
+
+@pytest.fixture
+def tasks(guardian: FakeGuardian) -> Tasks:
+    return Tasks(guardian)
+
+
+NO_SESSIONS = [{}, {"session": "x" * 43}, {"session": 3}, {"session": None}]
+
+
+@pytest.mark.parametrize("carried", NO_SESSIONS)
+def test_a_task_without_a_live_session_is_refused(
+    make_server: Callable[..., WebControlServer], tasks: Tasks, carried: dict[str, Any]
+) -> None:
+    reply = talk(make_server(), {"cmd": "task_start", "prompt": "borra todo", **carried})
+    assert reply["ok"] is False and reply["outcome"] == "refused"
+    assert "sesión" in reply["message"] and tasks.started == []
+
+
+@pytest.mark.parametrize("carried", NO_SESSIONS)
+def test_an_answer_without_a_live_session_is_refused(
+    make_server: Callable[..., WebControlServer], tasks: Tasks, carried: dict[str, Any]
+) -> None:
+    """The one read of this socket that takes a session: answers are not in the black box, which
+    is what the web's group may read anyway."""
+    reply = talk(make_server(), {"cmd": "task_status", "task": TASK_ID, **carried})
+    assert reply["ok"] is False and reply["outcome"] == "refused"
+    assert "answer" not in reply and "sk-ant" not in json.dumps(reply)
+    assert tasks.read == []
+
+
+def test_a_session_that_ended_reads_no_answer(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    server = make_server()
+    assert talk(server, {"cmd": "session_end", "session": SESSION})["outcome"] == "ended"
+    assert talk(server, signed({"cmd": "task_status", "task": TASK_ID}))["outcome"] == "refused"
+    assert talk(server, signed({"cmd": "task_start", "prompt": "x"}))["outcome"] == "refused"
+    assert tasks.read == [] and tasks.started == []
+
+
+def test_a_live_session_gives_a_task_as_the_web(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    reply = talk(make_server(), signed({"cmd": "task_start", "prompt": "hola", "continue": True}))
+    assert reply == {"ok": True, "outcome": "started", "message": "", "task": TASK_ID}
+    ((prompt, resume, seconds, by),) = tasks.started
+    assert (prompt, resume, seconds) == ("hola", True, None)
+    assert by == f"web (uid {ME}, pid 4242)"
+
+
+def test_the_web_cannot_say_it_is_the_cli(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    reply = talk(make_server(), signed({"cmd": "task_start", "prompt": "hola", "via": "cli"}))
+    assert reply["outcome"] == "refused" and tasks.started == []
+
+
+def test_a_live_session_reads_the_answer(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    reply = talk(make_server(), signed({"cmd": "task_status", "task": TASK_ID}))
+    assert reply["ok"] is True and reply["outcome"] == "ok" and reply["answer"] == SECRET_ANSWER
+    assert tasks.read == [TASK_ID]
+
+
+def test_the_web_cannot_stop_a_task_nor_open_the_old_way(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    """Not on its list, with a session or without. Nor `shell`, whose reply names the container."""
+    server = make_server()
+    for request in (
+        {"cmd": "task_stop", "task": TASK_ID},
+        signed({"cmd": "task_stop", "task": TASK_ID}),
+    ):
+        reply = talk(server, request)
+        assert reply["outcome"] == "refused" and "no se acepta" in reply["message"]
+    request = signed({"cmd": "shell", "kind": "session", "continue": False})
+    assert talk(server, request)["outcome"] == "refused"
+    assert tasks.stopped == []
+
+
+def test_reading_an_answer_does_not_keep_a_session_alive(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    """A chat left open asks by itself: the idle hour goes on counting (as the panel's stream)."""
+    now = [0.0]
+    sessions = Sessions(clock=lambda: now[0])
+    sessions.preset(SESSION)
+    server = make_server(sessions=sessions)
+    for _ in range(2):
+        now[0] += IDLE_SECONDS / 2 - 1
+        assert talk(server, signed({"cmd": "task_status", "task": TASK_ID}))["ok"] is True
+    now[0] += 10
+    assert talk(server, signed({"cmd": "task_status", "task": TASK_ID}))["outcome"] == "refused"
+
+
+def test_a_task_counts_as_using_the_session(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    now = [0.0]
+    sessions = Sessions(clock=lambda: now[0])
+    sessions.preset(SESSION)
+    server = make_server(sessions=sessions)
+    now[0] += IDLE_SECONDS - 1
+    assert talk(server, signed({"cmd": "task_start", "prompt": "hola"}))["ok"] is True
+    now[0] += IDLE_SECONDS - 1
+    assert sessions.check(SESSION) is not None
+
+
+def test_a_task_spends_the_changes_bucket_and_an_answer_does_not(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    server = make_server(changes=Bucket(1, 0.001))
+    assert talk(server, signed({"cmd": "task_start", "prompt": "uno"}))["ok"] is True
+    reply = talk(server, signed({"cmd": "task_start", "prompt": "dos"}))
+    assert reply["outcome"] == "refused" and "Demasiados" in reply["message"]
+    assert len(tasks.started) == 1
+    assert talk(server, signed({"cmd": "task_status", "task": TASK_ID}))["ok"] is True
+
+
+def test_an_answer_spends_the_requests_bucket(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    server = make_server(requests=Bucket(1, 0.001))
+    assert talk(server, signed({"cmd": "task_status", "task": TASK_ID}))["ok"] is True
+    assert talk(server, signed({"cmd": "task_status", "task": TASK_ID}))["outcome"] == "refused"
+
+
+def test_a_task_does_not_ask_to_touch_the_key() -> None:
+    """Docs/47, table 5.3: what the terminal does for hours does; a task, like approving, is what
+    happens every day."""
+    assert "task_start" not in TOUCH_CHANGES
+
+
+def test_the_longest_prompt_fits_with_its_session(
+    make_server: Callable[..., WebControlServer], tasks: Tasks
+) -> None:
+    prompt = "ñ" * MAX_PROMPT
+    server = make_server()
+    reply = ask_task_start(server.path, prompt, peer=the_web, server_uid=None, session=SESSION)
+    assert reply["ok"] is True and tasks.started[0][0] == prompt

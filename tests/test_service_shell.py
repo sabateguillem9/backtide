@@ -3,12 +3,18 @@
 commands (OpenClaw too, D27), `importar` and `exportar` only for a shell profile, only with the
 agent running, always recorded first. The Guardian is test_service_guardian.py's, with its fakes."""
 
+import json
+import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from backtide.jail import docker
 from backtide.jail.profiles import CLAUDE_CODE, OPENCLAW
+from backtide.service import tasks as tasks_module
 from backtide.service.guardian import AgentState
 from backtide.service.shell import ExportStatus, ShellStatus
 from backtide.snapshots import Reason, Snapshot
@@ -360,3 +366,90 @@ def test_what_is_not_a_bundle_is_not_exported(shell_world: World, tmp_path: Path
     outcome = shell_world.guardian.export(str(out), requested_by="cli", bundle=BUNDLE, repo=".")
     assert outcome.status is ExportStatus.FAILED and not out.exists()
     assert shell_world.only("export_failed").details["kind"] == "bundle"
+
+
+# --- the tasks (T26-5a): the real Guardian and its black box, with a double of the container ------
+
+SECRET_ANSWER = "T06 la clave era sk-ant-api03-" + "A1b2C3d4" * 8
+
+
+def claude_says(text: str) -> subprocess.CompletedProcess[str]:
+    body = json.dumps({"type": "result", "is_error": False, "result": text})
+    return subprocess.CompletedProcess([], 0, body, "")
+
+
+def finished(world: World, task_id: str) -> Any:  # noqa: F811
+    tasks = world.guardian._tasks  # noqa: SLF001
+    assert tasks._tasks[task_id].finished.wait(10)  # noqa: SLF001
+    return world.guardian.task_status(task_id)
+
+
+def test_a_task_is_recorded_from_start_to_end_and_the_answer_stays_out(
+    shell_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invariant 5: the agent's answer, here with a secret, is for whoever asked. In the black box:
+    the prompt struck and cut, and at the end the code, the time and the answer's length."""
+    monkeypatch.setattr(docker, "run", lambda args, **options: claude_says(SECRET_ANSWER))
+    started = shell_world.guardian.task_start("hola", requested_by="cli (uid 1, pid 2)")
+    assert started.task_id is not None
+    status = finished(shell_world, started.task_id)
+    assert status.answer == SECRET_ANSWER
+
+    opened = shell_world.only("agent_shell")
+    assert opened.target == "task" and opened.details["task"] == started.task_id
+    assert opened.details["prompt"] == "hola" and opened.details["requested_by"].startswith("cli")
+    ended = shell_world.only("agent_task_end")
+    assert (ended.source, ended.target) == ("system", "task")
+    assert ended.details == {
+        "task": started.task_id,
+        "outcome": "ok",
+        "code": 0,
+        "seconds": status.seconds,
+        "answer_chars": len(SECRET_ANSWER),
+        "requested_by": "cli (uid 1, pid 2)",
+    }
+    assert opened.seq < ended.seq
+    every = json.dumps([[e.target, e.details] for e in shell_world.box.events()], default=str)
+    assert "sk-ant" not in every and "T06 la clave" not in every
+
+
+def test_a_paused_agent_runs_no_task_and_records_none(
+    shell_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran: list[Any] = []
+    monkeypatch.setattr(docker, "run", lambda args, **options: ran.append(args))
+    shell_world.guardian._pause_reasons.add("test")  # noqa: SLF001
+    shell_world.guardian._agent_state = AgentState.FROZEN  # noqa: SLF001
+    started = shell_world.guardian.task_start("hola", requested_by="cli")
+    assert started.task_id is not None
+    status = finished(shell_world, started.task_id)
+    assert status.outcome == "refused" and "pausa" in status.message
+    assert ran == [] and shell_world.events("agent_shell") == []
+    assert shell_world.events("agent_task_end") == []
+
+
+def test_a_service_that_stops_records_the_end_of_what_runs_first(
+    shell_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end of the task goes in before ``service_stop``, and the black box still takes it."""
+    reached, let_go = threading.Event(), threading.Event()
+
+    def run(args: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        if "/usr/bin/pkill" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        reached.set()
+        assert let_go.wait(10)
+        return subprocess.CompletedProcess(args, 124, "", "")
+
+    monkeypatch.setattr(docker, "run", run)
+    monkeypatch.setattr(tasks_module, "CLOSE_WAIT", 0.05)
+    started = shell_world.guardian.task_start("hola", requested_by="cli")
+    assert started.task_id is not None and reached.wait(10)
+    try:
+        shell_world.guardian.stop()
+    finally:
+        let_go.set()
+    ended = shell_world.only("agent_task_end")
+    assert ended.details["outcome"] == "stopped"
+    assert ended.seq < shell_world.only("service_stop").seq
+    assert shell_world.guardian.task_start("tarde", requested_by="cli").task_id is None

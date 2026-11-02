@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from backtide.blackbox import redact
+from backtide.jail.profile import MAX_PROMPT, check_prompt
 from backtide.service.holds import (
     BATCH_ID_RE,
     HOLD_ID_RE,
@@ -98,15 +99,20 @@ from backtide.service.settings import KINDS as SECRET_KINDS
 from backtide.service.settings import TELEGRAM as SECRET_TELEGRAM
 from backtide.service.settings import Applied, Outcome, SettingsOutcome
 from backtide.service.shell import (
-    PROMPT_RECORDED,
     REPO_RE,
     ExportOutcome,
     ExportStatus,
     ShellOutcome,
     ShellStatus,
-    recorded_prompt,
 )
 from backtide.service.spend import CAP_SHAPE, CapOutcome, check_cap
+from backtide.service.tasks import (
+    MAX_TASK_SECONDS,
+    TASK_MAX_OUTPUT,
+    TaskOutcome,
+    TaskStart,
+    TaskStatus,
+)
 from backtide.service.trust import TRUST_ID_RE
 from backtide.snapshots import Snapshot
 
@@ -169,8 +175,9 @@ SETTINGS_REQUESTERS = frozenset({"cli", "web"})
 SETTINGS_OUTCOMES = frozenset({*(str(status) for status in Outcome), REFUSED})
 APPLIED = frozenset(str(applied) for applied in Applied)
 MAX_SECRET_CHARS = 256
-# The shell mode (T17a-4): what `backtide entrar`/`tarea` and `importar` may say.
-SHELL_REQUEST_KINDS = frozenset({"session", "task", "bundle"})
+# The shell mode (T17a-4): what `backtide entrar` and `importar` may say. A task is not on this
+# list since T26-5a: the service runs it (`task_start`), so there is nothing to open for the CLI.
+SHELL_REQUEST_KINDS = frozenset({"session", "bundle"})
 SHELL_OUTCOMES = frozenset({*(str(status) for status in ShellStatus), REFUSED})
 EXPORT_OUTCOMES = frozenset({*(str(status) for status in ExportStatus), REFUSED})
 IMPORT_KEYS = frozenset(
@@ -184,6 +191,25 @@ _WORKDIR_RE = re.compile(r"/workspace(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*", re.
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 MAX_SKIPPED_NAMES = 20
 MAX_SKIPPED_TEXT = 300
+# The tasks (T26-5a, backtide/service/tasks.py). The one request that may pass MAX_REQUEST_BYTES:
+# it starts like this, as the clients here write it, and carries a prompt of up to MAX_PROMPT
+# characters, each up to 12 bytes in JSON. Its reply, an answer: 6 bytes per byte in the worst case.
+TASK_REQUEST_START = b'{"cmd": "task_start", '
+MAX_TASK_REQUEST_BYTES = 12 * MAX_PROMPT + MAX_REQUEST_BYTES
+MAX_TASK_REPLY_BYTES = 6 * TASK_MAX_OUTPUT + MAX_REPLY_BYTES
+TASK_REQUESTERS = frozenset({"cli", "web"})
+TASK_ID_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
+TASK_UNKNOWN = "unknown"
+TASK_UNKNOWN_MESSAGE = (
+    "Este servicio no conoce esa tarea: las respuestas viven en memoria, se pierden al reiniciar "
+    "y solo se guardan las últimas."
+)
+TASK_START_OUTCOMES = frozenset({"started", REFUSED})
+TASK_STATUS_OUTCOMES = frozenset(
+    {*(str(outcome) for outcome in TaskOutcome), TASK_UNKNOWN, REFUSED}
+)
+TASK_STOP_OUTCOMES = frozenset({"stopped", "failed", TASK_UNKNOWN, REFUSED})
+TASK_STOP_REPLY_TIMEOUT = 2 * 60.0  # up to three ``pkill`` of 30 s each, inside the agent
 
 
 class ControlError(Exception):
@@ -230,6 +256,14 @@ class RewindService(Protocol):
         requested_by: str,
         details: dict[str, Any] | None = None,
     ) -> ShellOutcome: ...
+
+    def task_start(
+        self, prompt: str, *, resume: bool = False, seconds: int | None = None, requested_by: str
+    ) -> TaskStart: ...
+
+    def task_status(self, task_id: str) -> TaskStatus | None: ...
+
+    def task_stop(self, task_id: str) -> bool | None: ...
 
     def export(
         self,
@@ -459,15 +493,19 @@ class ControlServer:
         """The request: one JSON object on a line of at most 4 KiB, within the deadline."""
         deadline = time.monotonic() + self._request_timeout
         buffer = b""
+        limit = MAX_REQUEST_BYTES
         while b"\n" not in buffer:
-            if len(buffer) > MAX_REQUEST_BYTES:
-                break
+            if len(buffer) > limit:
+                # Only a task may be longer: the owner's prompt (T26-5a). All else stops here.
+                if limit == MAX_TASK_REQUEST_BYTES or not buffer.startswith(TASK_REQUEST_START):
+                    break
+                limit = MAX_TASK_REQUEST_BYTES
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise _BadRequest("La petición ha tardado demasiado en llegar.")
             sock.settimeout(remaining)
             try:
-                chunk = sock.recv(MAX_REQUEST_BYTES + 1 - len(buffer))
+                chunk = sock.recv(limit + 1 - len(buffer))
             except TimeoutError:
                 raise _BadRequest("La petición ha tardado demasiado en llegar.") from None
             except OSError as error:
@@ -476,14 +514,16 @@ class ControlServer:
                 break  # the client closed its side: what it sent is the request
             buffer += chunk
         line = buffer.split(b"\n", 1)[0]
-        if len(line) > MAX_REQUEST_BYTES:
-            raise _BadRequest(f"La petición pasa de {MAX_REQUEST_BYTES} bytes: no se atiende.")
+        if len(line) > limit:
+            raise _BadRequest(f"La petición pasa de {limit} bytes: no se atiende.")
         try:
             request = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError, RecursionError):
             raise _BadRequest("La petición no es un JSON válido.") from None
         if not isinstance(request, dict):
             raise _BadRequest("La petición tiene que ser un objeto JSON.")
+        if len(line) > MAX_REQUEST_BYTES and request.get("cmd") != "task_start":  # a repeated key
+            raise _BadRequest(f"La petición pasa de {MAX_REQUEST_BYTES} bytes: no se atiende.")
         return request
 
     def _handle(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
@@ -510,6 +550,12 @@ class ControlServer:
             return self._budget_command(request, pid, uid)
         if command in ("shell", "import"):
             return self._shell(request, pid, uid)
+        if command == "task_start":
+            return self._task_start(request, pid, uid)
+        if command == "task_status":
+            return self._task_status(request)
+        if command == "task_stop":
+            return self._task_stop(request, pid, uid)
         if command == "export":
             return self._export(request, pid, uid)
         if command == "web_link":
@@ -676,22 +722,11 @@ class ControlServer:
     def _shell(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         details: dict[str, Any] | None = None
         if request["cmd"] == "shell":
-            if set(request) - {"prompt"} != {"cmd", "kind", "continue"}:
-                raise _BadRequest(
-                    "Una petición de shell lleva `cmd`, `kind` y `continue` (y, una tarea, "
-                    "`prompt`)."
-                )
+            if set(request) != {"cmd", "kind", "continue"}:
+                raise _BadRequest("Una petición de shell lleva `cmd`, `kind` y `continue`.")
             kind, resume = request["kind"], request["continue"]
             if kind not in SHELL_REQUEST_KINDS or not isinstance(resume, bool):
-                raise _BadRequest("`kind` es session o task, y `continue` es true o false.")
-            if "prompt" in request:
-                prompt = request["prompt"]
-                if kind != "task" or not isinstance(prompt, str) or len(prompt) > PROMPT_RECORDED:
-                    raise _BadRequest(
-                        f"`prompt` es de una tarea: un texto de {PROMPT_RECORDED} caracteres "
-                        "como mucho."
-                    )
-                details = recorded_prompt(prompt)  # struck again here: the record is ours
+                raise _BadRequest("`kind` es session o bundle, y `continue` es true o false.")
         else:
             if set(request) != {"cmd", *IMPORT_KEYS}:
                 raise _BadRequest(
@@ -715,6 +750,82 @@ class ControlServer:
             "user": outcome.user,
             "workdir": outcome.workdir,
         }
+
+    def _task_start(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """Take a task (T26-5a, backtide/service/tasks.py). Its id comes back at once: nothing of
+        the task runs on this thread. The prompt never reaches a message or a log here."""
+        if not {"cmd", "prompt"} <= set(request) <= {"cmd", "prompt", "continue", "seconds", "via"}:
+            raise _BadRequest("Una tarea lleva `cmd` y `prompt`, y quizá `continue` y `seconds`.")
+        via = request.get("via", "cli")
+        if not isinstance(via, str) or via not in TASK_REQUESTERS:
+            raise _BadRequest("`via` es cli o web.")
+        resume, seconds = request.get("continue", False), request.get("seconds")
+        if not isinstance(resume, bool):
+            raise _BadRequest("`continue` es true o false.")
+        if seconds is not None and (
+            type(seconds) is not int or not 1 <= seconds <= MAX_TASK_SECONDS
+        ):
+            raise _BadRequest(f"`seconds` va de 1 a {MAX_TASK_SECONDS}.")
+        try:
+            prompt = check_prompt(request["prompt"])
+            prompt.encode()  # a lone surrogate of JSON's \\u is not an argument of docker exec
+        except (ValueError, UnicodeEncodeError):
+            raise _BadRequest(
+                f"`prompt` es un texto de {MAX_PROMPT} caracteres como mucho, y no vacío."
+            ) from None
+        try:
+            started = self._guardian.task_start(
+                prompt, resume=resume, seconds=seconds, requested_by=f"{via} (uid {uid}, pid {pid})"
+            )
+        except Exception as error:  # its type alone: its text could carry the prompt
+            logger.error("starting a task raised %s instead of answering", type(error).__name__)
+            return _refusal("Ha fallado algo inesperado: no se empieza la tarea.")
+        if started.task_id is None:
+            return _refusal(started.message)
+        return {"ok": True, "outcome": "started", "message": "", "task": started.task_id}
+
+    def _task_status(self, request: dict[str, Any]) -> dict[str, Any]:
+        """How a task goes, with its answer when it ended: the agent's text, as it came. On the
+        web's socket it takes a live session (``WebControlServer``): it is not in the black box."""
+        task_id = self._task_id_of(request)
+        try:
+            status = self._guardian.task_status(task_id)
+        except Exception as error:
+            logger.error("reading a task raised %s instead of answering", type(error).__name__)
+            return _refusal("Ha fallado algo inesperado: no se sabe cómo va la tarea.")
+        if status is None:
+            return {"ok": False, "outcome": TASK_UNKNOWN, "message": TASK_UNKNOWN_MESSAGE}
+        return {
+            "ok": True,
+            "outcome": str(status.outcome),
+            "message": status.message,
+            "task": task_id,
+            "answer": status.answer,
+            "code": status.code,
+            "seconds": status.seconds,
+        }
+
+    def _task_stop(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """Ctrl-C in `backtide tarea`: stop the task inside the agent. Not on the web's list."""
+        task_id = self._task_id_of(request)
+        try:
+            stopped = self._guardian.task_stop(task_id)
+        except Exception as error:
+            logger.error("stopping a task raised %s instead of answering", type(error).__name__)
+            stopped = False
+        if stopped is None:
+            return {"ok": False, "outcome": TASK_UNKNOWN, "message": TASK_UNKNOWN_MESSAGE}
+        logger.info("task %s: uid %d (pid %d) asked to stop it", task_id[:8], uid, pid)
+        return {"ok": stopped, "outcome": "stopped" if stopped else "failed", "message": ""}
+
+    @staticmethod
+    def _task_id_of(request: dict[str, Any]) -> str:
+        if set(request) != {"cmd", "task"}:
+            raise _BadRequest("Esa orden lleva `cmd` y `task`, y nada más.")
+        task_id = request["task"]
+        if not _is_task_id(task_id):
+            raise _BadRequest("Eso no es el identificador de una tarea.")
+        return task_id
 
     def _export(self, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
         keys = set(request)
@@ -2172,11 +2283,11 @@ def _connect(path: Path, peer: PeerCredentials, server_uid: int | None = None) -
 
 
 def _read_all(sock: socket.socket, limit: int = MAX_REPLY_BYTES) -> bytes:
-    data = b""
+    data = bytearray()
     while len(data) <= limit:
         chunk = sock.recv(65536)
         if not chunk:
-            return data
+            return bytes(data)
         data += chunk
     raise ControlOutcomeUnknown(
         "La respuesta del servicio es demasiado grande: no se usa. No se sabe si el rebobinado "
@@ -2262,25 +2373,20 @@ def ask_shell(
     *,
     resume: bool = False,
     import_details: Mapping[str, Any] | None = None,
-    prompt: str | None = None,
     wait: float = WAIT_FOR_SERVICE,
     peer: PeerCredentials = peer_credentials,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    """Ask the service whether `backtide entrar` (``kind`` "session"), `tarea` ("task") or
-    `importar` ("import", with ``import_details``: name, source, files, bytes, replace, and the
-    secrets it left out or took) or `exportar --git` ("bundle": the agent makes it) may run
-    now, recorded. A task's ``prompt`` goes into the record struck and cut
-    (``backtide.service.shell.recorded_prompt``, on both sides). Returns ``ok``, ``outcome``,
-    ``message`` and, when ``ok``, the ``container``, ``user`` and ``workdir`` for docker exec,
-    checked. Same retries and errors as ask_rewind."""
+    """Ask the service whether `backtide entrar` (``kind`` "session"), `importar` ("import", with
+    ``import_details``: name, source, files, bytes, replace, and the secrets it left out or took)
+    or `exportar --git` ("bundle": the agent makes it) may run now, recorded. Returns ``ok``,
+    ``outcome``, ``message`` and, when ``ok``, the ``container``, ``user`` and ``workdir`` for
+    docker exec, checked. Same retries and errors as ask_rewind. A task is ``ask_task_start``."""
     if kind == "import":
         request: dict[str, Any] = {"cmd": "import", **dict(import_details or {})}
     elif kind in SHELL_REQUEST_KINDS:
         request = {"cmd": "shell", "kind": kind, "continue": resume}
-        if kind == "task" and prompt is not None:
-            request["prompt"] = recorded_prompt(prompt)["prompt"]
     else:
         raise ValueError(f"unknown kind {kind!r}")
     raw = _ask(
@@ -2325,6 +2431,136 @@ def ask_shell(
             "workdir": workdir,
         }
     return checked
+
+
+def ask_task_start(
+    path: Path,
+    prompt: str,
+    *,
+    resume: bool = False,
+    seconds: int | None = None,
+    via: str | None = None,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+    session: str | None = None,
+) -> dict[str, Any]:
+    """Give the agent a task (`backtide tarea`, the web's chat). Returns ``ok``, ``outcome``
+    ("started" or "refused"), ``message`` and, when ``ok``, its id as ``task``: at once, whatever
+    the task takes. ``ask_task_status`` says how it goes. Same retries and errors as ask_rewind."""
+    request: dict[str, Any] = {"cmd": "task_start", "prompt": prompt, "continue": resume}
+    if seconds is not None:
+        request["seconds"] = seconds
+    if via is not None:
+        request["via"] = via
+    raw = _ask(
+        Path(path),
+        request,
+        what="la tarea",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        server_uid=server_uid,
+        session=session,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in TASK_START_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+        or (reply["ok"] and not _is_task_id(reply.get("task")))
+    ):
+        raise ControlOutcomeUnknown(
+            "La respuesta del servicio no es la esperada. La tarea puede estar en marcha: mira la "
+            "caja negra."
+        )
+    checked = {"ok": reply["ok"], "outcome": reply["outcome"], "message": reply["message"]}
+    return {**checked, "task": reply["task"]} if reply["ok"] else checked
+
+
+def ask_task_status(
+    path: Path,
+    task_id: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+    session: str | None = None,
+) -> dict[str, Any]:
+    """How a task goes: ``ok`` (False if it is not known here, or refused), ``outcome`` (a
+    ``TaskOutcome``, "unknown" or "refused"), ``message``, and its ``answer``, ``code`` and
+    ``seconds`` once it ended. The answer and the message can carry the agent's text, as it came:
+    whoever shows them escapes them."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "task_status", "task": task_id},
+        what="la pregunta",
+        wait=wait,
+        reply_timeout=REPLY_TIMEOUT * 6,
+        peer=peer,
+        server_uid=server_uid,
+        session=session,
+        sleep=sleep,
+        monotonic=monotonic,
+        max_reply=MAX_TASK_REPLY_BYTES,
+    )
+    reply = _json_or_none(raw)
+    if (
+        not isinstance(reply, dict)
+        or reply.get("outcome") not in TASK_STATUS_OUTCOMES
+        or not isinstance(reply.get("ok"), bool)
+        or not isinstance(reply.get("message"), str)
+        or not isinstance(reply.get("answer"), str | None)
+        or not (reply.get("code") is None or type(reply.get("code")) is int)
+        or not (reply.get("seconds") is None or type(reply.get("seconds")) in (int, float))
+    ):
+        raise ControlOutcomeUnknown("La respuesta del servicio no es la esperada.")
+    return {
+        "ok": reply["ok"],
+        "outcome": reply["outcome"],
+        "message": reply["message"],
+        "answer": reply.get("answer"),
+        "code": reply.get("code"),
+        "seconds": reply.get("seconds"),
+    }
+
+
+def ask_task_stop(
+    path: Path,
+    task_id: str,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Ctrl-C in `backtide tarea`: stop the task inside the agent. True if nothing of it is left or
+    it was signalled; False if it may run on, or the service did not say."""
+    raw = _ask(
+        Path(path),
+        {"cmd": "task_stop", "task": task_id},
+        what="la orden de parar",
+        wait=wait,
+        reply_timeout=TASK_STOP_REPLY_TIMEOUT,
+        peer=peer,
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    reply = _json_or_none(raw)
+    if not isinstance(reply, dict) or reply.get("outcome") not in TASK_STOP_OUTCOMES:
+        raise ControlOutcomeUnknown("La respuesta del servicio no es la esperada.")
+    return reply.get("ok") is True
+
+
+def _is_task_id(value: object) -> bool:
+    return isinstance(value, str) and TASK_ID_RE.fullmatch(value) is not None
 
 
 def ask_export(

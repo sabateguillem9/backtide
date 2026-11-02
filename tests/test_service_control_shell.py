@@ -10,16 +10,24 @@ from typing import Any
 
 import pytest
 
+from backtide.jail.profile import MAX_PROMPT
+from backtide.service import control
 from backtide.service.control import (
+    MAX_REQUEST_BYTES,
     ControlOutcomeUnknown,
     ControlServer,
     ask_export,
     ask_shell,
+    ask_task_start,
+    ask_task_status,
+    ask_task_stop,
 )
 from backtide.service.shell import ExportOutcome, ExportStatus, ShellOutcome, ShellStatus
+from backtide.service.tasks import TaskOutcome, TaskStart, TaskStatus
 from tests.test_service_control import FakeGuardian, me, talk
 
 CONTAINER_ID = "ab12" * 16
+TASK_ID = "c0de" * 8
 READY = ShellOutcome(
     ShellStatus.READY, "", "backtide-agente", "61000:61000", "/workspace/work", CONTAINER_ID
 )
@@ -36,6 +44,10 @@ class ShellGuardian(FakeGuardian):
         self.shells: list[tuple[str, bool, str, Any]] = []
         self.exports: list[tuple[str, str, dict[str, Any]]] = []
         self.shell_outcome = READY
+        self.tasks: list[tuple[str, bool, int | None, str]] = []
+        self.task_started = TaskStart(TASK_ID)
+        self.task_seen: TaskStatus | None = TaskStatus(TASK_ID, TaskOutcome.RUNNING)
+        self.task_stopped: bool | None = True
         self.export_outcome = ExportOutcome(
             ExportStatus.DONE, "", "/home/me/out", SNAP, {"files": 2, "bytes": 9}
         )
@@ -47,6 +59,24 @@ class ShellGuardian(FakeGuardian):
         if self.error is not None:
             raise self.error
         return self.shell_outcome
+
+    def task_start(
+        self, prompt: str, *, resume: bool = False, seconds: int | None = None, requested_by: str
+    ) -> TaskStart:
+        self.tasks.append((prompt, resume, seconds, requested_by))
+        if self.error is not None:
+            raise self.error
+        return self.task_started
+
+    def task_status(self, task_id: str) -> TaskStatus | None:
+        if self.error is not None:
+            raise self.error
+        return self.task_seen
+
+    def task_stop(self, task_id: str) -> bool | None:
+        if self.error is not None:
+            raise self.error
+        return self.task_stopped
 
     def export(self, destination: str, *, requested_by: str, **bundle: Any) -> ExportOutcome:
         self.exports.append((destination, requested_by, bundle))
@@ -90,39 +120,17 @@ def test_a_shell_request_reaches_the_guardian(
     assert (kind, resume, details) == ("session", True, None) and by.startswith("cli (uid ")
 
 
-def test_a_tasks_prompt_is_recorded_struck_and_cut(
-    server: ControlServer, guardian: ShellGuardian
-) -> None:
-    """What was asked goes into the record (``system/agent_shell``), struck of what looks like a
-    secret BEFORE it is cut (a secret cut in half would not be struck), at most 200 characters,
-    and ``slash`` for an agent's own command."""
-    secret = "sk-ant-api03-" + "A1b2C3d4" * 8
-    prompt = f"usa la clave {secret} y " + "x" * 400
-    assert ask_shell(server.path, "task", prompt=prompt, peer=me)["ok"]
-    assert ask_shell(server.path, "task", prompt="  /new", peer=me)["ok"]
-    (_, _, _, first), (_, _, _, second) = guardian.shells
-    assert secret not in first["prompt"] and secret[:20] not in first["prompt"]
-    assert first["prompt"].startswith("usa la clave ") and len(first["prompt"]) == 200
-    assert first["slash"] is False
-    assert second == {"prompt": "  /new", "slash": True}
-    # Sent raw to the socket, it is struck there too: the record is the service's.
-    reply = send(
-        server, {"cmd": "shell", "kind": "task", "continue": False, "prompt": f"k {secret}"}
-    )
-    assert reply["ok"] and secret not in guardian.shells[-1][3]["prompt"]
-
-
 @pytest.mark.parametrize(
     "request_",
     [
         {"cmd": "shell", "kind": "session"},
         {"cmd": "shell", "kind": "import", "continue": False},
         {"cmd": "shell", "kind": "root", "continue": False},
-        {"cmd": "shell", "kind": "task", "continue": "yes"},
-        {"cmd": "shell", "kind": "task", "continue": False, "argv": ["sh"]},
+        {"cmd": "shell", "kind": "task", "continue": False},
+        {"cmd": "shell", "kind": "task", "continue": False, "prompt": "hola"},
+        {"cmd": "shell", "kind": "session", "continue": "yes"},
+        {"cmd": "shell", "kind": "session", "continue": False, "argv": ["sh"]},
         {"cmd": "shell", "kind": "session", "continue": False, "prompt": "hola"},
-        {"cmd": "shell", "kind": "task", "continue": False, "prompt": 3},
-        {"cmd": "shell", "kind": "task", "continue": False, "prompt": "x" * 201},
         {"cmd": "import", "name": "r", "source": "/s", "files": 1, "bytes": 1},
         {"cmd": "import", "name": "r", "source": "/s", "files": -1, "bytes": 1, "replace": False},
         {"cmd": "import", "name": "r", "source": "/s", "files": True, "bytes": 1, "replace": False},
@@ -169,7 +177,7 @@ def test_an_import_carries_its_counts(server: ControlServer, guardian: ShellGuar
 
 def test_a_refusal_comes_back_without_names(server: ControlServer, guardian: ShellGuardian) -> None:
     guardian.shell_outcome = ShellOutcome(ShellStatus.NOT_RUNNING, "El agente está en pausa.")
-    reply = ask_shell(server.path, "task", peer=me)
+    reply = ask_shell(server.path, "session", peer=me)
     assert reply == {"ok": False, "outcome": "not_running", "message": "El agente está en pausa."}
 
 
@@ -177,7 +185,7 @@ def test_a_guardian_that_raises_is_a_failure(
     server: ControlServer, guardian: ShellGuardian
 ) -> None:
     guardian.error = RuntimeError("boom")
-    reply = ask_shell(server.path, "task", peer=me)
+    reply = ask_shell(server.path, "session", peer=me)
     assert reply["outcome"] == "failed" and "boom" not in reply["message"]
 
 
@@ -267,3 +275,200 @@ def test_the_outcomes_a_client_accepts() -> None:
 
     assert SHELL_OUTCOMES == {"ready", "not_shell", "not_running", "failed", "refused"}
     assert EXPORT_OUTCOMES == {"done", "invalid", "not_shell", "failed", "refused"}
+
+
+# --- the tasks (T26-5a): the service runs them, this is who may ask ---------------------------
+
+
+def test_a_task_reaches_the_guardian_with_who_asked(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    reply = ask_task_start(server.path, "-rf todo", resume=True, seconds=120, peer=me)
+    assert reply == {"ok": True, "outcome": "started", "message": "", "task": TASK_ID}
+    ((prompt, resume, seconds, by),) = guardian.tasks
+    assert (prompt, resume, seconds) == ("-rf todo", True, 120)
+    assert by.startswith("cli (uid ")
+
+
+def test_a_task_without_a_deadline_takes_the_profiles(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    assert ask_task_start(server.path, "hola", peer=me)["ok"]
+    assert guardian.tasks[0][1:3] == (False, None)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["x" * MAX_PROMPT, "ñ" * MAX_PROMPT, "\x1b" * MAX_PROMPT, "\U0001f600" * MAX_PROMPT],
+)
+def test_the_longest_prompt_fits_however_json_writes_it(
+    server: ControlServer, guardian: ShellGuardian, prompt: str
+) -> None:
+    assert ask_task_start(server.path, prompt, peer=me)["ok"]
+    assert guardian.tasks[0][0] == prompt
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        {"cmd": "task_start"},
+        {"cmd": "task_start", "prompt": ""},
+        {"cmd": "task_start", "prompt": "   "},
+        {"cmd": "task_start", "prompt": 3},
+        {"cmd": "task_start", "prompt": "a\0b"},
+        {"cmd": "task_start", "prompt": "\ud800"},
+        {"cmd": "task_start", "prompt": "x" * (MAX_PROMPT + 1)},
+        {"cmd": "task_start", "prompt": "x", "continue": "yes"},
+        {"cmd": "task_start", "prompt": "x", "seconds": 0},
+        {"cmd": "task_start", "prompt": "x", "seconds": 86401},
+        {"cmd": "task_start", "prompt": "x", "seconds": 1.5},
+        {"cmd": "task_start", "prompt": "x", "seconds": True},
+        {"cmd": "task_start", "prompt": "x", "seconds": "60"},
+        {"cmd": "task_start", "prompt": "x", "via": "telegram"},
+        {"cmd": "task_start", "prompt": "x", "via": 3},
+        {"cmd": "task_start", "prompt": "x", "argv": ["sh"]},
+        {"cmd": "task_start", "prompt": "x", "container": "otro"},
+        {"cmd": "task_start", "prompt": "x", "image": "evil"},
+    ],
+)
+def test_a_malformed_task_never_reaches_the_guardian(
+    server: ControlServer, guardian: ShellGuardian, request_: dict[str, Any]
+) -> None:
+    reply = send(server, request_)
+    assert reply["outcome"] == "refused" and reply["ok"] is False
+    assert guardian.tasks == []
+
+
+def test_a_refusal_says_why_without_an_id(server: ControlServer, guardian: ShellGuardian) -> None:
+    guardian.task_started = TaskStart(None, "Ya tiene 8 tareas.")
+    reply = ask_task_start(server.path, "hola", peer=me)
+    assert reply == {"ok": False, "outcome": "refused", "message": "Ya tiene 8 tareas."}
+
+
+def test_a_guardian_that_raises_says_nothing_of_the_prompt(
+    server: ControlServer, guardian: ShellGuardian, caplog: pytest.LogCaptureFixture
+) -> None:
+    guardian.error = RuntimeError("MARCA-DEL-PROMPT")
+    assert ask_task_start(server.path, "hola", peer=me)["outcome"] == "refused"
+    assert ask_task_status(server.path, TASK_ID, peer=me)["outcome"] == "refused"
+    assert ask_task_stop(server.path, TASK_ID, peer=me) is False
+    assert "MARCA-DEL-PROMPT" not in caplog.text and "RuntimeError" in caplog.text
+
+
+def test_only_a_task_may_pass_the_size_of_any_other_request(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    """The longer limit is for the prompt: nothing else gets it, whether it starts like something
+    else or says ``task_start`` first and something else after."""
+    pad = "x" * (MAX_REQUEST_BYTES + 100)
+    for raw in (
+        json.dumps({"cmd": "holds", "pad": pad}),
+        json.dumps({"cmd": "task_start", "pad": pad}).replace('"pad"', '"cmd": "holds", "pad"'),
+    ):
+        reply = talk(server, raw.encode() + b"\n")
+        assert reply["outcome"] == "refused" and "bytes" in reply["message"]
+    assert guardian.tasks == []
+
+
+def test_a_task_longer_than_its_own_limit_is_refused(
+    server: ControlServer, guardian: ShellGuardian
+) -> None:
+    reply = talk(server, b'{"cmd": "task_start", ' + b"x" * (13 * MAX_PROMPT) + b"\n")
+    assert reply["outcome"] == "refused" and "bytes" in reply["message"]
+    assert guardian.tasks == []
+
+
+def test_the_status_of_a_task_that_ended(server: ControlServer, guardian: ShellGuardian) -> None:
+    guardian.task_seen = TaskStatus(TASK_ID, TaskOutcome.OK, "", "listo \x1b[2J", 0, 1.5)
+    assert ask_task_status(server.path, TASK_ID, peer=me) == {
+        "ok": True, "outcome": "ok", "message": "", "answer": "listo \x1b[2J", "code": 0,
+        "seconds": 1.5,
+    }  # fmt: skip
+
+
+def test_the_status_of_a_task_that_runs(server: ControlServer, guardian: ShellGuardian) -> None:
+    reply = ask_task_status(server.path, TASK_ID, peer=me)
+    assert reply["ok"] and reply["outcome"] == "running" and reply["answer"] is None
+
+
+def test_a_big_answer_comes_back_whole(server: ControlServer, guardian: ShellGuardian) -> None:
+    """Over the 64 KiB of any other reply, and with what JSON makes longest."""
+    answer = "\x1b" * (1024 * 1024)
+    guardian.task_seen = TaskStatus(TASK_ID, TaskOutcome.OK, "", answer, 0, 1.0)
+    assert ask_task_status(server.path, TASK_ID, peer=me)["answer"] == answer
+
+
+def test_a_task_it_does_not_know(server: ControlServer, guardian: ShellGuardian) -> None:
+    guardian.task_seen = None
+    guardian.task_stopped = None
+    reply = ask_task_status(server.path, TASK_ID, peer=me)
+    assert reply["ok"] is False and reply["outcome"] == "unknown" and reply["answer"] is None
+    assert ask_task_stop(server.path, TASK_ID, peer=me) is False
+
+
+@pytest.mark.parametrize("stopped", [True, False])
+def test_stopping_says_what_the_guardian_says(
+    server: ControlServer, guardian: ShellGuardian, stopped: bool
+) -> None:
+    guardian.task_stopped = stopped
+    assert ask_task_stop(server.path, TASK_ID, peer=me) is stopped
+
+
+@pytest.mark.parametrize("command", ["task_status", "task_stop"])
+@pytest.mark.parametrize(
+    "more",
+    [{}, {"task": 3}, {"task": "x"}, {"task": "../../etc"}, {"task": TASK_ID, "extra": 1},
+     {"task": TASK_ID.upper()}, {"task": TASK_ID + "\n"}],
+)  # fmt: skip
+def test_a_bad_id_is_refused(server: ControlServer, command: str, more: dict[str, Any]) -> None:
+    reply = send(server, {"cmd": command, **more})
+    assert reply["outcome"] == "refused" and reply["ok"] is False
+
+
+def _service_says(monkeypatch: pytest.MonkeyPatch, reply: dict[str, Any]) -> None:
+    monkeypatch.setattr(control, "_ask", lambda *args, **options: json.dumps(reply).encode())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"task": "x"},
+        {"task": None},
+        {"message": 3},
+        {"outcome": "made-up"},
+    ],
+)
+def test_the_client_does_not_trust_an_odd_start_reply(
+    monkeypatch: pytest.MonkeyPatch, bad: dict[str, Any]
+) -> None:
+    _service_says(
+        monkeypatch, {"ok": True, "outcome": "started", "message": "", "task": TASK_ID, **bad}
+    )
+    with pytest.raises(ControlOutcomeUnknown):
+        ask_task_start(Path("/nowhere"), "hola", peer=me)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"outcome": "made-up"},
+        {"message": None},
+        {"answer": 3},
+        {"code": "0"},
+        {"code": True},
+        {"seconds": "1"},
+        {"ok": "yes"},
+    ],
+)
+def test_the_client_does_not_trust_an_odd_status_reply(
+    monkeypatch: pytest.MonkeyPatch, bad: dict[str, Any]
+) -> None:
+    _service_says(monkeypatch, {"ok": True, "outcome": "ok", "message": "", **bad})
+    with pytest.raises(ControlOutcomeUnknown):
+        ask_task_status(Path("/nowhere"), TASK_ID, peer=me)
+
+
+def test_the_client_does_not_trust_an_odd_stop_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    _service_says(monkeypatch, {"ok": True, "outcome": "made-up"})
+    with pytest.raises(ControlOutcomeUnknown):
+        ask_task_stop(Path("/nowhere"), TASK_ID, peer=me)

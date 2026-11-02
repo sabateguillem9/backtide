@@ -157,6 +157,7 @@ from backtide.service.shell import (
     ShellOutcome,
     ShellStatus,
 )
+from backtide.service.tasks import AgentTasks, TaskStart, TaskStatus
 from backtide.snapshots import (
     PruneIncomplete,
     Reason,
@@ -629,6 +630,12 @@ class Guardian:
 
         self.agent_lock = threading.Lock()
         self.freeze_lock = threading.Lock()
+        # This agent's tasks (T26-5a): `backtide tarea` and the web's chat, with their answers.
+        self._tasks = AgentTasks(
+            commands=lambda: self._jail.config.profile.shell,
+            open_shell=self.open_shell,
+            record_end=self._record_task_end,
+        )
         self._agent_state = AgentState.STOPPED
         self._state_epoch = 0  # bumped by every change of state: a stale thaw never applies
         self._thaw_to = AgentState.RUNNING  # what a freeze to confirm a condition goes back to
@@ -2675,6 +2682,25 @@ class Guardian:
                 container_id=container_id,
             )
 
+    def task_start(
+        self, prompt: str, *, resume: bool = False, seconds: int | None = None, requested_by: str
+    ) -> TaskStart:
+        """Take a task for the agent (backtide/service/tasks.py): its id, at once. Never waits for
+        the task, nor for a rewind: ``open_shell`` and the run are on the task's own thread."""
+        return self._tasks.start(prompt, resume=resume, seconds=seconds, requested_by=requested_by)
+
+    def task_status(self, task_id: str) -> TaskStatus | None:
+        """How that task goes, with its answer once it ended; None if it is not known here."""
+        return self._tasks.status(task_id)
+
+    def task_stop(self, task_id: str) -> bool | None:
+        """Stop that task inside the agent: False if it may run on, None if it is not known."""
+        return self._tasks.stop(task_id)
+
+    def _record_task_end(self, details: dict[str, Any]) -> None:
+        """The end of a task, next to its ``system/agent_shell``: never the answer."""
+        self._record("system", "agent_task_end", "task", details=details)
+
     def export(
         self,
         destination: str,
@@ -4030,6 +4056,7 @@ class Guardian:
         self._settle_risk()
         self._sensor_closing.set()  # the sensor's hooks stop waiting for agent_lock
         self._egress_closing.set()  # and so does the proxy's
+        self._tasks.close()  # before the lock, which a task about to start may be waiting for
         with self.agent_lock:
             if self._stopped:
                 return

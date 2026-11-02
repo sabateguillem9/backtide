@@ -27,6 +27,8 @@ and made-up keys: nothing reaches Anthropic, GitHub or anywhere real (invariant 
 - ``nombres-de-clave-en-la-linea`` (both agents): a secret on the command line in every shape
   the unified table of backtide/blackbox/secret_words.py must strike; none reaches the black box
   or Tetragon's file.
+- ``respuesta-fuera-de-la-caja``: the service runs the task now, and its answer stays out of the
+  black box, whatever arrives there late; the end of the task is recorded, with its fields.
 """
 
 import base64
@@ -527,4 +529,69 @@ def test_secret_names_on_the_command_line_are_struck(
         "recorded",
         recorded,
         f"el sensor grabó el proceso del ataque (marcador {marker}) con sus argumentos tachados.",
+    )
+
+
+# --- respuesta-fuera-de-la-caja (T26-5a) --------------------------------------------------------
+
+
+@scenario("respuesta-fuera-de-la-caja")
+def test_an_answer_never_reaches_the_black_box(attack: Attack, cc_lab: Lab) -> None:
+    """The service runs the task now, so the answer goes through it: the owner gets it, and the
+    black box only that the task ended. A made-up secret in the prompt stays out as well. What
+    could leak arrives late (the sensor's exec, the log bridge), so a sentinel comes first."""
+    service = cc_lab.service
+    since = service.box.head()[0]
+    marker = f"t265a-{secrets.token_hex(4)}"
+    secret = "sk-ant-api03-" + secrets.token_hex(24)
+    done = run_cli(service, "tarea", f"{marker} responde; usa {secret}", timeout=TASK_TIMEOUT)
+    sentinel = f"{marker}-fin"
+    service.jail.exec(["/bin/true", sentinel], check=True)
+    sensor_kit.wait_event(
+        service,
+        lambda e: e.source == "exec" and sentinel in str(e.details.get("argv", "")),
+        "the sentinel exec after the task",
+        since=since,
+    )
+    events = service.box.events(since_seq=since)
+    every = json.dumps([[e.target, e.details] for e in events], ensure_ascii=False, default=str)
+    attack.check(
+        "stopped",
+        done.returncode == 0
+        and REPLY_TEXT in done.stdout
+        and REPLY_TEXT not in every
+        and secret not in every,
+        f"el dueño recibe la respuesta (salida {done.returncode}, {done.stdout[-200:]!r}); la "
+        f"respuesta en algún evento de {len(events)}: {REPLY_TEXT in every}; la clave inventada de "
+        f"lo pedido en alguno: {secret in every}",
+    )
+    opened = [e for e in events if e.action == "agent_shell" and e.target == "task"]
+    ended = [e for e in events if e.action == "agent_task_end"]
+    execs = [
+        e
+        for e in events
+        if e.source == "exec"
+        and marker in str(e.details.get("argv", ""))
+        and sentinel not in str(e.details.get("argv", ""))
+    ]
+    closed = {"task", "outcome", "code", "seconds", "answer_chars", "requested_by"}
+    same_task = (
+        len(opened) == 1
+        and len(ended) == 1
+        and opened[0].details.get("task") == ended[0].details.get("task")
+        and opened[0].seq < ended[0].seq
+        and str(opened[0].details.get("prompt", "")).startswith(marker)
+    )
+    details = ended[0].details if ended else {}
+    attack.check(
+        "recorded",
+        same_task
+        and bool(execs)
+        and set(details) == closed
+        and details.get("outcome") == "ok"
+        and details.get("code") == 0
+        and details.get("answer_chars") == len(done.stdout.rstrip("\n")),
+        f"{len(opened)} system/agent_shell y {len(ended)} system/agent_task_end de la misma tarea, "
+        f"con lo pedido tachado y cortado ({same_task}); el sensor ha visto la tarea, también "
+        f"tachada ({len(execs)} exec); el final: {details}",
     )
