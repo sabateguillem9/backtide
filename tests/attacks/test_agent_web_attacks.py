@@ -12,6 +12,7 @@ with `_probe`. What a person does goes through the pages, with `web`. No model a
 """
 
 import json
+import re
 import secrets
 import threading
 import time
@@ -120,7 +121,9 @@ def ask(web: Web, verb: str, slug: str, **more: str) -> Any:
 def row(web: Web, slug: str) -> str:
     """What the list says of one agent: its <li>."""
     text = web.get("/agentes").text
-    start = text.index(f'data-agent="{slug}"')
+    start = text.find(f'data-agent="{slug}"')
+    if start < 0:  # not on the list (yet): the callers wait, and the diagnosis says what there is
+        return "<no row> " + " ".join(re.findall(r'data-agent="([^"]*)"', text))
     return text[start : text.index("</li>", start)]
 
 
@@ -311,27 +314,33 @@ def test_stopping_from_the_web_does_not_hang_nor_lie(attack: Attack, lab: Lab, w
         signed({"cmd": "agent_stop", "agent": MAIN.slug}),
         signed({"cmd": "agent_pause", "agent": MAIN.slug}),
     )
+    holds = {
+        "frozen_said": ES["agents.out.frozen"] in frozen_said,
+        "was_frozen": was_frozen,
+        "resumed_said": ES["agents.out.resumed"] in thawed_said,
+        "was_thawed": was_thawed,
+        "stopped_said": ES["agents.out.stopped"] in said,
+        "gone": gone,
+        "no_stop_button": "v=parar" not in stopped_row,
+        "quick": took < QUICK,
+        # A start that is quick is over when the browser asks: "arrancando", or already its end.
+        # The slow one, held on purpose, is `parar-no-espera-al-arranque`'s.
+        "starting_page": 'data-view="running"' in first or 'data-view="result"' in first,
+        "started_said": ES["agents.out.started"] in back,
+        "running_again": _running(THIRD.container),
+        "main_not_listed": "agente=principal" not in web.get("/agentes").text,
+        "stop_main_refused": stop_main["outcome"] == "refused",
+        "freeze_main_refused": freeze_main["outcome"] == "refused",
+        "main_not_paused": not paused(MAIN.container),
+        "main_same_start": started_at(MAIN.container) == main,
+    }
     attack.check(
         "stopped",
-        ES["agents.out.frozen"] in frozen_said
-        and was_frozen
-        and ES["agents.out.resumed"] in thawed_said
-        and was_thawed
-        and ES["agents.out.stopped"] in said
-        and gone
-        and "v=parar" not in stopped_row
-        and took < QUICK
-        and 'data-view="running"' in first
-        and ES["agents.out.started"] in back
-        and _running(THIRD.container)
-        and "agente=principal" not in web.get("/agentes").text
-        and stop_main["outcome"] == "refused"
-        and freeze_main["outcome"] == "refused"
-        and not paused(MAIN.container)
-        and started_at(MAIN.container) == main,
+        all(holds.values()),
         "congelar y descongelar lo hacen en Docker; «parado» sale cuando Docker lo dice, y la "
         f"lista ofrece arrancarlo; arrancar contesta en {took:.1f} s con la página de "
-        f"«arrancando»; y el principal, ni en la lista ni por el socket ({stop_main})",
+        f"«arrancando»; y el principal, ni en la lista ni por el socket ({stop_main}); "
+        f"no se cumple: {[name for name, ok in holds.items() if not ok] or 'nada'}",
     )
     asked = lab.events(THIRD, "agent_stop_asked")
     attack.check(
@@ -443,6 +452,9 @@ out = {}
 form = urllib.parse.urlencode({"csrf": "x", "ticket": "x", "slug": "cuarto", "perfil": "openclaw",
                                "tamano": "10"}).encode()
 proxy = os.environ["HTTP_PROXY"]
+# urllib reads NO_PROXY itself and would go straight to 127.0.0.1, past the proxy: take it out.
+for name in ("NO_PROXY", "no_proxy"):
+    os.environ.pop(name, None)
 through = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy}))
 port = int(sys.argv[1])
 for ip in sys.argv[2:]:
@@ -459,8 +471,8 @@ for ip in sys.argv[2:]:
     except urllib.error.HTTPError as error:
         said = [error.code, error.read(200).decode("utf-8", "replace")]
     except Exception as error:
-        said = [0, type(error).__name__]
-    out[ip] = {"direct": direct, "code": said[0], "said": said[1]}
+        said = [0, type(error).__name__ + ": " + str(error)[:120]]
+    out[ip] = {"direct": direct, "code": said[0], "said": said[1], "proxy": proxy}
 print(json.dumps(out))
 """
 
@@ -477,14 +489,21 @@ def test_no_agent_reaches_the_web_to_make_another(attack: Attack, lab: Lab, web:
     machine = [ip for ip in sh("hostname", "-I").stdout.split() if ":" not in ip]
     targets = [*machine, "127.0.0.1"]
     script = Path("/tmp") / f"por-la-web-{secrets.token_hex(4)}.py"  # noqa: S108 - in the agent
-    ran = lab.in_agent(
-        OTHER,
-        f"cat > {script} <<'FIN'\n{FROM_INSIDE}\nFIN\npython3 {script} {port} {' '.join(targets)}; "
-        f"code=$?; rm -f {script}; exit $code",
-        timeout=120,
-    )
-    assert ran.returncode == 0, ran.stderr
-    found = json.loads(ran.stdout.strip().splitlines()[-1])
+    # The neighbour was restarted by the scenario before: its proxy may not be listening yet, and a
+    # refused connection to it proves nothing. Ask again until the proxy itself answers.
+    deadline = time.monotonic() + 90
+    while True:
+        ran = lab.in_agent(
+            OTHER,
+            f"cat > {script} <<'FIN'\n{FROM_INSIDE}\nFIN\npython3 {script} {port} "
+            f"{' '.join(targets)}; code=$?; rm -f {script}; exit $code",
+            timeout=120,
+        )
+        assert ran.returncode == 0, ran.stderr
+        found = json.loads(ran.stdout.strip().splitlines()[-1])
+        if all(said["code"] != 0 for said in found.values()) or time.monotonic() > deadline:
+            break
+        time.sleep(3)
     control = web.post("/agentes/crear", {"csrf": "x"}, signed_in=False)
     listening = sh("ss", "-ltnH").stdout.splitlines()
     outside = [
@@ -499,6 +518,17 @@ def test_no_agent_reaches_the_web_to_make_another(attack: Attack, lab: Lab, web:
         for ip, said in found.items()
         if said["direct"] == 0 or said["code"] != 403 or PROXY_SAID not in said["said"]
     }
+    why = ""
+    if reached:  # a refusal that is not the proxy's own: what the agent sees of its proxy
+        seen = lab.in_agent(
+            OTHER,
+            "getent hosts backtide-proxy; env | grep -i proxy | sed 's/=.*@/=***@/'; "
+            'python3 -c "import socket;s=socket.socket();s.settimeout(3);'
+            "print('connect', s.connect_ex(('backtide-proxy', 8080)))\"",
+            timeout=30,
+        )
+        containers = sh("docker", "ps", "--format", "{{.Names}} {{.Status}}", check=False).stdout
+        why = f" [dentro: {seen.stdout.strip()!r}; contenedores: {containers.strip()!r}]"
     attack.check(
         "stopped",
         sorted(found) == sorted(targets)
@@ -509,7 +539,7 @@ def test_no_agent_reaches_the_web_to_make_another(attack: Attack, lab: Lab, web:
         and (whats_there(lab), len(lab.installation_events("agent_create"))) == before,
         f"desde dentro no llega directo a ninguna de las {len(targets)} direcciones, y su proxy "
         f"contesta 403 «{PROXY_SAID}» a todas ({reached or 'bien'}); desde la máquina, la misma "
-        f"web contesta {control.status_code}, solo escucha en lo local y no se crea nada",
+        f"web contesta {control.status_code}, solo escucha en lo local y no se crea nada{why}",
     )
 
 
