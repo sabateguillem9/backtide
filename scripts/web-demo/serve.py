@@ -24,6 +24,12 @@ kind, never a key), checks a value with the service's own rules and keeps only w
 show (the last four characters and when). It writes no file, holds no key and forgets everything
 when the demo stops. The page, its confirmations, the CSRF token and the one-time tickets are the
 real ones.
+
+The agents' pages (T26-6b): ``DemoOrders`` stands in for the service over its narrow socket. The
+forms, the tickets and the page that says how an order goes are the real ones; what an order
+"does" is a few seconds of waiting, and is remembered here until the demo stops. A stop takes long
+enough to see the page wait. It makes no container, and an agent "created" here has no pages of its
+own.
 """
 
 import copy
@@ -31,14 +37,25 @@ import json
 import logging
 import sys
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from backtide.service.roster import STARTING, STOPPED_BY_OWNER, STOPPING
 from backtide.service.settings import KINDS, PROVIDERS, check_chat_id, check_value, tail_of
 from backtide.snapshots import Snapshot
-from backtide.web.agents import AgentSource, PendingRequest, RosterError, request_from
+from backtide.web.agents import (
+    AgentFacts,
+    AgentSource,
+    Listing,
+    PendingRequest,
+    RetiredAgent,
+    RosterError,
+    request_from,
+)
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import Availability
@@ -295,6 +312,88 @@ def _later(seconds: float) -> str:
     return f"{datetime.now(UTC) + timedelta(seconds=seconds):%Y-%m-%dT%H:%M:%SZ}"
 
 
+class DemoOrders:
+    """The service's agents, in memory: the first has a task running, so "Tarea en marcha" shows,
+    and one was deleted, so "retirado" shows. Nothing is made. Thread-safe."""
+
+    enabled = True
+    STOP_SECONDS = 8.0
+    START_SECONDS = 6.0
+
+    def __init__(self, main: str | None, others: list[AgentSource]) -> None:
+        self._lock = threading.Lock()
+        self._agents = {
+            "principal": AgentFacts(
+                "principal", main, True, True, "running", "openclaw", "2026.9.8"
+            )
+        }
+        for number, other in enumerate(others):
+            in_use = "task" if number == 0 else None
+            self._agents[other.slug] = AgentFacts(
+                other.slug, other.name, False, True, "running", "claude-code", "2.1.306", in_use
+            )
+        now = datetime.now(UTC)
+        self._retired = (
+            RetiredAgent("viejo", "Viejo", now - timedelta(days=2), now + timedelta(days=5), False),
+        )
+
+    def availability(self) -> Availability:
+        return Availability.READY
+
+    def listing(self) -> Listing:
+        with self._lock:
+            return Listing(tuple(self._agents.values()), self._retired)
+
+    def _set(self, slug: str, **changes: Any) -> None:
+        with self._lock:
+            self._agents[slug] = replace(self._agents[slug], **changes)
+
+    def ask(self, request: dict[str, Any], session: str | None) -> dict[str, Any]:
+        command, slug = request["cmd"], request.get("agent") or request.get("slug")
+        if command == "agent_create":
+            if slug in self._agents or slug == "viejo":
+                return _refused(f"El nombre {slug} ya se usó.")
+            if request["slug"].startswith("primero"):
+                return {
+                    "ok": False,
+                    "outcome": "needs_restart",
+                    "message": "El servicio tendría que reiniciarse.",
+                }
+            with self._lock:
+                self._agents[slug] = AgentFacts(
+                    slug, None, False, False, None, request["profile"], "2.1.306", None, STARTING
+                )
+            time.sleep(self.START_SECONDS)
+            self._set(slug, watched=True, state="running", order=None)
+            return {"ok": True, "outcome": "created", "message": f"Agente {slug} creado (demo)."}
+        if command == "agent_stop":
+            self._set(slug, order=STOPPING, in_use=None)
+            time.sleep(self.STOP_SECONDS)
+            self._set(slug, order=None, watched=False, state=STOPPED_BY_OWNER)
+            return {"ok": True, "outcome": "stopped", "message": f"Agente {slug} parado (demo)."}
+        if command == "agent_start":
+            self._set(slug, order=STARTING)
+            time.sleep(self.START_SECONDS)
+            self._set(slug, order=None, watched=True, state="running")
+            return {"ok": True, "outcome": "started", "message": f"Agente {slug} en marcha (demo)."}
+        if command == "agent_pause":
+            self._set(slug, state="frozen", in_use=None)
+            return {"ok": True, "outcome": "frozen", "message": "Congelado (demo)."}
+        if command == "agent_resume":
+            self._set(slug, state="running")
+            return {"ok": True, "outcome": "resumed", "message": "Sigue (demo)."}
+        if command == "agent_delete":
+            now = datetime.now(UTC)
+            with self._lock:
+                gone = self._agents.pop(slug)
+                self._retired = (
+                    *self._retired,
+                    RetiredAgent(slug, gone.name, now, now + timedelta(days=7), False),
+                )
+            return {"ok": True, "outcome": "deleted", "message": f"Agente {slug} borrado (demo)."}
+        return _refused("Esa orden no se acepta.")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__)
@@ -322,6 +421,7 @@ def main(argv: list[str]) -> int:
         pending=demo_requests(config.parent / "requests.json", approver),
         settings=DemoSettings(config.parent / "settings.json"),
         approver=approver,
+        agent_orders=DemoOrders(name, others),
     )
     return 0
 

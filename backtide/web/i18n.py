@@ -33,6 +33,132 @@ ES: dict[str, str] = {
     "panel.live": "En directo",
     "panel.feed.empty": "Todavía no ha pasado nada. Lo que hagan tus agentes aparecerá aquí, "
     "lo último arriba.",
+    # the agents (T26-6b, D42)
+    "nav.agents": "Agentes",
+    "agents.title": "Agentes",
+    "agents.lede": "Crea, arranca, para y congela tus agentes. Lo hace el servicio: esta página "
+    "solo "
+    "se lo pide.",
+    "agents.new": "Crear un agente",
+    "agents.back": "Volver a la lista",
+    "agents.main": "el principal",
+    "agents.kind.claude-code": "Claude Code",
+    "agents.kind.openclaw": "OpenClaw",
+    "agents.kind.custom": "Agente propio",
+    "agents.in_use.task": "Tarea en marcha",
+    "agents.state.running": "en marcha",
+    "agents.state.frozen": "congelado",
+    "agents.state.still": "con su contenedor parado",
+    "agents.state.stopped": "parado",
+    "agents.state.unwatched": "sin vigilar: no ha arrancado o ha fallado",
+    "agents.state.starting": "arrancando…",
+    "agents.state.stopping": "parando…",
+    "agents.state.pausing": "congelando…",
+    "agents.state.resuming": "descongelando…",
+    "agents.state.deleting": "borrando…",
+    "agents.state.stop_failed": "no se ha podido parar",
+    "agents.state.unknown": "sin datos",
+    "agents.state.retired": "retirado",
+    "agents.stop_failed.note": "Puede seguir en marcha: prueba a pararlo otra vez y mira su caja "
+    "negra.",
+    "agents.do.arrancar": "Arrancar",
+    "agents.do.parar": "Parar",
+    "agents.do.pausar": "Congelar",
+    "agents.do.seguir": "Descongelar",
+    "agents.do.borrar": "Borrar",
+    "agents.retired": "Retirados",
+    "agents.retired.note": "Su caja negra se queda para siempre. Su nombre no se vuelve a usar.",
+    "agents.retired.until": "Su volumen espera hasta: {when}.",
+    "agents.retired.back": "Para recuperarlo, en el servidor: `sudo backtide agentes recuperar "
+    "{slug}`.",
+    "agents.retired.purged": "Su volumen ya se ha vaciado: queda su caja negra.",
+    "agents.new.title": "Crear un agente",
+    "agents.new.note": "Empieza vacío, en su propia jaula, y usa las claves que ya tienes. El tipo "
+    "y el tamaño son de una lista. Para elegir sus topes, usa `backtide agentes crear` en el "
+    "servidor.",
+    "agents.new.slug": "Nombre corto",
+    "agents.new.slug.hint": "Minúsculas, cifras y guiones, hasta 32. No se cambia y no se vuelve a "
+    "usar.",
+    "agents.new.profile": "Tipo de agente",
+    "agents.new.size": "Tamaño de su carpeta de trabajo",
+    "agents.new.size.hint": "Es un máximo: ocupa en el disco lo que use. Tiene que caber lo que "
+    "podrían llegar a ocupar todos.",
+    "agents.new.go": "Crear y arrancar",
+    "agents.confirm.arrancar": "Arrancar este agente",
+    "agents.confirm.arrancar.note": "Vuelve a trabajar vigilado, tras comprobar que cabe en la "
+    "máquina. Puede tardar unos minutos.",
+    "agents.confirm.parar": "Parar este agente",
+    "agents.confirm.parar.note": "Lo que tenga retenido se rechaza. No vuelve a arrancar hasta que "
+    "lo pidas, tampoco si se reinicia la máquina. Puede tardar un par de minutos.",
+    "agents.confirm.pausar": "Congelar este agente",
+    "agents.confirm.pausar.note": "Deja de ejecutar nada al momento, y lo que tenga retenido se "
+    "rechaza. Sigue donde estaba cuando lo descongeles.",
+    "agents.confirm.seguir": "Descongelar este agente",
+    "agents.confirm.seguir.note": "Sigue donde estaba, si nada más lo impide (por ejemplo, la "
+    "falta "
+    "de espacio).",
+    "agents.confirm.borrar": "Borrar este agente",
+    "agents.confirm.borrar.note": "Se para y se quitan su contenedor y sus redes. Su caja negra se "
+    "queda. Su volumen y sus instantáneas esperan 7 días, y solo vuelven desde el servidor, con "
+    "`sudo backtide agentes recuperar {slug}`. Luego se vacían.",
+    "agents.confirm.typed": "Escribe su nombre corto para confirmar: {slug}",
+    "agents.running.arrancar": "Arrancando…",
+    "agents.running.crear": "Creando…",
+    "agents.running.parar": "Parando…",
+    "agents.running.pausar": "Congelando…",
+    "agents.running.seguir": "Descongelando…",
+    "agents.running.borrar": "Borrando…",
+    "agents.running.note": "La orden sigue aunque cierres esta página. Aquí dirá cómo ha "
+    "terminado.",
+    "agents.running.long": "Puede tardar unos minutos: hasta entonces no se sabe cómo acaba.",
+    "agents.out.ok": "Hecho",
+    "agents.out.created": "Agente creado y en marcha",
+    "agents.out.started": "En marcha",
+    "agents.out.stopped": "Parado",
+    "agents.out.already": "Ya estaba así",
+    "agents.out.deleted": "Borrado",
+    "agents.out.frozen": "Congelado",
+    "agents.out.killed": "Parado a la fuerza",
+    "agents.out.resumed": "Descongelado",
+    "agents.out.not_paused": "No estaba congelado",
+    "agents.out.no": "No se ha hecho",
+    "agents.out.failed": "No ha terminado bien",
+    "agents.out.unknown": "No se sabe cómo ha terminado",
+    "agents.out.no_service": "El servicio no está en marcha: no se ha hecho nada",
+    "agents.out.untrusted": "No se ha podido pedir: no se ha hecho nada",
+    "agents.out.look": "La lista dice lo que hay ahora. Antes de repetirlo, mira también la caja "
+    "de "
+    "la instalación.",
+    "agents.out.needs_restart.note": "Es el primero además del principal: el servicio tiene que "
+    "reiniciarse, y el principal se para y vuelve a arrancar. Desde la web no se manda sobre el "
+    "principal. Hazlo una vez en el servidor; los siguientes ya se crean desde aquí:",
+    "agents.lost": "Esta web no sabe de esa orden",
+    "agents.lost.note": "Quizá se ha reiniciado, o es de hace mucho. La orden, si llegó al "
+    "servicio, "
+    "ha seguido: la lista dice lo que hay ahora.",
+    "agents.not": "Ahora no se puede",
+    "manage.off.disabled": "Esta web solo mira: para gestionar agentes hace falta `backtide web "
+    "--gestionar`, con el socket de la web.",
+    "manage.off.no_service": "El servicio no está en marcha: `sudo systemctl start backtide`.",
+    "manage.off.other_user": "Esta web no puede hablar con el servicio: su socket no es de su "
+    "grupo.",
+    "manage.off.off": "Esta web no encuentra el socket del servicio.",
+    "manage.err.form": "Ese formulario no vale: vuelve a la lista y prueba otra vez. No se ha "
+    "hecho "
+    "nada.",
+    "manage.err.nobody": "Ese agente no está en la lista.",
+    "manage.err.main": "Al agente principal no se le manda desde la web: lleva el servicio y a los "
+    "demás. Desde el servidor, `sudo backtide agentes pausar principal`.",
+    "manage.err.slug": "Tiene que ir en minúsculas, cifras y guiones, hasta 32, y no ser uno "
+    "reservado.",
+    "manage.err.list": "Elige el tipo y el tamaño de la lista.",
+    "manage.err.typed": "Ese no es su nombre corto: no se ha hecho nada.",
+    "manage.err.used": "Ese formulario ya se usó: mira la lista antes de repetirlo.",
+    "manage.err.expired": "Ese formulario ha caducado: vuelve a la lista y prueba otra vez.",
+    "manage.err.busy": "Hay demasiadas órdenes en marcha: espera a que acaben.",
+    "manage.err.running": "Este agente ya tiene una orden en curso: espera a que acabe.",
+    "agents.starting.note": "Hasta que termine de arrancar (puede tardar unos minutos), no se "
+    "puede parar desde aquí. En el servidor: `sudo backtide agentes parar {slug}`.",
     "agents.switch": "Otros agentes",
     "agent.default": "Tu agente",
     "theme.dark": "Modo oscuro",
@@ -857,6 +983,131 @@ EN: dict[str, str] = {
     "panel.live": "Live",
     "panel.feed.empty": "Nothing has happened yet. What your agents do appears here, newest on "
     "top.",
+    # the agents (T26-6b, D42)
+    "nav.agents": "Agents",
+    "agents.title": "Agents",
+    "agents.lede": "Create, start, stop and freeze your agents. The service does it: this page "
+    "only "
+    "asks.",
+    "agents.new": "Create an agent",
+    "agents.back": "Back to the list",
+    "agents.main": "the main one",
+    "agents.kind.claude-code": "Claude Code",
+    "agents.kind.openclaw": "OpenClaw",
+    "agents.kind.custom": "Custom agent",
+    "agents.in_use.task": "Task running",
+    "agents.state.running": "running",
+    "agents.state.frozen": "frozen",
+    "agents.state.still": "with its container stopped",
+    "agents.state.stopped": "stopped",
+    "agents.state.unwatched": "not watched: it did not start, or it failed",
+    "agents.state.starting": "starting…",
+    "agents.state.stopping": "stopping…",
+    "agents.state.pausing": "freezing…",
+    "agents.state.resuming": "thawing…",
+    "agents.state.deleting": "deleting…",
+    "agents.state.stop_failed": "could not be stopped",
+    "agents.state.unknown": "no data",
+    "agents.state.retired": "retired",
+    "agents.stop_failed.note": "It may still be running: try stopping it again and look at its "
+    "black box.",
+    "agents.do.arrancar": "Start",
+    "agents.do.parar": "Stop",
+    "agents.do.pausar": "Freeze",
+    "agents.do.seguir": "Thaw",
+    "agents.do.borrar": "Delete",
+    "agents.retired": "Retired",
+    "agents.retired.note": "Its black box stays for good. Its name is not used again.",
+    "agents.retired.until": "Its volume waits until: {when}.",
+    "agents.retired.back": "To bring it back, on the server: `sudo backtide agentes recuperar "
+    "{slug}`.",
+    "agents.retired.purged": "Its volume has been emptied: its black box stays.",
+    "agents.new.title": "Create an agent",
+    "agents.new.note": "It starts empty, in its own jail, and uses the keys you already have. Its "
+    "kind and its size come from a list. To choose its caps, use `backtide agentes crear` on the "
+    "server.",
+    "agents.new.slug": "Short name",
+    "agents.new.slug.hint": "Lower case, digits and hyphens, up to 32. It does not change and is "
+    "not used again.",
+    "agents.new.profile": "Kind of agent",
+    "agents.new.size": "Size of its working folder",
+    "agents.new.size.hint": "It is a maximum: on disk it takes what it uses. What all of them "
+    "could "
+    "come to take has to fit.",
+    "agents.new.go": "Create and start",
+    "agents.confirm.arrancar": "Start this agent",
+    "agents.confirm.arrancar.note": "It goes back to work, watched, once it is checked that it "
+    "fits "
+    "on the machine. It can take a few minutes.",
+    "agents.confirm.parar": "Stop this agent",
+    "agents.confirm.parar.note": "What it has held is rejected. It does not start again until you "
+    "ask, not even if the machine restarts. It can take a couple of minutes.",
+    "agents.confirm.pausar": "Freeze this agent",
+    "agents.confirm.pausar.note": "It stops running anything at once, and what it has held is "
+    "rejected. It goes on where it was when you thaw it.",
+    "agents.confirm.seguir": "Thaw this agent",
+    "agents.confirm.seguir.note": "It goes on where it was, if nothing else stands in the way "
+    "(lack "
+    "of space, for example).",
+    "agents.confirm.borrar": "Delete this agent",
+    "agents.confirm.borrar.note": "It stops, and its container and networks go. Its black box "
+    "stays. "
+    "Its volume and snapshots wait 7 days, and come back only from the server, with `sudo backtide "
+    "agentes recuperar {slug}`. Then they are emptied.",
+    "agents.confirm.typed": "Type its short name to confirm: {slug}",
+    "agents.running.arrancar": "Starting…",
+    "agents.running.crear": "Creating…",
+    "agents.running.parar": "Stopping…",
+    "agents.running.pausar": "Freezing…",
+    "agents.running.seguir": "Thawing…",
+    "agents.running.borrar": "Deleting…",
+    "agents.running.note": "The order goes on even if you close this page. This page will say how "
+    "it ended.",
+    "agents.running.long": "It can take a few minutes: until then nobody knows how it ends.",
+    "agents.out.ok": "Done",
+    "agents.out.created": "Agent created and running",
+    "agents.out.started": "Running",
+    "agents.out.stopped": "Stopped",
+    "agents.out.already": "It already was",
+    "agents.out.deleted": "Deleted",
+    "agents.out.frozen": "Frozen",
+    "agents.out.killed": "Stopped by force",
+    "agents.out.resumed": "Thawed",
+    "agents.out.not_paused": "It was not frozen",
+    "agents.out.no": "Not done",
+    "agents.out.failed": "It did not end well",
+    "agents.out.unknown": "Nobody knows how it ended",
+    "agents.out.no_service": "The service is not running: nothing was done",
+    "agents.out.untrusted": "It could not be asked: nothing was done",
+    "agents.out.look": "The list says what there is now. Before trying again, look at the "
+    "installation's box too.",
+    "agents.out.needs_restart.note": "It is the first besides the main one: the service has to "
+    "restart, and the main agent stops and starts again. The web gives the main agent no orders. "
+    "Do it once on the server; the next ones can be created here:",
+    "agents.lost": "This web does not know that order",
+    "agents.lost.note": "It may have restarted, or the order is old. If it reached the service, it "
+    "went on: the list says what there is now.",
+    "agents.not": "Not now",
+    "manage.off.disabled": "This web only watches: managing agents takes `backtide web "
+    "--gestionar`, "
+    "with the web's socket.",
+    "manage.off.no_service": "The service is not running: `sudo systemctl start backtide`.",
+    "manage.off.other_user": "This web cannot talk to the service: its socket is not of its group.",
+    "manage.off.off": "This web cannot find the service's socket.",
+    "manage.err.form": "That form is no good: go back to the list and try again. Nothing was done.",
+    "manage.err.nobody": "That agent is not on the list.",
+    "manage.err.main": "The web gives the main agent no orders: it runs the service and the "
+    "others. "
+    "On the server, `sudo backtide agentes pausar principal`.",
+    "manage.err.slug": "It takes lower case, digits and hyphens, up to 32, and not a reserved one.",
+    "manage.err.list": "Choose the kind and the size from the list.",
+    "manage.err.typed": "That is not its short name: nothing was done.",
+    "manage.err.used": "That form was already used: look at the list before trying again.",
+    "manage.err.expired": "That form has expired: go back to the list and try again.",
+    "manage.err.busy": "There are too many orders running: wait for them to end.",
+    "manage.err.running": "This agent already has an order running: wait for it to end.",
+    "agents.starting.note": "Until it has finished starting (it can take a few minutes), it cannot "
+    "be stopped from here. On the server: `sudo backtide agentes parar {slug}`.",
     "agents.switch": "Other agents",
     "agent.default": "Your agent",
     "theme.dark": "Dark mode",

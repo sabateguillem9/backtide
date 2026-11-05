@@ -197,6 +197,11 @@ class AgentTasks:
                 return None
             return task.status or TaskStatus(task.id, TaskOutcome.RUNNING)
 
+    def running(self) -> bool:
+        """Whether a task of this agent has not ended, whoever asked it (D42: the list says so)."""
+        with self._lock:
+            return any(not task.claimed for task in self._tasks.values())
+
     def stop(self, task_id: str) -> bool | None:
         """Stop it inside the agent (Ctrl-C): True if nothing of it is left or it was signalled,
         False if it may run on, None if there is no such task."""

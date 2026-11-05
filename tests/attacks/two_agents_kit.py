@@ -294,7 +294,7 @@ class Web:
                 "sudo", "-n", "setpriv", "--reuid", str(os.getuid()), "--regid", str(lab.web_gid),
                 "--clear-groups", "--", str(BIN / "backtide"), "web", "--config", str(CONFIG),
                 "--socket-web", str(STATE / STATE_WEB_SOCKET), "--port", "0", "--rebobinar",
-                "--aprobar", "--ajustes",
+                "--aprobar", "--ajustes", "--gestionar",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

@@ -155,6 +155,8 @@ One service can run several agents at once. This is early. [`backtide agentes cr
 
 [`backtide agentes borrar`](cli-reference.md#backtide-agentes) deletes one: its black box stays for good, and its volume waits 7 days in a bin, from which `backtide agentes recuperar` brings it back whole.
 
+The web's Agents page lists each agent with its kind, its version and whether a task is running in it, and deleted ones as retired. With `--gestionar` it also creates, starts, stops, freezes and deletes them, always by asking the service. Creating and deleting ask for your passkey touched in the last 5 minutes, once you have registered one (behind a domain, always), and deleting asks for the name written again. An order that takes minutes does not hold the page: it says how the order goes, and only what the service answered. From the web you pick a short name, a profile and a size, and nothing else. It gives no orders about the main agent: the first agent besides it restarts the service, so that one is created with `sudo backtide agentes crear ... --reiniciar`. Bringing a deleted agent back or emptying the bin is also done on the server.
+
 An installation with no file in `/etc/backtide/agents/` has one agent, `principal`, and behaves as it always did. Each other agent is a file, `/etc/backtide/agents/<slug>.toml`, which `backtide agentes crear` writes for you or you write by hand with `sudo`, where the slug is lowercase letters, digits and `-`:
 
 ```toml
@@ -407,13 +409,14 @@ Behavior:
 
 ## The web: `backtide web`
 
-The web view is read-only unless you switch things on. Each switch is a flag of `backtide web`, and each needs a running `backtide vigilar` and either the same user as the service or, with `--socket-web`, the service's narrow socket for the web's group. The installed web uses the second way: it runs as `backtide-web` and has the three switches on ([command-line reference](cli-reference.md#backtide-web)).
+The web view is read-only unless you switch things on. Each switch is a flag of `backtide web`, and each needs a running `backtide vigilar` and either the same user as the service or, with `--socket-web`, the service's narrow socket for the web's group. The installed web uses the second way: it runs as `backtide-web` and has the four switches on ([command-line reference](cli-reference.md#backtide-web)).
 
 | Flag | Default | Switches on |
 |---|---|---|
 | `--rebobinar` | off | Rewind from the Snapshots page (with the notice and a confirmation) |
 | `--aprobar` | off | Approve, reject and trust from the Requests page (each behind a confirmation) |
 | `--ajustes` | off | Changes on the Settings page |
+| `--gestionar` | off | Create, start, stop, freeze, thaw and delete agents from the Agents page (each behind a confirmation). It needs `--socket-web` |
 | `--puerto N` | `8765` | The port, on `127.0.0.1` only (`0`: a free one) |
 
 All details of the command are in the [command-line reference](cli-reference.md#backtide-web). The web only listens on `127.0.0.1`; it is never exposed to the network. As root it refuses to start unless a flag is given.

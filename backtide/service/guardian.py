@@ -2696,6 +2696,10 @@ class Guardian:
         """How that task goes, with its answer once it ended; None if it is not known here."""
         return self._tasks.status(task_id)
 
+    def task_running(self) -> bool:
+        """Whether a task runs in this agent now (D42): for the list, and nothing of what it is."""
+        return self._tasks.running()
+
     def task_stop(self, task_id: str) -> bool | None:
         """Stop that task inside the agent: False if it may run on, None if it is not known."""
         return self._tasks.stop(task_id)

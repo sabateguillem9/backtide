@@ -34,6 +34,7 @@
   <nav aria-label="{{ t('nav.label') }}">
     <a href="{{ base }}/panel"{% if active == 'panel' %} aria-current="page"{% endif %}>{{ t('nav.panel') }}{% if active == 'panel' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     <a href="{{ base }}/peticiones"{% if active == 'holds' %} aria-current="page"{% endif %}>{{ t('nav.holds') }}{% if requests is defined %} <span class="badge" data-waiting-badge{% if not requests %} hidden{% endif %}><span class="badge-dot" aria-hidden="true"></span><span class="num" data-waiting-n>{{ requests | length if requests else 0 }}</span><span class="visually-hidden"> {{ t('nav.waiting') }}</span></span>{% endif %}{% if active == 'holds' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
+    <a href="{{ base }}/agentes"{% if active == 'agents' %} aria-current="page"{% endif %}>{{ t('nav.agents') }}{% if active == 'agents' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
     <a href="{{ base }}/ajustes"{% if active == 'settings' %} aria-current="page"{% endif %}>{{ t('nav.settings') }}{% if active == 'settings' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
   </nav>
   {% endif %}
@@ -45,7 +46,7 @@
 {% if agent and active in ('now', 'history', 'snapshots', 'ask') %}
 <div class="agentbar a-{{ agent.colour }}">
   <div class="agentbar-top">
-    <p class="agentbar-who"><span class="tag" aria-hidden="true"></span><span class="agent-name" id="agentbar-name">{{ vis(agent_name(agent), 48) }}</span></p>
+    <p class="agentbar-who"><span class="tag" aria-hidden="true"></span><span class="agent-name" id="agentbar-name">{{ vis(agent_name(agent), 48) }}</span>{% set kind = kind_label(facts_of(agent)) %}{% if kind %} <span class="agentbar-kind">{{ kind }}</span>{% endif %}</p>
     {% if many %}
     <nav class="agentbar-others" aria-label="{{ t('agents.switch') }}">
       {% for other in roster %}{% if other.slug != agent.slug %}

@@ -234,6 +234,8 @@ FLEET_COMMANDS = frozenset(
 )
 AGENT_ORDER_REPLY_TIMEOUT = 300.0  # an agent's start: its checks and its first snapshot
 DELETED_KEYS = ("slug", "name", "state", "deleted_at", "purge_after", "purged")
+AGENT_WORDS = ("kind", "version", "in_use", "order")  # what the list says of an agent: D42, T26-6b
+_AGENT_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,39}", re.ASCII)
 
 
 class ControlError(Exception):
@@ -392,6 +394,7 @@ class ControlServer:
     socket_mode = 0o600
     socket_group: int | None = None
     label = "control socket"  # how the log names it (the web's narrow socket: "web socket")
+    asks_as = "cli"  # who the box says asked an order about the agents (the narrow socket: "web")
 
     def __init__(
         self,
@@ -647,13 +650,17 @@ class ControlServer:
             raise _BadRequest("Esa orden lleva `cmd` y `agent`, y nada más.")
         if command == "agent_resume":
             return self._resume(guardian, request, pid, uid)
-        outcome = guardian.pause_by_user(requested_by=f"cli (uid {uid}, pid {pid})")
+        outcome = guardian.pause_by_user(requested_by=self._requester(pid, uid))
         return {
             "ok": outcome.status in (PauseStatus.FROZEN, PauseStatus.STOPPED, PauseStatus.KILLED),
             "outcome": str(outcome.status),
             "message": redact(outcome.message),
             "agent_state": outcome.agent_state,
         }
+
+    def _requester(self, pid: int, uid: int) -> str:
+        """Who asked an order about the agents, as the box says it: the kernel's ids."""
+        return f"{self.asks_as} (uid {uid}, pid {pid})"
 
     def _fleet_order(
         self, command: str, request: dict[str, Any], pid: int, uid: int
@@ -671,7 +678,7 @@ class ControlServer:
             "agent_purge": self._fleet.purge,
         }[command]
         try:
-            return order(request, f"cli (uid {uid}, pid {pid})")
+            return order(request, self._requester(pid, uid))
         except OrderInvalid as bad:
             logger.warning("%s: refused %s outside its shape", self.label, command)
             return {"ok": False, "outcome": "invalid", "message": str(bad)}
@@ -1287,7 +1294,7 @@ class ControlServer:
         if set(request) != {"cmd"}:
             raise _BadRequest("Una petición de seguir lleva `cmd` y nada más.")
         try:
-            outcome = guardian.resume(requested_by=f"cli (uid {uid}, pid {pid})")
+            outcome = guardian.resume(requested_by=self._requester(pid, uid))
         except Exception:  # the Guardian should not raise; if it does, say so without its text
             logger.exception("resuming raised instead of answering")
             outcome = ResumeOutcome(
@@ -2448,36 +2455,10 @@ def ask_agents(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
 ) -> list[dict[str, Any]]:
-    """The agents the service at ``path`` has (T26-2c), checked: each a dict with its ``slug``,
-    ``name`` (None or a text), ``main``, ``watched``, ``state`` and ``notice`` (the lines of the
-    rewind notice about it, T26-2d). What does not look like one is dropped. ControlError if the
-    reply makes no sense."""
-    raw = _ask(
-        Path(path),
-        {"cmd": "agents"},
-        what="la lista",
-        wait=wait,
-        reply_timeout=REPLY_TIMEOUT * 6,
-        peer=peer,
-        server_uid=server_uid,
-        sleep=sleep,
-        monotonic=monotonic,
-    )
-    found = []
-    for item in _listed_reply(raw, "agents")["agents"]:
-        if (
-            isinstance(item, dict)
-            and _is_agent_name(item.get("slug"))
-            and isinstance(item.get("name"), str | None)
-            and isinstance(item.get("main"), bool)
-            and isinstance(item.get("watched"), bool)
-            and isinstance(item.get("state"), str | None)
-        ):
-            found.append(
-                {key: item[key] for key in ("slug", "name", "main", "watched", "state")}
-                | {"notice": _notice_lines(item.get("notice"))}
-            )
-    return found
+    """The agents the service at ``path`` has (T26-2c), checked: see ``ask_fleet``."""
+    return ask_fleet(
+        path, wait=wait, peer=peer, sleep=sleep, monotonic=monotonic, server_uid=server_uid
+    )[0]
 
 
 def ask_deleted(
@@ -2489,9 +2470,27 @@ def ask_deleted(
     monotonic: Callable[[], float] = time.monotonic,
     server_uid: int | None = None,
 ) -> list[dict[str, Any]]:
-    """The deleted agents the service at ``path`` still has (T26-6c), checked: each with its
-    ``slug``, ``name``, ``state``, ``deleted_at``, ``purge_after`` and ``purged``. What does not
-    look like one is dropped. ControlError if the reply makes no sense."""
+    """The deleted agents the service at ``path`` still has (T26-6c), checked: see ``ask_fleet``."""
+    return ask_fleet(
+        path, wait=wait, peer=peer, sleep=sleep, monotonic=monotonic, server_uid=server_uid
+    )[1]
+
+
+def ask_fleet(
+    path: Path,
+    *,
+    wait: float = WAIT_FOR_SERVICE,
+    peer: PeerCredentials = peer_credentials,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    server_uid: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """What the service at ``path`` says in one reply. The agents (T26-2c), each a dict with its
+    ``slug``, ``name`` (None or a text), ``main``, ``watched``, ``state``, ``notice`` (the lines of
+    the rewind notice about it, T26-2d), ``kind``, ``version``, ``in_use`` (D42) and ``order``
+    (T26-6b). And the deleted ones (T26-6c), each with its ``slug``, ``name``, ``state``,
+    ``deleted_at``, ``purge_after`` and ``purged``. What does not look like one is dropped.
+    ControlError if the reply makes no sense."""
     raw = _ask(
         Path(path),
         {"cmd": "agents"},
@@ -2503,7 +2502,31 @@ def ask_deleted(
         sleep=sleep,
         monotonic=monotonic,
     )
-    listed = _listed_reply(raw, "agents").get("deleted")
+    reply = _listed_reply(raw, "agents")
+    found = []
+    for item in reply["agents"]:
+        if (
+            isinstance(item, dict)
+            and _is_agent_name(item.get("slug"))
+            and isinstance(item.get("name"), str | None)
+            and isinstance(item.get("main"), bool)
+            and isinstance(item.get("watched"), bool)
+            and isinstance(item.get("state"), str | None)
+        ):
+            found.append(
+                {key: item[key] for key in ("slug", "name", "main", "watched", "state")}
+                | {"notice": _notice_lines(item.get("notice"))}
+                | {key: _short_word(item.get(key)) for key in AGENT_WORDS}
+            )
+    return found, _deleted_of(reply.get("deleted"))
+
+
+def _short_word(value: object) -> str | None:
+    """A word of the service's about an agent, or None if it does not look like one."""
+    return value if isinstance(value, str) and _AGENT_WORD.fullmatch(value) else None
+
+
+def _deleted_of(listed: object) -> list[dict[str, Any]]:
     return [
         {key: item[key] for key in DELETED_KEYS}
         for item in (listed if isinstance(listed, list) else [])

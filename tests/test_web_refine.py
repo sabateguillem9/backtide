@@ -505,7 +505,7 @@ def test_the_agent_has_a_bar_with_its_tabs_and_the_header_is_only_global(
     tmp_path: Path, path: str, current: str
 ) -> None:
     html = agent_pages(tmp_path).get(path).text
-    assert header_links(html) == ["Panel", "Peticiones", "Ajustes"]
+    assert header_links(html) == ["Panel", "Peticiones", "Agentes", "Ajustes"]
     assert '<div class="agentbar a-' in html, "the agent's bar"
     tabs = re.search(r'<nav class="agentbar-tabs"[^>]*>(.*?)</nav>', html, re.S)
     assert tabs

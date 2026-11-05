@@ -87,6 +87,45 @@ class AgentSource:
 
 
 @dataclass(frozen=True)
+class AgentFacts:
+    """What the service says of an agent now (T26-6b, D42): never the agent, whose words reach none
+    of this. ``state`` is its word for the container, ``order`` what an order is doing to it."""
+
+    slug: str
+    name: str | None = None
+    main: bool = False
+    watched: bool = True
+    state: str | None = None
+    kind: str | None = None
+    version: str | None = None
+    in_use: str | None = None
+    order: str | None = None
+
+
+@dataclass(frozen=True)
+class RetiredAgent:
+    """A deleted agent, as the service lists it (T26-6c): nothing an order can reach. A date it
+    could not read is None."""
+
+    slug: str
+    name: str | None
+    deleted_at: datetime | None
+    purge_after: datetime | None
+    purged: bool
+
+
+@dataclass(frozen=True)
+class Listing:
+    """What the service says there is."""
+
+    agents: tuple[AgentFacts, ...] = ()
+    retired: tuple[RetiredAgent, ...] = ()
+
+    def of(self, slug: str) -> AgentFacts | None:
+        return next((one for one in self.agents if one.slug == slug), None)
+
+
+@dataclass(frozen=True)
 class Agent:
     """One agent of the roster, as the pages use it."""
 
@@ -567,19 +606,26 @@ class Card:
     summary: Summary
     state: str
     pending: tuple[PendingRequest, ...] = field(default=())
+    facts: AgentFacts | None = None  # which agent it is, and whether it is in use (D42)
 
     @property
     def key(self) -> tuple[Any, ...]:
         """What makes two drawings of the card differ (ages tick in the browser)."""
-        return (self.summary.version, self.state, tuple(p.id for p in self.pending))
+        return (self.summary.version, self.state, tuple(p.id for p in self.pending), self.facts)
 
 
-def card(agent: Agent, summary: Summary, pending: Sequence[PendingRequest], now: datetime) -> Card:
+def card(
+    agent: Agent,
+    summary: Summary,
+    pending: Sequence[PendingRequest],
+    now: datetime,
+    facts: AgentFacts | None = None,
+) -> Card:
     """An agent the service has and is not watching says so, whatever its box last said: "idle"
     would read as if somebody were looking."""
     mine = tuple(p for p in pending if p.agent == agent.slug)
     state = state_of(summary, len(mine), now) if agent.source.watched else STOPPED
-    return Card(agent, summary, state, mine)
+    return Card(agent, summary, state, mine, facts)
 
 
 def merged_feed(cards: Sequence[Card], limit: int) -> list[tuple[Agent, Line]]:

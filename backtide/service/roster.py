@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 RETIRE_WAIT = 90.0  # a rewind takes seconds; this only keeps a stuck order from holding the stop
 NOBODY = "Ese agente no existe en esta instalación: no se ha hecho nada."
 STOPPED_BY_OWNER = "stopped_by_owner"  # in the list, for an agent the owner stopped (T26-6a)
+# What the list says an order is doing to an agent right now (T26-6b), whoever asked it: "stopped"
+# is Docker's word, so while it is being stopped, or if that failed, the list says that instead.
+STARTING, STOPPING, DELETING, STOP_FAILED = "starting", "stopping", "deleting", "stop_failed"
+IN_USE_TASK = "task"  # what the list says while a task runs in it (D42)
 _MAIN = object()
 
 
@@ -60,6 +64,15 @@ class Desk:
     notice: tuple[str, ...] = ()  # what the rewind notice says of it (its profile's lines)
 
 
+@dataclass(frozen=True)
+class AgentKind:
+    """Which agent it is (D42): its profile and the version its pinned image brings. The service
+    says it, from its own configuration: nothing an agent writes reaches it."""
+
+    profile: str
+    version: str | None = None
+
+
 class Roster:
     """Every agent of the installation, by slug: the main one always, the others while watched."""
 
@@ -68,8 +81,11 @@ class Roster:
         main: Desk,
         others: Sequence[tuple[str, str | None]] = (),
         stopped: Sequence[str] = (),
+        kinds: Mapping[str, AgentKind] | None = None,
     ) -> None:
         self._main = main
+        self._kinds = dict(kinds or {})
+        self._orders: dict[str, str] = {}
         self._deleted: list[dict[str, Any]] = []  # T26-6c: only the list reads it, no order
         self._named = {main.slug: main.name, **dict(others)}
         self._stopped = set(stopped)  # by the owner: not a failure, and it stays so (T26-6a)
@@ -77,10 +93,20 @@ class Roster:
         self._busy: dict[str, int] = {}
         self._changed = threading.Condition()
 
-    def add(self, slug: str, name: str | None) -> None:
+    def add(self, slug: str, name: str | None, kind: AgentKind | None = None) -> None:
         """A new agent of this installation (T26-6a): it exists, and it is not watched yet."""
         with self._changed:
             self._named[slug] = name
+            if kind is not None:
+                self._kinds[slug] = kind
+
+    def note_order(self, slug: str, doing: str | None) -> None:
+        """What an order is doing to this agent now, for the list; None: nothing."""
+        with self._changed:
+            if doing is None:
+                self._orders.pop(slug, None)
+            else:
+                self._orders[slug] = doing
 
     def forget(self, slug: str) -> None:
         """This agent was deleted (T26-6c): it is nobody from now on, and nothing of it stays here
@@ -89,6 +115,8 @@ class Roster:
             self._named.pop(slug, None)
             self._desks.pop(slug, None)
             self._stopped.discard(slug)  # its count of orders in flight ends by itself
+            self._kinds.pop(slug, None)
+            self._orders.pop(slug, None)
 
     def set_deleted(self, items: Sequence[Mapping[str, Any]]) -> None:
         """What the list says of the deleted agents: never something an order can reach."""
@@ -98,6 +126,12 @@ class Roster:
     def deleted(self) -> list[dict[str, Any]]:
         with self._changed:
             return [dict(item) for item in self._deleted]
+
+    def clear_order(self, slug: str, doing: str) -> None:
+        """The order ``doing`` is over: another's word stays."""
+        with self._changed:
+            if self._orders.get(slug) == doing:
+                del self._orders[slug]
 
     def knows(self, slug: object) -> bool:
         """Whether ``slug`` names an agent of this installation. A lookup: never the disk."""
@@ -135,15 +169,20 @@ class Roster:
 
     def listing(self) -> list[dict[str, Any]]:
         """Each agent and whether it is watched, the main one first. No secret and no path.
-        ``notice`` is what the web's rewind confirmation says of this agent, from its profile."""
+        ``notice`` is what the web's rewind confirmation says of this agent, from its profile;
+        ``kind`` and ``version`` which agent it is, ``in_use`` whether a task runs in it (D42) and
+        ``order`` what an order is doing to it now, from whoever (T26-6b)."""
         with self._changed:
             desks = {self._main.slug: self._main, **self._desks}
             named = dict(self._named)
             stopped = set(self._stopped)
+            kinds = dict(self._kinds)
+            orders = dict(self._orders)
         found = []
         for slug, name in named.items():
             desk = desks.get(slug)
             state = STOPPED_BY_OWNER if slug in stopped else None
+            kind = kinds.get(slug)
             found.append(
                 {
                     "slug": slug,
@@ -152,6 +191,10 @@ class Roster:
                     "watched": desk is not None,
                     "state": state if desk is None else _state_of(desk),
                     "notice": [] if desk is None else list(desk.notice),
+                    "kind": None if kind is None else kind.profile,
+                    "version": None if kind is None else kind.version,
+                    "in_use": None if desk is None else _in_use_of(desk),
+                    "order": orders.get(slug),
                 }
             )
         return found
@@ -194,3 +237,8 @@ class Roster:
 def _state_of(desk: Desk) -> str | None:
     state = getattr(desk.guardian, "agent_state", None)
     return None if state is None else str(state)
+
+
+def _in_use_of(desk: Desk) -> str | None:
+    running = getattr(desk.guardian, "task_running", None)
+    return IN_USE_TASK if callable(running) and running() is True else None

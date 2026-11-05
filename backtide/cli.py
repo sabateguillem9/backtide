@@ -1527,6 +1527,13 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "(hace falta su mismo usuario); sin esto, las enseña con los botones apagados",
     )
     web.add_argument(
+        "--gestionar",
+        action="store_true",
+        help="deja que la web cree, arranque, pare, pause y borre agentes pidiéndoselo al "
+        "servicio; "
+        "pide --socket-web: sin esto, la página Agentes los enseña sin botones",
+    )
+    web.add_argument(
         "--socket-web",
         dest="web_socket",
         type=Path,
@@ -1672,6 +1679,9 @@ def _web(args: argparse.Namespace) -> int:
     if _effective_uid() == 0 and not (args.rebobinar or args.ajustes or args.aprobar):
         _error(ROOT_WEB_REFUSAL)
         return EXIT_ERROR
+    if args.gestionar and args.web_socket is None:
+        _error("--gestionar pide --socket-web: los agentes se gestionan por el socket estrecho")
+        return EXIT_ERROR
     port = DEFAULT_PORT if args.port is None else args.port
     if not 0 <= port <= 65535:
         _error(f"el puerto debe estar entre 0 y 65535, no {port}")
@@ -1743,6 +1753,7 @@ def _web(args: argparse.Namespace) -> int:
             can_rewind=args.rebobinar,
             can_set=args.ajustes,
             can_approve=args.aprobar,
+            can_manage=args.gestionar,
             **({} if web_socket is None else {"web_socket": web_socket}),
             **({} if origin is None else {"public_origin": origin}),
         )

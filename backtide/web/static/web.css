@@ -583,6 +583,30 @@ h1 {
   .setting.is-later { flex-direction: row; align-items: center; }
 }
 
+/* ================================================================ the agents (T26-6b): Ajustes' rows, and its forms */
+.agents-list { margin-top: var(--space-6); }
+.agents-new { margin-top: var(--space-6); }
+.agents-list .setting-name { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0 var(--space-2); overflow-wrap: anywhere; }
+.agent-link { display: inline-flex; align-items: center; min-height: var(--size-target); text-decoration: none; }
+.agent-link:hover .agent-name { text-decoration: underline; text-decoration-thickness: var(--stroke-hair); text-underline-offset: 0.25em; }
+.agent-main { font-weight: var(--type-body-weight, 400); font-size: var(--type-caption-size); }
+.agent-running .setting-dot, .agent-starting .setting-dot { background: var(--ink); border-color: var(--ink); }
+.agent-stop_failed .setting-state { color: var(--ink); }
+.agent-stop_failed .setting-dot { background: var(--risk-3); border-color: var(--risk-3); outline: 1.5px solid var(--risk-3); outline-offset: 1.5px; }
+.in-use { font-weight: var(--type-label-weight); color: var(--ink); }
+.card-kind { margin: 0; font-size: var(--type-caption-size); line-height: var(--type-caption-leading); color: var(--ink-soft); }
+.agentbar-kind { margin-left: var(--space-3); font: var(--type-caption-size)/var(--type-caption-leading) var(--font-sans); color: var(--ink-muted); }
+.agents-command { margin: var(--space-3) 0 0; overflow-wrap: anywhere; }
+.agents-command code { white-space: normal; user-select: all; }
+/* a native select with a drawn chevron, as the filters' (a select draws no pseudo-elements) */
+.setting-choice { position: relative; }
+.setting-choice select { appearance: none; padding-right: 2.5rem; cursor: pointer; }
+.setting-choice select + .setting-hint { margin-top: 0; }
+.setting-choice::after {
+  content: ""; position: absolute; right: 1rem; top: 2.65rem; width: 0.45rem; height: 0.45rem; pointer-events: none;
+  border-right: 1.5px solid var(--ink-soft); border-bottom: 1.5px solid var(--ink-soft); transform: rotate(45deg);
+}
+
 /* ================================================================ the control room */
 .panel-head .lede { max-width: var(--measure); }
 .summary-left .req-count { color: var(--ink); font-weight: var(--type-label-weight); font-variant-numeric: tabular-nums; }
@@ -775,6 +799,7 @@ h1 {
   .anim .page > .agentbar, .anim .gate-page > .ic,
   .anim .page > main > :is(h1, .eyebrow, .page-head, .panel-head, .watchbar) { animation: bt-rise var(--duration-reveal) var(--ease) both; }
   .anim .page > main > :is(.lede, .chips, .tide-frame) { animation: bt-rise var(--duration-reveal) var(--ease) var(--stagger) both; }
+  .anim .page > main[data-still] > :is(h1, .lede) { animation: none; }  /* it loads again by itself: once is enough */
   .anim :is(.empty, .gate-page, .page-head, .waiting-head, .section-title) .ic :is(.ic-ink, .ic-clay, .ic-faint) { animation: bt-draw var(--duration-draw) var(--ease) var(--duration-quick) both; }
   .anim :is(.empty, .gate-page, .page-head, .waiting-head, .section-title) .ic :is(.ic-fill, .ic-soft) { animation: bt-pop var(--duration-settle) var(--ease) var(--duration-icon) both; }
   .anim .requests > .req, .anim .cards > .card { animation: bt-rise var(--duration-reveal) var(--ease) calc(var(--stagger) * 2) both; }

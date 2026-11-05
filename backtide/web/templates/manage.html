@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% from "icons.html" import ic %}
+{# The agents (T26-6b): what the service says of each one, and what can be asked of it. The list is
+   sent again by the stream when it changes ("Tarea en marcha" while it runs, D42). Plain links to a
+   confirmation of their own, plain forms there: nothing here needs JavaScript but the live part. #}
+{% block title %}{{ t('agents.title') }}{% endblock %}
+{% block main %}
+<main class="settings" hx-ext="sse" sse-connect="{{ stream }}">
+  <h1>{{ t('agents.title') }}</h1>
+  <p class="lede">{{ t('agents.lede') }}</p>
+  {% if state != 'ready' %}<div class="notice notice--info settings-off" role="note" data-state="{{ state }}">{{ ic('info') }}<p class="notice__text">{{ t.code('manage.off.' ~ state) }}</p></div>{% endif %}
+  {% if state == 'ready' %}
+  <div class="settings-actions agents-new">
+    <a class="settings-yes" href="{{ base }}/agentes/nuevo"><span>{{ t('agents.new') }}</span>{% include "arrow.html" %}</a>
+  </div>
+  {% endif %}
+  <div id="agents-list" sse-swap="list">{% include "manage_list.html" %}</div>
+</main>
+{% endblock %}

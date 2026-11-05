@@ -66,6 +66,7 @@ from backtide.web.agents import AgentSource, PendingRequest
 from backtide.web.app import create_app
 from backtide.web.approve import Approver, ControlApprover
 from backtide.web.live import LiveAgents
+from backtide.web.manage import AgentOrders, ControlAgentOrders
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import WAIT_FOR_SERVICE, ControlRewinder
@@ -217,6 +218,8 @@ def run_web(
     can_rewind: bool = False,
     can_set: bool = False,
     can_approve: bool = False,
+    can_manage: bool = False,
+    agent_orders: AgentOrders | None = None,
     settings: SettingsClient | None = None,
     approver: Approver | None = None,
     agent_name: str | None = None,
@@ -235,7 +238,9 @@ def run_web(
     exist; ``settings`` replaces the control socket's client (the Mac's demo). ``can_approve`` is
     `--aprobar` (T10-5): without it the held requests are listed from the black box with their
     buttons disabled, and the POST that decides does not exist; ``approver`` replaces the
-    control socket's client (the demo). ``agent_name``,
+    control socket's client (the demo). ``can_manage`` is `--gestionar` (T26-6b), which takes the
+    narrow socket: without it the list of agents shows them with no buttons, and the POSTs do not
+    exist; ``agent_orders`` replaces its client (the demo). ``agent_name``,
     ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
     requests) are only given by the demo: the real web asks the service which agents there are
     and what waits (``backtide.web.live``, T26-2d).
@@ -288,6 +293,13 @@ def run_web(
         agent_name=agent_name,
         others=others,
         agents_from=live,
+        agent_orders=agent_orders
+        or ControlAgentOrders(
+            control,
+            live.listing if live is not None else lambda: None,
+            enabled=can_manage,
+            server_uid=server_uid,
+        ),
         pending=pending,
         agent_lines=paths.agent_lines,
         origin=public_origin,

@@ -5,6 +5,9 @@
     <h3 class="card-name" id="name-{{ c.agent.slug }}"><a href="{{ c.agent.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(agent_name(c.agent), 48) }}</span></a></h3>
     <p class="card-state"><span class="pulse" aria-hidden="true"></span>{{ t('st.' ~ c.state) }}</p>
   </div>
+  {# Which agent it is, and whether it is in use (D42): the service's words, never the agent's. #}
+  {% set kind = kind_label(c.facts) %}
+  {% if kind or (c.facts and c.facts.in_use) %}<p class="card-kind">{% if kind %}{{ kind }}{% endif %}{% if c.facts and c.facts.in_use %}{% if kind %} · {% endif %}<span class="in-use">{{ t('agents.in_use.' ~ c.facts.in_use) if t.has('agents.in_use.' ~ c.facts.in_use) else '' }}</span>{% endif %}</p>{% endif %}
   {% set tide = s.tide %}
   {% set slug = c.agent.slug %}
   {% include "mini_tide.html" %}

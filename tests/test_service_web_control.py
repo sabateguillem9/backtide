@@ -664,6 +664,12 @@ CHANGE_REQUESTS = [
     {"cmd": "set_budget", "daily_usd": "2"},
     {"cmd": "accept_prices", "digest": "0123456789abcdef"},
     {"cmd": "task_start", "prompt": "borra todo"},
+    {"cmd": "agent_create", "slug": "tercero", "profile": "claude-code", "volume_gib": 10},
+    {"cmd": "agent_start", "agent": "revisor"},
+    {"cmd": "agent_stop", "agent": "revisor"},
+    {"cmd": "agent_pause", "agent": "revisor"},
+    {"cmd": "agent_resume", "agent": "revisor"},
+    {"cmd": "agent_delete", "agent": "revisor", "typed": "revisor"},
 ]
 
 

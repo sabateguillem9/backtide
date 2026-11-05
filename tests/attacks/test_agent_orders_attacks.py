@@ -41,6 +41,7 @@ from test_two_agents_attacks import (
     said_in,
     uid_of,
 )
+from test_web_socket_attacks import CHANGES_WAIT
 from two_agents_kit import (
     CONFIG,
     ETC,
@@ -115,6 +116,11 @@ def order(lab: Lab, request: dict[str, Any]) -> dict[str, Any]:
     return lab.helper("order", SOCKET, json.dumps(request), timeout=360)
 
 
+def _is_paused(container: str) -> bool:
+    ran = sh("docker", "inspect", "--format", "{{.State.Paused}}", container)
+    return ran.stdout.strip() == "true"
+
+
 def mounted(point: Path) -> str:
     return sudo("findmnt", "-n", "-o", "FSTYPE", "--mountpoint", str(point), check=False).stdout
 
@@ -144,6 +150,16 @@ def test_the_first_neighbour_restarts_the_service_and_only_if_accepted(
     create = ("agentes", "crear", OTHER.slug, "--perfil", "claude-code", "--volumen", "10",
               "--memoria", "1g", "--nombre", "Revisor")  # fmt: skip
     asked = lab.cli(*create)
+    # From the web there is no way to accept it (T26-6b): `restart` is no field of its form.
+    good = {"cmd": "agent_create", "slug": OTHER.slug, "profile": "claude-code", "volume_gib": 10}
+    session = {"session": "<session>", "_why": True}
+    token = lab.helper("link", SOCKET)["token"]
+    _, by_the_web, by_the_web_restarting = _probe(
+        int(sh("id", "-u", "nobody").stdout), lab.web_gid,
+        {"cmd": "session_open", "token": token},
+        {**good, **session},
+        {**good, "restart": True, **session},
+    )  # fmt: skip
     untouched = whats_there(lab) == before and started_at(MAIN.container) == main_started
     pid = lab.show("MainPID")
     made = lab.cli(*create, "--reiniciar")
@@ -154,11 +170,15 @@ def test_the_first_neighbour_restarts_the_service_and_only_if_accepted(
         "stopped",
         asked.returncode == 1
         and "--reiniciar" in asked.stderr
+        and by_the_web["outcome"] == "needs_restart"
+        and by_the_web_restarting["outcome"] == "invalid"
         and untouched
         and made.returncode == 0
         and started_at(MAIN.container) != main_started
         and uid_of(OTHER.container) == OTHER.uid,
-        f"sin aceptarlo no se toca nada ({asked.stderr.strip()[:90]}…); aceptado, el servicio se "
+        f"sin aceptarlo no se toca nada ({asked.stderr.strip()[:90]}…); desde la web ni se puede "
+        f"aceptar ({by_the_web['outcome']}, {by_the_web_restarting['outcome']}); aceptado, el "
+        "servicio se "
         f"reinicia solo y corren los dos, el nuevo con su id ({OTHER.uid})",
     )
     created = lab.installation_events("agent_create")
@@ -330,43 +350,72 @@ def test_an_order_outside_its_shape_touches_nothing(attack: Attack, lab: Lab) ->
 
 
 @scenario("ordenes-fuera-de-la-web")
-def test_a_live_session_of_the_web_reaches_none_of_these_orders(attack: Attack, lab: Lab) -> None:
-    """Against the real narrow socket, with the group of the web and a live session: without the
-    session, an order added to its list of changes would be refused too. T26-6b adds them, behind
-    a key just touched, and this scenario has to change with it."""
+def test_what_a_live_session_of_the_web_still_does_not_reach(attack: Attack, lab: Lab) -> None:
+    """The border since T26-6b, against the real narrow socket, with the web's group and a live
+    session: freezing a neighbour is on its list, and that is the control. What is not: the trash,
+    a restart, nothing about the main agent, and what was never there. Creating from the web, and
+    with what shape: tests/attacks/test_agent_web_attacks.py."""
+    time.sleep(CHANGES_WAIT)  # the changes' bucket, whatever came before
     before = whats_there(lab)
-    frozen_before = sh(
-        "docker", "inspect", "--format", "{{.State.Paused}}", OTHER.container
-    ).stdout.strip()  # fmt: skip
+    main_started = started_at(MAIN.container)
     token = lab.helper("link", SOCKET)["token"]
     session = {"session": "<session>", "_why": True}
-    orders = [
-        {**GOOD, **session},
-        {"cmd": "agent_start", "agent": OTHER.slug, **session},
-        {"cmd": "agent_stop", "agent": OTHER.slug, **session},
-        {"cmd": "agent_pause", "agent": OTHER.slug, **session},
-        {"cmd": "agent_resume", "agent": OTHER.slug, **session},
+    off_the_list = [
+        {"cmd": "agent_restore", "agent": OTHER.slug, **session},
+        {"cmd": "agent_purge", "agent": OTHER.slug, "typed": OTHER.slug, **session},
+        {"cmd": "resume", **session},
+        {"cmd": "shell", **session},
+        {"cmd": "web_link", **session},
+    ]
+    about_the_main = [
+        {"cmd": "agent_pause", "agent": MAIN.slug, **session},
+        {"cmd": "agent_resume", "agent": MAIN.slug, **session},
+        {"cmd": "agent_stop", "agent": MAIN.slug, **session},
+        {"cmd": "agent_start", "agent": MAIN.slug, **session},
+        {"cmd": "agent_delete", "agent": MAIN.slug, "typed": MAIN.slug, **session},
     ]
     nobody = int(sh("id", "-u", "nobody").stdout)
-    answers = _probe(
-        nobody, lab.web_gid, {"cmd": "session_open", "token": token}, *orders,
+    opened, *answers = _probe(
+        nobody, lab.web_gid, {"cmd": "session_open", "token": token}, *off_the_list, *about_the_main
+    )  # fmt: skip
+    refused = answers[: len(off_the_list)]
+    main_said = answers[len(off_the_list) :]
+    main_frozen = _is_paused(MAIN.container)
+    # Past the list and the session, each to its own: the same session freezes the neighbour.
+    time.sleep(CHANGES_WAIT)
+    token = lab.helper("link", SOCKET)["token"]
+    _, froze, control = _probe(
+        nobody, lab.web_gid, {"cmd": "session_open", "token": token},
+        {"cmd": "agent_pause", "agent": OTHER.slug, **session},
         {"cmd": "holds"},
     )  # fmt: skip
-    opened, *refused, control = answers
-    frozen = sh(
-        "docker", "inspect", "--format", "{{.State.Paused}}", OTHER.container
-    ).stdout.strip()
+    other_frozen = _is_paused(OTHER.container)
+    token = lab.helper("link", SOCKET)["token"]
+    _, thawed = _probe(
+        nobody, lab.web_gid, {"cmd": "session_open", "token": token},
+        {"cmd": "agent_resume", "agent": OTHER.slug, **session},
+    )  # fmt: skip
     attack.check(
         "stopped",
         opened["ok"] is True
         and control["ok"] is True
-        and len(refused) == len(orders)
+        and len(refused) == len(off_the_list)
         and all(a["outcome"] == "refused" and "socket de la web" in a["why"] for a in refused)
+        and len(main_said) == len(about_the_main)
+        and all(a["ok"] is False and a["outcome"] == "refused" for a in main_said)
+        and all("principal" in a["why"] for a in main_said)
+        and not main_frozen
+        and started_at(MAIN.container) == main_started
+        and froze["ok"] is True
+        and other_frozen
+        and thawed["ok"] is True
+        and not _is_paused(OTHER.container)
         and whats_there(lab) == before
-        and frozen == frozen_before == "false"
         and lab.running(OTHER),
-        f"con una sesión viva, las {len(orders)} órdenes se rechazan por no estar en su lista "
-        f"({refused[0]}), y `holds`, igual que ellas, contesta: {control}",
+        f"con una sesión viva: lo de fuera de la lista se rechaza ({refused[0]}), y lo del "
+        "principal "
+        f"también, sin tocarlo ({main_said[0]}); la misma sesión congela y descongela al vecino "
+        f"({froze}), y `holds` contesta: {control}",
     )
 
 

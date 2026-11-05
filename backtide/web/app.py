@@ -27,13 +27,14 @@ from it (``backtide.web.approve``). Every other route answers GET only.
 """
 
 import asyncio
+import hashlib
 import itertools
 import json
 import logging
 import math
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
@@ -55,8 +56,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backtide.blackbox import Event, Source
 from backtide.gate.phrase import api_name
-from backtide.jail.profiles import DEFAULT_PROFILE
+from backtide.jail.identity import SLUG, SlugError, check_slug
+from backtide.jail.profiles import DEFAULT_PROFILE, NAMED
 from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
+from backtide.service.fleet import PROFILES, VOLUME_SIZES_GIB
 from backtide.service.notice import rewind_notice
 from backtide.service.origin import PublicOrigin
 from backtide.service.passkeys import MAX_ANSWER_CHARS
@@ -66,8 +69,10 @@ from backtide.web import format as fmt
 from backtide.web.agents import (
     MAIN_SLUG,
     Agent,
+    AgentFacts,
     AgentSource,
     Card,
+    Listing,
     PendingRequest,
     Roster,
     Summary,
@@ -103,11 +108,31 @@ from backtide.web.approve import (
 )
 from backtide.web.ask import MAX_QUESTION, answer
 from backtide.web.i18n import LANGUAGES, Translator, negotiate
+from backtide.web.manage import (
+    CREATE,
+    LONG_AFTER,
+    ORDER_COMMAND,
+    QUICK,
+    TYPED_VERB,
+    VERBS,
+    AgentOrders,
+    Order,
+    OrderBook,
+    Row,
+    restart_command,
+    rows_of,
+)
 from backtide.web.narrate import Line, Name, Narrator, line_for, safe_sentence, sentence
 from backtide.web.reader import BoxReader, BoxUnavailable
 from backtide.web.rewind import Availability, Redeemed, Rewinder, Tickets
 from backtide.web.security import (
     ACTING_SESSION,
+    AGENT_CREATE_PATH,
+    AGENT_NEW_PATH,
+    AGENT_ORDER_PATH,
+    AGENT_RUNNING_PATH,
+    AGENTS_PATH,
+    AGENTS_STREAM_PATH,
     CLOSE_SESSIONS_PATH,
     CLOSE_SESSIONS_WORD,
     DECIDE_PATH,
@@ -193,8 +218,16 @@ SUMMARY_MAX = 20.0  # ...and at least this often, even when its box has not move
 PANEL_FEED = 40  # lines in the control room's feed when it loads
 REQUESTS_EVERY = 5.0  # how often the stream looks at the requests
 MAX_PASSWORD_CHARS = 256
+ROSTER_MARK_CHARS = 12  # enough to tell two lists apart: nothing is secret in it
+# The agents' forms (T26-6b): a slug, a word of a list and a number of a list, and nothing else.
+CREATE_FIELDS = ("csrf", "ticket", "slug", "perfil", "tamano")
+ORDER_FIELDS = ("csrf", "ticket", "v", "agente")
+ORDER_OPTIONAL = ("escrito",)
+ORDER_REFRESH = 2  # seconds: how often a page with an order running looks again
 # Where the touch page goes back to: a word, never a path from the query.
 TOUCH_BACK = {
+    "agentes": AGENTS_PATH,
+    "agentes-nuevo": AGENT_NEW_PATH,
     "ajustes": SETTINGS_PATH,
     "peticiones": HOLDS_PATH,
     "llaves": KEYS_PATH,
@@ -238,6 +271,7 @@ def create_app(
     approver: Approver | None = None,
     spend: SpendClient | None = None,
     agents_from: Callable[[], Sequence[AgentSource] | None] | None = None,
+    agent_orders: AgentOrders | None = None,
     poll_interval: float = 1.0,
     stream_seconds: float = 600.0,
     session_recheck: float = SESSION_RECHECK,
@@ -257,7 +291,9 @@ def create_app(
 
     ``reader`` and ``snapshots`` are the main agent's, called ``agent_name``; ``others`` are more
     agents, read the same way (the demo's), and ``agents_from`` says which others there are now
-    (``backtide.web.live``; None: it cannot say, the list stays). ``pending`` lists the gate's
+    (``backtide.web.live``; None: it cannot say, the list stays). ``agent_orders`` manages them
+    (T26-6b, ``backtide.web.manage``): its POST paths exist only when it is enabled (`--gestionar`).
+    ``pending`` lists the gate's
     requests waiting for a yes, in the demo: the page shows them. ``settings``
     asks the service about the keys (T12e, ``backtide.web.settings``); its POST path exists
     only when it is enabled (`backtide web --ajustes`). ``approver`` asks the service about the
@@ -901,6 +937,14 @@ def create_app(
         def agent_name(who: Agent) -> str:
             return who.name if who.name is not None else t("agent.default")
 
+        def kind_label(who: AgentFacts | Row | None) -> str:
+            """Which agent it is (D42), from the service's word: "Claude Code 2.1.306"."""
+            if who is None or who.kind is None:
+                return ""
+            key = f"agents.kind.{who.kind}"
+            kind = t(key) if t.has(key) else who.kind
+            return f"{kind} {who.version}" if who.version else kind
+
         return {
             "t": t,
             "tell": tell,
@@ -919,6 +963,8 @@ def create_app(
             "agent": agent,
             "roster": roster,
             "agent_name": agent_name,
+            "kind_label": kind_label,
+            "facts_of": _facts_of,
             "countdown": countdown,
             "run_name": run_name,
             # Whether the holds' buttons work (T10-5): "ready", or why not. Asked when drawn.
@@ -1181,7 +1227,28 @@ def create_app(
         return roster.main if slug is None else _agent(slug)
 
     def _cards(requests: Sequence[PendingRequest] | None, now: datetime) -> list[Card]:
-        return [card(a, _summary(a), requests or (), now) for a in roster]
+        listing = _listing()
+        return [
+            card(
+                a, _summary(a), requests or (), now, None if listing is None else listing.of(a.slug)
+            )
+            for a in roster
+        ]
+
+    def _listing() -> Listing | None:
+        """What the service says of the agents now: asked at most every few seconds. Not knowing
+        leaves the pages saying less, never a page's problem."""
+        if agent_orders is None:
+            return None
+        try:
+            return agent_orders.listing()
+        except Exception:  # as ``_refresh_roster``: a list that makes no sense takes no page down
+            logger.exception("what the service says of the agents cannot be used")
+            return None
+
+    def _facts_of(who: Agent) -> AgentFacts | None:
+        listing = _listing()
+        return None if listing is None else listing.of(who.slug)
 
     def _agent(slug: str) -> Agent:
         found = roster.get(slug)
@@ -1210,18 +1277,19 @@ def create_app(
             requests=requests,
             stale=failed,
             feed=_panel_feed(cards),
-            heads=".".join(str(c.summary.head) for c in cards),
+            heads=_heads_id(_roster_mark(roster), [c.summary.head for c in cards]),
             now=now,
             spend=_spend(),
         )
 
     @app.get("/panel/stream", dependencies=watching)
     def panel_stream(request: Request, after: str = "") -> Response:
-        resume = request.headers.get("last-event-id", "")
-        starts = _heads(resume) or _heads(after)
+        given = request.headers.get("last-event-id", "") or after
+        mark = _roster_mark(roster)
+        starts = _heads(given, mark)
         t = Translator(_language(request)[0])
         return StreamingResponse(
-            _panel_stream(request, t, starts),
+            _panel_stream(request, t, starts, stale=bool(given) and not starts),
             media_type="text/event-stream",
             headers={"x-accel-buffering": "no"},
         )
@@ -1921,6 +1989,251 @@ def create_app(
     if settings_on:
         app.post(SETTINGS_POST_PATH, dependencies=[Depends(require_session)])(settings_save)
 
+    # -- managing the agents (T26-6b, backtide.web.manage) ----------------------------------
+
+    order_tickets = Tickets(clock)
+    orders_on = agent_orders is not None and agent_orders.enabled is True
+    order_book = OrderBook(agent_orders.ask) if orders_on and agent_orders is not None else None
+
+    def _orders_state() -> Availability:
+        return Availability.DISABLED if agent_orders is None else agent_orders.availability()
+
+    def _agents_view() -> tuple[list[Row], tuple[Any, ...], str]:
+        listing = _listing()
+        running = {} if order_book is None else order_book.running()
+        retired = () if listing is None else listing.retired
+        return rows_of(list(roster), listing, running), retired, str(_orders_state())
+
+    def _manage_step(
+        request: Request, t: Translator, status: int, view: str, **values: Any
+    ) -> Response:
+        values.setdefault("outcome", "")
+        return _page("manage_step.html", request, status=status, active="agents", t=t, view=view,
+                     back=base + AGENTS_PATH, **values)  # fmt: skip
+
+    def _manage_refused(request: Request, t: Translator, status: int, reason: str) -> Response:
+        return _manage_step(request, t, status, "refused", reason=reason)
+
+    def _new_form(
+        request: Request, t: Translator, status: int, *, error: str = "", **typed: str
+    ) -> Response:
+        """The form: a slug, and two lists. Its ticket is what a POST has to come from."""
+        return _manage_step(
+            request, t, status, "new",
+            csrf=_csrf(request),
+            ticket=order_tickets.issue(CREATE),
+            action=base + AGENT_CREATE_PATH,
+            profiles=[(name, NAMED[name].version) for name in PROFILES],
+            sizes=VOLUME_SIZES_GIB,
+            pattern=SLUG.pattern,
+            error=error,
+            typed_slug=typed.get("slug", ""),
+            typed_profile=typed.get("profile", ""),
+            typed_size=typed.get("size", ""),
+        )  # fmt: skip
+
+    def _order_started(request: Request, t: Translator, order: Order | None, slug: str) -> Response:
+        if order is None:
+            running = order_book is not None and slug in order_book.running()
+            reason = "manage.err.running" if running else "manage.err.busy"
+            return _manage_refused(request, t, 409, reason)
+        return RedirectResponse(
+            f"{base}{AGENT_RUNNING_PATH}?{urlencode([('id', order.id)])}", status_code=303
+        )
+
+    @app.get(AGENTS_PATH, dependencies=protected)
+    def agents_page(request: Request) -> Response:
+        t = Translator(_language(request)[0])
+        rows, retired, state = _agents_view()
+        return _page("manage.html", request, active="agents", t=t, rows=rows, retired=retired,
+                     state=state, stream=base + AGENTS_STREAM_PATH)  # fmt: skip
+
+    @app.get(AGENTS_STREAM_PATH, dependencies=watching)
+    def agents_stream(request: Request) -> Response:
+        return StreamingResponse(
+            _agents_stream(request, Translator(_language(request)[0])),
+            media_type="text/event-stream",
+            headers={"x-accel-buffering": "no"},
+        )
+
+    async def _agents_stream(request: Request, t: Translator) -> AsyncIterator[bytes]:
+        """The list when it changes (D42: "Tarea en marcha" while it runs). It does not count as a
+        use of the session: a tab left open must not keep it alive."""
+        loop = asyncio.get_running_loop()
+        signed_in = _session_watch(request)
+        deadline = loop.time() + stream_seconds
+        sent: tuple[Any, ...] | None = None
+        last_sent = loop.time()
+        yield b"retry: 2000\n\n"
+        while loop.time() < deadline:
+            if await request.is_disconnected():
+                return
+            if not await signed_in(loop.time()):
+                yield _sse("session", "expired", None)
+                return
+            await _roster_now()
+            rows, retired, state = await asyncio.to_thread(_agents_view)
+            key = (rows, retired, state)
+            if key != sent:
+                sent = key
+                last_sent = loop.time()
+                html = env.get_template("manage_list.html").render(
+                    **_helpers(t, clock()), rows=rows, retired=retired, state=state
+                )
+                yield _sse("list", html, None)
+            elif loop.time() - last_sent >= keepalive:
+                last_sent = loop.time()
+                yield b": keepalive\n\n"
+            await asyncio.sleep(poll_interval)
+
+    @app.get(AGENT_NEW_PATH, dependencies=protected)
+    async def agent_new(request: Request) -> Response:
+        t = Translator(_language(request)[0])
+        state = await asyncio.to_thread(_orders_state)
+        if state is not Availability.READY:
+            return _manage_refused(request, t, 200, f"manage.off.{state}")
+        if await _touch_needed(request):
+            return _go_touch("agentes-nuevo")
+        return _new_form(request, t, 200)
+
+    @app.get(AGENT_ORDER_PATH, dependencies=protected)
+    async def agent_order_confirm(request: Request) -> Response:
+        """The confirmation of one order about one agent, and the only way to its ticket."""
+        t = Translator(_language(request)[0])
+        verb = request.query_params.get("v", "")
+        who = roster.get(request.query_params.get("agente", ""))
+        if verb not in VERBS or who is None:
+            return _manage_refused(request, t, 404, "manage.err.nobody")
+        if who.main:
+            return _manage_refused(request, t, 200, "manage.err.main")
+        state = await asyncio.to_thread(_orders_state)
+        if state is not Availability.READY:
+            return _manage_refused(request, t, 200, f"manage.off.{state}")
+        if verb == TYPED_VERB and await _touch_needed(request):
+            return _go_touch("agentes")
+        return _order_confirm(request, t, 200, verb, who)
+
+    def _order_confirm(
+        request: Request, t: Translator, status: int, verb: str, who: Agent, *, error: str = ""
+    ) -> Response:
+        return _manage_step(
+            request, t, status, "confirm",
+            verb=verb,
+            whose=who,
+            csrf=_csrf(request),
+            ticket=order_tickets.issue(f"{verb}:{who.slug}"),
+            action=base + AGENT_ORDER_PATH,
+            typed_verb=TYPED_VERB,
+            error=error,
+        )  # fmt: skip
+
+    async def agent_create(request: Request) -> Response:
+        """Create one. A slug, and a word and a number of their lists: the service checks them
+        again, with the session and the key, and writes the agent's file from its own template."""
+        t = Translator(_language(request)[0])
+        form = await _read_form(request, CREATE_FIELDS)
+        if form is None:
+            return _manage_refused(request, t, 400, "manage.err.form")
+        if not _csrf_is(request, form["csrf"]):
+            logger.warning("creating an agent from the web was refused: wrong form token")
+            return _manage_refused(request, t, 403, "manage.err.form")
+        typed = {"slug": form["slug"], "profile": form["perfil"], "size": form["tamano"]}
+        size = int(form["tamano"]) if form["tamano"] in map(str, VOLUME_SIZES_GIB) else None
+        try:
+            check_slug(form["slug"])
+        except SlugError:
+            return _new_form(request, t, 400, error="manage.err.slug", **typed)
+        if form["perfil"] not in PROFILES or size is None:
+            return _new_form(request, t, 400, error="manage.err.list", **typed)
+        if await _touch_needed(request):
+            return _go_touch("agentes-nuevo")
+        redeemed = order_tickets.redeem(form["ticket"], CREATE)
+        if redeemed is not Redeemed.OK:
+            return _manage_refused(
+                request, t, 400,
+                "manage.err.used" if redeemed is Redeemed.SPENT else "manage.err.expired",
+            )  # fmt: skip
+        state = await asyncio.to_thread(_orders_state)
+        if state is not Availability.READY or order_book is None:
+            return _manage_refused(request, t, 503, f"manage.off.{state}")
+        asked = {"cmd": ORDER_COMMAND, "slug": form["slug"], "profile": form["perfil"],
+                 "volume_gib": size}  # fmt: skip
+        order = order_book.start(CREATE, form["slug"], asked, request.state.session.id)
+        if order is not None:
+            await asyncio.to_thread(order.done.wait, QUICK)
+        return _order_started(request, t, order, form["slug"])
+
+    async def agent_order(request: Request) -> Response:
+        """Start, stop, freeze, thaw or delete one, past its confirmation. It answers at once and
+        the order goes on: a stop can take minutes, and a page must not hang on it."""
+        t = Translator(_language(request)[0])
+        form = await _read_form(request, ORDER_FIELDS, ORDER_OPTIONAL)
+        if form is None:
+            return _manage_refused(request, t, 400, "manage.err.form")
+        if not _csrf_is(request, form["csrf"]):
+            logger.warning("an order from the web was refused: wrong form token")
+            return _manage_refused(request, t, 403, "manage.err.form")
+        verb, who = form["v"], roster.get(form["agente"])
+        if verb not in VERBS or who is None:
+            return _manage_refused(request, t, 404, "manage.err.nobody")
+        if who.main:
+            return _manage_refused(request, t, 400, "manage.err.main")
+        if verb == TYPED_VERB:
+            if await _touch_needed(request):
+                return _go_touch("agentes")
+            if not token_matches(form.get("escrito"), who.slug):
+                return _order_confirm(request, t, 400, verb, who, error="manage.err.typed")
+        redeemed = order_tickets.redeem(form["ticket"], f"{verb}:{who.slug}")
+        if redeemed is not Redeemed.OK:
+            return _manage_refused(
+                request, t, 400,
+                "manage.err.used" if redeemed is Redeemed.SPENT else "manage.err.expired",
+            )  # fmt: skip
+        state = await asyncio.to_thread(_orders_state)
+        if state is not Availability.READY or order_book is None:
+            return _manage_refused(request, t, 503, f"manage.off.{state}")
+        asked: dict[str, Any] = {"cmd": VERBS[verb], "agent": who.slug}
+        if verb == TYPED_VERB:
+            asked["typed"] = form.get("escrito", "")
+        order = order_book.start(verb, who.slug, asked, request.state.session.id)
+        if order is not None:
+            await asyncio.to_thread(order.done.wait, QUICK)
+        return _order_started(request, t, order, who.slug)
+
+    if orders_on:
+        app.post(AGENT_CREATE_PATH, dependencies=[Depends(require_session)])(agent_create)
+        app.post(AGENT_ORDER_PATH, dependencies=[Depends(require_session)])(agent_order)
+
+    @app.get(AGENT_RUNNING_PATH, dependencies=protected)
+    def agent_order_running(request: Request) -> Response:
+        """How an order goes: what the service answered, or that it is not over. A web that
+        restarted has forgotten it, and says so: the list is what the service says now."""
+        t = Translator(_language(request)[0])
+        given = request.query_params.get("id", "")
+        order = (
+            None if order_book is None or len(given) > MAX_FIELD_CHARS else order_book.find(given)
+        )
+        if order is None:
+            return _manage_step(request, t, 200, "lost")
+        slug = order.slug
+        whose = roster.get(slug)
+        if not order.done.is_set():
+            return _manage_step(
+                request, t, 200, "running", verb=order.verb, slug=slug, whose=whose,
+                refresh=ORDER_REFRESH,
+                long=time.monotonic() - order.started >= LONG_AFTER,
+            )  # fmt: skip
+        reply = order.reply or {}
+        outcome = reply.get("outcome")
+        return _manage_step(
+            request, t, 200, "result", verb=order.verb, slug=slug, whose=whose,
+            what=order.what,
+            ok=reply.get("ok") is True,
+            outcome=outcome if isinstance(outcome, str) else "",
+            message=reply.get("message"),
+            command=restart_command(order.fields) if outcome == "needs_restart" else "",
+        )  # fmt: skip
+
     # -- the held requests (T10-5) ---------------------------------------------------------
 
     def _hold_view(
@@ -2271,9 +2584,15 @@ def create_app(
         )
 
     async def _panel_stream(
-        request: Request, t: Translator, starts: list[int]
+        request: Request, t: Translator, starts: list[int], *, stale: bool = False
     ) -> AsyncIterator[bytes]:
-        """Every agent's new lines (one feed), its card when it changes, and the requests."""
+        """Every agent's new lines (one feed), its card when it changes, and the requests.
+        ``stale``: the position it was given is of another list of agents (or not one at all), so
+        its numbers are nobody's here and that page's cards are not these: it loads again."""
+        if stale:
+            yield b"retry: 2000\n\n"
+            yield _sse("roster", "changed", None)
+            return
         loop = asyncio.get_running_loop()
         signed_in = _session_watch(request)
         deadline = loop.time() + stream_seconds
@@ -2357,7 +2676,7 @@ def create_app(
                 last_sent = now_t
             if moved:
                 # where each agent's feed is, so a reconnect goes on from here
-                yield _sse("at", "", _heads_id(seqs))
+                yield _sse("at", "", _heads_id(_roster_mark(agents), seqs))
                 last_sent = now_t
             if now_t - last_sent >= keepalive:
                 last_sent = now_t
@@ -2380,6 +2699,8 @@ def create_app(
         KEY_REMOVE_PATH,
         KEY_RENAME_PATH,
     )
+    if orders_on:
+        post_paths += (AGENT_CREATE_PATH, AGENT_ORDER_PATH)
     if settings_on:
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:
@@ -2467,19 +2788,27 @@ def _requests_key(requests: Sequence[PendingRequest] | None) -> tuple[Any, ...] 
 MAX_AGENTS_IN_ID = 64
 
 
-def _heads(text: str) -> list[int]:
-    """The control room's position in every agent's box (``12.0.345``, in roster order); an
-    empty list for anything else (the stream then starts at each box's end)."""
-    if not text or len(text) > 20 * MAX_AGENTS_IN_ID or not text.isascii():
+def _roster_mark(agents: Iterable[Agent]) -> str:
+    """Which list of agents a position is about (T26-6b): a number means nothing in another's box,
+    and now the list changes from this very web."""
+    slugs = "\n".join(agent.slug for agent in agents)
+    return hashlib.sha256(slugs.encode()).hexdigest()[:ROSTER_MARK_CHARS]
+
+
+def _heads(text: str, mark: str) -> list[int]:
+    """The control room's position in every agent's box (``<mark>.12.0.345``, in roster order); an
+    empty list for anything else, and for another list of agents."""
+    given, _, rest = text.partition(".")
+    if given != mark or not rest or len(rest) > 20 * MAX_AGENTS_IN_ID or not rest.isascii():
         return []
-    parts = text.split(".")
+    parts = rest.split(".")
     if len(parts) > MAX_AGENTS_IN_ID or not all(p.isdigit() and len(p) < 19 for p in parts):
         return []
     return [int(p) for p in parts]
 
 
-def _heads_id(seqs: Sequence[int]) -> str:
-    return ".".join(str(s) for s in seqs)
+def _heads_id(mark: str, seqs: Sequence[int]) -> str:
+    return ".".join((mark, *(str(s) for s in seqs)))
 
 
 def _details_json(event: Event) -> str:

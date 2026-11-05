@@ -16,9 +16,11 @@ program on this machine that listens on a port of its own (cookies ignore ports)
     (T12e: a key set or removed); and only with `backtide web --aprobar`, ``POST
     /peticiones/decidir`` (T10-5: approve, reject, "aprobar y confiar", revoke a batch, take a
     trusted recipient out); and always ``POST /salir`` and ``POST /ajustes/cerrar-sesiones``
-    (T26-3a-2: sign out, close every session), which only end sessions. A POST anywhere else,
-    and any other method, is a 405, so without ``--ajustes`` or ``--aprobar`` there is no door
-    that changes anything;
+    (T26-3a-2: sign out, close every session), which only end sessions; and only with
+    `backtide web --gestionar` and the narrow socket, ``POST /agentes/crear`` and ``POST
+    /agentes/orden`` (T26-6b: create, start, stop, freeze, thaw or delete an agent). A POST anywhere
+    else, and any other method, is a 405, so without ``--ajustes``, ``--aprobar`` or ``--gestionar``
+    there is no door that changes anything;
   * every such POST must come from our own page: exactly one ``Origin``, ours (every browser
     sends it on a POST), ``Sec-Fetch-Site: same-origin`` when the browser sends it (anything
     else, even ``none``, is refused), a plain form body (``application/x-www-form-urlencoded``: no
@@ -26,8 +28,8 @@ program on this machine that listens on a port of its own (cookies ignore ports)
     (no chunked bodies). Behind that the app still wants the session cookie (never the link
     token), the session's CSRF token from the form, and a one-time confirmation ticket for that
     very snapshot (``backtide.web.rewind.Tickets``), that very change of that very key
-    (``backtide.web.settings.SettingTickets``) or that very decision on that very hold, batch or
-    recipient (``backtide.web.approve.DecisionTickets``);
+    (``backtide.web.settings.SettingTickets``), that very decision on that very hold, batch or
+    recipient (``backtide.web.approve.DecisionTickets``) or that very order on that very agent;
   * a browser ``Origin`` that is not ours is refused, and so is any request the browser says is
     ``same-site`` or ``cross-site`` unless it is a top-level navigation (``Sec-Fetch-Mode:
     navigate``): the stream and the fragments are only ever fetched from our own pages;
@@ -129,6 +131,13 @@ SETTINGS_POST_PATH = "/ajustes/guardar"
 # The held requests (T10-5): their page, and the POST that decides, only with --aprobar.
 HOLDS_PATH = "/peticiones"
 DECIDE_PATH = "/peticiones/decidir"
+# The agents (T26-6b): the list and its pages, and their POSTs only with --gestionar.
+AGENTS_PATH = "/agentes"
+AGENT_NEW_PATH = "/agentes/nuevo"
+AGENT_CREATE_PATH = "/agentes/crear"
+AGENT_ORDER_PATH = "/agentes/orden"
+AGENT_RUNNING_PATH = "/agentes/en-curso"
+AGENTS_STREAM_PATH = "/agentes/stream"
 # Signing out and closing every session (T26-3a-2): always there, each with the session's CSRF.
 KEYS_PATH = "/llaves"  # the passkeys (T26-3b-2): the page, then its two POSTs
 KEYS_BEGIN_PATH = "/llaves/empezar"

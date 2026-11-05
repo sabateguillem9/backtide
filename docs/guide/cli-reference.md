@@ -104,7 +104,7 @@ In practice you start it with `make demo` or `make probar`, which first prepare 
 Serves the web view on `127.0.0.1` (this computer only): the live feed of what the agent does, the history with filters, the snapshots, the held requests and the Settings page. By default it only reads. The three flags below switch on the things that change state.
 
 ```sh
-backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes] [--socket-web PATH]
+backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes] [--gestionar] [--socket-web PATH]
 ```
 
 | Flag | Default | Effect |
@@ -113,6 +113,7 @@ backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes] 
 | `--rebobinar` | off | The Snapshots page can rewind (with the same notice as `rebobinar` and a confirmation) |
 | `--aprobar` | off | The Requests page can approve and reject held requests (each behind a confirmation). Without it the buttons are shown switched off |
 | `--ajustes` | off | The Settings page can set and remove API keys, the Telegram bot and the spending cap. Without it the page only explains how to switch it on |
+| `--gestionar` | off | The Agents page can create, start, stop, freeze, thaw and delete agents (each behind a confirmation). It needs `--socket-web`. Without it the page shows the agents with no buttons |
 | `--socket-web PATH` | off | Ask for all of the above, and for the snapshot list, through the service's narrow socket at `PATH` (the one `vigilar --grupo-web` opens) instead of the control socket. For a web that runs as an unprivileged user in that group. The socket and the process answering it must be root's, or nothing is sent. The installed `backtide-web.service` passes `--socket-web /var/lib/backtide/web.sock --rebobinar --aprobar --ajustes` |
 | `--enlace-en FILE` | off | Only with `--socket-web`. Write the web's address, without any token, and the run name to `FILE`, mode `600`, and remove the file when the web stops. The installed `backtide-web.service` uses it; `sudo backtide enlace` asks the service for a one-time token for that address. With `--socket-web`, the service keeps the sessions: the web cannot make its own way in, and the service refuses every change that does not come with a live session |
 
@@ -401,7 +402,7 @@ backtide agentes recuperar SLUG [--reiniciar] [--config FILE]
 backtide agentes lista [--config FILE]
 ```
 
-The running service does all of it, on its root-only socket: it asks the service and says what the service answers. The web has none of these yet, and no agent can reach that socket. See [several agents](configuration.md#several-agents).
+The running service does all of it, on its root-only socket: it asks the service and says what the service answers. No agent can reach that socket. The web's Agents page (`backtide web --gestionar`) asks for less: a short name, a profile and a size to create one, nothing about the main agent, and neither `recuperar` nor `vaciar`. The first agent besides the main one restarts the service, so it is created here, with `--reiniciar`. See [several agents](configuration.md#several-agents).
 
 **`crear`** makes a new agent and starts it. The slug is its name for good, and a slug that was ever used is not used again, because the black box of an agent stays when the agent goes. There is no option for an image, a path or a mount: the profile gives the image, and the volume is new and empty. Everything else comes from a short list. `--tope-espacio` goes from 64 MiB to half the volume, 5 % of it by default. `--dia` and `--mes` are its own spending caps, never above the whole installation's. The first agent besides `principal` restarts the service, and with it the main agent, so it needs `--reiniciar`; from the second on, the others are not touched. It is refused, with nothing made, if:
 
