@@ -92,7 +92,7 @@ class Agent(FakeGuardian):
         self.tasks.append(("status", task_id))
         return TaskStatus(task_id, TaskOutcome.RUNNING)
 
-    def task_stop(self, task_id: str) -> bool | None:
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None:
         self.tasks.append(("stop", task_id))
         return True
 
@@ -436,7 +436,6 @@ def test_what_the_narrow_socket_never_serves_it_never_serves_for_an_agent(two: T
         {"cmd": "resume", "agent": "revisor"},
         {"cmd": "shell", "kind": "session", "continue": False, "agent": "revisor"},
         {"cmd": "export", "dest": "/exportada/x", "agent": "revisor"},
-        {"cmd": "task_stop", "task": TASK, "agent": "revisor"},
     ):
         assert talk(two.web, signed(request))["outcome"] == "refused"
     assert two.nobody_touched()

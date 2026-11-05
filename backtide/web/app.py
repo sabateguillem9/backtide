@@ -23,7 +23,9 @@ page ("Ajustes"), again by asking the service: a confirmation page per change an
 (``backtide.web.settings``). The third, only with `backtide web --aprobar` (T10-5), is a decision
 on a held request of the gate (approve, reject, "aprobar y confiar", revoke a batch, take a
 trusted recipient out), again by asking the service: a confirmation page per decision and a POST
-from it (``backtide.web.approve``). Every other route answers GET only.
+from it (``backtide.web.approve``). The fourth, only with `backtide web --tareas` (T26-5b), is
+giving the agent a task, on the chat's page: a POST with the session and its form token, and no
+ticket, as a task is an everyday thing (``backtide.web.talk``). Every other route answers GET only.
 """
 
 import asyncio
@@ -57,6 +59,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from backtide.blackbox import Event, Source
 from backtide.gate.phrase import api_name
 from backtide.jail.identity import SLUG, SlugError, check_slug
+from backtide.jail.profile import MAX_PROMPT
 from backtide.jail.profiles import DEFAULT_PROFILE, NAMED
 from backtide.service.control import ControlError, ControlOutcomeUnknown, ControlUnavailable
 from backtide.service.fleet import PROFILES, VOLUME_SIZES_GIB
@@ -145,6 +148,7 @@ from backtide.web.security import (
     LANG_COOKIE,
     MAX_FORM_BYTES,
     MAX_LARGE_FORM_BYTES,
+    MAX_PROMPT_FORM_BYTES,
     PASSKEY_HOST,
     POST_PATH,
     SETTINGS_PATH,
@@ -153,6 +157,9 @@ from backtide.web.security import (
     SIGN_IN_KEY_FINISH_PATH,
     SIGN_IN_PATH,
     SIGN_OUT_PATH,
+    TALK_PATH,
+    TALK_SEND_PATH,
+    TALK_STOP_PATH,
     TOUCH_BEGIN_PATH,
     TOUCH_FINISH_PATH,
     TOUCH_PATH,
@@ -183,6 +190,16 @@ from backtide.web.settings import (
     views,
 )
 from backtide.web.state import STATE_ACTIONS, AgentStatus, read_status
+from backtide.web.talk import (
+    RUNNING,
+    UNKNOWN,
+    TaskClient,
+    TaskView,
+    is_task_id,
+    known_id,
+    known_of,
+    view_of,
+)
 from backtide.web.text import visible, visible_middle
 from backtide.web.tide import WINDOW, build_tide
 
@@ -269,6 +286,7 @@ def create_app(
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
     settings: SettingsClient | None = None,
     approver: Approver | None = None,
+    tasks: TaskClient | None = None,
     spend: SpendClient | None = None,
     agents_from: Callable[[], Sequence[AgentSource] | None] | None = None,
     agent_orders: AgentOrders | None = None,
@@ -300,7 +318,9 @@ def create_app(
     held requests (T10-5, ``backtide.web.approve``): without ``pending`` the page lists the real
     ones (from the service with `backtide web --aprobar`, else from the black box), and the
     POST that decides exists only when it is enabled. ``spend`` reads the spending (T11) for the
-    panel and Settings; changing the caps goes through ``settings`` (`--ajustes`).
+    panel and Settings; changing the caps goes through ``settings`` (`--ajustes`). ``tasks``
+    asks the service about the agent's tasks (T26-5b, ``backtide.web.talk``): the POST that gives
+    one exists only when it is enabled (`--tareas`).
     ``agent_lines`` are the agent profile's lines of the rewind notice (T17a-3). ``origin`` is the
     domain it is behind, if any (T26-4a, ``backtide.web.security``): the app lives at its root,
     the cookie is the ``__Host-`` one, and there is no way in with the password (D40)."""
@@ -2457,16 +2477,298 @@ def create_app(
     if approvals_on:
         app.post(DECIDE_PATH, dependencies=[Depends(require_session)])(decide)
 
+    # -- the chat (T26-5b) -----------------------------------------------------------------
+
+    talk_on = tasks is not None and getattr(tasks, "enabled", False) is True
+
+    def _talk_state(who: Agent) -> str:
+        """Whether this agent can be asked now: "ready", or why not. Asked when drawn."""
+        if tasks is None:
+            return str(Availability.OFF)
+        try:
+            state = tasks.availability()
+        except Exception:  # never a 500 for a page that only says it cannot ask
+            logger.exception("cannot tell whether the service can be asked about the tasks")
+            return str(Availability.OFF)
+        if state is Availability.READY and not who.source.watched:
+            return NOT_WATCHED
+        return str(state)
+
+    def _task_view(who: Agent, entry: dict[str, Any]) -> TaskView:
+        """A line of the list, with its answer once it ended. What cannot be read is said so, and
+        the stream asks again; a reply about a task only says "unknown" if the service forgot it.
+        Only ever an error's type in the log: what was asked or answered is never there."""
+        if entry["outcome"] == RUNNING or tasks is None:
+            return view_of(entry)
+        try:
+            status = tasks.status(entry["task"], **who.order)
+        except ControlError as error:
+            logger.warning("the chat cannot read a task's end: %s", type(error).__name__)
+            return view_of(entry)
+        if status["ok"] is not True and status["outcome"] != UNKNOWN:
+            logger.warning("the service refused the chat a task's end")
+            return view_of(entry)
+        return view_of(entry, status)
+
+    def _task_views(who: Agent) -> tuple[list[TaskView], bool]:
+        """This agent's tasks, the newest first, and whether the list could not be read."""
+        if tasks is None:
+            return [], False
+        try:
+            entries = tasks.tasks(**who.order)
+        except ControlError as error:
+            logger.warning("the chat cannot list the tasks: %s", type(error).__name__)
+            return [], True
+        return [_task_view(who, entry) for entry in reversed(entries)], False
+
+    def _talk_page(
+        request: Request,
+        who: Agent,
+        *,
+        status: int = 200,
+        asked: str = "",
+        error: str | None = None,
+        said: str = "",
+    ) -> Response:
+        """The page. A POST that did not give its task comes back here with what was typed."""
+        t = Translator(_language(request)[0])
+        state = _talk_state(who)
+        views, failed = _task_views(who) if state == Availability.READY else ([], False)
+        return _page(
+            "talk.html",
+            request,
+            status=status,
+            active="talk",
+            t=t,
+            agent=who,
+            tasks=views,
+            talk_state=state,
+            failed=failed,
+            running=sum(1 for one in views if not one.ended),
+            known=known_id({one.id: one.ended and not one.unread for one in reversed(views)}),
+            send=base + TALK_SEND_PATH,
+            stop=base + TALK_STOP_PATH,
+            csrf=_csrf(request),
+            max_prompt=MAX_PROMPT,
+            asked=asked,
+            error=error,
+            said=said,
+        )
+
+    @app.get(TALK_PATH, dependencies=protected)
+    def talk_page(request: Request) -> Response:
+        return _talk_page(request, roster.main)
+
+    @app.get("/agentes/{slug}" + TALK_PATH, dependencies=protected)
+    def agent_talk_page(request: Request, slug: str) -> Response:
+        return _talk_page(request, _agent(slug))
+
+    async def talk_send(request: Request) -> Response:
+        """Give the agent a task. The Guard already checked where it comes from and its size."""
+        form = await _read_form(
+            request,
+            ("csrf", "pedido"),
+            (*AGENT_FIELD, "seguir"),
+            limits={"pedido": 2 * MAX_PROMPT},  # each line break comes as two: see below
+            max_bytes=MAX_PROMPT_FORM_BYTES,
+            free=("pedido",),
+        )
+        if form is None:
+            return await asyncio.to_thread(
+                _talk_page, request, roster.main, status=400, error="talk.err.form"
+            )
+        if not _csrf_is(request, form["csrf"]):
+            logger.warning("a task from the web was refused: wrong form token")
+            return await asyncio.to_thread(
+                _talk_page, request, roster.main, status=403, error="talk.err.form"
+            )
+        who = _agent_in(form)
+        asked = form["pedido"].replace("\r\n", "\n")
+
+        def again(status: int, error: str, said: str = "") -> Any:
+            return asyncio.to_thread(
+                _talk_page, request, who, status=status, asked=asked, error=error, said=said
+            )
+
+        if not asked.strip():
+            return await again(400, "talk.err.empty")
+        if len(asked) > MAX_PROMPT:
+            return await again(400, "talk.err.long")
+        if await asyncio.to_thread(_talk_state, who) != Availability.READY or tasks is None:
+            return await again(503, "talk.err.not_now")
+        ask = tasks.start
+        order = who.order
+
+        def run() -> dict[str, Any] | str:
+            try:
+                return ask(asked, resume="seguir" in form, **order)
+            except ControlOutcomeUnknown as error:
+                logger.warning("a task from the web has no known outcome: %s", type(error).__name__)
+                return "talk.err.unknown"
+            except ControlError as error:
+                logger.warning("a task from the web was not sent: %s", type(error).__name__)
+                return "talk.err.not_now"
+
+        reply = await asyncio.to_thread(run)
+        if isinstance(reply, str):
+            return await again(503, reply)
+        if reply["ok"] is not True:
+            return await again(409, "talk.err.refused", said=reply["message"])
+        return RedirectResponse(f"{who.base}{TALK_PATH}", status_code=303)
+
+    async def talk_stop(request: Request) -> Response:
+        """Stop a task inside the agent (a decision that can be undone: docs/47 section 7.1). The
+        service stops every one that runs in that agent, as Ctrl-C does: the page says so."""
+        form = await _read_form(request, ("csrf", "tarea"), AGENT_FIELD)
+        if form is None or not is_task_id(form["tarea"]):
+            return await asyncio.to_thread(
+                _talk_page, request, roster.main, status=400, error="talk.err.form"
+            )
+        if not _csrf_is(request, form["csrf"]):
+            logger.warning("a task's stop from the web was refused: wrong form token")
+            return await asyncio.to_thread(
+                _talk_page, request, roster.main, status=403, error="talk.err.form"
+            )
+        who = _agent_in(form)
+        if await asyncio.to_thread(_talk_state, who) != Availability.READY or tasks is None:
+            return await asyncio.to_thread(
+                _talk_page, request, who, status=503, error="talk.err.not_now"
+            )
+        ask = tasks.stop
+        order = who.order
+
+        def run() -> bool:
+            try:
+                return ask(form["tarea"], **order)
+            except ControlError as error:
+                logger.warning("a task's stop from the web failed: %s", type(error).__name__)
+                return False
+
+        if not await asyncio.to_thread(run):
+            return await asyncio.to_thread(
+                _talk_page, request, who, status=503, error="talk.err.stop"
+            )
+        return RedirectResponse(f"{who.base}{TALK_PATH}", status_code=303)
+
+    if talk_on:
+        app.post(TALK_SEND_PATH, dependencies=[Depends(require_session)])(talk_send)
+        app.post(TALK_STOP_PATH, dependencies=[Depends(require_session)])(talk_stop)
+
+    def _render_task(t: Translator, who: Agent, view: TaskView, csrf: str, *, oob: bool) -> str:
+        return env.get_template("talk_item.html").render(
+            **_helpers(t, clock(), who),
+            task=view,
+            oob=oob,
+            csrf=csrf,
+            stop=base + TALK_STOP_PATH,
+        )
+
+    def _render_talk_state(t: Translator, who: Agent, running: int, failed: bool) -> str:
+        return env.get_template("talk_state.html").render(
+            **_helpers(t, clock(), who), running=running, failed=failed
+        )
+
+    def _task_lost(t: Translator, task_id: str) -> str:
+        """A line that was running and that the service no longer knows (it restarted): what was
+        asked stays on the page, with the word for it."""
+        return env.get_template("talk_lost.html").render(t=t, task_id=task_id)
+
+    async def _talk_stream(
+        request: Request, t: Translator, who: Agent, known: dict[str, bool]
+    ) -> AsyncIterator[bytes]:
+        """The chat as it changes: a new line, the end of one (each read once, ``known``) and how
+        many are running. Every question goes with the session of the page that asks."""
+        ACTING_SESSION.set(request.state.session.id)  # for the threads it asks the service from
+        csrf = _csrf(request)
+        loop = asyncio.get_running_loop()
+        # Before every read, not once a minute: a read with a dead session is a WARNING, recorded
+        # and alerted as what a web taken over would do, and a tab left open would say it every
+        # second.
+        signed_in = _session_watch(request, every=0.0)
+        deadline = loop.time() + stream_seconds
+        last_sent = loop.time()
+        sent_state: tuple[int, bool] | None = None
+        order = who.order
+        if tasks is None:
+            return
+        yield b"retry: 2000\n\n"
+        while loop.time() < deadline:
+            if await request.is_disconnected():
+                return
+            if not await signed_in(loop.time()):
+                yield _sse("session", "expired", None)
+                return
+            pieces: list[str] = []
+            try:
+                entries = await asyncio.to_thread(tasks.tasks, **order)
+                failed = False
+            except ControlError as error:
+                logger.warning("the chat cannot list the tasks: %s", type(error).__name__)
+                entries, failed = [], True
+            # The newest first: "afterbegin" puts a message's lines at the top, in its order.
+            for entry in reversed(entries):
+                task_id, ended = entry["task"], entry["outcome"] != RUNNING
+                had = known.get(task_id)
+                if had is True or (had is False and not ended):
+                    continue
+                view = await asyncio.to_thread(_task_view, who, entry)
+                known[task_id] = view.ended and not view.unread
+                if view.unread and had is not None:  # the page has this already: look again
+                    continue
+                pieces.append(
+                    await asyncio.to_thread(_render_task, t, who, view, csrf, oob=had is not None)
+                )
+            if not failed:
+                listed = {entry["task"] for entry in entries}
+                for task_id, had in list(known.items()):
+                    if not had and task_id not in listed:
+                        pieces.append(_task_lost(t, task_id))
+                        known[task_id] = True
+            now_t = loop.time()
+            if pieces:
+                yield _sse("tasks", "\n".join(pieces), known_id(known))
+                last_sent = now_t
+            running = sum(1 for ended in known.values() if not ended)
+            if (running, failed) != sent_state:
+                sent_state = (running, failed)
+                yield _sse("talk-state", _render_talk_state(t, who, running, failed), None)
+                last_sent = now_t
+            if now_t - last_sent >= keepalive:
+                last_sent = now_t
+                yield b": keepalive\n\n"
+            await asyncio.sleep(poll_interval)
+
+    def _open_talk_stream(request: Request, who: Agent, seen: str) -> Response:
+        resume = request.headers.get("last-event-id", "")
+        known = known_of(resume or seen)
+        t = Translator(_language(request)[0])
+        return StreamingResponse(
+            _talk_stream(request, t, who, known),
+            media_type="text/event-stream",
+            headers={"x-accel-buffering": "no"},
+        )
+
+    @app.get(TALK_PATH + "/stream", dependencies=watching)
+    def talk_stream(request: Request, visto: str = "") -> Response:
+        return _open_talk_stream(request, roster.main, visto)
+
+    @app.get("/agentes/{slug}" + TALK_PATH + "/stream", dependencies=watching)
+    def agent_talk_stream(request: Request, slug: str, visto: str = "") -> Response:
+        return _open_talk_stream(request, _agent(slug), visto)
+
     # -- the stream ------------------------------------------------------------------------
 
-    def _session_watch(request: Request) -> Callable[[float], Awaitable[bool]]:
+    def _session_watch(
+        request: Request, every: float | None = None
+    ) -> Callable[[float], Awaitable[bool]]:
         """For an open stream: does its session still live? Asked of the service at most every
-        ``session_recheck`` seconds, without counting as a use, so "Salir", "Cerrar todas" or
-        the end of the session stop a tab that is open (T26-3a-2)."""
+        ``session_recheck`` seconds (or ``every``), without counting as a use, so "Salir", "Cerrar
+        todas" or the end of the session stop a tab that is open (T26-3a-2)."""
         last = [asyncio.get_running_loop().time()]
+        wait = session_recheck if every is None else every
 
         async def alive(now: float) -> bool:
-            if now - last[0] < session_recheck:
+            if now - last[0] < wait:
                 return True
             last[0] = now
             cookie = request.headers.get("cookie")
@@ -2705,12 +3007,15 @@ def create_app(
         post_paths += (SETTINGS_POST_PATH,)
     if approvals_on:
         post_paths += (DECIDE_PATH,)
+    if talk_on:
+        post_paths += (TALK_STOP_PATH,)
     return Guard(
         app,
         port=port,
         prefix=prefix,
         post_paths=post_paths,
         large_post_paths=large_post_paths,
+        prompt_post_paths=(TALK_SEND_PATH,) if talk_on else (),
         origin=origin,
     )
 
@@ -2731,10 +3036,13 @@ async def _read_form(
     optional: Sequence[str] = (),
     limits: dict[str, int] | None = None,
     max_bytes: int = MAX_FORM_BYTES,
+    free: Sequence[str] = (),
 ) -> dict[str, str] | None:
     """A form of ``fields`` (each once) and maybe some of ``optional`` (each once at most), every
-    value short (``MAX_FIELD_CHARS``, or its own of ``limits``) and printable; None for anything
-    else. Read up to ``MAX_FORM_BYTES`` whatever the request says its length is. Never logs."""
+    value short (``MAX_FIELD_CHARS``, or its own of ``limits``) and printable, but for those of
+    ``free`` (what the owner writes to an agent has lines, and the service has its own rules for
+    it); None for anything else. Read up to ``max_bytes`` whatever the request says its length is.
+    Never logs."""
     body = b""
     async for chunk in request.stream():
         body += chunk
@@ -2759,7 +3067,7 @@ async def _read_form(
         return None
     sizes = limits or {}
     if any(
-        len(value) > sizes.get(name, MAX_FIELD_CHARS) or not value.isprintable()
+        len(value) > sizes.get(name, MAX_FIELD_CHARS) or not (name in free or value.isprintable())
         for name, value in form.items()
     ):
         return None

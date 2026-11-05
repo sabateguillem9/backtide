@@ -43,20 +43,20 @@
 <div class="page{% if wide %} wide{% endif %}">
 {# The agent's own bar (T12f-2a): who it is, the others one click away, and its four pages. The
    header above keeps only what is global. #}
-{% if agent and active in ('now', 'history', 'snapshots', 'ask') %}
+{% if agent and active in ('now', 'talk', 'history', 'snapshots', 'ask') %}
 <div class="agentbar a-{{ agent.colour }}">
   <div class="agentbar-top">
     <p class="agentbar-who"><span class="tag" aria-hidden="true"></span><span class="agent-name" id="agentbar-name">{{ vis(agent_name(agent), 48) }}</span>{% set kind = kind_label(facts_of(agent)) %}{% if kind %} <span class="agentbar-kind">{{ kind }}</span>{% endif %}</p>
     {% if many %}
     <nav class="agentbar-others" aria-label="{{ t('agents.switch') }}">
       {% for other in roster %}{% if other.slug != agent.slug %}
-      <a class="a-{{ other.colour }}" href="{{ other.base }}/{{ 'ahora/preguntar' if active == 'ask' else ('historia' if active == 'history' else ('instantaneas' if active == 'snapshots' else 'ahora')) }}"><span class="tag" aria-hidden="true"></span>{{ vis(agent_name(other), 48) }}</a>
+      <a class="a-{{ other.colour }}" href="{{ other.base }}/{{ 'ahora/preguntar' if active == 'ask' else ('historia' if active == 'history' else ('instantaneas' if active == 'snapshots' else ('hablar' if active == 'talk' else 'ahora'))) }}"><span class="tag" aria-hidden="true"></span>{{ vis(agent_name(other), 48) }}</a>
       {% endif %}{% endfor %}
     </nav>
     {% endif %}
   </div>
   <nav class="agentbar-tabs" aria-labelledby="agentbar-name">
-    {% for key, path, label in (('now', '/ahora', 'nav.now'), ('history', '/historia', 'nav.history'), ('snapshots', '/instantaneas', 'nav.snapshots'), ('ask', '/ahora/preguntar', 'nav.ask')) %}
+    {% for key, path, label in (('now', '/ahora', 'nav.now'), ('talk', '/hablar', 'nav.talk'), ('history', '/historia', 'nav.history'), ('snapshots', '/instantaneas', 'nav.snapshots'), ('ask', '/ahora/preguntar', 'nav.ask')) %}
     <a href="{{ agent.base }}{{ path }}"{% if active == key %} aria-current="page"{% endif %}>{{ t(label) }}</a>
     {% endfor %}
   </nav>

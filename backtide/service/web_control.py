@@ -29,9 +29,10 @@ The socket:
   ``end_batch`` (taking a trust away: they only make the gate ask more), ``set_secret`` and
   ``clear_secret`` (a provider's key or Telegram's token and chat: written by the service at
   0600, never sent back), ``set_budget`` (the caps, checked as `backtide tope` checks them),
-  ``accept_prices``, ``task_start`` (a task for the agent, T26-5a) and the agents' orders (below,
-  T26-6b). Nothing else: no ``resume`` (the main agent's; ``agent_resume`` is a neighbour's), no
-  ``shell``, ``import`` or ``export`` (no path of any kind), no config. Each
+  ``accept_prices``, ``task_start`` (a task for the agent, T26-5a), ``task_stop`` (stopping
+  it, T26-5b) and the agents' orders (below, T26-6b). Nothing else: no ``resume`` (the main
+  agent's; ``agent_resume`` is a neighbour's), no ``shell``, ``import`` or ``export`` (no path of
+  any kind), no config. Each
   change is handled by the very code of the control socket, with
   ``via`` forced to ``web``, so the black box records it as the control socket does:
   ``requested_by: "web (uid …, pid …)"`` with the kernel's uid and pid.
@@ -44,9 +45,9 @@ The socket:
   one: a web taken over cannot change anything on its own. A WARNING on every refusal; every
   new session and every "close them all" goes to the black box and is alerted, one by one
   (``on_entry``: ``Guardian.web_access``).
-- The tasks (T26-5a): ``task_start`` is a change, and ``task_status`` a read that takes a live
-  session too, because it returns answers that are not in the black box. ``task_stop`` is not on
-  the list: only the CLI's Ctrl-C asks it, on the control socket.
+- The tasks (T26-5a): ``task_start`` and ``task_stop`` (T26-5b) are changes, and ``task_status``
+  and ``task_list`` (T26-5b, the chat) reads that take a live session too, because what they return
+  is not in the black box. A stop from here is named in the task's end (``stopped_by``).
 - The agents (T26-6b, docs/47 section 8): ``agent_create``, ``agent_start``, ``agent_stop``,
   ``agent_pause``, ``agent_resume`` and ``agent_delete``, handled by the very code of the control
   socket (``backtide.service.fleet``), recorded as ``web (uid …, pid …)``. Narrower here than there.
@@ -119,7 +120,7 @@ READS = frozenset({"agents", "snapshots", "holds", "trusted", "batches", "secret
 CHANGES = frozenset(
     {
         "rewind", "decide", "trust", "untrust", "end_batch", "set_secret", "clear_secret",
-        "set_budget", "accept_prices", "task_start",
+        "set_budget", "accept_prices", "task_start", "task_stop",
         "agent_create", "agent_start", "agent_stop", "agent_pause", "agent_resume", "agent_delete",
     }
 )  # fmt: skip
@@ -134,7 +135,7 @@ LONG_ORDERS = 2  # of MAX_WEB_CONNECTIONS at once: an agent's start holds its co
 # A read that takes a live session, unlike READS (T26-5a, docs/47 section 7.1): a task's answer is
 # not in the black box, which the web's group may read anyway. It does not count as using the
 # session: a chat left open, which asks by itself, must not keep the session alive.
-SIGNED_IN_READS = frozenset({"task_status"})
+SIGNED_IN_READS = frozenset({"task_status", "task_list"})
 # The sign-in (T26-3a): opening, checking and ending the web's sessions.
 SESSION_COMMANDS = frozenset(
     {"session_open", "session_password", "session_check", "session_end", "session_end_all"}

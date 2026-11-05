@@ -19,7 +19,10 @@ web's chat.
   (invariant 5). So neither reaches a log either, which the log bridge records.
 - The answers live in this process's memory: the last MAX_KEPT of the agent, MAX_KEPT_CHARS in all,
   and they are lost on a restart (docs/47, decision 20). Who reads them needs a session on the web's
-  socket: they are not in the black box.
+  socket: they are not in the black box. What brought no answer (a refusal, "busy") goes first, so
+  that twenty refusals do not push out the twenty answers somebody came to read (T26-5b).
+- The chat's list (``listing``, T26-5b): each task with what was asked, struck and cut (``asked``:
+  the prompt itself is not kept past its run), never its answer, which is asked once of ``status``.
 - A service that stops signals what runs and records its end before the black box closes
   (``close``, from ``Guardian.stop``), since stopping the agent ends the tasks anyway. A service
   that dies leaves a task without its end in the black box: its container goes at the next start
@@ -39,6 +42,7 @@ from enum import StrEnum
 from typing import Any
 
 from backtide.blackbox import redact
+from backtide.blackbox.redact import strike_text
 from backtide.jail import docker
 from backtide.jail.docker import JailError
 from backtide.jail.profile import TASK_BUSY, TASK_OK, TASK_TIMED_OUT, ShellCommands
@@ -61,6 +65,7 @@ PROBE_TIMEOUT = 30.0
 PGREP = "/usr/bin/pgrep"
 PKILL = "/usr/bin/pkill"
 TAIL_CHARS = 2000
+ASKED_CHARS = 2000  # what the chat's list shows of what was asked: struck first, then cut
 MAX_KEPT = 20  # the answers of an agent, in memory (docs/47, section 7.1)
 MAX_KEPT_CHARS = 16 * 1024 * 1024  # at least a whole answer: the agent decides how long they are
 # A thread and a docker exec for hours each: a chat that asks without end runs out of these first.
@@ -118,6 +123,21 @@ class TaskStatus:
     seconds: float | None = None
 
 
+@dataclass(frozen=True)
+class TaskEntry:
+    """A line of the agent's list, for the chat. Never the answer (``answer_chars`` says how long
+    it is, and ``status`` gives it). ``asked`` is the owner's text struck and cut; ``via`` is who
+    gave it, "cli" or "web", and ``asked_at`` the seconds since the epoch."""
+
+    task_id: str
+    asked: str
+    asked_at: float
+    via: str
+    outcome: TaskOutcome
+    seconds: float | None = None
+    answer_chars: int = 0
+
+
 @dataclass(eq=False)
 class _Task:
     id: str
@@ -126,8 +146,11 @@ class _Task:
     seconds: int | None
     requested_by: str
     started: float
+    asked: str = ""  # what the list shows: ``prompt`` is emptied at the end, this stays with it
+    asked_at: float = 0.0
     target: ShellOutcome | None = None  # once recorded: the container, by what open_shell said
     stop_asked: bool = False
+    stopped_by: str | None = None  # the web's stop button (T26-5b): the black box says who
     claimed: bool = False  # somebody is writing its end: only once
     status: TaskStatus | None = None  # the end, once recorded
     finished: threading.Event = field(default_factory=threading.Event)
@@ -147,12 +170,14 @@ class AgentTasks:
         record_end: Callable[[dict[str, Any]], None],
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        wall: Callable[[], float] = time.time,
     ) -> None:
         self._shell = commands
         self._open_shell = open_shell
         self._record_end = record_end
         self._clock = clock
         self._sleep = sleep
+        self._wall = wall
         self._lock = threading.Lock()
         self._tasks: dict[str, _Task] = {}  # in the order they started
         self._ended: list[_Task] = []  # in the order they ended: the first to be forgotten
@@ -168,7 +193,16 @@ class AgentTasks:
     ) -> TaskStart:
         """Take a task (its prompt already checked, ``check_prompt``): its id, at once. Whether it
         may run, and how it ended, ``status`` says."""
-        task = _Task(secrets.token_hex(16), prompt, resume, seconds, requested_by, self._clock())
+        task = _Task(
+            secrets.token_hex(16),
+            prompt,
+            resume,
+            seconds,
+            requested_by,
+            self._clock(),
+            _asked_of(prompt),
+            self._wall(),
+        )
         task.thread = threading.Thread(
             target=self._run, args=(task,), name=f"backtide-task-{task.id[:8]}", daemon=True
         )
@@ -202,9 +236,16 @@ class AgentTasks:
         with self._lock:
             return any(not task.claimed for task in self._tasks.values())
 
-    def stop(self, task_id: str) -> bool | None:
-        """Stop it inside the agent (Ctrl-C): True if nothing of it is left or it was signalled,
-        False if it may run on, None if there is no such task."""
+    def listing(self) -> list[TaskEntry]:
+        """Every task this service knows of, in the order they began: those that run and the ones
+        it keeps. Small whatever the answers measure: at most MAX_RUNNING + MAX_KEPT short lines."""
+        with self._lock:
+            return [_entry_of(task) for task in self._tasks.values()]
+
+    def stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None:
+        """Stop it inside the agent (Ctrl-C, or the web's button, which says it is: ``requested_by``
+        goes in the end's event): True if nothing of it is left or it was signalled, False if it
+        may run on, None if there is no such task."""
         with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
@@ -212,6 +253,7 @@ class AgentTasks:
             if task.claimed:
                 return True
             task.stop_asked = True
+            task.stopped_by = requested_by or task.stopped_by  # a Ctrl-C after it names nobody
             target = task.target
         if target is None:  # not at the container yet: its thread sees ``stop_asked``
             return True
@@ -402,6 +444,7 @@ class AgentTasks:
                         "seconds": took,
                         "answer_chars": len(answer or ""),
                         "requested_by": task.requested_by,
+                        **({} if task.stopped_by is None else {"stopped_by": task.stopped_by}),
                     }
                 )
             except Exception as error:
@@ -417,17 +460,47 @@ class AgentTasks:
 
     def _forget_the_oldest(self) -> None:
         """At most the last MAX_KEPT that ended, and MAX_KEPT_CHARS of them: the one that has just
-        ended always stays, whenever it began, and a task that runs never goes. With the lock."""
+        ended always stays, whenever it began, and a task that runs never goes. Past the count, what
+        brought no answer goes before any answer; past the size, what measures most is the answers,
+        so simply the oldest. With the lock."""
         held = sum(_chars_of(task) for task in self._ended)
         while len(self._ended) > 1 and (len(self._ended) > MAX_KEPT or held > MAX_KEPT_CHARS):
-            oldest = self._ended.pop(0)
-            held -= _chars_of(oldest)
-            del self._tasks[oldest.id]
+            older = self._ended[:-1]
+            empty = next((task for task in older if _answer_of(task) is None), None)
+            gone = empty if empty is not None and len(self._ended) > MAX_KEPT else older[0]
+            self._ended.remove(gone)
+            held -= _chars_of(gone)
+            del self._tasks[gone.id]
 
 
 def _chars_of(task: _Task) -> int:
     status = task.status
-    return 0 if status is None else len(status.answer or "") + len(status.message)
+    size = len(task.asked)
+    return size if status is None else size + len(status.answer or "") + len(status.message)
+
+
+def _answer_of(task: _Task) -> str | None:
+    return None if task.status is None else task.status.answer
+
+
+def _asked_of(prompt: str) -> str:
+    """What the chat's list keeps of a prompt: struck, then cut, in that order (a secret cut in
+    half first would no longer be struck, ``recorded_prompt``)."""
+    struck = strike_text(prompt)
+    return struck if len(struck) <= ASKED_CHARS else struck[:ASKED_CHARS] + "…"
+
+
+def _entry_of(task: _Task) -> TaskEntry:
+    status = task.status
+    return TaskEntry(
+        task.id,
+        task.asked,
+        task.asked_at,
+        task.requested_by.split(" ")[0],
+        TaskOutcome.RUNNING if status is None else status.outcome,
+        None if status is None else status.seconds,
+        0 if status is None else len(status.answer or ""),
+    )
 
 
 def _timed_out(seconds: int) -> str:

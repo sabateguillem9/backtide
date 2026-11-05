@@ -1,0 +1,1 @@
+{% if failed %}{{ t('talk.state.failed') }}{% elif running == 0 %}{{ t('talk.state.none') }}{% elif running == 1 %}{{ t('talk.state.one') }}{% else %}{{ t('talk.state.many', count=running) }} {{ t('talk.stop.all') }}{% endif %}

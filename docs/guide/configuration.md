@@ -409,7 +409,7 @@ Behavior:
 
 ## The web: `backtide web`
 
-The web view is read-only unless you switch things on. Each switch is a flag of `backtide web`, and each needs a running `backtide vigilar` and either the same user as the service or, with `--socket-web`, the service's narrow socket for the web's group. The installed web uses the second way: it runs as `backtide-web` and has the four switches on ([command-line reference](cli-reference.md#backtide-web)).
+The web view is read-only unless you switch things on. Each switch is a flag of `backtide web`, and each needs a running `backtide vigilar` and either the same user as the service or, with `--socket-web`, the service's narrow socket for the web's group. The installed web uses the second way: it runs as `backtide-web` and has the five switches on ([command-line reference](cli-reference.md#backtide-web)).
 
 | Flag | Default | Switches on |
 |---|---|---|
@@ -417,6 +417,7 @@ The web view is read-only unless you switch things on. Each switch is a flag of 
 | `--aprobar` | off | Approve, reject and trust from the Requests page (each behind a confirmation) |
 | `--ajustes` | off | Changes on the Settings page |
 | `--gestionar` | off | Create, start, stop, freeze, thaw and delete agents from the Agents page (each behind a confirmation). It needs `--socket-web` |
+| `--tareas` | off | Giving each agent tasks, reading its answers and stopping what runs on its Hablar page. Stopping one stops every task running in that agent. The answers stay in the service's memory, the last 20 per agent, and are lost when it restarts: nothing of them goes to a file or to the black box |
 | `--puerto N` | `8765` | The port, on `127.0.0.1` only (`0`: a free one) |
 
 All details of the command are in the [command-line reference](cli-reference.md#backtide-web). The web only listens on `127.0.0.1`; it is never exposed to the network. As root it refuses to start unless a flag is given.

@@ -1534,11 +1534,19 @@ def _add_web(commands: "argparse._SubParsersAction[argparse.ArgumentParser]") ->
         "pide --socket-web: sin esto, la página Agentes los enseña sin botones",
     )
     web.add_argument(
+        "--tareas",
+        action="store_true",
+        help="deja que la web le pida tareas al agente y lea sus respuestas pidiéndoselo al "
+        "servicio (hace falta su mismo usuario); sin esto, la página Hablar solo dice cómo "
+        "encenderla",
+    )
+    web.add_argument(
         "--socket-web",
         dest="web_socket",
         type=Path,
         metavar="RUTA",
-        help="pide rebobinar, aprobar y los ajustes (cada uno con su opción) y la lista de "
+        help="pide rebobinar, aprobar, las tareas y los ajustes (cada uno con su opción) y la "
+        "lista de "
         "instantáneas por el socket estrecho de la web (el de `backtide vigilar --grupo-web`), "
         "no por el socket de control: para una web que no corre con el usuario del servicio",
     )
@@ -1646,11 +1654,21 @@ WEB_APPROVE_LINES = {
     "disabled": "Aprobar desde la web: no; sin `--aprobar` las peticiones retenidas se ven con "
     "los botones apagados. Usa Telegram o `backtide aprobar`.",
 }
+WEB_TALK_LINES = {
+    "ready": "Hablar con el agente desde la web: sí. Las tareas se le piden al servicio.",
+    "no_service": "Hablar con el agente desde la web: cuando el servicio esté en marcha "
+    "(`backtide vigilar`).",
+    "other_user": "Hablar con el agente desde la web: no. Esta web no corre con el usuario del "
+    "servicio; usa `backtide tarea`.",
+    "off": "Hablar con el agente desde la web: no disponible; usa `backtide tarea`.",
+    "disabled": "Hablar con el agente desde la web: no; sin `--tareas` la página solo dice cómo "
+    "encenderla. Usa `backtide tarea`.",
+}
 ROOT_WEB_REFUSAL = (
     "esta web iba a correr como root: con todos los privilegios y solo para mirar. Para mirar, "
     "lánzala con un usuario lector (con permiso de lectura sobre la caja negra); si de verdad "
-    "quieres rebobinar, cambiar las claves o aprobar desde la web como root, pásale --rebobinar, "
-    "--ajustes o --aprobar sabiendo lo que haces."
+    "quieres rebobinar, cambiar las claves, aprobar o pedir tareas desde la web como root, pásale "
+    "--rebobinar, --ajustes, --aprobar o --tareas sabiendo lo que haces."
 )
 
 
@@ -1675,8 +1693,11 @@ def _web(args: argparse.Namespace) -> int:
     from backtide.web.rewind import ControlRewinder
     from backtide.web.server import DEFAULT_PORT, SERVICE_UID, run_web
     from backtide.web.settings import ControlSettings
+    from backtide.web.talk import ControlTasks
 
-    if _effective_uid() == 0 and not (args.rebobinar or args.ajustes or args.aprobar):
+    if _effective_uid() == 0 and not (
+        args.rebobinar or args.ajustes or args.aprobar or args.tareas
+    ):
         _error(ROOT_WEB_REFUSAL)
         return EXIT_ERROR
     if args.gestionar and args.web_socket is None:
@@ -1742,6 +1763,9 @@ def _web(args: argparse.Namespace) -> int:
         approver = ControlApprover(control, enabled=args.aprobar, server_uid=server_uid)
         line = WEB_APPROVE_LINES.get(str(approver.availability()), WEB_APPROVE_LINES["off"])
         print(line, flush=True)
+        talking = ControlTasks(control, enabled=args.tareas, server_uid=server_uid)
+        line = WEB_TALK_LINES.get(str(talking.availability()), WEB_TALK_LINES["off"])
+        print(line, flush=True)
         if _effective_uid() == 0:
             print(ROOT_WEB_WARNING, flush=True)
 
@@ -1754,6 +1778,7 @@ def _web(args: argparse.Namespace) -> int:
             can_set=args.ajustes,
             can_approve=args.aprobar,
             can_manage=args.gestionar,
+            can_talk=args.tareas,
             **({} if web_socket is None else {"web_socket": web_socket}),
             **({} if origin is None else {"public_origin": origin}),
         )
