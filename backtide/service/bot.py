@@ -20,13 +20,16 @@ socket. Built in ``runner.serve`` when ``<state_dir>/telegram.toml`` exists.
   ``HoldDesk``, so a button can only reach the agent whose desk it came from. What goes through the
   control socket carries its ``agent`` (the main one's is byte for byte as always), and the socket
   is the machine's, the main config's. A neighbour's side is bound while its ``Guardian`` is up
-  (``NeighbourWatch``); before and after, it says it is not being watched.
+  (``NeighbourWatch``); before and after, it says it is not being watched. It goes on the table when
+  it is created or recovered and off it when it is deleted (``TelegramNeighbours``), with the
+  service running.
 """
 
 import logging
 import os
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,7 +38,7 @@ from backtide.blackbox import BlackBox, BlackBoxError, redact
 from backtide.jail.profiles import DEFAULT_PROFILE
 from backtide.notify.buttons import ButtonBook
 from backtide.notify.hold_notice import HoldDesk
-from backtide.notify.telegram import AgentSide, TelegramBot, TelegramNotifier
+from backtide.notify.telegram import AgentSide, AgentTable, TelegramBot, TelegramNotifier
 from backtide.notify.telegram_api import BotApi
 from backtide.service import scope
 from backtide.service.config import ServiceConfig
@@ -398,7 +401,7 @@ class Hooks:
 
 class _WorkingFor:
     """``target`` with each call on this thread working for the agent ``slug``: the bot's threads
-    are the main agent's, and what one logs about a neighbour is that neighbour's (T26-2c)."""
+    are nobody's, and what one logs about an agent is that agent's (T26-2c)."""
 
     def __init__(self, target: Any, slug: str) -> None:
         self._target, self._slug = target, slug
@@ -427,6 +430,67 @@ class TelegramNeighbour:
         self, guardian: Any, box: BlackBox, store: Any, *, budget: Any = None, waiting: Any = None
     ) -> "NeighbourWatch":
         return NeighbourWatch(self, guardian, box, store, budget, waiting)
+
+    def ended(self) -> None:
+        """Its thread ended, and with it this life of the agent: what its last alerts issued goes,
+        and what its gate told as it stopped is not told in the next one."""
+        self.desk.clear()
+        self.book.forget_agent(self.slug)
+
+
+class TelegramNeighbours(Mapping[str, TelegramNeighbour]):
+    """The Telegram side of each agent other than the main one, while the service runs. ``add``
+    gives one its own actions and its own desk and puts it on the bot's table; ``forget`` takes it
+    off, and none of its buttons acts again. As ``AgentTable``: each change makes a new dict."""
+
+    def __init__(
+        self, control_socket: Path, api: BotApi, chat_id: int, book: ButtonBook, table: AgentTable
+    ) -> None:
+        self._socket = control_socket  # the machine's: it is one, and says which agent by name
+        self._api = api
+        self._chat_id = chat_id
+        self._book = book
+        self._table = table
+        self._lock = threading.Lock()
+        self._theirs: dict[str, TelegramNeighbour] = {}
+
+    def add(self, config: ServiceConfig) -> None:
+        """It exists now, running or not. Twice is once: a desk stays the same for all its lives."""
+        slug = config.slug
+        with self._lock:
+            if slug in self._theirs:
+                return
+            actions = GuardianActions(
+                self._socket, agent_lines=config.agent_profile.rewind_notice_lines, agent=slug
+            )
+            scoped = _WorkingFor(actions, slug)
+            desk = HoldDesk(self._api, self._chat_id, self._book, scoped, agent=slug)  # type: ignore[arg-type]
+            self._book.admit_agent(slug)
+            self._theirs = {
+                **self._theirs,
+                slug: TelegramNeighbour(slug, actions, desk, self._book),
+            }
+            self._table.put(slug, AgentSide(scoped, _WorkingFor(desk, slug)))  # type: ignore[arg-type]
+
+    def forget(self, slug: str) -> None:
+        """It was deleted, and its thread has ended. Off the table first: nothing new reaches it."""
+        with self._lock:
+            side = self._theirs.get(slug)
+            self._theirs = {key: each for key, each in self._theirs.items() if key != slug}
+            self._table.drop(slug)
+        if side is not None:
+            side.actions.unbind()
+            side.desk.close()
+        self._book.retire_agent(slug)
+
+    def __getitem__(self, slug: str) -> TelegramNeighbour:
+        return self._theirs[slug]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._theirs)
+
+    def __len__(self) -> int:
+        return len(self._theirs)
 
 
 class NeighbourWatch:
@@ -461,39 +525,40 @@ class NeighbourWatch:
 class TelegramParts:
     """The notifier the alert queue delivers to, the actions to ``bind`` once the Guardian
     exists, the bot to run as a hook next to the control socket (it runs the desk too), and the
-    desk the egress tells about its held requests. ``neighbours``: the same for each other agent."""
+    desk the egress tells about its held requests. ``neighbours``: the same for each other agent,
+    those there are now."""
 
     notifier: TelegramNotifier
     actions: GuardianActions
     bot: TelegramBot
     desk: HoldDesk  # the gate's HoldWatch: the notices of the held requests (T10-4)
-    neighbours: Mapping[str, TelegramNeighbour] = field(default_factory=dict)
+    neighbours: TelegramNeighbours
 
 
 def telegram_parts(
     config: ServiceConfig, settings: TelegramSettings, others: Sequence[ServiceConfig] = ()
 ) -> TelegramParts:
     """The Telegram side of the service, with ``others`` the other agents it runs (T26-2e). One bot
-    and one book for all of them. Touches no network: the bot connects when started."""
+    and one book for all of them. Touches no network: the bot connects when started. With others,
+    what the bot does for the main agent, on its threads of nobody, is the main agent's too."""
     api = BotApi(settings.token.reveal(), base=settings.api_base)
     book = ButtonBook()
     actions = GuardianActions(
         config.control_socket, agent_lines=config.agent_profile.rewind_notice_lines
     )
     chat = settings.chat_id
-    desk = HoldDesk(api, chat, book, actions, agent=config.slug if others else None)
-    agents: dict[str, AgentSide] = {config.slug: AgentSide(actions, desk)} if others else {}
-    neighbours: dict[str, TelegramNeighbour] = {}
-    for other in others:
-        theirs = GuardianActions(
-            config.control_socket,  # the machine's: it is one, and says which agent by name
-            agent_lines=other.agent_profile.rewind_notice_lines,
-            agent=other.slug,
-        )
-        scoped = _WorkingFor(theirs, other.slug)
-        their_desk = HoldDesk(api, chat, book, scoped, agent=other.slug)  # type: ignore[arg-type]
-        neighbours[other.slug] = TelegramNeighbour(other.slug, theirs, their_desk, book)
-        agents[other.slug] = AgentSide(scoped, _WorkingFor(their_desk, other.slug))  # type: ignore[arg-type]
-    notifier = TelegramNotifier(api, chat, book, actions, agents=agents)
-    bot = TelegramBot(api, chat, book, actions, desk=desk, agents=agents)
+    table = AgentTable()
+    neighbours = TelegramNeighbours(config.control_socket, api, chat, book, table)
+    if others:
+        scoped = _WorkingFor(actions, config.slug)
+        desk = HoldDesk(api, chat, book, scoped, agent=config.slug)  # type: ignore[arg-type]
+        its_desk: Any = _WorkingFor(desk, config.slug)
+        table.put(config.slug, AgentSide(scoped, its_desk))  # type: ignore[arg-type]
+        for other in others:
+            neighbours.add(other)
+    else:
+        desk = HoldDesk(api, chat, book, actions)
+        its_desk = desk
+    notifier = TelegramNotifier(api, chat, book, actions, agents=table)
+    bot = TelegramBot(api, chat, book, actions, desk=its_desk, agents=table)
     return TelegramParts(notifier, actions, bot, desk, neighbours)

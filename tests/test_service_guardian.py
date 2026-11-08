@@ -23,7 +23,7 @@ import pytest
 from backtide.blackbox import BlackBox, BlackBoxError, Event, create_key
 from backtide.jail import ExposedJail, JailError
 from backtide.jail.openclaw import RewindProblem, UnrewindableConfig
-from backtide.notify import Alert, AlertLevel
+from backtide.notify import ALREADY_TOLD, Alert, AlertLevel
 from backtide.service import scope
 from backtide.service.config import Secret, ServiceConfig
 from backtide.service.guardian import AgentState, CycleResult, FileWatcher, Guardian
@@ -3530,3 +3530,71 @@ def test_the_bridge_of_a_rewind_without_a_service_has_the_filter_too(world: Worl
     assert world.guardian.flush_logs()
     assert world.box.events(action="log") == []
     world.guardian.close_after_rewind()
+
+
+def _guardian_of_the_main_agent(world: World) -> None:
+    world.guardian._log_filter = scope.belongs_to("principal", and_nobodys=True)  # noqa: SLF001
+    world.guardian._log_nobodys = scope.is_nobodys  # noqa: SLF001
+
+
+def test_what_a_thread_of_nobody_logs_goes_to_the_main_box_and_is_nobodys(world: World) -> None:
+    """The bot, the start, the orders of ``Fleet``: its alert has no name and no button, because a
+    «Pausar» on it would freeze the main agent for something about another."""
+    scope.hand_down()
+    _guardian_of_the_main_agent(world)
+    world.guardian.start()
+    world.log.clear()
+    logging.getLogger("backtide.service.fleet").warning("%s", "about the agent revisor")
+    assert world.guardian.flush_logs()
+    (event,) = [e for e in world.box.events(action="log") if "revisor" in e.details["message"]]
+    (alert,) = world.alerts.titled("Aviso de backtide.service.fleet")
+    assert alert.installation is True and alert.agent is None and alert.event_seq == event.seq
+    world.guardian.stop()
+
+
+def test_what_a_thread_of_the_main_agent_logs_is_the_main_agents(world: World) -> None:
+    scope.hand_down()
+    _guardian_of_the_main_agent(world)
+    world.guardian.start()
+    world.log.clear()
+    logger = logging.getLogger("backtide.service.fleet")
+
+    def one_of_its_threads() -> None:
+        scope.enter("principal")
+        logger.warning("%s", "of the main agent, directly")
+        child = threading.Thread(target=logger.warning, args=("%s %s", "of a thread", "it started"))
+        child.start()
+        child.join()
+
+    thread = threading.Thread(target=one_of_its_threads)
+    thread.start()
+    thread.join()
+    assert world.guardian.flush_logs()
+    alerts = world.alerts.titled("Aviso de backtide.service.fleet")
+    assert len(alerts) == 2 and all(alert.installation is False for alert in alerts)
+    world.guardian.stop()
+
+
+def test_what_was_already_told_is_recorded_and_not_told_again(world: World) -> None:
+    scope.hand_down()
+    _guardian_of_the_main_agent(world)
+    world.guardian.start()
+    world.log.clear()
+    logging.getLogger("backtide.service.fleet").error("%s", "said twice", extra=ALREADY_TOLD)
+    assert world.guardian.flush_logs()
+    assert "said twice" in [e.details["message"] for e in world.box.events(action="log")]
+    assert world.alerts.titled("Aviso de backtide.service.fleet") == []
+    world.guardian.stop()
+
+
+def test_with_one_agent_the_log_is_told_as_it_always_was(world: World) -> None:
+    """No filter: nobody is told apart, buttons and repeats included."""
+    world.guardian.start()
+    world.log.clear()
+    logger = logging.getLogger("backtide.service.fleet")
+    logger.error("%s", "said twice", extra=ALREADY_TOLD)
+    logger.warning("%s", "on any thread")
+    assert world.guardian.flush_logs()
+    alerts = world.alerts.titled("Aviso de backtide.service.fleet")
+    assert len(alerts) == 2 and all(alert.installation is False for alert in alerts)
+    world.guardian.stop()

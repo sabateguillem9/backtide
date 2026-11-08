@@ -30,11 +30,14 @@ socket behind it). Texts are in Spanish and plain text (no ``parse_mode``): what
 from the agent (a file name) cannot become markup, and control characters are escaped.
 
 Several agents (T26-2e; docs/47, section 6.10): one bot and a table of them, ``agents``, by slug,
-which the service made. With one agent there is no table and nothing here changes, texts included.
+which the service keeps: an agent is on it from when it is created or recovered until it is deleted
+(``AgentTable``). With one agent there is no table and nothing here changes, texts included.
 
 - A button acts on the agent it was issued for (``Button.agent``, in the server-side book), through
   that agent's own actions. A slug that is not in the table does nothing: it never falls back on
   the main agent.
+- An order reads the table once, so what it does is about the agents of that moment, each with its
+  own actions: one deleted meanwhile says it is not watched, and its name finds nobody else.
 - A written order names its agent with one more word (`/pausar revisor`), and that word is only
   ever compared with the keys of the table, so ``../x`` is simply nobody, and it is not repeated.
 - An order that acts and does not say which does not guess: `/seguir` refuses, `/pausar` asks, with
@@ -49,7 +52,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, ItemsView, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -191,6 +194,35 @@ class AgentSide:
     desk: HoldDesk | None = None
 
 
+class AgentTable(Mapping[str, AgentSide]):
+    """The agents the bot can act on, by slug. ``Fleet``'s thread changes it while the bot's threads
+    read it, so each change makes a new dict, and a reader that iterates keeps the one it found."""
+
+    def __init__(self) -> None:
+        self._sides: dict[str, AgentSide] = {}
+        self._lock = threading.Lock()
+
+    def put(self, slug: str, side: AgentSide) -> None:
+        with self._lock:
+            self._sides = {**self._sides, slug: side}
+
+    def drop(self, slug: str) -> None:
+        with self._lock:
+            self._sides = {key: side for key, side in self._sides.items() if key != slug}
+
+    def __getitem__(self, slug: str) -> AgentSide:
+        return self._sides[slug]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._sides)
+
+    def __len__(self) -> int:
+        return len(self._sides)
+
+    def items(self) -> ItemsView[str, AgentSide]:  # one dict, not a key at a time
+        return self._sides.items()
+
+
 def alert_text(alert: Alert) -> str:
     """The message of an alert: plain text, redacted again (whoever made the alert), control
     characters escaped line by line, and nothing Telegram would turn into something to tap."""
@@ -240,7 +272,7 @@ class TelegramNotifier:
         self._chat_id = chat_id
         self._book = book
         self._actions = actions
-        self._agents = agents or {}
+        self._agents = agents if agents is not None else {}  # the table itself: it changes
 
     def send(self, alert: Alert) -> None:
         actions = self._actions_of(alert.agent)
@@ -330,8 +362,8 @@ class TelegramBot:
         if type(chat_id) is not int:
             raise TypeError("chat_id must be an int")
         self._desk = desk
-        self._agents = dict(agents or {})  # with several agents: each one, the main one included
-        self._names = ", ".join(inert(slug) for slug in self._agents)
+        # With several agents: each one, the main one included. The table itself: it changes.
+        self._agents = agents if agents is not None else {}
         self._api = api
         self._chat_id = chat_id
         self._book = book
@@ -499,7 +531,8 @@ class TelegramBot:
             if len(picked) > 1:  # it did not say which
                 self._ask_which_to_pause()
             elif picked:
-                self._pause(picked[0])
+                agent, side = picked[0]
+                self._reply(side.actions.pause(), agent)
             return
         date = message.get("date")
         age = self._clock() - date if isinstance(date, int | float) else None
@@ -520,8 +553,7 @@ class TelegramBot:
             if len(picked) > 1:  # it did not say which: this one lets an agent run again
                 self._reply(RESUME_WHICH.format(names=self._names))
             elif picked and self._allowed(chat_id, from_id):
-                agent = picked[0]
-                side = self._side(agent)
+                agent, side = picked[0]
                 # Taken now, on the thread that also runs /pausar: a /pausar sent after this
                 # /seguir wins, however long the seguir waits for the worker or for the lock.
                 mark = side.actions.pause_mark()
@@ -531,7 +563,7 @@ class TelegramBot:
             picked = self._picked(text, chat_id, from_id)
             if not picked:
                 return
-            if any(self._side(agent).desk is None for agent in picked):
+            if any(side.desk is None for _, side in picked):
                 self._reply("Sin el bot completo no hay peticiones retenidas que enseñar aquí.")
             elif self._allowed(chat_id, from_id):
                 self._submit(lambda: self._tell_lists(picked, command))
@@ -628,23 +660,26 @@ class TelegramBot:
             return AgentSide(self._actions, self._desk) if agent is None else None
         return None if agent is None else self._agents.get(agent)
 
-    def _picked(self, text: Any, chat_id: Any, from_id: Any) -> list[str | None]:
-        """Whom an order is about: ``[None]`` with one agent, whatever it says after the command,
-        as always; with several, the one it names or, if it names nobody, all of them, for the
-        order to decide. Anything else is nobody: said, and with no agent touched."""
+    def _picked(self, text: Any, chat_id: Any, from_id: Any) -> list[tuple[str | None, AgentSide]]:
+        """Whom an order is about, each with what acts on it, read once: the only one, whatever it
+        says after the command, as always; with several, the one it names or, if it names nobody,
+        all of them, for the order to decide. Anything else is nobody: said, and with no agent
+        touched."""
         if not self._agents:
-            return [None]
+            return [(None, AgentSide(self._actions, self._desk))]
         said = text.split()[1:]
         if not said:
-            return list(self._agents)
-        if len(said) == 1 and said[0] in self._agents:
-            return [said[0]]
+            return list(self._agents.items())
+        side = self._agents.get(said[0]) if len(said) == 1 else None
+        if side is not None:
+            return [(said[0], side)]
         self._ignore("unknown_agent", "message", chat_id, from_id)  # never what it said
         self._reply(NOBODY.format(names=self._names))
         return []
 
-    def _pause(self, agent: str | None) -> None:
-        self._reply(self._side(agent).actions.pause(), agent)
+    @property
+    def _names(self) -> str:
+        return ", ".join(inert(slug) for slug in self._agents)
 
     def _ask_which_to_pause(self) -> None:
         text = PAUSE_WHICH.format(names=self._names)
@@ -690,13 +725,13 @@ class TelegramBot:
                 said.append(said_by(slug, PAUSE_FAILED))
         self._reply("\n\n".join(said))
 
-    def _tell_status(self, picked: list[str | None]) -> None:
-        self._reply("\n\n".join(said_by(a, self._side(a).actions.status()) for a in picked))
+    def _tell_status(self, picked: list[tuple[str | None, AgentSide]]) -> None:
+        self._reply("\n\n".join(said_by(agent, side.actions.status()) for agent, side in picked))
 
-    def _tell_lists(self, picked: list[str | None], command: str) -> None:
+    def _tell_lists(self, picked: list[tuple[str | None, AgentSide]], command: str) -> None:
         said = []
-        for agent in picked:
-            desk = self._side(agent).desk
+        for agent, side in picked:
+            desk = side.desk
             listing = desk.list_holds if command == "retenidas" else desk.list_batches
             text = listing()
             if text:

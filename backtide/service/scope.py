@@ -9,8 +9,13 @@ run on threads that descend from that agent's.
 
 ``threading`` does not hand anything down to a new thread, so ``hand_down`` wraps
 ``Thread.start`` for the whole process, once, and only when there is more than one agent: with
-one, this module changes nothing and nothing is filtered. A thread with no scope (the main
-thread, and what it starts) is the main agent's, which is where it has always gone.
+one, this module changes nothing and nothing is filtered.
+
+A thread with no scope works for nobody: the start of the service, its sockets, its bot, the orders
+of ``Fleet``, and what they start. What one logs still goes to the main agent's box, as it always
+has, but it is not the main agent's business, so its alert names nobody and offers no button (fail
+closed: what forgets to say whose it is cannot freeze the main agent). The main agent's own threads
+say so, like any other agent's: ``serve`` runs its ``Guardian`` under ``working_for``.
 """
 
 import logging
@@ -24,8 +29,13 @@ _handing_down = False
 
 
 def current() -> str | None:
-    """The slug this thread works for, or None for the main agent's."""
+    """The slug this thread works for, or None for nobody in particular."""
     return getattr(_here, "slug", None)
+
+
+def is_nobodys() -> bool:
+    """This thread works for no agent: what it logs is about the machine, or it cannot be told."""
+    return current() is None
 
 
 def enter(slug: str) -> None:
@@ -35,9 +45,9 @@ def enter(slug: str) -> None:
 
 @contextmanager
 def working_for(slug: str | None) -> Iterator[None]:
-    """For a while this thread works for ``slug`` (None: the main agent's). A connection to the
-    sockets runs on the sockets' thread whichever agent it is about, and what it logs is that
-    agent's (T26-2c)."""
+    """For a while this thread works for ``slug`` (None: for nobody). A connection to the sockets
+    runs on the sockets' thread whichever agent it is about, and what it logs is that agent's
+    (T26-2c)."""
     before = current()
     _here.slug = slug
     try:
@@ -70,11 +80,14 @@ def hand_down() -> None:
         threading.Thread.start = start  # type: ignore[method-assign]
 
 
-def belongs_to(slug: str | None) -> Callable[[logging.LogRecord], bool]:
-    """What a bridge asks of a log record: was it logged by a thread of this agent? ``slug`` None
-    is the main agent's, which also takes the threads of nobody in particular."""
+def belongs_to(
+    slug: str | None, *, and_nobodys: bool = False
+) -> Callable[[logging.LogRecord], bool]:
+    """What a bridge asks of a log record: was it logged by a thread of this agent?
+    ``and_nobodys``: the main agent's box also takes the threads of nobody in particular."""
 
     def accepts(record: logging.LogRecord) -> bool:
-        return current() == slug
+        here = current()
+        return here == slug or (and_nobodys and here is None)
 
     return accepts

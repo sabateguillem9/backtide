@@ -67,6 +67,7 @@ from backtide.jail.config import Protected
 from backtide.jail.proxy import ProxyJail
 from backtide.jail.sensor import SensorJail, SensorJailConfig
 from backtide.notify import (
+    ALREADY_TOLD,
     Alert,
     AlertLevel,
     AlertQueue,
@@ -82,7 +83,7 @@ from backtide.sensors.tetragon import TetragonReader
 from backtide.service import scope
 from backtide.service.agent_disk import SYSTEMD_RUN_MARK, ensure_on_disk, is_stopped
 from backtide.service.agents import kind_of
-from backtide.service.bot import Hooks, TelegramNeighbour, telegram_parts
+from backtide.service.bot import Hooks, TelegramNeighbours, telegram_parts
 from backtide.service.config import (
     KEY_UNUSABLE,
     ConfigError,
@@ -314,7 +315,7 @@ def _record_in_installation(
             box.append(source, action, target, details=details, risk=risk)
         return True
     except (BlackBoxError, ConfigError, OSError) as error:
-        logger.error("the installation's black box cannot be used: %s", error)
+        logger.error("the installation's black box cannot be used: %s", error, extra=ALREADY_TOLD)
         alerts.submit(
             Alert(
                 AlertLevel.ERROR,
@@ -484,6 +485,7 @@ def build_guardian(
     hold_watch: HoldWatch | None = None,
     sensor_share: SensorShare | None = None,
     log_filter: Callable[[logging.LogRecord], bool] | None = None,
+    log_nobodys: Callable[[], bool] | None = None,
     spend_total: SharedSpend | None = None,
 ) -> tuple[Guardian, AlertQueue, BlackBox]:
     """The Guardian with the real store, jail, file watcher and black box, the alert queue it
@@ -582,6 +584,7 @@ def build_guardian(
         sensor=process_sensor,
         egress=egress,
         log_filter=log_filter,
+        log_nobodys=log_nobodys,
     )
     responder.bind(snapshot=guardian.take_evidence, record=rated_box.append)
     return guardian, alerts, box
@@ -1135,14 +1138,14 @@ class _Neighbours:
         run: Callable[..., None] | None = None,
         roster: Roster | None = None,
         spend_total: SharedSpend | None = None,
-        telegram: Mapping[str, TelegramNeighbour] | None = None,
+        telegram: TelegramNeighbours | None = None,
         web_group: int | None = None,
         prepare: Callable[[ServiceConfig], None] | None = None,
         stop_alive: Callable[[ServiceConfig], bool] | None = None,
     ) -> None:
         self._stop_alive = stop_alive if stop_alive is not None else stop_unwatched
         self._roster = roster
-        self._telegram = telegram or {}
+        self._telegram = telegram
         self._spend_total = spend_total
         self._web_group = web_group
         self._main = main
@@ -1188,8 +1191,11 @@ class _Neighbours:
             stop.set()
 
     def add(self, config: ServiceConfig) -> None:
+        """It exists now, running or not: also for the bot."""
         with self._lock:
             self._others[config.slug] = config
+        if self._telegram is not None:
+            self._telegram.add(config)
 
     def config_of(self, slug: str) -> ServiceConfig | None:
         with self._lock:
@@ -1200,8 +1206,8 @@ class _Neighbours:
         thread = threading.Thread(
             target=self._watch, args=(config,), name=f"backtide-agent-{config.slug}"
         )
+        self.add(config)
         with self._lock:
-            self._others[config.slug] = config
             self._failures.pop(config.slug, None)
             self._stops[config.slug] = threading.Event()
             self._settled[config.slug] = threading.Event()
@@ -1217,7 +1223,7 @@ class _Neighbours:
         try:
             found = self._stop_alive(config)
         except Exception as error:  # the worst case: it runs, unrecorded, and it is said
-            logger.exception("the agent %s runs with nobody watching it", slug)
+            logger.exception("the agent %s runs with nobody watching it", slug, extra=ALREADY_TOLD)
             text = str(redact(f"{type(error).__name__}: {error}"))[:_FAILED_AGENT_CHARS]
             _record_in_installation(
                 self._main, self._told, "agent_stop_failed", slug,
@@ -1234,7 +1240,11 @@ class _Neighbours:
             )
             return False
         if found:
-            logger.error("the agent %s was running with nobody watching it: stopped", slug)
+            logger.error(
+                "the agent %s was running with nobody watching it: stopped",
+                slug,
+                extra=ALREADY_TOLD,
+            )
             _record_in_installation(
                 self._main, self._told, "agent_stop", slug, {"reason": "unsupervised"}, risk=2
             )
@@ -1261,9 +1271,8 @@ class _Neighbours:
             self._reloads.pop(slug, None)
             self._guardians.pop(slug, None)
             self._newcomers = [item for item in self._newcomers if item[0] != slug]
-        side = self._telegram.get(slug)
-        if side is not None:  # what an alert about it issued since, from the main agent's queue
-            side.book.forget_agent(slug)
+        if self._telegram is not None:  # also what an alert about it issued since its thread ended
+            self._telegram.forget(slug)
 
     def wait_settled(self, slug: str, timeout: float) -> None:
         """Until the agent is up, or its thread ended. See ``failure_of`` and the roster."""
@@ -1330,7 +1339,7 @@ class _Neighbours:
         try:
             self._serve_one(config, stop, settled)
         except Exception as error:  # the Guardian already stopped its agent, or said it could not
-            logger.exception("the agent %s is not being watched", config.slug)
+            logger.exception("the agent %s is not being watched", config.slug, extra=ALREADY_TOLD)
             with self._lock:
                 self._failures[config.slug] = str(redact(f"{error}"))[:_FAILED_AGENT_CHARS]
             record_agent_failed(self._main, self._told, config.slug, error)
@@ -1338,9 +1347,9 @@ class _Neighbours:
             with self._lock:
                 self._reloads.pop(config.slug, None)
                 self._guardians.pop(config.slug, None)
-            side = self._telegram.get(config.slug)
+            side = None if self._telegram is None else self._telegram.get(config.slug)
             if side is not None:  # what its last alerts issued as they went out, after its watch
-                side.book.forget_agent(config.slug)
+                side.ended()
             settled.set()
 
     def _serve_one(
@@ -1355,7 +1364,7 @@ class _Neighbours:
             share_box_with_web(config, self._web_group)
         built: list[Egress] = []
         secrets = LiveScrub()
-        telegram = self._telegram.get(config.slug)
+        telegram = None if self._telegram is None else self._telegram.get(config.slug)
         guardian, alerts, box = self._build(
             config,
             notifier=self._notifier_for(config.slug),
@@ -1390,6 +1399,22 @@ class _Neighbours:
                 )
                 control = Hooks(control, watch)
         self._run_guardian(guardian, alerts, box, stop=stop, handle_signals=False, control=control)
+
+
+class _OfNobody:
+    """Hooks that are the machine's, not the main agent's, though ``Guardian.run`` starts them on
+    its thread: the sockets, the bot, the trash. What they start and log is nobody's (``scope``)."""
+
+    def __init__(self, hook: ControlHook) -> None:
+        self._hook = hook
+
+    def start(self) -> None:
+        with scope.working_for(None):
+            self._hook.start()
+
+    def close(self) -> None:
+        with scope.working_for(None):
+            self._hook.close()
 
 
 class _Runnable(Protocol):
@@ -1546,11 +1571,13 @@ def serve(
         stop = stop if stop is not None else threading.Event()
         share: SensorShare | None = None
         log_filter = None
+        log_nobodys = None
         neighbours: _Neighbours | None = None
         spend_total = spend_total_for(config, others)
         if others:
             scope.hand_down()  # before any thread of an agent starts
-            log_filter = scope.belongs_to(None)
+            log_filter = scope.belongs_to(config.slug, and_nobodys=True)
+            log_nobodys = scope.is_nobodys
             share = SensorShare() if sensor else None
             machine_notifier = notifier if notifier is not None else LogNotifier()
             one_at_a_time = threading.Lock()
@@ -1561,24 +1588,29 @@ def serve(
             notifier = notifier_for(config.slug)
         built: list[Egress] = []
         sensor_secrets = LiveScrub()
-        guardian, alerts, box = build_guardian(
-            config,
-            jail=jail,
-            notifier=notifier,
-            watcher_config=watcher_config,
-            store=store,
-            space=space,
-            sensor=sensor,
-            sensor_jail=sensor_jail,
-            proxy=proxy,
-            hold_timings=hold_timings,
-            on_egress=built.append,
-            scrub=sensor_secrets,
-            hold_watch=None if telegram is None else telegram.desk,
-            sensor_share=share,
-            log_filter=log_filter,
-            spend_total=spend_total,
-        )
+        # With others this thread is nobody's but for the main agent's Guardian and what it starts:
+        # what forgets to say whose it is gets no button (``scope``).
+        main_scope = config.slug if others else None
+        with scope.working_for(main_scope):
+            guardian, alerts, box = build_guardian(
+                config,
+                jail=jail,
+                notifier=notifier,
+                watcher_config=watcher_config,
+                store=store,
+                space=space,
+                sensor=sensor,
+                sensor_jail=sensor_jail,
+                proxy=proxy,
+                hold_timings=hold_timings,
+                on_egress=built.append,
+                scrub=sensor_secrets,
+                hold_watch=None if telegram is None else telegram.desk,
+                sensor_share=share,
+                log_filter=log_filter,
+                log_nobodys=log_nobodys,
+                spend_total=spend_total,
+            )
         # The Settings page (T12e): `backtide web --ajustes` asks through this same socket.
         (egress,) = built
         reload_keys = key_reloader(config, egress, sensor_secrets)
@@ -1607,7 +1639,7 @@ def serve(
                 told=alerts,
                 roster=roster,
                 spend_total=spend_total,
-                telegram={} if telegram is None else telegram.neighbours,
+                telegram=None if telegram is None else telegram.neighbours,
                 web_group=web_group,
             )
             reload_keys = reload_everyones_keys(reload_keys, neighbours.reloads)
@@ -1699,15 +1731,18 @@ def serve(
             control = Hooks(control, telegram.bot)
         if fleet is not None:
             control = Hooks(control, TrashWatch(fleet))
+        if others:
+            control = _OfNobody(control)
         record_installation_start(config, alerts, others)
         if fleet is not None:
             fleet.finish_interrupted()
         if neighbours is not None:
             neighbours.start()
         try:
-            run_guardian(
-                guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control
-            )
+            with scope.working_for(main_scope):
+                run_guardian(
+                    guardian, alerts, box, stop=stop, handle_signals=handle_signals, control=control
+                )
         finally:
             if neighbours is not None:
                 stop.set()  # the main agent is gone, and with it the way to ask for anything

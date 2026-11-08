@@ -20,7 +20,10 @@ button without using it. A batch's confirmation is a single-use pair like a rewi
 With several agents (T26-2e) each button also keeps its ``agent``, here and never in Telegram: the
 ``callback_data`` is still only the token, well under Telegram's 64 bytes, so nobody can write a
 button for another agent, and the bot looks that slug up in the service's list. ``forget_agent``
-takes away all of an agent's buttons when it stops being watched.
+takes away all of an agent's buttons when it stops being watched. ``retire_agent``, when it is
+deleted, and from then on what is issued for it is born dead, until ``admit_agent`` brings it back:
+so no button outlives the agent it was for, whatever was on its way as it went and whoever comes
+back with that name.
 
 The book is in memory: after a restart of the service every old button answers "caducado".
 Forged data (anything that is not a token we issued) is just an unknown token. Thread-safe.
@@ -89,6 +92,7 @@ class ButtonBook:
         self._clock = clock
         self._capacity = capacity
         self._buttons: OrderedDict[str, Button] = OrderedDict()
+        self._retired: set[str] = set()
         self._lock = threading.Lock()
 
     def __len__(self) -> int:
@@ -108,9 +112,13 @@ class ButtonBook:
         rule_id: str | None = None,
         agent: str | None = None,
     ) -> str:
-        """A new token for ``action``. Buttons of one ``group`` are used up together."""
+        """A new token for ``action``. Buttons of one ``group`` are used up together. For an agent
+        that was deleted, a token that means nothing: the message can go out, and a press on it is
+        an unknown button."""
         token = secrets.token_urlsafe(18)
         with self._lock:
+            if agent in self._retired:
+                return token
             self._make_room()
             self._buttons[token] = Button(
                 action, snapshot_id, self._clock() + ttl, single_use, group or token,
@@ -140,6 +148,18 @@ class ButtonBook:
         with self._lock:
             for token in [t for t, b in self._buttons.items() if b.agent == agent]:
                 del self._buttons[token]
+
+    def retire_agent(self, agent: str) -> None:
+        """``agent`` was deleted: its buttons go, and none can be issued for it."""
+        with self._lock:
+            self._retired.add(agent)
+            for token in [t for t, b in self._buttons.items() if b.agent == agent]:
+                del self._buttons[token]
+
+    def admit_agent(self, agent: str) -> None:
+        """``agent`` is on the table: its buttons can be issued (again, if it was recovered)."""
+        with self._lock:
+            self._retired.discard(agent)
 
     def bind(self, tokens: list[str], message_id: int) -> None:
         """The message the buttons ``tokens`` were sent on: only a press there counts."""
