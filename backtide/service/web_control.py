@@ -120,7 +120,7 @@ from backtide.snapshots import Snapshot
 logger = logging.getLogger(__name__)
 
 WEB_SOCKET_MODE = 0o660
-MAX_WEB_CONNECTIONS = 7
+MAX_WEB_CONNECTIONS = 8
 # What the web may read (it shows them) and change (each behind its own confirmation in the web).
 READS = frozenset({"agents", "snapshots", "holds", "trusted", "batches", "secrets", "budget"})
 CHANGES = frozenset(
@@ -143,7 +143,8 @@ LONG_ORDERS = 2  # of MAX_WEB_CONNECTIONS at once: an agent's start holds its co
 # a time anyway (``AGENT_STOPS``). A task's stop is each agent's own (its ``pkill`` runs inside it,
 # and a hostile agent can make it hang): one per agent, and at most ``TASK_STOPS`` of them at once.
 # What lasts takes ``LONG_ORDERS + AGENT_STOPS + TASK_STOPS`` of ``MAX_WEB_CONNECTIONS``, and at
-# least two connections stay free for the pages, the cookie checks and the freeze (a test fixes it).
+# least three stay free: the cookie checks may take ``CHECKS_AT_ONCE`` of them and one is left that
+# nothing else can take, for the freeze (a test fixes it).
 AGENT_STOPS = 1
 TASK_STOPS = 2
 # A read that takes a live session, unlike READS (T26-5a, docs/47 section 7.1): a task's answer is

@@ -529,7 +529,7 @@ def test_long_orders_leave_connections_for_the_pages_and_never_stop_a_brake(
     assert talk(server, signed(START))["ok"] is True  # the room comes back
 
 
-FREE_FOR_PAGES = 2  # connections that no order of a kind that lasts may take: pages and the freeze
+FREE_FOR_PAGES = 3  # connections that no order of a kind that lasts may take: pages, checks, freeze
 
 
 def test_the_orders_that_last_never_take_every_connection() -> None:
@@ -537,7 +537,8 @@ def test_the_orders_that_last_never_take_every_connection() -> None:
     and the cookie checks (which also come through here) fitting in that room."""
     longest = LONG_ORDERS + AGENT_STOPS + TASK_STOPS
     assert longest + FREE_FOR_PAGES <= MAX_WEB_CONNECTIONS
-    assert CHECKS_AT_ONCE <= MAX_WEB_CONNECTIONS - longest
+    # the cookie checks never take them all: one stays for the freeze, which no flood can queue
+    assert CHECKS_AT_ONCE < MAX_WEB_CONNECTIONS - longest
 
 
 class SlowTaskStop:
