@@ -795,6 +795,8 @@
       reapply();
     } else if (target && target.id === "state") {
       heart();
+    } else if (target && target.id === "tasks") {
+      tickAges();
     } else if (target && target.classList && target.classList.contains("card")) {
       tickAges();
       stirCard(target);
@@ -817,6 +819,18 @@
   document.body.addEventListener("htmx:sseError", function () {
     connection(false);
     frame && frame.classList.remove("is-beating");
+  });
+  // A second click on "Pedir" would be a second task: the page that comes next has the button back.
+  document.body.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!form || !form.classList || !form.classList.contains("talk-form")) return;
+    var send = form.querySelector("button[type=submit]");
+    if (send) send.disabled = true;
+  });
+  window.addEventListener("pageshow", function () {
+    document.querySelectorAll(".talk-form button[type=submit]").forEach(function (send) {
+      send.disabled = false;
+    });
   });
   document.body.addEventListener("htmx:afterRequest", function (event) {
     var form = event.target;

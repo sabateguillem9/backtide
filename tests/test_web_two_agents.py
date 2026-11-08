@@ -910,14 +910,17 @@ def test_live_agents_only_take_slugs_for_a_path(
 ) -> None:
     """Even from the service's own reply: a name becomes a folder only if it is a slug, and one the
     web cannot show leaves the others standing."""
-    item = {"main": False, "watched": True, "state": None, "notice": []}
+    item = {
+        "main": False, "watched": True, "state": None, "notice": [],
+        "kind": None, "version": None, "in_use": None, "order": None,
+    }  # fmt: skip
     listed = [
         {"slug": "principal", "name": None, **item, "main": True},
         {"slug": "../../etc", "name": None, **item},
         {"slug": "largo", "name": "x" * 200, **item},
         {"slug": "bueno", "name": None, **item},
     ]
-    monkeypatch.setattr(live, "ask_agents", lambda *args, **options: listed)
+    monkeypatch.setattr(live, "ask_fleet", lambda *args, **options: (listed, []))
     monkeypatch.setattr(live, "availability_of", lambda *args, **options: Availability.READY)
     asked: list[str] = []
 

@@ -12,13 +12,17 @@ program on this machine that listens on a port of its own (cookies ignore ports)
     at 127.0.0.1 (DNS rebinding) arrives with ITS name in ``Host``. Each name's pages send their
     own ``Origin``, and only that one is taken with it;
   * only GET, except the paths that change something: ``POST /instantaneas/rebobinar`` (T12b);
+    only with `backtide web --tareas`, ``POST /hablar/pedir`` (T26-5b: a task for the agent, the one
+    form that may be as long as what the owner asks), and ``POST /hablar/parar`` (stopping one);
     only when `backtide web --ajustes` turned the Settings page on, ``POST /ajustes/guardar``
     (T12e: a key set or removed); and only with `backtide web --aprobar`, ``POST
     /peticiones/decidir`` (T10-5: approve, reject, "aprobar y confiar", revoke a batch, take a
     trusted recipient out); and always ``POST /salir`` and ``POST /ajustes/cerrar-sesiones``
-    (T26-3a-2: sign out, close every session), which only end sessions. A POST anywhere else,
-    and any other method, is a 405, so without ``--ajustes`` or ``--aprobar`` there is no door
-    that changes anything;
+    (T26-3a-2: sign out, close every session), which only end sessions; and only with
+    `backtide web --gestionar` and the narrow socket, ``POST /agentes/crear`` and ``POST
+    /agentes/orden`` (T26-6b: create, start, stop, freeze, thaw or delete an agent). A POST anywhere
+    else, and any other method, is a 405, so without ``--ajustes``, ``--aprobar`` or ``--gestionar``
+    there is no door that changes anything;
   * every such POST must come from our own page: exactly one ``Origin``, ours (every browser
     sends it on a POST), ``Sec-Fetch-Site: same-origin`` when the browser sends it (anything
     else, even ``none``, is refused), a plain form body (``application/x-www-form-urlencoded``: no
@@ -26,8 +30,8 @@ program on this machine that listens on a port of its own (cookies ignore ports)
     (no chunked bodies). Behind that the app still wants the session cookie (never the link
     token), the session's CSRF token from the form, and a one-time confirmation ticket for that
     very snapshot (``backtide.web.rewind.Tickets``), that very change of that very key
-    (``backtide.web.settings.SettingTickets``) or that very decision on that very hold, batch or
-    recipient (``backtide.web.approve.DecisionTickets``);
+    (``backtide.web.settings.SettingTickets``), that very decision on that very hold, batch or
+    recipient (``backtide.web.approve.DecisionTickets``) or that very order on that very agent;
   * a browser ``Origin`` that is not ours is refused, and so is any request the browser says is
     ``same-site`` or ``cross-site`` unless it is a top-level navigation (``Sec-Fetch-Mode:
     navigate``): the stream and the fragments are only ever fetched from our own pages;
@@ -73,6 +77,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Protocol
 
+from backtide.jail.profile import MAX_PROMPT
 from backtide.service.control import (
     ControlError,
     ControlOutcomeUnknown,
@@ -129,6 +134,13 @@ SETTINGS_POST_PATH = "/ajustes/guardar"
 # The held requests (T10-5): their page, and the POST that decides, only with --aprobar.
 HOLDS_PATH = "/peticiones"
 DECIDE_PATH = "/peticiones/decidir"
+# The agents (T26-6b): the list and its pages, and their POSTs only with --gestionar.
+AGENTS_PATH = "/agentes"
+AGENT_NEW_PATH = "/agentes/nuevo"
+AGENT_CREATE_PATH = "/agentes/crear"
+AGENT_ORDER_PATH = "/agentes/orden"
+AGENT_RUNNING_PATH = "/agentes/en-curso"
+AGENTS_STREAM_PATH = "/agentes/stream"
 # Signing out and closing every session (T26-3a-2): always there, each with the session's CSRF.
 KEYS_PATH = "/llaves"  # the passkeys (T26-3b-2): the page, then its two POSTs
 KEYS_BEGIN_PATH = "/llaves/empezar"
@@ -142,6 +154,9 @@ TOUCH_PATH = "/tocar"  # touching the key again (T26-3c): the page, then its two
 TOUCH_BEGIN_PATH = "/tocar/empezar"
 TOUCH_FINISH_PATH = "/tocar/responder"
 SIGN_OUT_PATH = "/salir"
+TALK_PATH = "/hablar"  # the chat (T26-5b): the page, its stream and, with --tareas, its POST
+TALK_SEND_PATH = "/hablar/pedir"
+TALK_STOP_PATH = "/hablar/parar"
 CLOSE_SESSIONS_PATH = "/ajustes/cerrar-sesiones"
 CLOSE_SESSIONS_WORD = "cerrar-todas"  # typed in the form: the confirmation
 MAX_FORM_BYTES = 2048
@@ -381,6 +396,9 @@ class ServiceAccess:
 
 PASSKEY_HOST = "backtide.localhost"  # the passkeys' relying party (backtide.service.passkeys)
 MAX_LARGE_FORM_BYTES = 8192  # a passkey's answer, on its own path only
+# What the owner asks an agent, on its own path only: MAX_PROMPT characters, each of up to four
+# bytes, each byte written %XX, and the form's other fields.
+MAX_PROMPT_FORM_BYTES = 12 * MAX_PROMPT + MAX_FORM_BYTES
 
 
 def allowed_hosts(port: int, origin: PublicOrigin | None = None) -> frozenset[str]:
@@ -405,13 +423,17 @@ class Guard:
         prefix: str,
         post_paths: tuple[str, ...] = (POST_PATH,),
         large_post_paths: tuple[str, ...] = (),
+        prompt_post_paths: tuple[str, ...] = (),
         origin: PublicOrigin | None = None,
     ) -> None:
         self.inner = app
         self.base = "" if origin is not None else f"/s/{prefix}"
-        self._post_paths = tuple(self.base + path for path in (*post_paths, *large_post_paths))
+        self._post_paths = tuple(
+            self.base + path for path in (*post_paths, *large_post_paths, *prompt_post_paths)
+        )
         # A passkey's answer is bigger than any other form: only its path takes up to 8 KiB.
         self._large_paths = tuple(self.base + path for path in large_post_paths)
+        self._prompt_paths = tuple(self.base + path for path in prompt_post_paths)
         self._hosts = allowed_hosts(port, origin)
         self._origin = None if origin is None else origin.url
 
@@ -456,7 +478,12 @@ class Guard:
             token_matches(scope["path"], path) for path in self._post_paths
         ):
             large = any(token_matches(scope["path"], path) for path in self._large_paths)
-            limit = MAX_LARGE_FORM_BYTES if large else MAX_FORM_BYTES
+            prompt = any(token_matches(scope["path"], path) for path in self._prompt_paths)
+            limit = (
+                MAX_PROMPT_FORM_BYTES
+                if prompt
+                else (MAX_LARGE_FORM_BYTES if large else MAX_FORM_BYTES)
+            )
             refusal = self._post_refusal(headers, own, limit)
             if refusal is not None:
                 return refusal

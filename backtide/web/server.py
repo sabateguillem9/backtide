@@ -66,6 +66,7 @@ from backtide.web.agents import AgentSource, PendingRequest
 from backtide.web.app import create_app
 from backtide.web.approve import Approver, ControlApprover
 from backtide.web.live import LiveAgents
+from backtide.web.manage import AgentOrders, ControlAgentOrders
 from backtide.web.paths import WebPaths
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import WAIT_FOR_SERVICE, ControlRewinder
@@ -77,6 +78,7 @@ from backtide.web.security import (
     session_cookie_name,
 )
 from backtide.web.settings import ControlSettings, ControlSpend, SettingsClient
+from backtide.web.talk import ControlTasks, TaskClient
 
 # The installed service runs as root: the narrow socket and the process behind it must be root's.
 SERVICE_UID = 0
@@ -217,8 +219,12 @@ def run_web(
     can_rewind: bool = False,
     can_set: bool = False,
     can_approve: bool = False,
+    can_manage: bool = False,
+    agent_orders: AgentOrders | None = None,
+    can_talk: bool = False,
     settings: SettingsClient | None = None,
     approver: Approver | None = None,
+    tasks: TaskClient | None = None,
     agent_name: str | None = None,
     others: Sequence[AgentSource] = (),
     pending: Callable[[], Sequence[PendingRequest]] | None = None,
@@ -235,7 +241,11 @@ def run_web(
     exist; ``settings`` replaces the control socket's client (the Mac's demo). ``can_approve`` is
     `--aprobar` (T10-5): without it the held requests are listed from the black box with their
     buttons disabled, and the POST that decides does not exist; ``approver`` replaces the
-    control socket's client (the demo). ``agent_name``,
+    control socket's client (the demo). ``can_manage`` is `--gestionar` (T26-6b), which takes the
+    narrow socket: without it the list of agents shows them with no buttons, and the POSTs do not
+    exist; ``agent_orders`` replaces its client (the demo). ``can_talk`` is `--tareas` (T26-5b):
+    without it the chat's page only says how to turn it on, and its POST does not exist; ``tasks``
+    replaces the socket's client (the demo). ``agent_name``,
     ``others`` (more agents, each read by its own ``BoxReader``) and ``pending`` (the gate's
     requests) are only given by the demo: the real web asks the service which agents there are
     and what waits (``backtide.web.live``, T26-2d).
@@ -284,10 +294,18 @@ def run_web(
         rewinder=ControlRewinder(control, enabled=can_rewind, server_uid=server_uid),
         settings=settings or ControlSettings(control, enabled=can_set, server_uid=server_uid),
         approver=approver or ControlApprover(control, enabled=can_approve, server_uid=server_uid),
+        tasks=tasks or ControlTasks(control, enabled=can_talk, server_uid=server_uid),
         spend=ControlSpend(control, server_uid=server_uid),
         agent_name=agent_name,
         others=others,
         agents_from=live,
+        agent_orders=agent_orders
+        or ControlAgentOrders(
+            control,
+            live.listing if live is not None else lambda: None,
+            enabled=can_manage,
+            server_uid=server_uid,
+        ),
         pending=pending,
         agent_lines=paths.agent_lines,
         origin=public_origin,

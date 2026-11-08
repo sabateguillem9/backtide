@@ -1,0 +1,46 @@
+{# The list of agents, the inside of #agents-list, which the stream replaces. Every word is the
+   service's or ours: a name is the owner's, and is shown as such. A deleted agent is "retirado":
+   it has no buttons, and it comes back only from the server's terminal. #}
+{% set ready = state == 'ready' %}
+<ul class="settings-list agents-list">
+  {% for row in rows %}
+  {% set kind = kind_label(row) %}
+  <li class="setting a-{{ row.colour }} agent-{{ row.word }}" data-agent="{{ row.slug }}">
+    <div class="setting-info">
+      <span class="setting-name">{% if row.base %}<a class="agent-link" href="{{ row.base }}/ahora"><span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(row.name if row.name is not none else t('agent.default'), 48) }}</span></a>{% else %}<span class="tag" aria-hidden="true"></span><span class="agent-name">{{ vis(row.name if row.name is not none else row.slug, 48) }}</span>{% endif %}{% if row.main %} <span class="muted agent-main">{{ t('agents.main') }}</span>{% endif %}</span>
+      <span class="setting-state"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('agents.state.' ~ row.word) }}</span></span>
+      {% if kind or row.in_use %}<span class="setting-note">{% if kind %}{{ kind }}{% endif %}{% if row.in_use %}{% if kind %} · {% endif %}<span class="in-use">{{ t('agents.in_use.' ~ row.in_use) if t.has('agents.in_use.' ~ row.in_use) else '' }}</span>{% endif %}</span>{% endif %}
+      {% if row.word == 'stop_failed' %}<span class="setting-note">{{ t('agents.stop_failed.note') }}</span>{% endif %}
+      {% if row.word == 'starting' and not row.main %}<span class="setting-note">{{ t.code('agents.starting.note', slug=row.slug) }}</span>{% endif %}
+    </div>
+    {% if ready and row.actions %}
+    <div class="setting-actions">
+      {% for verb in row.actions %}
+      <a class="{{ 'setting-remove' if verb == 'borrar' else 'setting-go' }}" href="{{ base }}/agentes/orden?v={{ verb }}&amp;agente={{ row.slug | urlencode }}">{{ t('agents.do.' ~ verb) }}<span class="visually-hidden"> {{ row.slug }}</span></a>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% if retired %}
+<section class="settings-group" aria-labelledby="agents-retired">
+  <h2 class="section-title" id="agents-retired">{{ t('agents.retired') }}</h2>
+  <p class="note">{{ t('agents.retired.note') }}</p>
+  <ul class="settings-list">
+    {% for one in retired %}
+    <li class="setting is-later" data-retired="{{ one.slug }}">
+      <div class="setting-info">
+        <span class="setting-name"><span class="agent-name">{{ vis(one.name if one.name is not none else one.slug, 48) }}</span></span>
+        <span class="setting-state"><span class="setting-dot" aria-hidden="true"></span><span>{{ t('agents.state.retired') }}{% if one.deleted_at %}, {{ day_time(one.deleted_at) }}{% endif %}</span></span>
+        {% if one.purged %}
+        <span class="setting-note">{{ t('agents.retired.purged') }}</span>
+        {% else %}
+        <span class="setting-note">{% if one.purge_after %}{{ t('agents.retired.until', when=day_time(one.purge_after)) }} {% endif %}{{ t.code('agents.retired.back', slug=one.slug) }}</span>
+        {% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}

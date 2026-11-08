@@ -2,7 +2,8 @@
 while it runs. The service may come up after the web, restart with more agents, or stop watching
 one, so this is asked and never remembered from the start.
 
-What it asks is ``{"cmd": "agents"}``, on the same socket as everything else: the narrow one on the
+What it asks is ``{"cmd": "agents"}``, on the same socket as everything else (it also keeps what the
+list says of each agent, ``listing``, T26-6b, the main one included): the narrow one on the
 installed web, which takes it without a session (it says who exists, which the web's group can read
 anyway). Each agent's black box is then read with its own ``BoxReader``, read-only and without the
 key (``ServiceConfig.blackbox_db``: the service gives that file to the web's group, as the installer
@@ -19,6 +20,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +28,12 @@ from backtide.jail.identity import SLUG
 from backtide.service.control import (
     ControlError,
     PeerCredentials,
-    ask_agents,
+    ask_fleet,
     ask_snapshots,
     peer_credentials,
 )
 from backtide.snapshots import Snapshot, SnapshotError
-from backtide.web.agents import AgentSource, RosterError
+from backtide.web.agents import AgentFacts, AgentSource, Listing, RetiredAgent, RosterError
 from backtide.web.reader import BoxReader
 from backtide.web.rewind import WAIT_FOR_SERVICE, Availability, availability_of
 
@@ -68,6 +70,7 @@ class LiveAgents:
         self._asking = threading.Lock()
         self._asked_at: float | None = None
         self._last: tuple[AgentSource, ...] | None = None
+        self._listing: Listing | None = None
         self._readers: dict[str, BoxReader] = {}
         self._listings: dict[str, Callable[[], Sequence[Snapshot]]] = {}
         self._failing = False
@@ -84,6 +87,12 @@ class LiveAgents:
         finally:
             self._asking.release()
         return self._last
+
+    def listing(self) -> Listing | None:
+        """What the service last said of every agent, the main one too (T26-6b); None if it has
+        never said. It never asks, so a page may call it anywhere: each request asks first, in a
+        thread of its own (``_roster_now``), and that is what keeps this fresh."""
+        return self._listing
 
     def close(self) -> None:
         with self._asking:
@@ -102,7 +111,9 @@ class LiveAgents:
         if state is not Availability.READY:  # a reader, or no service yet: nothing to ask
             return
         try:
-            listed = ask_agents(self._control, wait=0, peer=self._peer, server_uid=self._server_uid)
+            listed, deleted = ask_fleet(
+                self._control, wait=0, peer=self._peer, server_uid=self._server_uid
+            )
         except ControlError as error:
             if not self._failing:
                 logger.warning("the service cannot say which agents there are: %s", error)
@@ -114,6 +125,7 @@ class LiveAgents:
         self._last = tuple(
             source for item in listed if (source := self._source_of(item)) is not None
         )
+        self._listing = _listing_of(listed, deleted)
         self._let_go_of_others({item["slug"] for item in listed})
 
     def _let_go_of_others(self, listed: set[str]) -> None:
@@ -160,6 +172,44 @@ class LiveAgents:
                 raise SnapshotError(str(error)) from None
 
         return listing
+
+
+def _listing_of(listed: Sequence[dict[str, Any]], deleted: Sequence[dict[str, Any]]) -> Listing:
+    return Listing(
+        tuple(
+            AgentFacts(
+                item["slug"],
+                item["name"],
+                item["main"],
+                item["watched"],
+                item["state"],
+                item["kind"],
+                item["version"],
+                item["in_use"],
+                item["order"],
+            )
+            for item in listed
+        ),
+        tuple(
+            RetiredAgent(
+                item["slug"],
+                item["name"],
+                _moment(item["deleted_at"]),
+                _moment(item["purge_after"]),
+                item["purged"],
+            )
+            for item in deleted
+        ),
+    )
+
+
+def _moment(text: str) -> datetime | None:
+    """A date of the service's: one it cannot be is no date, and the page says less."""
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return moment if moment.utcoffset() is not None else None
 
 
 __all__ = ["ASK_EVERY", "LiveAgents"]

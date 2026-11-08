@@ -4,6 +4,7 @@ The founder's decisions of 2026-10-19: colour with meaning (never colour alone),
 agents and for pending requests with made-up data, and Approve / Reject drawn but INERT until
 T10: no form, no POST, no route behind them."""
 
+import hashlib
 import json
 import re
 import threading
@@ -31,7 +32,8 @@ from backtide.web.agents import (
     state_of,
     summarise,
 )
-from backtide.web.app import _heads
+from backtide.web.agents import Roster as _Roster
+from backtide.web.app import ROSTER_MARK_CHARS, _heads, _roster_mark
 from backtide.web.security import CSP, POST_PATH
 from tests.conftest import FakeClock
 from tests.test_web_rewind import POST_HEADERS
@@ -183,7 +185,7 @@ def test_the_feed_merges_every_agent_newest_first(room: TestClient) -> None:
     assert 'id="p-codigo-' in feed and 'id="p-principal-' in feed
     assert feed.index("rm -rf /") < feed.index("work/notas.md"), "newest on top"
     assert 'sse-swap="feed"' in html and 'hx-swap="afterbegin"' in html
-    assert f'sse-connect="{PREFIX_PATH}/panel/stream?after=3.8"' in html
+    assert f'sse-connect="{PREFIX_PATH}/panel/stream?after={TWO}.3.8"' in html
 
 
 def test_the_requests_say_what_why_how_serious_and_how_long(room: TestClient) -> None:
@@ -401,14 +403,22 @@ def test_the_room_streams_every_agent_cards_and_requests(tmp_path: Path, boxes) 
 
     writer = threading.Thread(target=later)
     writer.start()
-    events = parse_sse(web.get("/panel/stream?after=3.8").text)
+    events = parse_sse(web.get(f"/panel/stream?after={TWO}.3.8").text)
     writer.join()
     feed = "\n".join(e["data"] for e in events if e.get("event") == "feed")
     assert "make deploy" in feed and "work/plan.md" in feed
     assert 'id="p-codigo-9"' in feed and 'id="p-principal-4"' in feed
     assert any(e.get("event") == "requests" and 'id="req-r9"' in e["data"] for e in events)
     assert any(e.get("event") == "card-codigo" for e in events)
-    assert any(e.get("id") == "4.9" for e in events), "where to go on from after a reconnect"
+    assert any(e.get("id") == f"{TWO}.4.9" for e in events), "where to go on from a reconnect"
+
+
+# The position of the page in these tests: the main agent and "codigo".
+TWO = hashlib.sha256(b"principal\ncodigo").hexdigest()[:ROSTER_MARK_CHARS]
+
+
+def _source(tmp_path: Path) -> AgentSource:
+    return AgentSource("principal", None, BoxReader(tmp_path / "blackbox.db"))
 
 
 def test_the_room_stream_goes_on_from_the_last_event_id(tmp_path: Path, boxes) -> None:
@@ -418,7 +428,9 @@ def test_the_room_stream_goes_on_from_the_last_event_id(tmp_path: Path, boxes) -
         poll_interval=0.02,
         others=[source(tmp_path, "codigo", "Agente de código")],
     )
-    events = parse_sse(web.get("/panel/stream?after=0.0", headers={"last-event-id": "2.7"}).text)
+    events = parse_sse(
+        web.get(f"/panel/stream?after={TWO}.0.0", headers={"last-event-id": f"{TWO}.2.7"}).text
+    )
     feed = "\n".join(e["data"] for e in events if e.get("event") == "feed")
     assert 'id="p-principal-3"' in feed and 'id="p-codigo-8"' in feed
     assert 'id="p-principal-2"' not in feed and 'id="p-codigo-7"' not in feed
@@ -428,7 +440,29 @@ def test_the_room_stream_goes_on_from_the_last_event_id(tmp_path: Path, boxes) -
     "text", ["", "1.x", "-1.2", "1..2", "١.٢", "9" * 30, ".".join(["1"] * 100), "1. 2"]
 )
 def test_junk_positions_start_at_the_end(text: str) -> None:
-    assert _heads(text) == []
+    assert _heads(f"{TWO}.{text}", TWO) == []
+
+
+def test_a_position_is_of_one_list_of_agents(tmp_path: Path, boxes) -> None:
+    """T26-6b: the list changes from this very web, and a number in another agent's box would lose
+    its lines. A position of another list, or of none, is nobody's: the page has to load again."""
+    assert _heads(f"{TWO}.3.8", TWO) == [3, 8]
+    assert _heads("3.8", TWO) == [] and _heads(f"{'0' * len(TWO)}.3.8", TWO) == []
+    web = new_client(
+        tmp_path,
+        stream_seconds=0.2,
+        poll_interval=0.02,
+        others=[source(tmp_path, "codigo", "Agente de código")],
+    )
+    for given in ("3.8", f"{'0' * len(TWO)}.3.8"):
+        events = parse_sse(web.get(f"/panel/stream?after={given}").text)
+        assert [e["event"] for e in events if e.get("event")] == ["roster"]
+        events = parse_sse(web.get("/panel/stream", headers={"last-event-id": given}).text)
+        assert [e["event"] for e in events if e.get("event")] == ["roster"]
+    events = parse_sse(web.get(f"/panel/stream?after={TWO}.3.8").text)
+    assert "roster" not in {e.get("event") for e in events}
+    # The same agents in the same order is the same mark, whoever counts them.
+    assert _roster_mark(_Roster(_source(tmp_path), [], "")) != TWO
 
 
 def test_the_room_and_its_stream_carry_the_reviewed_headers(tmp_path: Path, boxes) -> None:

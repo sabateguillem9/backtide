@@ -4,9 +4,9 @@ Each scenario goes on from where the last left it, on one lab, as an owner would
 
     make ataques PERFIL=claude-code ATK_PATH=tests/attacks/test_agent_delete_attacks.py
 
-No model answers anything and nothing leaves the VM (invariant 8). The orders are on root's socket
-alone: T26-6b adds ``agent_delete`` to the web's, behind a key just touched, and
-``borrar-sin-esperar`` has to change with it. Emptying never goes there.
+No model answers anything and nothing leaves the VM (invariant 8). Bringing back and emptying are on
+root's socket alone, and from the web there is ``agent_delete`` (T26-6b, behind a key just touched:
+tests/attacks/test_agent_web_attacks.py). Emptying never goes there.
 """
 
 import json
@@ -111,7 +111,7 @@ def delete(lab: Lab, agent: Agent) -> Any:
 def test_deleting_keeps_the_black_box_whole_and_the_volume_in_the_trash(
     attack: Attack, lab: Lab
 ) -> None:
-    """The criterion of T26-6c, with what is on the web's socket today: nothing of this."""
+    """The criterion of T26-6c. Of the web's socket, only a delete with its name written."""
     made = lab.cli(
         "agentes", "crear", THIRD.slug, "--perfil", "claude-code", "--volumen", "10",
         "--tope-espacio", str(CAP_MIB), "--memoria", "1g", "--cpus", "1", "--nombre", "Tercero",
@@ -139,23 +139,26 @@ def test_deleting_keeps_the_black_box_whole_and_the_volume_in_the_trash(
     kept["snapshots"] = lab.snapshots(THIRD)
     kept["text"] = sudo("cat", str(file_of(THIRD))).stdout
 
-    # The web, with a live session, reaches none of it.
+    # The web, with a live session, reaches neither way out of the trash, and no delete without
+    # its name written. A delete with it, as the owner would: test_agent_web_attacks.py.
     token = lab.helper("link", SOCKET)["token"]
     session = {"session": "<session>", "_why": True}
     tried = [
-        {"cmd": "agent_delete", "agent": THIRD.slug, "typed": THIRD.slug, **session},
         {"cmd": "agent_restore", "agent": THIRD.slug, **session},
         {"cmd": "agent_purge", "agent": THIRD.slug, "typed": THIRD.slug, **session},
     ]
     nobody = int(sh("id", "-u", "nobody").stdout)
-    opened, *refused, control = _probe(
-        nobody, lab.web_gid, {"cmd": "session_open", "token": token}, *tried, {"cmd": "holds"}
-    )
+    opened, *refused, unnamed, control = _probe(
+        nobody, lab.web_gid, {"cmd": "session_open", "token": token}, *tried,
+        {"cmd": "agent_delete", "agent": THIRD.slug, "typed": "otro", **session},
+        {"cmd": "holds"},
+    )  # fmt: skip
     web_refused = (
         opened["ok"] is True
         and control["ok"] is True
         and len(refused) == len(tried)
         and all(a["outcome"] == "refused" and "socket de la web" in a["why"] for a in refused)
+        and unnamed["outcome"] == "invalid"
         and _running(THIRD.container)
     )
 

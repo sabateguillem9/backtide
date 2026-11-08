@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% from "icons.html" import ic %}
+{# One step of an order about the agents (T26-6b): the form to create one, a confirmation with its
+   one-time ticket, how it goes, how it ended, or why not. Plain forms, no scripts: the POST is a
+   normal navigation, which carries our Origin. While an order runs the page looks again by itself,
+   and only then. What it says of the end is the service's answer, or that nobody knows. #}
+{% block head %}{% if view == 'running' %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}{% endblock %}
+{% block title %}{{ t('agents.title') }}{% endblock %}
+{% block main %}
+<main class="settings"{% if view in ('running', 'result') %} data-still{% endif %}>
+  <h1>{{ t('agents.title') }}</h1>
+  <section class="settings-step" data-view="{{ view }}"{% if outcome %} data-outcome="{{ outcome }}"{% endif %} aria-labelledby="agents-step-title">
+  {% if view == 'new' %}
+    <h2 id="agents-step-title">{{ t('agents.new.title') }}</h2>
+    <p class="note">{{ t.code('agents.new.note') }}</p>
+    <form class="settings-form" method="post" action="{{ action }}" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="ticket" value="{{ ticket }}">
+      <div class="setting-field">
+        <label class="setting-label" for="agent-slug">{{ t('agents.new.slug') }}</label>
+        <input id="agent-slug" class="setting-input" type="text" name="slug" value="{{ typed_slug }}" maxlength="32" pattern="{{ pattern }}" required autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" {% if error %}aria-describedby="agent-slug-error" aria-invalid="true"{% else %}aria-describedby="agent-slug-hint"{% endif %}>
+        {% if error %}<p class="signin-error" id="agent-slug-error" role="alert">{{ ic('warning') }}<span>{{ t(error) }}</span></p>{% else %}<p class="setting-hint" id="agent-slug-hint">{{ t('agents.new.slug.hint') }}</p>{% endif %}
+      </div>
+      <div class="setting-field setting-choice">
+        <label class="setting-label" for="agent-profile">{{ t('agents.new.profile') }}</label>
+        <select id="agent-profile" class="setting-input" name="perfil" required>
+          {% for name, version in profiles %}<option value="{{ name }}"{% if typed_profile == name %} selected{% endif %}>{{ t('agents.kind.' ~ name) }} {{ version }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="setting-field setting-choice">
+        <label class="setting-label" for="agent-size">{{ t('agents.new.size') }}</label>
+        <select id="agent-size" class="setting-input" name="tamano" required aria-describedby="agent-size-hint">
+          {% for size in sizes %}<option value="{{ size }}"{% if typed_size == size | string %} selected{% endif %}>{{ size }} GiB</option>{% endfor %}
+        </select>
+        <p class="setting-hint" id="agent-size-hint">{{ t('agents.new.size.hint') }}</p>
+      </div>
+      <div class="settings-actions">
+        <button class="settings-yes" type="submit"><span>{{ t('agents.new.go') }}</span>{% include "arrow.html" %}</button>
+        <a class="settings-cancel" href="{{ back }}">{{ t('agents.back') }}</a>
+      </div>
+    </form>
+  {% elif view == 'confirm' %}
+    <h2 id="agents-step-title">{{ t('agents.confirm.' ~ verb) }}</h2>
+    {% include "order_for.html" %}
+    <p class="note">{{ t.code('agents.confirm.' ~ verb ~ '.note', slug=whose.slug) }}</p>
+    <form class="settings-form" method="post" action="{{ action }}" autocomplete="off">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="ticket" value="{{ ticket }}">
+      <input type="hidden" name="v" value="{{ verb }}">
+      <input type="hidden" name="agente" value="{{ whose.slug }}">
+      {% if verb == typed_verb %}
+      <div class="setting-field">
+        <label class="setting-label" for="agent-typed">{{ t('agents.confirm.typed', slug=whose.slug) }}</label>
+        <input id="agent-typed" class="setting-input" type="text" name="escrito" maxlength="32" required autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"{% if error %} aria-describedby="agent-typed-error" aria-invalid="true"{% endif %}>
+        {% if error %}<p class="signin-error" id="agent-typed-error" role="alert">{{ ic('warning') }}<span>{{ t(error) }}</span></p>{% endif %}
+      </div>
+      {% endif %}
+      <div class="settings-actions">
+        <button class="settings-yes{% if verb == typed_verb %} is-remove{% endif %}" type="submit"><span>{{ t('agents.do.' ~ verb) }}</span></button>
+        <a class="settings-cancel" href="{{ back }}">{{ t('agents.back') }}</a>
+      </div>
+    </form>
+  {% elif view == 'running' %}
+    <h2 id="agents-step-title">{{ t('agents.running.' ~ verb) }}</h2>
+    {% if whose %}{% include "order_for.html" %}{% else %}<p class="note"><span class="agent-name">{{ slug }}</span></p>{% endif %}
+    <p class="settings-said" role="status">{{ t('agents.running.note') }}</p>
+    {% if long %}<p class="note">{{ t('agents.running.long') }}</p>{% endif %}
+    <p class="settings-actions"><a class="settings-back" href="{{ back }}">{{ t('agents.back') }}</a></p>
+  {% elif view == 'result' %}
+    {# Never "done" on our own: only what the service answered says that. #}
+    {% if what != 'asked' %}
+    <h2 id="agents-step-title">{{ t('agents.out.' ~ what) }}</h2>
+    {% elif ok %}
+    <h2 id="agents-step-title">{{ t('agents.out.' ~ outcome) if t.has('agents.out.' ~ outcome) else t('agents.out.ok') }}</h2>
+    {% elif outcome in ('refused', 'invalid', 'busy', 'needs_restart') %}
+    <h2 id="agents-step-title">{{ t('agents.out.no') }}</h2>
+    {% else %}
+    <h2 id="agents-step-title">{{ t('agents.out.failed') }}</h2>
+    {% endif %}
+    {% if whose %}{% include "order_for.html" %}{% else %}<p class="note"><span class="agent-name">{{ slug }}</span></p>{% endif %}
+    {% if outcome == 'needs_restart' %}
+    <p class="note">{{ t('agents.out.needs_restart.note') }}</p>
+    <p class="agents-command"><code>{{ command }}</code></p>
+    {% elif message %}
+    <p class="settings-said"><span class="muted">{{ t('rewind.said') }}</span> <span lang="es">{{ vis(message, 600) }}</span></p>
+    {% endif %}
+    {% if what != 'asked' %}<p class="note">{{ t('agents.out.look') }}</p>{% endif %}
+    <p class="settings-actions"><a class="settings-back" href="{{ back }}">{{ t('agents.back') }}</a></p>
+  {% elif view == 'lost' %}
+    <h2 id="agents-step-title">{{ t('agents.lost') }}</h2>
+    <p class="note">{{ t('agents.lost.note') }}</p>
+    <p class="settings-actions"><a class="settings-back" href="{{ back }}">{{ t('agents.back') }}</a></p>
+  {% else %}
+    <h2 id="agents-step-title">{{ t('agents.not') }}</h2>
+    <p class="settings-said">{{ t.code(reason) }}</p>
+    <p class="settings-actions"><a class="settings-back" href="{{ back }}">{{ t('agents.back') }}</a></p>
+  {% endif %}
+  </section>
+</main>
+{% endblock %}

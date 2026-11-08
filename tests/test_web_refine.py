@@ -505,12 +505,13 @@ def test_the_agent_has_a_bar_with_its_tabs_and_the_header_is_only_global(
     tmp_path: Path, path: str, current: str
 ) -> None:
     html = agent_pages(tmp_path).get(path).text
-    assert header_links(html) == ["Panel", "Peticiones", "Ajustes"]
+    assert header_links(html) == ["Panel", "Peticiones", "Agentes", "Ajustes"]
     assert '<div class="agentbar a-' in html, "the agent's bar"
     tabs = re.search(r'<nav class="agentbar-tabs"[^>]*>(.*?)</nav>', html, re.S)
     assert tabs
     assert [text_of(a) for a in re.findall(r"<a [^>]*>.*?</a>", tabs.group(1), re.S)] == [
         "Ahora",
+        "Hablar",
         "Historia",
         "Instantáneas",
         "Preguntar",
@@ -539,6 +540,7 @@ def test_the_tabs_of_another_agent_stay_under_its_address(tmp_path: Path) -> Non
     tabs = re.search(r'<nav class="agentbar-tabs"[^>]*>(.*?)</nav>', html, re.S)
     assert tabs and re.findall(r'href="([^"]*)"', tabs.group(1)) == [
         f"{PREFIX_PATH}/agentes/correo/ahora",
+        f"{PREFIX_PATH}/agentes/correo/hablar",
         f"{PREFIX_PATH}/agentes/correo/historia",
         f"{PREFIX_PATH}/agentes/correo/instantaneas",
         f"{PREFIX_PATH}/agentes/correo/ahora/preguntar",

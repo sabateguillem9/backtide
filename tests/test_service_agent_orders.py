@@ -92,7 +92,7 @@ class Agent(FakeGuardian):
         self.tasks.append(("status", task_id))
         return TaskStatus(task_id, TaskOutcome.RUNNING)
 
-    def task_stop(self, task_id: str) -> bool | None:
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool | None:
         self.tasks.append(("stop", task_id))
         return True
 
@@ -311,13 +311,14 @@ def test_each_agent_has_its_own_tasks(two: Two) -> None:
 
 def test_the_list_of_agents_has_no_path(two: Two) -> None:
     agents = ask_agents(two.control.path, peer=me)
+    words = {"kind": None, "version": None, "in_use": None, "order": None}
     assert agents == [
         {"slug": "principal", "name": "Uno", "main": True, "watched": True, "state": "running",
-         "notice": []},
+         "notice": [], **words},
         {"slug": "revisor", "name": "Revisor", "main": False, "watched": True, "state": "running",
-         "notice": ["Sus canales."]},
+         "notice": ["Sus canales."], **words},
         {"slug": "parado", "name": None, "main": False, "watched": False, "state": None,
-         "notice": []},
+         "notice": [], **words},
     ]  # fmt: skip
 
 
@@ -435,7 +436,6 @@ def test_what_the_narrow_socket_never_serves_it_never_serves_for_an_agent(two: T
         {"cmd": "resume", "agent": "revisor"},
         {"cmd": "shell", "kind": "session", "continue": False, "agent": "revisor"},
         {"cmd": "export", "dest": "/exportada/x", "agent": "revisor"},
-        {"cmd": "task_stop", "task": TASK, "agent": "revisor"},
     ):
         assert talk(two.web, signed(request))["outcome"] == "refused"
     assert two.nobody_touched()
@@ -1106,7 +1106,9 @@ def test_a_notice_that_makes_no_sense_is_none(two: Two, notice: object) -> None:
     """What the web shows on a rewind's confirmation is checked like the rest of the list."""
     item = {"slug": "bueno", "name": None, "main": False, "watched": True, "state": None}
     with patch.object(two.roster, "listing", return_value=[{**item, "notice": notice}]):
-        assert ask_agents(two.control.path, peer=me) == [{**item, "notice": []}]
+        assert ask_agents(two.control.path, peer=me) == [
+            {**item, "notice": [], "kind": None, "version": None, "in_use": None, "order": None}
+        ]
 
 
 @pytest.mark.parametrize(

@@ -82,6 +82,7 @@ from backtide.sensors.scrub import LiveScrub
 from backtide.sensors.tetragon import TetragonReader
 from backtide.service import scope
 from backtide.service.agent_disk import SYSTEMD_RUN_MARK, ensure_on_disk, is_stopped
+from backtide.service.agents import kind_of
 from backtide.service.bot import Hooks, TelegramNeighbours, telegram_parts
 from backtide.service.config import (
     KEY_UNUSABLE,
@@ -1618,6 +1619,7 @@ def serve(
             _desk_of(config, guardian, built, store),
             [(other.slug, other.display_name) for other in others],
             [other.slug for other in others if is_stopped(other)],
+            {each.slug: kind_of(each) for each in (config, *others)},
         )
 
         def record_total(
@@ -1641,7 +1643,8 @@ def serve(
                 web_group=web_group,
             )
             reload_keys = reload_everyones_keys(reload_keys, neighbours.reloads)
-        # Creating, starting and stopping the others (T26-6a): on root's socket only.
+        # Creating, starting and stopping the others (T26-6a): on root's socket, and what the
+        # web's list takes on its narrow one (T26-6b).
         fleet = None
         if config.config_file is not None:
 
@@ -1717,6 +1720,7 @@ def serve(
                     passkeys=web_passkeys,
                     roster=roster,
                     whole_budget=spend_total,
+                    fleet=fleet,
                 ),
             )
         if telegram is not None:

@@ -108,6 +108,7 @@ WEB = {
     "ExecStart": [
         f"{layout.PROGRAM} web --config {layout.WEB_CONFIG_FILE} --enlace-en {layout.WEB_LINK_FILE}"
         f" --socket-web {layout.STATE_DIR / 'web.sock'} --rebobinar --aprobar --ajustes"
+        f" --gestionar --tareas"
     ],
     "RuntimeDirectory": ["backtide-web"],
     "RuntimeDirectoryMode": ["0700"],

@@ -85,6 +85,7 @@ from backtide.service.config import (
     read_token_to_strike,
     require_own_folder,
 )
+from backtide.service.roster import AgentKind
 
 _FILE_SUFFIX = ".toml"
 _KEYS = frozenset(
@@ -439,6 +440,12 @@ def _told_of_neighbours(config: ServiceConfig, agents: tuple[ServiceConfig, ...]
         if other.slug != config.slug:
             neighbours += protected_of(other)
     return dataclasses.replace(config, neighbours=tuple(neighbours))
+
+
+def kind_of(config: ServiceConfig) -> AgentKind:
+    """Which agent it is (D42), from its profile: a custom one has no version we pinned."""
+    profile = config.agent_profile
+    return AgentKind(profile.name, None if profile.version == profile.name else profile.version)
 
 
 def protected_of(other: ServiceConfig) -> list[Protected]:

@@ -7,9 +7,9 @@ Making a jail is the power of backtide itself, so the order has a closed shape:
   with nothing touched. No field is a path or an image: the volume and the image come from the slug
   and the profile, and the only free text is the name to show, which reaches no command. The file
   ``agents/<slug>.toml`` is written from this module's template, never from what was sent.
-- **Who can ask.** Only the control socket (root's, 0600). None of these orders is on the list of
-  the web's narrow socket (T26-6b adds them, behind a key just touched), and the sockets are never
-  in an agent's jail (invariants 1 and 2), so no agent reaches them.
+- **Who can ask.** The control socket (root's, 0600), and the web's narrow socket for what its list
+  takes (T26-6b, ``backtide.service.web_control``: a narrower ``agent_create``, behind a key just
+  touched). The sockets are never in an agent's jail (invariants 1 and 2), so no agent reaches them.
 - **What it checks** before touching anything: the slug (never used: an agent's black box stays
   when it goes, and its name with it), at most ``MAX_AGENTS``, its image here, room in memory
   (decision 15) and room on disk. The limits of what runs, the new one and the sensor, with 1 GiB
@@ -42,9 +42,14 @@ Making a jail is the power of backtide itself, so the order has a closed shape:
   the image. Not recorded, not done; and each step can be tried again, by the same order or by the
   next start of the service (``finish_interrupted``). ``agent_restore`` brings it back as it was,
   stopped; ``agent_purge`` empties it, and so does ``tend_trash`` after the wait, with a warning a
-  day before. Nothing of it is on the web's list: T26-6b adds ``agent_delete`` alone, and emptying
-  stays on root's socket for good, because what cannot be undone must not hang on the process that
+  day before. Of these only ``agent_delete`` is on the web's list (T26-6b); bringing back and
+  emptying stay on root's socket, because what cannot be undone must not hang on the process that
   faces the internet. The main agent is never deleted, and a slug that was used stays taken.
+- **One order at a time, but not while an agent comes up** (T26-6b). What they check is taken by the
+  time its thread starts, so the wait for it (up to ``START_WAIT``) is out of the lock: stopping
+  another agent does not have to wait four minutes behind a start. Stopping that very one is
+  accepted, and takes effect when its start ends: ``Guardian.run`` does not look at its stop until
+  then, so the web does not offer it, and the row says so.
 """
 
 import json
@@ -92,6 +97,7 @@ from backtide.service.agents import (
     check_fits,
     id_taken,
     image_of,
+    kind_of,
     load_installation,
     load_retired,
     protected_of,
@@ -109,7 +115,15 @@ from backtide.service.config import (
     agent_profile_of,
     ensure_state_folder,
 )
-from backtide.service.roster import NOBODY, OrderInvalid, Roster
+from backtide.service.roster import (
+    DELETING,
+    NOBODY,
+    STARTING,
+    STOP_FAILED,
+    STOPPING,
+    OrderInvalid,
+    Roster,
+)
 from backtide.service.spend import check_cap
 from backtide.service.trash import NUMBER_FILE
 from backtide.setup import containers, host, images, layout, networks, volume
@@ -160,6 +174,15 @@ class AgentSpec:
     daily_usd: Decimal | None = None
     monthly_usd: Decimal | None = None
     restart: bool = False
+
+
+@dataclass(frozen=True)
+class _Starting:
+    """An agent whose thread was started under the orders' lock: it is waited for out of it."""
+
+    config: ServiceConfig
+    done: str
+    text: str
 
 
 def _whole(value: object) -> bool:
@@ -437,12 +460,13 @@ class Fleet:
         spec = parse_create(request)  # OrderInvalid: before anything looks at the machine
         try:
             with self._one_at_a_time():
-                return self._create(spec, requested_by)
+                begun = self._create(spec, requested_by)
         except _Refused as refused:
             logger.warning("refused to create an agent: %s", refused.outcome)
             return _reply(refused.outcome, str(refused))
+        return self._settled(begun)
 
-    def _create(self, spec: AgentSpec, requested_by: str) -> dict[str, Any]:
+    def _create(self, spec: AgentSpec, requested_by: str) -> dict[str, Any] | _Starting:
         installation = self._read_all()
         self._check_can_create(spec, installation)
         number = self._next_number(installation)
@@ -483,7 +507,7 @@ class Fleet:
             )
         )
         if self._neighbours is None:
-            self._roster.add(new.slug, new.display_name)
+            self._roster.add(new.slug, new.display_name, kind_of(new))
             self._stop.set()  # the control socket answers this order before it closes
             return _reply(
                 RESTARTING,
@@ -495,9 +519,9 @@ class Fleet:
         self._neighbours.protect_also(new.slug, items)
         if self._add_to_total is not None:
             self._add_to_total(new.slug, new.agent_dir)
-        self._roster.add(new.slug, new.display_name)
+        self._roster.add(new.slug, new.display_name, kind_of(new))
         self._neighbours.add(new)
-        return self._start_and_tell(new, CREATED, f"Agente {spec.slug} creado y en marcha.")
+        return self._begin_start(new, CREATED, f"Agente {spec.slug} creado y en marcha.")
 
     def _read_all(self) -> Installation:
         try:
@@ -712,12 +736,13 @@ class Fleet:
         slug = _agent_of(request)
         try:
             with self._one_at_a_time():
-                return self._start(slug, requested_by)
+                begun = self._start(slug, requested_by)
         except _Refused as refused:
             logger.warning("refused to start the agent %s: %s", slug, refused.outcome)
             return _reply(refused.outcome, str(refused))
+        return self._settled(begun)
 
-    def _start(self, slug: str, requested_by: str) -> dict[str, Any]:
+    def _start(self, slug: str, requested_by: str) -> dict[str, Any] | _Starting:
         neighbours = self._others(slug)
         if neighbours.is_running(slug):
             return _reply(ALREADY, f"El agente {slug} ya está en marcha.")
@@ -736,22 +761,41 @@ class Fleet:
         except OSError as error:
             return _reply(FAILED, f"No se ha podido quitar la marca de parado: {error.strerror}.")
         self._roster.mark_stopped(slug, stopped=False)
-        return self._start_and_tell(config, STARTED, f"El agente {slug} está en marcha.")
+        return self._begin_start(config, STARTED, f"El agente {slug} está en marcha.")
 
-    def _start_and_tell(self, config: ServiceConfig, done: str, text: str) -> dict[str, Any]:
-        neighbours = self._others(config.slug)
-        neighbours.start_one(config)
-        neighbours.wait_settled(config.slug, self._start_wait)
-        if self._roster.watched(config.slug):
-            return _reply(done, text)
-        failure = neighbours.failure_of(config.slug)
-        if failure is not None:
-            return _reply(FAILED, f"El agente {config.slug} no ha arrancado: {failure}")
-        return _reply(
-            FAILED,
-            f"El agente {config.slug} aún no ha arrancado tras {int(self._start_wait)} s: mira "
-            "la caja de la instalación.",
-        )
+    def _begin_start(self, config: ServiceConfig, done: str, text: str) -> _Starting:
+        self._others(config.slug).start_one(config)
+        self._roster.note_order(config.slug, STARTING)
+        return _Starting(config, done, text)
+
+    def _settled(self, begun: dict[str, Any] | _Starting) -> dict[str, Any]:
+        """Out of the orders' lock: another order may come while this agent comes up, also to stop
+        this very one. What it says is what happened by then."""
+        if not isinstance(begun, _Starting):
+            return begun
+        slug = begun.config.slug
+        neighbours = self._neighbours
+        try:
+            if neighbours is None:  # nobody starts an agent without them: see ``_others``
+                return _reply(FAILED, NOBODY)
+            neighbours.wait_settled(slug, self._start_wait)
+            if self._roster.watched(slug):
+                return _reply(begun.done, begun.text)
+            if not self._roster.knows(slug) or is_stopped(begun.config):
+                return _reply(
+                    STOPPED, f"Se ha pedido parar al agente {slug} mientras arrancaba: no sigue."
+                )
+            failure = neighbours.failure_of(slug)
+            if failure is not None:
+                return _reply(FAILED, f"El agente {slug} no ha arrancado: {failure}")
+            return _reply(
+                FAILED,
+                f"El agente {slug} aún no ha arrancado tras {int(self._start_wait)} s: mira la "
+                "caja de la instalación.",
+            )
+        finally:
+            # Only its own word: a stop that came meanwhile says what it is doing itself.
+            self._roster.clear_order(slug, STARTING)
 
     def stop(self, request: Mapping[str, Any], requested_by: str) -> dict[str, Any]:
         slug = _agent_of(request)
@@ -769,7 +813,9 @@ class Fleet:
             raise _Refused(REFUSED, NOBODY)
         if is_stopped(config) and not neighbours.is_running(slug):
             if not neighbours.halt(config):  # Docker's word, not the mark's
+                self._roster.note_order(slug, STOP_FAILED)
                 return _reply(FAILED, f"El agente {slug} sigue en marcha y no se ha podido parar.")
+            self._roster.note_order(slug, None)
             return _reply(ALREADY, f"El agente {slug} ya está parado.")
         # Stopping is the safe way: nothing that fails here gets in its way. Recording and the
         # mark come first if they can, and what could not be done is said.
@@ -782,15 +828,23 @@ class Fleet:
             logger.error("the agent %s has no stopped mark: %s", slug, error.strerror)
             said += " No se ha podido dejar la marca: volverá a arrancar con el servicio."
         self._roster.mark_stopped(slug, stopped=True)
+        self._roster.note_order(slug, STOPPING)
         was_running = neighbours.is_running(slug)  # one that had already failed is simply stopped
-        neighbours.stop_one(slug, requested_by)
+        try:
+            neighbours.stop_one(slug, requested_by)
+        except Exception:  # it said nothing of how far it got: never "stopping" for good
+            self._roster.note_order(slug, STOP_FAILED)
+            raise
         if neighbours.is_running(slug):
+            self._roster.note_order(slug, STOP_FAILED)
             return _reply(
                 FAILED,
                 f"El agente {slug} no ha terminado de pararse: mira `docker ps` y la caja negra.",
             )
         if not neighbours.halt(config):  # whatever its thread said: Docker's word
+            self._roster.note_order(slug, STOP_FAILED)
             return _reply(FAILED, f"El agente {slug} sigue en marcha y no se ha podido parar.")
+        self._roster.note_order(slug, None)
         failure = neighbours.failure_of(slug)
         if was_running and failure is not None:
             return _reply(FAILED, f"Al parar al agente {slug} ha fallado algo: {failure}{said}")
@@ -834,11 +888,15 @@ class Fleet:
                 "Borrar un agente pide el servicio instalado: fuera de su unidad no se puede "
                 "desmontar su volumen.",
             )
-        if mark is None:
-            config, mark = self._close_agent(slug, requested_by)
-        else:  # a try that stopped half way, or a machine that died: it goes on from there
-            config = self._resume_delete(slug, requested_by)
-        self._finish_delete(config, mark)
+        self._roster.note_order(slug, DELETING)
+        try:
+            if mark is None:
+                config, mark = self._close_agent(slug, requested_by)
+            else:  # a try that stopped half way, or a machine that died: it goes on from there
+                config = self._resume_delete(slug, requested_by)
+            self._finish_delete(config, mark)
+        finally:  # only its own word: a stop that failed on the way has said so
+            self._roster.clear_order(slug, DELETING)
         return _reply(
             DELETED,
             f"Agente {slug} borrado: está parado y sin contenedores ni redes. Su caja negra se "
@@ -873,6 +931,7 @@ class Fleet:
         self._roster.mark_stopped(slug, stopped=True)
         neighbours.stop_one(slug, requested_by)
         if neighbours.is_running(slug) or not neighbours.halt(config):
+            self._roster.note_order(slug, STOP_FAILED)  # "stopped" is Docker's word, not the mark's
             raise _Refused(
                 FAILED,
                 f"El agente {slug} no ha terminado de pararse, así que no se ha borrado nada: "
@@ -1093,7 +1152,7 @@ class Fleet:
                 installation=True,
             )
         )
-        self._roster.add(new.slug, new.display_name)
+        self._roster.add(new.slug, new.display_name, kind_of(new))
         self._roster.mark_stopped(slug, stopped=True)
         if self._neighbours is None:
             self._stop.set()  # the control socket answers this order before it closes

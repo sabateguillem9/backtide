@@ -1,6 +1,7 @@
 """The web for real: uvicorn on a real 127.0.0.1 socket, a black box written by the real BlackBox
 (WAL, fsync), a real HTTP client, and the event stream read as a browser would read it."""
 
+import hashlib
 import socket
 import threading
 import time
@@ -9,8 +10,11 @@ from pathlib import Path
 import httpx2 as httpx
 import pytest
 
+from backtide.web.app import ROSTER_MARK_CHARS
 from backtide.web.server import LOOPBACK, bind
 from tests.webkit import PREFIX_PATH, SESSION, TOKEN, LiveServer, new_box
+
+MAIN_MARK = hashlib.sha256(b"principal").hexdigest()[:ROSTER_MARK_CHARS]  # the Panel's position
 
 
 def read_until(response: httpx.Response, wanted: str, seconds: float = 10.0) -> list[str]:
@@ -39,7 +43,7 @@ def test_a_real_browser_session_end_to_end(tmp_path: Path) -> None:
         room = browser.get("/", follow_redirects=True)  # the refresh; "/" sends on to the room
         assert room.status_code == 200 and "Sala de control" in room.text
         assert "Ha creado" in room.text and "notas.md" in room.text
-        assert f'sse-connect="{PREFIX_PATH}/panel/stream?after=3"' in room.text
+        assert f'sse-connect="{PREFIX_PATH}/panel/stream?after={MAIN_MARK}.3"' in room.text
         page = browser.get("/ahora")
         assert page.status_code == 200 and "Ha creado" in page.text and "notas.md" in page.text
         assert f'sse-connect="{PREFIX_PATH}/ahora/stream?after=3"' in page.text

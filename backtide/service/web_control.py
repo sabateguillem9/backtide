@@ -29,8 +29,10 @@ The socket:
   ``end_batch`` (taking a trust away: they only make the gate ask more), ``set_secret`` and
   ``clear_secret`` (a provider's key or Telegram's token and chat: written by the service at
   0600, never sent back), ``set_budget`` (the caps, checked as `backtide tope` checks them),
-  ``accept_prices`` and ``task_start`` (a task for the agent, T26-5a). Nothing else: no
-  ``resume``, no ``shell``, ``import`` or ``export`` (no path of any kind), no config. Each
+  ``accept_prices``, ``task_start`` (a task for the agent, T26-5a), ``task_stop`` (stopping
+  it, T26-5b) and the agents' orders (below, T26-6b). Nothing else: no ``resume`` (the main
+  agent's; ``agent_resume`` is a neighbour's), no ``shell``, ``import`` or ``export`` (no path of
+  any kind), no config. Each
   change is handled by the very code of the control socket, with
   ``via`` forced to ``web``, so the black box records it as the control socket does:
   ``requested_by: "web (uid …, pid …)"`` with the kernel's uid and pid.
@@ -43,9 +45,21 @@ The socket:
   one: a web taken over cannot change anything on its own. A WARNING on every refusal; every
   new session and every "close them all" goes to the black box and is alerted, one by one
   (``on_entry``: ``Guardian.web_access``).
-- The tasks (T26-5a): ``task_start`` is a change, and ``task_status`` a read that takes a live
-  session too, because it returns answers that are not in the black box. ``task_stop`` is not on
-  the list: only the CLI's Ctrl-C asks it, on the control socket.
+- The tasks (T26-5a): ``task_start`` and ``task_stop`` (T26-5b) are changes, and ``task_status``
+  and ``task_list`` (T26-5b, the chat) reads that take a live session too, because what they return
+  is not in the black box. A stop from here is named in the task's end (``stopped_by``).
+- The agents (T26-6b, docs/47 section 8): ``agent_create``, ``agent_start``, ``agent_stop``,
+  ``agent_pause``, ``agent_resume`` and ``agent_delete``, handled by the very code of the control
+  socket (``backtide.service.fleet``), recorded as ``web (uid …, pid …)``. Narrower here than there.
+  ``agent_create`` takes the slug, the profile and the size, and nothing else
+  (``WEB_CREATE_FIELDS``: no name, no caps, and no ``restart``). The main agent is out of reach:
+  nothing here stops, freezes, thaws, deletes or restarts it, so the first neighbour, which restarts
+  the service, is asked with sudo. Creating and deleting want a key just touched
+  (``TOUCH_CHANGES``). ``agent_restore`` and ``agent_purge`` are not on the list: what the trash
+  holds comes back or goes for good from the server's own terminal. At most ``LONG_ORDERS`` of what
+  takes long at once (``HOLDS_ITS_CONNECTION``), because one holds a connection for as long as an
+  agent takes to come up, and the pages need the others. Freezing and stopping are not counted: a
+  brake is not asked to wait behind two starts, and ``Fleet`` does its stops one at a time.
 - The keys (T26-3b-2, T26-3c, T26-3d): registering, listing and touching them, signing in, and
   ``key_remove`` and ``key_rename`` (``_manage_key``): by the whole id, with a key just touched,
   recorded first, and from here never the last key. Root's own ``passkey_remove``, by the end of
@@ -78,6 +92,7 @@ from backtide.service.control import (
     BudgetService,
     ControlError,
     ControlServer,
+    FleetOrders,
     PeerCredentials,
     RewindService,
     SettingsService,
@@ -105,13 +120,22 @@ READS = frozenset({"agents", "snapshots", "holds", "trusted", "batches", "secret
 CHANGES = frozenset(
     {
         "rewind", "decide", "trust", "untrust", "end_batch", "set_secret", "clear_secret",
-        "set_budget", "accept_prices", "task_start",
+        "set_budget", "accept_prices", "task_start", "task_stop",
+        "agent_create", "agent_start", "agent_stop", "agent_pause", "agent_resume", "agent_delete",
     }
 )  # fmt: skip
+# Which agents there are (T26-6b): the orders that say nothing of ``via``, because the box learns
+# who asked from the socket, and that have their own closed shape.
+AGENT_ORDERS = frozenset(
+    {"agent_create", "agent_start", "agent_stop", "agent_pause", "agent_resume", "agent_delete"}
+)
+WEB_CREATE_FIELDS = frozenset({"cmd", "slug", "profile", "volume_gib"})
+HOLDS_ITS_CONNECTION = frozenset({"agent_create", "agent_start", "agent_resume", "agent_delete"})
+LONG_ORDERS = 2  # of MAX_WEB_CONNECTIONS at once: an agent's start holds its connection for minutes
 # A read that takes a live session, unlike READS (T26-5a, docs/47 section 7.1): a task's answer is
 # not in the black box, which the web's group may read anyway. It does not count as using the
 # session: a chat left open, which asks by itself, must not keep the session alive.
-SIGNED_IN_READS = frozenset({"task_status"})
+SIGNED_IN_READS = frozenset({"task_status", "task_list"})
 # The sign-in (T26-3a): opening, checking and ending the web's sessions.
 SESSION_COMMANDS = frozenset(
     {"session_open", "session_password", "session_check", "session_end", "session_end_all"}
@@ -130,10 +154,10 @@ COMMANDS = (
     READS | SIGNED_IN_READS | CHANGES | SESSION_COMMANDS | PASSKEY_COMMANDS | SIGN_IN_COMMANDS
 )
 # What asks for the passkey touched a moment ago (docs/47 section 5.3), once there is one: it
-# outlasts the session or decides who hears the alerts. Closing every session, and adding, taking
-# out or naming a key too, in their own commands; creating agents (T26-6) and the terminal
-# (T26-5d) will join.
-TOUCH_CHANGES = frozenset({"set_secret", "clear_secret", "trust"})
+# outlasts the session or decides who hears the alerts, and creating and deleting an agent (T26-6b).
+# Closing every session, and adding, taking out or naming a key too, in their own commands; the
+# terminal (T26-5d) will join. Starting, stopping and freezing do not: they can be undone.
+TOUCH_CHANGES = frozenset({"set_secret", "clear_secret", "trust", "agent_create", "agent_delete"})
 # Every request: a burst of 120, then 20 a second (the panel's stream asks about once a second
 # per open tab). The changes: a burst of 10, then one every 3 s (a person clicks).
 REQUESTS_BURST, REQUESTS_PER_SECOND = 120, 20.0
@@ -179,6 +203,15 @@ PASSWORD_MESSAGES = {
 BUSY = "busy"  # a session_check past its bucket: nobody knows yet, and it is not "expired"
 NO_SESSION = "Sin una sesión viva no se cambia nada: vuelve a entrar con `sudo backtide enlace`."
 NEEDS_TOUCH = "Esto pide volver a tocar tu llave: tócala en la web y prueba otra vez."
+NOT_THE_MAIN = (
+    "Al agente principal no se le manda desde la web: lleva el servicio y a los demás. Desde el "
+    "servidor, `sudo backtide agentes pausar principal` o `systemctl stop backtide`."
+)
+CREATE_IS_CLOSED = (
+    "Desde la web, un agente se crea con su nombre corto, su perfil y su tamaño, y nada más. "
+    "No se ha hecho nada."
+)
+TOO_MANY_ORDERS = "Ya hay otras órdenes en marcha: espera a que acaben. No se ha hecho nada."
 FIRST_KEY_TOO_LATE = "La primera llave se registra nada más entrar: vuelve a entrar y regístrala."
 _FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID, *AGENT_ID_RANGE})
 _FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID, *AGENT_ID_RANGE})
@@ -220,6 +253,7 @@ class WebControlServer(ControlServer):
 
     socket_mode = WEB_SOCKET_MODE
     label = "web socket"
+    asks_as = "web"
 
     def __init__(
         self,
@@ -250,6 +284,7 @@ class WebControlServer(ControlServer):
         password: Checker | None = None,
         roster: Roster | None = None,
         whole_budget: WholeBudget | None = None,
+        fleet: FleetOrders | None = None,
     ) -> None:
         if isinstance(group, bool) or not isinstance(group, int) or group in _FORBIDDEN_GIDS:
             raise ControlError(
@@ -271,8 +306,10 @@ class WebControlServer(ControlServer):
             snapshots=snapshots,
             roster=roster,
             whole_budget=whole_budget,
+            fleet=fleet,
         )
         self.socket_group = group
+        self._long_orders = threading.BoundedSemaphore(LONG_ORDERS)
         # The web's own uid, when it is an account (the installed ``backtide-web``): then the
         # group alone is not enough, so a member of the group who switches to it (``sg``,
         # ``newgrp``) is refused too. Root may always ask (it has the control socket anyway).
@@ -349,9 +386,35 @@ class WebControlServer(ControlServer):
             if not self._changes.take():
                 logger.warning("web socket: too many changes, one from pid %d was refused", pid)
                 raise _BadRequest("Demasiados cambios seguidos: espera un poco.")
+            if command in AGENT_ORDERS:
+                request.pop("via", None)  # the socket is who says: it is no field of these orders
+                return self._agent_order(command, request, pid, uid)
             request["via"] = "web"
             self._warn_lasting(command, request, pid)
         return super()._handle(request, pid, uid)
+
+    def _agent_order(
+        self, command: str, request: dict[str, Any], pid: int, uid: int
+    ) -> dict[str, Any]:
+        """An order about the agents (T26-6b), past the session and the key: what this socket does
+        not take of them, and then the control socket's own code."""
+
+        def refused(outcome: str, message: str) -> dict[str, Any]:
+            logger.warning("web socket: refused a %s (pid %d): %s", command, pid, outcome)
+            return {"ok": False, "outcome": outcome, "message": message}
+
+        if request.get("agent") == MAIN_SLUG:
+            return refused("refused", NOT_THE_MAIN)
+        if command == "agent_create" and set(request) - WEB_CREATE_FIELDS:
+            return refused("invalid", CREATE_IS_CLOSED)
+        if command not in HOLDS_ITS_CONNECTION:  # a brake waits for nobody
+            return super()._handle(request, pid, uid)
+        if not self._long_orders.acquire(blocking=False):
+            return refused("busy", TOO_MANY_ORDERS)
+        try:
+            return super()._handle(request, pid, uid)
+        finally:
+            self._long_orders.release()
 
     def _agent_command(
         self, command: str, request: dict[str, Any], pid: int, uid: int, desk: Desk, *, named: bool
@@ -908,6 +971,7 @@ def web_group_problem(gid: int) -> str | None:
 
 
 __all__ = [
+    "AGENT_ORDERS",
     "CHANGES",
     "COMMANDS",
     "READS",
@@ -915,6 +979,7 @@ __all__ = [
     "SESSION_COMMANDS",
     "SIGN_IN_COMMANDS",
     "TOUCH_CHANGES",
+    "WEB_CREATE_FIELDS",
     "Bucket",
     "SessionCheckRefused",
     "WebControlServer",

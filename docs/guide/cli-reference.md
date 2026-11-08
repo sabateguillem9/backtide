@@ -104,7 +104,7 @@ In practice you start it with `make demo` or `make probar`, which first prepare 
 Serves the web view on `127.0.0.1` (this computer only): the live feed of what the agent does, the history with filters, the snapshots, the held requests and the Settings page. By default it only reads. The three flags below switch on the things that change state.
 
 ```sh
-backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes] [--socket-web PATH]
+backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes] [--gestionar] [--tareas] [--socket-web PATH]
 ```
 
 | Flag | Default | Effect |
@@ -113,15 +113,17 @@ backtide web [--config FILE] [--puerto N] [--rebobinar] [--aprobar] [--ajustes] 
 | `--rebobinar` | off | The Snapshots page can rewind (with the same notice as `rebobinar` and a confirmation) |
 | `--aprobar` | off | The Requests page can approve and reject held requests (each behind a confirmation). Without it the buttons are shown switched off |
 | `--ajustes` | off | The Settings page can set and remove API keys, the Telegram bot and the spending cap. Without it the page only explains how to switch it on |
+| `--gestionar` | off | The Agents page can create, start, stop, freeze, thaw and delete agents (each behind a confirmation). It needs `--socket-web`. Without it the page shows the agents with no buttons |
+| `--tareas` | off | Each agent's Hablar page can give it tasks, read its answers and stop what runs, as `backtide tarea` does. Without it the page only explains how to switch it on |
 | `--socket-web PATH` | off | Ask for all of the above, and for the snapshot list, through the service's narrow socket at `PATH` (the one `vigilar --grupo-web` opens) instead of the control socket. For a web that runs as an unprivileged user in that group. The socket and the process answering it must be root's, or nothing is sent. The installed `backtide-web.service` passes `--socket-web /var/lib/backtide/web.sock --rebobinar --aprobar --ajustes` |
 | `--enlace-en FILE` | off | Only with `--socket-web`. Write the web's address, without any token, and the run name to `FILE`, mode `600`, and remove the file when the web stops. The installed `backtide-web.service` uses it; `sudo backtide enlace` asks the service for a one-time token for that address. With `--socket-web`, the service keeps the sessions: the web cannot make its own way in, and the service refuses every change that does not come with a live session |
 
 How it behaves:
 
 - It prints a one-time link and a **run name** of three words, for example `luna-pino-boya`. Open the link in your browser; backtide does not open anything itself. The run name must match the one in the page header: if it does not, the page is not from this run. The link works once and for 15 minutes; afterwards the page uses a cookie, which stops working after an hour unused or 12 hours in all.
-- It then prints three lines saying whether rewind, Settings and approval are on or off for this run, and why.
-- `--rebobinar`, `--aprobar` and `--ajustes` ask the service through the control socket, so they only work when the web runs as the same user as the service and `backtide vigilar` is running. With `--socket-web` they ask through the narrow socket instead, which is how the installed web approves, rejects, rewinds and sets keys and caps without the service's privileges.
-- **As root, the web refuses to start** unless at least one of the three flags is given. A viewer that only looks should run as an ordinary user with read permission on the black box. With a flag as root it starts, with a warning.
+- It then prints four lines saying whether rewind, Settings, approval and tasks are on or off for this run, and why.
+- `--rebobinar`, `--aprobar`, `--ajustes` and `--tareas` ask the service through the control socket, so they only work when the web runs as the same user as the service and `backtide vigilar` is running. With `--socket-web` they ask through the narrow socket instead, which is how the installed web approves, rejects, rewinds and sets keys and caps without the service's privileges.
+- **As root, the web refuses to start** unless at least one of the four flags is given. A viewer that only looks should run as an ordinary user with read permission on the black box. With a flag as root it starts, with a warning.
 - The page language follows your browser's language (Spanish or English). Add `?lang=en` to the address to force English.
 - It reads only the black box, the snapshot folder and the control socket path from the config. It never reads the black box's key.
 - Exit codes: `0` stopped with Ctrl-C; `1` could not open the port; `2` bad config, a port out of range, or the root refusal.
@@ -298,7 +300,7 @@ backtide rechazar ID [--config FILE] [--agente NAME]
 
 `tarea` works with both profiles: Claude Code (`claude-code`) and the default, OpenClaw. `entrar`, `importar` and `exportar` are for agents that run as a **shell program** inside the container instead of as a background service, which today is only Claude Code; with OpenClaw they stop with exit 2 and say what to use instead. Choose the profile in `[agent] profile` ([configuration](configuration.md)).
 
-To talk to OpenClaw, use `backtide tarea` or Telegram. The web shows what it does and lets you approve, reject and rewind, but it does not send it messages. `tarea` goes through OpenClaw's running Gateway (the OpenClaw process that is the agent), into its main conversation: the same one its Telegram chat uses. There is only that one conversation, so every message continues it and `--continue` changes nothing. There is no `entrar` for OpenClaw yet: it runs all the time and reads Telegram and the web, so what it is told could make it write escape sequences straight into its terminal interface, which would be your terminal. The filter that `entrar` now has is the first step to opening it for OpenClaw too; it has not been opened yet.
+To talk to OpenClaw, use `backtide tarea`, the web's Hablar page (with `--tareas`) or Telegram. `tarea` and the web go through OpenClaw's running Gateway (the OpenClaw process that is the agent), into its main conversation: the same one its Telegram chat uses. There is only that one conversation, so every message continues it and `--continue` changes nothing. There is no `entrar` for OpenClaw yet: it runs all the time and reads Telegram and the web, so what it is told could make it write escape sequences straight into its terminal interface, which would be your terminal. The filter that `entrar` now has is the first step to opening it for OpenClaw too; it has not been opened yet.
 
 All four ask the running service first. The service records the request in the black box and checks that the agent is running, before anything happens.
 
@@ -401,7 +403,7 @@ backtide agentes recuperar SLUG [--reiniciar] [--config FILE]
 backtide agentes lista [--config FILE]
 ```
 
-The running service does all of it, on its root-only socket: it asks the service and says what the service answers. The web has none of these yet, and no agent can reach that socket. See [several agents](configuration.md#several-agents).
+The running service does all of it, on its root-only socket: it asks the service and says what the service answers. No agent can reach that socket. The web's Agents page (`backtide web --gestionar`) asks for less: a short name, a profile and a size to create one, nothing about the main agent, and neither `recuperar` nor `vaciar`. The first agent besides the main one restarts the service, so it is created here, with `--reiniciar`. See [several agents](configuration.md#several-agents).
 
 **`crear`** makes a new agent and starts it. The slug is its name for good, and a slug that was ever used is not used again, because the black box of an agent stays when the agent goes. There is no option for an image, a path or a mount: the profile gives the image, and the volume is new and empty. Everything else comes from a short list. `--tope-espacio` goes from 64 MiB to half the volume, 5 % of it by default. `--dia` and `--mes` are its own spending caps, never above the whole installation's. The first agent besides `principal` restarts the service, and with it the main agent, so it needs `--reiniciar`; from the second on, the others are not touched. It is refused, with nothing made, if:
 

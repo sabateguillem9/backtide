@@ -1276,15 +1276,10 @@ def test_with_no_fleet_nothing_is_created(sock_dir: Path) -> None:
     assert reply["ok"] is False and reply["outcome"] == "refused"
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "agent_create", "agent_start", "agent_stop", "agent_pause", "agent_resume", "agent_delete",
-        "agent_restore", "agent_purge",
-    ],
-)  # fmt: skip
-def test_none_of_these_is_on_the_webs_list(command: str, sock_dir: Path) -> None:
-    """Prepared for T26-6b, and off its list until then: not even a live session gets there."""
+@pytest.mark.parametrize("command", ["agent_restore", "agent_purge"])
+def test_these_are_never_on_the_webs_list(command: str, sock_dir: Path) -> None:
+    """What the trash holds comes back or goes from the server's terminal: not even a live session
+    gets there (what the web's list does take: tests/test_service_web_agent_orders.py)."""
     assert command not in COMMANDS
     guardian = FakeGuardian()
     server = WebControlServer(
