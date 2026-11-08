@@ -58,8 +58,11 @@ The socket:
   (``TOUCH_CHANGES``). ``agent_restore`` and ``agent_purge`` are not on the list: what the trash
   holds comes back or goes for good from the server's own terminal. At most ``LONG_ORDERS`` of what
   takes long at once (``HOLDS_ITS_CONNECTION``), because one holds a connection for as long as an
-  agent takes to come up, and the pages need the others. Freezing and stopping are not counted: a
-  brake is not asked to wait behind two starts, and ``Fleet`` does its stops one at a time.
+  agent takes to come up, and the pages need the others. Stopping, an agent (``agent_stop``) or a
+  task (``task_stop``), has a room of its own, ``AGENT_STOPS`` and ``TASK_STOPS``, so that it does
+  not wait behind two starts and, asked again and again, does not take the connections either
+  (``Fleet`` does its stops one at a time anyway). Freezing is counted nowhere: it is the brake,
+  and it is quick.
 - The keys (T26-3b-2, T26-3c, T26-3d): registering, listing and touching them, signing in, and
   ``key_remove`` and ``key_rename`` (``_manage_key``): by the whole id, with a key just touched,
   recorded first, and from here never the last key. Root's own ``passkey_remove``, by the end of
@@ -87,6 +90,7 @@ from backtide.jail.proxy_config import PROXY_GID, PROXY_UID
 from backtide.service.control import (
     LINK_CLOSED,
     MAX_CONNECTIONS,
+    REFUSED,
     REPLY_TIMEOUT,
     WAIT_FOR_SERVICE,
     BudgetService,
@@ -114,7 +118,7 @@ from backtide.snapshots import Snapshot
 logger = logging.getLogger(__name__)
 
 WEB_SOCKET_MODE = 0o660
-MAX_WEB_CONNECTIONS = 4
+MAX_WEB_CONNECTIONS = 6
 # What the web may read (it shows them) and change (each behind its own confirmation in the web).
 READS = frozenset({"agents", "snapshots", "holds", "trusted", "batches", "secrets", "budget"})
 CHANGES = frozenset(
@@ -132,6 +136,11 @@ AGENT_ORDERS = frozenset(
 WEB_CREATE_FIELDS = frozenset({"cmd", "slug", "profile", "volume_gib"})
 HOLDS_ITS_CONNECTION = frozenset({"agent_create", "agent_start", "agent_resume", "agent_delete"})
 LONG_ORDERS = 2  # of MAX_WEB_CONNECTIONS at once: an agent's start holds its connection for minutes
+# The stops hold theirs for long too (an agent's up to 110 s, a task's up to 120 s), so each has its
+# own room: a brake is not asked to wait behind two starts, and two starts and a stop of each kind,
+# asked again and again, leave ``MAX_WEB_CONNECTIONS - 4`` connections for the pages and the freeze.
+AGENT_STOPS = 1
+TASK_STOPS = 1
 # A read that takes a live session, unlike READS (T26-5a, docs/47 section 7.1): a task's answer is
 # not in the black box, which the web's group may read anyway. It does not count as using the
 # session: a chat left open, which asks by itself, must not keep the session alive.
@@ -212,6 +221,7 @@ CREATE_IS_CLOSED = (
     "No se ha hecho nada."
 )
 TOO_MANY_ORDERS = "Ya hay otras órdenes en marcha: espera a que acaben. No se ha hecho nada."
+STOP_IN_PROGRESS = "Ya hay una parada en marcha: espera a que acabe. No se ha hecho nada."
 FIRST_KEY_TOO_LATE = "La primera llave se registra nada más entrar: vuelve a entrar y regístrala."
 _FORBIDDEN_IDS = frozenset({AGENT_UID, PROXY_UID, *AGENT_ID_RANGE})
 _FORBIDDEN_GIDS = frozenset({0, AGENT_GID, PROXY_GID, *AGENT_ID_RANGE})
@@ -310,6 +320,8 @@ class WebControlServer(ControlServer):
         )
         self.socket_group = group
         self._long_orders = threading.BoundedSemaphore(LONG_ORDERS)
+        self._agent_stops = threading.BoundedSemaphore(AGENT_STOPS)
+        self._task_stops = threading.BoundedSemaphore(TASK_STOPS)
         # The web's own uid, when it is an account (the installed ``backtide-web``): then the
         # group alone is not enough, so a member of the group who switches to it (``sg``,
         # ``newgrp``) is refused too. Root may always ask (it has the control socket anyway).
@@ -391,7 +403,31 @@ class WebControlServer(ControlServer):
                 return self._agent_order(command, request, pid, uid)
             request["via"] = "web"
             self._warn_lasting(command, request, pid)
+            if command == "task_stop":
+                return self._within(
+                    self._task_stops, command, request, pid, uid, REFUSED, STOP_IN_PROGRESS
+                )
         return super()._handle(request, pid, uid)
+
+    def _within(
+        self,
+        room: threading.BoundedSemaphore,
+        command: str,
+        request: dict[str, Any],
+        pid: int,
+        uid: int,
+        outcome: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """The order, if its kind has room (a connection that stays for as long as it takes); if
+        not, a word at once and nothing called."""
+        if not room.acquire(blocking=False):
+            logger.warning("web socket: refused a %s (pid %d): %s", command, pid, outcome)
+            return {"ok": False, "outcome": outcome, "message": message}
+        try:
+            return super()._handle(request, pid, uid)
+        finally:
+            room.release()
 
     def _agent_order(
         self, command: str, request: dict[str, Any], pid: int, uid: int
@@ -407,14 +443,13 @@ class WebControlServer(ControlServer):
             return refused("refused", NOT_THE_MAIN)
         if command == "agent_create" and set(request) - WEB_CREATE_FIELDS:
             return refused("invalid", CREATE_IS_CLOSED)
-        if command not in HOLDS_ITS_CONNECTION:  # a brake waits for nobody
+        if command == "agent_stop":  # not behind the starts, and not more than one at a time
+            return self._within(
+                self._agent_stops, command, request, pid, uid, "busy", STOP_IN_PROGRESS
+            )
+        if command not in HOLDS_ITS_CONNECTION:  # a freeze waits for nobody
             return super()._handle(request, pid, uid)
-        if not self._long_orders.acquire(blocking=False):
-            return refused("busy", TOO_MANY_ORDERS)
-        try:
-            return super()._handle(request, pid, uid)
-        finally:
-            self._long_orders.release()
+        return self._within(self._long_orders, command, request, pid, uid, "busy", TOO_MANY_ORDERS)
 
     def _agent_command(
         self, command: str, request: dict[str, Any], pid: int, uid: int, desk: Desk, *, named: bool

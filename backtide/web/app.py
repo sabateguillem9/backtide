@@ -29,6 +29,7 @@ ticket, as a task is an everyday thing (``backtide.web.talk``). Every other rout
 """
 
 import asyncio
+import contextvars
 import hashlib
 import itertools
 import json
@@ -191,6 +192,7 @@ from backtide.web.settings import (
 )
 from backtide.web.state import STATE_ACTIONS, AgentStatus, read_status
 from backtide.web.talk import (
+    QUICK_STOP,
     RUNNING,
     UNKNOWN,
     TaskClient,
@@ -514,6 +516,7 @@ def create_app(
 
     tickets = Tickets(clock)
     rewinding: dict[str, threading.Lock] = {}  # one rewind in flight per agent, whoever asks
+    stopping: dict[str, threading.Lock] = {}  # one task stop in flight per agent, whoever asks
 
     @app.exception_handler(StartSession)
     async def _start_session(request: Request, started: StartSession) -> Response:
@@ -2636,15 +2639,46 @@ def create_app(
             )
         ask = tasks.stop
         order = who.order
+        lock = stopping.setdefault(who.slug, threading.Lock())
+        if not lock.acquire(blocking=False):  # the service stops them all: one ask is enough
+            return await asyncio.to_thread(
+                _talk_page, request, who, status=409, error="talk.err.stopping"
+            )
+        done = threading.Event()
+        failed: list[bool] = []
 
-        def run() -> bool:
+        def run() -> None:
+            # Taken above and released here, in the thread that waits for the service to its end
+            # (up to two minutes), whatever the browser does: the next stop waits for this one.
             try:
-                return ask(form["tarea"], **order)
+                failed.append(not ask(form["tarea"], **order))
             except ControlError as error:
                 logger.warning("a task's stop from the web failed: %s", type(error).__name__)
-                return False
+                failed.append(True)
+            except Exception:  # said, with its trace: nobody knows how far it got
+                logger.exception("a task's stop from the web failed")
+                failed.append(True)
+            finally:
+                lock.release()
+                done.set()
 
-        if not await asyncio.to_thread(run):
+        # With this request's context: it carries the session the service wants with the stop.
+        context = contextvars.copy_context()
+        thread = threading.Thread(
+            target=context.run, args=(run,), name=f"backtide-web-stop-{who.slug}", daemon=True
+        )
+        try:
+            thread.start()
+        except RuntimeError as error:  # no more threads: it never was a stop
+            lock.release()
+            logger.error("a task's stop from the web could not start its thread: %s", error)
+            return await asyncio.to_thread(
+                _talk_page, request, who, status=503, error="talk.err.stop"
+            )
+        # A moment, so that a refusal reaches the page that asked; past it, the page goes on and
+        # the stream shows how the task ends, which is the service's word and not ours.
+        await asyncio.to_thread(done.wait, QUICK_STOP)
+        if done.is_set() and failed == [True]:
             return await asyncio.to_thread(
                 _talk_page, request, who, status=503, error="talk.err.stop"
             )

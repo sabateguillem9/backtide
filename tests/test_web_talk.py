@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,9 @@ class FakeTasks:
         self.status_error: Exception | None = None
         self.stops: list[tuple[str, str | None]] = []
         self.stopped = True
+        self.stop_gate: threading.Event | None = None  # a stop that takes as long as it is let
+        self.stop_entered = threading.Semaphore(0)
+        self.stop_ended = threading.Semaphore(0)
 
     def availability(self) -> Availability:
         return self.state
@@ -104,9 +108,16 @@ class FakeTasks:
 
     def stop(self, task_id: str, *, agent: str | None = None) -> bool:
         self.stops.append((task_id, agent))
-        if self.error is not None:
-            raise self.error
-        return self.stopped
+        gate = self.stop_gate
+        try:
+            if gate is not None:
+                self.stop_entered.release()
+                gate.wait(10)
+            if self.error is not None:
+                raise self.error
+            return self.stopped
+        finally:
+            self.stop_ended.release()
 
 
 def said(text: str = "listo", outcome: str = "ok", message: str = "", chars: int | None = None):
@@ -565,6 +576,86 @@ def test_a_stop_that_failed_says_it_may_run_on(web: TestClient, tasks: FakeTasks
     tasks.stopped = False
     page = stop(web)
     assert page.status_code == 503 and "puede seguir en marcha" in page.text
+
+
+def test_a_stop_that_takes_long_does_not_hold_the_post(
+    web: TestClient, tasks: FakeTasks, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The service takes up to two minutes to answer a stop. The POST waits a moment and goes on to
+    the page, which shows the task as the service says it is; the stop goes on in a thread."""
+    monkeypatch.setattr("backtide.web.app.QUICK_STOP", 0.05)
+    tasks.stop_gate = gate = threading.Event()
+    try:
+        reply = stop(web)
+        assert reply.status_code == 303 and reply.headers["location"].endswith("/hablar")
+        assert tasks.stop_entered.acquire(timeout=10)
+        assert tasks.stops == [(TASK_A, None)]
+    finally:
+        gate.set()
+    assert tasks.stop_ended.acquire(timeout=10)
+
+
+def test_one_stop_at_a_time_per_agent_and_the_next_one_when_it_ends(
+    web: TestClient, tasks: FakeTasks, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("backtide.web.app.QUICK_STOP", 0.05)
+    tasks.stop_gate = gate = threading.Event()
+    try:
+        assert stop(web).status_code == 303
+        assert tasks.stop_entered.acquire(timeout=10)
+        for _ in range(5):  # clicked again, and again: nothing more goes to the service
+            again = stop(web, TASK_B)
+            assert again.status_code == 409 and "Ya hay una parada" in again.text
+        assert tasks.stops == [(TASK_A, None)]
+    finally:
+        gate.set()
+    assert tasks.stop_ended.acquire(timeout=10)
+    deadline = time.monotonic() + 10
+    while stop(web, TASK_B).status_code == 409 and time.monotonic() < deadline:
+        time.sleep(0.01)  # the thread frees the agent just after the service has answered
+    assert [task for task, _ in tasks.stops] == [TASK_A, TASK_B]
+
+
+def test_a_stop_in_one_agent_does_not_hold_the_stop_of_another(
+    two: TestClient, tasks: FakeTasks, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("backtide.web.app.QUICK_STOP", 0.05)
+    tasks.stop_gate = gate = threading.Event()
+    try:
+        first = {"csrf": csrf_of(two.get(PAGE).text), "tarea": TASK_A, "agente": SLUG}
+        assert two.post(STOP, data=first, headers=POST_HEADERS).status_code == 200
+        assert tasks.stop_entered.acquire(timeout=10)
+        other = {"csrf": csrf_of(two.get(PAGE).text), "tarea": TASK_B}  # the main agent's
+        assert two.post(STOP, data=other, headers=POST_HEADERS).status_code == 200
+        assert tasks.stop_entered.acquire(timeout=10)
+        assert tasks.stops == [(TASK_A, SLUG), (TASK_B, None)]
+    finally:
+        gate.set()
+
+
+def test_a_slow_stop_that_failed_is_said_in_the_log_and_frees_the_agent(
+    web: TestClient,
+    tasks: FakeTasks,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from backtide.service.control import ControlOutcomeUnknown
+
+    monkeypatch.setattr("backtide.web.app.QUICK_STOP", 0.05)
+    tasks.stop_gate = gate = threading.Event()
+    tasks.error = ControlOutcomeUnknown("MARCA")
+    try:
+        assert stop(web).status_code == 303
+        assert tasks.stop_entered.acquire(timeout=10)
+    finally:
+        gate.set()
+    assert tasks.stop_ended.acquire(timeout=10)
+    tasks.stop_gate = None
+    deadline = time.monotonic() + 10
+    while stop(web).status_code == 409 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "MARCA" not in caplog.text and "stop from the web failed" in caplog.text
+    assert len(tasks.stops) >= 2
 
 
 def test_a_service_that_does_not_answer_a_stop(web: TestClient, tasks: FakeTasks) -> None:

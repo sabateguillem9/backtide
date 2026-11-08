@@ -28,9 +28,13 @@ from backtide.service.roster import (
 from backtide.service.tasks import AgentTasks
 from backtide.service.web_control import (
     AGENT_ORDERS,
+    AGENT_STOPS,
     COMMANDS,
     LONG_ORDERS,
+    MAX_WEB_CONNECTIONS,
+    TASK_STOPS,
     TOUCH_CHANGES,
+    Bucket,
     WebControlServer,
 )
 from tests.test_service_agents import home as home  # noqa: F401, PLC0414 - the fixture
@@ -133,6 +137,19 @@ def server(
     roster = Roster(Desk("principal", main_desk), [("revisor", "Revisor")])
     roster.publish(Desk("revisor", desk))
     return make_server(fleet=fleet, roster=roster)
+
+
+@pytest.fixture
+def roomy(
+    make_server: Callable[..., WebControlServer],  # noqa: F811
+    fleet: FakeFleet,
+    desk: Freezable,
+    main_desk: Freezable,
+) -> WebControlServer:
+    """The same, with a bucket of changes that does not run out in the middle of a flood."""
+    roster = Roster(Desk("principal", main_desk), [("revisor", "Revisor")])
+    roster.publish(Desk("revisor", desk))
+    return make_server(fleet=fleet, roster=roster, changes=Bucket(1000, 1000.0))
 
 
 # --- the list ------------------------------------------------------------------------------------
@@ -502,6 +519,94 @@ def test_long_orders_leave_connections_for_the_pages_and_never_stop_a_brake(
             thread.join(10)
     assert all(reply["ok"] for reply in held)
     assert talk(server, signed(START))["ok"] is True  # the room comes back
+
+
+def test_the_stops_and_the_starts_never_take_every_connection() -> None:
+    """The sum of what may hold a connection for minutes, with room left for a page and a brake."""
+    assert LONG_ORDERS + AGENT_STOPS + TASK_STOPS + 2 <= MAX_WEB_CONNECTIONS
+
+
+class SlowTaskStop:
+    """A guardian whose ``task_stop`` takes as long as the test lets it (a ``pkill`` of 30 s)."""
+
+    def __init__(self, guardian: Any) -> None:
+        self.release = threading.Event()
+        self.holding = threading.Semaphore(0)
+        self.calls: list[str] = []
+        guardian.task_stop = self.task_stop
+
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool:
+        self.calls.append(task_id)
+        self.holding.release()
+        self.release.wait(10)
+        return True
+
+
+TASK_STOP = {"cmd": "task_stop", "task": "c0de" * 8}
+
+
+def test_the_stops_count_and_two_starts_with_repeated_stops_leave_the_brake_free(
+    roomy: WebControlServer, fleet: FakeFleet, desk: Freezable, main_desk: Freezable
+) -> None:
+    """The finding of the review of T26-6b: two starts, a stop of an agent and a stop of a task
+    held, and the same stops asked again and again. Each repeat is a word at once, the pages go on
+    being answered and the freeze goes through."""
+    slow = SlowTaskStop(main_desk)  # the main agent's desk: no `agent` in the order
+    held_by = threading.Event()
+    fleet.hold = held_by
+    held: list[dict[str, Any]] = []
+    threads = [
+        threading.Thread(target=lambda r=r: held.append(talk(roomy, signed(r))))
+        for r in (*([START] * LONG_ORDERS), *([STOP] * AGENT_STOPS), *([TASK_STOP] * TASK_STOPS))
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for _ in range(LONG_ORDERS + AGENT_STOPS):
+            assert fleet.holding.acquire(timeout=10)
+        for _ in range(TASK_STOPS):
+            assert slow.holding.acquire(timeout=10)
+        for _ in range(8):  # the stops asked again, over and over
+            again = talk(roomy, signed(STOP))
+            assert (again["ok"], again["outcome"]) == (False, "busy")
+            task_again = talk(roomy, signed(TASK_STOP))
+            assert (task_again["ok"], task_again["outcome"]) == (False, "refused")
+            assert "espera" in task_again["message"]
+        assert [name for name, _, _ in fleet.calls].count("stop") == AGENT_STOPS
+        assert len(slow.calls) == TASK_STOPS
+        fleet.hold = None
+        assert talk(roomy, {"cmd": "agents"})["ok"] is True
+        assert talk(roomy, signed({"cmd": "agent_pause", "agent": "revisor"}))["ok"] is True
+        assert len(desk.paused) == 1
+    finally:
+        slow.release.set()
+        held_by.set()
+        for thread in threads:
+            thread.join(10)
+    assert len(held) == len(threads) and all(reply["ok"] for reply in held)
+    assert talk(roomy, signed(STOP))["ok"] is True  # the room comes back
+    assert talk(roomy, signed(TASK_STOP))["ok"] is True
+
+
+def test_a_stop_that_fails_gives_its_room_back(
+    roomy: WebControlServer, fleet: FakeFleet, main_desk: Freezable
+) -> None:
+    def explode(task_id: str, *, requested_by: str | None = None) -> bool:
+        raise RuntimeError("boom")
+
+    main_desk.task_stop = explode  # type: ignore[attr-defined]
+    for _ in range(AGENT_STOPS + TASK_STOPS + 2):
+        assert talk(roomy, signed(TASK_STOP))["outcome"] == "failed"
+    original = fleet.stop
+
+    def broken(request: Any, requested_by: str) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    fleet.stop = broken  # type: ignore[method-assign]
+    for _ in range(AGENT_STOPS + 2):
+        assert talk(roomy, signed(STOP))["outcome"] == "failed"
+    fleet.stop = original  # type: ignore[method-assign]
+    assert talk(roomy, signed(STOP))["ok"] is True
 
 
 def test_a_stream_of_orders_runs_out_of_its_bucket(

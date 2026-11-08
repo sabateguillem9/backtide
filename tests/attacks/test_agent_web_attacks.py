@@ -383,6 +383,134 @@ def test_a_stop_does_not_wait_behind_a_start(attack: Attack, lab: Lab, web: Web)
     )
 
 
+CAP_WORDS = ("Demasiadas conexiones", "Ya hay otras órdenes", "Ya hay una parada")
+NO_TASK = "d" * 32  # a task id nobody has: the service answers "unknown", at once
+
+
+@scenario("paradas-repetidas-no-quitan-el-freno")
+def test_repeated_stops_never_take_the_webs_brake(attack: Attack, lab: Lab, web: Web) -> None:
+    """Review of T26-6b with the chat: the stops (`agent_stop`, `task_stop`) did not count in the
+    narrow socket's cap of connections, and a stop holds its own for as long as the machine takes
+    (up to 110 and 120 s). Two starts and stops asked again and again could take them all, and then
+    every page said "busy", "Congelar" too. Now each kind has its own room and leaves some free.
+
+    Here, in the real unit: both neighbours stopped, both started from the socket (two long
+    orders) and, meanwhile, stops asked over and over, the pages read and the brake pulled on the
+    first neighbour that is up. What a lab cannot do is make a stop last two minutes: that exact
+    arithmetic (two starts, a stop of each kind held, and the freeze answered) is in
+    tests/test_service_web_agent_orders.py, over real sockets. Here it is that nothing in the real
+    wiring turns a page or the freeze into the cap's word."""
+    time.sleep(CHANGES_WAIT)
+    for agent in (THIRD, OTHER):
+        assert order(lab, {"cmd": "agent_stop", "agent": agent.slug})["outcome"] == "stopped"
+    starts: dict[str, list[dict[str, Any]]] = {}
+    stops: list[list[dict[str, Any]]] = []
+    # One session for every thread (a link opens one): what a web taken over with it would have.
+    token = lab.helper("link", SOCKET)["token"]
+    [opened] = _probe(nobody(), lab.web_gid, {"cmd": "session_open", "token": token, "_see": True})
+    assert opened["ok"] is True, opened
+
+    def sent(*requests: dict[str, Any]) -> list[dict[str, Any]]:
+        return _probe(
+            nobody(),
+            lab.web_gid,
+            *({**one, "session": opened["session"], "_why": True} for one in requests),
+        )
+
+    def starting(agent: Any) -> None:
+        starts[agent.slug] = sent({"cmd": "agent_start", "agent": agent.slug})
+
+    def stopping() -> None:
+        stops.append(
+            sent(
+                {"cmd": "task_stop", "task": NO_TASK},
+                {"cmd": "agent_stop", "agent": "nadie"},
+                {"cmd": "task_stop", "task": NO_TASK},
+                {"cmd": "agent_stop", "agent": "nadie"},
+            )
+        )
+
+    threads = [threading.Thread(target=starting, args=(agent,)) for agent in (THIRD, OTHER)]
+    for thread in threads:
+        thread.start()
+    pages: list[tuple[str, Any]] = []
+    frozen: dict[str, Any] = {}
+    try:
+        wait(
+            lambda: any(item.get("order") == "starting" for item in listed(lab).values()),
+            60,
+            "a neighbour to be coming up",
+            lab.diagnosis,
+        )
+        thread = threading.Thread(target=stopping)
+        thread.start()
+        threads.append(thread)
+        for _ in range(3):  # the pages, while the starts and the stops go on
+            [read] = as_the_web(lab, {"cmd": "agents", "_why": True})
+            pages.append(("agents", read))
+            pages.append(("web", web.get("/agentes").status_code))
+        # The brake, on the first neighbour that is up.
+        up = wait_for_one_up(lab)
+        frozen["slug"] = up.slug
+        frozen["said"] = ended(web, ask(web, "pausar", up.slug))
+        frozen["paused"] = paused(up.container)
+        frozen["resumed"] = ended(web, ask(web, "seguir", up.slug))
+        frozen["thawed"] = not paused(up.container)
+    finally:
+        for thread in threads:
+            thread.join(START_TIMEOUT)
+        for agent in (THIRD, OTHER):  # whatever happened, the next scenarios find them up
+            if not _running(agent.container):
+                order(lab, {"cmd": "agent_start", "agent": agent.slug})
+    said = [reply for replies in stops for reply in replies]
+    never_the_cap = not any(
+        word in str(reply.get("why", "")) for reply in said for word in CAP_WORDS
+    )
+    started = {slug: replies[0] for slug, replies in starts.items()}
+    holds = {
+        "pages_answered": all(
+            (kind == "web" and item == 200) or (kind == "agents" and item.get("ok") is True)
+            for kind, item in pages
+        )
+        and len(pages) == 6,
+        "stops_answered": len(said) == 4 and never_the_cap,
+        "frozen_said": ES["agents.out.frozen"] in frozen.get("said", ""),
+        "was_frozen": frozen.get("paused") is True,
+        "resumed_said": ES["agents.out.resumed"] in frozen.get("resumed", ""),
+        "was_thawed": frozen.get("thawed") is True,
+        "starts_answered": set(started) == {THIRD.slug, OTHER.slug}
+        and not any(
+            word in str(item.get("why", "")) for item in started.values() for word in CAP_WORDS
+        ),
+    }
+    attack.check(
+        "stopped",
+        all(holds.values()),
+        "con dos arranques en marcha y paradas pedidas una y otra vez, las páginas contestan, "
+        f"«Congelar» congela a {frozen.get('slug')} y «Seguir» lo descongela, y ninguna respuesta "
+        f"es la del tope de conexiones; no se cumple: "
+        f"{[name for name, ok in holds.items() if not ok] or 'nada'}",
+    )
+
+
+def wait_for_one_up(lab: Lab) -> Any:
+    """The first neighbour the service watches again and that no order is working on: where the
+    brake is tried, with the other start still going."""
+    found: list[Any] = []
+
+    def one_up() -> bool:
+        said = listed(lab)
+        for agent in (THIRD, OTHER):
+            item = said.get(agent.slug, {})
+            if item.get("watched") and not item.get("order") and not paused(agent.container):
+                found.append(agent)
+                return True
+        return False
+
+    wait(one_up, START_TIMEOUT, "a neighbour to be up", lab.diagnosis)
+    return found[0]
+
+
 @scenario("borrar-desde-la-web")
 def test_deleting_from_the_web_leaves_the_box_and_is_retired(
     attack: Attack, lab: Lab, web: Web

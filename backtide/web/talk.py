@@ -41,6 +41,7 @@ from backtide.web.security import acting_session
 
 SHOWN_CHARS = 64 * 1024  # of an answer, on the page: at twenty of them, a page a browser can draw
 RUNNING = "running"
+QUICK_STOP = 2.0  # seconds a stop's POST waits for the service before going on to the page
 UNKNOWN = "unknown"
 _MAX_KNOWN = 64  # far more than the service keeps (MAX_KEPT + MAX_RUNNING)
 _KNOWN = re.compile(r"([re])([0-9a-f]{32})", re.ASCII)
@@ -191,6 +192,7 @@ def known_id(known: Mapping[str, bool]) -> str:
 
 
 __all__ = [
+    "QUICK_STOP",
     "RUNNING",
     "SHOWN_CHARS",
     "UNKNOWN",

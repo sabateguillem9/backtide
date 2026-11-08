@@ -3315,6 +3315,23 @@ recoverable = "n/a"
 held = "n/a"
 
 [[scenario]]
+id = "paradas-repetidas-no-quitan-el-freno"
+name = "Paradas repetidas no quitan el freno de la web"
+story = """Con dos arranques en marcha desde el socket estrecho de la web y paradas (de un agente y de una tarea) pedidas una y otra vez, \
+las páginas siguen contestando y «Congelar» congela a un vecino que ya está arriba: cada clase de parada tiene su sitio y deja \
+conexiones libres. Ninguna respuesta es la del tope de conexiones."""
+inspired_by = "Quien tiene la web de otro la deja sin freno justo cuando hace falta"
+invariants = [2, 6, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
 id = "borrar-desde-la-web"
 name = "Borrar desde la web deja la caja y sale como retirado"
 story = """Con otro nombre, ni por el socket ni por la página. Con el suyo se borra: su caja se queda, verifica y termina en \
