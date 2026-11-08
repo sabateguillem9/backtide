@@ -61,6 +61,8 @@ ES: dict[str, str] = {
     "talk.stop": "Parar",
     "talk.stop.all": "Parar una las para todas.",
     "talk.err.stop": "No se ha podido parar: puede seguir en marcha. Mira la caja negra.",
+    "talk.err.stopping": "Ya hay una parada en curso en este agente: espera a que acabe. "
+    "Una parada las para todas.",
     "talk.err.form": "Ese formulario no vale: vuelve a cargar la página y pide otra vez.",
     "talk.err.empty": "Escribe algo que pedirle.",
     "talk.err.long": "Es demasiado largo para una tarea: acórtalo.",
@@ -1085,6 +1087,8 @@ EN: dict[str, str] = {
     "talk.stop": "Stop",
     "talk.stop.all": "Stopping one stops them all.",
     "talk.err.stop": "It could not be stopped: it may still be running. Look at the black box.",
+    "talk.err.stopping": "A stop is already in progress in this agent: wait for it to end. "
+    "One stop stops them all.",
     "talk.err.form": "That form is no good: load the page again and ask again.",
     "talk.err.empty": "Write something to ask.",
     "talk.err.long": "That is too long for a task: shorten it.",

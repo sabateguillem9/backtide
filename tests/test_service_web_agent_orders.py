@@ -28,11 +28,18 @@ from backtide.service.roster import (
 from backtide.service.tasks import AgentTasks
 from backtide.service.web_control import (
     AGENT_ORDERS,
+    AGENT_STOPS,
+    CHANGES_BURST,
     COMMANDS,
     LONG_ORDERS,
+    MAX_WEB_CONNECTIONS,
+    STOPS_BURST,
+    TASK_STOPS,
     TOUCH_CHANGES,
+    Bucket,
     WebControlServer,
 )
+from backtide.web.security import CHECKS_AT_ONCE
 from tests.test_service_agents import home as home  # noqa: F401, PLC0414 - the fixture
 from tests.test_service_agents import main_config
 from tests.test_service_control import FakeGuardian, me
@@ -133,6 +140,24 @@ def server(
     roster = Roster(Desk("principal", main_desk), [("revisor", "Revisor")])
     roster.publish(Desk("revisor", desk))
     return make_server(fleet=fleet, roster=roster)
+
+
+@pytest.fixture
+def roomy(
+    make_server: Callable[..., WebControlServer],  # noqa: F811
+    fleet: FakeFleet,
+    desk: Freezable,
+    main_desk: Freezable,
+) -> WebControlServer:
+    """The same, with a bucket of changes that does not run out in the middle of a flood."""
+    roster = Roster(Desk("principal", main_desk), [("revisor", "Revisor")])
+    roster.publish(Desk("revisor", desk))
+    return make_server(
+        fleet=fleet,
+        roster=roster,
+        changes=Bucket(1000, 1000.0),
+        stops=Bucket(1000, 1000.0),
+    )
 
 
 # --- the list ------------------------------------------------------------------------------------
@@ -504,10 +529,186 @@ def test_long_orders_leave_connections_for_the_pages_and_never_stop_a_brake(
     assert talk(server, signed(START))["ok"] is True  # the room comes back
 
 
+FREE_FOR_PAGES = 2  # connections that no order of a kind that lasts may take: pages and the freeze
+
+
+def test_the_orders_that_last_never_take_every_connection() -> None:
+    """The sum of what may hold a connection for minutes, with room left for a page and a brake,
+    and the cookie checks (which also come through here) fitting in that room."""
+    longest = LONG_ORDERS + AGENT_STOPS + TASK_STOPS
+    assert longest + FREE_FOR_PAGES <= MAX_WEB_CONNECTIONS
+    assert CHECKS_AT_ONCE <= MAX_WEB_CONNECTIONS - longest
+
+
+class SlowTaskStop:
+    """A guardian whose ``task_stop`` takes as long as the test lets it (a ``pkill`` of 30 s)."""
+
+    def __init__(self, guardian: Any) -> None:
+        self.release = threading.Event()
+        self.holding = threading.Semaphore(0)
+        self.calls: list[str] = []
+        guardian.task_stop = self.task_stop
+
+    def task_stop(self, task_id: str, *, requested_by: str | None = None) -> bool:
+        self.calls.append(task_id)
+        self.holding.release()
+        self.release.wait(10)
+        return True
+
+
+def quick_task_stop(desk: Any) -> list[str]:
+    stopped: list[str] = []
+
+    def task_stop(task_id: str, *, requested_by: str | None = None) -> bool:
+        stopped.append(task_id)
+        return True
+
+    desk.task_stop = task_stop
+    return stopped
+
+
+TASK_STOP = {"cmd": "task_stop", "task": "c0de" * 8}
+TASK_STOP_REVISOR = {**TASK_STOP, "agent": "revisor"}
+
+
+def test_the_stops_count_and_two_starts_with_repeated_stops_leave_the_brake_free(
+    server: WebControlServer, fleet: FakeFleet, desk: Freezable, main_desk: Freezable
+) -> None:
+    """The finding of the review of T26-6b, with the bucket of changes as it comes: two starts, a
+    stop of an agent and a stop of a task held, and the same stops asked again and again. Each
+    repeat is a word at once and spends nothing, so the pages go on being answered and the freeze
+    goes through."""
+    slow = SlowTaskStop(main_desk)  # the main agent's desk: no `agent` in the order
+    held_by = threading.Event()
+    fleet.hold = held_by
+    held: list[dict[str, Any]] = []
+    threads = [
+        threading.Thread(target=lambda r=r: held.append(talk(server, signed(r))))
+        for r in (*([START] * LONG_ORDERS), STOP, TASK_STOP)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for _ in range(LONG_ORDERS + AGENT_STOPS):
+            assert fleet.holding.acquire(timeout=10)
+        assert slow.holding.acquire(timeout=10)
+        for _ in range(30):  # the stops asked again, over and over
+            again = talk(server, signed(STOP))
+            assert (again["ok"], again["outcome"]) == (False, "busy")
+            task_again = talk(server, signed(TASK_STOP))
+            assert (task_again["ok"], task_again["outcome"]) == (False, "refused")
+            assert "espera" in task_again["message"]
+        assert [name for name, _, _ in fleet.calls].count("stop") == AGENT_STOPS
+        assert len(slow.calls) == 1
+        fleet.hold = None
+        assert talk(server, {"cmd": "agents"})["ok"] is True
+        assert talk(server, signed({"cmd": "agent_pause", "agent": "revisor"}))["ok"] is True
+        assert len(desk.paused) == 1
+    finally:
+        slow.release.set()
+        held_by.set()
+        for thread in threads:
+            thread.join(10)
+    assert len(held) == len(threads) and all(reply["ok"] for reply in held)
+    assert talk(server, signed(STOP))["ok"] is True  # the room comes back
+    assert talk(server, signed(TASK_STOP))["ok"] is True
+
+
+def test_the_slow_stop_of_one_agents_task_does_not_refuse_anothers(
+    server: WebControlServer, desk: Freezable, main_desk: Freezable
+) -> None:
+    """A hostile agent can make the stop of its own tasks last (its ``pkill`` hangs). The room is
+    each agent's: another one's stop still goes through, and so does a stop of the main agent."""
+    slow = SlowTaskStop(desk)
+    stopped_in_main = quick_task_stop(main_desk)
+    held: list[dict[str, Any]] = []
+    thread = threading.Thread(target=lambda: held.append(talk(server, signed(TASK_STOP_REVISOR))))
+    thread.start()
+    try:
+        assert slow.holding.acquire(timeout=10)
+        again = talk(server, signed(TASK_STOP_REVISOR))  # the same agent's: one at a time
+        assert (again["ok"], again["outcome"]) == (False, "refused")
+        reply = talk(server, signed(TASK_STOP))  # the main agent's
+        assert (reply["ok"], reply["outcome"]) == (True, "stopped")
+        assert stopped_in_main == [TASK_STOP["task"]]
+        assert len(slow.calls) == 1
+    finally:
+        slow.release.set()
+        thread.join(10)
+    assert held and held[0]["ok"] is True
+    assert talk(server, signed(TASK_STOP_REVISOR))["ok"] is True  # and its room came back
+
+
+def test_the_stops_in_flight_are_capped_whatever_the_agents(
+    roomy: WebControlServer, desk: Freezable, main_desk: Freezable
+) -> None:
+    """Each agent has its room, but all of them together never pass ``TASK_STOPS``: the
+    connections are the ones that are left."""
+    slows = [SlowTaskStop(main_desk), SlowTaskStop(desk)]
+    requests = [TASK_STOP, TASK_STOP_REVISOR]
+    assert TASK_STOPS == len(requests)
+    held: list[dict[str, Any]] = []
+    threads = [
+        threading.Thread(target=lambda r=r: held.append(talk(roomy, signed(r)))) for r in requests
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for slow in slows:
+            assert slow.holding.acquire(timeout=10)
+        # An agent that nobody has takes no room either, but is refused all the same.
+        third = talk(roomy, signed({**TASK_STOP, "agent": "tercero"}))
+        assert third["ok"] is False and third["outcome"] == "refused"
+        assert "Ya hay una parada" in third["message"]
+    finally:
+        for slow in slows:
+            slow.release.set()
+        for thread in threads:
+            thread.join(10)
+    assert len(held) == 2 and all(reply["ok"] for reply in held)
+
+
+def test_a_stop_that_fails_gives_its_room_back(
+    roomy: WebControlServer, fleet: FakeFleet, main_desk: Freezable
+) -> None:
+    def explode(task_id: str, *, requested_by: str | None = None) -> bool:
+        raise RuntimeError("boom")
+
+    main_desk.task_stop = explode  # type: ignore[attr-defined]
+    for _ in range(AGENT_STOPS + TASK_STOPS + 2):
+        assert talk(roomy, signed(TASK_STOP))["outcome"] == "failed"
+    original = fleet.stop
+
+    def broken(request: Any, requested_by: str) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    fleet.stop = broken  # type: ignore[method-assign]
+    for _ in range(AGENT_STOPS + 2):
+        assert talk(roomy, signed(STOP))["outcome"] == "failed"
+    fleet.stop = original  # type: ignore[method-assign]
+    assert talk(roomy, signed(STOP))["ok"] is True
+
+
+def test_a_stream_of_stops_never_empties_the_bucket_of_the_freeze(
+    server: WebControlServer, fleet: FakeFleet, desk: Freezable
+) -> None:
+    """The stops have a bucket of their own: spamming "Parar" runs out that one, and "Congelar"
+    and the other changes keep theirs (the bucket of changes as it comes, nothing disabled)."""
+    replies = [talk(server, signed(STOP)) for _ in range(STOPS_BURST + 6)]
+    assert sum(1 for reply in replies if reply["ok"]) == STOPS_BURST
+    assert "Demasiadas paradas" in replies[-1]["message"]
+    task_replies = [talk(server, signed(TASK_STOP)) for _ in range(3)]
+    assert "Demasiadas paradas" in task_replies[-1]["message"]  # the same bucket: both are stops
+    assert len(fleet.calls) == STOPS_BURST
+    for _ in range(CHANGES_BURST):  # every change that is not a stop is still there
+        assert talk(server, signed({"cmd": "agent_pause", "agent": "revisor"}))["ok"] is True
+    assert len(desk.paused) == CHANGES_BURST
+
+
 def test_a_stream_of_orders_runs_out_of_its_bucket(
     server: WebControlServer, fleet: FakeFleet
 ) -> None:
-    replies = [talk(server, signed(STOP)) for _ in range(12)]
+    replies = [talk(server, signed(START)) for _ in range(12)]
     assert sum(1 for reply in replies if reply["ok"]) == 10
     assert "Demasiados cambios" in replies[-1]["message"]
     assert len(fleet.calls) == 10

@@ -3315,6 +3315,24 @@ recoverable = "n/a"
 held = "n/a"
 
 [[scenario]]
+id = "paradas-repetidas-no-quitan-el-freno"
+name = "Paradas repetidas no quitan el freno de la web"
+story = """Con un `agent_stop` de verdad en curso (unos 10 s), los pedidos de parar repetidos desde el socket de la web se rechazan al \
+momento con la palabra de las paradas («Ya hay una parada»), no con la de `Fleet`; mientras, las páginas contestan y «Congelar» y \
+«Seguir» funcionan en el vecino que está arriba. Al acabar se puede parar otra vez y los dos vecinos arrancan como dice la lista del \
+servicio. No cubre dos arranques a la vez ni una parada de tarea que dure: eso, con sockets reales, está en los tests del Mac."""
+inspired_by = "Quien tiene la web de otro la deja sin freno justo cuando hace falta"
+invariants = [2, 7]
+status = "ready"
+profiles = ["claude-code"]
+[scenario.expect]
+stopped = "yes"
+recorded = "n/a"
+risk = "n/a"
+recoverable = "n/a"
+held = "n/a"
+
+[[scenario]]
 id = "borrar-desde-la-web"
 name = "Borrar desde la web deja la caja y sale como retirado"
 story = """Con otro nombre, ni por el socket ni por la página. Con el suyo se borra: su caja se queda, verifica y termina en \

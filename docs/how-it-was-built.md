@@ -137,7 +137,7 @@ Measured on 2026-11-08 in the working repository (the private one, whose history
 | Calendar | 2026-10-05 to 2026-11-08, commits on 22 different days | `git log --date=short`, in the private repository |
 | Unit tests (Mac) | 19,030; in a run of `make test` that day, 18,973 passed, 41 were skipped and 16 are expected failures | `uv run pytest --collect-only -q` |
 | VM integration tests | 507 | `uv run pytest --collect-only -q -m integration` |
-| Attack battery | 177 scenarios: 171 ready with tests, 6 pending (110 run with OpenClaw and 94 with Claude Code; 33 with both) | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
+| Attack battery | 178 scenarios: 172 ready with tests, 6 pending (110 run with OpenClaw and 95 with Claude Code; 33 with both) | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
 | Product code | 81,395 lines in 162 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
 | Test code | 155,044 lines in 373 Python files | the same for `tests/` |
 | Documents | 47 numbered design and study documents, plus the backlog, the log and the decision record, kept in the private repository; here, the guide in `docs/guide/` and this page | `ls docs/*.md` in the private repository. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
