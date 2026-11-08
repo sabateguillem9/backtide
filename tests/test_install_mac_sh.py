@@ -843,6 +843,25 @@ def test_no_lima_call_ever_gets_the_keys_descriptor(mac: Mac) -> None:
     assert _install_call(mac)["stdin"] == KEY + "\n"
 
 
+# What the secret prompts (a key, a bot token) say of themselves, or begin with.
+_SECRET_PROMPTS = (b"no se ve", b"Clave de", b"Token del bot")
+
+
+def _wait_for_echo_off(proc: subprocess.Popen, master: int, wait: float = 10.0) -> None:
+    """Until the terminal itself has echo off: the fact a person typing a secret depends on, not
+    a guess of how long the installer's `stty -echo` takes (on a loaded machine it took longer
+    than the guess, and the key was typed while it still showed)."""
+    import termios
+    import time
+
+    until = time.monotonic() + wait
+    while termios.tcgetattr(master)[3] & termios.ECHO:
+        if proc.poll() is not None or time.monotonic() > until:
+            proc.kill()
+            raise AssertionError("the installer asked for a secret and never turned echo off")
+        time.sleep(0.002)
+
+
 def _on_a_terminal(
     mac: Mac,
     script: Path,
@@ -890,7 +909,8 @@ def _on_a_terminal(
         if master in ready:
             tty += os.read(master, 4096)
         if steps and steps[0][0] in out:
-            time.sleep(0.3)
+            if any(mark in steps[0][0] for mark in _SECRET_PROMPTS):
+                _wait_for_echo_off(proc, master)
             if len(steps) == 1 and signal:
                 os.killpg(proc.pid, signal)
             else:
