@@ -35,6 +35,9 @@ BRIDGE_QUEUE_SIZE = 256
 BRIDGE_INTERVAL = 60.0  # seconds between two bridged messages with the same template
 BRIDGE_MAX_TEMPLATES = 4096
 BRIDGE_IGNORED = ("backtide.notify",)
+# ``extra`` of a log call whose caller alerts about the same thing itself, with more care for whose
+# it is: the bridge still records it, and with several agents its alert would be a second message.
+ALREADY_TOLD = {"backtide_already_told": True}
 MAX_TEMPLATE_CHARS = 200
 MAX_MESSAGE_CHARS = 2000
 
@@ -242,13 +245,16 @@ class AlertQueue:
 @dataclass(frozen=True)
 class LoggedProblem:
     """A WARNING or ERROR the bridge lets through. ``suppressed`` counts the ones with the same
-    template held back since the last one."""
+    template held back since the last one. On a machine with several agents, ``nobodys``: logged by
+    a thread of no agent; ``told``: whoever logged it alerts about it too (``ALREADY_TOLD``)."""
 
     level: AlertLevel
     logger: str
     template: str
     message: str
     suppressed: int
+    nobodys: bool = False
+    told: bool = False
 
 
 class LogBridge(logging.Handler):
@@ -267,10 +273,12 @@ class LogBridge(logging.Handler):
         clock: Callable[[], float] = time.monotonic,
         maxsize: int = BRIDGE_QUEUE_SIZE,
         accepts: Callable[[logging.LogRecord], bool] | None = None,
+        nobodys: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(level=logging.WARNING)
         self._sink = sink
         self._accepts = accepts  # with several agents, what is this agent's (service.scope)
+        self._nobodys = nobodys  # the main agent's, with several: is this thread nobody's?
         self._interval = interval
         self._clock = clock
         self._seen: dict[tuple[str, int, str], tuple[float, int]] = {}
@@ -340,6 +348,8 @@ class LogBridge(logging.Handler):
                 template=template,
                 message=record.getMessage()[:MAX_MESSAGE_CHARS],
                 suppressed=suppressed,
+                nobodys=self._nobodys is not None and self._nobodys(),
+                told=self._accepts is not None and _already_told(record),
             )
         except Exception:
             self.handleError(record)
@@ -374,7 +384,12 @@ class LogBridge(logging.Handler):
         if lost:
             message = f"{lost} log messages were dropped because the bridge's queue was full"
             problem = LoggedProblem(
-                AlertLevel.WARNING, "backtide.notify.bridge", "bridge dropped", message, 0
+                AlertLevel.WARNING,
+                "backtide.notify.bridge",
+                "bridge dropped",
+                message,
+                0,
+                nobodys=self._nobodys is not None,  # whose they were cannot be told
             )
             self._record(None, problem)
 
@@ -404,6 +419,10 @@ class LogBridge(logging.Handler):
         self._seen = {k: v for k, v in self._seen.items() if now - v[0] < self._interval}
         if len(self._seen) >= BRIDGE_MAX_TEMPLATES:
             self._seen.clear()  # a flood of new templates: better to repeat than to grow
+
+
+def _already_told(record: logging.LogRecord) -> bool:
+    return getattr(record, next(iter(ALREADY_TOLD)), False) is True
 
 
 def _printable(text: str) -> str:

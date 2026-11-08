@@ -534,7 +534,9 @@ def _unannounced(notice: Mapping[str, Any], why: str) -> None:
 
 class HoldDesk:
     """The ``HoldWatch`` that tells the founder's chat about each held request, and what its
-    buttons and `/retenidas` and `/lotes` do. ``start()`` runs its thread; ``close()`` ends it."""
+    buttons and `/retenidas` and `/lotes` do. ``start()`` runs its thread; ``close()`` ends it. A
+    neighbour stopped and started goes on with this same desk: ``start()`` works again after
+    ``close()``, and ``clear()`` is the end of one life of its agent."""
 
     def __init__(
         self,
@@ -575,7 +577,7 @@ class HoldDesk:
         self._lost = 0
         self._lost3 = 0
         self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
+        self._stop = threading.Event()  # the current thread's: an old one keeps its own
 
     # The HoldWatch: never blocks, never raises
 
@@ -610,10 +612,15 @@ class HoldDesk:
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._run, name="backtide-holds", daemon=True)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, args=(self._stop,), name="backtide-holds", daemon=True
+        )
         self._thread.start()
 
     def close(self, timeout: float = 2.0) -> None:
+        """End its thread. One stuck on Telegram for longer ends by itself when it comes back, and
+        never takes anything else from the queue."""
         self._stop.set()
         try:
             self._queue.put_nowait(None)
@@ -621,15 +628,35 @@ class HoldDesk:
             pass
         if self._thread is not None:
             self._thread.join(timeout)
+            self._thread = None
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
+    def clear(self) -> None:
+        """One life of its agent ended, and with it every hold it had. What was queued as it went
+        would be told in the next life, maybe a day later, offering a yes to nothing. Its budget
+        stays: a notice a minute ago still counts."""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            self._notices.clear()
+            self._messages.clear()
+            self._closed.clear()
+            self._unannounced = self._unannounced3 = 0
+            self._lost = self._lost3 = 0
+            self._summary_id, self._summary_token = None, None
+            self._summary_since = self._summary_edited = float("-inf")
+            self._summary_shown = self._summary_shown3 = 0
+
+    def _run(self, stop: threading.Event) -> None:
+        while not stop.is_set():
             try:
                 item = self._queue.get(timeout=1.0)
             except queue.Empty:
                 item = ()
-            if item is None:
-                return
+            if item is None:  # the word to stop, or a last one's that was never read
+                continue
             try:
                 if item and item[0] == "held":
                     self._on_held(item[1])

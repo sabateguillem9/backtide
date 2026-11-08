@@ -131,6 +131,9 @@ class Rig:
 
     def __init__(self, home: Path, sockets: Path, fake: FakeBotApi) -> None:
         self.fake = fake
+        self.home, self.sockets = home, sockets
+        self.boxes: list[BlackBox] = []  # of an agent that comes later
+        self.watches: list[Any] = []
         add_agent(home, OTHER)
         found = load_installation(main_config(home))
         main, others = found.main, found.others
@@ -165,10 +168,14 @@ class Rig:
 
     def close(self) -> None:
         self.parts.bot.close()
+        for watch in self.watches:
+            watch.close()
         self.watch.close()
         self.server.close()
         self.main_box.close()
         self.other_box.close()
+        for box in self.boxes:
+            box.close()
 
     # What the owner sees
 
@@ -370,7 +377,7 @@ def test_the_pause_of_a_neighbour_no_longer_watched_says_so_and_freezes_nobody(r
 
 
 def test_one_that_is_not_on_the_table_is_said_with_no_button_for_anybody(rig: Rig) -> None:
-    """Created with the service running: the table is made at the start."""
+    """An agent the bot was never told about, whatever it is: fail closed."""
     before = time.monotonic()
     record_agent_failed(rig.config, rig.main_queue(), "tercero", RuntimeError("se rompió"))
     call = rig.fake.wait_call("sendMessage", after=before)
@@ -897,7 +904,8 @@ def test_what_its_last_alerts_issued_goes_when_its_thread_ends(tmp_path: Path) -
     with a «Pausar» good for 24 hours: none may be there for an agent back with this slug."""
     book = ButtonBook()
     actions = GuardianActions(tmp_path / "c.sock", agent=OTHER)
-    side = TelegramNeighbour(OTHER, actions, None, book)  # type: ignore[arg-type]
+    desk = SimpleNamespace(clear=lambda: None)
+    side = TelegramNeighbour(OTHER, actions, desk, book)  # type: ignore[arg-type]
     config = SimpleNamespace(slug=OTHER)
 
     def prepare(_: object) -> None:
@@ -911,7 +919,7 @@ def test_what_its_last_alerts_issued_goes_when_its_thread_ends(tmp_path: Path) -
         stop=threading.Event(),
         share=None,
         told=SimpleNamespace(submit=lambda alert: None),  # type: ignore[arg-type]
-        telegram={OTHER: side},
+        telegram={OTHER: side},  # type: ignore[arg-type]
         prepare=prepare,
         stop_alive=lambda config: False,
     )
@@ -1072,3 +1080,471 @@ def test_alone_the_other_orders_and_the_help_are_the_same(alone: Any) -> None:
     fake.push_message("/nada")
     said = fake.wait_call("sendMessage", lambda c: "Órdenes:" in c.params["text"])
     assert said.params["text"] == HELP
+
+
+# --- the table is alive: who comes, who goes and who comes back -----------------------------------
+
+
+THIRD = "tercero"
+
+
+def _third(rig: Rig) -> tuple[Guard, Any, ServiceConfig]:
+    """An agent created with the service running, as ``Fleet`` makes it, and up."""
+    add_agent(rig.home, THIRD, number=2)
+    config = load_installation(main_config(rig.home)).agent(THIRD)
+    rig.parts.neighbours.add(config)
+    guard = Guard(mark=5)
+    rig.roster.add(THIRD, None)
+    rig.roster.publish(Desk(THIRD, guard))
+    side = rig.parts.neighbours[THIRD]
+    side.actions._ask = partial(ask_rewind, peer=ours)  # noqa: SLF001
+    side.actions._ask_decision = partial(ask_decide, peer=ours)  # noqa: SLF001
+    box = _box(rig.sockets / "t")
+    rig.boxes.append(box)
+    watch = side.watch(guard, box, Store(OTHER_SNAPSHOT))
+    watch.start()
+    rig.watches.append(watch)
+    rig.notifiers[THIRD] = Labelled(rig.parts.notifier, THIRD, threading.Lock())
+    return guard, box, config
+
+
+def _gone(rig: Rig) -> None:
+    """Deleted: what ``Fleet`` and ``_Neighbours.forget`` do, in their order."""
+    rig.watches.pop().close()
+    rig.roster.retire(THIRD)
+    rig.roster.forget(THIRD)
+    rig.parts.neighbours.forget(THIRD)
+
+
+def test_an_agent_created_while_running_gets_buttons_as_soon_as_it_is_there(rig: Rig) -> None:
+    guard, box, _ = _third(rig)
+    call = rig.alert(THIRD, box)
+    assert call.params["text"].startswith(f"backtide, ALERTA: {THIRD}: Algo\n")
+    assert [label for label, _ in buttons(call)] == ["Pausar", "Rebobinar"]
+    before = rig.press(call, "Pausar")
+    reply = rig.message("congelado", after=before)
+    assert reply.params["text"].startswith(f"Agente {THIRD}:\n")
+    assert guard.pauses == ["telegram"]
+    assert not rig.main.touched() and not rig.other.touched()
+
+
+def test_pausar_reaches_an_agent_created_while_running(rig: Rig) -> None:
+    guard, _, _ = _third(rig)
+    before = rig.say(f"/pausar {THIRD}")
+    rig.message("congelado", after=before)
+    assert guard.pauses == ["telegram"]
+    assert not rig.main.touched() and not rig.other.touched()
+    before = rig.say("/pausar")
+    question = rig.message("todavía no se ha congelado ninguno", after=before)
+    assert f"Pausar {THIRD}" in dict(buttons(question))
+    assert THIRD in question.params["text"]
+
+
+def test_pausar_todos_touches_and_names_an_agent_created_while_running(rig: Rig) -> None:
+    guard, _, _ = _third(rig)
+    before = rig.say("/pausar")
+    question = rig.message("todavía no se ha congelado ninguno", after=before)
+    before = rig.press(question, "Pausar todos")
+    said = rig.message("congelado", after=before).params["text"]
+    assert f"Agente {THIRD}:\n" in said
+    assert guard.pauses == ["telegram"]
+    assert rig.main.pauses == ["telegram"] and rig.other.pauses == ["telegram"]
+
+
+def test_the_hold_of_an_agent_created_while_running_is_told_and_its_yes_goes_to_it(
+    rig: Rig,
+) -> None:
+    guard, _, _ = _third(rig)
+    before = time.monotonic()
+    rig.parts.neighbours[THIRD].desk.held(notice())
+    call = _hold_notice(rig, THIRD, HOLD, before)
+    rig.press(call, "Aprobar")
+    deadline = time.monotonic() + WAIT
+    while not guard.decisions:
+        assert time.monotonic() < deadline, "the yes never reached it"
+        time.sleep(0.01)
+    assert not rig.main.touched() and not rig.other.touched()
+
+
+def test_a_restored_agent_is_on_the_table_saying_it_is_not_watched(rig: Rig) -> None:
+    """Back from the trash, stopped: `/pausar` does not say it does not exist, and stops nobody."""
+    add_agent(rig.home, THIRD, number=2)
+    rig.parts.neighbours.add(load_installation(main_config(rig.home)).agent(THIRD))
+    before = rig.say(f"/pausar {THIRD}")
+    reply = rig.message("no se está vigilando ahora mismo", after=before)
+    assert reply.params["text"].startswith(f"Agente {THIRD}:\n")
+    assert not rig.main.touched() and not rig.other.touched()
+
+
+def test_adding_one_twice_keeps_what_it_has(rig: Rig) -> None:
+    """``_Neighbours`` adds it when it is created and again each time it starts."""
+    first = rig.parts.neighbours[OTHER]
+    rig.parts.neighbours.add(load_installation(main_config(rig.home)).agent(OTHER))
+    assert rig.parts.neighbours[OTHER] is first
+
+
+def test_a_deleted_agent_is_no_longer_offered_nor_told_with_buttons(rig: Rig) -> None:
+    guard, box, _ = _third(rig)
+    before = rig.say("/pausar")
+    old_question = rig.message("todavía no se ha congelado ninguno", after=before)
+    old_alert = rig.alert(THIRD, box)
+    _gone(rig)
+
+    before = rig.say("/pausar")
+    question = rig.message("todavía no se ha congelado ninguno", after=before)
+    assert f"Pausar {THIRD}" not in dict(buttons(question))
+    assert THIRD not in question.params["text"]
+    before = rig.say(f"/pausar {THIRD}")
+    rig.message("no existe en esta instalación", after=before)
+    before = rig.say("/estado")
+    assert THIRD not in "".join(rig.replies_after(before))
+    before = rig.say("/ayuda")
+    assert THIRD not in rig.message("Hay varios agentes", after=before).params["text"]
+
+    for call, label in ((old_alert, "Pausar"), (old_question, f"Pausar {THIRD}")):
+        before = rig.press(call, label)
+        rig.fake.wait_call(
+            "answerCallbackQuery", lambda c: "ya no vale" in c.params["text"], after=before
+        )
+    before = rig.press(question, "Pausar todos")
+    said = rig.message("congelado", after=before).params["text"]
+    assert THIRD not in said
+    assert guard.pauses == []
+
+    rig.notifiers[THIRD].send(Alert(AlertLevel.ERROR, "Su último aviso", "cuerpo", 1))
+    last = rig.fake.wait_call("sendMessage", lambda c: "Su último aviso" in c.params["text"])
+    assert "reply_markup" not in last.params
+
+
+def test_what_is_issued_for_it_as_it_goes_acts_on_nobody_also_if_it_comes_back(rig: Rig) -> None:
+    """A slug is not reused today, and a button must not depend on it: an alert that was on its way
+    as the agent was deleted issues a button that is dead from birth."""
+    old, box, config = _third(rig)
+    kept = rig.alert(THIRD, box)
+    _gone(rig)
+    late = rig.book.issue(Action.PAUSE, agent=THIRD)
+    rig.book.bind([late], kept.message_id)
+    assert rig.book.peek(late) is None
+
+    rig.parts.neighbours.add(config)  # recovered
+    new = Guard(mark=9)
+    box2 = _box(rig.sockets / "t2")
+    rig.boxes.append(box2)
+    rig.parts.neighbours[THIRD].actions.bind(new, box2, Store())  # type: ignore[arg-type]
+    for token in (dict(buttons(kept))["Pausar"], late):
+        before = time.monotonic()
+        rig.fake.push_callback(token, kept.message_id)
+        rig.fake.wait_call(
+            "answerCallbackQuery", lambda c: "ya no vale" in c.params["text"], after=before
+        )
+    assert new.pauses == [] and old.pauses == []
+    before = rig.say(f"/pausar {THIRD}")
+    rig.message("congelado", after=before)
+    assert new.pauses == ["telegram"] and old.pauses == []
+    # What it is told from now on has buttons that work: it is not retired for ever.
+    before = time.monotonic()
+    rig.notifiers[THIRD].send(Alert(AlertLevel.ERROR, "Ha vuelto", "cuerpo"))
+    alert = rig.bound(
+        rig.fake.wait_call("sendMessage", lambda c: "Ha vuelto" in c.params["text"], after=before)
+    )
+    before = rig.press(alert, "Pausar")
+    rig.message("congelado", after=before)
+    assert new.pauses == ["telegram", "telegram"] and old.pauses == []
+
+
+def test_an_order_that_picked_an_agent_just_deleted_says_so_and_touches_nobody(rig: Rig) -> None:
+    """The list is read once for an order: one deleted while it runs is not a failed order, and
+    its name finds nobody else."""
+    guard, _, _ = _third(rig)
+    real = rig.parts.actions.status
+
+    def status() -> str:
+        _gone(rig)
+        return real()
+
+    rig.parts.actions.status = status  # type: ignore[method-assign]
+    before = rig.say("/estado")
+    said = "\n".join(rig.replies_after(before))
+    assert "Ha fallado algo" not in said
+    assert f"Agente {THIRD}:\nEl agente {THIRD} no se está vigilando" in said
+    assert not guard.touched()
+
+
+def test_the_neighbours_of_the_service_keep_the_table_as_they_come_and_go(
+    home: Path,  # noqa: F811
+) -> None:
+    """`Fleet` tells ``_Neighbours``: the table has to hear it from there."""
+    add_agent(home, OTHER)
+    found = load_installation(main_config(home))
+    parts = telegram_parts(
+        found.main, TelegramSettings(_secret(), OWNER, "http://127.0.0.1:9"), found.others
+    )
+    add_agent(home, THIRD, number=2)
+    third = load_installation(main_config(home)).agent(THIRD)
+    guard = Guard()
+    during: list[str] = []
+    options_seen: dict[str, Any] = {}
+
+    class Box:
+        def close(self) -> None: ...
+
+    def build(config: ServiceConfig, **options: Any) -> Any:
+        options_seen.update(options)
+        return guard, "alerts", Box()
+
+    def run(*_: Any, control: Any, **__: Any) -> None:
+        control.start()
+        during.append(parts.bot._agents[THIRD].actions.pause())  # noqa: SLF001
+        control.close()
+
+    roster = Roster(Desk(MAIN, Guard()), [(OTHER, None)])
+    neighbours = _Neighbours(
+        found.main, found.others, notifier_for=lambda slug: None, stop=threading.Event(),  # type: ignore[arg-type,return-value]
+        share=None, told=None, build=build, run=run, roster=roster, telegram=parts.neighbours,  # type: ignore[arg-type]
+        prepare=lambda config: None,
+    )  # fmt: skip
+    assert THIRD not in parts.bot._agents  # noqa: SLF001
+    neighbours.add(third)
+    assert THIRD in parts.bot._agents  # noqa: SLF001
+    roster.add(THIRD, None)
+    neighbours.start_one(third)
+    neighbours.join(10)
+    assert options_seen["hold_watch"] is parts.neighbours[THIRD].desk
+    assert "congelado" in during[0] and guard.pauses == ["telegram"]
+    parts.bot._book.issue(Action.PAUSE, agent=THIRD)  # noqa: SLF001 - its thread has ended
+    neighbours.forget(THIRD)
+    assert THIRD not in parts.bot._agents and THIRD not in parts.neighbours  # noqa: SLF001
+    assert len(parts.bot._book) == 0  # noqa: SLF001
+
+
+# --- one that stops and starts goes on telling ----------------------------------------------------
+
+
+def _hold_notice(rig: Rig, slug: str, hold_id: str, after: float) -> Call:
+    return rig.bound(
+        rig.fake.wait_call(
+            "sendMessage",
+            lambda c: (
+                c.params.get("text", "").startswith(f"Agente {slug}:\n⏸")
+                and hold_id in c.params["text"]
+            ),
+            after=after,
+        )
+    )
+
+
+def test_a_neighbour_stopped_and_started_tells_its_holds_again(rig: Rig) -> None:
+    rig.watch.close()
+    rig.side.ended()
+    rig.watch = rig.side.watch(rig.other, rig.other_box, Store(OTHER_SNAPSHOT))
+    rig.watch.start()
+    before = time.monotonic()
+    rig.side.desk.held(notice())
+    call = _hold_notice(rig, OTHER, HOLD, before)
+    rig.press(call, "Aprobar")
+    deadline = time.monotonic() + WAIT
+    while not rig.other.decisions:
+        assert time.monotonic() < deadline, "the yes never reached it"
+        time.sleep(0.01)
+    assert not rig.main.touched()
+
+
+def test_it_goes_on_telling_however_many_times_it_starts(rig: Rig) -> None:
+    for turn in range(3):
+        rig.watch.close()
+        rig.side.ended()
+        rig.watch = rig.side.watch(rig.other, rig.other_box, Store(OTHER_SNAPSHOT))
+        rig.watch.start()
+        hold_id = f"h-00000000000{turn}"
+        before = time.monotonic()
+        rig.side.desk.held(notice(hold_id=hold_id))
+        _hold_notice(rig, OTHER, hold_id, before)
+
+
+def test_what_it_held_as_it_stopped_is_not_told_after_it_starts(rig: Rig) -> None:
+    """The gate of the old life tells its last holds after the desk closed: all of them end with
+    it, so a notice of one the next day would offer a yes to nothing."""
+    rig.watch.close()
+    rig.side.desk.held(notice())
+    rig.side.desk.closed(HOLD, "expired", "restart")
+    rig.side.ended()
+    before = time.monotonic()
+    rig.watch = rig.side.watch(rig.other, rig.other_box, Store(OTHER_SNAPSHOT))
+    rig.watch.start()
+    fresh = "h-ffffffffffff"
+    rig.side.desk.held(notice(hold_id=fresh))
+    _hold_notice(rig, OTHER, fresh, before)
+    time.sleep(0.2)
+    assert not [c for c in rig.fake.sent() if c.at >= before and HOLD in c.params.get("text", "")]
+
+
+def test_what_it_holds_before_its_watch_starts_is_told_when_it_does(rig: Rig) -> None:
+    """Its proxy is up before its ``Guardian``'s hooks: what it holds then waits for the desk."""
+    rig.watch.close()
+    rig.side.ended()
+    before = time.monotonic()
+    rig.side.desk.held(notice())
+    rig.watch = rig.side.watch(rig.other, rig.other_box, Store(OTHER_SNAPSHOT))
+    rig.watch.start()
+    _hold_notice(rig, OTHER, HOLD, before)
+
+
+def test_a_desk_stuck_on_its_last_message_does_not_keep_the_next_from_starting(
+    tmp_path: Path,
+) -> None:
+    """A closing that does not wait for Telegram leaves the old thread alive for a while: it ends
+    by itself, and the new one tells."""
+    release = threading.Event()
+    sent: list[str] = []
+
+    class Api:
+        def call(self, method: str, params: dict[str, Any], **_: Any) -> Any:
+            sent.append(params.get("text", ""))
+            if len(sent) == 1:
+                release.wait(WAIT)
+            return {"message_id": len(sent)}
+
+    actions = GuardianActions(tmp_path / "c.sock", agent=OTHER)
+    desk = HoldDesk(Api(), OWNER, ButtonBook(), actions, agent=OTHER)  # type: ignore[arg-type]
+    desk.start()
+    desk.held(notice(hold_id="h-aaaaaaaaaaaa"))
+    deadline = time.monotonic() + WAIT
+    while not sent:
+        assert time.monotonic() < deadline, "the desk never sent it"
+        time.sleep(0.01)
+    old_thread = desk._thread  # noqa: SLF001
+    desk.close(timeout=0.01)
+    desk.start()
+    desk.held(notice(hold_id="h-bbbbbbbbbbbb"))
+    release.set()
+    while len(sent) < 2:
+        assert time.monotonic() < deadline, "the new life never told"
+        time.sleep(0.01)
+    assert "h-bbbbbbbbbbbb" in sent[1]
+    old_thread.join(WAIT)
+    assert not old_thread.is_alive(), "the new life's start must not bring the old thread back"
+    desk.close()
+
+
+def test_a_desk_closed_before_it_ever_started_can_start(tmp_path: Path) -> None:
+    """The word to stop stays in its queue: the next life must not take it as its own."""
+    sent: list[str] = []
+
+    class Api:
+        def call(self, method: str, params: dict[str, Any], **_: Any) -> Any:
+            sent.append(params.get("text", ""))
+            return {"message_id": 1}
+
+    actions = GuardianActions(tmp_path / "c.sock", agent=OTHER)
+    desk = HoldDesk(Api(), OWNER, ButtonBook(), actions, agent=OTHER)  # type: ignore[arg-type]
+    desk.close()
+    desk.start()
+    desk.held(notice())
+    deadline = time.monotonic() + WAIT
+    while not sent:
+        assert time.monotonic() < deadline, "the word to stop stopped the next life"
+        time.sleep(0.01)
+    desk.close()
+
+
+def test_the_neighbours_start_it_again_on_the_same_desk_and_it_tells(
+    home: Path,  # noqa: F811
+) -> None:
+    """As ``Fleet`` does it: `parar`, `arrancar`, with the real ``_Neighbours``."""
+    add_agent(home, OTHER)
+    found = load_installation(main_config(home))
+    with FakeBotApi(max_poll=1.0) as fake:
+        parts = telegram_parts(
+            found.main, TelegramSettings(_secret(), OWNER, fake.base), found.others
+        )
+        side = parts.neighbours[OTHER]
+        guard = Guard()
+
+        class Box:
+            def close(self) -> None: ...
+
+        def build(config: ServiceConfig, **options: Any) -> Any:
+            return guard, "alerts", Box()
+
+        def run(*_: Any, control: Any, stop: threading.Event, **__: Any) -> None:
+            control.start()
+            stop.wait(WAIT)
+            control.close()
+            side.desk.held(notice(hold_id="h-eeeeeeeeeeee"))  # its gate, as it stops
+
+        roster = Roster(Desk(MAIN, Guard()), [(OTHER, None)])
+        neighbours = _Neighbours(
+            found.main, found.others, notifier_for=lambda slug: None, stop=threading.Event(),  # type: ignore[arg-type,return-value]
+            share=None, told=None, build=build, run=run, roster=roster, telegram=parts.neighbours,  # type: ignore[arg-type]
+            prepare=lambda config: None,
+        )  # fmt: skip
+        config = found.others[0]
+        for turn in range(2):
+            neighbours.start_one(config)
+            neighbours.wait_settled(OTHER, WAIT)
+            hold_id = f"h-00000000000{turn}"
+            before = time.monotonic()
+            side.desk.held(notice(hold_id=hold_id))
+            fake.wait_call(
+                "sendMessage",
+                lambda c, hold_id=hold_id: hold_id in c.params.get("text", ""),
+                after=before,
+            )
+            neighbours.stop_one(OTHER)
+        neighbours.join(1)
+        assert not [c for c in fake.sent() if "h-eeeeeeeeeeee" in c.params.get("text", "")]
+
+
+# --- whose thread: the bot's work for the main agent is the main agent's --------------------------
+
+
+def test_what_the_bot_does_for_the_main_agent_works_for_it(rig: Rig) -> None:
+    seen: list[str | None] = []
+
+    def pause_by_user(*, requested_by: str) -> PauseOutcome:
+        seen.append(scope.current())
+        return PauseOutcome(PauseStatus.FROZEN, "Agente congelado: no hace nada hasta /seguir.")
+
+    rig.main.pause_by_user = pause_by_user  # type: ignore[method-assign]
+    before = rig.say(f"/pausar {MAIN}")
+    rig.message("congelado", after=before)
+    assert seen == [MAIN]
+
+
+def test_the_desk_of_the_main_agent_runs_on_a_thread_of_the_main_agent(home: Path) -> None:  # noqa: F811
+    """It is started by the bot, on a thread of nobody: `the held request of risk 3 got no notice`
+    is the main agent's all the same."""
+    scope.hand_down()
+    add_agent(home, OTHER)
+    found = load_installation(main_config(home))
+    seen: list[str | None] = []
+    with FakeBotApi(max_poll=1.0) as fake:
+        parts = telegram_parts(
+            found.main, TelegramSettings(_secret(), OWNER, fake.base), found.others
+        )
+        real = parts.desk._on_held  # noqa: SLF001
+
+        def on_held(item: dict[str, Any]) -> None:
+            seen.append(scope.current())
+            real(item)
+
+        parts.desk._on_held = on_held  # type: ignore[method-assign]  # noqa: SLF001
+        parts.bot.start()
+        parts.desk.held(notice())
+        deadline = time.monotonic() + WAIT
+        while not seen:
+            assert time.monotonic() < deadline, "the desk never took it"
+            time.sleep(0.01)
+        parts.bot.close()
+    assert seen == [MAIN]
+
+
+def test_a_broken_installation_box_is_told_once(rig: Rig, caplog: Any) -> None:
+    """The log says it too: it is still recorded, marked as already told, so its alert is not a
+    second message."""
+    assert _record_in_installation(rig.config, rig.main_queue(), "x", "", {})
+    (rig.config.installation_dir / STATE_KEY).unlink()
+    with caplog.at_level(logging.ERROR, logger="backtide.service.runner"):
+        assert not _record_in_installation(rig.config, rig.main_queue(), "x", "", {})
+    (record,) = [r for r in caplog.records if "installation's black box" in r.getMessage()]
+    assert record.backtide_already_told is True

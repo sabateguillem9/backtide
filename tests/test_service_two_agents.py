@@ -220,7 +220,10 @@ def test_each_agents_bridge_hears_only_its_own_threads() -> None:
     scope.hand_down()
     heard: dict[str, list[str]] = {"principal": [], "revisor": []}
     bridges = [
-        LogBridge(lambda p: heard["principal"].append(p.message), accepts=scope.belongs_to(None)),
+        LogBridge(
+            lambda p: heard["principal"].append(p.message),
+            accepts=scope.belongs_to("principal", and_nobodys=True),
+        ),
         LogBridge(
             lambda p: heard["revisor"].append(p.message), accepts=scope.belongs_to("revisor")
         ),
@@ -443,7 +446,7 @@ def test_serve_hands_new_keys_to_every_proxy_and_each_agent_its_own_thread_scope
     serve(main, others=others, handle_signals=False)
     assert sorted(reloaded) == ["bueno", "malo", "principal"]
     assert captured["applied"] is Applied.NOW
-    assert scopes == {"principal": None, "bueno": "bueno", "malo": "malo"}
+    assert scopes == {"principal": "principal", "bueno": "bueno", "malo": "malo"}
 
 
 def test_what_is_trusted_for_one_agent_is_its_own(
@@ -585,6 +588,69 @@ def test_serve_starts_the_neighbours_and_they_end_with_the_main_agent(
     assert start.details == {"agents": ["principal", "bueno", "malo"]}
 
 
+def test_serve_tells_the_main_agents_threads_from_those_of_nobody(
+    home: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The start of the service and its sockets are nobody's: what they log has no button that
+    would act on the main agent. Its ``Guardian``, and only that, is the main agent's."""
+    main, others = two_configs(home)
+    seen: dict[str, Any] = {}
+    real_build = runner.build_guardian
+    real_start = runner.record_installation_start
+
+    def build(config: ServiceConfig, **kwargs: Any) -> Any:
+        seen[config.slug] = (scope.current(), kwargs.get("log_nobodys"), kwargs["log_filter"])
+        return real_build(config, **{**kwargs, "jail": AgentJail(config.jail_config())})
+
+    def record_start(*args: Any, **kwargs: Any) -> None:
+        seen["start"] = scope.current()
+        real_start(*args, **kwargs)
+
+    def run(guardian: Any, alerts: Any, box: Any, *, stop: threading.Event, **kwargs: Any) -> None:
+        if threading.current_thread() is threading.main_thread():
+            seen["run"] = scope.current()
+            seen["control"] = kwargs["control"]
+            stop.set()
+        else:
+            stop.wait(30)
+
+    monkeypatch.setattr(runner, "build_guardian", build)
+    monkeypatch.setattr(runner, "run_guardian", run)
+    monkeypatch.setattr(runner, "record_installation_start", record_start)
+    serve(main, others=others, handle_signals=False)
+    assert seen["start"] is None
+    assert seen["run"] == "principal"
+    assert isinstance(seen["control"], runner._OfNobody)  # noqa: SLF001
+    assert seen["principal"][:2] == ("principal", scope.is_nobodys)
+    assert seen["bueno"][:2] == ("bueno", None) and seen["malo"][:2] == ("malo", None)
+    assert seen["principal"][2](None)  # on this thread, of nobody: it is told in the main box
+    assert not seen["bueno"][2](None)
+    assert scope.current() is None
+
+
+def test_what_a_hook_of_the_machine_starts_is_nobodys_though_the_main_agent_runs_it() -> None:
+    scope.hand_down()
+    seen: list[str | None] = []
+
+    class Hook:
+        def start(self) -> None:
+            seen.append(scope.current())
+            thread = threading.Thread(target=lambda: seen.append(scope.current()))
+            thread.start()
+            thread.join()
+
+        def close(self) -> None:
+            seen.append(scope.current())
+
+    hook = runner._OfNobody(Hook())  # type: ignore[arg-type]  # noqa: SLF001
+    with scope.working_for("principal"):
+        hook.start()
+        hook.close()
+        assert scope.current() == "principal"
+    assert seen == [None, None, None]
+
+
 # --- what is each one's -----------------------------------------------------------------------
 
 
@@ -693,12 +759,16 @@ def test_serve_with_one_agent_starts_no_thread_and_filters_no_log(
 
     def run(*_: Any, **kwargs: Any) -> None:
         seen["threads"] = {t.name for t in threading.enumerate()}
+        seen["control"] = kwargs["control"]
+        seen["scope"] = scope.current()
 
     monkeypatch.setattr(runner, "build_guardian", build)
     monkeypatch.setattr(runner, "run_guardian", run)
     monkeypatch.setattr(runner, "_Neighbours", lambda *a, **k: pytest.fail("no neighbours to run"))
     serve(config, handle_signals=False)
     assert seen["log_filter"] is None and seen["sensor_share"] is None
+    assert seen["log_nobodys"] is None and seen["scope"] is None
+    assert not isinstance(seen["control"], runner._OfNobody)  # noqa: SLF001
     assert not any(name.startswith("backtide-agent-") for name in seen["threads"])
     with open_installation_box(config) as box:
         (start,) = box.events(action="service_start")

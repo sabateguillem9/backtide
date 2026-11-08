@@ -162,7 +162,8 @@ class Roster:
         Raises AgentRefused, with nobody touched, if it cannot be."""
         desk = self._desk_of(named)
         if desk is self._main:
-            yield desk
+            with scope.working_for(desk.slug):
+                yield desk
             return
         try:
             with scope.working_for(desk.slug):

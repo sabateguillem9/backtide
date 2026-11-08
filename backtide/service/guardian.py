@@ -584,6 +584,7 @@ class Guardian:
         sensor: Sensor | None = None,
         egress: EgressProxy | None = None,
         log_filter: Callable[[logging.LogRecord], bool] | None = None,
+        log_nobodys: Callable[[], bool] | None = None,
     ) -> None:
         """Every collaborator is injected, so the tests use fakes. ``alerts`` is where alerts
         go (an ``AlertQueue`` in production); the caller starts and closes it. ``sample``
@@ -601,9 +602,12 @@ class Guardian:
         commands and connections. ``egress`` (T06-4) is the proxy, the agent's only way out;
         without it the Guardian neither starts nor watches one (the unit tests that do not
         test it). ``log_filter`` says which log records are this agent's, when a process runs
-        several (T26-2b, ``service.scope``); without it, all of them."""
+        several (T26-2b, ``service.scope``); without it, all of them. ``log_nobodys``, the main
+        agent's alone with several: whether what is being logged comes from a thread of no agent,
+        whose alert is then nobody's."""
         self._config = config
         self._log_filter = log_filter
+        self._log_nobodys = log_nobodys
         self._sensor = sensor
         self._sensor_closing = threading.Event()  # set by the stop: the hooks stop waiting
         self._sensor_held = False  # the sensor (required) stopped the agent or kept it stopped
@@ -666,7 +670,7 @@ class Guardian:
         self._late_pause_seq: int | None = None
         self._late_since: float | None = None  # when that freeze was made (LATE_STUCK_AFTER)
 
-        self._bridge = LogBridge(self._on_log, accepts=self._log_filter)
+        self._bridge = self._new_bridge()
         self._stopped = False  # the agent really stopped
         self._wound_down = False  # watcher closed, service_stop recorded, bridge removed
         self._serving = False  # booted (black box open, service_start recorded), not wound down
@@ -740,7 +744,7 @@ class Guardian:
             self._serving = True
             with self.freeze_lock:
                 self._serving_since = self._mono()
-            self._bridge = LogBridge(self._on_log, accepts=self._log_filter)
+            self._bridge = self._new_bridge()
             self._bridge.start()
             logging.getLogger(_BRIDGED_LOGGERS).addHandler(self._bridge)
             try:
@@ -2589,7 +2593,7 @@ class Guardian:
                 logger.error("cannot use the black box, so nothing is rewound: %s", error)
                 raise
             self._serving = True
-            self._bridge = LogBridge(self._on_log, accepts=self._log_filter)
+            self._bridge = self._new_bridge()
             self._bridge.start()
             logging.getLogger(_BRIDGED_LOGGERS).addHandler(self._bridge)
 
@@ -4372,9 +4376,14 @@ class Guardian:
             event,
         )
 
+    def _new_bridge(self) -> LogBridge:
+        return LogBridge(self._on_log, accepts=self._log_filter, nobodys=self._log_nobodys)
+
     def _on_log(self, problem: LoggedProblem) -> None:
         """The bridge: a WARNING or ERROR of a ``backtide.*`` logger becomes an event and an
-        alert."""
+        alert. The event always; the alert unless whoever logged it alerts about it too. With
+        several agents, what a thread of nobody logs is here because this box takes it, and it is
+        not this agent's: its alert names nobody and offers no button (docs/47, 6.10)."""
         error = problem.level is AlertLevel.ERROR
         event = self._record(
             "system",
@@ -4389,11 +4398,14 @@ class Guardian:
             risk=2 if error else 1,
             log_failure=False,  # logging that the log failed would only come back here
         )
+        if problem.told:
+            return
         self._alert(
             problem.level,
             f"Aviso de {problem.logger}",
             problem.message,
             event,
+            installation=problem.nobodys,
         )
 
 

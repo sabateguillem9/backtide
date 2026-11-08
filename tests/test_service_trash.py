@@ -11,7 +11,6 @@ import threading
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,8 +19,10 @@ from backtide import cli
 from backtide.blackbox import BlackBox, BlackBoxError, load_key
 from backtide.notify import AlertLevel
 from backtide.notify.buttons import Action, ButtonBook
+from backtide.notify.telegram import AgentTable
 from backtide.service import agent_disk, agentes, fleet, runner, trash
 from backtide.service.agents import check_alone, load_agent, load_installation, load_retired
+from backtide.service.bot import TelegramNeighbours
 from backtide.service.config import (
     RETIRED_MARK,
     SAVED_AGENT_FILE,
@@ -1048,7 +1049,9 @@ def test_an_agent_that_comes_back_is_watched_with_nothing_of_before(home: Path) 
     assert neighbours.failure_of("revisor") is not None
     book = ButtonBook()
     book.issue(Action.PAUSE, agent="revisor")
-    neighbours._telegram = {"revisor": SimpleNamespace(book=book)}
+    neighbours._telegram = TelegramNeighbours(
+        found.main.control_socket, None, 1, book, AgentTable()
+    )  # type: ignore[arg-type]
     neighbours.forget("revisor")
     assert len(book) == 0, "not even the alert of its failure, which came through the main queue"
     assert neighbours.failure_of("revisor") is None

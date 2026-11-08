@@ -18,13 +18,18 @@ from collections.abc import Iterator
 
 import pytest
 from attack_kit import CONTAINER_WORK, Attack, scenario
+from test_agent_orders_attacks import CAP_MIB, START_TIMEOUT, seen_in_its_box
 from test_two_agents_attacks import SEEN_TIMEOUT, _hold, said_in
-from two_agents_kit import MAIN, OTHER, SLUG, STATE, Agent, Lab, open_lab, sh, sudo, wait
+from two_agents_kit import MAIN, OTHER, SLUG, STATE, THIRD, Agent, Lab, open_lab, sh, sudo, wait
 
 from backtide.service.config import STATE_INSTALLATION, STATE_KEY
 from tests.telegram_fake import OWNER, TOKEN, Call, FakeBotApi, buttons
 
 REWIND_TIMEOUT = 180.0
+COMMAND_EVERY = 3.0  # the bot's rate limit gives one order back in this many seconds
+LOG_SETTLE = (
+    3.0  # seconds; for what the log says to have reached the bridge and the chat, if it did
+)
 WRECKED = 300  # files deleted at once: past the 100 of mass-delete-severe
 TRANSIENT_WINDOW = 3.0  # seconds; the watcher's own is 2 (default_rules.toml, `transient`)
 
@@ -92,11 +97,151 @@ def press(fake: FakeBotApi, call: Call, label: str) -> float:
     return before
 
 
+@scenario("telegram-sigue-a-los-agentes")
+def test_the_bot_follows_the_agents_as_they_come_stop_and_go(
+    attack: Attack, lab: Lab, fake: FakeBotApi
+) -> None:
+    """First in this file: it leaves the lab as it found it, with the third one in the trash."""
+    service = lab.show("MainPID"), lab.show("NRestarts")
+    made = lab.cli(
+        "agentes", "crear", THIRD.slug, "--perfil", "claude-code", "--volumen", "10",
+        "--tope-espacio", str(CAP_MIB), "--memoria", "1g", "--cpus", "1", "--nombre", "Tercero",
+    )  # fmt: skip
+    assert made.returncode == 0, f"{made.stdout}{made.stderr}\n{lab.diagnosis()}"
+    lab.agents = [MAIN, OTHER, THIRD]
+    lab.wait_up(START_TIMEOUT)
+    seen_in_its_box(lab, THIRD)
+
+    # Created with the service running: its holds are told and its yes is its own, no restart.
+    first_hold = _hold(attack, lab, THIRD, "recien-creado")
+    first = notice_of(fake, THIRD, first_hold)
+    answered(fake, "Aprobando", press(fake, first, "Aprobar"))
+    wait(
+        lambda: said_in(lab.events(THIRD, "approved"), first_hold),
+        SEEN_TIMEOUT,
+        "the new one's yes",
+        lab.diagnosis,
+    )
+    frozen = reply_to(fake, f"/pausar {THIRD.slug}", "congelado")
+    wait(lambda: paused(THIRD), SEEN_TIMEOUT, "the new one frozen", lab.diagnosis)
+    frozen_alone = not paused(MAIN) and not paused(OTHER)
+    reply_to(fake, f"/seguir {THIRD.slug}", "donde estaba")
+    wait(lambda: not paused(THIRD), SEEN_TIMEOUT, "the new one thawed", lab.diagnosis)
+    asked = reply_to(fake, "/pausar", "todavía no se ha congelado ninguno")
+    offered = f"Pausar {THIRD.slug}" in dict(buttons(asked))
+    press_at = press(fake, asked, "Pausar todos")
+    everyone = said_after(fake, f"Agente {THIRD.slug}:", press_at)
+    wait(
+        lambda: paused(MAIN) and paused(OTHER) and paused(THIRD),
+        SEEN_TIMEOUT,
+        "all three frozen",
+        lab.diagnosis,
+    )
+    time.sleep(COMMAND_EVERY)
+    for agent in (MAIN, OTHER, THIRD):
+        reply_to(fake, f"/seguir {agent.slug}", "donde estaba")
+        wait(lambda agent=agent: not paused(agent), SEEN_TIMEOUT, "thawed", lab.diagnosis)
+
+    # Stopped and started: it goes on telling.
+    assert lab.cli("agentes", "parar", THIRD.slug).returncode == 0
+    lab.agents = [MAIN, OTHER]
+    assert lab.cli("agentes", "arrancar", THIRD.slug).returncode == 0
+    lab.agents = [MAIN, OTHER, THIRD]
+    lab.wait_up(START_TIMEOUT)
+    seen_in_its_box(lab, THIRD)
+    second_hold = _hold(attack, lab, THIRD, "tras-arrancar")
+    second = notice_of(fake, THIRD, second_hold)
+    press(fake, second, "Rechazar")
+    wait(
+        lambda: said_in(lab.events(THIRD, "rejected"), second_hold),
+        SEEN_TIMEOUT,
+        "its no, after it started again",
+        lab.diagnosis,
+    )
+
+    # Deleted: not offered, and what was offered acts on nobody. Asked with it stopped, so its
+    # thread ended before and nothing takes this button away but the deletion itself.
+    assert lab.cli("agentes", "parar", THIRD.slug).returncode == 0
+    lab.agents = [MAIN, OTHER]
+    time.sleep(COMMAND_EVERY)
+    last_asked = reply_to(fake, "/pausar", "todavía no se ha congelado ninguno")
+    still_offered = f"Pausar {THIRD.slug}" in dict(buttons(last_asked))
+    gone = lab.cli("agentes", "borrar", THIRD.slug, "--confirmar", THIRD.slug)
+    assert gone.returncode == 0, f"{gone.stdout}{gone.stderr}\n{lab.diagnosis()}"
+    answered(fake, "ya no vale", press(fake, last_asked, f"Pausar {THIRD.slug}"))
+    nobody = reply_to(fake, f"/pausar {THIRD.slug}", "no existe en esta instalación")
+    after = reply_to(fake, "/pausar", "todavía no se ha congelado ninguno")
+    not_offered = (
+        f"Pausar {THIRD.slug}" not in dict(buttons(after))
+        and THIRD.slug not in after.params["text"]
+    )
+    nobody_frozen = not paused(MAIN) and not paused(OTHER)
+
+    # Recovered: on the table, stopped, saying so; the old button stays dead, and once it starts
+    # its holds are told with buttons that work.
+    back = lab.cli("agentes", "recuperar", THIRD.slug)
+    assert back.returncode == 0, f"{back.stdout}{back.stderr}\n{lab.diagnosis()}"
+    not_watched = reply_to(fake, f"/pausar {THIRD.slug}", "no se está vigilando ahora mismo")
+    answered(fake, "ya no vale", press(fake, last_asked, f"Pausar {THIRD.slug}"))
+    assert lab.cli("agentes", "arrancar", THIRD.slug).returncode == 0
+    lab.agents = [MAIN, OTHER, THIRD]
+    lab.wait_up(START_TIMEOUT)
+    seen_in_its_box(lab, THIRD)
+    third_hold = _hold(attack, lab, THIRD, "recuperado")
+    third = notice_of(fake, THIRD, third_hold)
+    answered(fake, "Aprobando", press(fake, third, "Aprobar"))
+    wait(
+        lambda: said_in(lab.events(THIRD, "approved"), third_hold),
+        SEEN_TIMEOUT,
+        "its yes, after it came back",
+        lab.diagnosis,
+    )
+    again = lab.cli("agentes", "borrar", THIRD.slug, "--confirmar", THIRD.slug)
+    assert again.returncode == 0, f"{again.stdout}{again.stderr}\n{lab.diagnosis()}"
+    lab.agents = [MAIN, OTHER]
+
+    attack.check(
+        "held",
+        said_in(lab.events(THIRD, "held"), first_hold) != []
+        and said_in(lab.events(THIRD, "approved"), first_hold)[0]["details"]["by"] == "telegram"
+        and said_in(lab.events(THIRD, "rejected"), second_hold) != []
+        and said_in(lab.events(THIRD, "approved"), third_hold)[0]["details"]["by"] == "telegram"
+        and said_in(lab.events(MAIN), first_hold) == []
+        and said_in(lab.events(OTHER), first_hold) == []
+        and (lab.show("MainPID"), lab.show("NRestarts")) == service,
+        f"la retención {first_hold} de un agente creado en marcha avisa y su «Aprobar» es suyo; "
+        f"tras pararlo y arrancarlo {second_hold} vuelve a avisar y su «Rechazar» también, y tras "
+        f"borrarlo y recuperarlo, {third_hold} y su «Aprobar»; todo sin reiniciar el servicio "
+        f"({service})",
+    )
+    attack.check(
+        "stopped",
+        frozen.params["text"].startswith(f"Agente {THIRD.slug}:\n")
+        and frozen_alone
+        and offered
+        and all(f"Agente {a.slug}:" in everyone.params["text"] for a in (MAIN, OTHER, THIRD))
+        and still_offered
+        and not_offered
+        and nobody_frozen
+        and THIRD.slug not in nobody.params["text"]
+        and not_watched.params["text"].startswith(f"Agente {THIRD.slug}:\n"),
+        f"/pausar {THIRD.slug} lo congela solo a él, «Pausar todos» lo toca y lo nombra; una vez "
+        "borrado, /pausar no lo ofrece, su nombre no es nadie y su botón viejo no congela a nadie; "
+        "recuperado, dice que no se vigila y el botón viejo sigue sin valer",
+    )
+    attack.check(
+        "recorded",
+        lab.verify(MAIN)["ok"] and lab.verify(OTHER)["ok"] and lab.verify(THIRD)["ok"],
+        "lo decidido queda en la caja de ese agente, y las tres cajas verifican",
+    )
+
+
 @scenario("boton-de-otro-agente")
 def test_a_button_acts_on_its_agent_and_on_no_other(
     attack: Attack, lab: Lab, fake: FakeBotApi
 ) -> None:
     """Every defence has its control: the same button on its own message does act, on its agent."""
+    ignored_before = len(lab.events(MAIN, "telegram_ignored"))  # the last scenario's
     their_hold = _hold(attack, lab, OTHER, "boton")
     my_hold = _hold(attack, lab, MAIN, "boton")
     theirs, mine = notice_of(fake, OTHER, their_hold), notice_of(fake, MAIN, my_hold)
@@ -210,12 +355,34 @@ def test_a_button_acts_on_its_agent_and_on_no_other(
     not_watched = said_after(fake, "no se está vigilando ahora mismo", press_at)
     main_not_frozen = not paused(MAIN) and lab.running(MAIN)
     # And what is about the whole installation names nobody and offers nothing to press: with its
-    # key gone, its box cannot be written, which an order that records there finds out. What the
-    # log says about it is another alert, as the main agent's: a known limit (docs/47, 6.10).
+    # key gone, its box cannot be written, which an order that records there finds out. It is told
+    # once: what the log says about it stays in the main box. And what an order on the socket logs,
+    # a thread of nobody, has no button that would act on the main agent.
     sudo("rm", "-f", str(STATE / STATE_INSTALLATION / STATE_KEY))
     asked_at = time.monotonic()
     assert lab.cli("agentes", "arrancar", SLUG).returncode != 0
     whole = said_after(fake, "La caja de la instalación no se puede usar", asked_at, 60)
+    of_nobody = fake.wait_call(
+        "sendMessage",
+        lambda c: (
+            "Aviso de backtide.service.fleet" in c.params.get("text", "")
+            and "refused to start the agent" in c.params["text"]
+        ),
+        after=asked_at,
+        timeout=30,
+    )
+    wait(
+        lambda: any(
+            "installation's black box cannot be used" in event["details"].get("message", "")
+            for event in lab.events(MAIN, "log")
+        ),
+        SEEN_TIMEOUT,
+        "what the log says about it, in the main box",
+        lab.diagnosis,
+    )
+    time.sleep(LOG_SETTLE)
+    told_since = [call.params["text"] for call in fake.sent() if call.at >= asked_at]
+    told_twice = any("installation's black box" in text for text in told_since)
 
     attack.check(
         "stopped",
@@ -229,12 +396,16 @@ def test_a_button_acts_on_its_agent_and_on_no_other(
         and not_watched.params["text"].startswith(f"Agente {SLUG}:\n")
         and main_not_frozen
         and whole.params["text"].startswith("backtide, ALERTA: La caja de la instalación ")
-        and "reply_markup" not in whole.params,
+        and "reply_markup" not in whole.params
+        and not told_twice
+        and of_nobody.params["text"].startswith("backtide, aviso: Aviso de backtide.service.fleet")
+        and "reply_markup" not in of_nobody.params,
         f"/pausar {SLUG} congela solo al vecino; con los dos congelados, /seguir sin decir cuál, "
         f"una ruta o un agente inventado no sueltan a ninguno, y /seguir {SLUG} solo lo reanuda a "
         "él; cada mensaje dice de quién es, y su rebobinado no toca al principal; el aviso de que "
         f"{SLUG} no se vigila es suyo y su «Pausar» no congela al principal; el de la caja de la "
-        "instalación no nombra a nadie ni lleva botones",
+        "instalación no nombra a nadie, no lleva botones y sale una vez; lo que registra una orden "
+        "desde un hilo de nadie tampoco lleva botones",
     )
     attack.check(
         "recoverable",
@@ -245,7 +416,7 @@ def test_a_button_acts_on_its_agent_and_on_no_other(
         f"el aviso del vecino vuelve a tener {labels}, y «Rebobinar» le devuelve su carpeta: "
         f"{seen.stdout!r}",
     )
-    ignored = lab.events(MAIN, "telegram_ignored")
+    ignored = lab.events(MAIN, "telegram_ignored")[ignored_before:]
     reasons = {event["details"]["reason"] for event in ignored}
     attack.check(
         "recorded",

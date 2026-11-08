@@ -451,7 +451,7 @@ def test_what_an_order_logs_is_that_agents(two: Two) -> None:
     bridges = [
         LogBridge(
             lambda problem, slug=slug: heard[slug].append(problem.message),
-            accepts=scope.belongs_to(None if slug == "principal" else slug),
+            accepts=scope.belongs_to(slug),
         )
         for slug in heard
     ]
@@ -1136,7 +1136,7 @@ def test_trusting_warns_in_the_box_of_that_agent_and_names_it(
         r.getMessage() for r in caplog.records if "to trust a recipient" in r.getMessage()
     )
     assert (seen in message) if seen else ("the agent" not in message)
-    assert scopes == [agent]
+    assert scopes == [agent or "principal"]  # an order about the main agent is the main agent's
 
 
 def test_trusting_nobody_warns_only_of_the_refusal(
