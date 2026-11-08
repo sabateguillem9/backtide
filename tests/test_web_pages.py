@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from backtide.snapshots import Reason, Snapshot, SnapshotError
 from tests.conftest import FakeClock
-from tests.webkit import PREFIX_PATH, ROOT, START, new_box, new_client
+from tests.webkit import PREFIX_PATH, ROOT, START, new_box, new_client, without_session_forms
 
 HOSTILE = '"><img src=x onerror=alert(1)>‮txt.exe'
 
@@ -347,7 +347,9 @@ def test_snapshots_list_newest_first_with_a_disabled_rewind(tmp_path: Path) -> N
     assert "no está disponible desde esta web" in html, "without a rewinder: disabled, and why"
     assert "periódica" in html and "manual" in html
     assert "hace 2 min" in text_of(html)
-    assert "<form" not in html, "the list itself never rewinds (T12b: only the confirmation)"
+    assert "<form" not in without_session_forms(html), (
+        "the list itself never rewinds (T12b: only the confirmation)"
+    )
     assert not re.search(r"<a [^>]*rebobinar|hx-(post|put|delete|get)=\"[^\"]*rebob", html, re.I)
 
 

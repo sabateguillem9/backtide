@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ t('panel.title') }}{% endblock %}
 {% block main %}
-<main class="panel" hx-ext="sse" sse-connect="{{ base }}/panel/stream?after={{ heads }}">
+<main class="panel" hx-ext="sse" sse-connect="{{ base }}/panel/stream?after={{ heads }}" sse-close="session">
   {# The service has other agents now (T26-2d): web.js loads the page again, with their cards. #}
   <span data-roster sse-swap="roster" hidden></span>
   {# One sentence on top (T12f-1): what waits for you, and the most urgent. The stream sends the

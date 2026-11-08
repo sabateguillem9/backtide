@@ -820,6 +820,12 @@
     connection(false);
     frame && frame.classList.remove("is-beating");
   });
+  // The session is over (T26-3a-2: "Salir" in another tab, "Cerrar todas", or its hour): the
+  // stream says `event: session` and htmx closes it (sse-close) instead of reconnecting forever.
+  // A reload asks the server again, which answers with the sign-in page.
+  document.body.addEventListener("htmx:sseClose", function (event) {
+    if (event.detail && event.detail.type === "message") window.location.reload();
+  });
   // A second click on "Pedir" would be a second task: the page that comes next has the button back.
   document.body.addEventListener("submit", function (event) {
     var form = event.target;

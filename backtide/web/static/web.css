@@ -119,6 +119,27 @@ h1 {
 .badge[hidden] { display: none; }
 .badge-dot { display: none; }
 @media (max-width: 480px) { .top nav { gap: 0 var(--space-5); } }
+/* "Salir" (T26-3a-2): a form, but it reads as the header's last word, quieter than the pages and
+   set apart from them by a hairline. On a narrow screen it goes up to the name's row, at its end,
+   so the pages keep their own row. */
+.sign-out { margin: 0; display: flex; align-items: center; padding-left: var(--space-8); border-left: var(--stroke-hair) solid var(--hair); }
+.sign-out-go {
+  position: relative; display: inline-flex; align-items: center; min-height: var(--size-target); padding: 0;
+  font: inherit; font-size: var(--type-body-ui-size); color: var(--ink-muted); background: none; border: 0; cursor: pointer;
+}
+.sign-out-go::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0.55rem; height: var(--stroke-hair); background: currentColor;
+  transform: scaleX(0); transform-origin: left;
+}
+.sign-out-go:hover { color: var(--ink); }
+.sign-out-go:hover::after { transform: scaleX(1); }
+.top:has(.sign-out) nav { margin-left: auto; }
+@media (max-width: 860px) {
+  .top:has(.sign-out) { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .top:has(.sign-out) .brand { grid-row: 1; grid-column: 1; }
+  .top:has(.sign-out) .sign-out { grid-row: 1; grid-column: 2; padding-left: 0; border-left: 0; }
+  .top:has(.sign-out) nav { grid-row: 2; grid-column: 1 / -1; margin-left: 0; }
+}
 
 /* ================================================================ the page */
 .page {
@@ -535,6 +556,13 @@ h1 {
 .setting-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); flex: none; }
 .setting-cap { max-width: 10rem; }
 .settings-agent { margin-top: var(--space-12); }
+/* "Cerrar todas" (T26-3a-2): under the passkeys, past a hairline as wide as the form; what it
+   closes and the way back in come before the word, so they are read before it is typed. */
+.settings-keys { margin-top: var(--space-5); }
+.close-all { margin-top: var(--space-8); padding-top: var(--space-6); border-top: var(--stroke-hair) solid var(--hair); }
+.close-all-say { display: grid; gap: var(--space-2); }
+.close-all-say p { margin: 0; color: var(--ink-soft); }
+.close-all-title { margin: 0; font: var(--type-label-weight) var(--type-body-size)/var(--type-body-leading) var(--font-sans); color: var(--ink); }
 /* a step: the confirmation of one change, its result, or why not now */
 .settings-step { margin-top: var(--space-8); border-top: var(--stroke-hair) solid var(--line); padding-top: var(--space-8); }
 .settings-step > p { margin: var(--space-3) 0 0; }
@@ -799,6 +827,7 @@ h1 {
   .anim .page > .agentbar, .anim .gate-page > .ic,
   .anim .page > main > :is(h1, .eyebrow, .page-head, .panel-head, .watchbar) { animation: bt-rise var(--duration-reveal) var(--ease) both; }
   .anim .page > main > :is(.lede, .chips, .tide-frame) { animation: bt-rise var(--duration-reveal) var(--ease) var(--stagger) both; }
+  .anim .gate-page > .auth-expiry { animation: bt-rise var(--duration-reveal) var(--ease) calc(var(--stagger) * 2) both; }  /* after the lead it explains */
   .anim .page > main[data-still] > :is(h1, .lede) { animation: none; }  /* it loads again by itself: once is enough */
   .anim :is(.empty, .gate-page, .page-head, .waiting-head, .section-title) .ic :is(.ic-ink, .ic-clay, .ic-faint) { animation: bt-draw var(--duration-draw) var(--ease) var(--duration-quick) both; }
   .anim :is(.empty, .gate-page, .page-head, .waiting-head, .section-title) .ic :is(.ic-fill, .ic-soft) { animation: bt-pop var(--duration-settle) var(--ease) var(--duration-icon) both; }
@@ -810,7 +839,7 @@ h1 {
   :is(.req-yes, .req-no, .settings-yes, .rewind-yes, .ask-send, .filters-apply, .setting-go, .setting-remove, .dot-button, .more)::before,
   :is(.ask-examples a, .suggest a, .seg button, .chips a)::before { transition: opacity var(--duration-hover) var(--ease); }
   .arrow { transition: transform var(--duration-hover) var(--ease); }
-  .top nav a::after { transition: transform var(--duration-settle) var(--ease); }
+  .top nav a::after, .sign-out-go::after { transition: transform var(--duration-settle) var(--ease); }
   .card-cta::after { transition: opacity var(--duration-hover) var(--ease); }
   :is(.more-filters, .req-more) > summary::before { transition: transform var(--duration-settle) var(--ease); }
 

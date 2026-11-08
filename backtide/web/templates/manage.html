@@ -5,7 +5,7 @@
    confirmation of their own, plain forms there: nothing here needs JavaScript but the live part. #}
 {% block title %}{{ t('agents.title') }}{% endblock %}
 {% block main %}
-<main class="settings" hx-ext="sse" sse-connect="{{ stream }}">
+<main class="settings" hx-ext="sse" sse-connect="{{ stream }}" sse-close="session">
   <h1>{{ t('agents.title') }}</h1>
   <p class="lede">{{ t('agents.lede') }}</p>
   {% if state != 'ready' %}<div class="notice notice--info settings-off" role="note" data-state="{{ state }}">{{ ic('info') }}<p class="notice__text">{{ t.code('manage.off.' ~ state) }}</p></div>{% endif %}

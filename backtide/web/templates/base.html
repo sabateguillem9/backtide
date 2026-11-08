@@ -38,6 +38,14 @@
     <a href="{{ base }}/ajustes"{% if active == 'settings' %} aria-current="page"{% endif %}>{{ t('nav.settings') }}{% if active == 'settings' %}<span class="nav-line" aria-hidden="true"></span>{% endif %}</a>
   </nav>
   {% endif %}
+  {# "Salir" (T26-3a-2): a plain form, so it works without JavaScript and needs nothing inline. Only
+     with a session: the sign-in page and a page whose session has just ended have none. #}
+  {% if signed_in %}
+  <form class="sign-out" method="post" action="{{ signed_in.sign_out }}">
+    <input type="hidden" name="csrf" value="{{ signed_in.csrf }}">
+    <button class="sign-out-go" type="submit">{{ t('signout.go') }}</button>
+  </form>
+  {% endif %}
 </header>
 </div>
 <div class="page{% if wide %} wide{% endif %}">

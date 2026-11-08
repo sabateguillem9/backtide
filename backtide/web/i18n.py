@@ -733,6 +733,26 @@ ES: dict[str, str] = {
     "Edge, Firefox o Safari.",
     "auth.err.refused": "Ahora no se puede comprobar: prueba otra vez en un momento.",
     "auth.err.form": "Eso no se ha podido leer: escribe la contraseña otra vez.",
+    "auth.bad.installed": "Ese enlace ya se usó o ya no vale. Entra con tu contraseña, o pide otro "
+    "con `sudo backtide enlace` en el servidor.",
+    "auth.expiry": "Una sesión se cierra sola tras una hora sin uso o 12 horas después de entrar. "
+    "`sudo backtide enlace` en el servidor da otro enlace.",
+    "auth.expiry.local": "Una sesión se cierra sola tras una hora sin uso o 12 horas después de "
+    "entrar. Para otro enlace, para `backtide web` y vuelve a lanzarlo.",
+    # signing out and closing every session (T26-3a-2)
+    "signout.go": "Salir",
+    "sessions.title": "Entrar y salir",
+    "sessions.note": "Una sesión se cierra sola tras una hora sin uso o 12 horas después de "
+    "entrar. «Salir», arriba, cierra la de este navegador.",
+    "sessions.close.title": "Cerrar todas las sesiones",
+    "sessions.close.what": "Cierra esta y cualquier otra en la que hayas entrado, la del portátil "
+    "o la del móvil, y también el enlace que aún no se haya usado. Hazlo si te avisan de que "
+    "alguien ha entrado en la web y no fuiste tú.",
+    "sessions.close.back": "Para volver a entrar: tu llave o tu contraseña, si tienes, o un enlace "
+    "nuevo con `sudo backtide enlace` en el servidor.",
+    "sessions.close.label": "Escribe `{word}` para confirmar",
+    "sessions.close.go": "Cerrar todas",
+    "sessions.close.typo": "Escribe exactamente {word}, en minúsculas.",
     "notfound.title": "Aquí no hay nada",
     "notfound.body": "Esa página no existe.",
     # ages
@@ -1731,6 +1751,26 @@ EN: dict[str, str] = {
     "Firefox or Safari.",
     "auth.err.refused": "It cannot be checked right now: try again in a moment.",
     "auth.err.form": "That could not be read: type the password again.",
+    "auth.bad.installed": "That link was already used or no longer works. Sign in with your "
+    "password, or get another with `sudo backtide enlace` on the server.",
+    "auth.expiry": "A session ends by itself after an hour unused or 12 hours after signing in. "
+    "`sudo backtide enlace` on the server gives you another link.",
+    "auth.expiry.local": "A session ends by itself after an hour unused or 12 hours after signing "
+    "in. For another link, stop `backtide web` and start it again.",
+    # signing out and closing every session (T26-3a-2)
+    "signout.go": "Sign out",
+    "sessions.title": "Signing in and out",
+    "sessions.note": "A session ends by itself after an hour unused or 12 hours after signing in. "
+    '"Sign out", at the top, ends this browser\'s.',
+    "sessions.close.title": "Close every session",
+    "sessions.close.what": "Closes this one and any other you signed in to, on the laptop or on "
+    "the phone, and the link nobody has used yet too. Do it if you are told someone signed in to "
+    "the web and it was not you.",
+    "sessions.close.back": "To sign in again: your key or your password, if you have one, or a new "
+    "link with `sudo backtide enlace` on the server.",
+    "sessions.close.label": "Type `{word}` to confirm",
+    "sessions.close.go": "Close them all",
+    "sessions.close.typo": "Type exactly {word}, in lowercase.",
     "notfound.title": "Nothing here",
     "notfound.body": "That page does not exist.",
     "day.today": "Today, {time}",

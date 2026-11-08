@@ -1,6 +1,7 @@
 """Helpers shared by the tests of backtide.web: a black box written by the real BlackBox, and the
 app on top of it, reached with Host 127.0.0.1:PORT like a browser would."""
 
+import re
 import threading
 import warnings
 from collections.abc import Callable
@@ -122,6 +123,7 @@ class _AnswerWalk(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.problems: list[str] = []
         self.depth = 0  # how many <pre> of text we are inside
+        self.ours = False  # inside backtide's own "Salir" button
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         found = dict(attrs)
@@ -141,8 +143,12 @@ class _AnswerWalk(HTMLParser):
                 self.problems.append(f"<{tag}> inside a text: {found}")
         if tag == "pre":
             self.depth += 1
+        if tag == "button" and found.get("class") == "sign-out-go" and not self.depth:
+            self.ours = True  # backtide's own "Salir" (T26-3a-2), not the agent's text
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "button":
+            self.ours = False
         if tag == "pre":
             self.depth -= 1
         if self.depth < 0:
@@ -150,8 +156,21 @@ class _AnswerWalk(HTMLParser):
             self.depth = 0
 
     def handle_data(self, data: str) -> None:
-        if self.depth == 0 and ("todo en orden" in data or "fuera" in data or "Salir" in data):
+        if (
+            self.depth == 0
+            and not self.ours
+            and ("todo en orden" in data or "fuera" in data or "Salir" in data)
+        ):
             self.problems.append(f"the agent's text outside its frame: {data[:60]!r}")
+
+
+_SESSION_FORMS = re.compile(r'<form class="(?:sign-out|settings-form close-all)".*?</form>', re.S)
+
+
+def without_session_forms(html: str) -> str:
+    """A page without "Salir" and "Cerrar todas" (T26-3a-2), the two forms every page with a
+    session may carry and that only end sessions: what is left is what the page itself changes."""
+    return _SESSION_FORMS.sub("", html)
 
 
 def answer_problems(html: str) -> list[str]:

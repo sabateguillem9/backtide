@@ -32,7 +32,15 @@ from backtide.service.pause import ResumeOutcome
 from backtide.service.rewind import RewindOutcome, RewindStatus
 from backtide.snapshots import Reason, Snapshot, SnapshotError
 from backtide.web.rewind import Availability, ControlRewinder, Redeemed, Tickets
-from tests.webkit import PREFIX_PATH, ROOT, SESSION, TOKEN, new_box, new_client
+from tests.webkit import (
+    PREFIX_PATH,
+    ROOT,
+    SESSION,
+    TOKEN,
+    new_box,
+    new_client,
+    without_session_forms,
+)
 
 NOW = datetime(2026, 10, 16, 10, 0, tzinfo=UTC)
 SNAPS = [
@@ -137,7 +145,9 @@ def test_with_the_service_reachable_every_row_links_to_its_confirmation(web: Tes
     assert [html_lib.unescape(link) for link in links] == [
         f"{PREFIX_PATH}{REWIND}?id={s.id}" for s in reversed(SNAPS)
     ]
-    assert "<form" not in page, "the list itself can never rewind: only the confirmation"
+    assert "<form" not in without_session_forms(page), (
+        "the list itself can never rewind: only the confirmation"
+    )
     assert "muy pronto" not in page
 
 
