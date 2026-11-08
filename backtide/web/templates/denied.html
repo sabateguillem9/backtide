@@ -17,7 +17,7 @@
   {% if sign_in_error %}<p class="signin-error" role="alert">{{ ic('warning') }}<span>{{ t.code('auth.err.' ~ sign_in_error) }}</span></p>{% endif %}
   {{ key_button() }}
   {% elif sign_in %}
-  <p class="lede">{{ t.code('auth.bad') if bad_link else t.code('auth.body.installed') }}</p>
+  <p class="lede">{{ t.code('auth.bad.installed') if bad_link else t.code('auth.body.installed') }}</p>
   <form class="settings-form signin-form" method="post" action="{{ sign_in }}">
     <div class="setting-field">
       <label class="setting-label" for="signin-password">{{ t('auth.password') }}</label>
@@ -37,5 +37,7 @@
   <p class="lede">{{ t.code('auth.bad') if bad_link else t.code('auth.body') }}</p>
   {% if sign_in_error %}<p class="signin-error" role="alert">{{ ic('warning') }}<span>{{ t.code('auth.err.' ~ sign_in_error) }}</span></p>{% endif %}
   {% endif %}
+  {# How long a session lasts (T26-3a-2), so a page that sends you here after an hour makes sense. #}
+  <p class="note auth-expiry">{{ t.code('auth.expiry' if sign_in or key_only else 'auth.expiry.local') }}</p>
 </main>
 {% endblock %}

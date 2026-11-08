@@ -15,7 +15,7 @@ from backtide.snapshots import Reason, Snapshot
 from backtide.web.security import CSP
 from backtide.web.tide import BASE, PAD, WIDTH, build_tide
 from tests.conftest import FakeClock
-from tests.webkit import PREFIX_PATH, START, new_box, new_client
+from tests.webkit import PREFIX_PATH, START, new_box, new_client, without_session_forms
 
 STATIC = Path(__file__).resolve().parent.parent / "backtide" / "web" / "static"
 TEMPLATES = STATIC.parent / "templates"
@@ -387,7 +387,7 @@ def test_the_snapshots_page_draws_its_list_on_a_tide(tmp_path: Path) -> None:
     assert "hace 6 h" in text_of(html), "the line goes back to the oldest listed snapshot"
     assert re.search(r'<time class="ago" datetime="[^"]+" data-ago>', html)
     assert "Señala o toca una instantánea" in html
-    assert "<form" not in html, "still nothing here can rewind"
+    assert "<form" not in without_session_forms(html), "still nothing here can rewind"
 
 
 def test_snapshots_have_human_titles_and_a_small_id(tmp_path: Path) -> None:

@@ -83,7 +83,31 @@
       {% endif %}
     </ul>
   </section>
-  <p class="note settings-keys"><a href="{{ base }}/llaves">{{ t('settings.keys') }}</a></p>
+  {# Signing in and out (T26-3a-2): the passkeys, and "Cerrar todas", which the core always
+     offers to a live session (POST /ajustes/cerrar-sesiones, its word typed as the confirmation).
+     A plain form: `pattern` keeps a mistyped word from leaving the browser. #}
+  <section class="settings-group" aria-labelledby="settings-sessions">
+    <h2 class="section-title" id="settings-sessions">{{ ic('key', 'ic--m') }}{{ t('sessions.title') }}</h2>
+    <p class="note">{{ t('sessions.note') }}</p>
+    <p class="note settings-keys"><a href="{{ base }}/llaves">{{ t('settings.keys') }}</a></p>
+    {% if signed_in %}
+    <form class="settings-form close-all" method="post" action="{{ signed_in.close_all }}" aria-labelledby="close-all-title">
+      <input type="hidden" name="csrf" value="{{ signed_in.csrf }}">
+      <div class="close-all-say">
+        <h3 class="close-all-title" id="close-all-title">{{ t('sessions.close.title') }}</h3>
+        <p>{{ t('sessions.close.what') }}</p>
+        <p>{{ t.code('sessions.close.back') }}</p>
+      </div>
+      <div class="setting-field">
+        <label class="setting-label" for="close-all-word">{{ t.code('sessions.close.label', word=signed_in.close_word) }}</label>
+        <input id="close-all-word" class="setting-input" type="text" name="confirmo" required pattern="{{ signed_in.close_word }}" title="{{ t('sessions.close.typo', word=signed_in.close_word) }}" maxlength="32" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </div>
+      <div class="settings-actions">
+        <button class="settings-yes is-remove" type="submit">{{ t('sessions.close.go') }}</button>
+      </div>
+    </form>
+    {% endif %}
+  </section>
   <p class="note settings-agent">{{ t('settings.agent') }}</p>
 </main>
 {% endblock %}

@@ -29,7 +29,17 @@ from backtide.service.settings import KINDS, Applied, Settings
 from backtide.web.rewind import Availability, Redeemed
 from backtide.web.settings import ControlSettings, SettingTickets, views
 from tests.test_service_control import FakeGuardian, me
-from tests.webkit import KEY, PREFIX_PATH, ROOT, SESSION, TOKEN, new_box, new_client, parse_sse
+from tests.webkit import (
+    KEY,
+    PREFIX_PATH,
+    ROOT,
+    SESSION,
+    TOKEN,
+    new_box,
+    new_client,
+    parse_sse,
+    without_session_forms,
+)
 
 NOW = datetime(2026, 10, 20, 10, 0, tzinfo=UTC)
 POST_HEADERS = {"origin": ROOT, "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate"}
@@ -148,7 +158,7 @@ def test_the_page_says_what_is_set_and_never_more(web: TestClient) -> None:
     assert "Bot de Telegram sin configurar" in said
     assert "Tope de gasto no se sabe: el servicio no contesta" in said  # no spending client here
     assert 'href="' + PREFIX_PATH + '/ajustes/cambiar?tipo=tope"' not in page.text
-    assert "<form" not in page.text, "the list itself changes nothing"
+    assert "<form" not in without_session_forms(page.text), "the list itself changes nothing"
     assert f'href="{PREFIX_PATH}/ajustes/quitar?tipo=anthropic"' in page.text
     assert f'href="{PREFIX_PATH}/ajustes/quitar?tipo=openai"' not in page.text
     assert f'href="{PREFIX_PATH}/ajustes"' in page.text, "the menu has it"
@@ -178,7 +188,7 @@ def test_without_the_service_the_page_says_why_and_offers_nothing(
     if state is Availability.DISABLED:
         assert "backtide web --ajustes" in text_of(page)
     confirmation = web.get("/ajustes/cambiar?tipo=anthropic")
-    assert "<form" not in confirmation.text
+    assert "<form" not in without_session_forms(confirmation.text)
 
 
 def test_without_ajustes_there_is_no_post_at_all(tmp_path: Path) -> None:
@@ -266,7 +276,9 @@ def test_a_key_is_removed_with_its_own_confirmation(web: TestClient, fake: FakeS
     page = text_of(web.get("/ajustes/quitar?tipo=anthropic").text)
     assert "el agente no puede usar ese modelo hasta que pongas otra" in page
     refused = web.get("/ajustes/quitar?tipo=openai")
-    assert "<form" not in refused.text and "No hay nada que quitar" in text_of(refused.text)
+    assert "<form" not in without_session_forms(
+        refused.text
+    ) and "No hay nada que quitar" in text_of(refused.text)
     fields = confirm(web, "clear", "anthropic")
     assert post(web, fields).status_code == 200
     assert fake.clears == ["anthropic"]

@@ -21,7 +21,7 @@ from backtide.web.rewind import Availability
 from backtide.web.settings import ControlSettings, ControlSpend, SpendView, spend_view
 from tests.test_service_control import FakeGuardian, me
 from tests.test_web_settings import NOW, FakeSettings, confirm, hidden, post, text_of
-from tests.webkit import KEY, new_box, new_client
+from tests.webkit import KEY, new_box, new_client, without_session_forms
 
 STATUS = {
     "available": True,
@@ -179,7 +179,7 @@ def test_without_ajustes_the_caps_are_shown_but_not_changed(tmp_path: Path) -> N
     page = web.get("/ajustes").text
     assert "Hoy: 0,25 $ de 5,00 $" in text_of(page)
     assert "/ajustes/cambiar?tipo=tope" not in page
-    assert "<form" not in web.get("/ajustes/cambiar?tipo=tope").text
+    assert "<form" not in without_session_forms(web.get("/ajustes/cambiar?tipo=tope").text)
 
 
 @pytest.fixture
@@ -290,11 +290,11 @@ def test_b3_without_ajustes_or_without_new_prices_nothing_is_offered(
     page = off.get("/ajustes").text
     assert "Precios nuevos por aceptar" in text_of(page)
     assert "/ajustes/cambiar?tipo=precios" not in page
-    assert "<form" not in off.get("/ajustes/cambiar?tipo=precios").text
+    assert "<form" not in without_session_forms(off.get("/ajustes/cambiar?tipo=precios").text)
     (tmp_path / "plain").mkdir()
     plain = prices_client(tmp_path / "plain", fake, STATUS)
     assert "tipo=precios" not in plain.get("/ajustes").text
-    assert "<form" not in plain.get("/ajustes/cambiar?tipo=precios").text
+    assert "<form" not in without_session_forms(plain.get("/ajustes/cambiar?tipo=precios").text)
 
 
 def test_with_several_agents_the_numbers_are_the_whole_installations() -> None:

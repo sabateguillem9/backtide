@@ -4,7 +4,7 @@
 {% block main %}
 {# The chat (T26-5b). The form is a plain POST and a new page; the list comes up to date by itself
    over the stream, and without JavaScript a reload does the same. #}
-<main class="watch talk a-{{ agent.colour }}"{% if talk_state == 'ready' %} hx-ext="sse" sse-connect="{{ agent.base }}/hablar/stream?visto={{ known }}"{% endif %}>
+<main class="watch talk a-{{ agent.colour }}"{% if talk_state == 'ready' %} hx-ext="sse" sse-connect="{{ agent.base }}/hablar/stream?visto={{ known }}" sse-close="session"{% endif %}>
   <div class="page-head ic-host">{{ ic('ask', 'ic--l') }}<h1>{{ t('talk.title') }}</h1></div>
   <p class="lede">{{ t('talk.lede') }}</p>
   {% if talk_state == 'ready' or asked %}

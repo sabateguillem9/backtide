@@ -29,7 +29,7 @@ from backtide.web.approve import (
 )
 from backtide.web.rewind import Availability, Redeemed
 from tests.test_service_control import FakeGuardian, me
-from tests.webkit import PREFIX_PATH, ROOT, START, TOKEN, new_box, new_client
+from tests.webkit import PREFIX_PATH, ROOT, START, TOKEN, new_box, new_client, without_session_forms
 
 NOW = START + timedelta(minutes=1)
 POST_HEADERS = {"origin": ROOT, "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate"}
@@ -147,7 +147,7 @@ def test_with_aprobar_the_buttons_lead_to_a_confirmation(web: TestClient) -> Non
     assert f'href="{PREFIX_PATH}/peticiones/decidir?id={HOLD}&amp;v=confiar"' in page
     assert f"id={OTHER}&amp;v=confiar" not in page, "only what may be trusted offers it"
     assert f'href="{PREFIX_PATH}/peticiones/ver?id={HOLD}"' in page
-    assert "<form" not in page, "the panel itself changes nothing"
+    assert "<form" not in without_session_forms(page), "the panel itself changes nothing"
     said = text_of(page)
     assert "Quiere enviar un mensaje por Telegram" in said, "our words, from the closed tables"
     assert "Lo que pide el agente (texto suyo, no de backtide):" in said and "556" in said
@@ -166,7 +166,9 @@ def test_without_aprobar_nothing_decides_and_the_post_does_not_exist(tmp_path: P
     assert "backtide web --aprobar" in text_of(page)
     assert off.calls == [] and re.findall(r"<button[^>]*disabled", page)
     refused = web.get(f"{DECIDE}?id={HOLD}&v=aprobar")
-    assert "--aprobar" in text_of(refused.text) and "<form" not in refused.text
+    assert "--aprobar" in text_of(refused.text) and "<form" not in without_session_forms(
+        refused.text
+    )
     assert post(web, {"csrf": "x", "ticket": "y", "id": HOLD, "v": "aprobar"}).status_code == 405
     assert off.calls == []
 
@@ -311,7 +313,7 @@ def confirm_trust(web: TestClient) -> dict[str, str]:
 
 def test_what_may_not_be_trusted_is_not_offered(web: TestClient, fake: FakeApprover) -> None:
     page = web.get(f"{DECIDE}?id={OTHER}&v=confiar")
-    assert "<form" not in page.text and "una a una" in text_of(page.text)
+    assert "<form" not in without_session_forms(page.text) and "una a una" in text_of(page.text)
     approve = confirm(web, "aprobar")
     assert post(web, approve | {"confirmo": "si"}).status_code == 400, "no box on another verb"
     assert fake.calls == []
@@ -455,7 +457,7 @@ def test_batches_and_trusted_recipients_are_listed_and_ended(
     forget = confirm(web, "olvidar", "t-0a1b2c3d")
     assert post(web, forget).status_code == 200
     assert fake.calls == [("end_batch", "b-01234567"), ("untrust", "t-0a1b2c3d")]
-    assert web.get(f"{DECIDE}?id=b-ffffffff&v=revocar").text.count("<form") == 0
+    assert "<form" not in without_session_forms(web.get(f"{DECIDE}?id=b-ffffffff&v=revocar").text)
 
 
 @pytest.mark.parametrize(
@@ -467,7 +469,7 @@ def test_an_id_of_the_wrong_shape_is_refused(
     web: TestClient, fake: FakeApprover, verb: str, subject: str
 ) -> None:
     page = web.get(f"{DECIDE}?{urlencode({'id': subject, 'v': verb})}")
-    assert "<form" not in page.text
+    assert "<form" not in without_session_forms(page.text)
     reply = post(web, {"csrf": "c", "ticket": "t", "id": subject, "v": verb})
     assert reply.status_code == 400 and fake.calls == []
 
