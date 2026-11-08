@@ -79,15 +79,15 @@ The report only says "yes" for what a test actually checked in this run. What a 
 
 ## How many scenarios there are
 
-Counted from `tests/attacks/manifest.toml` at the time of writing:
+Counted from `tests/attacks/manifest.toml` on 2026-11-08:
 
 | | Count |
 |---|---|
-| Entries in the manifest | 101 |
-| **Ready**: have a test that runs today | 95 |
+| Entries in the manifest | 177 |
+| **Ready**: have a test that runs today | 171 |
 | **Pending**: listed, but cannot be written until a later task exists | 6 |
 
-Of the 95 ready scenarios, 89 run with the OpenClaw battery and 22 with the Claude Code battery (16 run with both). In a run for one profile, the scenarios of the other profile are skipped and the report says so.
+Of the 171 ready scenarios, 110 run with the OpenClaw battery and 94 with the Claude Code battery (33 run with both). In a run for one profile, the scenarios of the other profile are skipped and the report says so.
 
 Fifteen of the ready scenarios still have one dimension marked pending (a risk level or a "recorded" check that waits for a feature). There are 18 such cells in total. The run counts them in its summary line, as "comprobaciones pendientes", and never shows them as passed.
 

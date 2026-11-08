@@ -12,7 +12,7 @@ This page says who did what, how the work was organised, and what that means for
 
 - **The founder** decided what backtide is and what it must never do: the product, its scope, its security rules (the eight invariants in CLAUDE.md (internal note) and [SECURITY.md](../SECURITY.md)), and the choices that each design document put to the founder. The project's rules require the founder's approval for every new privileged command (`sudo`) and every new dependency. The founder ran the first end-to-end test with a real model.
 - **Claude Code**, with Anthropic's Claude models, wrote nearly all of the code, the tests, the design documents, the attack scenarios and the security reviews. It worked as a small team of specialised agents, each with written instructions, described below.
-- **Every commit** in the history carries a `Co-Authored-By: Claude` line.
+- **Every commit that holds work** carries a `Co-Authored-By: Claude` line. The only ones without it are a few merge commits that the version control tool writes by itself.
 - **No human security expert has reviewed this code.** The security reviews were done by an AI agent too. Section 5 explains what that means.
 
 ## 2. The process
@@ -129,18 +129,18 @@ First drafts had real bugs, including serious ones. A few that the reviews caugh
 
 ## 6. Numbers
 
-Measured on 2026-10-29 in this public repository, at commit `9add602`.
+Measured on 2026-11-08 in the working repository (the private one, whose history this public copy follows). The line and file counts of the code leave out the three test files that stay private (the website's tests and the publishing check); the counts of tests are those of the whole working repository.
 
 | What | Count | How it was counted |
 |---|---|---|
-| Commits | 135, all with a `Co-Authored-By: Claude` line | `git rev-list --count HEAD`, and `git log --format=%B` searched for the trailer. 129 name Claude Opus 5.5 and 6 Claude Sonnet 5.5. This copy keeps only the commits that touch the product; the private repository has 196. |
-| Calendar | 2026-10-05 to 2026-10-29, commits on 15 different days | `git log --date=short` |
-| Unit tests (Mac) | 11,251; in a run of `make test` that day, 11,204 passed, 32 were skipped and 15 are expected failures | `uv run pytest --collect-only -q` |
+| Commits | 293 in the private repository; 289 have a `Co-Authored-By: Claude` line and the other 4 are automatic merge commits | `git rev-list --count HEAD`, and `git log --format=%B` searched for the trailer. 260 name Claude Opus 5.5, 28 Claude Sonnet 5.5 and 1 another Claude model. The public copy keeps only the commits that touch the product, so its count is lower; it was not recounted here. |
+| Calendar | 2026-10-05 to 2026-11-08, commits on 22 different days | `git log --date=short`, in the private repository |
+| Unit tests (Mac) | 19,030; in a run of `make test` that day, 18,973 passed, 41 were skipped and 16 are expected failures | `uv run pytest --collect-only -q` |
 | VM integration tests | 507 | `uv run pytest --collect-only -q -m integration` |
-| Attack battery | 101 scenarios: 95 ready with tests, 6 pending | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
-| Product code | 67,298 lines in 144 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
-| Test code | 124,152 lines in 333 Python files | the same for `tests/` |
-| Documents | 45 numbered design and study documents, plus the backlog, the log and the decision record, kept in the private repository; here, the guide in `docs/guide/` and this page | `ls docs/*.md` in the private repository. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
+| Attack battery | 177 scenarios: 171 ready with tests, 6 pending (110 run with OpenClaw and 94 with Claude Code; 33 with both) | `tests/attacks/manifest.toml`, field `status`; each ready one has an `@scenario` test |
+| Product code | 81,395 lines in 162 Python files | `wc -l` of `backtide/**/*.py` tracked by git, blank lines and comments included |
+| Test code | 155,044 lines in 373 Python files | the same for `tests/` |
+| Documents | 47 numbered design and study documents, plus the backlog, the log and the decision record, kept in the private repository; here, the guide in `docs/guide/` and this page | `ls docs/*.md` in the private repository. Documents 01 to 06 are an older, long-term vision, not about backtide itself. |
 | Specialised agents and skills | 15 agents, 6 skills | `.claude/agents/`, `.claude/skills/`, in the private repository |
 
 These numbers are counts, not quality. More tests do not mean fewer bugs, and the test code being larger than the product code says as much about the style as about the coverage.

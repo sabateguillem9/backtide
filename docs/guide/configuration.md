@@ -424,7 +424,7 @@ All details of the command are in the [command-line reference](cli-reference.md#
 
 ### `[web]`: shorter sessions, for a test
 
-A session of the installed web ends after an hour unused or 12 hours in all. `[web]` in `backtide.toml` can only make those shorter, never longer, and never under a minute: it is for testing that sessions expire.
+A session of the installed web ends after an hour unused or 12 hours in all. `[web]` in `backtide.toml` can only make those shorter, never longer, and never under a minute: it is for testing that sessions expire. You can end one yourself: "Salir" (sign out) at the end of the header of every page, or "Cerrar todas las sesiones" (close every session) in Settings > "Signing in and out", where you type `cerrar-todas` to confirm. When a session ends, the live pages stop reconnecting and take you back to the sign-in page, which says how long a session lasts.
 
 ```toml
 [web]

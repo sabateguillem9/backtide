@@ -680,7 +680,7 @@ With [`[web] public_origin`](configuration.md#web-public_origin-the-web-on-a-dom
 sudo backtide enlace --cerrar-todas
 ```
 
-Closes every web session and the unused link, without giving a new one, through root's control socket: it works even when the web does not answer or cannot be trusted. It is written in the black box and alerted. Exit codes: `0` closed; `1` no running service, or one without the installed web; `2` a configuration that cannot be read, or `--archivo` given with it.
+Closes every web session and the unused link, without giving a new one, through root's control socket: it works even when the web does not answer or cannot be trusted. The web has the same thing under Settings > "Signing in and out" ("Cerrar todas las sesiones"); this command is for when you cannot reach the web. It is written in the black box and alerted. Exit codes: `0` closed; `1` no running service, or one without the installed web; `2` a configuration that cannot be read, or `--archivo` given with it.
 
 The exit codes of `sudo backtide enlace` itself: `0` printed; `1` no running web or service, or a file that is not the web's address; `2` a configuration that cannot be read.
 
