@@ -175,6 +175,10 @@ vm-limpiar: ## VM: borra solo restos nuestros (backtide-*, vigia-demo-*, volúme
 # Clean, throwaway VMs for the installer (T13-1, T13-5; docs/25): nothing of the dev VM, no Mac
 # folder mounted, the code copied in from `git archive HEAD`. One at a time: 4 CPU, 6 GiB.
 LIMPIA_PREFIX := backtide-limpia-
+# GiB of memory and of disk (sparse: only what is used is taken). More for a second agent:
+# make vm-limpia-up LIMPIA_MEM=9 LIMPIA_DISK=100
+LIMPIA_MEM ?= 6
+LIMPIA_DISK ?= 40
 LIMPIA_VM = $(LIMPIA_PREFIX)$(DISTRO)
 LIMPIA_TEMPLATE_fedora := template:fedora-44
 LIMPIA_TEMPLATE_ubuntu24 := template:ubuntu-24.04
@@ -192,7 +196,7 @@ vm-limpia-up: ## Clean VM: create and start backtide-limpia-<DISTRO> (fedora|ubu
 	if [ "$$status" = "Running" ]; then echo "$(LIMPIA_VM) ya está en marcha"; \
 	elif [ -n "$$status" ]; then limactl start --tty=false $(LIMPIA_VM); \
 	else limactl start --name=$(LIMPIA_VM) --tty=false --mount-none --containerd=none \
-	  --cpus=4 --memory=6 --disk=40 $(LIMPIA_TEMPLATE_$(DISTRO)); fi
+	  --cpus=4 --memory=$(LIMPIA_MEM) --disk=$(LIMPIA_DISK) $(LIMPIA_TEMPLATE_$(DISTRO)); fi
 	@$(MAKE) --no-print-directory vm-limpia-codigo DISTRO=$(DISTRO)
 
 vm-limpia-codigo: ## Clean VM: copy `git archive HEAD` (+ tests/install/ as it is now) to ~/backtide-src
