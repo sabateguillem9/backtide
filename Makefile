@@ -87,7 +87,7 @@ probar-web: ## Prueba real: la web con Ajustes, aprobar y rebobinar (abre el enl
 	@case "$(DEMO_WEB_CONFIG)$(DEMO_WEB_PORT)" in *"'"*) echo "no ' in DEMO_WEB_*" >&2; exit 2;; esac
 	@if lsof -nP -iTCP:$(DEMO_WEB_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 	  echo "El puerto $(DEMO_WEB_PORT) del Mac ya está ocupado: Lima no podría reenviarlo y el enlace llegaría a otro programa" >&2; exit 2; fi
-	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay prueba en marcha: lanza antes make probar (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --ajustes --aprobar --rebobinar'
+	$(VM_SH) 'test -f "$(DEMO_WEB_CONFIG)" || { echo "No hay prueba en marcha: lanza antes make probar (terminal 1)" >&2; exit 2; }; $(UV_VM) backtide web --config "$(DEMO_WEB_CONFIG)" --puerto $(DEMO_WEB_PORT) --ajustes --aprobar --rebobinar --tareas'
 
 probar-pedir: ## Prueba real: un mensaje al agente y su respuesta (MSG="...")
 	@test -n "$$MSG" || { echo 'Di qué le pides: make probar-pedir MSG="..."' >&2; exit 2; }
