@@ -668,13 +668,43 @@ def test_a_new_task_comes_at_the_top_and_its_end_in_place(
     assert "Nada en marcha" in events(second, "talk-state")[0]["data"]
 
 
-def test_a_task_that_ended_is_read_once(live: TestClient, tasks: FakeTasks) -> None:
-    """T26-5a's point for this task: the stream asks every second, and the answer can be 8 MiB."""
+def test_a_task_that_ended_is_read_once(tmp_path: Path, tasks: FakeTasks) -> None:
+    """T26-5a's point for this task: the stream asks every second, and the answer can be 8 MiB.
+
+    The stream is not timed: its session ends during the fourth listing and the stream, which
+    looks at it before every round, says so and stops. So "it did go on looking" is a count of
+    rounds, true on a machine of any speed, not a guess of how many fit in a fraction of a
+    second (a loaded runner did one and the old version of this test failed)."""
+    rounds = 4
+    new_box(tmp_path)
+    sessions = Sessions()
+    sessions.preset(SESSION)
+    from backtide.web.security import LocalAccess
+
+    # stream_seconds is only a backstop: if the session did not end the stream, the test fails
+    # at the end of it (a minute) with the wrong number of rounds instead of hanging.
+    web = new_client(
+        tmp_path,
+        tasks=tasks,
+        access=LocalAccess(sessions),
+        poll_interval=0.001,
+        stream_seconds=60.0,
+    )
     tasks.entries = [line()]
-    found = stream_of(live)
+    real_tasks = tasks.tasks
+
+    def counting(*, agent: str | None = None) -> list[dict[str, Any]]:
+        found = real_tasks(agent=agent)
+        if len(tasks.listed) >= rounds:
+            sessions.end(SESSION)
+        return found
+
+    tasks.tasks = counting  # type: ignore[method-assign]
+    found = stream_of(web)
+    assert events(found, "session")[0]["data"] == "expired"  # the session ended it, not the clock
+    assert len(tasks.listed) == rounds  # it did go on looking, round after round
     assert len(events(found, "tasks")) == 1
-    assert tasks.statuses == [(TASK_A, None)]
-    assert len(tasks.listed) > 1  # it did go on looking
+    assert tasks.statuses == [(TASK_A, None)]  # and the answer was asked for once, not per round
 
 
 def test_what_the_page_has_is_not_asked_for_nor_sent(live: TestClient, tasks: FakeTasks) -> None:
