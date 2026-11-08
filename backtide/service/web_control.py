@@ -59,19 +59,21 @@ The socket:
   holds comes back or goes for good from the server's own terminal. At most ``LONG_ORDERS`` of what
   takes long at once (``HOLDS_ITS_CONNECTION``), because one holds a connection for as long as an
   agent takes to come up, and the pages need the others. Stopping, an agent (``agent_stop``) or a
-  task (``task_stop``), has a room of its own, ``AGENT_STOPS`` and ``TASK_STOPS``, so that it does
-  not wait behind two starts and, asked again and again, does not take the connections either
-  (``Fleet`` does its stops one at a time anyway). Freezing is counted nowhere: it is the brake,
-  and it is quick.
+  task (``task_stop``), has a room of its own: ``AGENT_STOPS`` at once, and a task's one per agent
+  and ``TASK_STOPS`` at most (a hostile agent can make its own stop hang, and must not refuse
+  another's). So it does not wait behind two starts and, asked again and again, does not take the
+  connections either. A stop that finds no room answers at once and spends nothing, and the stops
+  have a token bucket of their own (``STOPS_*``), so that "Parar" never empties the changes'.
+  Freezing is counted nowhere: it is the brake, and it is quick.
 - The keys (T26-3b-2, T26-3c, T26-3d): registering, listing and touching them, signing in, and
   ``key_remove`` and ``key_rename`` (``_manage_key``): by the whole id, with a key just touched,
   recorded first, and from here never the last key. Root's own ``passkey_remove``, by the end of
   an id and for any key, stays off this list.
 - How much: a request is one JSON line of at most 4 KiB within 5 s (the control socket's own
-  reading), at most ``MAX_WEB_CONNECTIONS`` at once, and two token buckets: every request, and the
-  changes on their own (``REQUESTS_*``, ``CHANGES_*``). Over either, a refusal without calling
-  anything. Every refusal of a command or a caller is a WARNING, which the log bridge records in
-  the black box (once a minute per kind) and alerts.
+  reading), at most ``MAX_WEB_CONNECTIONS`` at once, and three token buckets: every request, the
+  changes on their own and the stops (``REQUESTS_*``, ``CHANGES_*``, ``STOPS_*``). Over any of
+  them, a refusal without calling anything. Every refusal of a command or a caller is a WARNING,
+  which the log bridge records in the black box (once a minute per kind) and alerts.
 
 The client side is the control socket's (``ask_*`` with ``server_uid=0``: the socket and the
 process answering must be root's), plus ``ask_snapshots`` here.
@@ -118,7 +120,7 @@ from backtide.snapshots import Snapshot
 logger = logging.getLogger(__name__)
 
 WEB_SOCKET_MODE = 0o660
-MAX_WEB_CONNECTIONS = 6
+MAX_WEB_CONNECTIONS = 7
 # What the web may read (it shows them) and change (each behind its own confirmation in the web).
 READS = frozenset({"agents", "snapshots", "holds", "trusted", "batches", "secrets", "budget"})
 CHANGES = frozenset(
@@ -136,11 +138,14 @@ AGENT_ORDERS = frozenset(
 WEB_CREATE_FIELDS = frozenset({"cmd", "slug", "profile", "volume_gib"})
 HOLDS_ITS_CONNECTION = frozenset({"agent_create", "agent_start", "agent_resume", "agent_delete"})
 LONG_ORDERS = 2  # of MAX_WEB_CONNECTIONS at once: an agent's start holds its connection for minutes
-# The stops hold theirs for long too (an agent's up to 110 s, a task's up to 120 s), so each has its
-# own room: a brake is not asked to wait behind two starts, and two starts and a stop of each kind,
-# asked again and again, leave ``MAX_WEB_CONNECTIONS - 4`` connections for the pages and the freeze.
+# The stops hold theirs for long too (an agent's up to 110 s, a task's up to 120 s), so each kind
+# has its own room: a brake is not asked to wait behind two starts. ``Fleet`` does its stops one at
+# a time anyway (``AGENT_STOPS``). A task's stop is each agent's own (its ``pkill`` runs inside it,
+# and a hostile agent can make it hang): one per agent, and at most ``TASK_STOPS`` of them at once.
+# What lasts takes ``LONG_ORDERS + AGENT_STOPS + TASK_STOPS`` of ``MAX_WEB_CONNECTIONS``, and at
+# least two connections stay free for the pages, the cookie checks and the freeze (a test fixes it).
 AGENT_STOPS = 1
-TASK_STOPS = 1
+TASK_STOPS = 2
 # A read that takes a live session, unlike READS (T26-5a, docs/47 section 7.1): a task's answer is
 # not in the black box, which the web's group may read anyway. It does not count as using the
 # session: a chat left open, which asks by itself, must not keep the session alive.
@@ -171,6 +176,11 @@ TOUCH_CHANGES = frozenset({"set_secret", "clear_secret", "trust", "agent_create"
 # per open tab). The changes: a burst of 10, then one every 3 s (a person clicks).
 REQUESTS_BURST, REQUESTS_PER_SECOND = 120, 20.0
 CHANGES_BURST, CHANGES_PER_SECOND = 10, 1 / 3
+# The stops (agent_stop, task_stop) have a bucket of their own, so that nobody empties the
+# changes' with "Parar" and leaves the freeze without its token. One that finds no room does
+# not spend from it.
+STOPS_BURST, STOPS_PER_SECOND = 6, 1 / 3
+STOP_COMMANDS = frozenset({"agent_stop", "task_stop"})
 # Every page and fragment checks its session: a bucket of their own, so the stream of an open
 # tab never starves a click. Made-up cookies have another (T26-4a): behind a domain anyone can send
 # them, and they must never empty the one of a session that lives. A wrong link spends its bucket
@@ -280,6 +290,7 @@ class WebControlServer(ControlServer):
         max_connections: int = MAX_WEB_CONNECTIONS,
         requests: Bucket | None = None,
         changes: Bucket | None = None,
+        stops: Bucket | None = None,
         sessions: Sessions | None = None,
         checks: Bucket | None = None,
         made_up: Bucket | None = None,
@@ -322,12 +333,15 @@ class WebControlServer(ControlServer):
         self._long_orders = threading.BoundedSemaphore(LONG_ORDERS)
         self._agent_stops = threading.BoundedSemaphore(AGENT_STOPS)
         self._task_stops = threading.BoundedSemaphore(TASK_STOPS)
+        self._stopping_tasks: set[str] = set()  # whose agents a task's stop is running
+        self._stopping_lock = threading.Lock()
         # The web's own uid, when it is an account (the installed ``backtide-web``): then the
         # group alone is not enough, so a member of the group who switches to it (``sg``,
         # ``newgrp``) is refused too. Root may always ask (it has the control socket anyway).
         self._user = user
         self._requests = requests or Bucket(REQUESTS_BURST, REQUESTS_PER_SECOND)
         self._changes = changes or Bucket(CHANGES_BURST, CHANGES_PER_SECOND)
+        self._stops = stops or Bucket(STOPS_BURST, STOPS_PER_SECOND)
         self._checks = checks or Bucket(CHECKS_BURST, CHECKS_PER_SECOND)
         self._made_up = made_up or Bucket(MADE_UP_BURST, MADE_UP_PER_SECOND)
         self._opens = opens or Bucket(OPENS_BURST, OPENS_PER_SECOND)
@@ -395,6 +409,8 @@ class WebControlServer(ControlServer):
                     "web socket: refused a %s without the passkey touched (pid %d)", command, pid
                 )
                 raise _BadRequest(NEEDS_TOUCH)
+            if command in STOP_COMMANDS:
+                return self._stop(command, request, pid, uid)
             if not self._changes.take():
                 logger.warning("web socket: too many changes, one from pid %d was refused", pid)
                 raise _BadRequest("Demasiados cambios seguidos: espera un poco.")
@@ -403,31 +419,51 @@ class WebControlServer(ControlServer):
                 return self._agent_order(command, request, pid, uid)
             request["via"] = "web"
             self._warn_lasting(command, request, pid)
-            if command == "task_stop":
-                return self._within(
-                    self._task_stops, command, request, pid, uid, REFUSED, STOP_IN_PROGRESS
-                )
         return super()._handle(request, pid, uid)
 
-    def _within(
-        self,
-        room: threading.BoundedSemaphore,
-        command: str,
-        request: dict[str, Any],
-        pid: int,
-        uid: int,
-        outcome: str,
-        message: str,
-    ) -> dict[str, Any]:
-        """The order, if its kind has room (a connection that stays for as long as it takes); if
-        not, a word at once and nothing called."""
-        if not room.acquire(blocking=False):
-            logger.warning("web socket: refused a %s (pid %d): %s", command, pid, outcome)
-            return {"ok": False, "outcome": outcome, "message": message}
+    def _stop(self, command: str, request: dict[str, Any], pid: int, uid: int) -> dict[str, Any]:
+        """A stop, past the session: first its room (a connection that stays for as long as the
+        stop lasts), and only with it, a token from the stops' bucket. A stop that finds no room
+        gets a word at once, spends nothing and calls nothing."""
+        release = self._stop_room(command, request)
+        if release is None:
+            logger.warning("web socket: refused a %s (pid %d): a stop is in progress", command, pid)
+            outcome = "busy" if command == "agent_stop" else REFUSED
+            return {"ok": False, "outcome": outcome, "message": STOP_IN_PROGRESS}
         try:
+            if not self._stops.take():
+                logger.warning("web socket: too many stops, one from pid %d was refused", pid)
+                raise _BadRequest("Demasiadas paradas seguidas: espera un poco.")
+            if command == "agent_stop":
+                request.pop("via", None)  # the socket is who says: it is no field of these orders
+                return self._agent_order(command, request, pid, uid)
+            request["via"] = "web"
+            self._warn_lasting(command, request, pid)
             return super()._handle(request, pid, uid)
         finally:
-            room.release()
+            release()
+
+    def _stop_room(self, command: str, request: dict[str, Any]) -> Callable[[], None] | None:
+        """The room of a stop, or None: the agents' stop is one at a time, and a task's is one per
+        agent (as the agent in the order says, the main one without it) and ``TASK_STOPS`` at most.
+        What comes back gives it back."""
+        if command == "agent_stop":
+            if not self._agent_stops.acquire(blocking=False):
+                return None
+            return self._agent_stops.release
+        named = request.get("agent") or MAIN_SLUG
+        whose = named if isinstance(named, str) and len(named) <= 64 else "?"
+        with self._stopping_lock:
+            if whose in self._stopping_tasks or not self._task_stops.acquire(blocking=False):
+                return None
+            self._stopping_tasks.add(whose)
+
+        def release() -> None:
+            with self._stopping_lock:
+                self._stopping_tasks.discard(whose)
+            self._task_stops.release()
+
+        return release
 
     def _agent_order(
         self, command: str, request: dict[str, Any], pid: int, uid: int
@@ -443,13 +479,14 @@ class WebControlServer(ControlServer):
             return refused("refused", NOT_THE_MAIN)
         if command == "agent_create" and set(request) - WEB_CREATE_FIELDS:
             return refused("invalid", CREATE_IS_CLOSED)
-        if command == "agent_stop":  # not behind the starts, and not more than one at a time
-            return self._within(
-                self._agent_stops, command, request, pid, uid, "busy", STOP_IN_PROGRESS
-            )
-        if command not in HOLDS_ITS_CONNECTION:  # a freeze waits for nobody
+        if command not in HOLDS_ITS_CONNECTION:  # a freeze waits for nobody; a stop has its room
             return super()._handle(request, pid, uid)
-        return self._within(self._long_orders, command, request, pid, uid, "busy", TOO_MANY_ORDERS)
+        if not self._long_orders.acquire(blocking=False):
+            return refused("busy", TOO_MANY_ORDERS)
+        try:
+            return super()._handle(request, pid, uid)
+        finally:
+            self._long_orders.release()
 
     def _agent_command(
         self, command: str, request: dict[str, Any], pid: int, uid: int, desk: Desk, *, named: bool

@@ -87,7 +87,6 @@ from backtide.service.control import (
 from backtide.service.origin import PublicOrigin
 from backtide.service.sessions import Session, Sessions
 from backtide.service.web_control import (
-    MAX_WEB_CONNECTIONS,
     SessionCheckRefused,
     ask_auth,
     ask_passkey,
@@ -109,7 +108,10 @@ TOKEN_BYTES = 32
 COOKIE_NAME = "backtide_web"
 DOMAIN_COOKIE_NAME = "__Host-backtide_web"  # behind a domain (T26-4a)
 LANG_COOKIE = "backtide_lang"
-CHECKS_AT_ONCE = MAX_WEB_CONNECTIONS // 2  # of the narrow socket's connections, the rest for clicks
+# Of the narrow socket's connections, at most these for the cookie checks, so that the rest are for
+# clicks. Fixed, not derived from the socket's cap: a test fixes that they fit in what the orders
+# that last (starts, stops) leave free.
+CHECKS_AT_ONCE = 2
 CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
     "font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; "

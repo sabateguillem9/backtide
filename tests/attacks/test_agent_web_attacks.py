@@ -78,7 +78,7 @@ def as_the_web(lab: Lab, *requests: dict[str, Any]) -> list[dict[str, Any]]:
     opened, *said = _probe(
         nobody(), lab.web_gid, {"cmd": "session_open", "token": token}, *requests
     )
-    assert opened["ok"] is True, opened
+    assert opened["ok"] is True, {key: opened.get(key) for key in ("outcome", "ok")}
     return said
 
 
@@ -383,32 +383,41 @@ def test_a_stop_does_not_wait_behind_a_start(attack: Attack, lab: Lab, web: Web)
     )
 
 
-CAP_WORDS = ("Demasiadas conexiones", "Ya hay otras órdenes", "Ya hay una parada")
-NO_TASK = "d" * 32  # a task id nobody has: the service answers "unknown", at once
+STOP_BUSY = "Ya hay una parada"  # the service's own word when a stop finds the stops' room taken
+CONNECTION_CAP = "Demasiadas conexiones"  # what the socket says with every connection taken
+STOP_HELD = 1.0  # seconds a real stop has been running before the second one is asked
+
+
+def reply_one(reply: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """The one reply a probe of one request gave (its secrets never leave the probe)."""
+    return reply[0] if reply else {"error": "no answer"}
 
 
 @scenario("paradas-repetidas-no-quitan-el-freno")
 def test_repeated_stops_never_take_the_webs_brake(attack: Attack, lab: Lab, web: Web) -> None:
     """Review of T26-6b with the chat: the stops (`agent_stop`, `task_stop`) did not count in the
-    narrow socket's cap of connections, and a stop holds its own for as long as the machine takes
-    (up to 110 and 120 s). Two starts and stops asked again and again could take them all, and then
-    every page said "busy", "Congelar" too. Now each kind has its own room and leaves some free.
+    narrow socket's cap of connections and a stop holds its own while it lasts, so two starts and
+    stops asked again and again could take them all, "Congelar" with them. Now each kind of stop
+    has its room, and the second one finds it taken and is told so at once, spending nothing.
 
-    Here, in the real unit: both neighbours stopped, both started from the socket (two long
-    orders) and, meanwhile, stops asked over and over, the pages read and the brake pulled on the
-    first neighbour that is up. What a lab cannot do is make a stop last two minutes: that exact
-    arithmetic (two starts, a stop of each kind held, and the freeze answered) is in
-    tests/test_service_web_agent_orders.py, over real sockets. Here it is that nothing in the real
-    wiring turns a page or the freeze into the cap's word."""
+    In the real unit, with two real neighbours and a real session: a real `agent_stop` of one
+    lasts ~10 s (Docker's). While it runs, stops asked again and again (of the other neighbour and
+    of the same) are answered `busy` by the stops' room ("Ya hay una parada"): without the room
+    they reach `Fleet`, which answers `refused` with another text. Meanwhile the pages answer and
+    "Congelar" and "Seguir" work from the real web on the neighbour that is up (so the stops did
+    not spend the changes' tokens either). After it, both stops are possible and the starts come
+    out as the service's list says.
+
+    Not covered here, and why: (a) two starts held at once, since a lab's start answers in ~1.5 s
+    and `Fleet` takes a second start only after the first one's checks; (b) a stop of a task that
+    lasts (a lab's `pkill` answers at once), the per-agent room of the task's stop and the chat's
+    second "Parar" (409; the lab's web has no `--tareas`). All three are in
+    tests/test_service_web_agent_orders.py (real sockets, held orders), and the chat's in
+    tests/test_web_talk.py."""
     time.sleep(CHANGES_WAIT)
-    for agent in (THIRD, OTHER):
-        assert order(lab, {"cmd": "agent_stop", "agent": agent.slug})["outcome"] == "stopped"
-    starts: dict[str, list[dict[str, Any]]] = {}
-    stops: list[list[dict[str, Any]]] = []
-    # One session for every thread (a link opens one): what a web taken over with it would have.
     token = lab.helper("link", SOCKET)["token"]
     [opened] = _probe(nobody(), lab.web_gid, {"cmd": "session_open", "token": token, "_see": True})
-    assert opened["ok"] is True, opened
+    assert opened["ok"] is True, {key: opened.get(key) for key in ("outcome", "ok")}
 
     def sent(*requests: dict[str, Any]) -> list[dict[str, Any]]:
         return _probe(
@@ -417,98 +426,66 @@ def test_repeated_stops_never_take_the_webs_brake(attack: Attack, lab: Lab, web:
             *({**one, "session": opened["session"], "_why": True} for one in requests),
         )
 
-    def starting(agent: Any) -> None:
-        starts[agent.slug] = sent({"cmd": "agent_start", "agent": agent.slug})
+    def stop_of(agent: Any) -> dict[str, Any]:
+        return {"cmd": "agent_stop", "agent": agent.slug}
 
-    def stopping() -> None:
-        stops.append(
-            sent(
-                {"cmd": "task_stop", "task": NO_TASK},
-                {"cmd": "agent_stop", "agent": "nadie"},
-                {"cmd": "task_stop", "task": NO_TASK},
-                {"cmd": "agent_stop", "agent": "nadie"},
-            )
-        )
+    answers: dict[str, list[dict[str, Any]]] = {}
 
-    threads = [threading.Thread(target=starting, args=(agent,)) for agent in (THIRD, OTHER)]
-    for thread in threads:
-        thread.start()
-    pages: list[tuple[str, Any]] = []
-    frozen: dict[str, Any] = {}
+    def run_stop() -> None:
+        answers["stop-third"] = sent(stop_of(THIRD))
+
+    holds: dict[str, bool] = {}
+    notes: dict[str, Any] = {}
+    first = threading.Thread(target=run_stop, name="stop-third")
+    first.start()
     try:
-        wait(
-            lambda: any(item.get("order") == "starting" for item in listed(lab).values()),
-            60,
-            "a neighbour to be coming up",
-            lab.diagnosis,
+        time.sleep(STOP_HELD)
+        repeats = [reply_one(sent(stop_of(OTHER))), reply_one(sent(stop_of(THIRD)))]
+        repeats.append(reply_one(sent(stop_of(OTHER))))
+        notes["repeats"] = repeats
+        holds["repeated_stops_busy"] = all(
+            one.get("outcome") == "busy" and STOP_BUSY in str(one.get("why", "")) for one in repeats
         )
-        thread = threading.Thread(target=stopping)
-        thread.start()
-        threads.append(thread)
-        for _ in range(3):  # the pages, while the starts and the stops go on
-            [read] = as_the_web(lab, {"cmd": "agents", "_why": True})
-            pages.append(("agents", read))
-            pages.append(("web", web.get("/agentes").status_code))
-        # The brake, on the first neighbour that is up.
-        up = wait_for_one_up(lab)
-        frozen["slug"] = up.slug
-        frozen["said"] = ended(web, ask(web, "pausar", up.slug))
-        frozen["paused"] = paused(up.container)
-        frozen["resumed"] = ended(web, ask(web, "seguir", up.slug))
-        frozen["thawed"] = not paused(up.container)
+        holds["the_stop_was_still_running"] = first.is_alive()
+        holds["neighbour_untouched"] = _running(OTHER.container)
+        pages = [web.get("/agentes").status_code for _ in range(3)]
+        listing = reply_one(_probe(nobody(), lab.web_gid, {"cmd": "agents", "_why": True}))
+        notes["listing"] = listing
+        holds["pages"] = pages == [200] * 3 and listing.get("ok") is True
+        frozen = ended(web, ask(web, "pausar", OTHER.slug))
+        holds["frozen"] = ES["agents.out.frozen"] in frozen and paused(OTHER.container)
+        thawed = ended(web, ask(web, "seguir", OTHER.slug))
+        holds["thawed"] = ES["agents.out.resumed"] in thawed and not paused(OTHER.container)
     finally:
-        for thread in threads:
-            thread.join(START_TIMEOUT)
+        first.join(START_TIMEOUT)
         for agent in (THIRD, OTHER):  # whatever happened, the next scenarios find them up
-            if not _running(agent.container):
-                order(lab, {"cmd": "agent_start", "agent": agent.slug})
-    said = [reply for replies in stops for reply in replies]
-    never_the_cap = not any(
-        word in str(reply.get("why", "")) for reply in said for word in CAP_WORDS
+            if paused(agent.container):
+                order(lab, {"cmd": "agent_resume", "agent": agent.slug})
+    holds["first_stop_ended"] = reply_one(answers.get("stop-third")).get(
+        "outcome"
+    ) == "stopped" and not _running(THIRD.container)
+    # The room is back: both stops are possible again, and the starts end as the list says.
+    again = reply_one(sent(stop_of(OTHER)))
+    holds["room_back"] = again.get("outcome") == "stopped" and not _running(OTHER.container)
+    for agent in (THIRD, OTHER):
+        assert order(lab, {"cmd": "agent_start", "agent": agent.slug})["outcome"] == "started"
+    said = listed(lab)
+    holds["starts_as_the_list_says"] = all(
+        said.get(agent.slug, {}).get("watched")
+        and not said.get(agent.slug, {}).get("order")
+        and _running(agent.container)
+        for agent in (THIRD, OTHER)
     )
-    started = {slug: replies[0] for slug, replies in starts.items()}
-    holds = {
-        "pages_answered": all(
-            (kind == "web" and item == 200) or (kind == "agents" and item.get("ok") is True)
-            for kind, item in pages
-        )
-        and len(pages) == 6,
-        "stops_answered": len(said) == 4 and never_the_cap,
-        "frozen_said": ES["agents.out.frozen"] in frozen.get("said", ""),
-        "was_frozen": frozen.get("paused") is True,
-        "resumed_said": ES["agents.out.resumed"] in frozen.get("resumed", ""),
-        "was_thawed": frozen.get("thawed") is True,
-        "starts_answered": set(started) == {THIRD.slug, OTHER.slug}
-        and not any(
-            word in str(item.get("why", "")) for item in started.values() for word in CAP_WORDS
-        ),
-    }
+    holds["no_answer_was_the_cap"] = CONNECTION_CAP not in str(notes) + str(answers)
     attack.check(
         "stopped",
         all(holds.values()),
-        "con dos arranques en marcha y paradas pedidas una y otra vez, las páginas contestan, "
-        f"«Congelar» congela a {frozen.get('slug')} y «Seguir» lo descongela, y ninguna respuesta "
-        f"es la del tope de conexiones; no se cumple: "
-        f"{[name for name, ok in holds.items() if not ok] or 'nada'}",
+        "con un parar de verdad en curso (unos 10 s), los pedidos de parar repetidos se rechazan "
+        "al momento con la palabra de las paradas y no con la de `Fleet`; las páginas contestan y "
+        "«Congelar» y «Seguir» funcionan en el vecino que está arriba; al acabar, se puede parar "
+        "otra vez y los dos vecinos arrancan como dice la lista del servicio. No se cumple: "
+        f"{[name for name, ok in holds.items() if not ok] or 'nada'}; {notes}",
     )
-
-
-def wait_for_one_up(lab: Lab) -> Any:
-    """The first neighbour the service watches again and that no order is working on: where the
-    brake is tried, with the other start still going."""
-    found: list[Any] = []
-
-    def one_up() -> bool:
-        said = listed(lab)
-        for agent in (THIRD, OTHER):
-            item = said.get(agent.slug, {})
-            if item.get("watched") and not item.get("order") and not paused(agent.container):
-                found.append(agent)
-                return True
-        return False
-
-    wait(one_up, START_TIMEOUT, "a neighbour to be up", lab.diagnosis)
-    return found[0]
 
 
 @scenario("borrar-desde-la-web")
